@@ -1,0 +1,55 @@
+# OCaml / dune
+_build/
+*.install
+
+# Node / TypeScript
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.pnpm-store/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Rust
+target/
+Cargo.lock
+
+# Go
+vendor/
+
+# JVM
+.gradle/
+*.class
+
+# Native artifacts
+*.so
+*.dylib
+*.dll
+*.a
+*.wasm
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Env / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Local
+.cache/
+.tmp/

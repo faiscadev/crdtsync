@@ -1,0 +1,2782 @@
+# crdtsync
+
+> Self-hosted collaborative sync backend with a portable CRDT core.
+> [crdtsync.com](https://crdtsync.com)
+
+Project lives in the [faisca](https://github.com/faisca) org alongside `fila` (messaging), `fakecloud` (local AWS emulator), `pensum` (tasks), and others.
+
+## Vision
+
+Build a language-agnostic collaborative sync engine inspired by Yjs/Liveblocks, but designed around:
+
+- batteries-included deployment
+- self-hosting first
+- no Postgres/Redis dependencies
+- portable CRDT core
+- official backend
+- horizontal scalability
+- multi-language support
+- offline-first synchronization
+- operational simplicity
+
+The core insight:
+
+> Existing CRDT ecosystems solve the data structure problem, but not the infrastructure problem.
+
+The goal is to create:
+
+> A collaborative sync backend that can be deployed as a single container and embedded into applications across many languages.
+
+---
+
+# Core Product Positioning
+
+## What this is
+
+A realtime collaborative backend + portable CRDT engine.
+
+Features:
+
+- collaborative document editing
+- offline-first synchronization
+- realtime replication
+- embedded persistence
+- horizontal scaling
+- awareness (cursors, selections, user identity, typing, viewport — what Liveblocks calls "presence")
+- snapshots + compaction
+- multi-language SDKs
+- self-hosted deployment
+- official sync protocol
+
+---
+
+## What this is NOT
+
+### Not just a CRDT library
+
+The focus is not:
+
+- "yet another CRDT implementation"
+- purely academic CRDT research
+- a data structure package only
+
+The focus is:
+
+- operational infrastructure
+- deployment simplicity
+- production-ready sync
+- batteries-included collaboration
+
+---
+
+## Problems with existing solutions
+
+### Yjs
+
+Strengths:
+
+- excellent CRDT implementation
+- battle-tested
+- strong JS ecosystem
+
+Weaknesses:
+
+- backend story is fragmented
+- websocket providers often handwritten
+- persistence is DIY
+- scaling architecture unclear
+- multi-language editing awkward
+- operational setup fragmented
+
+---
+
+### Liveblocks / hosted providers
+
+Strengths:
+
+- batteries-included
+- easy onboarding
+- polished developer experience
+
+Weaknesses:
+
+- SaaS lock-in
+- opaque internals
+- expensive at scale
+- less control
+- difficult self-hosting story
+
+---
+
+# Main Product Goals
+
+## 1. Batteries-Included Deployment
+
+Users should deploy:
+
+```bash
+crdtsync serve
+```
+
+or:
+
+```bash
+docker run crdtsync
+```
+
+without provisioning:
+
+- Postgres
+- Redis
+- Kafka
+- ZooKeeper
+- NATS
+- etcd
+- Elasticsearch
+- external brokers
+
+The system should contain:
+
+- storage
+- replication
+- pubsub
+- snapshots
+- clustering
+- failover
+- room routing
+
+inside one deployable unit.
+
+---
+
+## 2. Portable CRDT Core
+
+The CRDT implementation should exist exactly once.
+
+Avoid:
+
+- reimplementing merge logic in every language
+- duplicated protocol semantics
+- divergent implementations
+- compatibility nightmares
+
+The core should be:
+
+- implemented in OCaml
+- exported as WASM
+- exported as stable C ABI
+- wrapped by thin SDKs
+
+---
+
+## 3. Multi-Language Support
+
+Clients in:
+
+- JavaScript
+- TypeScript
+- Python
+- Go
+- Rust
+- OCaml
+- Node.js
+- JVM languages
+
+should all edit the same document naturally.
+
+---
+
+## 4. Operational Simplicity
+
+Infrastructure should feel like:
+
+- SQLite
+- Tailscale
+- Fly.io
+- LiteFS
+
+rather than:
+
+- Kubernetes-first infra stacks
+- distributed systems requiring many dependencies
+
+---
+
+# High-Level Architecture
+
+```text
+               ┌───────────────────┐
+               │    Client SDKs    │
+               │ JS / Python / Go  │
+               └─────────┬─────────┘
+                         │
+                         ▼
+               ┌───────────────────┐
+               │ Shared CRDT Core  │
+               │      OCaml        │
+               └─────────┬─────────┘
+                         │
+         ┌───────────────┴───────────────┐
+         ▼                               ▼
+   WASM Export                      C ABI Export
+         │                               │
+         ▼                               ▼
+ Browser / Node                Native language bindings
+
+
+               ┌───────────────────┐
+               │    Sync Server    │
+               │       OCaml       │
+               └─────────┬─────────┘
+                         │
+                         ▼
+               ┌───────────────────┐
+               │ Embedded Storage  │
+               │ SQLite / RocksDB  │
+               └───────────────────┘
+```
+
+---
+
+# CRDT Model
+
+The system supports a focused set of primitives. Avoid generic CRDT abstractions early.
+
+```text
+Document               root container: named Map<string, Element>
+ ├── Map               string-keyed, recursive values
+ ├── List              ordered items, recursive values
+ ├── Text              collaborative char sequence, lives anywhere
+ ├── XmlElement        tag + attrs (Map<string,Value>) + children (List<XmlElement|Text>)
+ ├── XmlFragment       root container of XmlElements (no own tag)
+ ├── RangedElement     (start_anchor, end_anchor, payload: Element) — generic ranged annotation
+ ├── Register          single LWW value
+ └── Counter           increment/decrement
+```
+
+## Rationale
+
+- Map/List/Text/Register/Counter cover structured collaborative apps (Kanban, settings, code editors, dashboards, forms).
+- XmlElement covers document-style trees (ProseMirror, HTML, SVG, OOXML-shaped data). Attributes are first-class: modeled as a collaborative `Map<string, Value>`, so attribute values can themselves be `Text` or other CRDTs.
+- RangedElement is the generic ranged annotation. Models marks (bold/italic/links), comments, suggestions, highlights, mentions, and domain-specific overlays. Payload is any Element — recursive composition.
+
+## Document Shape
+
+Document root is `Map<string, Element>`. Top-level types accessed by name:
+
+```ts
+doc.getText("body")
+doc.getMap("settings")
+doc.getXmlFragment("content")
+doc.getList("comments")
+```
+
+Text is standalone — can live at the doc root, inside a Map value, inside a List item, or inside an XmlElement's children. XmlElement children are restricted to `XmlElement | Text` (matches DOM/XML model). All other containers accept any Element type.
+
+## Why XmlElement (not "Tree")
+
+A generic Tree without attributes is a strict subset of XmlElement with attributes. Solving for XmlElement solves for Tree (leave attrs empty); the reverse does not hold. XML's three-way split (tag / attrs / children) is the right shape for document data — HTML, SVG, ProseMirror, RSS all chose it because it fits. We claim the data model, not the angle-bracket serialization (wire format stays binary).
+
+---
+
+# Supported Operations
+
+## Text
+
+```text
+insert(index, chars)
+remove(index, length)
+replace(index, length, chars)
+```
+
+Positions in user-facing APIs are integer offsets; internally these resolve to char-ID anchors so concurrent edits don't drift.
+
+---
+
+## Map
+
+```text
+set(key, value)              // throws if key already holds a CRDT — see Map Slot Safety
+replace(key, value)          // explicit replacement
+initOnce(key, factory)       // safe lazy init for CRDT children
+delete(key)
+live(key)                    // reactive accessor for editor bindings
+```
+
+Nested values supported (any Element type). Scalar set uses LWW.
+
+---
+
+## List
+
+```text
+insert(index, item)
+remove(index, count)
+move(from, to)
+```
+
+---
+
+## XmlElement
+
+```text
+setAttr(key, value)          // attr values may themselves be Element (e.g. Text)
+removeAttr(key)
+insertChild(index, child)    // child: XmlElement | Text
+removeChild(index)
+move(node, newParent, index) // tree move — implements Kleppmann 2021 (see Algorithms)
+```
+
+---
+
+## RangedElement
+
+```text
+create(start_anchor, end_anchor, payload: Element)
+removeRange(rangedElementId)
+updatePayload(rangedElementId, op)   // routes to payload's own CRDT ops
+```
+
+---
+
+## Register
+
+```text
+set(value)                   // LWW
+```
+
+---
+
+## Counter
+
+```text
+increment(n)
+decrement(n)
+```
+
+---
+
+# Internal Data Model
+
+Every operation is immutable and append-only.
+
+```json
+{
+  "op_id":          "client-7:493",
+  "client_id":      "client-7",
+  "client_seq":     493,
+  "actor_id":       "user_42",
+  "room":           "doc-1",
+  "branch":         "main",
+  "zone":           "shared_content",
+  "schema_version": 5,
+  "lamport":        18923,
+  "wall_time":      1733000000,
+  "kind":           "text.insert",
+  "target":         { "path": ["body", "children", 7, "text"] },
+  "payload":        { "index": 42, "value": "hello" }
+}
+```
+
+Field roles:
+
+- `op_id = (client_id, client_seq)` — globally unique op identity, used for idempotency
+- `actor_id` — authenticated human (from token); same actor across devices = same id
+- `branch` — which branch this op belongs to (default `main`)
+- `zone` — derived from target Element; routing key for per-zone replication and auth
+- `schema_version` — schema this op was authored under
+- `lamport` — per-zone lamport timestamp (zone-scoped to avoid cross-zone activity leakage)
+- `wall_time` — informational only; not used for causality
+- `kind` — op type (`text.insert`, `xml.setAttr`, `xml.move`, `acl.grant`, `migrate`, ...)
+- `target` — where in the doc the op applies
+- `payload` — op-specific data
+
+---
+
+# Important Design Principle
+
+## Intentions vs Internal CRDT Ops
+
+SDKs should expose high-level editing operations.
+
+Example:
+
+```ts
+room.text("body").insert(0, "hello")
+```
+
+NOT:
+
+```ts
+apply_crdt_delta(...)
+```
+
+The CRDT internals should remain hidden.
+
+The server/core transforms user intentions into actual CRDT operations.
+
+---
+
+# Anchors and Element IDs
+
+Every Element receives a stable CRDT identifier at creation:
+
+```text
+element_id = (client_id, client_seq)
+```
+
+Element IDs never change — survive renames, moves, structural mutations. All cross-references inside the document graph go through element IDs, never integer paths.
+
+## Anchor Model
+
+Anchors identify positions inside collaborative containers. Used for cursors, selections, marks, comments, and any RangedElement boundary.
+
+```text
+Anchor = {
+  target: element_id           // stable ID of any Element
+  sub:    SubPosition
+}
+
+SubPosition =
+  | CharAnchor  { char_id, side: Before | After }   // target is Text
+  | IndexAnchor { item_id, side: Before | After }   // target is List or XmlElement children
+  | Whole                                            // target is Map, Register, Counter, or whole element
+```
+
+CharAnchor and IndexAnchor tie to specific CRDT char/item IDs (not integer offsets) — they survive concurrent inserts and deletes without drifting.
+
+## RelativePosition
+
+Anchors are exposed at the SDK level as `RelativePosition`. Editor bindings (cursors, selections) must use these instead of integer offsets:
+
+```text
+pos_to_relative(view_position) -> RelativePosition
+relative_to_pos(rel)           -> view_position    // resolved against current state
+```
+
+Without RelativePosition, cursors jump on remote edits. This is a core primitive, not a per-SDK concern.
+
+---
+
+# Marks (Rich Text Formatting)
+
+Marks are range overlays on Text — bold, italic, links, highlights, comments. Implemented as a convention over `RangedElement`, not as a separate primitive.
+
+## Open-Ended
+
+Core does not predefine mark names. Marks are `(name: string, value?: Element)`. The app decides what marks exist and how to render them.
+
+```ts
+text.mark(start, end, "bold")
+text.mark(start, end, "link", { href: "https://..." })
+text.mark(start, end, "comment", { thread_id: "t-42" })
+text.unmark(start, end, "bold")
+```
+
+## Mark Registration
+
+Each mark name needs declared merge semantics. The app registers at doc setup:
+
+```ts
+doc.registerMark("bold",    { kind: "boolean" })
+doc.registerMark("link",    { kind: "value", merge: "lww", growRight: false })
+doc.registerMark("comment", { kind: "object" })
+```
+
+Unregistered marks default to `{ kind: "value", merge: "lww", growLeft: true, growRight: true }`.
+
+## Merge Flavors
+
+| kind | example | concurrent behavior |
+|------|---------|---------------------|
+| boolean | bold | presence only. add+add = present. add+remove = LWW. |
+| value | link={href} | single value, LWW on conflict. |
+| object | comment={id} | each mark independent — no range merging across instances. |
+
+## Anchor Expansion
+
+Per-mark flags control whether the mark grows when text is inserted at its boundary:
+
+```text
+growLeft  : bool   // expand to cover new chars before start
+growRight : bool   // expand to cover new chars after end
+```
+
+Bold: typically grows both ways (typing at the end of a bold word stays bold). Link: typically grows neither (don't extend the URL).
+
+## Algorithm
+
+Peritext-style range CRDT (Litt, van Hardenberg, Kleppmann — Ink & Switch 2022). Marks stored separately from Text content as a `RangedElement` log per mark name.
+
+---
+
+# Map Slot Safety
+
+`Map.set(key, value)` uses LWW on assignment. For scalar values this is fine. For child CRDTs, naive use causes silent orphaning.
+
+## The Problem
+
+```text
+Alice: map.set("body", new Text())   @ t=10
+Bob:   map.set("body", new Text())   @ t=12   (concurrent)
+→ Bob's Text wins LWW. Alice's Text is orphaned.
+  Alice continues editing her Text locally; ops are valid but unreachable from doc root.
+  Visible content diverges silently until Alice re-reads map["body"].
+```
+
+## API Guardrails
+
+```ts
+map.initOnce(key, factory)   // safe lazy init — concurrent calls converge to one Element
+map.replace(key, value)      // explicit replacement (acknowledges orphaning)
+map.set(key, crdtValue)      // throws if key already holds a CRDT; allowed for scalars
+map.live(key)                // reactive accessor — re-resolves through path on every op
+```
+
+App pattern:
+
+```ts
+const body = doc.getMap("doc").initOnce("body", () => new Text())
+// All clients converge to the same Text. Edit forever.
+```
+
+Editor bindings hold `map.live(key)` references, not direct CRDT references. When LWW swaps a value, the live ref re-binds, observers fire, the view re-attaches.
+
+## Orphan Event
+
+When an Element becomes unreachable from any root, core fires:
+
+```ts
+doc.on("orphan", (element) => { /* salvage, warn, log, ignore */ })
+```
+
+Orphaning is never silent.
+
+---
+
+# Algorithms and Invariants
+
+## Causality
+
+```text
+op identity:    (client_id, client_seq)
+total order:    lamport timestamp + client_id tiebreak
+client order:   client_seq monotonic per client (FIFO)
+```
+
+Lamport = `max(seen_ts) + 1`. Used by tree moves, mark merging, Register LWW. Wall clocks are not trusted.
+
+## Tree Moves (XmlElement)
+
+Implements Kleppmann 2021 ("A highly-available move operation for replicated trees"):
+
+- every move op carries a lamport timestamp
+- ops applied in timestamp order
+- on out-of-order receive: undo later ops, insert new op, replay
+- maintains a bounded undo log sized to the concurrent op window
+
+Guarantees: exactly one parent per node, no cycles, no duplication, deterministic convergence.
+
+## Marks
+
+Peritext-style range CRDT. Anchors tied to char IDs (not offsets). Range merging per mark `kind` (boolean / value / object). Anchor expansion via `growLeft` / `growRight` flags.
+
+## LWW
+
+Used by:
+
+- `Register` values
+- `Map.set` of scalar values
+- `XmlElement` attribute values
+- mark values of `kind: value`
+
+Resolution: higher lamport timestamp wins, tiebreak by `client_id`.
+
+## Tombstone GC
+
+CRDT text/list deletions leave tombstones (required to position concurrent inserts). Without GC, document size grows unbounded.
+
+```text
+watermark = min(last_seen_seq) across all known clients
+at snapshot boundary: discard tombstones older than watermark
+```
+
+Offline clients block GC for ops they haven't acknowledged. Server tracks per-client `last_seen_seq` (already required for reconnect resume).
+
+## Op Batching
+
+Wire format supports run-length encoding for consecutive same-client inserts from v0.1, even if the v0.1 encoder ships single-op only. Locking the format early avoids breaking changes later.
+
+## Schema and Repair
+
+Schema enforcement and invariant repair are first-class core concerns. See the dedicated **Schema**, **Invariant Repair**, and **Schema Migration** sections below.
+
+---
+
+# Schema
+
+The Document carries an optional declarative schema. Schema-less docs work (free-form Map / List / Text), but apps that ship versioned releases over time should declare a schema.
+
+## Why Declare
+
+- producer-side op validation catches bugs at the write site (invalid op never enters the log)
+- type-aware SDK API (autocomplete on `xml.insertChild(...)`, attr setters narrow by type)
+- enables deterministic invariant repair under concurrent merges
+- enables schema migration with full history preservation
+- cross-language: schema is JSON, every SDK enforces identically
+
+## Declaration
+
+Schema is data, JSON-serializable. Declared once at doc setup, committed alongside app code:
+
+```json
+{
+  "version": 5,
+  "types": {
+    "doc":       { "kind": "xml", "children": ["block+"] },
+    "block":     { "anyOf": ["paragraph", "heading", "list"] },
+    "paragraph": {
+      "kind": "xml",
+      "tag": "p",
+      "attrs": { "align": { "type": "lww-enum", "values": ["left","center","right"], "default": "left" } },
+      "children": ["inline*"]
+    },
+    "heading": {
+      "kind": "xml",
+      "tag": "h",
+      "attrs": { "level": { "type": "lww-int", "range": [1,6] } },
+      "children": ["text"],
+      "exclusive": true
+    },
+    "inline": { "anyOf": ["text"] },
+    "text":   { "kind": "text", "marks": ["bold", "italic", "link"] }
+  },
+  "marks": {
+    "bold":   { "kind": "boolean" },
+    "italic": { "kind": "boolean" },
+    "link":   { "kind": "value", "value": { "href": "url" }, "growRight": false }
+  }
+}
+```
+
+## Enforcement Points
+
+| Where | Behavior |
+|-------|----------|
+| Producer SDK | Rejects an op that violates schema before sending. App bugs caught at the write site. Convergence preserved (invalid ops never enter the log). |
+| Server ingress | Validates incoming ops against current schema, rejects invalid. Defense in depth. |
+| Apply boundary (every replica) | Validates merged state after each apply. Invariant violations trigger Invariant Repair (next section). |
+
+## What Schema Predefines vs Not
+
+Predefined by core: validation engine, mark kinds (boolean / value / object), attr types (`lww-string`, `lww-int`, `lww-enum`, `url`, ...), repair rules.
+
+Declared by app: type names, mark names, attr keys, allowed children, default values, exclusivity, anchor expansion per mark, the chosen default block type for repair.
+
+## Schema-less Mode
+
+No schema declared → no validation, no schema-driven repair, no migration story. Core invariants (Kleppmann moves, Map Slot Safety, anchor stability) still hold. Fine for ephemeral / free-form data. Wrong for any app that ships versioned releases over time.
+
+## Versioning
+
+Every schema declares a `version`. Every Document records the `schema_version` it was created under, bumped after each migration. Versioning is mandatory once a schema is declared — required for safe evolution.
+
+---
+
+# Invariant Repair
+
+Concurrent merges can produce schema-invalid states even when each individual op is valid. Example: schema says "at most one heading per block." Alice and Bob each concurrently insert a heading. Both ops valid individually. Merged state has two headings — schema violation.
+
+## Opinionated, Not Configurable
+
+Core ships fixed repair rules. Apps don't pick. Same rationale as why CRDT merge behavior isn't configurable: configurable repair = configurable footguns + cross-language divergence + decision fatigue.
+
+## Repair Rules (Normative)
+
+| Violation | Fixed rule |
+|-----------|-----------|
+| Orphan inline (inline outside its required block) | Wrap in schema's declared default block for that scope |
+| Disallowed child (child kind not in parent's allowed set) | Drop child |
+| Exclusive-child collision (>1 child where schema allows ≤1) | Keep lamport-oldest, demote rest to default sibling type |
+| Out-of-range scalar (e.g., heading level 7 when max is 6) | Clamp to nearest valid value |
+| Disallowed attr | Drop attr |
+| Attr type mismatch | Drop attr |
+| Mark on type that disallows marks | Drop mark |
+| Tree move cycle | Handled by Kleppmann move algorithm — not a separate repair |
+| Type mismatch on Map slot | Handled by Map Slot Safety — not a separate repair |
+
+Each rule is a deterministic function of (current state, schema, lamport order). All replicas independently converge to the same repaired state.
+
+## Observation, Not Override
+
+Apps cannot change what repair does. Apps can observe that it happened:
+
+```ts
+doc.on("repaired", (details) => {
+  // details: { violation_kind, location, original_op, resulting_state }
+  // UX uses: "we resolved a concurrent edit", offer undo, log, audit
+})
+```
+
+There is no `unrepairable` event. The rule table above is provably complete (see Closure of Violation Set).
+
+## Closure of Violation Set
+
+The schema language has finite dimensions: type membership, children cardinality, attr presence, attr type, attr value range, mark allowance, mark value shape. Every violation maps to one dimension. Every dimension has a rule.
+
+To keep the table complete, schema declarations are validated at parse time. The following are declaration errors caught at build time, not runtime violations:
+
+- required attr without declared default
+- exclusive container without declared demotion target
+- container allowing inline without declared default wrap block
+- mark value type without declared malformed-value rule (URL → drop, enum → drop, int → clamp, etc.)
+
+Apps cannot write a schema that admits unrepairable runtime states.
+
+## Out of Scope: Semantic Invariants
+
+Core schema covers **structural** invariants: shape, type, cardinality. It does not cover **semantic** invariants:
+
+- uniqueness ("list items must be unique IDs")
+- cross-field relations ("end_date ≥ start_date")
+- aggregate constraints ("sum of child counts ≤ total")
+- reference integrity ("foreign key must resolve")
+
+These are not in scope because they are not CRDT-mergeable with deterministic repair. Two users can each produce a unique-individually but duplicate-together state, and no fixed rule recovers a "correct" choice without losing intent.
+
+Apps handle semantic invariants in the app layer:
+
+- producer-side: app refuses to send an op that would violate locally (best-effort, doesn't prevent concurrent violation)
+- reactive: app observes doc state, surfaces warnings to the user ("duplicate ID detected — please rename"), prompts the user to fix
+- derived: aggregates computed by app code; failures surface in UI
+
+This boundary is explicit: structure = core, semantics = app.
+
+## Acknowledged Risk
+
+Opinions are hard to change later. Mitigations:
+
+- Each rule documented as normative spec — apps know what to expect
+- Schema-driven defaults provide the one knob that matters (which block wraps an orphan inline, etc.)
+- New violation kinds get new opinions in schema-version bumps, not retroactively
+- `repaired` event gives apps a UX-level escape valve without changing core behavior
+
+---
+
+# Schema Migration
+
+When schema version changes between app releases, existing documents must be transformed. Migrations live in the core (same logic as CRDT merge — one implementation, deterministic, cross-language).
+
+## Migrations as Log Entries
+
+The op log is append-only forever, including migration entries:
+
+```text
+log: [
+  op@v1,
+  op@v1,
+  op@v1,
+  ▶ migrate(v1 → v2) ◀     // first-class log entry
+  op@v2,
+  op@v2,
+  ▶ migrate(v2 → v3) ◀
+  op@v3,
+  ...
+]
+```
+
+Every op carries its creation `schema_version`. Migration entries are checkpoints. Replay walks entries in order — user ops apply under their schema, migration entries transform state at their position.
+
+This preserves time-travel debugging, audit (`when did body become content?`), and rollback. Snapshots cache state at intervals to keep steady-state replay fast — migration cost is paid once when a snapshot crosses a migration boundary.
+
+## Generated, Not Hand-Written
+
+Schema is the source of truth. Migrations are derived artifacts. Same model as Prisma / Atlas / Rails / EF Core.
+
+```text
+1. App dev edits schema.json
+2. `crdtsync migrate generate` diffs new schema vs last applied schema
+3. Tool emits migration file: migrations/0005_<name>.json
+4. App dev reviews; edits custom transforms if generated migration needs them
+5. Both schema + migration committed to repo
+6. CI runs `crdtsync migrate check` + `crdtsync migrate verify` — PR fails on drift or invalid output
+7. Deploy: server validates migration on load; per-replica safety net at apply time
+```
+
+## Auto-Generation Coverage
+
+| Schema change | Generated migration | Confidence |
+|---------------|---------------------|------------|
+| New field with default | `addField` | 100% |
+| Field removed | `removeKey` | 100% |
+| Attr added with default | `setAttr` | 100% |
+| Attr removed | `removeAttr` | 100% |
+| Mark added | `addMark` | 100% |
+| Mark removed | `removeMark` | 100% |
+| Type's allowed children expanded | (no migration needed) | 100% |
+| Field renamed (with `@renamedFrom` annotation) | `renameKey` | 100% |
+| Type renamed (with annotation) | structural rename | 100% |
+| Wrap (child X now inside new Y) | `wrap` | 90% (heuristic-detectable) |
+| Field split / type change | scaffolded TODO + pattern-rewrite skeleton | manual |
+
+~70-80% of real-world schema changes auto-generate cleanly. The rest get a scaffolded skeleton; CLI exits with a warning at `migrate generate` until the app dev completes the custom step.
+
+## Migration File Format
+
+JSON. Storage and edit format both. Cross-language by construction, diff-friendly in PR review, no parser to maintain, LSP/JSON-Schema tooling for free.
+
+```json
+{
+  "version": 5,
+  "name": "split_user_name_and_add_created_at",
+  "from": 4,
+  "to": 5,
+  "steps": [
+    { "kind": "splitField",
+      "at": "users.*",
+      "from_key": "name",
+      "to_keys": ["first", "last"],
+      "by": { "split_string": " ", "first_n": 1, "rest_to": "last" } },
+    { "kind": "addField",
+      "at": "doc",
+      "key": "created_at",
+      "default": "epoch:now-at-migration-time" }
+  ]
+}
+```
+
+Two-tier expressiveness:
+
+| Tier | What | Use |
+|------|------|-----|
+| 1. Built-in `kind` steps | `renameKey`, `removeKey`, `addField`, `wrap`, `unwrap`, `setAttr`, `removeAttr`, `addMark`, `removeMark`, `mapValues`, ... | ~80% of migrations |
+| 2. Pattern-rewrite DSL | Small pure language: selectors + transforms, no I/O, no clocks, terminates | Custom tree rewrites tier 1 can't express |
+
+WASM escape hatch (tier 3) deferred to v0.7+. Only added if real demand surfaces.
+
+## Schema Annotations as Diff Hints
+
+Transforms the differ can't infer from shape alone are declared next to the field via annotations:
+
+```json
+{
+  "type": "User",
+  "fields": {
+    "first": { "kind": "text", "@renamedFrom": "name", "@derive": "split:0" },
+    "last":  { "kind": "text", "@derivedFrom": "name", "@derive": "split:1.." }
+  }
+}
+```
+
+Differ reads annotations, generates the corresponding transform. App dev declares intent on the field, never writes DSL by hand for the common rename / derive cases.
+
+## Opinionated Choices (No Config)
+
+| Concern | Choice | Why |
+|---------|--------|-----|
+| Replay model | append-only log with migration entries | Preserves history; consistent with rest of system |
+| Snapshot cache | per-snapshot, includes `schema_version` | Steady-state replay stays fast |
+| Log compaction | optional admin action at migration boundaries | Storage knob when needed, default = preserve everything |
+| Sync policy | derived from migration kind, not declared | `renameKey` / `addField` / `removeKey-with-default` → bidirectional; `wrap` / `split` / custom DSL → forward-only |
+| Determinism | enforced by core (built-ins pure, DSL sandboxed) | Convergence by construction, not by app discipline |
+| Custom logic | DSL only, no app hooks | Hooks reintroduce per-language divergence |
+
+## Mixed-Version Sync
+
+Server checks client `schema_version` on handshake:
+
+- Gap covered entirely by bidirectional migrations → server translates ops in flight transparently. Old client keeps working.
+- Gap includes any forward-only migration → server rejects with `please-update-app`. Client must upgrade.
+
+No separate "breakpoint" policy. Forward-only is the breakpoint.
+
+## Detection — Four Gates
+
+### 1. Drift detection — `crdtsync migrate check`
+
+Compares declared `schema.json` against the cumulative effect of applying all migration files. If they don't match → drift. CI gate. Catches both directions: schema-edited-without-migration AND migration-edited-without-schema-update.
+
+```text
+$ crdtsync migrate check
+✗ Drift detected:
+  schema.json declares field 'doc.subtitle' (Text)
+  but migrations only end at schema v5, which doesn't have 'subtitle'
+
+  Run `crdtsync migrate generate` to create the missing migration.
+```
+
+### 2. Verification — `crdtsync migrate verify`
+
+Applies the migration to a synthetic fixture (or app-provided fixture), validates the result against the new schema. Property-based variant `crdtsync migrate test --samples N` generates N random docs valid under the old schema, applies migration, validates all against new. CI gate.
+
+### 3. Server boot — chain completeness + immutability
+
+Migration files are immutable once applied. Each gets a SHA-256 hash recorded on first apply, stored in a doc-local migrations lock:
+
+```text
+.migrations.lock
+  v1: sha256:abc...
+  v2: sha256:def...
+  v3: sha256:hij...
+```
+
+Server refuses to start if any migration in the chain is missing, out of sequence, or has a hash mismatch (someone modified a previously-shipped migration).
+
+### 4. Per-doc runtime — version reachability
+
+When a doc with `schema_version=N` loads against a server on `schema_version=M`:
+
+- If `M > N` and chain N→M exists with current migration files → apply chain.
+- If chain incomplete → reject doc load with explicit error, don't corrupt.
+
+Same check for incoming ops: op tagged version X arrives → server checks chain X→current. Missing → reject op with `migration-gap` error sent back to the client.
+
+## Tooling Surface
+
+```text
+crdtsync migrate status              show declared schema version, last migration, drift y/n, hash status
+crdtsync migrate check               exit non-zero on drift, gap, or hash mismatch
+crdtsync migrate verify [--fixture]  apply pending migration to fixture, validate against new schema
+crdtsync migrate test [--samples N]  property-based: random valid-under-old docs, apply, validate all
+crdtsync migrate generate            diff schema → emit migration file (refuses if pre-existing drift)
+crdtsync migrate apply               run migrations (includes verify pre-flight)
+```
+
+Standard Prisma surface, adapted to the doc/CRDT model. Familiar muscle memory.
+
+## What Migrations Cannot Do
+
+- no I/O, no wall-clock, no random, no network
+- no reaching outside doc state
+- no interaction with the user
+
+These constraints are non-negotiable — determinism is the entire reason migrations live in the core. If the app needs user input to resolve an ambiguous transform, run the migration with a safe default, then surface a follow-up edit task in the UI; user-driven edits flow through the normal op stream after migration completes.
+
+## Detection Limits (Be Honest)
+
+- **Intent violations** — user's migration produces schema-valid state that doesn't match their intent. System sees consistent state, can't read minds. App-level unit tests catch this.
+- **Semantically wrong custom transforms** — DSL program produces valid types but wrong values (e.g., split heuristic at wrong index). App-level fixture tests catch this.
+- Structural correctness = detectable. Semantic correctness = not. Acceptable line.
+
+---
+
+# Undo / Redo
+
+Per-user undo via SDK helper. Core sees only inverse ops — no server-side undo state, no special wire format.
+
+## Per-User Model
+
+Each user's undo stack contains intentions (op groups) the user authored. Undo reverts only that user's ops, even when other users' ops are interleaved. Per-op identity (`client_id, client_seq`) makes targeting precise; other users' ops are unaffected.
+
+Global undo (revert any op regardless of author) is not supported in core — it produces broken UX in collaborative settings. Apps that want "revert someone else's change" build it as a deliberate edit feature, not as undo.
+
+## Inverse Ops
+
+Undo emits an inverse op into the normal op stream. The inverse op replicates, persists, and merges like any other op.
+
+| Forward op | Inverse |
+|------------|---------|
+| `text.insert(i, "abc")` | `text.remove` of inserted chars by anchor id |
+| `text.remove(i, n)` | re-insert of removed chars at their original anchors |
+| `map.set(k, v_new)` | `map.set(k, v_prev)` — requires capturing `v_prev` |
+| `map.delete(k)` | re-create with captured prior value |
+| `xml.insertChild(p, i, c)` | `xml.removeChild(p, c.id)` |
+| `xml.removeChild(p, c)` | re-insert subtree (captured pre-state) |
+| `xml.move(c, new_p, i)` | `xml.move(c, prev_p, prev_i)` |
+| `xml.setAttr(k, v_new)` | `xml.setAttr(k, v_prev)` |
+| `text.mark(s, e, name)` | `text.unmark(s, e, name)` + restore overlapping marks |
+| `text.unmark(s, e, name)` | `text.mark(s, e, name, v_prev)` |
+| `counter.increment(n)` | `counter.decrement(n)` |
+| `ranged.create(...)` | `ranged.remove(id)` |
+
+Ops that overwrite or delete state require prior-state capture at op creation time. SDK captures into the local undo stack alongside the op id.
+
+## Intention Grouping
+
+Undo is per-intention, not per-op. SDK groups ops into intentions:
+
+```ts
+doc.beginIntention("type-word")
+text.insert(5, "h")
+text.insert(6, "i")
+doc.endIntention()
+// undo() reverts both inserts as one atomic intention
+```
+
+Auto-grouping on debounced gaps (>500ms idle = boundary by default). Manual `beginIntention` / `endIntention` for explicit grouping (paste, structured edit, paragraph break).
+
+## Redo
+
+Standard pattern: undo pushes the now-undone intention onto a redo stack. Any new user op clears the redo stack — diverging from the undone path retires it. Identical to every text editor.
+
+## Local Stack
+
+Undo state lives in the SDK on the client, not the server. The stack persists in local storage so reload doesn't lose it. Offline editing produces undoable ops without network.
+
+## Interaction with Invariant Repair
+
+User op triggers repair (e.g., demotes a duplicate heading). User undoes the op. Inverse op emits, state reverts, repair re-evaluates against the new state. If state is now valid, no repair fires. If still invalid, repair fires deterministically.
+
+Undo does not undo the repair specifically — it undoes the user's op. Repair re-runs naturally.
+
+## Interaction with Migrations
+
+Schema migration is a major event. Undo stack drops at migration boundaries. Users do not expect undo to cross schema versions; matches the convention of every other versioned system.
+
+## Where It Lives
+
+SDK, not core. Wire format unchanged — inverses are normal ops.
+
+| Capability | Milestone |
+|-----------|-----------|
+| Basic UndoManager for Map / List / Text / Register / Counter | v0.2 |
+| XmlElement (including move), RangedElement, marks | v0.5 |
+
+---
+
+# Persistence Architecture
+
+## Main Goal
+
+Persistence should require zero external infrastructure.
+
+---
+
+## Initial Storage Engine
+
+Recommendation:
+
+```text
+SQLite + append-only operation log
+```
+
+Advantages:
+
+- easy deployment
+- mature
+- reliable
+- inspectable
+- backup-friendly
+- WAL support
+- transactional
+
+---
+
+## Storage Layout
+
+### Tables
+
+```text
+rooms
+snapshots
+operations
+clients
+cluster_membership
+```
+
+---
+
+## Operations Table
+
+```text
+room_id
+server_seq
+client_id
+client_seq
+op_payload
+created_at
+```
+
+---
+
+## Snapshot Table
+
+```text
+room_id
+snapshot_blob
+last_seq
+created_at
+```
+
+---
+
+# Snapshots
+
+A snapshot is a serialized materialized Document state at a specific lamport timestamp. Snapshots make replay fast, drive tombstone garbage collection, mark migration checkpoints, and back the user-facing versioning layer.
+
+## Envelope
+
+```text
+SnapshotEnvelope {
+  room_id:        string
+  branch:         string         // default "main"
+  schema_version: int
+  lamport:        int            // all ops with lamport ≤ this are included
+  produced_at:    timestamp
+  format_version: int
+  body:           bytes          // CBOR / MessagePack / Cap'n Proto encoded Document state
+  body_hash:      sha256
+}
+```
+
+Includes full Element tree with stable element IDs preserved, all CRDT internal state (char IDs, anchor indexes, retained tombstones), and `schema_version`. Identical binary format to the on-wire serialization.
+
+## Frequency Triggers
+
+| Trigger | Default |
+|---------|---------|
+| Op count since last snapshot | every 10,000 ops |
+| Time since last snapshot | every 1 hour |
+| Migration boundary | always, immediately after applying a migration entry |
+| Manual | admin / app API: `doc.snapshot()` |
+
+All thresholds tunable per room.
+
+## Retention Policy
+
+| Snapshot kind | Default retention |
+|---------------|------------------|
+| Latest per branch | always retained |
+| Migration-boundary snapshots | retained forever (or until explicit log compaction at that boundary) |
+| Periodic snapshots between migrations | rolling window, default keep last 3 |
+| Named versions (see Versioning and Branches) | retained until app deletes |
+
+Migration-boundary snapshots are sticky because they are the only way to fast-replay across a migration. Removing them forces full history replay through the migration step.
+
+## Tombstone GC
+
+Snapshots are when GC actually happens. Until a snapshot crosses the watermark, tombstones must be retained — concurrent ops from offline clients could need them.
+
+```text
+watermark = min(last_seen_seq) across all known clients
+at snapshot time: discard tombstones older than watermark
+```
+
+Offline clients block GC for ops they haven't acknowledged.
+
+## Migration Interaction
+
+When a `migrate(vN → vN+1)` entry hits the log, every replica:
+
+1. Applies the migration to current state in memory
+2. Validates the result against the new schema
+3. Persists a new snapshot tagged `schema_version = N+1, lamport = entry.lamport`
+4. New snapshot becomes the latest for the branch
+
+Future replays of post-migration ops start from this snapshot; the pre-migration ops + migration entry remain in the log for time-travel + audit.
+
+## Time Travel
+
+```text
+1. Find nearest snapshot S with S.lamport ≤ target T
+2. Load S
+3. Replay log entries from S.lamport to T
+4. Materialized state at T
+```
+
+If only the latest snapshot is retained, time-travel before that point requires full-history replay (slow but possible).
+
+Migration-boundary snapshots make cross-migration time-travel cheap.
+
+## Replication
+
+Default: leader takes snapshots, replicates them to followers. Followers verify `body_hash` before swapping their snapshot pointer.
+
+Alternative (per-replica snapshots): each follower computes independently. More CPU, more resilient — followers can serve cold-starts without leader involvement. Move to per-replica when perf demands; default leader-only.
+
+## Cold Start
+
+When a client connects to a room it has not seen before, the server sends `latest_snapshot + ops_since(snapshot.lamport)`. No full-history replay on the client.
+
+## Export / Import
+
+Snapshots are portable. CLI:
+
+```bash
+crdtsync snapshot export <room_id> [--branch <name>] > backup.snap
+crdtsync snapshot import backup.snap [--as <new_room_id>]
+```
+
+Use cases: backup / restore, cloning rooms (templates), cross-server moves, debugging (load a customer snapshot locally to reproduce a bug). Import bumps client/server lamport clocks past the imported snapshot's lamport so subsequent ops have higher timestamps. Element IDs and client IDs are namespaced so no identity conflict on import.
+
+## Compaction
+
+Tombstone GC at snapshot time is the default compaction mechanism. Optional admin action `crdtsync compact --before-migration vN` can additionally truncate pre-migration ops from the log, sacrificing time-travel before that point for storage. Default behavior preserves everything.
+
+---
+
+# Versioning and Branches
+
+Snapshots are the storage primitive. Versioning is the user-facing layer built on top. Apps that need named versions, restore, publish/draft workflows, per-user forks, or diff between revisions should not have to reinvent these on top of raw snapshots.
+
+## Named Versions
+
+Every snapshot can carry user metadata:
+
+```ts
+const v = doc.createVersion({
+  name: "before_q4_refactor",
+  description: "Saved before restructuring the analytics section",
+  type: "manual" | "scheduled" | "publish" | "restore-audit",
+  createdBy: userId,
+})
+```
+
+A version is a snapshot plus an entry in a versions index. List, paginate, rename, delete are first-class API operations:
+
+```ts
+doc.listVersions({ page, pageSize, branch })
+doc.updateVersion(id, { name, description })
+doc.deleteVersion(id)
+```
+
+## Auto-Version Triggers
+
+Versions can be created declaratively in response to engine events or schedules:
+
+```ts
+doc.autoVersion({
+  onEvent:    ["before-publish", "after-restore"],
+  onSchedule: "@daily",
+  onOpCount:  5000,
+})
+```
+
+App-defined events fire when the app calls `doc.event("event-name")`. Engine-defined events include `before-publish`, `after-restore`, `before-migration`, `after-migration`, `on-snapshot`.
+
+## Branches
+
+A branch is a named pointer into the op log. Default branch is `main`. Apps create additional branches:
+
+```ts
+const draft     = doc.branch("draft").forkFrom("main")
+const published = doc.branch("published").forkFrom("main")
+const userFork  = doc.branch(`user-${userId}`).forkFrom("published")
+```
+
+Each branch has:
+
+- a stable name
+- a HEAD lamport timestamp
+- a fork point (the snapshot or lamport position it diverged at)
+
+Branches share immutable history before their fork point. Storage cost = only divergent ops past the fork. Adding a new branch is cheap.
+
+## Restore as Branch
+
+Restore does not rewrite history or reset state vectors. It forks a new branch from a chosen snapshot and switches the active HEAD:
+
+```text
+main: [op1 op2 op3 op4 op5 op6]
+                  ↑
+              snapshot @ op3
+
+doc.restoreToVersion(v3):
+main:     [op1 op2 op3 op4 op5 op6]     ← old branch, preserved
+restored: ───── op3 ─►                    ← new branch becomes live, future ops land here
+```
+
+Properties:
+
+- old branch preserved as immutable history
+- offline-client ops in flight against the old HEAD land on the old branch, not on the restored live state — not lost, not corrupting
+- no state-vector reset, no custom clock hacks
+- audit version created automatically on the old branch before the restore, so the pre-restore state is named and reachable
+- restore is itself a first-class log entry with creator + timestamp
+
+## Publish / Draft Convention
+
+A common pattern: edit on `main`, publish a read-only snapshot for consumers.
+
+```ts
+doc.connect({ branch: "main" })                  // editor users connect here
+doc.branch("published").syncFrom("main")         // publish: update published HEAD to main's current state
+doc.connect({ branch: "published" })             // readers connect here
+```
+
+Republishing updates `published`'s HEAD pointer to a new snapshot of `main`. Old `published` snapshots remain reachable as versions on the published branch — apps can roll back published state independently of editor state.
+
+## Per-User Branches
+
+The same primitive supports per-user state forks:
+
+```ts
+const userBranch = doc.branch(`user-${userId}`).forkFrom("published")
+```
+
+Each user's edits go into their branch. Storage shared from the fork point. Sync isolated. Replication scoped per branch.
+
+Useful when each user customizes a base template (form-builder, dashboard, notebook with per-user filters) without affecting the shared base.
+
+## Branch-Scoped Replication
+
+Connection establishes which branch the client edits/reads:
+
+```text
+client → connect(branch = "main")        // gets ops on main
+client → connect(branch = "user-42")     // gets ops on user-42 branch
+```
+
+The `(room, branch)` tuple is the unit of replication. Replica sets shard by `(room, branch)` if needed. Cross-branch sync (e.g., `published.syncFrom("main")`) happens via internal engine operations, not normal client ops.
+
+## Schema-Aware Diff
+
+Because Documents are structured Element trees with declared schema (not opaque binary blobs), diffs between any two snapshots are computable as structural change lists:
+
+```ts
+const diff = doc.diff(versionA, versionB)
+// returns ordered list of structural changes, e.g.:
+//   { path: "doc.body.children.[3]",                kind: "added",      value: <Element> }
+//   { path: "doc.body.children.[5].attrs.align",    kind: "changed",    from: "left", to: "center" }
+//   { path: "doc.body.children.[2]",                kind: "removed",    was: <Element> }
+//   { path: "doc.body.children.[7].text",           kind: "text-diff",  chunks: [{op:"keep", n:5}, {op:"ins", str:"foo"}, ...] }
+//   { path: "doc.body.children.[7].marks.[bold:1]", kind: "mark-added", range: [12, 18] }
+```
+
+Diff is schema-aware:
+
+- Text values produce char-level diffs (insertions / deletions / keeps)
+- XmlElement subtrees produce structural diffs (added / removed / moved children)
+- Attr changes show old → new values
+- Marks show added / removed / range-changed
+- Map / Register / Counter show value diffs
+
+Engine ships sensible default text/structural renderers; apps can override.
+
+## Branch Merging (Out of Scope for v0.x)
+
+Merging two divergent branches back into one is the harder version-control problem. Snapshots + CRDT semantics make it possible (merge the two branches' op logs from their fork point), but conflict resolution UX is app-specific. Not in scope for v0.x. The primitive (fork point + HEAD pointers) is there; merge tooling can land later.
+
+---
+
+# Networking Layer
+
+## Main Transport
+
+```text
+WebSocket
+```
+
+Reasons:
+
+- bidirectional
+- browser-native
+- low latency
+- mature ecosystem
+
+---
+
+## Binary Protocol
+
+Prefer binary protocol eventually.
+
+Possible encodings:
+
+- MessagePack
+- CBOR
+- Cap'n Proto
+- FlatBuffers
+- custom compact binary protocol
+
+MVP can begin with JSON.
+
+---
+
+# Realtime Synchronization
+
+## Connection Flow
+
+```text
+client connects
+→ authenticate
+→ join room
+→ send last_seen_seq
+→ receive missing operations
+→ subscribe to live ops
+```
+
+---
+
+## Client Reconnect
+
+Client stores:
+
+```json
+{
+  "room": "doc-1",
+  "last_seen_seq": 128
+}
+```
+
+Reconnect:
+
+```text
+resume from seq 128
+```
+
+---
+
+# Idempotency
+
+Every operation must be idempotent.
+
+Necessary because:
+
+- reconnects
+- retries
+- failovers
+- duplicate packets
+
+Example:
+
+```text
+op_id = client_id + client_seq
+```
+
+The server ignores already-seen operations.
+
+---
+
+# Offline-First Support
+
+## Local Editing
+
+Clients should support:
+
+- local optimistic editing
+- offline operation queues
+- reconnect synchronization
+- local snapshots
+
+This is enabled by embedding the CRDT core locally.
+
+---
+
+# Shared Portable Core
+
+## Goal
+
+Avoid implementing the CRDT in every language.
+
+---
+
+# Export Strategy
+
+## 1. WASM Export
+
+Used for:
+
+- browser
+- Node.js
+- Electron
+
+Advantages:
+
+- single implementation
+- deterministic behavior
+- easy web distribution
+
+---
+
+## 2. Stable C ABI
+
+Used for:
+
+- Python bindings
+- Go bindings
+- Rust bindings
+- JVM native wrappers
+
+The C ABI becomes the canonical native interface.
+
+---
+
+# Example C ABI
+
+```c
+crdt_doc_new
+crdt_doc_free
+crdt_doc_apply_update
+crdt_doc_encode_update
+crdt_doc_text_insert
+crdt_doc_text_delete
+crdt_doc_map_set
+crdt_doc_observe
+```
+
+SDKs should be thin wrappers over this ABI.
+
+---
+
+# SDK Philosophy
+
+SDKs should contain:
+
+- serialization
+- networking
+- reconnect logic
+- API ergonomics
+
+SDKs should NOT contain:
+
+- merge logic
+- causality logic
+- CRDT internals
+
+---
+
+# Horizontal Scaling
+
+## Main Constraint
+
+No Redis/Postgres dependencies.
+
+The cluster layer must be internal.
+
+---
+
+# Room-Based Sharding
+
+Each room maps to a replica set.
+
+Example:
+
+```text
+room abc -> node A, node B, node C
+```
+
+One node becomes leader.
+
+Others become followers.
+
+---
+
+# Consistent Hashing
+
+Replica sets selected via:
+
+```text
+hash(room_id)
+```
+
+This enables:
+
+- deterministic placement
+- horizontal scaling
+- balanced room distribution
+
+---
+
+# Leader Model
+
+For each room:
+
+```text
+leader handles writes
+followers replicate operations
+```
+
+Clients can connect to any node.
+
+If connected to wrong node:
+
+```text
+proxy to leader
+```
+
+or redirect.
+
+---
+
+# Replication Flow
+
+```text
+client -> leader
+leader persists locally
+leader replicates to followers
+followers ACK
+leader ACKs client
+```
+
+---
+
+# Durability Guarantees
+
+Recommended policy:
+
+```text
+ACK only after majority replication
+```
+
+Example:
+
+```text
+3 replicas
+2 acknowledgements required
+```
+
+Advantages:
+
+- avoids losing acknowledged edits
+- better collaborative guarantees
+
+---
+
+# Failover
+
+If leader dies:
+
+```text
+followers elect new leader
+clients reconnect
+resume from last_seen_seq
+```
+
+---
+
+# Client Recovery
+
+Clients reconnect with:
+
+```text
+last_seen_seq
+```
+
+Server sends:
+
+```text
+missing operations
+```
+
+This allows seamless recovery.
+
+---
+
+# Cluster Discovery
+
+Potential approaches:
+
+## Static Join
+
+```bash
+crdtsync serve --join node-a,node-b,node-c
+```
+
+---
+
+## Gossip-Based Discovery
+
+Nodes exchange:
+
+- liveness
+- room ownership
+- replication state
+- membership
+
+---
+
+# Awareness
+
+Ephemeral per-client state surfaced to other connected clients. Cursors, selections, user identity, typing indicators, viewport, mouse position, app-defined transient state.
+
+Other libraries call this **presence** (Liveblocks, Slack, Firebase). We use **awareness** — the Yjs term, grounded in the CSCW workspace-awareness literature, more accurate (cursor positions and viewport are not "presence" in the chat-system sense). Treat the names as synonyms when reading other ecosystems' docs.
+
+## Properties
+
+- not durably persisted (ephemeral by design)
+- not in the op log, not in snapshots, not replicated for durability
+- replicates on a separate lower-latency channel from document ops
+- per-entry TTL (some entries session-lifetime, others auto-expire after silence)
+- per-entry throttle (server caps high-frequency entries like mouse/cursor)
+- LWW per-client (each client owns its own state; no CRDT merge across clients)
+- auth-filtered per recipient
+- carries `actor_id` from token so receivers know which human is publishing
+
+## Schema-Declared
+
+Awareness entries are declared in the same schema file as content, alongside `types` and `marks`:
+
+```json
+{
+  "version": 5,
+  "types":  { ... },
+  "marks":  { ... },
+  "awareness": {
+    "cursor": {
+      "type":     "anchor",                     // a RelativePosition into doc content
+      "ttl":      "10s",
+      "throttle": "30ms",
+      "@auth":    { "publish": ["role:editor"], "see": ["role:viewer", "role:editor"] }
+    },
+    "selection": {
+      "type":     "anchor-range",
+      "ttl":      "10s",
+      "throttle": "50ms"
+    },
+    "user": {
+      "type":  "object",
+      "shape": { "name": "string", "color": "string", "avatar_url": "string?" },
+      "ttl":   "session",                        // cleared only on disconnect
+      "@auth": { "publish": ["authenticated:*"], "see": ["authenticated:*"] }
+    },
+    "typing": {
+      "type": "boolean",
+      "ttl":  "2s"                               // auto-clears after 2s without refresh
+    },
+    "mouse": {
+      "type":     "object",
+      "shape":    { "x": "int", "y": "int" },
+      "ttl":      "5s",
+      "throttle": "50ms"
+    },
+    "viewport": {
+      "type":     "object",
+      "shape":    { "top_anchor": "anchor", "bottom_anchor": "anchor" },
+      "ttl":      "session",
+      "throttle": "200ms"
+    }
+  }
+}
+```
+
+| Field | Behavior |
+|-------|----------|
+| `type` | data shape — primitives, `anchor`, `anchor-range`, `object` with `shape` |
+| `ttl` | auto-clear after N units of silence (`session` = clear only on disconnect) |
+| `throttle` | server drops same-entry updates faster than this; SDK debounces client-side too |
+| `@auth.publish` | who can publish this entry |
+| `@auth.see` | who can observe this entry from others |
+
+Schema-validated on publish — bad shape rejected at the SDK before wire.
+
+## State Model
+
+```text
+Awareness {
+  states: Map<client_id, ClientAwareness>
+}
+
+ClientAwareness {
+  client_id:    string
+  actor_id:     string                  // from token
+  branch:       string
+  connected_at: lamport
+  entries:      Map<string, Entry>
+}
+
+Entry {
+  value:        validated by schema
+  updated_at:   wall-clock + lamport
+  expires_at:   wall-clock              // from TTL
+}
+```
+
+## API
+
+```ts
+// publish own state
+doc.awareness.set("cursor", anchor)
+doc.awareness.set("user", { name: "Alice", color: "#f0a", avatar_url: "..." })
+doc.awareness.set("typing", true)
+doc.awareness.delete("selection")
+
+// observe others
+doc.awareness.observe((all) => {
+  for (const [clientId, state] of all) {
+    if (clientId === doc.clientId) continue
+    renderCursor(state.entries.cursor, state.entries.user)
+  }
+})
+
+// granular events
+doc.awareness.on("cursor",       (clientId, cursor) => { ... })
+doc.awareness.on("user-joined",  (clientId, state)  => { ... })
+doc.awareness.on("user-left",    (clientId)         => { ... })
+
+// query
+doc.awareness.get(clientId)
+doc.awareness.list({ branch, filter })
+doc.awareness.count()
+```
+
+## TTL Handling
+
+Server sweeps entries:
+
+- `ttl: "session"` entries cleared only on disconnect
+- timed-TTL entries cleared on expiry; removal broadcast to subscribers
+- SDK auto-refreshes high-traffic entries (cursor) on activity; lets low-traffic entries (typing) expire naturally
+
+## Throttling (Two-Layer)
+
+- **Client-side** SDK debounces at `throttle` interval before sending
+- **Server-side** caps inbound — faster updates coalesce, keep latest only
+
+Reduces wire chatter and downstream broadcast cost. Critical for mouse/cursor in whiteboard-style apps with many participants.
+
+## Reconnect Grace Window
+
+On disconnect:
+
+- server marks state stale but does not immediately clear
+- grace window (default 5s)
+- if client reconnects with same `client_id` within grace: state preserved, no `user-left` fires
+- if grace expires: state cleared, `user-left` broadcast
+
+Fixes the flash-of-user-left-then-user-joined pattern on every brief reconnect.
+
+## Anchors
+
+Cursor / selection / viewport entries use the same `RelativePosition` model as document anchors (see Anchors and Element IDs). Survive concurrent doc edits without drifting. Editor bindings translate between view positions and `RelativePosition` for transmission.
+
+## Auth-Aware Filtering
+
+Awareness is not pure broadcast — server filters per recipient. Two permissions per entry govern visibility:
+
+- `awareness.publish` — actor can publish this entry on a given branch / zone
+- `awareness.see` — recipient can observe this entry from others
+
+Server walks each entry per recipient:
+
+- check `@auth.see` for the entry
+- check anchor reachability (cursor targets element in unauthorized zone → drop entry for this recipient)
+- skip whole client state if recipient cannot see them at all
+
+Possible policies the schema enables:
+
+- viewers see editors' cursors, not vice versa
+- team A members see only team A awareness
+- anonymous users see no awareness at all
+- cursor in a private zone never sent to clients without access to that zone
+- user identity visible to authenticated; cursor visible to anyone with `awareness.see`
+
+## Branch and Zone Scoping
+
+Awareness scoped per `(room, branch)`. Cursor on `main` not visible on `published`. Anchors must target Elements in zones both the publisher AND the recipient can access; otherwise filtered.
+
+Per-user branches: typically only the branch owner publishes awareness on their own branch.
+
+## Wire Format
+
+Separate message kind from doc ops. No lamport ordering required — LWW-per-client suffices.
+
+```text
+{
+  kind:      "awareness.update",
+  client_id: "...",
+  actor_id:  "...",
+  branch:    "...",
+  zone_hint: "shared_content",        // optional, derived from anchor target
+  updates:   { cursor: <anchor>, typing: true },
+  deletes:   ["selection"]
+}
+```
+
+Server fan-out:
+
+1. validate against schema
+2. check `@auth.publish` for each updated entry
+3. apply throttle (drop if too fast)
+4. broadcast filtered per recipient
+
+## Storage and Cluster
+
+In-memory only. Not persisted, not in op log, not in snapshots.
+
+For cluster: leader holds awareness state in memory, forwards ephemerally to followers for the clients connected to those followers. On failover, awareness is lost — clients republish to the new leader on reconnect. Acceptable trade for an ephemeral subsystem.
+
+## What's Not Awareness
+
+Things that look like awareness but belong in document content:
+
+| Use case | Where it goes |
+|----------|--------------|
+| "Show poll results everyone sees" | Counter / Register in doc content — shared, persistent |
+| "Last edited by X at time Y" | Audit log or content metadata, not awareness |
+| "User X commented" | Comment is a `RangedElement`, not awareness |
+| "User X is currently in this section" | Awareness `viewport` entry |
+| "Active users in this room right now" | Awareness — derived from connected client states |
+
+Rule of thumb: if it must persist beyond disconnect, it is not awareness.
+
+## What We Don't Ship
+
+- awareness history (use audit log of connect/disconnect events)
+- CRDT merge across clients (each client owns its own state; no merge needed)
+- awareness migrations (awareness schema evolves independently; mismatched clients drop unknown entries)
+
+---
+
+# Admin UI
+
+The system should include a lightweight dashboard.
+
+Features:
+
+```text
+rooms
+connected users
+ops/sec
+snapshot size
+replication lag
+cluster health
+operation log viewer
+```
+
+---
+
+# Debugging Features
+
+CRDT systems are difficult to debug.
+
+Need tooling:
+
+- operation inspection
+- replay
+- timeline visualization
+- causal graph visualization
+- room export/import
+
+---
+
+# Authentication
+
+Engine validates signed tokens at connection time. Engine does not ship an identity provider — apps bring tokens from their own auth backend (JWT, OIDC, custom).
+
+## Token Shape
+
+```json
+{
+  "iss": "app-auth-provider",
+  "sub": "user_123",
+  "aud": "crdtsync:room:doc-7",
+  "exp": 1234567890,
+  "roles":  ["editor"],
+  "groups": ["team-acme", "beta-testers"],
+  "scope":  { "session_id": "...", "device_id": "..." }
+}
+```
+
+Standard JWT. Signed with a key the engine trusts (configured at server startup). Engine validates signature + expiration + claims. Engine never issues tokens; app's auth provider does.
+
+For sharing / embed: app generates a restricted-scope token (limited role, scoped room/branch, near-term expiration). Engine validates and grants access scoped to that token.
+
+## Identity on Ops
+
+Every op carries:
+
+```text
+op_id:          (client_id, client_seq)
+actor_id:       authenticated user id (from token sub)
+zone:           zone id (derived from target Element; see Authorization)
+schema_version: int
+lamport:        int
+kind:           ...
+target:         ...
+payload:        ...
+```
+
+`client_id` identifies device/session. `actor_id` identifies the human. Same user across two devices = same `actor_id`, different `client_id`. Critical for per-user undo (stacks are per-actor across devices), per-user branches, and audit.
+
+`actor_id` is mandatory from v0.1. For dev mode without auth, app issues an anonymous token with `actor_id = "anon:<random>"` so the field is always populated.
+
+---
+
+# Authorization
+
+Authorization in a collaborative sync engine has to be first-class. Bolting it on after the fact is the most common reason CRDT-based apps end up reinventing huge amounts of infrastructure badly.
+
+The engine ships:
+
+- token validation
+- declarative policy enforcement
+- two-tier auth model (schema-level defaults + doc-level dynamic ACLs)
+- wire-level redaction (unauthorized bytes never leave the server)
+- audit log
+
+The engine does not ship:
+
+- identity provider, login, password reset, MFA
+- user / team / org management UI
+- permission management UI (admins build their own)
+- organization modeling beyond claims in the token
+
+## Two-Tier Model
+
+Two complementary systems, each with its own scope:
+
+| Layer | Where | Purpose |
+|-------|-------|---------|
+| **Schema-level `@auth`** | declared in schema, version-controlled, ships with app code | static type-wide defaults: "all paragraphs writable by editor role" |
+| **Doc-level ACL** | CRDT-merged state inside the document | dynamic per-instance grants: "this specific comment readable only by Alice" |
+
+Apps need both. Schema covers "default policy for things of type X." Doc-level covers "specific instance Y has unique sharing."
+
+This split matches Google Docs, Notion, Linear, AWS IAM. Industry standard.
+
+## Subject Types
+
+| Subject | Match rule | Source |
+|---------|-----------|--------|
+| `user:<id>` | `actor_id == "<id>"` | token `sub` claim |
+| `role:<name>` | `"<name>" ∈ token.roles` | token `roles` claim |
+| `group:<name>` | `"<name>" ∈ token.groups` | token `groups` claim |
+| `authenticated:*` | actor has a valid token | implicit |
+| `anonymous:*` | request has no token or anon token | implicit |
+| `*` | anyone (including anonymous) | implicit |
+
+User-level and role-level are first-class peers — both supported, composable in any ACL tuple. Engine reads claims from the token, never decides role membership itself; that is the app auth provider's responsibility.
+
+## Action Set
+
+```text
+room:      read, admin
+branch:    read, write, create, delete
+element:   read, write              (per path or per element id)
+mark:      create, read, update, delete   (per mark name or per mark instance id)
+version:   create, read, restore, delete
+snapshot:  export
+migration: apply
+awareness: publish, see                  (per awareness entry kind)
+acl:       grant, revoke, read       (meta-auth on the ACL system itself)
+```
+
+## Resource References
+
+| Form | Scope |
+|------|-------|
+| `room.<id>` | the whole room |
+| `branch:<name>` | a specific branch within the room |
+| `element:<path>` | a path into the tree (inherits downward) |
+| `element_id:<id>` | a specific Element instance, survives moves |
+| `mark:<name>` | all instances of a mark name |
+| `mark_instance:<id>` | a specific mark instance |
+| `version:<id>` | a specific named version |
+
+Path-based resources inherit downward (ACL on `element:doc.body` covers all descendants unless overridden). Instance-based resources are precise.
+
+## Schema-Level `@auth` Annotations
+
+Co-declared in the schema alongside type and mark definitions. Auth requirements travel with type definitions, version with the schema, get validated at producer side.
+
+```json
+{
+  "types": {
+    "paragraph": {
+      "kind": "xml",
+      "tag": "p",
+      "@auth": {
+        "read":  ["role:viewer", "role:editor", "role:admin"],
+        "write": ["role:editor", "role:admin"]
+      },
+      "children": ["inline*"]
+    },
+    "private_note": {
+      "kind": "xml",
+      "tag": "note-private",
+      "@auth": {
+        "read":  ["user:${author_id}"],
+        "write": ["user:${author_id}"]
+      }
+    }
+  },
+  "marks": {
+    "comment": {
+      "kind": "object",
+      "@auth": {
+        "create": ["role:viewer", "role:editor"],
+        "delete": ["role:author", "role:admin"]
+      }
+    }
+  }
+}
+```
+
+Templating: `${actor_id}`, `${author_id}`, `${room_id}`, `${branch_id}` resolve at check time from connection / op context. Allows expressing "user can do X to resources they own" cleanly without instance-by-instance ACL tuples.
+
+## Doc-Level ACL Subsystem
+
+A dedicated CRDT-merged subsystem alongside content:
+
+```text
+Document {
+  schema_version: int
+  content:        <main element tree>
+  acl:            ACLSubsystem
+}
+
+ACLSubsystem = CRDT-Set<ACLTuple>
+
+ACLTuple {
+  id:         stable CRDT id
+  subject:    "user:42" | "role:editor" | "group:team-x" | "authenticated:*" | ...
+  action:     "read" | "write" | "create" | "delete" | ...
+  resource:   "element:doc.body.section_3"
+            | "element_id:abc-123"
+            | "mark:comment"
+            | "mark_instance:def-456"
+            | "branch:main"
+            | "version:v-789"
+  effect:     "allow" | "deny"
+  granted_by: actor_id
+  granted_at: lamport
+  expires_at: lamport | timestamp | null
+}
+```
+
+Tuples are CRDT-merged: add-wins for grant set membership; per-tuple LWW for field updates.
+
+### API
+
+```ts
+doc.acl.grant({  subject: "user:bob",     action: "read",   resource: "element:doc.body.section_5" })
+doc.acl.grant({  subject: "role:editor",  action: "update", resource: commentElement.id })
+doc.acl.deny ({  subject: "user:bob",     action: "read",   resource: privateNote.id })
+doc.acl.revoke(tupleId)
+
+doc.acl.list({ filterBy: { resource: commentElement.id } })
+doc.acl.check({ actor: "user:alice", action: "read", resource: commentElement.id })  // local check
+doc.acl.observe((change) => { ... })
+```
+
+ACL ops are first-class CRDT log entries. Replicated, audited, undoable.
+
+## Decision Flow
+
+For every check `can(actor, action, resource)`:
+
+```text
+1. Walk ACL tuples matching (actor, action, resource) and its ancestors
+2. Any explicit DENY match (on user, role, or group) → DENY
+3. Any explicit ALLOW match → ALLOW
+4. Schema @auth grants actor's role for this resource type → ALLOW
+5. Otherwise → DENY                          (default-deny)
+```
+
+Standard IAM semantics:
+
+- explicit deny always wins
+- user-specific tuples are not implicitly "stronger" than role-based for allow — match is match
+- absence of declaration = denial
+
+This evaluator is the single source of truth used at every enforcement point.
+
+## Enforcement Points (Server-Side)
+
+| When | Check |
+|------|-------|
+| Connect | actor has `room.read` on the room AND `branch.read` on the requested branch |
+| Op submit | actor has `element.write` at op's target AND schema-level type/mark auth |
+| Op outbound | recipient has `element.read` at op's target — filter per recipient before sending |
+| Awareness publish | actor has `awareness.publish` for the entry kind on the branch/zone |
+| Awareness outbound | recipient has `awareness.see` for the entry kind — filter before broadcasting |
+| Version create / restore / delete | actor has corresponding `version.*` |
+| Branch create / delete | actor has corresponding `branch.*` |
+| Migration apply | actor has `migration.apply` |
+| Snapshot export | actor has `snapshot.export` |
+| ACL grant / revoke | actor has `acl.grant` or `acl.revoke` |
+
+Server is the final authority. SDK exposes `canDo(action, resource)` for client-side UI hints, but client-side checks are advisory only.
+
+## Wire-Level Redaction
+
+If bytes hit the client, assume they leak. Browser devtools, MitM, malicious extensions — any sent byte is observable. Server must never send unauthorized data, ever.
+
+### Per-Recipient Filtering
+
+On every op send and every cold-start snapshot, server walks the tree and filters:
+
+```text
+for each Element / attr / mark / range:
+  if not can(recipient, "read", thing):
+    skip — never send
+```
+
+The check combines schema + ACL evaluation through the same evaluator used for write authorization.
+
+### Zones (Coarse Partition)
+
+For docs with large auth-uniform subtrees, declare them as zones — separately replicated streams:
+
+```json
+{
+  "types": {
+    "doc": {
+      "kind": "xml",
+      "children": ["public_meta", "shared_content", "private_section"]
+    },
+    "public_meta":     { "kind": "xml", "@zone": "public",  "@auth": { "read": ["*"] } },
+    "shared_content":  { "kind": "xml", "@zone": "team",    "@auth": { "read": ["role:viewer", "role:editor", "role:admin"] } },
+    "private_section": { "kind": "xml", "@zone": "private", "@auth": { "read": ["role:admin"] } }
+  }
+}
+```
+
+Zone properties:
+
+- each zone is a separate sync stream
+- per-zone lamport clocks (avoids cross-zone activity leakage)
+- client subscribes only to zones it's authorized for
+- unauthorized zone ops, snapshots, structure, even element counts never sent
+- cross-zone tree moves forbidden at schema level
+- cross-zone anchors forbidden by default; opt-in opaque references for cross-zone marks/comments
+
+Zones are a perf and isolation optimization. For fine-grained per-instance auth (lots of per-element ACLs), zones less useful — ACL set carries the load. For coarse uniform-auth subtrees, zones are highly efficient (one rule, big coverage). Both work together.
+
+### Snapshot Strategy
+
+| Option | Trade-off |
+|--------|-----------|
+| Per-zone snapshots stored separately | Cleaner. Server combines authorized zone snapshots on cold-start. Storage = sum of zones. |
+| Single snapshot with per-recipient redaction on demand | Single storage. CPU cost per cold-start, mitigated by caching per auth profile. |
+
+Default: per-zone snapshots when few zones exist; redact-on-demand with profile cache for many fine-grained zones.
+
+## ACL State is Itself Privacy-Sensitive
+
+The existence of a tuple "Alice can read `element_id:secret`" leaks that `secret` exists and Alice has access to it.
+
+ACL tuples are redacted per recipient:
+
+- tuple sent to a recipient only if they are the subject, or they have `acl.read` on the resource
+- admins (with `acl.read = *`) see all tuples
+- regular users see only tuples involving them
+
+Engine handles ACL-tuple filtering the same way it handles content redaction.
+
+## Meta-Auth: Who Can Grant?
+
+Schema declares meta-rules about who can mutate the ACL subsystem:
+
+```json
+{
+  "@meta_auth": {
+    "acl.grant":  ["role:admin", "role:owner"],
+    "acl.share":  ["role:editor"],     // sharing-only role, can grant read but not write
+    "acl.revoke": ["role:admin", "role:owner"],
+    "acl.read":   ["role:admin"]       // full visibility into all ACL tuples
+  }
+}
+```
+
+App tunes per-app: some apps let any editor share a section; some restrict grants to owner only.
+
+## Producer-Side Defense in Depth
+
+SDK won't let a client construct an op targeting elements / paths / zones it can't write to. Producer-side schema enforcement already exists; auth checks layer in. Invalid op never leaves the client.
+
+Server still re-validates — client-side enforcement is advisory, server is authoritative.
+
+## Audit
+
+Op log is the authoritative record. Every op has `actor_id` + lamport + timestamp. Audit = log query:
+
+```bash
+crdtsync audit --room=doc-7 --user=user_123 --since=2026-01-01
+crdtsync audit --room=doc-7 --action=restore --since=2026-01-01
+crdtsync audit --room=doc-7 --kind=acl.grant
+```
+
+Separate **access log** for read-only actions (connect, snapshot export, branch read) since those don't generate ops:
+
+```text
+access_log {
+  timestamp, actor_id, action, resource, result (allow/deny), token_hash
+}
+```
+
+## Hard Problems
+
+### Offline Edits + Permission Revocation
+
+User offline for a day, edits locally. Permissions revoked while offline. Reconnects → server rejects unauthorized ops.
+
+Behavior:
+
+- server returns `unauthorized` for each rejected op with details
+- SDK surfaces to app: "these ops were rejected" + op contents
+- app decides UX: discard / export / show user / etc.
+- local state reverts to last server-acknowledged state
+
+Not silent. Not data-loss without notice.
+
+### Race: Op Submitted as Permission is Being Revoked
+
+Permission state itself is versioned in lamport time. Server checks ops against permissions at the op's lamport position. Deterministic across replicas — if revocation lamport < op lamport, op rejected.
+
+### Schema Migration + Auth Migration
+
+Schema version N has auth declaration. Schema version N+1 has different auth declaration. Migration entry carries new auth. Ops tagged version N checked against version N auth; ops tagged version N+1 checked against version N+1 auth. Auth declarations migrate alongside schema in the same migration files.
+
+### Migration as Admin Op
+
+Migration entries themselves require `migration.apply` permission. Signed by an admin actor. Server rejects migration entries from non-admins.
+
+### Public / Anonymous Access
+
+App generates anonymous tokens (`actor_id = "anon:<rand>"`, role `anon`). Policy treats `role:anon` like any other role. Engine doesn't distinguish anonymous from authenticated — it's just a token with whatever claims the app put in.
+
+### Cross-Zone References
+
+Comments anchored across auth zones, mentions of users in unauthorized zones, suggestions that bridge zones — restricted by default. App can opt into opaque-reference behavior where the anchor is a token the client can pass back but cannot decode.
+
+## Storage / Perf Notes
+
+- ACL set indexed by resource (lookup by element_id) and by subject (lookup all grants for a user)
+- ACL ops are normal log entries
+- ACL snapshot included in document snapshot
+- Per-recipient filtered view computed on op send + cached per auth profile
+- Cold-start: build per-recipient redacted view from snapshot + ACL state, cache by profile
+- Old tuples GC'd when subject deleted or resource removed
+
+ACL state grows with use. High-cardinality per-element ACLs cost more — apps that need many specific grants should consider whether a path-based or role-based grant would cover the use case more efficiently.
+
+## Roadmap
+
+| Capability | Milestone |
+|-----------|-----------|
+| Token validation + actor_id on ops + basic room read/write enforcement | v0.1 |
+| Declarative policy file, role-based + path-based rules, audit log | v0.2 |
+| Schema-declared awareness entries (typed, per-entry TTL + throttle) | v0.2 |
+| Per-recipient awareness filtering (`@auth.see`, anchor reachability) | v0.2 |
+| Reconnect grace window | v0.2 |
+| Cluster awareness forwarding (leader → followers) | v0.4 |
+| Branch-level ACL + branch-scoped replication | v0.4 |
+| Schema-level `@auth` annotations | v0.5 |
+| Doc-level ACL CRDT subsystem | v0.5 |
+| Zones + per-zone replication streams + wire-level redaction | v0.5 |
+| Per-zone snapshots + per-profile redacted view caching | v0.5 |
+| Schema-aware attr / mark filtering per recipient | v0.5 |
+| Meta-auth (who can grant) | v0.5 |
+| Opaque cross-zone anchors (opt-in) | v0.6 |
+| ACL audit / query CLI | v0.6 |
+| Sharing / embed token generation helpers | v0.3 |
+
+---
+
+# API Surface
+
+The main editing API should be SDK-based.
+
+HTTP APIs mainly for:
+
+- observability
+- snapshots
+- exports
+- admin
+- cluster inspection
+
+---
+
+# Deployment Story
+
+## Single Node
+
+```bash
+docker run crdtsync
+```
+
+Provides:
+
+- websocket server
+- persistence
+- snapshots
+- admin UI
+
+---
+
+## Cluster Mode
+
+```bash
+crdtsync serve \
+  --node-id node-a \
+  --join node-b,node-c
+```
+
+Cluster features:
+
+- room sharding
+- replication
+- failover
+- distributed ownership
+
+---
+
+# Use Cases
+
+## Collaborative Text Editors
+
+- notes
+- docs
+- markdown editors
+- CMS
+
+---
+
+## Kanban / Productivity Apps
+
+- tasks
+- boards
+- comments
+- shared state
+
+---
+
+## Multiplayer Applications
+
+- shared state
+- collaborative tools
+- whiteboards
+
+---
+
+## Embedded Sync Engine
+
+Apps embed local core and sync automatically.
+
+---
+
+# Yjs Interoperability
+
+A `fromYDoc` importer ships in v0.3 alongside the WASM/C ABI work.
+
+## Scope
+
+- snapshot import only: walk a Y.Doc's current state, reconstruct as native Document
+- one-way migration tool, not a live bridge
+- imported doc starts fresh history; merge with live Yjs peers after import is not supported
+
+## Type Mapping
+
+| Yjs | Native | Notes |
+|-----|--------|-------|
+| `Y.Map` | `Map` | direct |
+| `Y.Array` | `List` | direct |
+| `Y.Text` | `Text` (+ marks via `RangedElement`) | format attributes mapped to marks |
+| `Y.XmlElement` / `Y.XmlFragment` / `Y.XmlText` | `XmlElement` / `XmlFragment` / `Text` | direct (v0.5+) |
+| `Y.Doc` | `Document` | direct |
+
+## Non-Goals
+
+- YATA wire-compat or binary update format — that would amount to reimplementing Yjs core and defeat the portable-OCaml-core architecture.
+- Y.UndoManager parity — undo is reimplemented natively, not imported.
+- Y.Awareness import — awareness is ephemeral, not part of the snapshot.
+
+The importer is framed explicitly as a **migration tool** to avoid setting expectations of drop-in replacement.
+
+---
+
+# Why OCaml?
+
+OCaml is a strong fit because of:
+
+- algebraic data types
+- correctness guarantees
+- immutable data structures
+- excellent parsing/modeling
+- strong concurrency story with OCaml 5
+- systems-level performance
+- good fit for protocol/state machine design
+
+CRDTs and distributed systems benefit heavily from:
+
+- explicit modeling
+- type-safe invariants
+- correctness-oriented architecture
+
+---
+
+# Suggested Tech Stack
+
+## Core
+
+```text
+OCaml 5
+```
+
+---
+
+## Concurrency
+
+Potentially:
+
+```text
+Eio
+```
+
+---
+
+## Networking
+
+Possible options:
+
+```text
+Dream
+Piaf
+custom Eio server
+```
+
+---
+
+## Storage
+
+Start:
+
+```text
+SQLite
+```
+
+Later optional:
+
+```text
+RocksDB
+```
+
+---
+
+## Serialization
+
+Potential options:
+
+```text
+CBOR
+MessagePack
+Cap'n Proto
+```
+
+---
+
+## CLI
+
+```text
+Cmdliner
+```
+
+---
+
+# Foundational Decisions
+
+Decisions that shape the wire format, op model, or schema language. These bind early — adding them after v0.1 ships requires breaking changes. Listed in priority order for discussion.
+
+| Status | Decision | Why foundational |
+|--------|----------|------------------|
+| pending | **Binary blob model** | Inline in ops vs refs to a separate store vs both. Forces decisions about op size, content addressing, snapshot inclusion, ACL granularity, range fetching, deferred load. |
+| pending | **Atomic multi-op transactions** | Is the unit of mutation one op or a transaction of N ops? Affects repair, undo, replay, invariant checking semantics. Adding `tx_id` later is a wire-format break. |
+| pending | **Unicode / Text char-id strategy** | UTF-8 + grapheme-aware boundaries vs naive codepoints. Determines what "position" means in Text. Char identity is baked into every Text op ever written — picking wrong is permanent. |
+| pending | **Op causality model** | Explicit per-op dependencies vs lamport-only ordering. Affects replay correctness in pathological out-of-order scenarios and protocol byte cost. |
+| pending | **Custom Element types / plugin extensibility** | Whether the primitive type system is closed or open. If open: schema language and op-kind discriminator need namespacing + versioning. Closing later is easy; opening later is a wire break. |
+| pending | **Client ID strategy** | UUID v7 (sortable + random)? Server-issued? Persistent across sessions and devices? Affects op identity, undo stacks, audit, dedup. |
+| pending | **Wire protocol format + framing** | Serializes whatever model the decisions above lock in. Format choice (CBOR / MessagePack / Cap'n Proto / custom) is a perf + tooling pick **after** the model is settled, not before. Includes framing, version negotiation, mixed-version protocol headers. |
+
+These decisions interlock — the cargo determines the carrier. Wire protocol is intentionally last; designing it before locking the model is premature.
+
+## Additive (no foundational pressure)
+
+Topics that can land cleanly later without breaking the v0.1 model:
+
+- editor adapter contract (pure SDK layer)
+- storage layout refresh (server-internal refactor)
+- search / indexing (wraps existing op log + schema)
+- quotas / rate limits (server-side gates)
+- debugging tools (additive on top of op log + replay)
+- E2E encryption (op payload wrapping, no envelope change)
+- branch merging (logical layer over existing branch primitives)
+- webhooks / external integrations (event emitter)
+
+---
+
+# Suggested Roadmap
+
+# v0.1
+
+## Single Node MVP
+
+Features:
+
+- websocket sync
+- room support
+- operation log
+- snapshots
+- SQLite persistence
+- TS SDK
+- shared CRDT core
+- primitives: Map, List, Text, Register, Counter
+- anchors / RelativePosition
+- Map slot safety (initOnce, live, replace, orphan event)
+- op batching wire format (encoder can ship dumb single-op)
+- token validation + `actor_id` on every op + basic room-level read/write enforcement
+
+---
+
+# v0.2
+
+## Developer Experience
+
+Features:
+
+- declarative policy file (role / user / group + path-based rules) with audit log
+- awareness subsystem (schema-declared entries, per-entry TTL + throttle, per-recipient auth filtering, reconnect grace window)
+- reconnect
+- compaction with tombstone GC watermark
+- admin dashboard
+- replay tooling
+- `UndoManager` (per-user, intention grouping, redo) for Map / List / Text / Register / Counter
+- named versions (`createVersion` / `listVersions` / `updateVersion` / `deleteVersion`)
+- auto-version triggers (event-driven and schedule-driven)
+
+---
+
+# v0.3
+
+## Portable Runtime + Interop
+
+Features:
+
+- WASM export
+- stable C ABI
+- Python bindings
+- Go bindings
+- Yjs snapshot importer (`fromYDoc`) — framed as one-way migration tool, not live bridge
+
+---
+
+# v0.4
+
+## Distributed Cluster + Branches
+
+Features:
+
+- room sharding
+- replication
+- failover
+- leader election
+- cluster membership
+- first-class branches (`doc.branch(...)`, fork points, per-branch HEAD)
+- branch-scoped replication (replica sets shard by `(room, branch)`)
+- branch-level ACL (per-branch read/write permissions)
+- restore-as-branch (no state-vector reset, no clock hacks, audit version auto-created)
+- publish / draft convention (`branch("published").syncFrom("main")`)
+- per-user branches (`branch(`user-${id}`).forkFrom(...)`)
+
+Branches piggyback on cluster work because branch-scoped replication and sharding are co-designed with the cluster routing layer.
+
+---
+
+# v0.5
+
+## Rich Text, Document Trees, Schema
+
+Features:
+
+- XmlElement / XmlFragment primitives
+- RangedElement primitive (generic ranged annotation)
+- Marks (Peritext-style range CRDT, declarative registration via schema)
+- Kleppmann 2021 tree-move algorithm
+- declarative Schema (first-class, JSON-serializable, versioned, optional)
+- producer-side op validation against schema
+- Invariant Repair (opinionated, fixed rules, no config, `repaired` event)
+- `sync-prosemirror` adapter (mirrors `y-prosemirror` API surface)
+- `UndoManager` extensions: XmlElement (including move), RangedElement, marks
+- schema-aware diff API (`doc.diff(versionA, versionB)`) with per-type renderers
+- schema-level `@auth` annotations (type / attr / mark)
+- doc-level ACL CRDT subsystem (per-instance grants and denies, CRDT-merged)
+- zones + per-zone replication streams + per-zone lamport clocks
+- wire-level redaction (per-recipient filtering of ops, snapshots, marks, attrs)
+- per-zone snapshots + per-profile redacted view caching
+- meta-auth declarations (who can grant / revoke / share)
+
+The milestone that unlocks editor-grade collaboration (ProseMirror, Tiptap, BlockNote, Notion-style apps) and locks in schema as a first-class concern. Rich text + schema are the hardest parts of the project and get a dedicated release.
+
+---
+
+# v0.6
+
+## Schema Migration
+
+Features:
+
+- migration entries as first-class log entries (history preserved)
+- per-op `schema_version` tagging
+- two-tier migration format: built-in step kinds + pattern-rewrite DSL
+- `crdtsync migrate` CLI suite: `status`, `check`, `verify`, `test`, `generate`, `apply`
+- schema-diff-based migration generation (Prisma-style)
+- schema annotations (`@renamedFrom`, `@derivedFrom`) as diff hints
+- four detection gates: drift, verification, server boot completeness/immutability, per-doc reachability
+- mixed-version sync with bidirectional / forward-only translation policy derived from migration kind
+- migration immutability via SHA-256 hash lock
+- ACL audit / query CLI
+- opaque cross-zone anchors (opt-in)
+
+Depends on v0.5 schema landing first. Standalone milestone because migration tooling is substantial and orthogonal to runtime features.
+
+---
+
+# v0.7
+
+## Production Features
+
+Features:
+
+- metrics
+- tracing
+- snapshots export/import
+- replication tuning
+- durability modes
+- compaction policies (including optional log compaction at migration boundaries)
+- WASM tier-3 migration escape hatch (if real demand surfaces)
+
+---
+
+# Potential Future Features
+
+## Binary Attachments
+
+- blobs
+- media synchronization
+
+---
+
+## End-to-End Encryption
+
+Potentially:
+
+```text
+encrypted operation payloads
+```
+
+---
+
+## Edge Deployment
+
+Deploy small sync nodes geographically.
+
+---
+
+# Final Positioning
+
+**crdtsync** should be positioned as:
+
+> A self-hosted collaborative sync backend with a portable CRDT core.
+
+Not merely:
+
+> A CRDT library.
+
+The differentiation is:
+
+- batteries-included infrastructure
+- operational simplicity
+- no external infra dependencies
+- portable shared runtime
+- multi-language editing
+- first-class versioning, branches, schema, auth, awareness
+- official backend architecture
+- self-hosted deployment
+- horizontal scalability
+
+---
+
+# One-Sentence Pitch
+
+> **crdtsync** — open-source collaborative sync infrastructure with a portable CRDT core, deployable as a single container with no Redis or Postgres required.
+
