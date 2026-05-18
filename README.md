@@ -2,7 +2,7 @@
 
 > Self-hosted collaborative sync backend with a portable CRDT core.
 
-[crdtsync.com](https://crdtsync.com) · part of the [faisca](https://github.com/faisca) org
+[crdtsync.com](https://crdtsync.com) · part of the [faiscadev](https://github.com/faiscadev) org
 
 ---
 

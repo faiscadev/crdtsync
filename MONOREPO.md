@@ -71,8 +71,8 @@ Release flow:
    - `npm publish crdtsync@0.1.0`
    - `pip publish crdtsync==0.1.0`
    - `cargo publish crdtsync@0.1.0`
-   - Go: tag-based, `go get github.com/faisca/crdtsync/sdks/go@v0.1.0`
-   - Maven: `com.faisca:crdtsync:0.1.0`
+   - Go: tag-based, `go get github.com/faiscadev/crdtsync/sdks/go@v0.1.0`
+   - Maven: `dev.faisca:crdtsync:0.1.0`
 
 Lockstep is intentional and permanent. Components ship together because they're designed together; independent semver across packages would re-introduce the coordination drift that monorepos exist to prevent.
 
@@ -159,4 +159,4 @@ Revisit if the project grows to where parallel incremental builds across all SDK
 
 ## Reference
 
-Org sibling fakecloud uses the same shape — see [github.com/faisca/fakecloud](https://github.com/faisca/fakecloud) for a working monorepo with Rust core + multi-language SDKs in `sdks/{go,java,php,python,typescript}/`.
+Org sibling fakecloud uses the same shape — see [github.com/faiscadev/fakecloud](https://github.com/faiscadev/fakecloud) for a working monorepo with Rust core + multi-language SDKs in `sdks/{go,java,php,python,typescript}/`.
