@@ -356,6 +356,75 @@ decrement(n)
 
 ---
 
+# Extensibility
+
+The CRDT primitive set is **closed**: Map, List, Text, XmlElement, XmlFragment, RangedElement, Register, Counter. The wire-format op `kind` field is a fixed enum. Apps cannot define new CRDT types in app code.
+
+## Why Closed
+
+Custom CRDT types in app code would mean custom merge logic shipped per SDK language. Different impls = divergence risk. Sandboxing custom merge functions has the same cost as the migration DSL machinery. Wire format stays compact only if `kind` is an enum. Yjs, Automerge, and Loro all reach the same conclusion.
+
+## What Composition Covers (~95% of "Custom" Wants)
+
+| Want | Build with |
+|------|------------|
+| Counter with min/max bounds | Counter + app-side clamping on read |
+| Set | `Map<key, true>` with delete |
+| MV-Register | `List<{ timestamp, value }>` |
+| Geographic position | `Map { lat: Register, lng: Register }` |
+| Numeric range | `Map { start: Register, end: Register }` |
+| Time interval | `Map { start: Register<timestamp>, end: Register<timestamp> }` |
+| Task with status enum | XmlElement + schema-declared enum attr |
+| Tag list | `Map<tag, true>` or `List<string>` |
+| Comment / annotation | `RangedElement` with payload |
+| Nested arbitrary structured data | composition of Map / List / Text / XmlElement |
+
+What composition cannot cover: fundamentally new merge semantics (max-CRDT, min-CRDT, custom convergence rules). These are rare. Apps approximate via composition or propose a new primitive through the escape hatch.
+
+## What IS App-Customizable (Schema, Not "Custom Types")
+
+Apps freely customize within the schema layer:
+
+- new XML element types with custom tags, attrs, children rules
+- new mark names with custom value shapes and merge kinds
+- new attr value types within supported value primitives
+- declared constraints (ranges, enums, required fields)
+- awareness entry shapes
+- ACL tuples and meta-auth rules
+
+These are **structural / type-system** features layered on top of fixed CRDT primitives. Schema handles them. Not "custom types" in the new-CRDT-primitive sense.
+
+## Escape Hatch
+
+New CRDT primitives can be proposed via RFC, reviewed against criteria — cross-language implementability, schema fit, no conflict with existing primitives, real demand — and accepted into core through the normal release cycle. Adding a new primitive bumps the engine version; old clients reject the new kind at handshake-time version negotiation.
+
+Apps do not ship custom CRDT primitives in their own code.
+
+## Op `kind` as a Closed Enum
+
+```text
+op.kind = enum {
+  text.insert | text.remove | text.replace
+  map.set | map.replace | map.initOnce | map.delete
+  list.insert | list.remove | list.move
+  xml.setAttr | xml.removeAttr | xml.insertChild | xml.removeChild | xml.move
+  ranged.create | ranged.remove | ranged.updatePayload
+  register.set
+  counter.increment | counter.decrement
+  acl.grant | acl.revoke
+  tx.commit
+  migrate
+}
+```
+
+Receivers panic on unknown `kind` — protocol violation, indicates bug or version mismatch caught at the handshake layer. Compact wire encoding (small integer per kind, not a string).
+
+## Cookbook
+
+SDK ships a documented cookbook of "build this custom-feeling type from these primitives" recipes for the common cases above. Ships v0.2.
+
+---
+
 # Internal Data Model
 
 Every operation is immutable and append-only.
@@ -3224,7 +3293,7 @@ Decisions that shape the wire format, op model, or schema language. These bind e
 | **decided** | **Atomic multi-op transactions** | Single `doc.transact()` API. Non-atomic batching is the default (streaming UX, CRDT-correct). `atomic: true` opt-in for privilege / reference / cross-element invariants. `tx_id` + `tx_role` reserved in op envelope from v0.1. See **Transactions** section. |
 | **decided** | **Unicode / Text char-id strategy** | Codepoint as CRDT identity (stable across Unicode versions), UTF-8 on wire, grapheme-cluster API default with codepoint-level opt-in. Mismatched Unicode versions produce cosmetic differences only — no data corruption. See **Text and Unicode** section. |
 | **decided** | **Op causality model** | Lamport timestamp + implicit dependency via payload refs. No explicit `deps` list field, no vector clocks. Receivers buffer out-of-order ops by looking up referenced `char_id` / `element_id`. See **Algorithms and Invariants → Causality → Dependency Model**. |
-| pending | **Custom Element types / plugin extensibility** | Whether the primitive type system is closed or open. If open: schema language and op-kind discriminator need namespacing + versioning. Closing later is easy; opening later is a wire break. |
+| **decided** | **Custom Element types / plugin extensibility** | Closed primitive set. Wire-format op `kind` is a fixed enum. Apps cannot define new CRDT types in app code; they compose from existing primitives (cookbook ships v0.2). Genuinely new primitives ship through engine releases via RFC. App-level customization (XML types, marks, attrs, schema constraints, awareness, ACL) is fully supported through schema. See **Extensibility** section. |
 | pending | **Client ID strategy** | UUID v7 (sortable + random)? Server-issued? Persistent across sessions and devices? Affects op identity, undo stacks, audit, dedup. |
 | pending | **Wire protocol format + framing** | Serializes whatever model the decisions above lock in. Format choice (CBOR / MessagePack / Cap'n Proto / custom) is a perf + tooling pick **after** the model is settled, not before. Includes framing, version negotiation, mixed-version protocol headers. |
 
@@ -3271,6 +3340,7 @@ Features:
 - `tx_id` + `tx_role` reserved in op envelope
 - `doc.transact()` API: client-side observer batching, network batching, server-side log atomic write (non-atomic default)
 - Text with codepoint identity + UTF-8 wire + grapheme-aware SDK helpers (per-language Unicode lib bundled)
+- op `kind` as a fixed enum in the wire format (closed primitive set)
 
 ---
 
@@ -3287,6 +3357,7 @@ Features:
 - admin dashboard
 - replay tooling
 - `UndoManager` (per-user, redo) for Map / List / Text / Register / Counter — reuses `doc.transact()` for intention grouping
+- composition cookbook (build Set / MV-Register / Counter-with-bounds / position pair / etc. from existing primitives)
 - named versions (`createVersion` / `listVersions` / `updateVersion` / `deleteVersion`)
 - auto-version triggers (event-driven and schedule-driven)
 
