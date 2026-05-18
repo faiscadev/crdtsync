@@ -74,6 +74,7 @@ This is a **monorepo**. Core + SDKs + adapters + CLI + website all live together
 |------|---------|
 | [README.md](./README.md) | This file — project overview |
 | [ROADMAP.md](./ROADMAP.md) | High-level milestones (v0.1 through v0.7) |
+| [KANBAN.md](./KANBAN.md) | Detailed task breakdown for the current milestone |
 | [MONOREPO.md](./MONOREPO.md) | Repository layout, build conventions, release process |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | Full design spec — primitives, schema, auth, migrations, branches, awareness, foundational decisions |
 
