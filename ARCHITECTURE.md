@@ -391,6 +391,17 @@ Field roles:
 - `target` — where in the doc the op applies
 - `payload` — op-specific data
 
+## Value Types in Op Payloads
+
+```text
+Value =
+  | Scalar     (string, int, bool, null)
+  | BlobRef    { id, size, mime_type, filename?, inline?, created_by, created_at }
+  | ElementRef element_id
+```
+
+`BlobRef` is reserved from v0.1 in the wire format even though full blob implementation lands in v0.5 — see **Binary Blobs**. Adding new value types later would be a wire-format break.
+
 ---
 
 # Important Design Principle
@@ -1346,6 +1357,342 @@ Engine ships sensible default text/structural renderers; apps can override.
 ## Branch Merging (Out of Scope for v0.x)
 
 Merging two divergent branches back into one is the harder version-control problem. Snapshots + CRDT semantics make it possible (merge the two branches' op logs from their fork point), but conflict resolution UX is app-specific. Not in scope for v0.x. The primitive (fork point + HEAD pointers) is there; merge tooling can land later.
+
+---
+
+# Binary Blobs
+
+Files, images, audio, video, PDFs, plot outputs — collaborative apps need to attach binary content. Treated as a separate concern from the op stream because the access patterns are fundamentally different.
+
+## Why Blobs Are Different from Other Data
+
+| Property | Doc ops | Blobs |
+|----------|---------|-------|
+| Size | bytes–KB | KB–GB |
+| Mutability | edited collaboratively | immutable once created |
+| Merge semantics | needed | not applicable |
+| Delivery | eager (replicated to every replica) | lazy (fetched on render) |
+| Storage tier | op log | content-addressable blob store |
+| Bandwidth pattern | low per op, every op | high per fetch, only on demand |
+| Dedup | rarely | critical (same avatar uploaded by many users) |
+
+Inlining blobs in the op stream wrecks everything: log balloons, snapshots bloat, every replica receives bytes whether or not they render. Blobs need a parallel system designed for their access pattern.
+
+## Architecture: Refs in Ops, Bytes in Blob Store
+
+Op payloads carry `BlobRef` values, not raw bytes. Actual bytes live in a separate, addressable blob store and are fetched lazily on render.
+
+```text
+BlobRef {
+  id:          random UUID            // public reference; never reveals content
+  size:        bytes
+  mime_type:   string
+  filename:    string?                // user-provided original name
+  created_by:  actor_id
+  created_at:  lamport
+  inline:      bytes?                 // present iff size ≤ inline threshold
+}
+```
+
+Server-side, blobs are stored content-addressable (keyed by sha256) for dedup. The mapping `random_id → sha256` lives server-side only — **never exposed on the wire or to apps**. Same bytes uploaded twice produce two distinct `BlobRef`s with two random IDs that internally point to one stored blob.
+
+This gives global dedup without leaking content fingerprints. Confirmation attacks (adversary with the same file checking "does the server have this?") are blocked because public IDs are unpredictable.
+
+For ultra-paranoid mode (per-tenant HMAC-keyed hashing so even server admins cannot cross-correlate across tenants) — deferred to v0.7.
+
+## Blob is a Value Type, Not a CRDT Primitive
+
+Blobs do not merge, do not have substructure. They fit as values inside any container:
+
+```ts
+map.set("avatar", blobRef)
+xmlElement.setAttr("image", blobRef)
+list.insert(0, blobRef)
+ranged.create(start, end, { kind: "attachment", file: blobRef })
+```
+
+Replacing a blob value = LWW on the assignment (same as Map Slot Safety). No "edit" semantics. To "edit" a blob, upload a new version and assign the new ref.
+
+## Inline Threshold
+
+Small blobs can be embedded directly in the `BlobRef` to skip the fetch roundtrip:
+
+```text
+size ≤ inline_under: BlobRef carries bytes inline; no fetch needed
+size  > inline_under: BlobRef carries only metadata; client fetches on render
+```
+
+Default threshold: **4 KB**. Covers most icons, tiny avatars, thumbnails. Schema can override per-field.
+
+## Schema Declaration
+
+```json
+{
+  "types": {
+    "image_block": {
+      "kind": "xml",
+      "tag": "img",
+      "attrs": {
+        "file": {
+          "type":         "blob",
+          "max_size":     "10MB",
+          "allowed_mime": ["image/png", "image/jpeg", "image/webp", "image/gif"],
+          "inline_under": "8KB"
+        },
+        "alt": { "type": "lww-string" }
+      }
+    },
+    "attachment": {
+      "kind": "xml",
+      "attrs": { "file": { "type": "blob", "max_size": "100MB" } }
+    },
+    "video_clip": {
+      "kind": "xml",
+      "attrs": {
+        "file": {
+          "type":         "blob",
+          "max_size":     "5GB",
+          "allowed_mime": ["video/mp4", "video/webm"],
+          "inline_under": "0"
+        }
+      }
+    }
+  }
+}
+```
+
+Producer SDK rejects out-of-spec uploads at the write site (oversize, wrong MIME).
+
+## Presigned URLs: The Universal Interface
+
+All blob upload and fetch goes through presigned URLs. **The engine never proxies blob bytes through its main RPC/websocket channel.** Backend-specific implementation; uniform client/SDK interface.
+
+### Upload
+
+```ts
+const { url, ref } = await doc.blobs.requestUpload({ size, mime_type, filename })
+// 'ref' is the future BlobRef (random_id assigned upfront, not yet "available")
+
+await fetch(url, {
+  method:  "PUT",
+  body:    file,
+  headers: { "Content-Type": mime_type },
+  onProgress,
+})
+
+await doc.blobs.confirmUpload(ref)
+// server verifies completion (size match, optional checksum) and marks the blob available
+// orphan refs that never get confirmed are GC'd after a short timeout
+```
+
+### Fetch
+
+```ts
+const { url } = await doc.blobs.requestFetch(ref, { range })
+const bytes   = await fetch(url).then(r => r.arrayBuffer())
+
+// or for direct browser rendering:
+const src = await doc.blobs.url(ref)        // <img src={src} />
+```
+
+SDK wraps the two-step calls into `doc.blobs.upload(file)` / `doc.blobs.fetch(ref)` for ergonomic single-call usage.
+
+### Why Presigned URLs Universally
+
+- **Uniform API.** Apps and SDKs write one code path regardless of backend.
+- **Engine bandwidth saved.** Even on local FS, bytes flow through a separate HTTP route, not the websocket. Engine main loop stays light.
+- **CDN-native.** Production deployments offload reads to a CDN by issuing CDN-signed URLs.
+- **Backends pluggable cleanly.** Trait surface is "issue PUT URL" + "issue GET URL," not "stream bytes through me."
+
+### Trade-offs Acknowledged
+
+- Engine cannot easily middleware-process bytes (compression, virus scan) without explicit middleware mode.
+- Direct-to-S3 means the server does not observe the upload happening — relies on S3 event hooks or `confirmUpload` + post-upload verification.
+- Local FS backend needs a co-located HTTP route + signed-token verification (more setup than "just save bytes from the websocket").
+
+Worth it for the uniform-API + CDN-native + bandwidth-savings wins.
+
+## Backends
+
+```text
+trait BlobBackend {
+  presign_upload(blob_id, size, mime)   -> URL
+  presign_fetch(blob_id, range?)        -> URL
+  exists(blob_id)                       -> bool
+  delete(blob_id)                       -> Result
+  size(blob_id)                         -> bytes
+  verify_upload(blob_id, expected_size) -> Result   // post-upload integrity
+}
+```
+
+Ship two backends:
+
+| Backend | Use case | Notes |
+|---------|----------|-------|
+| **Local filesystem** | single-node dev, small deployments | engine serves bytes via co-located HTTP route with signed JWT tokens |
+| **S3-compatible** (S3 / R2 / B2 / MinIO) | production | real S3 presigned URLs, direct-to-S3 from clients |
+
+Deferred backends:
+- CDN tier (signed CDN URLs backed by S3) — v0.7
+- IPFS backend — future, contingent on E2E story
+- Embedded SQLite blob column — rarely worth it
+
+## Authorization
+
+Two-layer check, both server-side:
+
+### 1. Reference-site Element Auth
+
+Can recipient read the Element containing the `BlobRef`? If no, the entire Element (and the embedded ref) is filtered before send. Wire-level guarantee — the `BlobRef` never leaves the server for that recipient.
+
+### 2. Blob-Fetch Auth
+
+When a client calls `requestFetch(ref)`, server checks ACL **in the context of the reference site that delivered the ref**. ACL is evaluated per reference site, not per blob.
+
+```text
+blob X referenced from:
+  - element_a in zone "team"    → fetch authorized by zone "team" + element_a's ACL
+  - element_b in zone "private" → fetch authorized by zone "private" + element_b's ACL
+
+User can read element_a but not element_b:
+  → sees the ref at element_a, can fetch (auth passes via that site)
+  → does not see the ref at element_b at all, cannot even try
+```
+
+No global "Alice can read blob X" tuple. Auth flows through the containing element. Same blob in two contexts has two independent ACL evaluations.
+
+### Default Blob ACL
+
+A new blob inherits the ACL of the Element where it was first attached. App can override per-site with explicit grant/deny on `element_id:<id>` (the reference site, not the blob).
+
+## Dedup (Server-Side, Invisible to Clients)
+
+Same content → same internal sha256 → stored once. Reference counting tracks how many active reference sites point at each underlying hash across all docs / branches / snapshots.
+
+Big space savings on:
+
+- user avatars (uploaded by hundreds of users, stored once)
+- template assets
+- shared brand images, logos
+- replicated PDFs across docs
+
+Dedup is transparent to clients — they always see distinct random IDs.
+
+## Garbage Collection
+
+When all reference sites for a blob disappear (deleted, replaced via LWW, branch pruned), the blob becomes orphan. GC sweeps periodically.
+
+```text
+sweep:
+  for each blob in blob_store:
+    if reference_count(blob) == 0:
+      if (now - last_referenced(blob)) > grace_period:
+        delete from blob_store
+```
+
+**Grace period: 30 days (default, tunable per deployment).** Protects against:
+
+- undo / redo restoring a ref to a "deleted" blob
+- restore-as-branch re-referencing old blobs
+- mistaken delete recovery
+
+Reference counting respects branches: a blob referenced from any live branch (or retained snapshot / named version) is retained. Blob referenced only from pruned op log + GC'd snapshots = eligible for delete.
+
+Conservative GC — trades some storage for safety against accidental data loss.
+
+## Upload Protocol
+
+S3-compatible multipart for all backends (clients always speak the same protocol regardless of backend):
+
+- chunked upload (typical chunk: 5–10 MB)
+- resume on connection loss
+- per-chunk integrity check
+- progress reporting per chunk
+- for S3-compatible backends: clients upload directly to S3 with no engine proxy
+- for local FS: engine implements the S3 multipart protocol locally
+
+Universal tooling for free — every language already has S3 multipart support.
+
+## Range Requests and Streaming
+
+```text
+GET /blobs/<random_id>?token=...
+GET /blobs/<random_id>?token=...    Range: bytes=0-65535
+```
+
+Critical for:
+
+- video / audio streaming
+- PDF page-by-page fetch
+- large image progressive load
+- partial download with resume
+
+S3 backends support natively. Local FS backend implements via HTTP range serving.
+
+## Snapshots
+
+Snapshots reference blobs by id, not include bytes. Snapshot size stays manageable independent of blob count or sizes.
+
+```bash
+crdtsync snapshot export <room>                            # refs only (small file)
+crdtsync snapshot export <room> --with-blobs               # bundle blob bytes too (large)
+
+crdtsync snapshot import backup.snap                       # errors if blobs not on target
+crdtsync snapshot import backup.snap --pull-blobs-from <origin>   # lazy fetch from origin
+```
+
+For cross-server migration: `--with-blobs` for one-shot, or `crdtsync blob sync <origin> <target>` to transfer blob store separately.
+
+## Versioning + Blobs
+
+Blobs are immutable. "Editing" = upload new version → new `BlobRef` → assign new ref (LWW):
+
+```ts
+const newRef = await doc.blobs.upload(updatedFile)
+xmlElement.setAttr("image", newRef)
+```
+
+Old blob retained as long as any branch / version / snapshot references the old ref. GC frees it after the grace period beyond the last reference. Undo restores the old ref naturally.
+
+For explicit version-tracking of a file, model it in the app with normal CRDT primitives:
+
+```ts
+const attachments = doc.getMap("attachment_versions")
+attachments.set("v1", ref1)
+attachments.set("v2", ref2)   // user kept v1 around explicitly
+```
+
+No engine concept of "blob versioning" needed. App composes from existing primitives.
+
+## Wire-Format Reservation
+
+The op envelope's `Value` type reserves a slot for `BlobRef` from v0.1, even though full implementation lands later:
+
+```text
+Value =
+  | Scalar (string, int, bool, null)
+  | BlobRef { id, size, mime_type, filename?, inline?, ... }
+  | ElementRef element_id
+```
+
+Cheap-now / painful-later decision. The slot exists in the format from day one so adding full blob support in v0.5 does not break the wire.
+
+## Locked Decisions
+
+| Decision | Choice |
+|----------|--------|
+| Public identity | random UUID per upload; server-internal sha256 for dedup |
+| Privacy | random IDs are default — content hash never leaks to wire or apps |
+| Upload / fetch interface | presigned URLs, uniform across all backends |
+| Engine in the bytes path | never — bytes flow through dedicated HTTP route or directly to S3 |
+| Default inline threshold | 4 KB (schema can override per attr) |
+| Backend default | local filesystem for single-node; S3-compatible trait for production |
+| Multipart protocol | S3-compatible (universal tooling) |
+| Blob ACL evaluation | per reference site (not per blob) |
+| Default blob ACL | inherits from the Element where attached at creation |
+| Mutable blob semantics | none — replace ref to "edit"; immutable bytes |
+| GC grace period | 30 days post-last-reference (tunable) |
+| Hash-as-identity ultra-privacy mode (per-tenant HMAC keys) | deferred to v0.7 |
 
 ---
 
@@ -2560,7 +2907,7 @@ Decisions that shape the wire format, op model, or schema language. These bind e
 
 | Status | Decision | Why foundational |
 |--------|----------|------------------|
-| pending | **Binary blob model** | Inline in ops vs refs to a separate store vs both. Forces decisions about op size, content addressing, snapshot inclusion, ACL granularity, range fetching, deferred load. |
+| **decided** | **Binary blob model** | Refs in ops, bytes in separate blob store, content-addressable internally (sha256), random UUIDs publicly. Universal presigned-URL interface across all backends. Inline only for blobs ≤ 4KB. ACL per reference site. See **Binary Blobs** section. |
 | pending | **Atomic multi-op transactions** | Is the unit of mutation one op or a transaction of N ops? Affects repair, undo, replay, invariant checking semantics. Adding `tx_id` later is a wire-format break. |
 | pending | **Unicode / Text char-id strategy** | UTF-8 + grapheme-aware boundaries vs naive codepoints. Determines what "position" means in Text. Char identity is baked into every Text op ever written — picking wrong is permanent. |
 | pending | **Op causality model** | Explicit per-op dependencies vs lamport-only ordering. Affects replay correctness in pathological out-of-order scenarios and protocol byte cost. |
@@ -2605,6 +2952,9 @@ Features:
 - Map slot safety (initOnce, live, replace, orphan event)
 - op batching wire format (encoder can ship dumb single-op)
 - token validation + `actor_id` on every op + basic room-level read/write enforcement
+- `BlobRef` value type reserved in op envelope
+- local filesystem blob backend with co-located HTTP route + signed tokens
+- blob upload / fetch / `inline_under: 4KB` for small blobs
 
 ---
 
@@ -2684,6 +3034,13 @@ Features:
 - wire-level redaction (per-recipient filtering of ops, snapshots, marks, attrs)
 - per-zone snapshots + per-profile redacted view caching
 - meta-auth declarations (who can grant / revoke / share)
+- schema-declared blob fields (`max_size`, `allowed_mime`, `inline_under`)
+- reference-site + blob-fetch auth checks (per-site ACL evaluation)
+- S3-compatible backend (direct-to-S3 with no engine proxy)
+- S3-compatible multipart resumable upload
+- range requests + streaming
+- server-side blob dedup (`random_id → sha256` mapping)
+- reference counting + grace-period (30 day default) blob GC
 
 The milestone that unlocks editor-grade collaboration (ProseMirror, Tiptap, BlockNote, Notion-style apps) and locks in schema as a first-class concern. Rich text + schema are the hardest parts of the project and get a dedicated release.
 
@@ -2724,6 +3081,9 @@ Features:
 - durability modes
 - compaction policies (including optional log compaction at migration boundaries)
 - WASM tier-3 migration escape hatch (if real demand surfaces)
+- `crdtsync snapshot export --with-blobs` + `crdtsync blob sync` (federation)
+- CDN tier for blob fetches (signed CDN URLs backed by S3)
+- per-tenant HMAC-keyed blob hashing (ultra-privacy mode)
 
 ---
 
