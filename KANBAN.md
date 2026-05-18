@@ -3,7 +3,11 @@
 > Detailed task breakdown for the [v0.1 milestone](./ROADMAP.md#v01--single-node-mvp).
 > Higher-level milestones live in [ROADMAP.md](./ROADMAP.md). Full design in [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-**Status legend:** 🔲 backlog · 🔄 in progress · ✅ done · ❌ blocked · ⏸️ paused
+**Status convention:**
+
+- `- [ ]` = todo
+- `- [x]` = done
+- Inline `(in progress)` or `(blocked: <reason>)` annotates current state when relevant
 
 **Size estimates:** S = ≤1d · M = 1–3d · L = >3d
 
@@ -15,75 +19,75 @@ Ship a working single-node sync engine. One OCaml server, SQLite persistence, Ty
 
 ## Repo Hygiene & Setup
 
-- [ ] 🔲 **SETUP-1** [M] OCaml workspace (`dune-project`, base lib + bin structure, build verified)
-- [ ] 🔲 **SETUP-2** [M] TS SDK workspace (pnpm + tsconfig + build pipeline + test runner)
-- [ ] 🔲 **SETUP-3** [M] CI: path-filtered per-component jobs (core / wasm / cabi / sdk-ts / lint / e2e)
-- [ ] 🔲 **SETUP-4** [S] Lint + format baseline (ocamlformat, prettier, eslint)
+- [ ] **SETUP-1** [M] OCaml workspace (`dune-project`, base lib + bin structure, build verified)
+- [ ] **SETUP-2** [M] TS SDK workspace (pnpm + tsconfig + build pipeline + test runner)
+- [ ] **SETUP-3** [M] CI: path-filtered per-component jobs (core / wasm / cabi / sdk-ts / lint / e2e)
+- [ ] **SETUP-4** [S] Lint + format baseline (ocamlformat, prettier, eslint)
 
 ## Core CRDT (OCaml)
 
-- [ ] 🔲 **CORE-1** [M] Op envelope type + per-zone lamport infrastructure + UUID v7 generation
-- [ ] 🔲 **CORE-2** [L] Map primitive (with slot safety: `initOnce`, `live`, `replace`, orphan event)
-- [ ] 🔲 **CORE-3** [L] List primitive
-- [ ] 🔲 **CORE-4** [L] Text primitive (codepoint identity, char_id, UTF-8 in/out)
-- [ ] 🔲 **CORE-5** [M] Register + Counter primitives
-- [ ] 🔲 **CORE-6** [M] Anchors / RelativePosition (CharAnchor / IndexAnchor / Whole)
-- [ ] 🔲 **CORE-7** [M] `doc.transact()` server-side semantics: client batching + log atomic write (non-atomic default)
-- [ ] 🔲 **CORE-8** [S] Closed `op.kind` enum + dispatch
+- [ ] **CORE-1** [M] Op envelope type + per-zone lamport infrastructure + UUID v7 generation
+- [ ] **CORE-2** [L] Map primitive (with slot safety: `initOnce`, `live`, `replace`, orphan event)
+- [ ] **CORE-3** [L] List primitive
+- [ ] **CORE-4** [L] Text primitive (codepoint identity, char_id, UTF-8 in/out)
+- [ ] **CORE-5** [M] Register + Counter primitives
+- [ ] **CORE-6** [M] Anchors / RelativePosition (CharAnchor / IndexAnchor / Whole)
+- [ ] **CORE-7** [M] `doc.transact()` server-side semantics: client batching + log atomic write (non-atomic default)
+- [ ] **CORE-8** [S] Closed `op.kind` enum + dispatch
 
 ## Persistence (OCaml)
 
-- [ ] 🔲 **PERSIST-1** [M] SQLite schema + open/close lifecycle
-- [ ] 🔲 **PERSIST-2** [M] Op log: append-only writes, replay reads, per-client `last_seen_seq` tracking
-- [ ] 🔲 **PERSIST-3** [M] Snapshot table + envelope serialization
-- [ ] 🔲 **PERSIST-4** [M] Snapshot triggers (op-count + time intervals, manual API)
-- [ ] 🔲 **PERSIST-5** [M] Cold-start delivery (latest snapshot + ops_since(snapshot.lamport))
+- [ ] **PERSIST-1** [M] SQLite schema + open/close lifecycle
+- [ ] **PERSIST-2** [M] Op log: append-only writes, replay reads, per-client `last_seen_seq` tracking
+- [ ] **PERSIST-3** [M] Snapshot table + envelope serialization
+- [ ] **PERSIST-4** [M] Snapshot triggers (op-count + time intervals, manual API)
+- [ ] **PERSIST-5** [M] Cold-start delivery (latest snapshot + ops_since(snapshot.lamport))
 
 ## Wire Protocol (OCaml)
 
-- [ ] 🔲 **WIRE-1** [M] Codec pick + implement (CBOR recommended — deferred-to-impl decision, lock now)
-- [ ] 🔲 **WIRE-2** [S] Format-stable wire-version header (4-byte magic + 4-byte version)
-- [ ] 🔲 **WIRE-3** [M] Hello / ServerHello exchange + codec/capability negotiation
-- [ ] 🔲 **WIRE-4** [M] Auth phase: bearer header on upgrade + in-band `Auth` message (cookie carrier post-v0.1)
-- [ ] 🔲 **WIRE-5** [M] Subscribe / SubscribeAck + multiplexed channels per `(room, branch, zone)`
-- [ ] 🔲 **WIRE-6** [S] Standardized `Error` envelope (closed-enum code + message + details)
-- [ ] 🔲 **WIRE-7** [S] `BlobRef` value type + `tx_id` / `tx_role` fields reserved in op envelope
+- [ ] **WIRE-1** [M] Codec pick + implement (CBOR recommended — deferred-to-impl decision, lock now)
+- [ ] **WIRE-2** [S] Format-stable wire-version header (4-byte magic + 4-byte version)
+- [ ] **WIRE-3** [M] Hello / ServerHello exchange + codec/capability negotiation
+- [ ] **WIRE-4** [M] Auth phase: bearer header on upgrade + in-band `Auth` message (cookie carrier post-v0.1)
+- [ ] **WIRE-5** [M] Subscribe / SubscribeAck + multiplexed channels per `(room, branch, zone)`
+- [ ] **WIRE-6** [S] Standardized `Error` envelope (closed-enum code + message + details)
+- [ ] **WIRE-7** [S] `BlobRef` value type + `tx_id` / `tx_role` fields reserved in op envelope
 
 ## Server (OCaml)
 
-- [ ] 🔲 **SERVER-1** [M] WebSocket server skeleton (accept, run handshake, dispatch by channel)
-- [ ] 🔲 **SERVER-2** [M] Room support (create implicit on first connect, route ops to channel subscribers)
-- [ ] 🔲 **SERVER-3** [M] Op apply pipeline (validate kind + actor + room ACL, persist, fan-out)
-- [ ] 🔲 **SERVER-4** [M] Reconnect resume from `last_seen_seq` per channel
-- [ ] 🔲 **SERVER-5** [M] Token validation (one carrier for v0.1: JWT bearer) + actor_id binding to session
-- [ ] 🔲 **SERVER-6** [M] Basic auth enforcement: room-level `read` / `write` on every op
-- [ ] 🔲 **SERVER-7** [S] `crdtsync serve` CLI binary
+- [ ] **SERVER-1** [M] WebSocket server skeleton (accept, run handshake, dispatch by channel)
+- [ ] **SERVER-2** [M] Room support (create implicit on first connect, route ops to channel subscribers)
+- [ ] **SERVER-3** [M] Op apply pipeline (validate kind + actor + room ACL, persist, fan-out)
+- [ ] **SERVER-4** [M] Reconnect resume from `last_seen_seq` per channel
+- [ ] **SERVER-5** [M] Token validation (one carrier for v0.1: JWT bearer) + actor_id binding to session
+- [ ] **SERVER-6** [M] Basic auth enforcement: room-level `read` / `write` on every op
+- [ ] **SERVER-7** [S] `crdtsync serve` CLI binary
 
 ## Blobs (OCaml)
 
-- [ ] 🔲 **BLOB-1** [M] Local FS backend (put / get by random UUID, internal sha256 dedup, ref-count storage)
-- [ ] 🔲 **BLOB-2** [M] HMAC-signed presigned URL generation (PUT + GET with expiry)
-- [ ] 🔲 **BLOB-3** [M] Co-located HTTP route for blob PUT/GET with signed-token verification
-- [ ] 🔲 **BLOB-4** [M] `requestUpload` / `confirmUpload` / `requestFetch` wire ops + flow
+- [ ] **BLOB-1** [M] Local FS backend (put / get by random UUID, internal sha256 dedup, ref-count storage)
+- [ ] **BLOB-2** [M] HMAC-signed presigned URL generation (PUT + GET with expiry)
+- [ ] **BLOB-3** [M] Co-located HTTP route for blob PUT/GET with signed-token verification
+- [ ] **BLOB-4** [M] `requestUpload` / `confirmUpload` / `requestFetch` wire ops + flow
 
 ## TS SDK
 
-- [ ] 🔲 **SDK-1** [L] WASM build of OCaml core (`wasm_of_ocaml` / `js_of_ocaml` pipeline + glue)
-- [ ] 🔲 **SDK-2** [M] Document open/connect API + client-side handshake
-- [ ] 🔲 **SDK-3** [L] Map / List / Text / Register / Counter ergonomic wrappers + observe API
-- [ ] 🔲 **SDK-4** [M] Anchors / RelativePosition surface
-- [ ] 🔲 **SDK-5** [M] `doc.transact()` ergonomic wrapper (observer fire boundary + intention undo unit)
-- [ ] 🔲 **SDK-6** [M] Grapheme-aware Text helpers (`Intl.Segmenter`)
-- [ ] 🔲 **SDK-7** [M] UUID v7 generation + sessionStorage persistence for `client_id`
-- [ ] 🔲 **SDK-8** [M] Reconnect logic + per-channel `last_seen_seq` tracking
-- [ ] 🔲 **SDK-9** [M] Token / auth helpers (set bearer, prepare upgrade headers / in-band Auth)
-- [ ] 🔲 **SDK-10** [M] Blob upload / fetch / url helpers (presigned URL two-step + inline ≤4KB)
-- [ ] 🔲 **SDK-11** [S] `Error` envelope decoding + typed error surfaces
+- [ ] **SDK-1** [L] WASM build of OCaml core (`wasm_of_ocaml` / `js_of_ocaml` pipeline + glue)
+- [ ] **SDK-2** [M] Document open/connect API + client-side handshake
+- [ ] **SDK-3** [L] Map / List / Text / Register / Counter ergonomic wrappers + observe API
+- [ ] **SDK-4** [M] Anchors / RelativePosition surface
+- [ ] **SDK-5** [M] `doc.transact()` ergonomic wrapper (observer fire boundary + intention undo unit)
+- [ ] **SDK-6** [M] Grapheme-aware Text helpers (`Intl.Segmenter`)
+- [ ] **SDK-7** [M] UUID v7 generation + sessionStorage persistence for `client_id`
+- [ ] **SDK-8** [M] Reconnect logic + per-channel `last_seen_seq` tracking
+- [ ] **SDK-9** [M] Token / auth helpers (set bearer, prepare upgrade headers / in-band Auth)
+- [ ] **SDK-10** [M] Blob upload / fetch / url helpers (presigned URL two-step + inline ≤4KB)
+- [ ] **SDK-11** [S] `Error` envelope decoding + typed error surfaces
 
 ## Demo & E2E
 
-- [ ] 🔲 **DEMO-1** [M] Minimal "two clients edit the same Text + Map" demo (no UI framework, just SDK in browser)
-- [ ] 🔲 **DEMO-2** [M] E2E integration test harness (spin up server, connect two clients, assert convergence + reconnect + auth rejection)
+- [ ] **DEMO-1** [M] Minimal "two clients edit the same Text + Map" demo (no UI framework, just SDK in browser)
+- [ ] **DEMO-2** [M] E2E integration test harness (spin up server, connect two clients, assert convergence + reconnect + auth rejection)
 
 ---
 
@@ -93,7 +97,7 @@ Ship a working single-node sync engine. One OCaml server, SQLite persistence, Ty
 - `crdtsync serve` runs single-node, accepts WebSocket connections, persists ops + snapshots to SQLite
 - Two browsers can collaboratively edit Map / List / Text / Register / Counter and converge to identical state
 - Reconnect resumes from `last_seen_seq` per channel without data loss
-- JWT bearer auth works: token validates → `actor_id` bound → room-level read/write enforced server-side
+- JWT bearer auth works: token validates, `actor_id` bound, room-level read/write enforced server-side
 - Blobs upload via presigned URL, reference from a doc, fetch via presigned URL (with inline-under-4KB fast path)
 - All foundational op envelope fields (`actor_id`, `branch`, `zone`, `schema_version`, `lamport`, `tx_id`, `tx_role`, `BlobRef` value type) present on the wire, even if not all fully utilized in v0.1
 - CI green on push to main
@@ -102,4 +106,4 @@ Ship a working single-node sync engine. One OCaml server, SQLite persistence, Ty
 
 - Some fields exist in the op envelope from v0.1 but aren't fully exercised until later milestones (e.g., `zone` defaults to a single implicit zone in v0.1; `schema_version` is hardcoded; `tx_id` / `tx_role` non-null only inside `doc.transact()`). The wire format reserves them; behavior fills in over time.
 - Schema, migrations, ACL CRDT subsystem, branches, awareness, rich text — none of those are v0.1 scope. See ROADMAP.md for which milestone each lands in.
-- Decimal estimates are gut guesses, not commitments. Adjust as you go.
+- Size estimates are gut guesses, not commitments. Adjust as you go.
