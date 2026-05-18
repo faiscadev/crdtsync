@@ -469,6 +469,119 @@ Without RelativePosition, cursors jump on remote edits. This is a core primitive
 
 ---
 
+# Text and Unicode
+
+What "one character" means in the `Text` primitive — the choice of identity granularity and wire encoding. Permanent. Yjs got this wrong and pays for it forever; we do not get to revisit it once shipped.
+
+## The Choice (Locked)
+
+| Layer | Choice |
+|-------|--------|
+| **CRDT identity granularity** | codepoint (Unicode scalar value) |
+| **Wire encoding** | UTF-8 |
+| **Internal storage** | codepoint sequence with per-codepoint `char_id = (client_id, client_seq)` |
+| **Public API default unit** | grapheme cluster (via SDK Unicode helper) |
+| **Codepoint-level API** | available as opt-in for advanced use |
+| **Unicode version mismatch** | cosmetic only — codepoints stable, graphemes may render differently |
+| **Auto-normalization (NFC / NFD / NFKC / NFKD)** | none — app responsibility |
+
+## Why Not Other Combinations
+
+| Option | Why rejected |
+|--------|-------------|
+| **Byte (UTF-8 byte) as identity** | every multi-byte char shatters; cursor mid-byte = corruption |
+| **Code unit (UTF-16) as identity** | what Yjs does; cursor lands mid-emoji (surrogate pair); family/flag emoji break; documented pain Yjs cannot fix |
+| **Grapheme cluster as identity** | grapheme boundaries are Unicode-version-dependent. Clients on different versions disagree about boundaries. Mathematically impossible to maintain CRDT identity across version mismatch if grapheme is the identity unit. |
+| **UTF-16 on wire** | doubles bandwidth for ASCII content, carries surrogate-pair baggage |
+| **UTF-32 on wire** | quadruples bandwidth for no win |
+
+Codepoint identity + UTF-8 wire + grapheme-aware API is the only combination that preserves CRDT correctness across all clients and gives users grapheme-level UX.
+
+## Why Codepoint Identity Works Across Unicode Versions
+
+Codepoints are universal. Unicode 14 and Unicode 15 agree on what codepoints exist (Unicode is append-only). What differs is **grapheme cluster boundaries** — how codepoints group into user-perceived characters.
+
+Scenario: Alice on Unicode 15, Bob on Unicode 14. Alice types a new emoji introduced in Unicode 15.
+
+- Alice's SDK emits N codepoints with stable char_ids
+- Bob's SDK receives the same N codepoints with the same char_ids
+- Alice renders 1 grapheme on screen
+- Bob renders multiple separate codepoints (cosmetic artifact)
+- Both can edit; both converge on the same codepoint sequence
+- No data corruption, no CRDT identity break
+
+Visual quirk only. Right failure mode.
+
+## API
+
+Default operations operate on grapheme clusters (the unit users perceive). SDK ships with a Unicode lib per language:
+
+- TypeScript: `Intl.Segmenter` (built-in to modern JS engines)
+- Python: `grapheme` package
+- Go: `golang.org/x/text/unicode/norm` + grapheme segmenter
+- Rust: `unicode-segmentation` crate
+- Java: `java.text.BreakIterator`
+
+```ts
+text.insert(5, "🎉")               // position 5 = 5th grapheme cluster
+text.delete(5, 1)                   // delete 1 grapheme (handles surrogates, combining seqs, ZWJ correctly)
+text.length()                       // grapheme cluster count
+text.cursor(5)                      // anchor at start of 5th grapheme — returns CharAnchor (codepoint-level char_id)
+
+// opt-in: codepoint-level for collation, programmatic, or advanced use
+text.insertCodepoints(5, "...")
+text.lengthCodepoints()
+text.iterateCodepoints()
+```
+
+## Anchors
+
+`CharAnchor { char_id, side: Before | After }` references a codepoint. Cursors render at the nearest grapheme boundary on display. Anchors never drift under concurrent edits because char_id is stable.
+
+If an anchor lands mid-grapheme (e.g., between an emoji's component codepoints) due to a remote edit, render position snaps to the nearest grapheme boundary. The anchor stays valid at the CRDT level.
+
+## Wire Format
+
+- `text.insert` payload: position (codepoint offset within Text) + UTF-8 byte string + count
+- Char_ids assigned per codepoint at producer side
+- Receivers decode UTF-8, split into codepoints, attach incoming char_ids in order
+- Long inserts (paste large content) chunked into reasonable op sizes and sent as a non-atomic batch tx
+
+## Failure Modes (Honest)
+
+| Scenario | What happens |
+|----------|-------------|
+| Mismatched Unicode versions across clients | cosmetic rendering differences only; data converges; no corruption |
+| User types "café" decomposed (e + combining accent, 2 codepoints) | stored as 2 codepoints; grapheme-API backspace deletes both as 1 grapheme |
+| User types "café" composed (é as single codepoint) | stored as 1 codepoint; grapheme-API backspace deletes 1 codepoint |
+| App receives input mixing composed and decomposed forms | app's responsibility to normalize on input if it cares; core stores both forms as-given |
+| Cursor anchored mid-grapheme by app bug | anchor still valid at CRDT level; renders at nearest grapheme boundary |
+| Pasting 1 MB of text | chunked into reasonable op sizes, sent as a non-atomic batch tx; observers fire once at the batch boundary |
+
+## What Core Does Not Ship
+
+| Concern | Why deferred to app / editor adapter |
+|---------|---------------------------------------|
+| NFC / NFD / NFKC / NFKD normalization | normalization changes char_ids; app must opt in on input only if it accepts that cost |
+| Locale-aware collation | not Unicode-universal; app uses its own intl lib |
+| Bidi / RTL display order | rendering concern, lives in the editor adapter |
+| Locale-aware case folding | not Unicode-universal |
+| Word / sentence boundary detection | available via SDK helper for grapheme; locale-specific cases pushed to app |
+| Auto-repair of broken ZWJ sequences | codepoints stored as-given; app filters at input if needed |
+
+Editor adapters (`sync-prosemirror`, `sync-codemirror`, etc.) handle their target editor's idiosyncrasies. Core stays Unicode-neutral beyond codepoint identity + grapheme helpers.
+
+## Roadmap
+
+| Capability | Milestone |
+|-----------|-----------|
+| Codepoint-level char_id, UTF-8 wire, grapheme-aware insert / delete / length / cursor helpers in SDK | v0.1 |
+| Bundled Unicode-segmentation lib in each SDK | v0.1 |
+| Grapheme-aware behavior extended to RangedElement + Marks (e.g., mark anchored at grapheme boundary) | v0.5 (with rich text) |
+| Locale-aware operations (collation, case folding) | not in scope — app concern |
+
+---
+
 # Marks (Rich Text Formatting)
 
 Marks are range overlays on Text — bold, italic, links, highlights, comments. Implemented as a convention over `RangedElement`, not as a separate primitive.
@@ -3091,7 +3204,7 @@ Decisions that shape the wire format, op model, or schema language. These bind e
 |--------|----------|------------------|
 | **decided** | **Binary blob model** | Refs in ops, bytes in separate blob store, content-addressable internally (sha256), random UUIDs publicly. Universal presigned-URL interface across all backends. Inline only for blobs ≤ 4KB. ACL per reference site. See **Binary Blobs** section. |
 | **decided** | **Atomic multi-op transactions** | Single `doc.transact()` API. Non-atomic batching is the default (streaming UX, CRDT-correct). `atomic: true` opt-in for privilege / reference / cross-element invariants. `tx_id` + `tx_role` reserved in op envelope from v0.1. See **Transactions** section. |
-| pending | **Unicode / Text char-id strategy** | UTF-8 + grapheme-aware boundaries vs naive codepoints. Determines what "position" means in Text. Char identity is baked into every Text op ever written — picking wrong is permanent. |
+| **decided** | **Unicode / Text char-id strategy** | Codepoint as CRDT identity (stable across Unicode versions), UTF-8 on wire, grapheme-cluster API default with codepoint-level opt-in. Mismatched Unicode versions produce cosmetic differences only — no data corruption. See **Text and Unicode** section. |
 | pending | **Op causality model** | Explicit per-op dependencies vs lamport-only ordering. Affects replay correctness in pathological out-of-order scenarios and protocol byte cost. |
 | pending | **Custom Element types / plugin extensibility** | Whether the primitive type system is closed or open. If open: schema language and op-kind discriminator need namespacing + versioning. Closing later is easy; opening later is a wire break. |
 | pending | **Client ID strategy** | UUID v7 (sortable + random)? Server-issued? Persistent across sessions and devices? Affects op identity, undo stacks, audit, dedup. |
@@ -3139,6 +3252,7 @@ Features:
 - blob upload / fetch / `inline_under: 4KB` for small blobs
 - `tx_id` + `tx_role` reserved in op envelope
 - `doc.transact()` API: client-side observer batching, network batching, server-side log atomic write (non-atomic default)
+- Text with codepoint identity + UTF-8 wire + grapheme-aware SDK helpers (per-language Unicode lib bundled)
 
 ---
 
