@@ -78,7 +78,7 @@ This is a **monorepo**. Core + SDKs + adapters + CLI + website all live together
 
 ## License
 
-TBD.
+AGPL-3.0-or-later. See [LICENSE](./LICENSE).
 
 ## Where to follow along
 
