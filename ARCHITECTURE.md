@@ -971,6 +971,188 @@ These constraints are non-negotiable — determinism is the entire reason migrat
 
 ---
 
+# Transactions
+
+A group of ops sent together as one wire message, batched into one local observer fire, and treated as one undo entry. Optionally made atomic across replicas via opt-in.
+
+## API
+
+```ts
+// default: non-atomic batching (CRDT-correct default, streaming UX)
+doc.transact(() => {
+  text.insert(0, "hello")
+  text.insert(5, " world")
+})
+
+// opt-in: cross-replica atomicity for the cases that need it
+doc.transact(() => {
+  acl.grant({ subject: "user:bob", action: "write", resource: elem.id })
+  elem.setAttr("owner", "user:bob")
+}, { atomic: true })
+
+// named intention for undo
+doc.transact(() => { ... }, { intention: "rename-section" })
+
+// combine
+doc.transact(() => { ... }, { atomic: true, intention: "grant-and-set-owner" })
+```
+
+Single API. Two effects: batching (always) + atomicity (opt-in).
+
+## Default: Non-Atomic
+
+Most ops should be independent and stream as they arrive. Typing should appear character-by-character on remote screens, not all-at-once when the typist pauses.
+
+What non-atomic batching guarantees:
+
+| Guarantee | Always |
+|-----------|--------|
+| Client-side observer fires once for the whole batch | yes |
+| Network sent as one wire message | yes |
+| Undo treats the batch as one intention | yes |
+| Server-side: applies batch as one atomic log write | yes |
+
+What it does NOT guarantee:
+
+| Not guaranteed | Why |
+|----------------|-----|
+| Other replicas see ops "together" | Each op merges independently on arrival (CRDT semantics) |
+| Cross-replica view boundary | Other clients can render mid-batch state |
+| Schema invariant preservation across batch | Invariant repair handles partial-state cases deterministically |
+
+This is the CRDT default. Independent merge, eventual convergence, streaming UX.
+
+## Opt-In: `atomic: true`
+
+For the cases where intermediate state is genuinely unsafe:
+
+| Use case | Why atomic |
+|----------|-----------|
+| Privilege grant + use of new permission | Race window between op 1 and op 2 = security gap |
+| Delete entity + remove all refs to it | Refs become dangling if delete lands first |
+| Multi-element invariant schema cannot repair | Both ops together avoid invalid intermediate state |
+
+What `atomic: true` adds:
+
+- ops carry `tx_id` and a `tx.commit` marker
+- receivers buffer member ops by `tx_id` until commit marker arrives
+- on commit marker: all buffered ops apply atomically to the local view
+- between member-receive and commit-receive, local state shows pre-tx
+- view-layer atomic transition across replicas
+
+Cost: latency (commit marker must arrive), buffering complexity, partial-tx timeout (default 30s) + abort handling.
+
+## Why Atomic Is NOT the Default
+
+Atomic-by-default would wreck streaming UX:
+
+| Operation | Non-atomic default | Atomic-by-default would |
+|-----------|--------------------|--------------------------|
+| typing "Hello world!" | streams char-by-char on remote screens | pops in all at once when typist pauses |
+| moving paragraphs | each move visible as it happens | hidden until "all moves done" marker |
+| cursor moves | fire-and-forget, instant | buffered, never feels live |
+| typing indicator on/off | instant | lagged by RTT |
+
+CRDTs exist specifically to **avoid** coordination. Atomic-by-default reintroduces it for every op, costing latency on the 95% of ops that do not need it. Atomic is the deliberate override for the 5% that do.
+
+## Scope Constraints (Producer-Side Enforced)
+
+| Constraint | Why |
+|------------|-----|
+| Tx must stay within one branch | Branches are independent timelines |
+| Tx must stay within one zone | Per-zone lamport clocks make cross-zone ordering ill-defined |
+| Tx must stay within one schema version | Migration entries are boundaries; tx cannot straddle |
+| Tx cannot include migration ops | Migrations are special log entries, applied alone |
+| Atomic tx member-op count capped | Default 1000; prevents pathological buffering |
+
+Producer SDK rejects out-of-scope txs at the write site.
+
+## Interaction with Invariant Repair
+
+For atomic txs: repair runs **inside the commit pipeline**, not after. The visible effect of a tx is the repaired state. Apps see one atomic event:
+
+```text
+tx ops applied → repair fires deterministically → committed state visible
+```
+
+No two-step "tx done + then repair changed it" surprise. The repaired state IS the transaction's outcome.
+
+For non-atomic batches: repair runs per-op as usual, independent of the batch boundary.
+
+## Interaction with Undo
+
+A transaction is naturally an undo intention. Same construct:
+
+```ts
+doc.transact(() => { ... }, { intention: "rename-section" })
+// → goes into undo stack as one intention labelled "rename-section"
+// → ctrl-z undoes the entire batch as one step
+```
+
+Undo of an atomic tx = generate inverse ops for all members, wrap in a new atomic tx, apply atomically. Atomicity is preserved through undo / redo.
+
+## Wire Envelope
+
+Op envelope reserves two fields from v0.1:
+
+```text
+{
+  ...existing fields...
+  tx_id:   string?              // null = standalone op
+  tx_role: "member" | "commit"  // present iff tx_id present
+}
+```
+
+| `tx_id` | `tx_role` | Meaning |
+|---------|-----------|---------|
+| null | — | standalone op, applied immediately |
+| T | "member" | part of tx T |
+| T | "commit" | commit marker for tx T |
+
+The `atomic` flag is encoded in the commit marker, not in member ops. Receivers know whether to buffer based on the commit-marker's atomic flag:
+
+- Non-atomic batch: member ops apply immediately on receive; commit marker exists for undo grouping + close-the-batch signal.
+- Atomic tx: member ops buffered; commit marker triggers atomic apply of all buffered members.
+
+## Partial-Tx Failure (Atomic Only)
+
+If commit marker never arrives within timeout (default 30s):
+
+- receiver discards buffered partial tx
+- originator notified to retry the entire tx
+- no partial state is ever applied
+
+Causes:
+- network partition between member ops and commit marker
+- crash of the originating client before sending commit
+- intentional abort by originator (`doc.transact.abort()`)
+
+## What Is NOT Shipped
+
+- **Strong consensus / 2PC across replicas** — defeats CRDT coordination-free property
+- **Compare-and-swap / conditional ops** — break CRDT mergeability. Deferred to v0.7+ if real demand surfaces
+- **Cross-branch / cross-zone / cross-schema-version transactions** — would require distributed coordination
+- **Long-running transactions** — txs are short (default 30s atomic timeout). Long-running app workflows are app state, not engine txs
+
+## Locked Decisions
+
+| Decision | Choice |
+|----------|--------|
+| Adopt transactions | Yes, single API |
+| Default semantics | Non-atomic batching (CRDT-correct, streaming UX) |
+| Opt-in semantics | `atomic: true` for cross-replica view-boundary atomicity |
+| Wire reservation | `tx_id` + `tx_role` in op envelope from v0.1 |
+| Atomic implementation | Member-op buffering at receivers, triggered by commit marker |
+| Scope | single branch, single zone, single schema version |
+| Repair (atomic txs) | runs inside commit pipeline, atomic with tx |
+| Undo intention | same construct as tx |
+| Strong consensus | not shipped |
+| CAS / conditional ops | not shipped; deferred to v0.7+ |
+| Atomic tx timeout | 30s default, tunable |
+| Atomic tx member cap | 1000 ops default |
+
+---
+
 # Undo / Redo
 
 Per-user undo via SDK helper. Core sees only inverse ops — no server-side undo state, no special wire format.
@@ -2908,7 +3090,7 @@ Decisions that shape the wire format, op model, or schema language. These bind e
 | Status | Decision | Why foundational |
 |--------|----------|------------------|
 | **decided** | **Binary blob model** | Refs in ops, bytes in separate blob store, content-addressable internally (sha256), random UUIDs publicly. Universal presigned-URL interface across all backends. Inline only for blobs ≤ 4KB. ACL per reference site. See **Binary Blobs** section. |
-| pending | **Atomic multi-op transactions** | Is the unit of mutation one op or a transaction of N ops? Affects repair, undo, replay, invariant checking semantics. Adding `tx_id` later is a wire-format break. |
+| **decided** | **Atomic multi-op transactions** | Single `doc.transact()` API. Non-atomic batching is the default (streaming UX, CRDT-correct). `atomic: true` opt-in for privilege / reference / cross-element invariants. `tx_id` + `tx_role` reserved in op envelope from v0.1. See **Transactions** section. |
 | pending | **Unicode / Text char-id strategy** | UTF-8 + grapheme-aware boundaries vs naive codepoints. Determines what "position" means in Text. Char identity is baked into every Text op ever written — picking wrong is permanent. |
 | pending | **Op causality model** | Explicit per-op dependencies vs lamport-only ordering. Affects replay correctness in pathological out-of-order scenarios and protocol byte cost. |
 | pending | **Custom Element types / plugin extensibility** | Whether the primitive type system is closed or open. If open: schema language and op-kind discriminator need namespacing + versioning. Closing later is easy; opening later is a wire break. |
@@ -2955,6 +3137,8 @@ Features:
 - `BlobRef` value type reserved in op envelope
 - local filesystem blob backend with co-located HTTP route + signed tokens
 - blob upload / fetch / `inline_under: 4KB` for small blobs
+- `tx_id` + `tx_role` reserved in op envelope
+- `doc.transact()` API: client-side observer batching, network batching, server-side log atomic write (non-atomic default)
 
 ---
 
@@ -2970,7 +3154,7 @@ Features:
 - compaction with tombstone GC watermark
 - admin dashboard
 - replay tooling
-- `UndoManager` (per-user, intention grouping, redo) for Map / List / Text / Register / Counter
+- `UndoManager` (per-user, redo) for Map / List / Text / Register / Counter — reuses `doc.transact()` for intention grouping
 - named versions (`createVersion` / `listVersions` / `updateVersion` / `deleteVersion`)
 - auto-version triggers (event-driven and schedule-driven)
 
@@ -3041,6 +3225,9 @@ Features:
 - range requests + streaming
 - server-side blob dedup (`random_id → sha256` mapping)
 - reference counting + grace-period (30 day default) blob GC
+- atomic transactions opt-in (`atomic: true`): cross-replica buffering, commit marker, partial-tx timeout + abort
+- repair-in-commit-pipeline for atomic txs (atomic with tx)
+- producer-side tx scope validation (single branch / zone / schema version)
 
 The milestone that unlocks editor-grade collaboration (ProseMirror, Tiptap, BlockNote, Notion-style apps) and locks in schema as a first-class concern. Rich text + schema are the hardest parts of the project and get a dedicated release.
 
