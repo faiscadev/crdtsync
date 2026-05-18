@@ -473,6 +473,89 @@ Value =
 
 ---
 
+# Client ID
+
+Each connecting Document instance carries a `client_id` — used for op identity (`op_id = (client_id, client_seq)`), per-instance undo stacks, reconnect routing, and audit. Distinct from `actor_id` (the authenticated human, from token).
+
+## Format and Generation
+
+| Property | Choice |
+|----------|--------|
+| Format | **UUID v7** (128-bit, time-sortable, RFC 9562) |
+| Generation | **client-side at first Document instance** — never server-issued |
+| Wire encoding | **16 bytes binary**; rendered as 36-char hex string in logs |
+| Trust | **untrusted** — actor_id (from token) is the trusted identity; forged client_id grants no impersonation |
+
+Client-generated because CRDTs are offline-first: editing must work before the first server contact. UUID v7 because it's standard, sortable by creation time (useful for debug / audit), and has wide ecosystem support across SDK languages. Birthday collisions at 128-bit width are negligible.
+
+## Lifetime: Per-Instance, Persisted Within the Instance
+
+Each Document instance gets its own `client_id`. The id persists across same-instance restart (page reload on web, app process restart on native) via:
+
+- web: `sessionStorage` (per-tab, survives page reload, lost on tab close)
+- native: app-local temp/process storage (survives in-process restart)
+
+New tab / new process = new `client_id`. No coordination across tabs.
+
+## Why Per-Tab and Not Per-Device
+
+Per-device (one `client_id` shared across all tabs in a browser) would require:
+
+- coordination of `client_seq` across tabs to prevent duplicate `op_id`s
+- leader election among tabs to own the counter
+- BroadcastChannel or SharedWorker to message between tabs
+- complex reconnect logic when the leader tab closes
+
+Per-tab gives up the "same device = same client" abstraction in exchange for zero coordination complexity. Engine treats each tab as a distinct client of the same actor. Undo stacks per-tab feel natural; the same user can have multiple parallel editing contexts.
+
+If an app genuinely needs shared undo across tabs (rare), it builds it on top via its own mechanism — not core's concern.
+
+## Multi-Device, Same Actor
+
+Each device has its own `client_id`. Ops carry both `client_id` (device/session) and `actor_id` (human). Per-device undo stacks; cross-device undo is an app-level layering if desired.
+
+```text
+Alice's laptop:  client_id = ABC..., actor_id = "user:alice"
+Alice's phone:   client_id = XYZ..., actor_id = "user:alice"
+```
+
+Audit queries can group by `actor_id` (all activity by Alice) or by `client_id` (specific device).
+
+## Renewal
+
+`client_id` is stable forever within an instance. It regenerates only on storage wipe (clearing cookies, clearing sessionStorage, clearing app data). Old `client_id`'s ops remain valid orphan history in the op log — they don't affect convergence, just take some tombstone GC effort eventually.
+
+No periodic rotation. No server-driven revocation.
+
+## Wire Footprint
+
+```text
+op_id    = client_id (16 bytes) + client_seq (u64, 8 bytes) = 24 bytes per op_id
+```
+
+24 bytes per op_id reference is acceptable. Compactness preserved in CBOR / MessagePack / Cap'n Proto.
+
+## Future v4-only Privacy Mode
+
+UUID v7's timestamp prefix leaks the device's first-connect time. Not a real privacy concern (`wall_time` on each op is more revealing). If a deployment ever requires unlinkable IDs, a config toggle could switch generation to UUID v4 instead. Same wire format (16 bytes), no breaking change. Deferred.
+
+## Locked Decisions
+
+| Decision | Choice |
+|----------|--------|
+| Format | UUID v7 |
+| Generation | client-side at first Document instance |
+| Server-issued option | not supported |
+| Lifetime | per-instance, persisted across same-instance restart (sessionStorage / app temp storage) |
+| Multi-tab coordination | none — each tab is a distinct `client_id` |
+| Multi-device | each device has its own `client_id`; same `actor_id` ties them together |
+| Wire encoding | 16 bytes binary |
+| Trust model | `client_id` untrusted; `actor_id` (token) is the trusted identity |
+| Renewal | only on storage wipe; no rotation |
+| v4 privacy-mode toggle | possible future config; not a wire-format change |
+
+---
+
 # Important Design Principle
 
 ## Intentions vs Internal CRDT Ops
@@ -3294,7 +3377,7 @@ Decisions that shape the wire format, op model, or schema language. These bind e
 | **decided** | **Unicode / Text char-id strategy** | Codepoint as CRDT identity (stable across Unicode versions), UTF-8 on wire, grapheme-cluster API default with codepoint-level opt-in. Mismatched Unicode versions produce cosmetic differences only — no data corruption. See **Text and Unicode** section. |
 | **decided** | **Op causality model** | Lamport timestamp + implicit dependency via payload refs. No explicit `deps` list field, no vector clocks. Receivers buffer out-of-order ops by looking up referenced `char_id` / `element_id`. See **Algorithms and Invariants → Causality → Dependency Model**. |
 | **decided** | **Custom Element types / plugin extensibility** | Closed primitive set. Wire-format op `kind` is a fixed enum. Apps cannot define new CRDT types in app code; they compose from existing primitives (cookbook ships v0.2). Genuinely new primitives ship through engine releases via RFC. App-level customization (XML types, marks, attrs, schema constraints, awareness, ACL) is fully supported through schema. See **Extensibility** section. |
-| pending | **Client ID strategy** | UUID v7 (sortable + random)? Server-issued? Persistent across sessions and devices? Affects op identity, undo stacks, audit, dedup. |
+| **decided** | **Client ID strategy** | UUID v7, client-generated, per-Document-instance, persisted across same-instance restart (sessionStorage on web / app temp storage on native). Each tab is a distinct `client_id`; multi-device handled by shared `actor_id`. 16 bytes binary on wire. See **Client ID** section. |
 | pending | **Wire protocol format + framing** | Serializes whatever model the decisions above lock in. Format choice (CBOR / MessagePack / Cap'n Proto / custom) is a perf + tooling pick **after** the model is settled, not before. Includes framing, version negotiation, mixed-version protocol headers. |
 
 These decisions interlock — the cargo determines the carrier. Wire protocol is intentionally last; designing it before locking the model is premature.
@@ -3341,6 +3424,7 @@ Features:
 - `doc.transact()` API: client-side observer batching, network batching, server-side log atomic write (non-atomic default)
 - Text with codepoint identity + UTF-8 wire + grapheme-aware SDK helpers (per-language Unicode lib bundled)
 - op `kind` as a fixed enum in the wire format (closed primitive set)
+- UUID v7 `client_id`, client-generated, per-instance, persisted via sessionStorage / app temp storage; 16 bytes binary on wire
 
 ---
 
