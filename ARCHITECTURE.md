@@ -2163,34 +2163,113 @@ Cheap-now / painful-later decision. The slot exists in the format from day one s
 
 # Networking Layer
 
-## Main Transport
+## Transport
+
+WebSocket. Bidirectional, browser-native, low latency, mature tooling. WSS over TLS in production.
+
+## Connection / Multiplexing Model
+
+**One WebSocket per `(server, actor session)`. Logical channels multiplexed per `(room, branch, zone)` subscription.**
+
+| Property | Choice |
+|----------|--------|
+| Connections per actor session | 1 |
+| Channels per connection | many — one per active `(room, branch, zone)` subscription |
+| Subscribe / unsubscribe | in-band control messages, runtime-mutable |
+| Server scaling | rooms sharded across replica sets; clients routed to the right replica via front-door router or HTTP redirect |
+| Heartbeat | per-connection keepalive (interval config) |
+| Reconnect | resume all subscriptions + `last_seen_seq` per channel |
+
+A client editing five docs in five tabs of one app opens five connections (per-tab `client_id`); a client editing five docs in one tab opens one connection with five channels. Server tracks subscriptions per channel; ops route only to subscribers of the channel they belong to.
+
+## Handshake
+
+Three phases. Wire structure is fixed; the credential carrier is deployment-pluggable.
 
 ```text
-WebSocket
+Phase 1: Hello (always)
+  Client → Server : ClientHello { wire_version, supported_codecs, capability_flags }
+  Server → Client : ServerHello { chosen_wire_version, chosen_codec, server_caps,
+                                  auth_state: "established" | "required" }
+
+Phase 2: Auth (only if auth_state == "required")
+  Client → Server : Auth        { credentials: opaque }
+  Server → Client : AuthResult  { actor_id, schema_versions_supported, ... }
+                  | AuthFailure { code, message }
+
+Phase 3: Subscribe (after auth established, repeatable)
+  Client → Server : Subscribe    { room, branch }
+  Server → Client : SubscribeAck { channel_id, snapshot_lamport, ops_since_lamport, ... }
 ```
 
-Reasons:
+### Wire-Version Header (Format-Stable)
 
-- bidirectional
-- browser-native
-- low latency
-- mature ecosystem
+The very first bytes of the connection carry a **fixed-format header**: a 4-byte magic + 4-byte protocol version. This header never changes shape across protocol versions — it is the only piece guaranteed to be parseable by every client/server forever.
 
----
+After the Hello exchange negotiates `chosen_codec`, all subsequent messages use that codec. New binary formats can ship in later releases without breaking older clients because Hello itself stays in a format-stable shape.
 
-## Binary Protocol
+### Fast Path: Credentials Present at Transport Upgrade
 
-Prefer binary protocol eventually.
+Browser cookie / WS subprotocol / `Authorization` header arrives with the connection upgrade. Server validates during accept. `ServerHello.auth_state = "established"`. Client skips Phase 2 and goes straight to Subscribe. Saves one round trip.
 
-Possible encodings:
+### Fallback Path: In-Band Auth Message
 
-- MessagePack
-- CBOR
-- Cap'n Proto
-- FlatBuffers
-- custom compact binary protocol
+No upgrade-time credentials? Server replies `auth_state = "required"`. Client sends an `Auth` message with credentials in-band. Server validates and replies `AuthResult`. Then subscriptions allowed.
 
-MVP can begin with JSON.
+### Pluggable Auth Carriers
+
+Deployment configures which carriers the server accepts:
+
+| Carrier | Use case |
+|---------|----------|
+| Cookie (HttpOnly, SameSite) | browser app served from same origin; XSS-safer, app code never touches credentials |
+| Bearer in `Sec-WebSocket-Protocol` subprotocol | browser app cross-origin |
+| `Authorization` header on upgrade | native apps, server-to-server |
+| In-band `Auth` message post-connect | transports without header support; embed contexts; custom transports |
+| Query parameter (`wss://...?token=...`) | not ideal (logs leak); supported for restricted embed contexts |
+| mTLS | server-to-server / high-security |
+| API key | server-to-server / scripted clients |
+
+`Auth.credentials` is opaque bytes on the wire. The server interprets them per its configured carrier(s) and verification (JWT signature, OIDC introspection, mTLS peer cert, cookie session lookup, etc.). Clients never assert `actor_id` — the server derives it from the verified credential.
+
+### Operations Allowed Before Auth Established
+
+Only `ClientHello`, `ServerHello`, and `Auth` messages. Any other op before auth is established = protocol violation, connection terminated.
+
+### Anonymous Mode
+
+If deployment policy permits anonymous access, server emits `actor_id = "anon:<random>"` either during the upgrade fast path (no creds present, anon allowed) or in response to an explicit `Auth { credentials: <anon_token> }`. Treated as any other authenticated actor by the authorization layer.
+
+## Binary Codec
+
+Format choice (CBOR / MessagePack / Cap'n Proto / custom) is an **implementation decision**, not a foundational one. Negotiated via Hello. New codecs ship in later releases without breaking older clients because the Hello header is format-stable.
+
+v0.1 likely ships with one binary format. JSON may be supported as a debug-mode codec for human-readable wire dumps.
+
+## Error Response Envelope
+
+Standardized error response carries a **closed enum code** + human message + opaque details. Closed enum for the same reason `op.kind` is closed: keeps the wire compact and ensures cross-language error handling stays uniform. New error codes ship through engine releases.
+
+```text
+Error {
+  code:    enum   // closed namespace: auth_failed, schema_mismatch, migration_gap,
+                  //                   unauthorized_op, blob_unavailable, ...
+  message: string
+  details: opaque
+}
+```
+
+## Format / Framing Details Not Locked
+
+| Decision | Status |
+|----------|--------|
+| Binary codec choice | deferred to implementation |
+| Compression algorithm (per-message, per-batch) | deferred (additive flag in framing) |
+| TLS profile, cipher selection | infrastructure, not protocol |
+| Field tag numbering (for tagged formats) | implementation detail of chosen codec |
+| Heartbeat interval default | runtime config |
+| Op size limits | server-side gate, can tighten/loosen without wire impact |
+| Batching strategy | optimization, semantics unchanged |
 
 ---
 
@@ -3368,7 +3447,9 @@ Cmdliner
 
 # Foundational Decisions
 
-Decisions that shape the wire format, op model, or schema language. These bind early — adding them after v0.1 ships requires breaking changes. Listed in priority order for discussion.
+Decisions that shape the wire format, op model, or schema language. These bind early — adding them after v0.1 ships requires breaking changes.
+
+**Status: all foundational decisions are decided.** Implementation choices (wire codec, compression, framing details, TLS profile, keepalive intervals, op size limits) are deferred to implementation time and can be revisited without breaking the model.
 
 | Status | Decision | Why foundational |
 |--------|----------|------------------|
@@ -3378,7 +3459,10 @@ Decisions that shape the wire format, op model, or schema language. These bind e
 | **decided** | **Op causality model** | Lamport timestamp + implicit dependency via payload refs. No explicit `deps` list field, no vector clocks. Receivers buffer out-of-order ops by looking up referenced `char_id` / `element_id`. See **Algorithms and Invariants → Causality → Dependency Model**. |
 | **decided** | **Custom Element types / plugin extensibility** | Closed primitive set. Wire-format op `kind` is a fixed enum. Apps cannot define new CRDT types in app code; they compose from existing primitives (cookbook ships v0.2). Genuinely new primitives ship through engine releases via RFC. App-level customization (XML types, marks, attrs, schema constraints, awareness, ACL) is fully supported through schema. See **Extensibility** section. |
 | **decided** | **Client ID strategy** | UUID v7, client-generated, per-Document-instance, persisted across same-instance restart (sessionStorage on web / app temp storage on native). Each tab is a distinct `client_id`; multi-device handled by shared `actor_id`. 16 bytes binary on wire. See **Client ID** section. |
-| pending | **Wire protocol format + framing** | Serializes whatever model the decisions above lock in. Format choice (CBOR / MessagePack / Cap'n Proto / custom) is a perf + tooling pick **after** the model is settled, not before. Includes framing, version negotiation, mixed-version protocol headers. |
+| **decided** | **Connection / multiplexing model** | One WebSocket per `(server, actor session)`; logical channels multiplexed per `(room, branch, zone)` subscription; subscribe/unsubscribe in-band. See **Networking Layer → Connection / Multiplexing Model**. |
+| **decided** | **Handshake structure** | Three phases (Hello / Auth / Subscribe); format-stable wire-version header in the first 8 bytes; pluggable auth carriers (cookie / WS subprotocol / Authorization header / in-band Auth / mTLS / API key); `Auth.credentials` is opaque bytes interpreted by deployment-configured verifier; clients never assert `actor_id`. See **Networking Layer → Handshake**. |
+| deferred to impl | **Wire format codec** (CBOR / MessagePack / Cap'n Proto / custom) | Negotiated via Hello; new codecs ship in later releases without breaking older clients. |
+| deferred to impl | Compression, framing details, TLS profile, keepalive, op size limits | Implementation/infrastructure, not foundational. |
 
 These decisions interlock — the cargo determines the carrier. Wire protocol is intentionally last; designing it before locking the model is premature.
 
@@ -3425,6 +3509,9 @@ Features:
 - Text with codepoint identity + UTF-8 wire + grapheme-aware SDK helpers (per-language Unicode lib bundled)
 - op `kind` as a fixed enum in the wire format (closed primitive set)
 - UUID v7 `client_id`, client-generated, per-instance, persisted via sessionStorage / app temp storage; 16 bytes binary on wire
+- single multiplexed WebSocket per `(server, actor session)` with logical channels per `(room, branch, zone)`
+- three-phase handshake (Hello / Auth / Subscribe), format-stable wire-version header, pluggable auth carriers (cookie / WS subprotocol / `Authorization` header / in-band Auth message), opaque `Auth.credentials`
+- standardized `Error` envelope (closed-enum code + message + opaque details)
 
 ---
 
