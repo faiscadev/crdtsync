@@ -684,11 +684,29 @@ Orphaning is never silent.
 
 ```text
 op identity:    (client_id, client_seq)
-total order:    lamport timestamp + client_id tiebreak
+total order:    per-zone lamport timestamp + client_id tiebreak
 client order:   client_seq monotonic per client (FIFO)
 ```
 
-Lamport = `max(seen_ts) + 1`. Used by tree moves, mark merging, Register LWW. Wall clocks are not trusted.
+Lamport = `max(seen_ts_in_zone) + 1`. Used by tree moves, mark merging, Register LWW. Wall clocks are not trusted.
+
+### Dependency Model: Lamport + Implicit (No Explicit Deps List)
+
+Ops carry only the lamport timestamp on the wire. Causal dependencies are **implicit through payload refs** — each op references the `char_id`s or `element_id`s it operates on, and those refs ARE the dependencies.
+
+Receivers buffer ops whose payload refs point to ids not yet seen; apply when the referenced ids arrive. Apply within a zone in lamport order.
+
+Rejected: explicit per-op dependency lists (Automerge-style hashes / op_id sets).
+
+| Approach | Why |
+|----------|-----|
+| **Lamport + implicit (chosen)** | Smaller wire bytes per op (no deps list); simpler protocol; lookup by referenced char_id is natural; track record at Yjs scale. |
+| Explicit deps list | Deps would duplicate refs already in the payload; larger ops; protocol overhead with no engine-level benefit. |
+| Vector clocks (O(n_actors) per op) | Lets engine distinguish concurrent vs causal precisely. CRDT primitives merge correctly regardless, so the distinction is not needed at engine level. |
+
+Receivers do buffer out-of-order ops, but the buffering machinery looks up by referenced id — no separate `deps` field on the wire.
+
+Both approaches buffer when prerequisites are missing. The difference is **how prerequisites are identified**: lamport-only reads the payload's existing refs; explicit-deps adds a redundant field. We pick lamport-only.
 
 ## Tree Moves (XmlElement)
 
@@ -3205,7 +3223,7 @@ Decisions that shape the wire format, op model, or schema language. These bind e
 | **decided** | **Binary blob model** | Refs in ops, bytes in separate blob store, content-addressable internally (sha256), random UUIDs publicly. Universal presigned-URL interface across all backends. Inline only for blobs ≤ 4KB. ACL per reference site. See **Binary Blobs** section. |
 | **decided** | **Atomic multi-op transactions** | Single `doc.transact()` API. Non-atomic batching is the default (streaming UX, CRDT-correct). `atomic: true` opt-in for privilege / reference / cross-element invariants. `tx_id` + `tx_role` reserved in op envelope from v0.1. See **Transactions** section. |
 | **decided** | **Unicode / Text char-id strategy** | Codepoint as CRDT identity (stable across Unicode versions), UTF-8 on wire, grapheme-cluster API default with codepoint-level opt-in. Mismatched Unicode versions produce cosmetic differences only — no data corruption. See **Text and Unicode** section. |
-| pending | **Op causality model** | Explicit per-op dependencies vs lamport-only ordering. Affects replay correctness in pathological out-of-order scenarios and protocol byte cost. |
+| **decided** | **Op causality model** | Lamport timestamp + implicit dependency via payload refs. No explicit `deps` list field, no vector clocks. Receivers buffer out-of-order ops by looking up referenced `char_id` / `element_id`. See **Algorithms and Invariants → Causality → Dependency Model**. |
 | pending | **Custom Element types / plugin extensibility** | Whether the primitive type system is closed or open. If open: schema language and op-kind discriminator need namespacing + versioning. Closing later is easy; opening later is a wire break. |
 | pending | **Client ID strategy** | UUID v7 (sortable + random)? Server-issued? Persistent across sessions and devices? Affects op identity, undo stacks, audit, dedup. |
 | pending | **Wire protocol format + framing** | Serializes whatever model the decisions above lock in. Format choice (CBOR / MessagePack / Cap'n Proto / custom) is a perf + tooling pick **after** the model is settled, not before. Includes framing, version negotiation, mixed-version protocol headers. |
