@@ -295,13 +295,17 @@ Positions in user-facing APIs are integer offsets; internally these resolve to c
 
 ## Map
 
+Wire-level ops:
+
 ```text
-set(key, value)              // throws if key already holds a CRDT — see Map Slot Safety
-replace(key, value)          // explicit replacement
-initOnce(key, factory)       // safe lazy init for CRDT children
-delete(key)
-live(key)                    // reactive accessor for editor bindings
+set(key, value)              // unconditional LWW; displaced Element refs surface as orphans
+delete(key)                  // remove key; displaced Element ref surfaces as orphan
 ```
+
+SDK adds ergonomic getOrCreate surfaces (e.g. `Map.text key`, `Map.list key`,
+`Map.map key`) that internally derive the child element_id from `(parent_id,
+key)` and emit a `set` op — concurrent calls converge on the same Element by
+construction. See Map Slot Safety.
 
 Nested values supported (any Element type). Scalar set uses LWW.
 
@@ -405,7 +409,7 @@ Apps do not ship custom CRDT primitives in their own code.
 ```text
 op.kind = enum {
   text.insert | text.remove | text.replace
-  map.set | map.replace | map.initOnce | map.delete
+  map.set | map.delete
   list.insert | list.remove | list.move
   xml.setAttr | xml.removeAttr | xml.insertChild | xml.removeChild | xml.move
   ranged.create | ranged.remove | ranged.updatePayload
@@ -788,45 +792,51 @@ Peritext-style range CRDT (Litt, van Hardenberg, Kleppmann — Ink & Switch 2022
 
 # Map Slot Safety
 
-`Map.set(key, value)` uses LWW on assignment. For scalar values this is fine. For child CRDTs, naive use causes silent orphaning.
+`Map.set(key, value)` uses LWW. For scalar values this is fine. For child CRDTs, the convergence guarantee comes from **deterministic element_id derivation**, not from API guardrails.
 
-## The Problem
+## The Problem (and Solution)
 
 ```text
-Alice: map.set("body", new Text())   @ t=10
-Bob:   map.set("body", new Text())   @ t=12   (concurrent)
-→ Bob's Text wins LWW. Alice's Text is orphaned.
-  Alice continues editing her Text locally; ops are valid but unreachable from doc root.
-  Visible content diverges silently until Alice re-reads map["body"].
+Alice: map.text("body")   @ t=10        // SDK derives id = v5(map_id, "body")
+Bob:   map.text("body")   @ t=12        // SDK derives same id (concurrent)
+→ Both clients compute the SAME element_id from (parent_id, "body").
+  Both Set ops carry the same Element value.
+  LWW picks one wire op as the winner; the value is identical either way.
+  No orphan, no divergence. Both Alice and Bob edit the same Text.
 ```
 
-## API Guardrails
+## SDK Surface (illustrative; final naming lives in each SDK)
 
-```ts
-map.initOnce(key, factory)   // safe lazy init — concurrent calls converge to one Element
-map.replace(key, value)      // explicit replacement (acknowledges orphaning)
-map.set(key, crdtValue)      // throws if key already holds a CRDT; allowed for scalars
-map.live(key)                // reactive accessor — re-resolves through path on every op
+```ocaml
+Map.set    : Map.t -> key:string -> value:Value.t -> unit
+Map.delete : Map.t -> key:string -> unit
+Map.text   : Map.t -> key:string -> Text.t        (* getOrCreate; deterministic id *)
+Map.map    : Map.t -> key:string -> Map.t         (* nested map; same idea *)
+Map.list   : Map.t -> key:string -> List.t
+Map.live   : Map.t -> key:string -> live_handle   (* reactive ref for editor bindings *)
 ```
 
-App pattern:
+Wire-level ops are minimal: just `Set { key; value }` and `Delete { key }`. The
+ergonomic getOrCreate surfaces (`text`, `get_map`, `get_list`) are SDK sugar
+that derives the child element_id from `(parent_id, key)` and emits a `Set`
+op with that derived id as the value. Two clients calling the same SDK helper
+on the same (parent, key) compute the same id and converge by construction.
 
-```ts
-const body = doc.getMap("doc").initOnce("body", () => new Text())
-// All clients converge to the same Text. Edit forever.
-```
+Standalone CRDT construction (a la `new Text()` in Yjs) is intentionally not
+supported in v0.1: elements must be created at their final location so the
+deterministic id has a parent. Removes the "type not yet integrated" footgun.
 
-Editor bindings hold `map.live(key)` references, not direct CRDT references. When LWW swaps a value, the live ref re-binds, observers fire, the view re-attaches.
+Editor bindings hold `Map.live key` references, not direct CRDT references. When LWW swaps a value, the live ref re-binds, observers fire, the view re-attaches.
 
 ## Orphan Event
 
-When an Element becomes unreachable from any root, core fires:
+If a `Set` or `Delete` displaces an Element ref (e.g. set("body", "scalar") on a slot that previously held a Text), the displaced element_id may become unreachable. Core surfaces this:
 
-```ts
-doc.on("orphan", (element) => { /* salvage, warn, log, ignore */ })
+```ocaml
+Doc.on_orphan : Doc.t -> (Element_id.t -> unit) -> unit
 ```
 
-Orphaning is never silent.
+Orphaning is never silent. Note: with deterministic ids and SDK getOrCreate, concurrent same-key initialization no longer causes orphans — only deliberate `Set`/`Delete` does.
 
 ---
 

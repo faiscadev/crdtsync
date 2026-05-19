@@ -14,6 +14,9 @@ module Uuid_v7 = Uuid_v7
 module Op_id = Op_id
 module Lamport = Lamport
 module Wall_time = Wall_time
+module Element_id = Element_id
+module Value = Value
+module Map = Map
 module Op = Op
 module Envelope = Envelope
 

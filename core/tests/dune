@@ -5,7 +5,10 @@
   test_op_id
   test_lamport
   test_wall_time
-  test_envelope)
+  test_envelope
+  test_element_id
+  test_value
+  test_map)
  (libraries
   alcotest
   qcheck-alcotest
