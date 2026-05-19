@@ -1,5 +1,5 @@
-(** Tests for [Crdtsync_crdt.Uuid_v7]. Black-box: only the .mli surface is exercised, never
-    internals. *)
+(** Tests for [Crdtsync_crdt.Uuid_v7]. Black-box: only the .mli surface is exercised,
+    never internals. *)
 
 module Uuid_v7 = Crdtsync_crdt.Uuid_v7
 
@@ -76,7 +76,8 @@ let test_of_string_malformed () =
     (Option.map Uuid_v7.to_string (Uuid_v7.of_string "not-a-uuid"));
   Alcotest.(check (option string))
     "garbage rejected" None
-    (Option.map Uuid_v7.to_string (Uuid_v7.of_string "zzzzzzzz-zzzz-7zzz-zzzz-zzzzzzzzzzzz"))
+    (Option.map Uuid_v7.to_string
+       (Uuid_v7.of_string "zzzzzzzz-zzzz-7zzz-zzzz-zzzzzzzzzzzz"))
 
 let test_of_string_wrong_version () =
   let u = Uuid_v7.v () in
@@ -148,8 +149,8 @@ let prop_string_round_trip =
 
 let prop_compare_total =
   (* Antisymmetry-of-sign: compare a b and compare b a have opposite signs (or both 0). *)
-  QCheck.Test.make ~count:200 ~name:"compare antisymmetric" (QCheck.pair arb_uuid arb_uuid)
-    (fun (a, b) ->
+  QCheck.Test.make ~count:200 ~name:"compare antisymmetric"
+    (QCheck.pair arb_uuid arb_uuid) (fun (a, b) ->
       let ab = Uuid_v7.compare a b in
       let ba = Uuid_v7.compare b a in
       (ab = 0 && ba = 0) || ab * ba < 0)
@@ -182,9 +183,11 @@ let () =
       ( "parsing rejects",
         [
           Alcotest.test_case "of_bytes wrong length" `Quick test_of_bytes_wrong_length;
-          Alcotest.test_case "of_bytes wrong version nibble" `Quick test_of_bytes_wrong_version;
+          Alcotest.test_case "of_bytes wrong version nibble" `Quick
+            test_of_bytes_wrong_version;
           Alcotest.test_case "of_string malformed input" `Quick test_of_string_malformed;
-          Alcotest.test_case "of_string wrong version digit" `Quick test_of_string_wrong_version;
+          Alcotest.test_case "of_string wrong version digit" `Quick
+            test_of_string_wrong_version;
         ] );
       ( "properties (qcheck)",
         List.map QCheck_alcotest.to_alcotest

@@ -25,7 +25,7 @@ Ship a working single-node sync engine. One OCaml server, SQLite persistence, Ty
 ## Core CRDT (OCaml)
 
 - [x] **CORE-1** Op envelope type + per-zone lamport infrastructure + UUID v7 generation
-- [ ] **CORE-2** Map primitive (with slot safety: `initOnce`, `live`, `replace`, orphan event)
+- [x] **CORE-2** Map primitive (LWW; ops = `set` / `delete`; deterministic Element_id via UUID v5; released-refs surface for orphan tracking; `initOnce`/`live` deferred to SDK as ergonomic sugar)
 - [ ] **CORE-3** List primitive
 - [ ] **CORE-4** Text primitive (codepoint identity, char_id, UTF-8 in/out)
 - [ ] **CORE-5** Register + Counter primitives

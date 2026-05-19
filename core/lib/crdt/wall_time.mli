@@ -1,12 +1,12 @@
 (** Wall-clock time.
 
-    Real-world timestamp captured at op authoring. Informational only — not used for causality (see
-    {!Lamport} for that). Powers debug / audit / display / analytics. See ARCHITECTURE.md, section
-    "Internal Data Model". *)
+    Real-world timestamp captured at op authoring. Informational only — not used for
+    causality (see {!Lamport} for that). Powers debug / audit / display / analytics. See
+    ARCHITECTURE.md, section "Internal Data Model". *)
 
 type t
-(** Abstract, nonnegative [int64] milliseconds since the Unix epoch (1970-01-01 UTC). Pre-epoch
-    timestamps not supported. *)
+(** Abstract, nonnegative [int64] milliseconds since the Unix epoch (1970-01-01 UTC).
+    Pre-epoch timestamps not supported. *)
 
 val now : unit -> t
 (** Current wall-clock time. *)

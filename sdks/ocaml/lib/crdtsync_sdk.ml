@@ -1,7 +1,7 @@
 (** crdtsync OCaml client SDK.
 
-    Client-side connection + ergonomic API for OCaml apps that want to speak the crdtsync protocol
-    as a peer of TS / Python / Go / Rust / JVM clients.
+    Client-side connection + ergonomic API for OCaml apps that want to speak the crdtsync
+    protocol as a peer of TS / Python / Go / Rust / JVM clients.
 
     Surface (lands per SDK-OCAML-1 through SDK-OCAML-7 — see KANBAN.md):
     - Document.open / connect — establish session, run handshake
@@ -17,8 +17,8 @@
     - crdtsync_core.crdt for the local CRDT types
     - crdtsync_core.wire for op envelope + codec + handshake messages
 
-    Does NOT depend on [crdtsync_core.persist] / [crdtsync_core.server] / [crdtsync_core.auth] /
-    [crdtsync_core.blob] — those are server-side concerns. *)
+    Does NOT depend on [crdtsync_core.persist] / [crdtsync_core.server] /
+    [crdtsync_core.auth] / [crdtsync_core.blob] — those are server-side concerns. *)
 
 (* Wrapper module for the [crdtsync_sdk] library. Submodules from sibling files must be
    re-exported here to be reachable as [Crdtsync_sdk.<Submodule>] from outside. *)

@@ -14,5 +14,6 @@ let test_sublibraries_link () =
 let () =
   Alcotest.run "smoke"
     [
-      ("sublibraries", [ Alcotest.test_case "all sublibraries link" `Quick test_sublibraries_link ]);
+      ( "sublibraries",
+        [ Alcotest.test_case "all sublibraries link" `Quick test_sublibraries_link ] );
     ]
