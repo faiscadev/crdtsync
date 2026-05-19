@@ -23,6 +23,7 @@ crdtsync/
 │   ├── wasm/                   wasm_of_ocaml / js_of_ocaml build of core
 │   └── cabi/                   C header + shared lib (.so / .dylib / .dll) build
 ├── sdks/
+│   ├── ocaml/                  consumes crdtsync_core directly (no FFI)
 │   ├── typescript/             consumes WASM
 │   ├── python/                 consumes C ABI via cffi
 │   ├── go/                     consumes C ABI via cgo
@@ -68,6 +69,7 @@ Release flow:
 1. Bump `VERSION`
 2. Tag the monorepo: `git tag v0.1.0`
 3. CI publishes each SDK to its native registry under that version:
+   - `opam publish crdtsync_sdk.0.1.0` (OCaml SDK)
    - `npm publish crdtsync@0.1.0`
    - `pip publish crdtsync==0.1.0`
    - `cargo publish crdtsync@0.1.0`
@@ -120,7 +122,8 @@ GitHub Actions runs jobs per concern:
 | `core-build-test` | every push |
 | `wasm-build` | every push touching `core/`, `bindings/wasm/` |
 | `cabi-build` | every push touching `core/`, `bindings/cabi/`, any `sdks/{python,go,rust,jvm}/` |
-| `sdk-{lang}-test` | every push touching `sdks/{lang}/` or its build deps |
+| `sdk-ocaml-test` | every push touching `core/lib/{crdt,wire}/` or `sdks/ocaml/` (no FFI; same dune workspace) |
+| `sdk-{lang}-test` for `{lang}` in `{typescript,python,go,rust,jvm}` | every push touching `sdks/{lang}/` or its build deps |
 | `adapter-{name}-test` | every push touching adapter dirs |
 | `cli-build-test` | every push touching `cli/` |
 | `release` | on tag push (`v*`) |

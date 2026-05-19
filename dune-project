@@ -44,3 +44,19 @@ See ARCHITECTURE.md.")
   (ocaml (>= 5.1))
   (dune (>= 3.16))
   crdtsync_core))
+
+(package
+ (name crdtsync_sdk)
+ (synopsis "crdtsync OCaml client SDK")
+ (description
+  "Client-side SDK for OCaml apps: WebSocket client, handshake, reconnect,
+ergonomic primitives wrappers, anchors, doc.transact(), observers, blob
+helpers. Sibling of the TS / Python / Go / Rust / JVM SDKs.
+
+Lives in the same dune workspace; sources under sdks/ocaml/.")
+ (depends
+  (ocaml (>= 5.1))
+  (dune (>= 3.16))
+  (crdtsync_core (= :version))
+  (logs (>= 0.7.0))
+  (alcotest :with-test)))
