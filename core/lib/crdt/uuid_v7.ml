@@ -19,10 +19,12 @@ let rec v () : t =
 let to_bytes (id : t) : bytes = Uuidm.to_binary_string id |> Bytes.of_string
 
 let of_bytes (bs : bytes) : t option =
-  let s = Bytes.to_string bs in
-  match Uuidm.of_binary_string s with
-  | Some uuid when Uuidm.version uuid = 7 -> Some uuid
-  | _ -> None
+  if Bytes.length bs <> 16 then None
+  else
+    let s = Bytes.to_string bs in
+    match Uuidm.of_binary_string s with
+    | Some uuid when Uuidm.version uuid = 7 -> Some uuid
+    | _ -> None
 
 let to_string (id : t) : string = Uuidm.to_string id
 
