@@ -1,8 +1,8 @@
 (** crdtsync CLI entrypoint.
 
-    Subcommands (per ARCHITECTURE.md, CLI section): serve — run the sync server snapshot — export /
-    import snapshots migrate — generate / verify / apply schema migrations audit — query the op log
-    compact — run log compaction
+    Subcommands (per ARCHITECTURE.md, CLI section): serve — run the sync server snapshot —
+    export / import snapshots migrate — generate / verify / apply schema migrations audit
+    — query the op log compact — run log compaction
 
     None of these are implemented yet. See KANBAN.md, SERVER-7. *)
 

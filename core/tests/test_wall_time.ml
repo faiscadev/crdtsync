@@ -19,7 +19,8 @@ let test_of_ms_rejects_negative () =
         let _ = Wall_time.of_ms (-1L) in
         ()
       with e -> if is_failure e then raise (Failure "ignored") else raise e);
-  Alcotest.check_raises "of_ms Int64.min_int raises Failure" (Failure "ignored") (fun () ->
+  Alcotest.check_raises "of_ms Int64.min_int raises Failure" (Failure "ignored")
+    (fun () ->
       try
         let _ = Wall_time.of_ms Int64.min_int in
         ()
@@ -40,8 +41,12 @@ let test_equal_matches_compare () =
   Alcotest.(check bool) "not equal a c" false (Wall_time.equal a c)
 
 let test_pp_decimal () =
-  Alcotest.(check string) "pp 0" "0" (Format.asprintf "%a" Wall_time.pp (Wall_time.of_ms 0L));
-  Alcotest.(check string) "pp 42" "42" (Format.asprintf "%a" Wall_time.pp (Wall_time.of_ms 42L));
+  Alcotest.(check string)
+    "pp 0" "0"
+    (Format.asprintf "%a" Wall_time.pp (Wall_time.of_ms 0L));
+  Alcotest.(check string)
+    "pp 42" "42"
+    (Format.asprintf "%a" Wall_time.pp (Wall_time.of_ms 42L));
   Alcotest.(check string)
     "pp 1733000000000" "1733000000000"
     (Format.asprintf "%a" Wall_time.pp (Wall_time.of_ms 1733000000000L))
@@ -68,12 +73,12 @@ let nonneg_int64 : int64 QCheck.arbitrary =
   QCheck.map ~rev:(fun n -> n) (fun n -> Int64.logand n Int64.max_int) QCheck.int64
 
 let prop_round_trip =
-  QCheck.Test.make ~count:500 ~name:"of_ms / to_ms round-trip on nonneg" nonneg_int64 (fun n ->
-      Int64.equal n (Wall_time.to_ms (Wall_time.of_ms n)))
+  QCheck.Test.make ~count:500 ~name:"of_ms / to_ms round-trip on nonneg" nonneg_int64
+    (fun n -> Int64.equal n (Wall_time.to_ms (Wall_time.of_ms n)))
 
 let prop_compare_antisymmetric =
-  QCheck.Test.make ~count:200 ~name:"compare antisymmetric" (QCheck.pair nonneg_int64 nonneg_int64)
-    (fun (a, b) ->
+  QCheck.Test.make ~count:200 ~name:"compare antisymmetric"
+    (QCheck.pair nonneg_int64 nonneg_int64) (fun (a, b) ->
       let ta = Wall_time.of_ms a in
       let tb = Wall_time.of_ms b in
       let ab = Wall_time.compare ta tb in
@@ -88,7 +93,8 @@ let prop_equal_iff_compare_zero =
       Bool.equal (Wall_time.equal ta tb) (Wall_time.compare ta tb = 0))
 
 let prop_of_ms_raises_on_negative =
-  QCheck.Test.make ~count:200 ~name:"of_ms raises Failure on negative" QCheck.int64 (fun n ->
+  QCheck.Test.make ~count:200 ~name:"of_ms raises Failure on negative" QCheck.int64
+    (fun n ->
       if n < 0L then
         try
           let _ = Wall_time.of_ms n in

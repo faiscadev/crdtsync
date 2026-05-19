@@ -29,7 +29,9 @@ let of_bytes (bs : bytes) : t option =
 let to_string (id : t) : string = Uuidm.to_string id
 
 let of_string (str : string) : t option =
-  match Uuidm.of_string str with Some uuid when Uuidm.version uuid = 7 -> Some uuid | _ -> None
+  match Uuidm.of_string str with
+  | Some uuid when Uuidm.version uuid = 7 -> Some uuid
+  | _ -> None
 
 let compare = Uuidm.compare
 let pp = Uuidm.pp

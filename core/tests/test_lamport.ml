@@ -8,7 +8,9 @@ let test_zero_round_trips () =
   Alcotest.(check int64) "to_int64 zero = 0L" 0L (Lamport.to_int64 Lamport.zero)
 
 let test_zero_reflexive () =
-  Alcotest.(check int) "compare zero zero = 0" 0 (Lamport.compare Lamport.zero Lamport.zero)
+  Alcotest.(check int)
+    "compare zero zero = 0" 0
+    (Lamport.compare Lamport.zero Lamport.zero)
 
 let test_tick_adds_one () =
   let one = Lamport.tick Lamport.zero in
@@ -59,7 +61,8 @@ let test_pp_decimal () =
   Alcotest.(check string) "pp 0 = \"0\"" "0" (Format.asprintf "%a" Lamport.pp zero);
   Alcotest.(check string) "pp 42 = \"42\"" "42" (Format.asprintf "%a" Lamport.pp small);
   Alcotest.(check string)
-    "pp Int64.max_int" (Int64.to_string Int64.max_int)
+    "pp Int64.max_int"
+    (Int64.to_string Int64.max_int)
     (Format.asprintf "%a" Lamport.pp big)
 
 let test_of_int64_rejects_negative () =
@@ -69,7 +72,8 @@ let test_of_int64_rejects_negative () =
         let _ = Lamport.of_int64 (-1L) in
         ()
       with e -> if is_failure e then raise (Failure "ignored") else raise e);
-  Alcotest.check_raises "of_int64 Int64.min_int raises Failure" (Failure "ignored") (fun () ->
+  Alcotest.check_raises "of_int64 Int64.min_int raises Failure" (Failure "ignored")
+    (fun () ->
       try
         let _ = Lamport.of_int64 Int64.min_int in
         ()
@@ -93,12 +97,12 @@ let arb_lamport : Lamport.t QCheck.arbitrary =
   QCheck.map ~rev:Lamport.to_int64 Lamport.of_int64 nonneg_int64
 
 let prop_round_trip_int64_nonneg =
-  QCheck.Test.make ~count:500 ~name:"of_int64 nonneg / to_int64 round-trip" nonneg_int64 (fun n ->
-      Int64.equal n (Lamport.to_int64 (Lamport.of_int64 n)))
+  QCheck.Test.make ~count:500 ~name:"of_int64 nonneg / to_int64 round-trip" nonneg_int64
+    (fun n -> Int64.equal n (Lamport.to_int64 (Lamport.of_int64 n)))
 
 let prop_of_int64_raises_on_negative =
-  QCheck.Test.make ~count:200 ~name:"of_int64 raises Failure on any negative input" QCheck.int64
-    (fun n ->
+  QCheck.Test.make ~count:200 ~name:"of_int64 raises Failure on any negative input"
+    QCheck.int64 (fun n ->
       if n < 0L then
         try
           let _ = Lamport.of_int64 n in
@@ -107,11 +111,12 @@ let prop_of_int64_raises_on_negative =
       else true)
 
 let prop_compare_reflexive =
-  QCheck.Test.make ~count:200 ~name:"compare l l = 0" arb_lamport (fun l -> Lamport.compare l l = 0)
+  QCheck.Test.make ~count:200 ~name:"compare l l = 0" arb_lamport (fun l ->
+      Lamport.compare l l = 0)
 
 let prop_compare_antisymmetric =
-  QCheck.Test.make ~count:200 ~name:"compare antisymmetric" (QCheck.pair arb_lamport arb_lamport)
-    (fun (a, b) ->
+  QCheck.Test.make ~count:200 ~name:"compare antisymmetric"
+    (QCheck.pair arb_lamport arb_lamport) (fun (a, b) ->
       let ab = Lamport.compare a b in
       let ba = Lamport.compare b a in
       (ab = 0 && ba = 0) || ab * ba < 0)
@@ -132,7 +137,8 @@ let prop_merge_dominates =
     (QCheck.pair arb_lamport arb_lamport) (fun (recv, local) ->
       let r_i = Lamport.to_int64 recv in
       let l_i = Lamport.to_int64 local in
-      QCheck.assume ((not (Int64.equal r_i Int64.max_int)) && not (Int64.equal l_i Int64.max_int));
+      QCheck.assume
+        ((not (Int64.equal r_i Int64.max_int)) && not (Int64.equal l_i Int64.max_int));
       let m = Lamport.merge ~recv ~local in
       Lamport.compare m recv > 0 && Lamport.compare m local > 0)
 
@@ -161,13 +167,16 @@ let () =
           Alcotest.test_case "recv larger" `Quick test_merge_max_plus_one_recv_larger;
           Alcotest.test_case "local larger" `Quick test_merge_max_plus_one_local_larger;
           Alcotest.test_case "equal" `Quick test_merge_equal;
-          Alcotest.test_case "result dominates both inputs" `Quick test_merge_dominates_inputs;
+          Alcotest.test_case "result dominates both inputs" `Quick
+            test_merge_dominates_inputs;
         ] );
-      ("equal", [ Alcotest.test_case "matches compare = 0" `Quick test_equal_matches_compare ]);
+      ( "equal",
+        [ Alcotest.test_case "matches compare = 0" `Quick test_equal_matches_compare ] );
       ("pp", [ Alcotest.test_case "format is decimal" `Quick test_pp_decimal ]);
       ( "of_int64",
         [
-          Alcotest.test_case "raises Failure on negative" `Quick test_of_int64_rejects_negative;
+          Alcotest.test_case "raises Failure on negative" `Quick
+            test_of_int64_rejects_negative;
           Alcotest.test_case "round-trip on nonneg covers extremes" `Quick
             test_round_trip_int64_nonneg;
         ] );

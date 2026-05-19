@@ -10,7 +10,8 @@ let compare (a : t) (b : t) : int =
   let c = Uuid_v7.compare a.client_id b.client_id in
   if c <> 0 then c else Int64.compare a.client_seq b.client_seq
 
-let equal (a : t) (b : t) : bool = a.client_id = b.client_id && a.client_seq = b.client_seq
+let equal (a : t) (b : t) : bool =
+  a.client_id = b.client_id && a.client_seq = b.client_seq
 
 let pp (fmt : Format.formatter) (opid : t) : unit =
   Format.fprintf fmt "%a:%Ld" Uuid_v7.pp opid.client_id opid.client_seq

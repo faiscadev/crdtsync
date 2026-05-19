@@ -91,8 +91,8 @@ let prop_compare_reflexive =
       Op_id.compare op op = 0)
 
 let prop_compare_antisymmetric =
-  QCheck.Test.make ~count:200 ~name:"compare antisymmetric" (QCheck.pair arb_op_id arb_op_id)
-    (fun (a, b) ->
+  QCheck.Test.make ~count:200 ~name:"compare antisymmetric"
+    (QCheck.pair arb_op_id arb_op_id) (fun (a, b) ->
       let ab = Op_id.compare a b in
       let ba = Op_id.compare b a in
       (ab = 0 && ba = 0) || ab * ba < 0)
@@ -105,10 +105,11 @@ let prop_equal_iff_compare_zero =
 let prop_make_round_trip =
   let cid_gen = QCheck.make ~print:Uuid_v7.to_string (fun _ -> Uuid_v7.v ()) in
   let seq_gen = QCheck.int64 in
-  QCheck.Test.make ~count:200 ~name:"make/project round-trip" (QCheck.pair cid_gen seq_gen)
-    (fun (cid, seq) ->
+  QCheck.Test.make ~count:200 ~name:"make/project round-trip"
+    (QCheck.pair cid_gen seq_gen) (fun (cid, seq) ->
       let op = Op_id.make ~client_id:cid ~client_seq:seq in
-      Uuid_v7.compare (Op_id.client_id op) cid = 0 && Int64.equal (Op_id.client_seq op) seq)
+      Uuid_v7.compare (Op_id.client_id op) cid = 0
+      && Int64.equal (Op_id.client_seq op) seq)
 
 (* ── entry point ──────────────────────────────────────────────────────────── *)
 
@@ -117,23 +118,32 @@ let () =
     [
       ( "construction",
         [
-          Alcotest.test_case "make then client_id round-trips" `Quick test_make_projects_client_id;
-          Alcotest.test_case "make then client_seq round-trips" `Quick test_make_projects_client_seq;
+          Alcotest.test_case "make then client_id round-trips" `Quick
+            test_make_projects_client_id;
+          Alcotest.test_case "make then client_seq round-trips" `Quick
+            test_make_projects_client_seq;
         ] );
       ( "compare",
         [
           Alcotest.test_case "reflexive" `Quick test_compare_reflexive;
-          Alcotest.test_case "client_id is primary key" `Quick test_compare_client_id_first;
-          Alcotest.test_case "client_seq breaks ties" `Quick test_compare_client_seq_on_tie;
+          Alcotest.test_case "client_id is primary key" `Quick
+            test_compare_client_id_first;
+          Alcotest.test_case "client_seq breaks ties" `Quick
+            test_compare_client_seq_on_tie;
           Alcotest.test_case "signed Int64 ordering at extremes" `Quick
             test_compare_int64_unsigned_or_signed;
         ] );
       ( "equal",
         [
           Alcotest.test_case "matches compare = 0" `Quick test_equal_matches_compare;
-          Alcotest.test_case "distinct client_id => not equal" `Quick test_equal_distinct_client_id;
+          Alcotest.test_case "distinct client_id => not equal" `Quick
+            test_equal_distinct_client_id;
         ] );
-      ("pp", [ Alcotest.test_case "format is \"<client_id>:<client_seq>\"" `Quick test_pp_format ]);
+      ( "pp",
+        [
+          Alcotest.test_case "format is \"<client_id>:<client_seq>\"" `Quick
+            test_pp_format;
+        ] );
       ( "properties (qcheck)",
         List.map QCheck_alcotest.to_alcotest
           [

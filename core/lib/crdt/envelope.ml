@@ -21,10 +21,12 @@ type t = {
   tx : (Uuid_v7.t * tx_role) option;
 }
 
-let make ~op_id ~actor_id ~room ~branch ~zone ~schema_version ~lamport ~wall_time ~op ?tx () : t =
+let make ~op_id ~actor_id ~room ~branch ~zone ~schema_version ~lamport ~wall_time ~op ?tx
+    () : t =
   { op_id; actor_id; room; branch; zone; schema_version; lamport; wall_time; op; tx }
 
-let equal_tx (a : (Uuid_v7.t * tx_role) option) (b : (Uuid_v7.t * tx_role) option) : bool =
+let equal_tx (a : (Uuid_v7.t * tx_role) option) (b : (Uuid_v7.t * tx_role) option) : bool
+    =
   Option.equal
     (fun (id_a, role_a) (id_b, role_b) ->
       Uuid_v7.compare id_a id_b = 0 && equal_tx_role role_a role_b)
@@ -33,11 +35,14 @@ let equal_tx (a : (Uuid_v7.t * tx_role) option) (b : (Uuid_v7.t * tx_role) optio
 let equal (a : t) (b : t) : bool =
   Op_id.equal a.op_id b.op_id
   && String.equal a.actor_id b.actor_id
-  && String.equal a.room b.room && String.equal a.branch b.branch && String.equal a.zone b.zone
+  && String.equal a.room b.room
+  && String.equal a.branch b.branch
+  && String.equal a.zone b.zone
   && Int.equal a.schema_version b.schema_version
   && Lamport.equal a.lamport b.lamport
   && Wall_time.equal a.wall_time b.wall_time
-  && Op.equal_kind a.op b.op && equal_tx a.tx b.tx
+  && Op.equal_kind a.op b.op
+  && equal_tx a.tx b.tx
 
 let pp_tx (fmt : Format.formatter) (tx : (Uuid_v7.t * tx_role) option) : unit =
   match tx with
@@ -58,5 +63,5 @@ let pp (fmt : Format.formatter) (e : t) : unit =
      op = %a;@,\
      tx = %a;@]@,\
      }"
-    Op_id.pp e.op_id e.actor_id e.room e.branch e.zone e.schema_version Lamport.pp e.lamport
-    Wall_time.pp e.wall_time Op.pp_kind e.op pp_tx e.tx
+    Op_id.pp e.op_id e.actor_id e.room e.branch e.zone e.schema_version Lamport.pp
+    e.lamport Wall_time.pp e.wall_time Op.pp_kind e.op pp_tx e.tx

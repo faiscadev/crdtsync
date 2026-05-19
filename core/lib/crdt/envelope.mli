@@ -3,10 +3,13 @@
     Immutable record carried with every operation. Mirrors the wire shape described in
     ARCHITECTURE.md, section "Internal Data Model".
 
-    Transaction membership: in the wire format, [tx_id] and [tx_role] appear iff together. Here they
-    are folded into a single optional pair to make the invalid state unrepresentable. *)
+    Transaction membership: in the wire format, [tx_id] and [tx_role] appear iff together.
+    Here they are folded into a single optional pair to make the invalid state
+    unrepresentable. *)
 
-type tx_role = Member  (** part of an open tx *) | Commit  (** commit marker; closes the tx *)
+type tx_role =
+  | Member  (** part of an open tx *)
+  | Commit  (** commit marker; closes the tx *)
 
 val pp_tx_role : Format.formatter -> tx_role -> unit
 val equal_tx_role : tx_role -> tx_role -> bool

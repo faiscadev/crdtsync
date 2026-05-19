@@ -65,11 +65,14 @@ let apply (m : t) ~op ~op_id ~lamport : t * Element_id.t list =
     ({ m with data = StringMap.add key new_slot m.data }, released)
 
 let get (m : t) (k : string) : Value.t option =
-  match StringMap.find_opt k m.data with Some (Live { value; _ }) -> Some value | _ -> None
+  match StringMap.find_opt k m.data with
+  | Some (Live { value; _ }) -> Some value
+  | _ -> None
 
 let keys (m : t) : string list =
   StringMap.bindings m.data
-  |> List.filter_map (fun (k, slot) -> match slot with Live _ -> Some k | Tomb _ -> None)
+  |> List.filter_map (fun (k, slot) ->
+         match slot with Live _ -> Some k | Tomb _ -> None)
 
 let entries (m : t) : (string * Value.t) list =
   StringMap.bindings m.data
@@ -77,7 +80,9 @@ let entries (m : t) : (string * Value.t) list =
          match slot with Live { value; _ } -> Some (k, value) | Tomb _ -> None)
 
 let cardinal (m : t) : int =
-  StringMap.fold (fun _ slot n -> match slot with Live _ -> n + 1 | Tomb _ -> n) m.data 0
+  StringMap.fold
+    (fun _ slot n -> match slot with Live _ -> n + 1 | Tomb _ -> n)
+    m.data 0
 
 let equal_slot (a : slot) (b : slot) : bool =
   match (a, b) with
@@ -85,7 +90,8 @@ let equal_slot (a : slot) (b : slot) : bool =
       Value.equal l1.value l2.value
       && Lamport.equal l1.lamport l2.lamport
       && Op_id.equal l1.op_id l2.op_id
-  | Tomb t1, Tomb t2 -> Lamport.equal t1.lamport t2.lamport && Op_id.equal t1.op_id t2.op_id
+  | Tomb t1, Tomb t2 ->
+      Lamport.equal t1.lamport t2.lamport && Op_id.equal t1.op_id t2.op_id
   | _ -> false
 
 let equal (a : t) (b : t) : bool =

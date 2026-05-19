@@ -1,4 +1,5 @@
-(** Tests for [Crdtsync_crdt.Element_id]. Black-box: only the .mli surface is exercised. *)
+(** Tests for [Crdtsync_crdt.Element_id]. Black-box: only the .mli surface is exercised.
+*)
 
 module Element_id = Crdtsync_crdt.Element_id
 
@@ -33,14 +34,18 @@ let test_derive_deterministic () =
 let test_derive_different_keys_different_ids () =
   let a = Element_id.derive ~parent:Element_id.root ~key:"body" in
   let b = Element_id.derive ~parent:Element_id.root ~key:"title" in
-  Alcotest.(check bool) "derive root body <> derive root title" true (Element_id.compare a b <> 0)
+  Alcotest.(check bool)
+    "derive root body <> derive root title" true
+    (Element_id.compare a b <> 0)
 
 let test_derive_different_parents_different_ids () =
   let p1 = Element_id.derive ~parent:Element_id.root ~key:"p1" in
   let p2 = Element_id.derive ~parent:Element_id.root ~key:"p2" in
   let a = Element_id.derive ~parent:p1 ~key:"body" in
   let b = Element_id.derive ~parent:p2 ~key:"body" in
-  Alcotest.(check bool) "derive p1 body <> derive p2 body" true (Element_id.compare a b <> 0)
+  Alcotest.(check bool)
+    "derive p1 body <> derive p2 body" true
+    (Element_id.compare a b <> 0)
 
 let test_derive_nested_chain () =
   let a = Element_id.derive ~parent:Element_id.root ~key:"a" in
@@ -51,7 +56,8 @@ let test_derive_nested_chain () =
     (fun id ->
       match Element_id.of_string (Element_id.to_string id) with
       | None -> Alcotest.failf "nested id failed string round-trip"
-      | Some id' -> Alcotest.(check int) "nested id round-trips" 0 (Element_id.compare id id'))
+      | Some id' ->
+          Alcotest.(check int) "nested id round-trips" 0 (Element_id.compare id id'))
     [ a; b; c ]
 
 let test_derive_bytes_round_trip () =
@@ -83,7 +89,8 @@ let test_of_string_malformed () =
   List.iter
     (fun s ->
       Alcotest.(check (option string))
-        (Printf.sprintf "%S rejected" s) None
+        (Printf.sprintf "%S rejected" s)
+        None
         (Option.map Element_id.to_string (Element_id.of_string s)))
     cases
 
@@ -147,14 +154,17 @@ let () =
         ] );
       ( "derive",
         [
-          Alcotest.test_case "deterministic on same (parent, key)" `Quick test_derive_deterministic;
+          Alcotest.test_case "deterministic on same (parent, key)" `Quick
+            test_derive_deterministic;
           Alcotest.test_case "different keys yield different ids" `Quick
             test_derive_different_keys_different_ids;
           Alcotest.test_case "different parents yield different ids" `Quick
             test_derive_different_parents_different_ids;
-          Alcotest.test_case "nested derivation chain round-trips" `Quick test_derive_nested_chain;
+          Alcotest.test_case "nested derivation chain round-trips" `Quick
+            test_derive_nested_chain;
           Alcotest.test_case "bytes round-trip" `Quick test_derive_bytes_round_trip;
-          Alcotest.test_case "produces UUID v5 (version nibble)" `Quick test_derive_is_uuid_v5;
+          Alcotest.test_case "produces UUID v5 (version nibble)" `Quick
+            test_derive_is_uuid_v5;
         ] );
       ( "parsing rejects",
         [

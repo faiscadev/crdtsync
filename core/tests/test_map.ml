@@ -29,7 +29,9 @@ let empty_map () = Map.empty ~element_id:Element_id.root
 let test_empty_has_element_id () =
   let id = Element_id.derive ~parent:Element_id.root ~key:"m" in
   let m = Map.empty ~element_id:id in
-  Alcotest.(check int) "empty.element_id = id" 0 (Element_id.compare (Map.element_id m) id);
+  Alcotest.(check int)
+    "empty.element_id = id" 0
+    (Element_id.compare (Map.element_id m) id);
   Alcotest.(check int) "empty cardinal = 0" 0 (Map.cardinal m);
   Alcotest.(check (list string)) "empty keys = []" [] (Map.keys m)
 
@@ -53,7 +55,9 @@ let test_set_scalar_visible_via_get () =
 let test_set_overwrite_by_higher_lamport () =
   let op1 = Map.Set { key = "x"; value = Scalar (Int 1L) } in
   let op2 = Map.Set { key = "x"; value = Scalar (Int 2L) } in
-  let m, _ = Map.apply (empty_map ()) ~op:op1 ~op_id:(fresh_op_id ()) ~lamport:(lam 10L) in
+  let m, _ =
+    Map.apply (empty_map ()) ~op:op1 ~op_id:(fresh_op_id ()) ~lamport:(lam 10L)
+  in
   let m, _ = Map.apply m ~op:op2 ~op_id:(fresh_op_id ()) ~lamport:(lam 20L) in
   match Map.get m "x" with
   | Some (Scalar (Int n)) -> Alcotest.(check int64) "winner = 2L (higher lamport)" 2L n
@@ -83,11 +87,14 @@ let test_set_tie_breaks_by_op_id () =
       ~op_id:lo ~lamport:(lam 5L)
   in
   let m, _ =
-    Map.apply m ~op:(Set { key = "x"; value = Scalar (Int 2L) }) ~op_id:hi ~lamport:(lam 5L)
+    Map.apply m
+      ~op:(Set { key = "x"; value = Scalar (Int 2L) })
+      ~op_id:hi ~lamport:(lam 5L)
   in
   (* hi > lo at equal lamport, so hi wins. *)
   match Map.get m "x" with
-  | Some (Scalar (Int n)) -> Alcotest.(check int64) "tiebreak: higher op_id wins (2L)" 2L n
+  | Some (Scalar (Int n)) ->
+      Alcotest.(check int64) "tiebreak: higher op_id wins (2L)" 2L n
   | _ -> Alcotest.fail "expected Some (Scalar (Int 2L))"
 
 let test_set_tie_loser_does_not_clobber () =
@@ -99,7 +106,9 @@ let test_set_tie_loser_does_not_clobber () =
       ~op_id:hi ~lamport:(lam 5L)
   in
   let m, _ =
-    Map.apply m ~op:(Set { key = "x"; value = Scalar (Int 1L) }) ~op_id:lo ~lamport:(lam 5L)
+    Map.apply m
+      ~op:(Set { key = "x"; value = Scalar (Int 1L) })
+      ~op_id:lo ~lamport:(lam 5L)
   in
   match Map.get m "x" with
   | Some (Scalar (Int n)) -> Alcotest.(check int64) "hi keeps slot (2L)" 2L n
@@ -113,7 +122,9 @@ let test_delete_removes_key () =
       ~op:(Set { key = "x"; value = Scalar (Int 1L) })
       ~op_id:(fresh_op_id ()) ~lamport:(lam 1L)
   in
-  let m, _ = Map.apply m ~op:(Delete { key = "x" }) ~op_id:(fresh_op_id ()) ~lamport:(lam 2L) in
+  let m, _ =
+    Map.apply m ~op:(Delete { key = "x" }) ~op_id:(fresh_op_id ()) ~lamport:(lam 2L)
+  in
   Alcotest.(check bool) "get x = None after delete" true (Option.is_none (Map.get m "x"));
   Alcotest.(check int) "cardinal = 0" 0 (Map.cardinal m)
 
@@ -124,7 +135,9 @@ let test_delete_lower_lamport_loses () =
       ~op:(Set { key = "x"; value = Scalar (Int 1L) })
       ~op_id:(fresh_op_id ()) ~lamport:(lam 10L)
   in
-  let m, _ = Map.apply m ~op:(Delete { key = "x" }) ~op_id:(fresh_op_id ()) ~lamport:(lam 5L) in
+  let m, _ =
+    Map.apply m ~op:(Delete { key = "x" }) ~op_id:(fresh_op_id ()) ~lamport:(lam 5L)
+  in
   Alcotest.(check bool) "x still present" true (Option.is_some (Map.get m "x"))
 
 let test_set_after_delete_with_higher_lamport () =
@@ -133,7 +146,9 @@ let test_set_after_delete_with_higher_lamport () =
       ~op:(Set { key = "x"; value = Scalar (Int 1L) })
       ~op_id:(fresh_op_id ()) ~lamport:(lam 1L)
   in
-  let m, _ = Map.apply m ~op:(Delete { key = "x" }) ~op_id:(fresh_op_id ()) ~lamport:(lam 5L) in
+  let m, _ =
+    Map.apply m ~op:(Delete { key = "x" }) ~op_id:(fresh_op_id ()) ~lamport:(lam 5L)
+  in
   let m, _ =
     Map.apply m
       ~op:(Set { key = "x"; value = Scalar (Int 2L) })
@@ -235,7 +250,9 @@ let test_losing_set_element_releases_stranded_id () =
   Alcotest.(check int) "released has 1 stranded id" 1 (List.length released);
   (match released with
   | [ id ] ->
-      Alcotest.(check int) "stranded id = child_b (the loser)" 0 (Element_id.compare id child_b)
+      Alcotest.(check int)
+        "stranded id = child_b (the loser)" 0
+        (Element_id.compare id child_b)
   | _ -> Alcotest.fail "expected exactly 1 stranded id");
   Alcotest.(check bool)
     "slot still holds child_a (winner kept)" true
@@ -276,7 +293,9 @@ let test_apply_same_op_twice_idempotent () =
     Map.apply m1 ~op:(Set { key = "x"; value = Scalar (Int 1L) }) ~op_id ~lamport:(lam 1L)
   in
   Alcotest.(check bool) "state unchanged on re-apply" true (Map.equal m1 m2);
-  Alcotest.(check (list int)) "no release on re-apply" [] (List.map (fun _ -> 0) released2)
+  Alcotest.(check (list int))
+    "no release on re-apply" []
+    (List.map (fun _ -> 0) released2)
 
 (* ── initOnce-by-SDK convention: two clients deriving same id converge ─────── *)
 
@@ -367,16 +386,21 @@ let () =
     [
       ( "empty",
         [
-          Alcotest.test_case "carries element_id, cardinal 0" `Quick test_empty_has_element_id;
-          Alcotest.test_case "get missing key returns None" `Quick test_get_missing_returns_none;
+          Alcotest.test_case "carries element_id, cardinal 0" `Quick
+            test_empty_has_element_id;
+          Alcotest.test_case "get missing key returns None" `Quick
+            test_get_missing_returns_none;
         ] );
       ( "set / LWW",
         [
           Alcotest.test_case "set scalar then get" `Quick test_set_scalar_visible_via_get;
-          Alcotest.test_case "higher lamport wins" `Quick test_set_overwrite_by_higher_lamport;
+          Alcotest.test_case "higher lamport wins" `Quick
+            test_set_overwrite_by_higher_lamport;
           Alcotest.test_case "lower lamport loses" `Quick test_set_lower_lamport_loses;
-          Alcotest.test_case "tie broken by higher op_id" `Quick test_set_tie_breaks_by_op_id;
-          Alcotest.test_case "tie loser does not clobber" `Quick test_set_tie_loser_does_not_clobber;
+          Alcotest.test_case "tie broken by higher op_id" `Quick
+            test_set_tie_breaks_by_op_id;
+          Alcotest.test_case "tie loser does not clobber" `Quick
+            test_set_tie_loser_does_not_clobber;
         ] );
       ( "delete",
         [
@@ -396,8 +420,8 @@ let () =
             test_set_replacing_scalar_no_release;
           Alcotest.test_case "losing Set with Scalar releases nothing" `Quick
             test_losing_set_scalar_releases_nothing;
-          Alcotest.test_case "losing Set with unique Element releases the stranded id" `Quick
-            test_losing_set_element_releases_stranded_id;
+          Alcotest.test_case "losing Set with unique Element releases the stranded id"
+            `Quick test_losing_set_element_releases_stranded_id;
           Alcotest.test_case "losing Set with same Element id releases nothing" `Quick
             test_losing_set_same_element_id_releases_nothing;
         ] );
@@ -409,7 +433,10 @@ let () =
             test_concurrent_deterministic_set_converges;
         ] );
       ( "introspection",
-        [ Alcotest.test_case "keys / entries / cardinal sorted" `Quick test_keys_entries_sorted ] );
+        [
+          Alcotest.test_case "keys / entries / cardinal sorted" `Quick
+            test_keys_entries_sorted;
+        ] );
       ( "equal / pp",
         [
           Alcotest.test_case "equal reflexive" `Quick test_equal_reflexive;
