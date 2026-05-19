@@ -1,5 +1,5 @@
 (tests
- (names test_smoke test_uuid_v7)
+ (names test_smoke test_uuid_v7 test_op_id)
  (libraries
   alcotest
   qcheck-alcotest
