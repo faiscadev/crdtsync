@@ -31,6 +31,7 @@ See ARCHITECTURE.md and ROADMAP.md.")
   (ocaml (>= 5.1))
   (dune (>= 3.16))
   (logs (>= 0.7.0))
+  (uuidm (>= 0.9.10))
   (alcotest :with-test)
   (qcheck-alcotest :with-test)))
 
