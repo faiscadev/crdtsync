@@ -94,3 +94,39 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+
+  lint-ocaml:
+    name: Lint OCaml (ocamlformat)
+    needs: changes
+    if: needs.changes.outputs.core == 'true' || needs.changes.outputs.sdk-ocaml == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.2"
+          dune-cache: true
+      - run: opam install ocamlformat.0.27.0 --yes
+      - run: opam exec -- dune build @fmt
+
+  lint-ts:
+    name: Lint TypeScript (eslint + prettier)
+    needs: changes
+    if: needs.changes.outputs.sdk-ts == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: sdks/typescript/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm format:check

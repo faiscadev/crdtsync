@@ -18,9 +18,9 @@ Ship a working single-node sync engine. One OCaml server, SQLite persistence, Ty
 ## Repo Hygiene & Setup
 
 - [x] **SETUP-1** OCaml workspace (`dune-project`, base lib + bin structure, build verified)
-- [ ] **SETUP-2** TS SDK workspace (pnpm + tsconfig + build pipeline + test runner)
-- [ ] **SETUP-3** CI: path-filtered per-component jobs (core / wasm / cabi / sdk-ts / lint / e2e)
-- [ ] **SETUP-4** Lint + format baseline (ocamlformat, prettier, eslint)
+- [x] **SETUP-2** TS SDK workspace (pnpm + tsconfig + build pipeline + test runner)
+- [x] **SETUP-3** CI: path-filtered per-component jobs (core / wasm / cabi / sdk-ts / lint / e2e)
+- [x] **SETUP-4** Lint + format baseline (ocamlformat, prettier, eslint)
 
 ## Core CRDT (OCaml)
 
