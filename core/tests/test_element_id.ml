@@ -108,7 +108,10 @@ let test_pp_matches_to_string () =
 
 (* ── qcheck property tests ────────────────────────────────────────────────── *)
 
-let arb_key : string QCheck.arbitrary = QCheck.string_of_size (QCheck.Gen.int_bound 32)
+let arb_key : string QCheck.arbitrary =
+  QCheck.make
+    ~print:(fun s -> Printf.sprintf "%S" s)
+    (QCheck.Gen.string_size (QCheck.Gen.int_bound 32))
 
 let arb_element_id : Element_id.t QCheck.arbitrary =
   QCheck.map ~rev:Element_id.to_string
