@@ -11,5 +11,6 @@
    land. *)
 
 module Uuid_v7 = Uuid_v7
+module Op_id = Op_id
 
 let version = "0.0.0"

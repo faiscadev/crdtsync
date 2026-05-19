@@ -1,4 +1,4 @@
-(** UUID v7 wrapper over Uuidm. CORE-1 subtask 1 — see KANBAN.md. *)
+(** UUID v7 wrapper over Uuidm *)
 
 type t = Uuidm.t
 
