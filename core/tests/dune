@@ -1,5 +1,11 @@
 (tests
- (names test_smoke test_uuid_v7 test_op_id test_lamport)
+ (names
+  test_smoke
+  test_uuid_v7
+  test_op_id
+  test_lamport
+  test_wall_time
+  test_envelope)
  (libraries
   alcotest
   qcheck-alcotest

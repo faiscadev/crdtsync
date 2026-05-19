@@ -13,5 +13,8 @@
 module Uuid_v7 = Uuid_v7
 module Op_id = Op_id
 module Lamport = Lamport
+module Wall_time = Wall_time
+module Op = Op
+module Envelope = Envelope
 
 let version = "0.0.0"
