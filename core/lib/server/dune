@@ -1,0 +1,10 @@
+(library
+ (name crdtsync_server)
+ (public_name crdtsync_core.server)
+ (libraries
+  logs
+  crdtsync_core.crdt
+  crdtsync_core.wire
+  crdtsync_core.persist
+  crdtsync_core.auth
+  crdtsync_core.blob))

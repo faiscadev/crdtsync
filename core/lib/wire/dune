@@ -1,0 +1,4 @@
+(library
+ (name crdtsync_wire)
+ (public_name crdtsync_core.wire)
+ (libraries logs))

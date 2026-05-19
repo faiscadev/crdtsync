@@ -6,15 +6,17 @@ default:
     @just --list
 
 # === Core (OCaml) ===
+# dune-project lives at the repo root; the OCaml workspace covers
+# `core/` and (later) `bindings/wasm`, `bindings/cabi`.
 
 core-build:
-    cd core && dune build
+    dune build
 
 core-test:
-    cd core && dune runtest
+    dune runtest
 
 core-clean:
-    cd core && dune clean
+    dune clean
 
 # === Bindings ===
 
@@ -54,12 +56,13 @@ sdk-jvm-build: cabi-build
     cd sdks/jvm && ./gradlew build
 
 # === CLI ===
+# The `crdtsync` binary builds as part of the OCaml workspace.
 
 cli-build: core-build
-    cd cli && dune build
+    dune build core/bin/crdtsync/
 
-cli-install: cli-build
-    cd cli && dune install
+cli-install:
+    dune install crdtsync
 
 # === Adapters ===
 

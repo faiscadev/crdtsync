@@ -1,0 +1,10 @@
+(test
+ (name test_smoke)
+ (libraries
+  alcotest
+  crdtsync_core.crdt
+  crdtsync_core.wire
+  crdtsync_core.persist
+  crdtsync_core.auth
+  crdtsync_core.blob
+  crdtsync_core.server))

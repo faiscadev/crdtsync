@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (public_name crdtsync)
+ (package crdtsync)
+ (libraries crdtsync_core.server))

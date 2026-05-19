@@ -1,0 +1,4 @@
+(library
+ (name crdtsync_blob)
+ (public_name crdtsync_core.blob)
+ (libraries logs))

@@ -1,0 +1,4 @@
+(library
+ (name crdtsync_persist)
+ (public_name crdtsync_core.persist)
+ (libraries logs))
