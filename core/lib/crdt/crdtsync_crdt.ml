@@ -12,5 +12,6 @@
 
 module Uuid_v7 = Uuid_v7
 module Op_id = Op_id
+module Lamport = Lamport
 
 let version = "0.0.0"
