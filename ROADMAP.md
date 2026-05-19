@@ -12,6 +12,7 @@ First working sync engine. Single OCaml server, no cluster, one binary, one stor
 
 - core CRDT primitives: Map, List, Text, Register, Counter
 - WebSocket sync server with SQLite persistence
+- OCaml SDK (consumes core directly, no FFI) — sibling of the other SDKs and a second-client implementation that validates the wire protocol against the server in the same workspace
 - TypeScript SDK (via WASM core)
 - op envelope finalized per Foundational Decisions
 - basic auth (token + actor_id), single multiplexed connection per actor

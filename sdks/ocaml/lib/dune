@@ -1,0 +1,7 @@
+(library
+ (name crdtsync_sdk)
+ (public_name crdtsync_sdk)
+ (libraries
+  logs
+  crdtsync_core.crdt
+  crdtsync_core.wire))

@@ -68,6 +68,19 @@ Ship a working single-node sync engine. One OCaml server, SQLite persistence, Ty
 - [ ] **BLOB-3** Co-located HTTP route for blob PUT/GET with signed-token verification
 - [ ] **BLOB-4** `requestUpload` / `confirmUpload` / `requestFetch` wire ops + flow
 
+## OCaml SDK
+
+OCaml client SDK. Consumes `crdtsync_core.{crdt,wire}` directly; no FFI. Lives in the same dune workspace under `sdks/ocaml/`. First non-core client implementation — validates the wire protocol end-to-end in the same workspace as the server.
+
+- [x] **SDK-OCAML-0** Workspace scaffold (`sdks/ocaml/lib/` + `sdks/ocaml/tests/`, `crdtsync_sdk` opam package, smoke test green)
+- [ ] **SDK-OCAML-1** WebSocket client (Eio-based) + connection lifecycle
+- [ ] **SDK-OCAML-2** Client-side handshake (Hello + Auth + Subscribe phases)
+- [ ] **SDK-OCAML-3** Document open/connect API + multiplexed channels
+- [ ] **SDK-OCAML-4** Primitives wrappers (Map / List / Text / Register / Counter) + observers
+- [ ] **SDK-OCAML-5** `doc.transact()` ergonomic wrapper (observer fire boundary + intention undo unit)
+- [ ] **SDK-OCAML-6** Reconnect logic + per-channel `last_seen_seq` tracking
+- [ ] **SDK-OCAML-7** Token / auth helpers + blob upload/fetch helpers + Error envelope decoding
+
 ## TS SDK
 
 - [ ] **SDK-1** WASM build of OCaml core (`wasm_of_ocaml` / `js_of_ocaml` pipeline + glue)
@@ -85,7 +98,7 @@ Ship a working single-node sync engine. One OCaml server, SQLite persistence, Ty
 ## Demo & E2E
 
 - [ ] **DEMO-1** Minimal "two clients edit the same Text + Map" demo (no UI framework, just SDK in browser)
-- [ ] **DEMO-2** E2E integration test harness (spin up server, connect two clients, assert convergence + reconnect + auth rejection)
+- [ ] **DEMO-2** E2E integration test harness — both an OCaml client (via OCaml SDK) and a TS client (via WASM+TS SDK) connect to the server, assert convergence + reconnect + auth rejection
 
 ---
 

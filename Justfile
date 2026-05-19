@@ -28,6 +28,14 @@ cabi-build: core-build
 
 # === SDKs ===
 
+# OCaml SDK is part of the same dune workspace — no FFI, no separate
+# toolchain. Builds when `dune build` runs.
+sdk-ocaml-build: core-build
+    dune build sdks/ocaml/
+
+sdk-ocaml-test:
+    dune runtest sdks/ocaml/
+
 sdk-ts-build: wasm-build
     cd sdks/typescript && pnpm install && pnpm build
 
@@ -96,9 +104,9 @@ website-dev:
 
 # === Aggregate ===
 
-all: core-build wasm-build cabi-build cli-build sdk-ts-build sdk-py-build sdk-go-build sdk-rust-build
+all: core-build sdk-ocaml-build wasm-build cabi-build cli-build sdk-ts-build sdk-py-build sdk-go-build sdk-rust-build
 
-test-all: core-test sdk-ts-test sdk-py-test sdk-go-test sdk-rust-test
+test-all: core-test sdk-ocaml-test sdk-ts-test sdk-py-test sdk-go-test sdk-rust-test
 
 clean:
     cd core && dune clean
