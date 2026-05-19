@@ -94,6 +94,24 @@ example-prosemirror-run: adapter-prosemirror-build
 example-kanban-run: sdk-ts-build
     cd examples/kanban && pnpm dev
 
+# === Lint / Format ===
+
+lint: lint-ocaml lint-ts
+
+lint-fix: lint-ocaml-fix lint-ts-fix
+
+lint-ocaml:
+    dune build @fmt
+
+lint-ocaml-fix:
+    dune build @fmt --auto-promote
+
+lint-ts:
+    cd sdks/typescript && pnpm lint && pnpm format:check
+
+lint-ts-fix:
+    cd sdks/typescript && pnpm lint:fix && pnpm format
+
 # === Docs / website ===
 
 docs-build:
