@@ -1,7 +1,8 @@
-(test
- (name test_smoke)
+(tests
+ (names test_smoke test_uuid_v7)
  (libraries
   alcotest
+  qcheck-alcotest
   crdtsync_core.crdt
   crdtsync_core.wire
   crdtsync_core.persist

@@ -20,4 +20,7 @@
     Does NOT depend on [crdtsync_core.persist] / [crdtsync_core.server] / [crdtsync_core.auth] /
     [crdtsync_core.blob] — those are server-side concerns. *)
 
+(* Wrapper module for the [crdtsync_sdk] library. Submodules from sibling files must be
+   re-exported here to be reachable as [Crdtsync_sdk.<Submodule>] from outside. *)
+
 let version = "0.0.0"
