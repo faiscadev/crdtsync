@@ -1,3 +1,0 @@
-(test
- (name test_smoke)
- (libraries alcotest crdtsync_sdk))

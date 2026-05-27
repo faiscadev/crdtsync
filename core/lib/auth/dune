@@ -1,4 +1,0 @@
-(library
- (name crdtsync_auth)
- (public_name crdtsync_core.auth)
- (libraries logs))

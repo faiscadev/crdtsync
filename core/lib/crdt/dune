@@ -1,4 +1,0 @@
-(library
- (name crdtsync_crdt)
- (public_name crdtsync_core.crdt)
- (libraries logs uuidm unix))
