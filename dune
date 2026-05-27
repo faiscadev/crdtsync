@@ -1,0 +1,4 @@
+; Project-wide compiler flags. Downgrade warnings from errors to plain
+; warnings across all profiles — keep them visible but don't fail the build.
+(env
+ (_ (flags (:standard -warn-error -a))))

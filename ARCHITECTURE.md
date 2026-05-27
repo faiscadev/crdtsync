@@ -313,11 +313,46 @@ Nested values supported (any Element type). Scalar set uses LWW.
 
 ## List
 
+Sequence CRDT. Algorithm: **Fugue** (Weidner & Kleppmann 2023, "The Art of the
+Fugue"). Tree-based, formally proven no-interleaving on concurrent inserts at
+the same point. Same algorithm reused for Text (CORE-4).
+
+Wire-level ops:
+
 ```text
-insert(index, item)
-remove(index, count)
-move(from, to)
+insert(entry_id, value, origin_left, origin_right)
+remove(target_entry_id)
+move(target_entry_id, new_origin_left, new_origin_right)
 ```
+
+Every list entry carries a stable `entry_id : Element_id.t` derived from
+`(list_element_id, insert_op_id)` at insert time — globally unique
+(`Op_id` is unique per client), stable across `move` / `remove`, valid as a
+cursor anchor even after tombstone (the entry record stays so other entries
+can keep referencing it as `origin_left` / `origin_right`).
+
+LWW rules (per entry):
+
+- `insert`: idempotent on `entry_id`.
+- `remove`: idempotent; tombstones the entry.
+- `move`: LWW on `(lamport, op_id)` of the move op; newer move's neighbors win.
+
+No cycles to worry about — lists are linear, so Kleppmann's tree-move cycle
+detection is not needed.
+
+SDK ergonomics:
+
+```ocaml
+List.insert : t -> index:int -> value:Value.t -> unit
+List.delete : t -> index:int -> unit
+List.move   : t -> from_:int -> to_:int -> unit
+List.text   : t -> index:int -> Text.t      (* getOrCreate via Insert with derived Element_id *)
+List.get    : t -> index:int -> Value.t option
+```
+
+The SDK's `insert` / `move` translate indices into `(origin_left, origin_right)`
+neighbor pairs via the primitive's `neighbors_at` helper before emitting the
+wire op.
 
 ---
 

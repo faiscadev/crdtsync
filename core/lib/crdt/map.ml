@@ -71,12 +71,12 @@ let get (m : t) (k : string) : Value.t option =
 
 let keys (m : t) : string list =
   StringMap.bindings m.data
-  |> List.filter_map (fun (k, slot) ->
+  |> Stdlib.List.filter_map (fun (k, slot) ->
          match slot with Live _ -> Some k | Tomb _ -> None)
 
 let entries (m : t) : (string * Value.t) list =
   StringMap.bindings m.data
-  |> List.filter_map (fun (k, slot) ->
+  |> Stdlib.List.filter_map (fun (k, slot) ->
          match slot with Live { value; _ } -> Some (k, value) | Tomb _ -> None)
 
 let cardinal (m : t) : int =

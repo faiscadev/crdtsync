@@ -8,7 +8,8 @@
   test_envelope
   test_element_id
   test_value
-  test_map)
+  test_map
+  test_list)
  (libraries
   alcotest
   qcheck-alcotest
