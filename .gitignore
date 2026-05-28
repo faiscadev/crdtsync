@@ -15,7 +15,7 @@ a.out
 *.dSYM/
 
 # Test binaries
-/test_hashtabl
+/test_hashtable
 
 # IDE / editor
 .vscode/
