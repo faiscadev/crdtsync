@@ -11,6 +11,11 @@ build/
 *.dll
 *.a
 *.wasm
+a.out
+*.dSYM/
+
+# Test binaries
+/test_hashtabl
 
 # IDE / editor
 .vscode/
