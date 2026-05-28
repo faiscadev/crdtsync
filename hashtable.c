@@ -3,7 +3,8 @@
 #include <stdio.h>
 
 typedef struct HashTableNode {
-    const char *key;
+    void *key;
+    size_t key_len;
     void *value;
     HashTableNode *next;
 } HashTableNode;
@@ -18,20 +19,21 @@ HashTable *hashtable_create(Arena *arena) {
     return table;
 }
 
-HashTableInsertResult _hashtable_insert(HashTable *table, const char *key,
-                                      void *value) {
+HashTableInsertResult _hashtable_insert(HashTable *table, void *key, size_t key_len,
+                                        void *value) {
     HashTableNode *node = arena_alloc(table->arena, sizeof(HashTableNode));
     if (!node) {
         return HASHTABLE_ERR_OOM;
     }
 
-    node->key = arena_alloc(table->arena, strlen(key) + 1);
+    node->key = arena_alloc(table->arena, key_len);
     if (!node->key) {
         return HASHTABLE_ERR_OOM;
     }
 
-    strcpy((char *)node->key, key);
+    memcpy(node->key, key, key_len);
     node->value = value;
+    node->key_len = key_len;
 
     // cons into head of list
     node->next = table->head;
@@ -40,21 +42,22 @@ HashTableInsertResult _hashtable_insert(HashTable *table, const char *key,
     return HASHTABLE_OK;
 }
 
-HashTableInsertResult hashtable_insert(HashTable *table, const char *key,
-                                     void *value) {
-    if (hashtable_get(table, key, NULL)) {
+HashTableInsertResult hashtable_insert(HashTable *table, void *key, size_t key_len,
+                                       void *value) {
+    if (hashtable_get(table, key, key_len, NULL)) {
         return HASHTABLE_ERR_KEY_EXISTS;
     }
 
-    return _hashtable_insert(table, key, value);
+    return _hashtable_insert(table, key, key_len, value);
 }
 
-bool hashtable_get(HashTable *table, const char *key, void **out) {
+bool hashtable_get(HashTable *table, void *key, size_t key_len, void **out) {
     HashTableIter it = hashtable_iter(table);
-    const char *k;
+    const void *k;
     void *v;
-    while (hashtable_iter_next(&it, &k, &v)) {
-        if (strcmp(k, key) == 0) {
+    size_t kl;
+    while (hashtable_iter_next(&it, &k, &kl, &v)) {
+        if (kl == key_len && memcmp(k, key, key_len) == 0) {
             if (out) {
                 *out = v;
             }
@@ -64,10 +67,10 @@ bool hashtable_get(HashTable *table, const char *key, void **out) {
     return false;
 }
 
-HashTableRemoveResult hashtable_remove(HashTable *table, const char *key) {
+HashTableRemoveResult hashtable_remove(HashTable *table, void *key, size_t key_len) {
     HashTableNode *prev = NULL;
     for (HashTableNode *n = table->head; n; prev = n, n = n->next) {
-        if (strcmp(n->key, key) == 0) {
+        if (n->key_len == key_len && memcmp(n->key, key, key_len) == 0) {
             if (prev) {
                 prev->next = n->next;
             } else {
@@ -80,11 +83,11 @@ HashTableRemoveResult hashtable_remove(HashTable *table, const char *key) {
     return HASHTABLE_REMOVE_ERR_NOT_FOUND;
 }
 
-HashTableUpdateResult hashtable_update(HashTable *table, const char *key,
-                                     void *value) {
+HashTableUpdateResult hashtable_update(HashTable *table, void *key, size_t key_len, void *value) {
     for (HashTableNode *n = table->head; n; n = n->next) {
-        if (strcmp(n->key, key) == 0) {
+        if (n->key_len == key_len && memcmp(n->key, key, key_len) == 0) {
             n->value = value;
+            n->key_len = key_len;
             return HASHTABLE_UPDATE_OK;
         }
     }
@@ -92,13 +95,13 @@ HashTableUpdateResult hashtable_update(HashTable *table, const char *key,
     return HASHTABLE_UPDATE_ERR_NOT_FOUND;
 }
 
-HashTableUpsertResult hashtable_upsert(HashTable *table, const char *key,
-                                     void *value) {
-    if (hashtable_update(table, key, value) == HASHTABLE_UPDATE_OK) {
+HashTableUpsertResult hashtable_upsert(HashTable *table, void *key, size_t key_len,
+                                       void *value) {
+    if (hashtable_update(table, key, key_len, value) == HASHTABLE_UPDATE_OK) {
         return HASHTABLE_UPSERT_UPDATED;
     }
 
-    HashTableInsertResult insert_result = _hashtable_insert(table, key, value);
+    HashTableInsertResult insert_result = _hashtable_insert(table, key, key_len, value);
     if (insert_result == HASHTABLE_OK) {
         return HASHTABLE_UPSERT_INSERTED;
     } else {
@@ -113,7 +116,7 @@ HashTableIter hashtable_iter(HashTable *table) {
     it.next = table->head;
     return it;
 }
-bool hashtable_iter_next(HashTableIter *it, const char **key, void **value) {
+bool hashtable_iter_next(HashTableIter *it, const void **key, size_t *key_len, void **value) {
     if (it->next == NULL) {
         return false;
     }
@@ -121,9 +124,16 @@ bool hashtable_iter_next(HashTableIter *it, const char **key, void **value) {
     if (key) {
         *key = it->next->key;
     }
+
+    if (key_len) {
+        *key_len = it->next->key_len;
+    }
+
     if (value) {
         *value = it->next->value;
     }
+
     it->next = it->next->next;
+
     return true;
 }

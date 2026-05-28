@@ -1,17 +1,27 @@
+#include <stdint.h>
 #include <string.h>
+#include <assert.h>
 
 #include "arena.h"
 #include "hashtable.h"
 #include "test_util.h"
-#include <assert.h>
 
-// Backing buffer big enough for functional tests (keys + buckets + rehash
-// slack).
+// hashtable keys on raw bytes (key pointer + length), not C strings.
+// Expected API (you implement in hashtable.h / hashtable.c):
+//   HashTableInsertResult hashtable_insert(HashTable*, const void *key, size_t key_len, void *value);
+//   bool                  hashtable_get   (HashTable*, const void *key, size_t key_len, void **out);
+//   HashTableRemoveResult hashtable_remove(HashTable*, const void *key, size_t key_len);
+//   HashTableUpdateResult hashtable_update(HashTable*, const void *key, size_t key_len, void *value);
+//   HashTableUpsertResult hashtable_upsert(HashTable*, const void *key, size_t key_len, void *value);
+//   bool hashtable_iter_next(HashTableIter*, const void **key, size_t *key_len, void **value);
+// Keys are copied (key_len bytes) into the arena. Binary-safe: embedded NUL
+// bytes are part of the key, and length is significant.
+
 #define ARENA_BYTES (64 * 1024)
 
-// Helper: build a fresh table on a caller-owned stack buffer.
-// Returns table; writes the arena pointer through `out_arena` (unused by most
-// tests).
+// String-key shorthand: expands to (bytes, length) without the NUL terminator.
+#define SK(s) (s), strlen(s)
+
 static HashTable *fresh(uint8_t *buf, size_t buf_len) {
     Arena *arena = arena_create(buf, buf_len);
     HashTable *table = hashtable_create(arena);
@@ -23,23 +33,28 @@ TEST(create_empty) {
     uint8_t buf[ARENA_BYTES];
     HashTable *t = fresh(buf, sizeof(buf));
 
+    uint32_t k = 7;
     void *out = (void *)0xdead;
-    ASSERT(hashtable_get(t, "missing", &out) == false);
+    ASSERT(hashtable_get(t, &k, sizeof k, &out) == false);
     // out must be untouched on miss.
     ASSERT(out == (void *)0xdead);
 }
 
+// uint32 key, fetched via a separate variable holding the same value — proves
+// the table compares key *bytes*, not pointers.
 TEST(insert_then_get) {
     uint8_t buf[ARENA_BYTES];
     HashTable *t = fresh(buf, sizeof(buf));
 
-    int v = 42;
-    ASSERT_EQ(hashtable_insert(t, "answer", &v), HASHTABLE_OK);
+    uint32_t k = 42;
+    int v = 99;
+    ASSERT_EQ(hashtable_insert(t, &k, sizeof k, &v), HASHTABLE_OK);
 
+    uint32_t k2 = 42;
     void *out = NULL;
-    ASSERT(hashtable_get(t, "answer", &out) == true);
+    ASSERT(hashtable_get(t, &k2, sizeof k2, &out) == true);
     ASSERT(out == &v);
-    ASSERT_EQ(*(int *)out, 42);
+    ASSERT_EQ(*(int *)out, 99);
 }
 
 TEST(insert_duplicate_rejected) {
@@ -47,12 +62,11 @@ TEST(insert_duplicate_rejected) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     int a = 1, b = 2;
-    ASSERT_EQ(hashtable_insert(t, "k", &a), HASHTABLE_OK);
-    ASSERT_EQ(hashtable_insert(t, "k", &b), HASHTABLE_ERR_KEY_EXISTS);
+    ASSERT_EQ(hashtable_insert(t, SK("k"), &a), HASHTABLE_OK);
+    ASSERT_EQ(hashtable_insert(t, SK("k"), &b), HASHTABLE_ERR_KEY_EXISTS);
 
-    // Value must remain the first one.
     void *out = NULL;
-    ASSERT(hashtable_get(t, "k", &out) == true);
+    ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &a);
 }
 
@@ -61,28 +75,25 @@ TEST(get_missing_returns_false) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     int v = 7;
-    hashtable_insert(t, "present", &v);
-    printf("Inserted key 'present' with value %d\n", v);
+    hashtable_insert(t, SK("present"), &v);
 
     void *out = NULL;
-    ASSERT(hashtable_get(t, "absent", &out) == false);
+    ASSERT(hashtable_get(t, SK("absent"), &out) == false);
 }
 
-// The whole point of the bool/out-param API: NULL is a storable value,
-// distinguishable from "not found".
+// NULL is a storable value, distinguishable from "not found".
 TEST(stored_null_is_distinguishable) {
     uint8_t buf[ARENA_BYTES];
     HashTable *t = fresh(buf, sizeof(buf));
 
-    ASSERT_EQ(hashtable_insert(t, "nullval", NULL), HASHTABLE_OK);
+    ASSERT_EQ(hashtable_insert(t, SK("nullval"), NULL), HASHTABLE_OK);
 
     void *out = (void *)0xbeef;
-    ASSERT(hashtable_get(t, "nullval", &out) == true);
+    ASSERT(hashtable_get(t, SK("nullval"), &out) == true);
     ASSERT(out == NULL);
 
-    // A genuinely missing key still reports false.
     out = (void *)0xbeef;
-    ASSERT(hashtable_get(t, "other", &out) == false);
+    ASSERT(hashtable_get(t, SK("other"), &out) == false);
 }
 
 TEST(update_existing) {
@@ -90,11 +101,11 @@ TEST(update_existing) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     int a = 1, b = 2;
-    hashtable_insert(t, "k", &a);
-    ASSERT_EQ(hashtable_update(t, "k", &b), HASHTABLE_UPDATE_OK);
+    hashtable_insert(t, SK("k"), &a);
+    ASSERT_EQ(hashtable_update(t, SK("k"), &b), HASHTABLE_UPDATE_OK);
 
     void *out = NULL;
-    ASSERT(hashtable_get(t, "k", &out) == true);
+    ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &b);
 }
 
@@ -103,7 +114,7 @@ TEST(update_missing_rejected) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     int b = 2;
-    ASSERT_EQ(hashtable_update(t, "ghost", &b), HASHTABLE_UPDATE_ERR_NOT_FOUND);
+    ASSERT_EQ(hashtable_update(t, SK("ghost"), &b), HASHTABLE_UPDATE_ERR_NOT_FOUND);
 }
 
 TEST(upsert_inserts_when_absent) {
@@ -111,10 +122,10 @@ TEST(upsert_inserts_when_absent) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     int v = 5;
-    ASSERT_EQ(hashtable_upsert(t, "k", &v), HASHTABLE_UPSERT_INSERTED);
+    ASSERT_EQ(hashtable_upsert(t, SK("k"), &v), HASHTABLE_UPSERT_INSERTED);
 
     void *out = NULL;
-    ASSERT(hashtable_get(t, "k", &out) == true);
+    ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &v);
 }
 
@@ -123,11 +134,11 @@ TEST(upsert_updates_when_present) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     int a = 1, b = 2;
-    ASSERT_EQ(hashtable_upsert(t, "k", &a), HASHTABLE_UPSERT_INSERTED);
-    ASSERT_EQ(hashtable_upsert(t, "k", &b), HASHTABLE_UPSERT_UPDATED);
+    ASSERT_EQ(hashtable_upsert(t, SK("k"), &a), HASHTABLE_UPSERT_INSERTED);
+    ASSERT_EQ(hashtable_upsert(t, SK("k"), &b), HASHTABLE_UPSERT_UPDATED);
 
     void *out = NULL;
-    ASSERT(hashtable_get(t, "k", &out) == true);
+    ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &b);
 }
 
@@ -136,116 +147,142 @@ TEST(remove_existing) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     int v = 9;
-    hashtable_insert(t, "k", &v);
-    ASSERT_EQ(hashtable_remove(t, "k"), HASHTABLE_REMOVE_OK);
+    hashtable_insert(t, SK("k"), &v);
+    ASSERT_EQ(hashtable_remove(t, SK("k")), HASHTABLE_REMOVE_OK);
 
     void *out = NULL;
-    ASSERT(hashtable_get(t, "k", &out) == false);
+    ASSERT(hashtable_get(t, SK("k"), &out) == false);
 }
 
 TEST(remove_missing_rejected) {
     uint8_t buf[ARENA_BYTES];
     HashTable *t = fresh(buf, sizeof(buf));
 
-    ASSERT_EQ(hashtable_remove(t, "nope"), HASHTABLE_REMOVE_ERR_NOT_FOUND);
+    ASSERT_EQ(hashtable_remove(t, SK("nope")), HASHTABLE_REMOVE_ERR_NOT_FOUND);
 }
 
-// After remove, the slot must be reusable (no tombstone wreckage blocking
-// reinsert).
 TEST(remove_then_reinsert) {
     uint8_t buf[ARENA_BYTES];
     HashTable *t = fresh(buf, sizeof(buf));
 
     int a = 1, b = 2;
-    hashtable_insert(t, "k", &a);
-    hashtable_remove(t, "k");
-    ASSERT_EQ(hashtable_insert(t, "k", &b), HASHTABLE_OK);
+    hashtable_insert(t, SK("k"), &a);
+    hashtable_remove(t, SK("k"));
+    ASSERT_EQ(hashtable_insert(t, SK("k"), &b), HASHTABLE_OK);
 
     void *out = NULL;
-    ASSERT(hashtable_get(t, "k", &out) == true);
+    ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &b);
 }
 
-// Validates documented key-copy semantics: the table must copy key bytes,
-// so mutating the caller's buffer after insert must not corrupt the entry.
+// Table must copy the key bytes: mutating the caller's buffer after insert
+// must not corrupt or relocate the stored entry.
 TEST(key_is_copied_not_borrowed) {
     uint8_t buf[ARENA_BYTES];
     HashTable *t = fresh(buf, sizeof(buf));
 
-    char key[8];
-    strcpy(key, "stable");
+    uint8_t key[4] = {1, 2, 3, 4};
     int v = 123;
-    hashtable_insert(t, key, &v);
+    hashtable_insert(t, key, sizeof key, &v);
 
     // Scribble over the caller's buffer.
-    strcpy(key, "ZZZZZZ");
+    key[0] = 9;
+    key[1] = 9;
 
+    uint8_t orig[4] = {1, 2, 3, 4};
     void *out = NULL;
-    ASSERT(hashtable_get(t, "stable", &out) == true);
+    ASSERT(hashtable_get(t, orig, sizeof orig, &out) == true);
     ASSERT(out == &v);
 
-    // The mutated string must NOT resolve to the stored entry.
+    uint8_t mutated[4] = {9, 9, 3, 4};
     out = NULL;
-    ASSERT(hashtable_get(t, "ZZZZZZ", &out) == false);
+    ASSERT(hashtable_get(t, mutated, sizeof mutated, &out) == false);
 }
 
-// Distinct keys that collide into the same bucket must both be retrievable.
-// (Independent of the hash fn: with initial size 2 and several keys, collisions
-// are forced by pigeonhole.)
+// The headline reason for byte keys: keys with embedded NUL bytes must be
+// distinguished past the NUL. A string-keyed table would treat all of these
+// as "\x01" and collapse them.
+TEST(embedded_nul_keys_distinct) {
+    uint8_t buf[ARENA_BYTES];
+    HashTable *t = fresh(buf, sizeof(buf));
+
+    uint8_t k1[3] = {0x01, 0x00, 0x02};
+    uint8_t k2[3] = {0x01, 0x00, 0x03};
+    uint8_t k3[1] = {0x01};
+    int va = 1, vb = 2, vc = 3;
+
+    ASSERT_EQ(hashtable_insert(t, k1, sizeof k1, &va), HASHTABLE_OK);
+    ASSERT_EQ(hashtable_insert(t, k2, sizeof k2, &vb), HASHTABLE_OK);
+    ASSERT_EQ(hashtable_insert(t, k3, sizeof k3, &vc), HASHTABLE_OK);
+
+    void *out = NULL;
+    ASSERT(hashtable_get(t, k1, sizeof k1, &out) == true);
+    ASSERT(out == &va);
+    ASSERT(hashtable_get(t, k2, sizeof k2, &out) == true);
+    ASSERT(out == &vb);
+    ASSERT(hashtable_get(t, k3, sizeof k3, &out) == true);
+    ASSERT(out == &vc);
+}
+
+// Same prefix, different length: must be distinct keys.
+TEST(length_distinguishes_keys) {
+    uint8_t buf[ARENA_BYTES];
+    HashTable *t = fresh(buf, sizeof(buf));
+
+    uint8_t a[2] = {0x01, 0x02};
+    uint8_t b[3] = {0x01, 0x02, 0x03};
+    int va = 1, vb = 2;
+
+    ASSERT_EQ(hashtable_insert(t, a, sizeof a, &va), HASHTABLE_OK);
+    ASSERT_EQ(hashtable_insert(t, b, sizeof b, &vb), HASHTABLE_OK);
+
+    void *out = NULL;
+    ASSERT(hashtable_get(t, a, sizeof a, &out) == true);
+    ASSERT(out == &va);
+    ASSERT(hashtable_get(t, b, sizeof b, &out) == true);
+    ASSERT(out == &vb);
+}
+
 TEST(collisions_resolve) {
     uint8_t buf[ARENA_BYTES];
     HashTable *t = fresh(buf, sizeof(buf));
 
     int va = 1, vb = 2, vc = 3, vd = 4;
-    ASSERT_EQ(hashtable_insert(t, "alpha", &va), HASHTABLE_OK);
-    ASSERT_EQ(hashtable_insert(t, "bravo", &vb), HASHTABLE_OK);
-    ASSERT_EQ(hashtable_insert(t, "charlie", &vc), HASHTABLE_OK);
-    ASSERT_EQ(hashtable_insert(t, "delta", &vd), HASHTABLE_OK);
+    ASSERT_EQ(hashtable_insert(t, SK("alpha"), &va), HASHTABLE_OK);
+    ASSERT_EQ(hashtable_insert(t, SK("bravo"), &vb), HASHTABLE_OK);
+    ASSERT_EQ(hashtable_insert(t, SK("charlie"), &vc), HASHTABLE_OK);
+    ASSERT_EQ(hashtable_insert(t, SK("delta"), &vd), HASHTABLE_OK);
 
     void *out = NULL;
-    ASSERT(hashtable_get(t, "alpha", &out) == true);
+    ASSERT(hashtable_get(t, SK("alpha"), &out) == true);
     ASSERT(out == &va);
-    ASSERT(hashtable_get(t, "bravo", &out) == true);
+    ASSERT(hashtable_get(t, SK("bravo"), &out) == true);
     ASSERT(out == &vb);
-    ASSERT(hashtable_get(t, "charlie", &out) == true);
+    ASSERT(hashtable_get(t, SK("charlie"), &out) == true);
     ASSERT(out == &vc);
-    ASSERT(hashtable_get(t, "delta", &out) == true);
+    ASSERT(hashtable_get(t, SK("delta"), &out) == true);
     ASSERT(out == &vd);
 }
 
 // Insert many more than initial size to force at least one grow/rehash.
-// All entries must survive the rehash.
+// uint32 keys exercise the byte-key path; all entries must survive the rehash.
 TEST(grow_preserves_entries) {
     uint8_t buf[ARENA_BYTES];
     HashTable *t = fresh(buf, sizeof(buf));
 
     enum { N = 200 };
+    static uint32_t keys[N];
     static int vals[N];
-    static char keys[N][16];
     for (int i = 0; i < N; i++) {
+        keys[i] = (uint32_t)(i * 7 + 1);
         vals[i] = i * 10;
-        // keys: "key0".."key199"
-        int n = i, p = 0;
-        char tmp[16];
-        keys[i][p++] = 'k';
-        keys[i][p++] = 'e';
-        keys[i][p++] = 'y';
-        int len = 0;
-        if (n == 0)
-            tmp[len++] = '0';
-        while (n > 0) {
-            tmp[len++] = (char)('0' + n % 10);
-            n /= 10;
-        }
-        while (len > 0)
-            keys[i][p++] = tmp[--len];
-        keys[i][p] = '\0';
-        ASSERT_EQ(hashtable_insert(t, keys[i], &vals[i]), HASHTABLE_OK);
+        ASSERT_EQ(hashtable_insert(t, &keys[i], sizeof keys[i], &vals[i]),
+                  HASHTABLE_OK);
     }
 
     for (int i = 0; i < N; i++) {
         void *out = NULL;
-        ASSERT(hashtable_get(t, keys[i], &out) == true);
+        ASSERT(hashtable_get(t, &keys[i], sizeof keys[i], &out) == true);
         ASSERT(out == &vals[i]);
     }
 }
@@ -255,46 +292,53 @@ TEST(iter_empty_yields_nothing) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     HashTableIter it = hashtable_iter(t);
-    const char *k = NULL;
+    const void *k = NULL;
+    size_t klen = 0;
     void *v = NULL;
-    ASSERT(hashtable_iter_next(&it, &k, &v) == false);
+    ASSERT(hashtable_iter_next(&it, &k, &klen, &v) == false);
 }
 
-// Iteration must visit every entry exactly once (order unspecified).
+// Iteration must visit every entry exactly once (order unspecified), yielding
+// the key bytes and their length.
 TEST(iter_visits_all_once) {
     uint8_t buf[ARENA_BYTES];
     HashTable *t = fresh(buf, sizeof(buf));
 
-    int va = 1, vb = 2, vc = 3;
-    hashtable_insert(t, "one", &va);
-    hashtable_insert(t, "two", &vb);
-    hashtable_insert(t, "three", &vc);
+    uint32_t k1 = 10, k2 = 20, k3 = 30;
+    int v1 = 1, v2 = 2, v3 = 3;
+    hashtable_insert(t, &k1, sizeof k1, &v1);
+    hashtable_insert(t, &k2, sizeof k2, &v2);
+    hashtable_insert(t, &k3, sizeof k3, &v3);
 
-    int seen_one = 0, seen_two = 0, seen_three = 0, total = 0;
+    int seen1 = 0, seen2 = 0, seen3 = 0, total = 0;
 
     HashTableIter it = hashtable_iter(t);
-    const char *k = NULL;
+    const void *k = NULL;
+    size_t klen = 0;
     void *v = NULL;
-    while (hashtable_iter_next(&it, &k, &v)) {
+    while (hashtable_iter_next(&it, &k, &klen, &v)) {
         total++;
-        if (strcmp(k, "one") == 0) {
-            seen_one++;
-            ASSERT(v == &va);
+        ASSERT_EQ(klen, sizeof(uint32_t));
+        uint32_t kv;
+        memcpy(&kv, k, sizeof kv);
+        if (kv == 10) {
+            seen1++;
+            ASSERT(v == &v1);
         }
-        if (strcmp(k, "two") == 0) {
-            seen_two++;
-            ASSERT(v == &vb);
+        if (kv == 20) {
+            seen2++;
+            ASSERT(v == &v2);
         }
-        if (strcmp(k, "three") == 0) {
-            seen_three++;
-            ASSERT(v == &vc);
+        if (kv == 30) {
+            seen3++;
+            ASSERT(v == &v3);
         }
     }
 
     ASSERT_EQ(total, 3);
-    ASSERT_EQ(seen_one, 1);
-    ASSERT_EQ(seen_two, 1);
-    ASSERT_EQ(seen_three, 1);
+    ASSERT_EQ(seen1, 1);
+    ASSERT_EQ(seen2, 1);
+    ASSERT_EQ(seen3, 1);
 }
 
 TEST(clear_empties_table) {
@@ -302,60 +346,44 @@ TEST(clear_empties_table) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     int va = 1, vb = 2;
-    hashtable_insert(t, "a", &va);
-    hashtable_insert(t, "b", &vb);
+    hashtable_insert(t, SK("a"), &va);
+    hashtable_insert(t, SK("b"), &vb);
 
     hashtable_clear(t);
 
     void *out = NULL;
-    ASSERT(hashtable_get(t, "a", &out) == false);
-    ASSERT(hashtable_get(t, "b", &out) == false);
+    ASSERT(hashtable_get(t, SK("a"), &out) == false);
+    ASSERT(hashtable_get(t, SK("b"), &out) == false);
 
-    // Iteration after clear yields nothing.
     HashTableIter it = hashtable_iter(t);
-    const char *k = NULL;
+    const void *k = NULL;
+    size_t klen = 0;
     void *v = NULL;
-    ASSERT(hashtable_iter_next(&it, &k, &v) == false);
+    ASSERT(hashtable_iter_next(&it, &k, &klen, &v) == false);
 
-    // Table is reusable after clear.
     int vc = 3;
-    ASSERT_EQ(hashtable_insert(t, "c", &vc), HASHTABLE_OK);
-    ASSERT(hashtable_get(t, "c", &out) == true);
+    ASSERT_EQ(hashtable_insert(t, SK("c"), &vc), HASHTABLE_OK);
+    ASSERT(hashtable_get(t, SK("c"), &out) == true);
     ASSERT(out == &vc);
 }
 
-// With a deliberately tiny arena, inserts must eventually report OOM
-// rather than corrupting memory or succeeding past the buffer.
+// With a deliberately tiny arena, inserts must eventually report OOM rather
+// than corrupting memory or succeeding past the buffer.
 TEST(oom_when_arena_exhausted) {
-    // Small buffer: enough for the table header + a few entries, not unbounded.
     uint8_t buf[256];
     Arena *arena = arena_create(buf, sizeof(buf));
     HashTable *t = hashtable_create(arena);
-    // create itself may fail if buffer is too small; if so, nothing to test.
     if (t == NULL)
         return;
 
+    static uint32_t keys[1024];
     static int vals[1024];
     int got_oom = 0;
     for (int i = 0; i < 1024; i++) {
+        keys[i] = (uint32_t)i;
         vals[i] = i;
-        char key[16];
-        // "k0".."k1023"
-        int n = i, p = 0;
-        char tmp[16];
-        key[p++] = 'k';
-        int len = 0;
-        if (n == 0)
-            tmp[len++] = '0';
-        while (n > 0) {
-            tmp[len++] = (char)('0' + n % 10);
-            n /= 10;
-        }
-        while (len > 0)
-            key[p++] = tmp[--len];
-        key[p] = '\0';
-
-        if (hashtable_insert(t, key, &vals[i]) == HASHTABLE_ERR_OOM) {
+        if (hashtable_insert(t, &keys[i], sizeof keys[i], &vals[i]) ==
+            HASHTABLE_ERR_OOM) {
             got_oom = 1;
             break;
         }
@@ -377,6 +405,8 @@ int main(void) {
     RUN(remove_missing_rejected);
     RUN(remove_then_reinsert);
     RUN(key_is_copied_not_borrowed);
+    RUN(embedded_nul_keys_distinct);
+    RUN(length_distinguishes_keys);
     RUN(collisions_resolve);
     RUN(grow_preserves_entries);
     RUN(iter_empty_yields_nothing);

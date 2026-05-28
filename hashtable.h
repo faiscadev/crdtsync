@@ -2,24 +2,27 @@
 #define _CRDT_HASHTABLE_H
 
 // Ownership:
-//   Keys  — table copies the bytes into its arena on insert/update/upsert.
-//           Caller's `key` pointer may be transient (stack, freed after the call).
-//           Keys returned by `hashtable_iter_next` are table-owned; valid as long as
-//           the arena lives. Caller must not free them.
+//   Keys  — table copies key_len bytes into its arena when a new entry is
+//           inserted (insert, and the insert path of upsert). Keys are raw
+//           bytes: embedded NULs and the length are significant — they are not
+//           NUL-terminated strings. Caller's `key` pointer may be transient
+//           (stack, freed after the call). Keys returned by
+//           `hashtable_iter_next` are table-owned; valid as long as the arena
+//           lives. Caller must not free them.
 //   Values — stored as opaque `void *`; table does NOT copy. Caller owns the
-//            pointed-to memory (typically arena-allocated). Lifetime must outlive
-//            any get/iter that reads the slot.
+//            pointed-to memory (typically arena-allocated). Lifetime must
+//            outlive any get/iter that reads the slot.
 //
-// Lifetime: HashTable must not outlive its arena. Resetting the arena invalidates
-// every key, value, and the table itself.
+// Lifetime: HashTable must not outlive its arena. Resetting the arena
+// invalidates every key, value, and the table itself.
 //
 // Iteration: do NOT insert into or remove from the table while iterating it.
 // Mutation can leave the iterator's cursor pointing at an unlinked entry or
 // cause entries to be skipped. Finish iterating first, then mutate.
 
-#include <stddef.h>
-#include <stdbool.h>
 #include "arena.h"
+#include <stdbool.h>
+#include <stddef.h>
 
 typedef struct HashTableNode HashTableNode;
 
@@ -35,30 +38,34 @@ typedef enum {
     HASHTABLE_ERR_OOM,
     HASHTABLE_ERR_KEY_EXISTS,
 } HashTableInsertResult;
-HashTableInsertResult hashtable_insert(HashTable *table, const char *key, void *value);
+HashTableInsertResult hashtable_insert(HashTable *table, void *key,
+                                       size_t key_len, void *value);
 
-// Returns true if key found; sets *out to stored value (which may itself be NULL).
-// Returns false if key not present; *out untouched.
-bool hashtable_get(HashTable *table, const char *key, void **out);
+// Returns true if key found; sets *out to stored value (which may itself be
+// NULL). Returns false if key not present; *out untouched.
+bool hashtable_get(HashTable *table, void *key, size_t key_len, void **out);
 
 typedef enum {
     HASHTABLE_REMOVE_OK,
     HASHTABLE_REMOVE_ERR_NOT_FOUND,
 } HashTableRemoveResult;
-HashTableRemoveResult hashtable_remove(HashTable *table, const char *key);
+HashTableRemoveResult hashtable_remove(HashTable *table, void *key,
+                                       size_t key_len);
 
 typedef enum {
     HASHTABLE_UPDATE_OK,
     HASHTABLE_UPDATE_ERR_NOT_FOUND,
 } HashTableUpdateResult;
-HashTableUpdateResult hashtable_update(HashTable *table, const char *key, void *value);
+HashTableUpdateResult hashtable_update(HashTable *table, void *key,
+                                       size_t key_len, void *value);
 
 typedef enum {
     HASHTABLE_UPSERT_INSERTED,
     HASHTABLE_UPSERT_UPDATED,
     HASHTABLE_UPSERT_ERR_OOM,
 } HashTableUpsertResult;
-HashTableUpsertResult hashtable_upsert(HashTable *table, const char *key, void *value);
+HashTableUpsertResult hashtable_upsert(HashTable *table, void *key,
+                                       size_t key_len, void *value);
 
 void hashtable_clear(HashTable *table);
 
@@ -67,6 +74,7 @@ typedef struct {
 } HashTableIter;
 
 HashTableIter hashtable_iter(HashTable *table);
-bool hashtable_iter_next(HashTableIter *it, const char **key, void **value);
+bool hashtable_iter_next(HashTableIter *it, const void **key, size_t *key_len,
+                         void **value);
 
 #endif // _CRDT_HASHTABLE_H
