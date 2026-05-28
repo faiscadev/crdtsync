@@ -17,6 +17,7 @@ a.out
 # Test binaries
 /test_hashtable
 /test_string
+/test_counter
 
 # IDE / editor
 .vscode/
