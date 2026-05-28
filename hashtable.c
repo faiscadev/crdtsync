@@ -19,7 +19,7 @@ HashTable *hashtable_create(Arena *arena) {
     return table;
 }
 
-HashTableInsertResult _hashtable_insert(HashTable *table, void *key,
+HashTableInsertResult _hashtable_insert(HashTable *table, const void *key,
                                         size_t key_len, void *value) {
     HashTableNode *node = arena_alloc(table->arena, sizeof(HashTableNode));
     if (!node) {
@@ -42,7 +42,7 @@ HashTableInsertResult _hashtable_insert(HashTable *table, void *key,
     return HASHTABLE_OK;
 }
 
-HashTableInsertResult hashtable_insert(HashTable *table, void *key,
+HashTableInsertResult hashtable_insert(HashTable *table, const void *key,
                                        size_t key_len, void *value) {
     if (hashtable_get(table, key, key_len, NULL)) {
         return HASHTABLE_ERR_KEY_EXISTS;
@@ -51,7 +51,8 @@ HashTableInsertResult hashtable_insert(HashTable *table, void *key,
     return _hashtable_insert(table, key, key_len, value);
 }
 
-bool hashtable_get(HashTable *table, void *key, size_t key_len, void **out) {
+bool hashtable_get(HashTable *table, const void *key, size_t key_len,
+                   void **out) {
     HashTableIter it = hashtable_iter(table);
     const void *k;
     void *v;
@@ -67,7 +68,7 @@ bool hashtable_get(HashTable *table, void *key, size_t key_len, void **out) {
     return false;
 }
 
-HashTableRemoveResult hashtable_remove(HashTable *table, void *key,
+HashTableRemoveResult hashtable_remove(HashTable *table, const void *key,
                                        size_t key_len) {
     HashTableNode *prev = NULL;
     for (HashTableNode *n = table->head; n; prev = n, n = n->next) {
@@ -84,7 +85,7 @@ HashTableRemoveResult hashtable_remove(HashTable *table, void *key,
     return HASHTABLE_REMOVE_ERR_NOT_FOUND;
 }
 
-HashTableUpdateResult hashtable_update(HashTable *table, void *key,
+HashTableUpdateResult hashtable_update(HashTable *table, const void *key,
                                        size_t key_len, void *value) {
     for (HashTableNode *n = table->head; n; n = n->next) {
         if (n->key_len == key_len && memcmp(n->key, key, key_len) == 0) {
@@ -97,7 +98,7 @@ HashTableUpdateResult hashtable_update(HashTable *table, void *key,
     return HASHTABLE_UPDATE_ERR_NOT_FOUND;
 }
 
-HashTableUpsertResult hashtable_upsert(HashTable *table, void *key,
+HashTableUpsertResult hashtable_upsert(HashTable *table, const void *key,
                                        size_t key_len, void *value) {
     if (hashtable_update(table, key, key_len, value) == HASHTABLE_UPDATE_OK) {
         return HASHTABLE_UPSERT_UPDATED;

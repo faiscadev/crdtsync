@@ -38,25 +38,26 @@ typedef enum {
     HASHTABLE_ERR_OOM,
     HASHTABLE_ERR_KEY_EXISTS,
 } HashTableInsertResult;
-HashTableInsertResult hashtable_insert(HashTable *table, void *key,
+HashTableInsertResult hashtable_insert(HashTable *table, const void *key,
                                        size_t key_len, void *value);
 
 // Returns true if key found; sets *out to stored value (which may itself be
 // NULL). Returns false if key not present; *out untouched.
-bool hashtable_get(HashTable *table, void *key, size_t key_len, void **out);
+bool hashtable_get(HashTable *table, const void *key, size_t key_len,
+                   void **out);
 
 typedef enum {
     HASHTABLE_REMOVE_OK,
     HASHTABLE_REMOVE_ERR_NOT_FOUND,
 } HashTableRemoveResult;
-HashTableRemoveResult hashtable_remove(HashTable *table, void *key,
+HashTableRemoveResult hashtable_remove(HashTable *table, const void *key,
                                        size_t key_len);
 
 typedef enum {
     HASHTABLE_UPDATE_OK,
     HASHTABLE_UPDATE_ERR_NOT_FOUND,
 } HashTableUpdateResult;
-HashTableUpdateResult hashtable_update(HashTable *table, void *key,
+HashTableUpdateResult hashtable_update(HashTable *table, const void *key,
                                        size_t key_len, void *value);
 
 typedef enum {
@@ -64,7 +65,7 @@ typedef enum {
     HASHTABLE_UPSERT_UPDATED,
     HASHTABLE_UPSERT_ERR_OOM,
 } HashTableUpsertResult;
-HashTableUpsertResult hashtable_upsert(HashTable *table, void *key,
+HashTableUpsertResult hashtable_upsert(HashTable *table, const void *key,
                                        size_t key_len, void *value);
 
 void hashtable_clear(HashTable *table);
