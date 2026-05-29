@@ -10,7 +10,8 @@
 //   void     counter_merge(Counter *dst, const Counter *src);
 //
 // Model — state-based PN-counter, backed by hashtable:
-//   client_id (uint32_t, keyed as raw bytes) -> CounterEntry { uint32_t inc; uint32_t dec; }
+//   client_id (uint32_t, keyed as raw bytes) -> CounterEntry { uint32_t inc;
+//   uint32_t dec; }
 //
 //   - read  = sum over all clients of (inc - dec). Signed (can go negative).
 //   - LOCAL inc/dec ACCUMULATE into the caller's own client entry
@@ -22,9 +23,9 @@
 // counter_merge is one-directional: src's state is folded into dst; src is
 // left unchanged.
 
-#include "test_util.h"
 #include "arena.h"
 #include "counter.h"
+#include "test_util.h"
 
 #define ARENA_BYTES (64 * 1024)
 

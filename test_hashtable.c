@@ -1,6 +1,6 @@
+#include <assert.h>
 #include <stdint.h>
 #include <string.h>
-#include <assert.h>
 
 #include "arena.h"
 #include "hashtable.h"
@@ -8,12 +8,15 @@
 
 // hashtable keys on raw bytes (key pointer + length), not C strings.
 // Expected API (you implement in hashtable.h / hashtable.c):
-//   HashTableInsertResult hashtable_insert(HashTable*, const void *key, size_t key_len, void *value);
-//   bool                  hashtable_get   (HashTable*, const void *key, size_t key_len, void **out);
-//   HashTableRemoveResult hashtable_remove(HashTable*, const void *key, size_t key_len);
-//   HashTableUpdateResult hashtable_update(HashTable*, const void *key, size_t key_len, void *value);
-//   HashTableUpsertResult hashtable_upsert(HashTable*, const void *key, size_t key_len, void *value);
-//   bool hashtable_iter_next(HashTableIter*, const void **key, size_t *key_len, void **value);
+//   HashTableInsertResult hashtable_insert(HashTable*, const void *key, size_t
+//   key_len, void *value); bool                  hashtable_get   (HashTable*,
+//   const void *key, size_t key_len, void **out); HashTableRemoveResult
+//   hashtable_remove(HashTable*, const void *key, size_t key_len);
+//   HashTableUpdateResult hashtable_update(HashTable*, const void *key, size_t
+//   key_len, void *value); HashTableUpsertResult hashtable_upsert(HashTable*,
+//   const void *key, size_t key_len, void *value); bool
+//   hashtable_iter_next(HashTableIter*, const void **key, size_t *key_len, void
+//   **value);
 // Keys are copied (key_len bytes) into the arena. Binary-safe: embedded NUL
 // bytes are part of the key, and length is significant.
 
@@ -114,7 +117,8 @@ TEST(update_missing_rejected) {
     HashTable *t = fresh(buf, sizeof(buf));
 
     int b = 2;
-    ASSERT_EQ(hashtable_update(t, SK("ghost"), &b), HASHTABLE_UPDATE_ERR_NOT_FOUND);
+    ASSERT_EQ(hashtable_update(t, SK("ghost"), &b),
+              HASHTABLE_UPDATE_ERR_NOT_FOUND);
 }
 
 TEST(upsert_inserts_when_absent) {

@@ -1,7 +1,6 @@
 #include "counter.h"
 #include "arena.h"
 #include "hashtable.h"
-#include <stdio.h>
 
 static inline uint32_t max_u32(uint32_t a, uint32_t b) {
     if (a > b) {

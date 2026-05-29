@@ -29,7 +29,7 @@ static char test_fail_msg[512];
         name();                                                                \
         if (test_cur_failed) {                                                 \
             test_fail_count++;                                                 \
-            printf("%s%s FAIL %s %s\n        %s\n", TC_RED, TC_BOLD, TC_RESET,  \
+            printf("%s%s FAIL %s %s\n        %s\n", TC_RED, TC_BOLD, TC_RESET, \
                    #name, test_fail_msg);                                      \
         } else {                                                               \
             printf("%s ok %s   %s\n", TC_GREEN, TC_RESET, #name);              \

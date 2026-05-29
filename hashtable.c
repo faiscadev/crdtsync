@@ -1,6 +1,5 @@
 #include "hashtable.h"
 #include "string.h"
-#include <stdio.h>
 
 typedef struct HashTableNode {
     void *key;
