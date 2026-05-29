@@ -19,6 +19,9 @@ a.out
 /test_string
 /test_counter
 
+# Tooling
+/.venv-fmt/
+
 # IDE / editor
 .vscode/
 .idea/
