@@ -46,5 +46,10 @@ test-register: arena.c string.c scalar.c register.c test_register.c test_util.h
 	$(CC) $(CFLAGS) -o test_register arena.c string.c scalar.c register.c test_register.c
 	./test_register
 
+.PHONY: test-clientid
+test-clientid: string.c clientid.c test_clientid.c test_util.h
+	$(CC) $(CFLAGS) -o test_clientid string.c clientid.c test_clientid.c
+	./test_clientid
+
 .PHONY: test
-test: test-hashtable test-string test-counter test-scalar test-register
+test: test-hashtable test-string test-counter test-scalar test-register test-clientid
