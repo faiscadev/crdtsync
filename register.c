@@ -1,5 +1,6 @@
 #include "register.h"
 #include "arena.h"
+#include "host.h"
 #include "scalar.h"
 #include <stdbool.h>
 #include <string.h>
@@ -9,6 +10,9 @@ Scalar accept_value(Arena *arena, Scalar value) {
     case SCALAR_STRING: {
         // Copy string bytes into arena.
         uint8_t *dst = arena_alloc(arena, value.as.s.len);
+        if (!dst && value.as.s.len > 0) {
+            host_abort("register: arena OOM copying string bytes");
+        }
         memcpy(dst, value.as.s.bytes, value.as.s.len);
         return scalar_string(dst, value.as.s.len);
     }
@@ -21,6 +25,9 @@ Scalar accept_value(Arena *arena, Scalar value) {
 
 Register *register_create(Arena *arena, Scalar value, Stamp stamp) {
     Register *reg = arena_alloc(arena, sizeof(Register));
+    if (!reg) {
+        host_abort("register_create: arena OOM");
+    }
     reg->arena = arena;
     reg->value = accept_value(arena, value);
     reg->stamp = stamp;
