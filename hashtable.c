@@ -1,6 +1,18 @@
 #include "hashtable.h"
 #include "string.h"
 
+const char *hashtable_insert_result_name(HashTableInsertResult r) {
+    switch (r) {
+    case HASHTABLE_OK:
+        return "OK";
+    case HASHTABLE_ERR_OOM:
+        return "OOM";
+    case HASHTABLE_ERR_KEY_EXISTS:
+        return "KEY_EXISTS";
+    }
+    return "unknown";
+}
+
 typedef struct HashTableNode {
     void *key;
     size_t key_len;

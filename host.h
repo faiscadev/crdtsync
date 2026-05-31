@@ -30,4 +30,9 @@ void host_fill_entropy(uint8_t *buf, size_t n);
 // string suitable for logging. Never returns.
 _Noreturn void host_abort(const char *reason);
 
+// printf-style variant. Per-target impls must support at minimum %s, %d, %u
+// and %zu so primitives can interpolate enum names, sizes, and ids in their
+// abort messages. Never returns.
+_Noreturn void host_abortf(const char *fmt, ...);
+
 #endif // _CRDT_HOST_H
