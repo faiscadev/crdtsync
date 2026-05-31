@@ -51,5 +51,10 @@ test-clientid: string.c clientid.c test_clientid.c test_util.h
 	$(CC) $(CFLAGS) -o test_clientid string.c clientid.c test_clientid.c
 	./test_clientid
 
+.PHONY: test-stamp
+test-stamp: string.c clientid.c stamp.c test_stamp.c test_util.h
+	$(CC) $(CFLAGS) -o test_stamp string.c clientid.c stamp.c test_stamp.c
+	./test_stamp
+
 .PHONY: test
-test: test-hashtable test-string test-counter test-scalar test-register test-clientid
+test: test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp
