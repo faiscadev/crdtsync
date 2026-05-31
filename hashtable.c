@@ -10,7 +10,6 @@ const char *hashtable_insert_result_name(HashTableInsertResult r) {
     case HASHTABLE_ERR_KEY_EXISTS:
         return "KEY_EXISTS";
     }
-    return "unknown";
 }
 
 typedef struct HashTableNode {
