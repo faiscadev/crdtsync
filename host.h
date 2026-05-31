@@ -35,4 +35,10 @@ _Noreturn void host_abort(const char *reason);
 // abort messages. Never returns.
 _Noreturn void host_abortf(const char *fmt, ...);
 
+void *host_malloc(size_t size);
+
+void host_free(void *ptr);
+
+void *host_realloc(void *ptr, size_t new_size);
+
 #endif // _CRDT_HOST_H

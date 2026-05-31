@@ -59,3 +59,11 @@ _Noreturn void host_abortf(const char *fmt, ...) {
     va_end(args);
     abort();
 }
+
+void *host_malloc(size_t size) { return malloc(size); }
+
+void host_free(void *ptr) { free(ptr); }
+
+void *host_realloc(void *ptr, size_t new_size) {
+    return realloc(ptr, new_size);
+}

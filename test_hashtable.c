@@ -20,21 +20,18 @@
 // Keys are copied (key_len bytes) into the arena. Binary-safe: embedded NUL
 // bytes are part of the key, and length is significant.
 
-#define ARENA_BYTES (64 * 1024)
-
 // String-key shorthand: expands to (bytes, length) without the NUL terminator.
 #define SK(s) (s), strlen(s)
 
-static HashTable *fresh(uint8_t *buf, size_t buf_len) {
-    Arena *arena = arena_create(buf, buf_len);
+static HashTable *fresh(void) {
+    Arena *arena = arena_create();
     HashTable *table = hashtable_create(arena);
     assert(table != NULL);
     return table;
 }
 
 TEST(create_empty) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     uint32_t k = 7;
     void *out = (void *)0xdead;
@@ -46,8 +43,7 @@ TEST(create_empty) {
 // uint32 key, fetched via a separate variable holding the same value — proves
 // the table compares key *bytes*, not pointers.
 TEST(insert_then_get) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     uint32_t k = 42;
     int v = 99;
@@ -61,8 +57,7 @@ TEST(insert_then_get) {
 }
 
 TEST(insert_duplicate_rejected) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int a = 1, b = 2;
     ASSERT_EQ(hashtable_insert(t, SK("k"), &a), HASHTABLE_OK);
@@ -74,8 +69,7 @@ TEST(insert_duplicate_rejected) {
 }
 
 TEST(get_missing_returns_false) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int v = 7;
     hashtable_insert(t, SK("present"), &v);
@@ -86,8 +80,7 @@ TEST(get_missing_returns_false) {
 
 // NULL is a storable value, distinguishable from "not found".
 TEST(stored_null_is_distinguishable) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     ASSERT_EQ(hashtable_insert(t, SK("nullval"), NULL), HASHTABLE_OK);
 
@@ -100,8 +93,7 @@ TEST(stored_null_is_distinguishable) {
 }
 
 TEST(update_existing) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int a = 1, b = 2;
     hashtable_insert(t, SK("k"), &a);
@@ -113,8 +105,7 @@ TEST(update_existing) {
 }
 
 TEST(update_missing_rejected) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int b = 2;
     ASSERT_EQ(hashtable_update(t, SK("ghost"), &b),
@@ -122,8 +113,7 @@ TEST(update_missing_rejected) {
 }
 
 TEST(upsert_inserts_when_absent) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int v = 5;
     ASSERT_EQ(hashtable_upsert(t, SK("k"), &v), HASHTABLE_UPSERT_INSERTED);
@@ -134,8 +124,7 @@ TEST(upsert_inserts_when_absent) {
 }
 
 TEST(upsert_updates_when_present) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int a = 1, b = 2;
     ASSERT_EQ(hashtable_upsert(t, SK("k"), &a), HASHTABLE_UPSERT_INSERTED);
@@ -147,8 +136,7 @@ TEST(upsert_updates_when_present) {
 }
 
 TEST(remove_existing) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int v = 9;
     hashtable_insert(t, SK("k"), &v);
@@ -159,15 +147,13 @@ TEST(remove_existing) {
 }
 
 TEST(remove_missing_rejected) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     ASSERT_EQ(hashtable_remove(t, SK("nope")), HASHTABLE_REMOVE_ERR_NOT_FOUND);
 }
 
 TEST(remove_then_reinsert) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int a = 1, b = 2;
     hashtable_insert(t, SK("k"), &a);
@@ -182,8 +168,7 @@ TEST(remove_then_reinsert) {
 // Table must copy the key bytes: mutating the caller's buffer after insert
 // must not corrupt or relocate the stored entry.
 TEST(key_is_copied_not_borrowed) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     uint8_t key[4] = {1, 2, 3, 4};
     int v = 123;
@@ -207,8 +192,7 @@ TEST(key_is_copied_not_borrowed) {
 // distinguished past the NUL. A string-keyed table would treat all of these
 // as "\x01" and collapse them.
 TEST(embedded_nul_keys_distinct) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     uint8_t k1[3] = {0x01, 0x00, 0x02};
     uint8_t k2[3] = {0x01, 0x00, 0x03};
@@ -230,8 +214,7 @@ TEST(embedded_nul_keys_distinct) {
 
 // Same prefix, different length: must be distinct keys.
 TEST(length_distinguishes_keys) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     uint8_t a[2] = {0x01, 0x02};
     uint8_t b[3] = {0x01, 0x02, 0x03};
@@ -248,8 +231,7 @@ TEST(length_distinguishes_keys) {
 }
 
 TEST(collisions_resolve) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int va = 1, vb = 2, vc = 3, vd = 4;
     ASSERT_EQ(hashtable_insert(t, SK("alpha"), &va), HASHTABLE_OK);
@@ -271,8 +253,7 @@ TEST(collisions_resolve) {
 // Insert many more than initial size to force at least one grow/rehash.
 // uint32 keys exercise the byte-key path; all entries must survive the rehash.
 TEST(grow_preserves_entries) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     enum { N = 200 };
     static uint32_t keys[N];
@@ -292,8 +273,7 @@ TEST(grow_preserves_entries) {
 }
 
 TEST(iter_empty_yields_nothing) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     HashTableIter it = hashtable_iter(t);
     const void *k = NULL;
@@ -305,8 +285,7 @@ TEST(iter_empty_yields_nothing) {
 // Iteration must visit every entry exactly once (order unspecified), yielding
 // the key bytes and their length.
 TEST(iter_visits_all_once) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     uint32_t k1 = 10, k2 = 20, k3 = 30;
     int v1 = 1, v2 = 2, v3 = 3;
@@ -346,8 +325,7 @@ TEST(iter_visits_all_once) {
 }
 
 TEST(clear_empties_table) {
-    uint8_t buf[ARENA_BYTES];
-    HashTable *t = fresh(buf, sizeof(buf));
+    HashTable *t = fresh();
 
     int va = 1, vb = 2;
     hashtable_insert(t, SK("a"), &va);
@@ -371,30 +349,6 @@ TEST(clear_empties_table) {
     ASSERT(out == &vc);
 }
 
-// With a deliberately tiny arena, inserts must eventually report OOM rather
-// than corrupting memory or succeeding past the buffer.
-TEST(oom_when_arena_exhausted) {
-    uint8_t buf[256];
-    Arena *arena = arena_create(buf, sizeof(buf));
-    HashTable *t = hashtable_create(arena);
-    if (t == NULL)
-        return;
-
-    static uint32_t keys[1024];
-    static int vals[1024];
-    int got_oom = 0;
-    for (int i = 0; i < 1024; i++) {
-        keys[i] = (uint32_t)i;
-        vals[i] = i;
-        if (hashtable_insert(t, &keys[i], sizeof keys[i], &vals[i]) ==
-            HASHTABLE_ERR_OOM) {
-            got_oom = 1;
-            break;
-        }
-    }
-    ASSERT(got_oom == 1);
-}
-
 int main(void) {
     RUN(create_empty);
     RUN(insert_then_get);
@@ -416,6 +370,5 @@ int main(void) {
     RUN(iter_empty_yields_nothing);
     RUN(iter_visits_all_once);
     RUN(clear_empties_table);
-    RUN(oom_when_arena_exhausted);
     TEST_SUMMARY();
 }
