@@ -41,5 +41,10 @@ test-scalar: string.c scalar.c test_scalar.c test_util.h
 	$(CC) $(CFLAGS) -o test_scalar string.c scalar.c test_scalar.c
 	./test_scalar
 
+.PHONY: test-register
+test-register: arena.c string.c scalar.c register.c test_register.c test_util.h
+	$(CC) $(CFLAGS) -o test_register arena.c string.c scalar.c register.c test_register.c
+	./test_register
+
 .PHONY: test
-test: test-hashtable test-string test-counter test-scalar
+test: test-hashtable test-string test-counter test-scalar test-register

@@ -19,6 +19,7 @@ a.out
 /test_string
 /test_counter
 /test_scalar
+/test_register
 
 # Tooling
 /.venv-fmt/
