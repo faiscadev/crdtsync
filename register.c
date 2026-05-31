@@ -11,7 +11,8 @@ Scalar accept_value(Arena *arena, Scalar value) {
         // Copy string bytes into arena.
         uint8_t *dst = arena_alloc(arena, value.as.s.len);
         if (!dst && value.as.s.len > 0) {
-            host_abort("register: arena OOM copying string bytes");
+            host_abortf("register: arena OOM copying %zu string bytes",
+                        value.as.s.len);
         }
         memcpy(dst, value.as.s.bytes, value.as.s.len);
         return scalar_string(dst, value.as.s.len);
@@ -26,7 +27,9 @@ Scalar accept_value(Arena *arena, Scalar value) {
 Register *register_create(Arena *arena, Scalar value, Stamp stamp) {
     Register *reg = arena_alloc(arena, sizeof(Register));
     if (!reg) {
-        host_abort("register_create: arena OOM");
+        host_abortf(
+            "register_create: arena OOM (requested %zu bytes for Register)",
+            sizeof(Register));
     }
     reg->arena = arena;
     reg->value = accept_value(arena, value);

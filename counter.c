@@ -14,7 +14,9 @@ static inline uint32_t max_u32(uint32_t a, uint32_t b) {
 Counter *counter_create(Arena *arena) {
     Counter *counter = arena_alloc(arena, sizeof(Counter));
     if (!counter) {
-        host_abort("counter_create: arena OOM");
+        host_abortf(
+            "counter_create: arena OOM (requested %zu bytes for Counter)",
+            sizeof(Counter));
     }
     counter->arena = arena;
     counter->entries = hashtable_create(arena);
@@ -53,7 +55,9 @@ void counter_merge(Counter *dst, const Counter *src) {
         } else {
             CounterEntry *copy = arena_alloc(dst->arena, sizeof *copy);
             if (!copy) {
-                host_abort("counter_merge: arena OOM");
+                host_abortf("counter_merge: arena OOM (requested %zu bytes for "
+                            "CounterEntry)",
+                            sizeof *copy);
             }
             *copy = *src_entry;
             HashTableInsertResult r =
@@ -75,7 +79,9 @@ void counter_inc(Counter *counter, ClientId client_id, uint32_t amount) {
     } else {
         CounterEntry *entry = arena_alloc(counter->arena, sizeof *entry);
         if (!entry) {
-            host_abort("counter_inc: arena OOM");
+            host_abortf("counter_inc: arena OOM (requested %zu bytes for "
+                        "CounterEntry)",
+                        sizeof *entry);
         }
         entry->client_id = client_id;
         entry->inc = amount;
@@ -98,7 +104,9 @@ void counter_dec(Counter *counter, ClientId client_id, uint32_t amount) {
     } else {
         CounterEntry *entry = arena_alloc(counter->arena, sizeof *entry);
         if (!entry) {
-            host_abort("counter_dec: arena OOM");
+            host_abortf("counter_dec: arena OOM (requested %zu bytes for "
+                        "CounterEntry)",
+                        sizeof *entry);
         }
         entry->client_id = client_id;
         entry->inc = 0;
