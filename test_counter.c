@@ -3,10 +3,8 @@
 #include "counter.h"
 #include "test_util.h"
 
-#define ARENA_BYTES (64 * 1024)
-
-static Counter *fresh(uint8_t *buf, size_t len) {
-    Arena *arena = arena_create(buf, len);
+static Counter *fresh(void) {
+    Arena *arena = arena_create();
     return counter_create(arena);
 }
 
@@ -21,21 +19,21 @@ static ClientId cid(uint8_t first_byte) {
 // --- local operations (single replica) ---
 
 TEST(empty_reads_zero) {
-    uint8_t buf[ARENA_BYTES];
-    Counter *c = fresh(buf, sizeof(buf));
+
+    Counter *c = fresh();
     ASSERT_EQ(counter_read(c), 0);
 }
 
 TEST(single_inc) {
-    uint8_t buf[ARENA_BYTES];
-    Counter *c = fresh(buf, sizeof(buf));
+
+    Counter *c = fresh();
     counter_inc(c, cid(1), 5);
     ASSERT_EQ(counter_read(c), 5);
 }
 
 TEST(inc_then_dec_nets) {
-    uint8_t buf[ARENA_BYTES];
-    Counter *c = fresh(buf, sizeof(buf));
+
+    Counter *c = fresh();
     counter_inc(c, cid(1), 5);
     counter_dec(c, cid(1), 2);
     ASSERT_EQ(counter_read(c), 3);
@@ -43,23 +41,23 @@ TEST(inc_then_dec_nets) {
 
 // Local repeated ops on the same client accumulate (this is NOT max).
 TEST(local_inc_accumulates) {
-    uint8_t buf[ARENA_BYTES];
-    Counter *c = fresh(buf, sizeof(buf));
+
+    Counter *c = fresh();
     counter_inc(c, cid(1), 5);
     counter_inc(c, cid(1), 2);
     ASSERT_EQ(counter_read(c), 7);
 }
 
 TEST(read_can_go_negative) {
-    uint8_t buf[ARENA_BYTES];
-    Counter *c = fresh(buf, sizeof(buf));
+
+    Counter *c = fresh();
     counter_dec(c, cid(1), 3);
     ASSERT_EQ(counter_read(c), -3);
 }
 
 TEST(two_clients_sum_in_one_replica) {
-    uint8_t buf[ARENA_BYTES];
-    Counter *c = fresh(buf, sizeof(buf));
+
+    Counter *c = fresh();
     counter_inc(c, cid(1), 5);
     counter_inc(c, cid(2), 3);
     counter_dec(c, cid(2), 1);
@@ -69,8 +67,8 @@ TEST(two_clients_sum_in_one_replica) {
 // Two clients are distinguished by the FULL 16-byte ClientId, not the first
 // byte (proves the hashtable key uses sizeof(ClientId) and not just a prefix).
 TEST(client_ids_distinguished_by_full_bytes) {
-    uint8_t buf[ARENA_BYTES];
-    Counter *c = fresh(buf, sizeof(buf));
+
+    Counter *c = fresh();
 
     uint8_t a_bytes[16] = {1, 2,  3,  4,  5,  6,  7,  8,
                            9, 10, 11, 12, 13, 14, 15, 16};
@@ -87,9 +85,9 @@ TEST(client_ids_distinguished_by_full_bytes) {
 // --- merge (two replicas) ---
 
 TEST(merge_disjoint_clients_unions) {
-    uint8_t bufA[ARENA_BYTES], bufB[ARENA_BYTES];
-    Counter *a = fresh(bufA, sizeof(bufA));
-    Counter *b = fresh(bufB, sizeof(bufB));
+
+    Counter *a = fresh();
+    Counter *b = fresh();
 
     counter_inc(a, cid(1), 5);
     counter_inc(b, cid(2), 3);
@@ -101,9 +99,9 @@ TEST(merge_disjoint_clients_unions) {
 // Classic CRDT result: concurrent increments on different clients converge,
 // both replicas read the same value after exchanging state.
 TEST(concurrent_inc_converges) {
-    uint8_t bufA[ARENA_BYTES], bufB[ARENA_BYTES];
-    Counter *a = fresh(bufA, sizeof(bufA));
-    Counter *b = fresh(bufB, sizeof(bufB));
+
+    Counter *a = fresh();
+    Counter *b = fresh();
 
     counter_inc(a, cid(1), 5);
     counter_inc(b, cid(2), 3);
@@ -118,9 +116,9 @@ TEST(concurrent_inc_converges) {
 // Same client seen with different counts on two replicas: merge takes the MAX,
 // not the sum (the lower replica was simply behind).
 TEST(merge_same_client_takes_max_not_sum) {
-    uint8_t bufA[ARENA_BYTES], bufB[ARENA_BYTES];
-    Counter *a = fresh(bufA, sizeof(bufA));
-    Counter *b = fresh(bufB, sizeof(bufB));
+
+    Counter *a = fresh();
+    Counter *b = fresh();
 
     counter_inc(a, cid(1), 5);
     counter_inc(b, cid(1), 3);
@@ -130,9 +128,9 @@ TEST(merge_same_client_takes_max_not_sum) {
 }
 
 TEST(merge_same_client_max_on_both_directions) {
-    uint8_t bufA[ARENA_BYTES], bufB[ARENA_BYTES];
-    Counter *a = fresh(bufA, sizeof(bufA));
-    Counter *b = fresh(bufB, sizeof(bufB));
+
+    Counter *a = fresh();
+    Counter *b = fresh();
 
     // a: inc 10, dec 2  -> {inc:10, dec:2}
     counter_inc(a, cid(1), 10);
@@ -147,9 +145,9 @@ TEST(merge_same_client_max_on_both_directions) {
 }
 
 TEST(merge_idempotent) {
-    uint8_t bufA[ARENA_BYTES], bufB[ARENA_BYTES];
-    Counter *a = fresh(bufA, sizeof(bufA));
-    Counter *b = fresh(bufB, sizeof(bufB));
+
+    Counter *a = fresh();
+    Counter *b = fresh();
 
     counter_inc(a, cid(1), 5);
     counter_inc(b, cid(2), 3);
@@ -165,18 +163,18 @@ TEST(merge_idempotent) {
 
 TEST(merge_commutative) {
     // (a <- b)
-    uint8_t bufA1[ARENA_BYTES], bufB1[ARENA_BYTES];
-    Counter *a1 = fresh(bufA1, sizeof(bufA1));
-    Counter *b1 = fresh(bufB1, sizeof(bufB1));
+
+    Counter *a1 = fresh();
+    Counter *b1 = fresh();
     counter_inc(a1, cid(1), 5);
     counter_dec(a1, cid(1), 1);
     counter_inc(b1, cid(2), 3);
     counter_merge(a1, b1);
 
     // (b <- a)
-    uint8_t bufA2[ARENA_BYTES], bufB2[ARENA_BYTES];
-    Counter *a2 = fresh(bufA2, sizeof(bufA2));
-    Counter *b2 = fresh(bufB2, sizeof(bufB2));
+
+    Counter *a2 = fresh();
+    Counter *b2 = fresh();
     counter_inc(a2, cid(1), 5);
     counter_dec(a2, cid(1), 1);
     counter_inc(b2, cid(2), 3);
@@ -186,10 +184,10 @@ TEST(merge_commutative) {
 }
 
 TEST(merge_associative) {
-    uint8_t bufA[ARENA_BYTES], bufB[ARENA_BYTES], bufC[ARENA_BYTES];
-    Counter *a = fresh(bufA, sizeof(bufA));
-    Counter *b = fresh(bufB, sizeof(bufB));
-    Counter *c = fresh(bufC, sizeof(bufC));
+
+    Counter *a = fresh();
+    Counter *b = fresh();
+    Counter *c = fresh();
     counter_inc(a, cid(1), 5);
     counter_inc(b, cid(2), 3);
     counter_inc(c, cid(3), 2);
@@ -199,10 +197,10 @@ TEST(merge_associative) {
     counter_merge(a, c);
 
     // a <- (b <- c)  (rebuild on a fresh accumulator)
-    uint8_t bufA2[ARENA_BYTES], bufB2[ARENA_BYTES], bufC2[ARENA_BYTES];
-    Counter *a2 = fresh(bufA2, sizeof(bufA2));
-    Counter *b2 = fresh(bufB2, sizeof(bufB2));
-    Counter *c2 = fresh(bufC2, sizeof(bufC2));
+
+    Counter *a2 = fresh();
+    Counter *b2 = fresh();
+    Counter *c2 = fresh();
     counter_inc(a2, cid(1), 5);
     counter_inc(b2, cid(2), 3);
     counter_inc(c2, cid(3), 2);
@@ -215,9 +213,9 @@ TEST(merge_associative) {
 
 // Merge leaves the source untouched.
 TEST(merge_does_not_mutate_src) {
-    uint8_t bufA[ARENA_BYTES], bufB[ARENA_BYTES];
-    Counter *a = fresh(bufA, sizeof(bufA));
-    Counter *b = fresh(bufB, sizeof(bufB));
+
+    Counter *a = fresh();
+    Counter *b = fresh();
 
     counter_inc(a, cid(1), 5);
     counter_inc(b, cid(2), 3);
@@ -229,9 +227,9 @@ TEST(merge_does_not_mutate_src) {
 // After merge, a subsequent local inc on a newly-learned client accumulates
 // from the merged-in value (not from zero).
 TEST(local_inc_after_merge_accumulates) {
-    uint8_t bufA[ARENA_BYTES], bufB[ARENA_BYTES];
-    Counter *a = fresh(bufA, sizeof(bufA));
-    Counter *b = fresh(bufB, sizeof(bufB));
+
+    Counter *a = fresh();
+    Counter *b = fresh();
 
     counter_inc(b, cid(2), 3);
     counter_merge(a, b); // a learns client 2 = 3
