@@ -1,39 +1,3 @@
-// Native unit tests for the Scalar value type. Compile with system clang,
-// link string.c + scalar.c. Run the binary.
-//
-// Expected API (you implement in scalar.h + scalar.c):
-//
-//   typedef enum {
-//       SCALAR_NULL,
-//       SCALAR_BOOL,
-//       SCALAR_INT,
-//       SCALAR_STRING,
-//   } ScalarKind;
-//
-//   typedef struct Scalar {
-//       ScalarKind kind;
-//       union {
-//           bool    b;
-//           int64_t i;
-//           struct { const uint8_t *bytes; size_t len; } s;
-//       } as;
-//   } Scalar;
-//
-//   Scalar scalar_null(void);
-//   Scalar scalar_bool(bool b);
-//   Scalar scalar_int(int64_t i);
-//   Scalar scalar_string(const uint8_t *bytes, size_t len);
-//   bool   scalar_eq(Scalar a, Scalar b);
-//
-// Notes:
-//   - Pass by value (~24 bytes).
-//   - SCALAR_STRING bytes are borrowed at the boundary; whoever stores a
-//     Scalar long-term dups into its own arena.
-//   - scalar_eq compares by KIND first; equal kind compares the inner value
-//     (bytes+len memcmp for strings, binary-safe).
-//   - Cross-kind comparison is always false, even for "obvious" equivalents
-//     (e.g. scalar_int(0) != scalar_bool(false)). The tag matters.
-
 #include "scalar.h"
 #include "test_util.h"
 #include <stdint.h>
