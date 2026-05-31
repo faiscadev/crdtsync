@@ -21,6 +21,7 @@ a.out
 /test_scalar
 /test_register
 /test_clientid
+/test_stamp
 
 # Tooling
 /.venv-fmt/
