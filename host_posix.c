@@ -7,10 +7,12 @@
 
 #include "host.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -24,14 +26,19 @@ void host_fill_entropy(uint8_t *buf, size_t n) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) {
         // Catastrophic — host_fill_entropy is documented as infallible.
-        abort();
+        host_abortf("host_fill_entropy: open(/dev/urandom) failed: %s",
+                    strerror(errno));
     }
     size_t got = 0;
     while (got < n) {
         ssize_t r = read(fd, buf + got, n - got);
         if (r <= 0) {
+            int saved_errno = errno;
             close(fd);
-            abort();
+            host_abortf(
+                "host_fill_entropy: read(/dev/urandom) returned %zd (errno %d "
+                "%s) after %zu of %zu bytes",
+                r, saved_errno, r < 0 ? strerror(saved_errno) : "EOF", got, n);
         }
         got += (size_t)r;
     }

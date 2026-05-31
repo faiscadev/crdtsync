@@ -24,7 +24,10 @@ Arena *arena_create(uint8_t *data, size_t size) {
     // the upcoming struct write would overflow the caller's buffer and
     // arena->size would underflow — programmer error, abort loudly.
     if (payload_at > (uintptr_t)data + size) {
-        host_abort("arena_create: buffer smaller than ARENA_MIN_SIZE");
+        host_abortf(
+            "arena_create: buffer size %zu < required minimum (sizeof(Arena) "
+            "%zu + alignment slack up to %zu)",
+            size, sizeof(Arena), (size_t)(2 * (align - 1)));
     }
 
     Arena *arena = (Arena *)struct_at;
@@ -61,7 +64,8 @@ void arena_restore(Arena *arena, size_t mark) {
     // [0, offset]. Restoring to a mark greater than the current offset would
     // advance, not rewind — programmer error, abort loudly.
     if (mark > arena->offset) {
-        host_abort("arena_restore: mark > current offset");
+        host_abortf("arena_restore: mark %zu > current offset %zu", mark,
+                    arena->offset);
     }
     arena->offset = mark;
 }
