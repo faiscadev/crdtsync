@@ -30,23 +30,21 @@
 
 #include "arena.h"
 #include "scalar.h"
+#include "stamp.h"
 #include <stdbool.h>
 #include <stdint.h>
 
 typedef struct Register {
     Arena *arena;
     Scalar value;
-    uint64_t lamport;
-    uint32_t client_id;
+    Stamp stamp;
 } Register;
 
-Register *register_create(Arena *arena, Scalar value, uint64_t lamport,
-                          uint32_t client_id);
+Register *register_create(Arena *arena, Scalar value, Stamp stamp);
 
 Scalar register_read(const Register *reg);
 
-void register_set(Register *reg, Scalar value, uint64_t lamport,
-                  uint32_t client_id);
+void register_set(Register *reg, Scalar value, Stamp stamp);
 
 void register_merge(Register *dst, const Register *src);
 
