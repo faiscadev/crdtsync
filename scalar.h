@@ -1,0 +1,38 @@
+#ifndef _CRDT_SCALAR_H
+#define _CRDT_SCALAR_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+typedef enum ScalarKind {
+    SCALAR_STRING,
+    SCALAR_INT,
+    SCALAR_BOOL,
+    SCALAR_NULL
+} ScalarKind;
+
+typedef struct Scalar {
+    ScalarKind kind;
+
+    union {
+        struct {
+            const uint8_t *bytes;
+            size_t len;
+        } s;       // for SCALAR_STRING
+        int64_t i; // for SCALAR_INT
+        bool b;    // for SCALAR_BOOL
+    } as;
+} Scalar;
+
+Scalar scalar_null(void);
+
+Scalar scalar_bool(bool b);
+
+Scalar scalar_int(int64_t i);
+
+Scalar scalar_string(const uint8_t *bytes, size_t len);
+
+bool scalar_eq(Scalar a, Scalar b);
+
+#endif // _CRDT_SCALAR_H

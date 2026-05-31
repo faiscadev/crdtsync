@@ -18,6 +18,7 @@ a.out
 /test_hashtable
 /test_string
 /test_counter
+/test_scalar
 
 # Tooling
 /.venv-fmt/

@@ -36,5 +36,10 @@ test-counter: arena.c string.c hashtable.c counter.c test_counter.c test_util.h
 	$(CC) $(CFLAGS) -o test_counter arena.c string.c hashtable.c counter.c test_counter.c
 	./test_counter
 
+.PHONY: test-scalar
+test-scalar: string.c scalar.c test_scalar.c test_util.h
+	$(CC) $(CFLAGS) -o test_scalar string.c scalar.c test_scalar.c
+	./test_scalar
+
 .PHONY: test
-test: test-hashtable test-string test-counter
+test: test-hashtable test-string test-counter test-scalar
