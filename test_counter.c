@@ -1,29 +1,5 @@
-// Native unit tests for the PN-counter CRDT. Compile with system clang,
-// link arena.c + string.c + hashtable.c + counter.c. Run the binary.
-//
-// Expected API (you implement in counter.h + counter.c):
-//
-//   Counter *counter_create(Arena *arena);
-//   void     counter_inc(Counter *c, uint32_t client_id, uint32_t amount);
-//   void     counter_dec(Counter *c, uint32_t client_id, uint32_t amount);
-//   int64_t  counter_read(const Counter *c);
-//   void     counter_merge(Counter *dst, const Counter *src);
-//
-// Model — state-based PN-counter, backed by hashtable:
-//   client_id (uint32_t, keyed as raw bytes) -> CounterEntry { uint32_t inc;
-//   uint32_t dec; }
-//
-//   - read  = sum over all clients of (inc - dec). Signed (can go negative).
-//   - LOCAL inc/dec ACCUMULATE into the caller's own client entry
-//       (entry.inc += amount  /  entry.dec += amount).
-//   - MERGE takes per-direction MAX per client
-//       (dst.inc = max(dst.inc, src.inc); dst.dec = max(dst.dec, src.dec)).
-//     NOT a sum — both replicas may have counted the same ops; max reconciles.
-//
-// counter_merge is one-directional: src's state is folded into dst; src is
-// left unchanged.
-
 #include "arena.h"
+#include "clientid.h"
 #include "counter.h"
 #include "test_util.h"
 
@@ -32,6 +8,14 @@
 static Counter *fresh(uint8_t *buf, size_t len) {
     Arena *arena = arena_create(buf, len);
     return counter_create(arena);
+}
+
+// Build a ClientId fixture from a single byte (rest zero). Keeps tests
+// compact; ClientId is otherwise 16 raw bytes.
+static ClientId cid(uint8_t first_byte) {
+    uint8_t b[16] = {0};
+    b[0] = first_byte;
+    return clientid_from_bytes(b);
 }
 
 // --- local operations (single replica) ---
@@ -45,15 +29,15 @@ TEST(empty_reads_zero) {
 TEST(single_inc) {
     uint8_t buf[ARENA_BYTES];
     Counter *c = fresh(buf, sizeof(buf));
-    counter_inc(c, 1, 5);
+    counter_inc(c, cid(1), 5);
     ASSERT_EQ(counter_read(c), 5);
 }
 
 TEST(inc_then_dec_nets) {
     uint8_t buf[ARENA_BYTES];
     Counter *c = fresh(buf, sizeof(buf));
-    counter_inc(c, 1, 5);
-    counter_dec(c, 1, 2);
+    counter_inc(c, cid(1), 5);
+    counter_dec(c, cid(1), 2);
     ASSERT_EQ(counter_read(c), 3);
 }
 
@@ -61,25 +45,43 @@ TEST(inc_then_dec_nets) {
 TEST(local_inc_accumulates) {
     uint8_t buf[ARENA_BYTES];
     Counter *c = fresh(buf, sizeof(buf));
-    counter_inc(c, 1, 5);
-    counter_inc(c, 1, 2);
+    counter_inc(c, cid(1), 5);
+    counter_inc(c, cid(1), 2);
     ASSERT_EQ(counter_read(c), 7);
 }
 
 TEST(read_can_go_negative) {
     uint8_t buf[ARENA_BYTES];
     Counter *c = fresh(buf, sizeof(buf));
-    counter_dec(c, 1, 3);
+    counter_dec(c, cid(1), 3);
     ASSERT_EQ(counter_read(c), -3);
 }
 
 TEST(two_clients_sum_in_one_replica) {
     uint8_t buf[ARENA_BYTES];
     Counter *c = fresh(buf, sizeof(buf));
-    counter_inc(c, 1, 5);
-    counter_inc(c, 2, 3);
-    counter_dec(c, 2, 1);
+    counter_inc(c, cid(1), 5);
+    counter_inc(c, cid(2), 3);
+    counter_dec(c, cid(2), 1);
     ASSERT_EQ(counter_read(c), 7); // (5-0) + (3-1)
+}
+
+// Two clients are distinguished by the FULL 16-byte ClientId, not the first
+// byte (proves the hashtable key uses sizeof(ClientId) and not just a prefix).
+TEST(client_ids_distinguished_by_full_bytes) {
+    uint8_t buf[ARENA_BYTES];
+    Counter *c = fresh(buf, sizeof(buf));
+
+    uint8_t a_bytes[16] = {1, 2,  3,  4,  5,  6,  7,  8,
+                           9, 10, 11, 12, 13, 14, 15, 16};
+    uint8_t b_bytes[16] = {1, 2,  3,  4,  5,  6,  7,  8,
+                           9, 10, 11, 12, 13, 14, 15, 99};
+    ClientId a = clientid_from_bytes(a_bytes);
+    ClientId b = clientid_from_bytes(b_bytes);
+
+    counter_inc(c, a, 5);
+    counter_inc(c, b, 3);
+    ASSERT_EQ(counter_read(c), 8); // distinct clients -> two entries
 }
 
 // --- merge (two replicas) ---
@@ -89,8 +91,8 @@ TEST(merge_disjoint_clients_unions) {
     Counter *a = fresh(bufA, sizeof(bufA));
     Counter *b = fresh(bufB, sizeof(bufB));
 
-    counter_inc(a, 1, 5);
-    counter_inc(b, 2, 3);
+    counter_inc(a, cid(1), 5);
+    counter_inc(b, cid(2), 3);
 
     counter_merge(a, b);
     ASSERT_EQ(counter_read(a), 8);
@@ -103,8 +105,8 @@ TEST(concurrent_inc_converges) {
     Counter *a = fresh(bufA, sizeof(bufA));
     Counter *b = fresh(bufB, sizeof(bufB));
 
-    counter_inc(a, 1, 5);
-    counter_inc(b, 2, 3);
+    counter_inc(a, cid(1), 5);
+    counter_inc(b, cid(2), 3);
 
     counter_merge(a, b);
     counter_merge(b, a);
@@ -120,8 +122,8 @@ TEST(merge_same_client_takes_max_not_sum) {
     Counter *a = fresh(bufA, sizeof(bufA));
     Counter *b = fresh(bufB, sizeof(bufB));
 
-    counter_inc(a, 1, 5);
-    counter_inc(b, 1, 3);
+    counter_inc(a, cid(1), 5);
+    counter_inc(b, cid(1), 3);
 
     counter_merge(a, b);
     ASSERT_EQ(counter_read(a), 5); // max(5,3), NOT 8
@@ -133,11 +135,11 @@ TEST(merge_same_client_max_on_both_directions) {
     Counter *b = fresh(bufB, sizeof(bufB));
 
     // a: inc 10, dec 2  -> {inc:10, dec:2}
-    counter_inc(a, 1, 10);
-    counter_dec(a, 1, 2);
+    counter_inc(a, cid(1), 10);
+    counter_dec(a, cid(1), 2);
     // b: inc 4, dec 6   -> {inc:4, dec:6}
-    counter_inc(b, 1, 4);
-    counter_dec(b, 1, 6);
+    counter_inc(b, cid(1), 4);
+    counter_dec(b, cid(1), 6);
 
     counter_merge(a, b);
     // max(inc)=10, max(dec)=6 -> 10 - 6 = 4
@@ -149,8 +151,8 @@ TEST(merge_idempotent) {
     Counter *a = fresh(bufA, sizeof(bufA));
     Counter *b = fresh(bufB, sizeof(bufB));
 
-    counter_inc(a, 1, 5);
-    counter_inc(b, 2, 3);
+    counter_inc(a, cid(1), 5);
+    counter_inc(b, cid(2), 3);
 
     counter_merge(a, b);
     int64_t once = counter_read(a);
@@ -166,18 +168,18 @@ TEST(merge_commutative) {
     uint8_t bufA1[ARENA_BYTES], bufB1[ARENA_BYTES];
     Counter *a1 = fresh(bufA1, sizeof(bufA1));
     Counter *b1 = fresh(bufB1, sizeof(bufB1));
-    counter_inc(a1, 1, 5);
-    counter_dec(a1, 1, 1);
-    counter_inc(b1, 2, 3);
+    counter_inc(a1, cid(1), 5);
+    counter_dec(a1, cid(1), 1);
+    counter_inc(b1, cid(2), 3);
     counter_merge(a1, b1);
 
     // (b <- a)
     uint8_t bufA2[ARENA_BYTES], bufB2[ARENA_BYTES];
     Counter *a2 = fresh(bufA2, sizeof(bufA2));
     Counter *b2 = fresh(bufB2, sizeof(bufB2));
-    counter_inc(a2, 1, 5);
-    counter_dec(a2, 1, 1);
-    counter_inc(b2, 2, 3);
+    counter_inc(a2, cid(1), 5);
+    counter_dec(a2, cid(1), 1);
+    counter_inc(b2, cid(2), 3);
     counter_merge(b2, a2);
 
     ASSERT_EQ(counter_read(a1), counter_read(b2));
@@ -188,9 +190,9 @@ TEST(merge_associative) {
     Counter *a = fresh(bufA, sizeof(bufA));
     Counter *b = fresh(bufB, sizeof(bufB));
     Counter *c = fresh(bufC, sizeof(bufC));
-    counter_inc(a, 1, 5);
-    counter_inc(b, 2, 3);
-    counter_inc(c, 3, 2);
+    counter_inc(a, cid(1), 5);
+    counter_inc(b, cid(2), 3);
+    counter_inc(c, cid(3), 2);
 
     // (a <- b) <- c
     counter_merge(a, b);
@@ -201,9 +203,9 @@ TEST(merge_associative) {
     Counter *a2 = fresh(bufA2, sizeof(bufA2));
     Counter *b2 = fresh(bufB2, sizeof(bufB2));
     Counter *c2 = fresh(bufC2, sizeof(bufC2));
-    counter_inc(a2, 1, 5);
-    counter_inc(b2, 2, 3);
-    counter_inc(c2, 3, 2);
+    counter_inc(a2, cid(1), 5);
+    counter_inc(b2, cid(2), 3);
+    counter_inc(c2, cid(3), 2);
     counter_merge(b2, c2);
     counter_merge(a2, b2);
 
@@ -217,8 +219,8 @@ TEST(merge_does_not_mutate_src) {
     Counter *a = fresh(bufA, sizeof(bufA));
     Counter *b = fresh(bufB, sizeof(bufB));
 
-    counter_inc(a, 1, 5);
-    counter_inc(b, 2, 3);
+    counter_inc(a, cid(1), 5);
+    counter_inc(b, cid(2), 3);
 
     counter_merge(a, b);
     ASSERT_EQ(counter_read(b), 3); // b unchanged
@@ -231,10 +233,10 @@ TEST(local_inc_after_merge_accumulates) {
     Counter *a = fresh(bufA, sizeof(bufA));
     Counter *b = fresh(bufB, sizeof(bufB));
 
-    counter_inc(b, 2, 3);
-    counter_merge(a, b); // a learns c2 = 3
+    counter_inc(b, cid(2), 3);
+    counter_merge(a, b); // a learns client 2 = 3
 
-    counter_inc(a, 2, 4); // a is now also acting as c2? accumulate to 7
+    counter_inc(a, cid(2), 4); // a now also acting as client 2: accumulate to 7
     ASSERT_EQ(counter_read(a), 7);
 }
 
@@ -245,6 +247,7 @@ int main(void) {
     RUN(local_inc_accumulates);
     RUN(read_can_go_negative);
     RUN(two_clients_sum_in_one_replica);
+    RUN(client_ids_distinguished_by_full_bytes);
     RUN(merge_disjoint_clients_unions);
     RUN(concurrent_inc_converges);
     RUN(merge_same_client_takes_max_not_sum);
