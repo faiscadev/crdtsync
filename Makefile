@@ -47,13 +47,13 @@ test-register: arena.c string.c scalar.c register.c test_register.c test_util.h
 	./test_register
 
 .PHONY: test-clientid
-test-clientid: string.c clientid.c test_clientid.c test_util.h
-	$(CC) $(CFLAGS) -o test_clientid string.c clientid.c test_clientid.c
+test-clientid: string.c clientid.c host_posix.c test_clientid.c test_util.h
+	$(CC) $(CFLAGS) -o test_clientid string.c clientid.c host_posix.c test_clientid.c
 	./test_clientid
 
 .PHONY: test-stamp
-test-stamp: string.c clientid.c stamp.c test_stamp.c test_util.h
-	$(CC) $(CFLAGS) -o test_stamp string.c clientid.c stamp.c test_stamp.c
+test-stamp: string.c clientid.c host_posix.c stamp.c test_stamp.c test_util.h
+	$(CC) $(CFLAGS) -o test_stamp string.c clientid.c host_posix.c stamp.c test_stamp.c
 	./test_stamp
 
 .PHONY: test
