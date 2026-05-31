@@ -8,6 +8,7 @@
 #include "host.h"
 
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
@@ -34,4 +35,9 @@ void host_fill_entropy(uint8_t *buf, size_t n) {
         got += (size_t)r;
     }
     close(fd);
+}
+
+_Noreturn void host_abort(const char *reason) {
+    fprintf(stderr, "host_abort: %s\n", reason ? reason : "(no reason)");
+    abort();
 }
