@@ -19,37 +19,26 @@ Scalar accept_value(Arena *arena, Scalar value) {
     }
 }
 
-Register *register_create(Arena *arena, Scalar value, uint64_t lamport,
-                          uint32_t client_id) {
+Register *register_create(Arena *arena, Scalar value, Stamp stamp) {
     Register *reg = arena_alloc(arena, sizeof(Register));
     reg->arena = arena;
     reg->value = accept_value(arena, value);
-    reg->lamport = lamport;
-    reg->client_id = client_id;
+    reg->stamp = stamp;
     return reg;
 }
 
 Scalar register_read(const Register *reg) { return reg->value; }
 
-bool is_newer(uint64_t lamport_a, uint32_t client_id_a, uint64_t lamport_b,
-              uint32_t client_id_b) {
-    return (lamport_a > lamport_b) ||
-           (lamport_a == lamport_b && client_id_a > client_id_b);
-}
-
-void register_set(Register *reg, Scalar value, uint64_t lamport,
-                  uint32_t client_id) {
-    if (is_newer(lamport, client_id, reg->lamport, reg->client_id)) {
+void register_set(Register *reg, Scalar value, Stamp stamp) {
+    if (stamp_gt(stamp, reg->stamp)) {
         reg->value = accept_value(reg->arena, value);
-        reg->lamport = lamport;
-        reg->client_id = client_id;
+        reg->stamp = stamp;
     }
 }
 
 void register_merge(Register *dst, const Register *src) {
-    if (is_newer(src->lamport, src->client_id, dst->lamport, dst->client_id)) {
+    if (stamp_gt(src->stamp, dst->stamp)) {
         dst->value = accept_value(dst->arena, src->value);
-        dst->lamport = src->lamport;
-        dst->client_id = src->client_id;
+        dst->stamp = src->stamp;
     }
 }
