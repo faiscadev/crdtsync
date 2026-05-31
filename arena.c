@@ -15,17 +15,20 @@ static uintptr_t align_up_ptr(uintptr_t value, size_t align) {
 Arena *arena_create(uint8_t *data, size_t size) {
     size_t align = _Alignof(max_align_t);
 
-    // Place the Arena struct at the next aligned address inside `data`. The
-    // caller's pointer may have any alignment; we round it up so the struct's
-    // fields are aligned (avoids strict-alignment UB on ARM / RISC-V).
+    // Compute the aligned struct and payload addresses without touching memory
+    // yet, so the size check below fires before any out-of-bounds writes.
     uintptr_t struct_at = align_up_ptr((uintptr_t)data, align);
+    uintptr_t payload_at = align_up_ptr(struct_at + sizeof(Arena), align);
+
+    // Buffer must accommodate the Arena struct plus alignment slack. If not,
+    // the upcoming struct write would overflow the caller's buffer and
+    // arena->size would underflow — programmer error, abort loudly.
+    if (payload_at > (uintptr_t)data + size) {
+        host_abort("arena_create: buffer smaller than ARENA_MIN_SIZE");
+    }
+
     Arena *arena = (Arena *)struct_at;
     arena->offset = 0;
-
-    // Payload starts at the next aligned address past the struct. With this,
-    // every arena_alloc returns an aligned pointer regardless of where `data`
-    // landed.
-    uintptr_t payload_at = align_up_ptr(struct_at + sizeof(Arena), align);
     arena->data = (uint8_t *)payload_at;
 
     // Whatever's left of the caller's buffer is available for allocations.
