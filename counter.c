@@ -51,7 +51,7 @@ void counter_merge(Counter *dst, const Counter *src) {
     }
 }
 
-void counter_inc(Counter *counter, uint32_t client_id, uint32_t amount) {
+void counter_inc(Counter *counter, ClientId client_id, uint32_t amount) {
     void *entry_ptr;
     if (hashtable_get(counter->entries, &client_id, sizeof(client_id),
                       &entry_ptr)) {
@@ -67,7 +67,7 @@ void counter_inc(Counter *counter, uint32_t client_id, uint32_t amount) {
     }
 }
 
-void counter_dec(Counter *counter, uint32_t client_id, uint32_t amount) {
+void counter_dec(Counter *counter, ClientId client_id, uint32_t amount) {
     void *entry_ptr;
     if (hashtable_get(counter->entries, &client_id, sizeof(client_id),
                       &entry_ptr)) {

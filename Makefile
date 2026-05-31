@@ -32,8 +32,8 @@ test-string: string.c test_string.c test_util.h
 	./test_string
 
 .PHONY: test-counter
-test-counter: arena.c string.c hashtable.c counter.c test_counter.c test_util.h
-	$(CC) $(CFLAGS) -o test_counter arena.c string.c hashtable.c counter.c test_counter.c
+test-counter: arena.c string.c hashtable.c clientid.c host_posix.c counter.c test_counter.c test_util.h
+	$(CC) $(CFLAGS) -o test_counter arena.c string.c hashtable.c clientid.c host_posix.c counter.c test_counter.c
 	./test_counter
 
 .PHONY: test-scalar
