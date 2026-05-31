@@ -25,6 +25,15 @@ typedef struct ClientId {
 
 ClientId clientid_from_bytes(const uint8_t bytes[16]);
 
+// Construct a UUID v7 deterministically from a 48-bit `timestamp_ms` and 10
+// bytes of randomness. Sets the version (0x7) and variant (0b10) fields per
+// RFC 9562. Pure function — no clock, no entropy.
+ClientId clientid_v7(uint64_t timestamp_ms, const uint8_t random[10]);
+
+// Construct a UUID v7 using the host clock (host_now_ms) and host entropy
+// (host_fill_entropy). See host.h for the per-target seam.
+ClientId clientid_v7_now(void);
+
 int clientid_cmp(ClientId a, ClientId b);
 
 bool clientid_eq(ClientId a, ClientId b);
