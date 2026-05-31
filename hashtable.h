@@ -41,6 +41,10 @@ typedef enum {
 HashTableInsertResult hashtable_insert(HashTable *table, const void *key,
                                        size_t key_len, void *value);
 
+// Human-readable name of a HashTableInsertResult, for logging and abort
+// messages. Returns a static string ("OK", "OOM", "KEY_EXISTS", or "unknown").
+const char *hashtable_insert_result_name(HashTableInsertResult r);
+
 // Returns true if key found; sets *out to stored value (which may itself be
 // NULL). Returns false if key not present; *out untouched.
 bool hashtable_get(HashTable *table, const void *key, size_t key_len,

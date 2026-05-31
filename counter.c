@@ -56,9 +56,11 @@ void counter_merge(Counter *dst, const Counter *src) {
                 host_abort("counter_merge: arena OOM");
             }
             *copy = *src_entry;
-            if (hashtable_insert(dst->entries, key, key_len, copy) !=
-                HASHTABLE_OK) {
-                host_abort("counter_merge: hashtable_insert failed");
+            HashTableInsertResult r =
+                hashtable_insert(dst->entries, key, key_len, copy);
+            if (r != HASHTABLE_OK) {
+                host_abortf("counter_merge: hashtable_insert -> %s",
+                            hashtable_insert_result_name(r));
             }
         }
     }
@@ -78,9 +80,11 @@ void counter_inc(Counter *counter, ClientId client_id, uint32_t amount) {
         entry->client_id = client_id;
         entry->inc = amount;
         entry->dec = 0;
-        if (hashtable_insert(counter->entries, &client_id, sizeof(client_id),
-                             entry) != HASHTABLE_OK) {
-            host_abort("counter_inc: hashtable_insert failed");
+        HashTableInsertResult r = hashtable_insert(counter->entries, &client_id,
+                                                   sizeof(client_id), entry);
+        if (r != HASHTABLE_OK) {
+            host_abortf("counter_inc: hashtable_insert -> %s",
+                        hashtable_insert_result_name(r));
         }
     }
 }
@@ -99,9 +103,11 @@ void counter_dec(Counter *counter, ClientId client_id, uint32_t amount) {
         entry->client_id = client_id;
         entry->inc = 0;
         entry->dec = amount;
-        if (hashtable_insert(counter->entries, &client_id, sizeof(client_id),
-                             entry) != HASHTABLE_OK) {
-            host_abort("counter_dec: hashtable_insert failed");
+        HashTableInsertResult r = hashtable_insert(counter->entries, &client_id,
+                                                   sizeof(client_id), entry);
+        if (r != HASHTABLE_OK) {
+            host_abortf("counter_dec: hashtable_insert -> %s",
+                        hashtable_insert_result_name(r));
         }
     }
 }
