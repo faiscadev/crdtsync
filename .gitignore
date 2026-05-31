@@ -15,6 +15,7 @@ a.out
 *.dSYM/
 
 # Test binaries
+/test_arena
 /test_hashtable
 /test_string
 /test_counter

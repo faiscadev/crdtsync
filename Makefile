@@ -21,9 +21,14 @@ fmt: $(CLANG_FORMAT)
 fmt-check: $(CLANG_FORMAT)
 	$(CLANG_FORMAT) --dry-run --Werror $(SRC)
 
+.PHONY: test-arena
+test-arena: arena.c string.c host_posix.c test_arena.c test_util.h
+	$(CC) $(CFLAGS) -o test_arena arena.c string.c host_posix.c test_arena.c
+	./test_arena
+
 .PHONY: test-hashtable
-test-hashtable: arena.c string.c hashtable.c test_hashtable.c test_util.h
-	$(CC) $(CFLAGS) -o test_hashtable arena.c string.c hashtable.c test_hashtable.c
+test-hashtable: arena.c string.c host_posix.c hashtable.c test_hashtable.c test_util.h
+	$(CC) $(CFLAGS) -o test_hashtable arena.c string.c host_posix.c hashtable.c test_hashtable.c
 	./test_hashtable
 
 .PHONY: test-string
@@ -57,4 +62,4 @@ test-stamp: string.c clientid.c host_posix.c stamp.c test_stamp.c test_util.h
 	./test_stamp
 
 .PHONY: test
-test: test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp
+test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp

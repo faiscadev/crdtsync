@@ -25,4 +25,9 @@ uint64_t host_now_ms(void);
 // Fill `n` bytes of `buf` with cryptographically suitable randomness.
 void host_fill_entropy(uint8_t *buf, size_t n);
 
+// Abort the process — programmer-error escape hatch for invariant violations
+// (e.g. passing an out-of-range mark to arena_restore). `reason` is a static
+// string suitable for logging. Never returns.
+_Noreturn void host_abort(const char *reason);
+
 #endif // _CRDT_HOST_H
