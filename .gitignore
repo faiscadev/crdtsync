@@ -25,6 +25,7 @@ a.out
 /test_stamp
 /test_map
 /test_elementid
+/test_element
 
 # Tooling
 /.venv-fmt/

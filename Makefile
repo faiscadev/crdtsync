@@ -56,6 +56,11 @@ test-map: arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c 
 	$(CC) $(CFLAGS) -o test_map arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c map.c test_map.c
 	./test_map
 
+.PHONY: test-element
+test-element: arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c test_util.h
+	$(CC) $(CFLAGS) -o test_element arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c
+	./test_element
+
 .PHONY: test-clientid
 test-clientid: string.c clientid.c host_posix.c test_clientid.c test_util.h
 	$(CC) $(CFLAGS) -o test_clientid string.c clientid.c host_posix.c test_clientid.c
@@ -72,4 +77,4 @@ test-elementid: string.c clientid.c host_posix.c elementid.c test_elementid.c te
 	./test_elementid
 
 .PHONY: test
-test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-elementid
+test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-elementid test-element
