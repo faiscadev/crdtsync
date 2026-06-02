@@ -1,9 +1,13 @@
 #ifndef _CRDT_ELEMENT_H
+#define _CRDT_ELEMENT_H
 
 #include "counter.h"
-#include "map.h"
 #include "register.h"
 #include "scalar.h"
+
+typedef struct Map Map;
+typedef struct Register Register;
+typedef struct Counter Counter;
 
 typedef enum ElementKind {
     ELEMENT_SCALAR,

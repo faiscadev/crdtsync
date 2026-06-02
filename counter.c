@@ -3,6 +3,12 @@
 #include "hashtable.h"
 #include "host.h"
 
+struct Counter {
+    ElementId id;
+    Arena *arena;
+    HashTable *entries; // client_id (uint32_t) -> CounterEntry
+};
+
 static inline uint32_t max_u32(uint32_t a, uint32_t b) {
     if (a > b) {
         return a;
@@ -11,13 +17,14 @@ static inline uint32_t max_u32(uint32_t a, uint32_t b) {
     return b;
 }
 
-Counter *counter_create(Arena *arena) {
+Counter *counter_create(Arena *arena, ElementId id) {
     Counter *counter = arena_alloc(arena, sizeof(Counter));
     if (!counter) {
         host_abortf(
             "counter_create: arena OOM (requested %zu bytes for Counter)",
             sizeof(Counter));
     }
+    counter->id = id;
     counter->arena = arena;
     counter->entries = hashtable_create(arena);
     if (!counter->entries) {
@@ -25,6 +32,8 @@ Counter *counter_create(Arena *arena) {
     }
     return counter;
 }
+
+ElementId counter_id(const Counter *counter) { return counter->id; }
 
 int64_t counter_read(const Counter *counter) {
     int64_t total = 0;

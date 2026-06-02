@@ -3,6 +3,7 @@
 
 #include "arena.h"
 #include "clientid.h"
+#include "elementid.h"
 #include "hashtable.h"
 #include <stdint.h>
 
@@ -12,12 +13,11 @@ typedef struct CounterEntry {
     uint32_t dec;
 } CounterEntry;
 
-typedef struct Counter {
-    Arena *arena;
-    HashTable *entries; // client_id (uint32_t) -> CounterEntry
-} Counter;
+typedef struct Counter Counter;
 
-Counter *counter_create(Arena *arena);
+Counter *counter_create(Arena *arena, ElementId id);
+
+ElementId counter_id(const Counter *counter);
 
 int64_t counter_read(const Counter *counter);
 

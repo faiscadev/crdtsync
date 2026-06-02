@@ -1,5 +1,6 @@
 #include "arena.h"
 #include "clientid.h"
+#include "elementid.h"
 #include "register.h"
 #include "scalar.h"
 #include "stamp.h"
@@ -13,6 +14,12 @@ static ClientId cid(uint8_t first_byte) {
     return clientid_from_bytes(b);
 }
 
+static ElementId eid(uint8_t origin_byte, uint64_t seq) {
+    return elementid_new(cid(origin_byte), seq);
+}
+
+static ElementId default_id(void) { return eid(0xFF, 0); }
+
 // Build a Stamp from lamport + a ClientId's first byte. Tests stay readable.
 static Stamp stmp(uint64_t lamport, uint8_t client_first_byte) {
     return (Stamp){.lamport = lamport, .client_id = cid(client_first_byte)};
@@ -20,7 +27,15 @@ static Stamp stmp(uint64_t lamport, uint8_t client_first_byte) {
 
 static Register *fresh(Scalar value, Stamp stamp) {
     Arena *arena = arena_create();
-    return register_create(arena, value, stamp);
+    return register_create(arena, default_id(), value, stamp);
+}
+
+TEST(register_create_stores_id) {
+    Arena *a = arena_create();
+    ElementId id = eid(7, 42);
+    Register *r = register_create(a, id, scalar_int(0), stmp(1, 1));
+    ASSERT(elementid_eq(register_id(r), id) == true);
+    arena_destroy(a);
 }
 
 // --- create / read ---
@@ -226,6 +241,7 @@ TEST(merge_copies_string_into_dst_arena) {
 }
 
 int main(void) {
+    RUN(register_create_stores_id);
     RUN(create_seeds_value);
     RUN(create_with_string);
     RUN(create_with_null);

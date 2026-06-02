@@ -1,12 +1,8 @@
 #include "arena.h"
 #include "clientid.h"
 #include "counter.h"
+#include "elementid.h"
 #include "test_util.h"
-
-static Counter *fresh(void) {
-    Arena *arena = arena_create();
-    return counter_create(arena);
-}
 
 // Build a ClientId fixture from a single byte (rest zero). Keeps tests
 // compact; ClientId is otherwise 16 raw bytes.
@@ -14,6 +10,26 @@ static ClientId cid(uint8_t first_byte) {
     uint8_t b[16] = {0};
     b[0] = first_byte;
     return clientid_from_bytes(b);
+}
+
+static ElementId eid(uint8_t origin_byte, uint64_t seq) {
+    return elementid_new(cid(origin_byte), seq);
+}
+
+// Default id for tests that don't care about identity.
+static ElementId default_id(void) { return eid(0xFF, 0); }
+
+static Counter *fresh(void) {
+    Arena *arena = arena_create();
+    return counter_create(arena, default_id());
+}
+
+TEST(counter_create_stores_id) {
+    Arena *a = arena_create();
+    ElementId id = eid(7, 42);
+    Counter *c = counter_create(a, id);
+    ASSERT(elementid_eq(counter_id(c), id) == true);
+    arena_destroy(a);
 }
 
 // --- local operations (single replica) ---
@@ -239,6 +255,7 @@ TEST(local_inc_after_merge_accumulates) {
 }
 
 int main(void) {
+    RUN(counter_create_stores_id);
     RUN(empty_reads_zero);
     RUN(single_inc);
     RUN(inc_then_dec_nets);

@@ -5,6 +5,13 @@
 #include <stdbool.h>
 #include <string.h>
 
+struct Register {
+    ElementId id;
+    Arena *arena;
+    Scalar value;
+    Stamp stamp;
+};
+
 Scalar accept_value(Arena *arena, Scalar value) {
     switch (value.kind) {
     case SCALAR_STRING: {
@@ -24,18 +31,22 @@ Scalar accept_value(Arena *arena, Scalar value) {
     }
 }
 
-Register *register_create(Arena *arena, Scalar value, Stamp stamp) {
+Register *register_create(Arena *arena, ElementId id, Scalar value,
+                          Stamp stamp) {
     Register *reg = arena_alloc(arena, sizeof(Register));
     if (!reg) {
         host_abortf(
             "register_create: arena OOM (requested %zu bytes for Register)",
             sizeof(Register));
     }
+    reg->id = id;
     reg->arena = arena;
     reg->value = accept_value(arena, value);
     reg->stamp = stamp;
     return reg;
 }
+
+ElementId register_id(const Register *reg) { return reg->id; }
 
 Scalar register_read(const Register *reg) { return reg->value; }
 

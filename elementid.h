@@ -1,5 +1,7 @@
-#include "clientid.h"
 #ifndef _CRDT_ELEMENTID_H
+#define _CRDT_ELEMENTID_H
+
+#include "clientid.h"
 
 typedef struct ElementId {
     ClientId origin;

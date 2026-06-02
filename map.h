@@ -1,7 +1,7 @@
 #ifndef _CRDT_MAP_H
 #define _CRDT_MAP_H
 
-// LWW Map with tombstones, keyed on raw bytes (binary-safe), Scalar-valued.
+// LWW Map with tombstones, keyed on raw bytes (binary-safe), Element-valued.
 //
 // Semantics:
 //   - Each slot carries a Stamp. set / delete take effect iff the new stamp
@@ -25,6 +25,8 @@
 // Lifetime: Map must not outlive its arena.
 
 #include "arena.h"
+#include "element.h"
+#include "elementid.h"
 #include "scalar.h"
 #include "stamp.h"
 #include <stdbool.h>
@@ -32,13 +34,15 @@
 
 typedef struct Map Map;
 
-Map *map_create(Arena *arena);
+Map *map_create(Arena *arena, ElementId id);
+
+ElementId map_id(const Map *map);
 
 // Returns true if the key has a live (non-tombstone) entry, in which case
 // *out is set. Returns false otherwise; *out is untouched.
-bool map_get(const Map *map, const void *key, size_t key_len, Scalar *out);
+bool map_get(const Map *map, const void *key, size_t key_len, Element *out);
 
-void map_set(Map *map, const void *key, size_t key_len, Scalar value,
+void map_set(Map *map, const void *key, size_t key_len, Element value,
              Stamp stamp);
 void map_delete(Map *map, const void *key, size_t key_len, Stamp stamp);
 
