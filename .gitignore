@@ -23,6 +23,7 @@ a.out
 /test_register
 /test_clientid
 /test_stamp
+/test_map
 
 # Tooling
 /.venv-fmt/

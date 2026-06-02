@@ -42,14 +42,19 @@ test-counter: arena.c string.c hashtable.c clientid.c host_posix.c counter.c tes
 	./test_counter
 
 .PHONY: test-scalar
-test-scalar: string.c scalar.c test_scalar.c test_util.h
-	$(CC) $(CFLAGS) -o test_scalar string.c scalar.c test_scalar.c
+test-scalar: arena.c string.c host_posix.c scalar.c test_scalar.c test_util.h
+	$(CC) $(CFLAGS) -o test_scalar arena.c string.c host_posix.c scalar.c test_scalar.c
 	./test_scalar
 
 .PHONY: test-register
 test-register: arena.c string.c clientid.c host_posix.c stamp.c scalar.c register.c test_register.c test_util.h
 	$(CC) $(CFLAGS) -o test_register arena.c string.c clientid.c host_posix.c stamp.c scalar.c register.c test_register.c
 	./test_register
+
+.PHONY: test-map
+test-map: arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c map.c test_map.c test_util.h
+	$(CC) $(CFLAGS) -o test_map arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c map.c test_map.c
+	./test_map
 
 .PHONY: test-clientid
 test-clientid: string.c clientid.c host_posix.c test_clientid.c test_util.h
@@ -62,4 +67,4 @@ test-stamp: string.c clientid.c host_posix.c stamp.c test_stamp.c test_util.h
 	./test_stamp
 
 .PHONY: test
-test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp
+test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map

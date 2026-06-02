@@ -16,6 +16,7 @@
 // for "obvious" coincidences (scalar_int(0) != scalar_bool(false)). For
 // SCALAR_STRING, equality is bytes+len memcmp (binary-safe).
 
+#include "arena.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -49,5 +50,7 @@ Scalar scalar_int(int64_t i);
 Scalar scalar_string(const uint8_t *bytes, size_t len);
 
 bool scalar_eq(Scalar a, Scalar b);
+
+Scalar scalar_dup(Arena *arena, Scalar value);
 
 #endif // _CRDT_SCALAR_H
