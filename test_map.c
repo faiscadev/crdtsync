@@ -640,32 +640,6 @@ TEST(merge_same_id_counter_advances_slot_stamp) {
     arena_destroy(as);
 }
 
-// LWW path with a composite src that LOSES the stamp comparison must NOT
-// abort. The abort guard exists for composite displacement (src wins,
-// would dangle across arenas) — when src loses, dst keeps its slot and no
-// displacement happens. Scenario: dst has newer scalar, src has older
-// Counter at same key.
-TEST(merge_composite_in_src_loses_lww_does_not_abort) {
-    Arena *ad = arena_create();
-    Arena *as = arena_create();
-
-    Map *dst = map_create(ad, default_id());
-    map_set(dst, SK("x"), EI(42), stmp(10, 1)); // newer scalar in dst
-
-    Map *src = map_create(as, default_id());
-    Counter *sc = counter_create(as, eid(7, 1));
-    counter_inc(sc, cid(2), 5);
-    map_set(src, SK("x"), element_counter(sc), stmp(1, 1)); // older composite
-
-    map_merge(dst, src); // must NOT abort
-
-    Element out;
-    ASSERT(map_get(dst, SK("x"), &out) == true);
-    ASSERT_SCALAR_EQ(out, scalar_int(42));
-    arena_destroy(ad);
-    arena_destroy(as);
-}
-
 int main(void) {
     RUN(map_create_stores_id);
 
@@ -714,7 +688,6 @@ int main(void) {
     RUN(merge_same_id_nested_map_recurses);
     RUN(merge_same_id_counter_does_not_mutate_src);
     RUN(merge_same_id_counter_advances_slot_stamp);
-    RUN(merge_composite_in_src_loses_lww_does_not_abort);
 
     TEST_SUMMARY();
 }

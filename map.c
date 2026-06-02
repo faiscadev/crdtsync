@@ -165,25 +165,20 @@ void map_merge(Map *dst, const Map *src) {
 
         // LWW fallthrough.
         if (se->is_tombstone) {
-            map_delete(dst, k, klen,
-                       se->stamp); // map_delete is itself LWW-guarded
+            map_delete(dst, k, klen, se->stamp);
             continue;
         }
 
-        // src has a live value. Only abort if src's value would actually
-        // win LWW and is a composite — that's the cross-arena displacement
-        // hazard. If src loses by stamp, dst keeps its slot and nothing
-        // dangerous happens.
-        bool src_wins = !dst_has || stamp_gt(se->stamp, de->stamp);
-        if (!src_wins) {
-            continue;
-        }
+        // Reaching the LWW path with a composite means id derivation is
+        // broken or types diverged at this key — programmer error
+        // regardless of which side's stamp wins. Abort unconditionally so
+        // the failure is not stamp-dependent (which would let the same
+        // broken state crash one replica and silently pass on another).
         if (se->value.kind != ELEMENT_SCALAR) {
-            host_abortf("map_merge: cross-replica composite displacement "
-                        "at key (LWW path) — "
-                        "src %s id != dst id (or dst slot "
-                        "empty/tombstone). Use deterministic "
-                        "id derivation for composite slots.",
+            host_abortf("map_merge: composite at LWW path — "
+                        "src kind %s, dst id != src id (or dst empty / "
+                        "tombstoned / different kind). "
+                        "Use deterministic id derivation for composite slots.",
                         element_kind_name(se->value.kind));
         }
         map_set(dst, k, klen, se->value, se->stamp);
