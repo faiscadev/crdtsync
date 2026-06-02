@@ -2,7 +2,9 @@
 #define _CRDT_REGISTER_H
 
 // LWW (last-writer-wins) Register holding a Scalar value with a
-// (lamport, client_id) stamp.
+// (lamport, client_id) stamp. Carries an ElementId set at create,
+// exposed via register_id — that's how parent containers identify
+// "same logical Register across replicas".
 //
 // Semantics:
 //   - Register always holds a value (seeded at create); there is no "unset"
