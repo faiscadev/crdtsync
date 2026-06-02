@@ -47,7 +47,7 @@ TEST(set_overwrites_with_newer_stamp) {
     map_set(m, SK("k"), scalar_int(10), stmp(1, 1));
     map_set(m, SK("k"), scalar_int(20), stmp(2, 1));
     Scalar out;
-    map_get(m, SK("k"), &out);
+    ASSERT(map_get(m, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_int(20)));
 }
 
@@ -56,7 +56,7 @@ TEST(set_lower_stamp_ignored) {
     map_set(m, SK("k"), scalar_int(20), stmp(5, 1));
     map_set(m, SK("k"), scalar_int(10), stmp(3, 1)); // older — ignored
     Scalar out;
-    map_get(m, SK("k"), &out);
+    ASSERT(map_get(m, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_int(20)));
 }
 
@@ -65,7 +65,7 @@ TEST(set_equal_lamport_higher_client_wins) {
     map_set(m, SK("k"), scalar_int(10), stmp(5, 1));
     map_set(m, SK("k"), scalar_int(20), stmp(5, 2)); // same lamport, > client
     Scalar out;
-    map_get(m, SK("k"), &out);
+    ASSERT(map_get(m, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_int(20)));
 }
 
@@ -74,7 +74,7 @@ TEST(set_equal_lamport_lower_client_ignored) {
     map_set(m, SK("k"), scalar_int(20), stmp(5, 2));
     map_set(m, SK("k"), scalar_int(10), stmp(5, 1));
     Scalar out;
-    map_get(m, SK("k"), &out);
+    ASSERT(map_get(m, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_int(20)));
 }
 
@@ -83,7 +83,7 @@ TEST(set_same_stamp_idempotent) {
     map_set(m, SK("k"), scalar_int(42), stmp(5, 1));
     map_set(m, SK("k"), scalar_int(42), stmp(5, 1));
     Scalar out;
-    map_get(m, SK("k"), &out);
+    ASSERT(map_get(m, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_int(42)));
 }
 
@@ -93,7 +93,7 @@ TEST(set_can_change_value_kind) {
     map_set(m, SK("k"), scalar_int(42), stmp(1, 1));
     map_set(m, SK("k"), scalar_string((const uint8_t *)"hi", 2), stmp(2, 1));
     Scalar out;
-    map_get(m, SK("k"), &out);
+    ASSERT(map_get(m, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_string((const uint8_t *)"hi", 2)));
 }
 
@@ -103,8 +103,8 @@ TEST(distinct_keys_are_independent) {
     map_set(m, SK("a"), scalar_int(1), stmp(1, 1));
     map_set(m, SK("b"), scalar_int(2), stmp(1, 1));
     Scalar a, b;
-    map_get(m, SK("a"), &a);
-    map_get(m, SK("b"), &b);
+    ASSERT(map_get(m, SK("a"), &a) == true);
+    ASSERT(map_get(m, SK("b"), &b) == true);
     ASSERT(scalar_eq(a, scalar_int(1)));
     ASSERT(scalar_eq(b, scalar_int(2)));
 }
@@ -165,8 +165,9 @@ TEST(set_after_delete_with_lower_stamp_ignored) {
     ASSERT(map_get(m, SK("k"), &out) == false);
 }
 
-// Concurrent set vs delete: stamp decides which wins.
-TEST(set_vs_delete_higher_stamp_wins_set) {
+// Concurrent set vs delete: stamp decides which wins. Here delete has the
+// higher stamp, so the slot ends up tombstoned.
+TEST(set_vs_delete_higher_stamp_wins_delete) {
     Map *m = fresh();
     map_set(m, SK("k"), scalar_int(10), stmp(1, 1));
     map_delete(m, SK("k"), stmp(5, 1));
@@ -250,7 +251,7 @@ TEST(merge_same_key_newer_wins) {
 
     map_merge(a, b);
     Scalar out;
-    map_get(a, SK("k"), &out);
+    ASSERT(map_get(a, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_int(20)));
 }
 
@@ -262,7 +263,7 @@ TEST(merge_src_older_loses) {
 
     map_merge(a, b);
     Scalar out;
-    map_get(a, SK("k"), &out);
+    ASSERT(map_get(a, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_int(20)));
 }
 
@@ -307,8 +308,8 @@ TEST(merge_commutative) {
     map_merge(b2, a2);
 
     Scalar v1, v2;
-    map_get(a1, SK("k"), &v1);
-    map_get(b2, SK("k"), &v2);
+    ASSERT(map_get(a1, SK("k"), &v1) == true);
+    ASSERT(map_get(b2, SK("k"), &v2) == true);
     ASSERT(scalar_eq(v1, v2));
     ASSERT(scalar_eq(v1, scalar_int(20)));
 }
@@ -321,10 +322,10 @@ TEST(merge_idempotent) {
 
     map_merge(a, b);
     Scalar once;
-    map_get(a, SK("k"), &once);
+    ASSERT(map_get(a, SK("k"), &once) == true);
     map_merge(a, b);
     Scalar twice;
-    map_get(a, SK("k"), &twice);
+    ASSERT(map_get(a, SK("k"), &twice) == true);
     ASSERT(scalar_eq(once, twice));
     ASSERT(scalar_eq(twice, scalar_int(20)));
 }
@@ -351,8 +352,8 @@ TEST(merge_associative) {
     map_merge(a2, b2);
 
     Scalar v1, v2;
-    map_get(a, SK("k"), &v1);
-    map_get(a2, SK("k"), &v2);
+    ASSERT(map_get(a, SK("k"), &v1) == true);
+    ASSERT(map_get(a2, SK("k"), &v2) == true);
     ASSERT(scalar_eq(v1, v2));
     ASSERT(scalar_eq(v1, scalar_int(30)));
 }
@@ -365,7 +366,7 @@ TEST(merge_does_not_mutate_src) {
 
     map_merge(a, b);
     Scalar out;
-    map_get(b, SK("k"), &out);
+    ASSERT(map_get(b, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_int(7))); // b unchanged
 }
 
@@ -388,7 +389,7 @@ TEST(merge_copies_string_into_dst_arena) {
     src_bytes[1] = 'X';
 
     Scalar out;
-    map_get(a, SK("k"), &out);
+    ASSERT(map_get(a, SK("k"), &out) == true);
     ASSERT(scalar_eq(out, scalar_string((const uint8_t *)"hello", 5)));
 }
 
@@ -421,7 +422,7 @@ int main(void) {
     RUN(delete_with_lower_stamp_ignored);
     RUN(set_after_delete_with_higher_stamp_resurrects);
     RUN(set_after_delete_with_lower_stamp_ignored);
-    RUN(set_vs_delete_higher_stamp_wins_set);
+    RUN(set_vs_delete_higher_stamp_wins_delete);
     RUN(delete_idempotent_same_stamp);
     RUN(delete_absent_key_still_installs_tombstone);
 
