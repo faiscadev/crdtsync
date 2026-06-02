@@ -605,6 +605,67 @@ TEST(merge_same_id_counter_does_not_mutate_src) {
     arena_destroy(as);
 }
 
+// After recursive same-id merge the slot stamp must advance to the max of
+// dst's and src's slot stamps. Otherwise a later slot-level op on dst could
+// flip the slot using a stamp that src has already moved past, and the
+// replicas diverge. Probe externally: a subsequent set with a stamp above
+// dst's old slot stamp but below src's must be ignored.
+TEST(merge_same_id_counter_advances_slot_stamp) {
+    Arena *ad = arena_create();
+    Arena *as = arena_create();
+    ElementId votes_id = eid(7, 1);
+
+    Map *dst = map_create(ad, default_id());
+    Counter *dc = counter_create(ad, votes_id);
+    counter_inc(dc, cid(1), 5);
+    map_set(dst, SK("votes"), element_counter(dc), stmp(1, 1));
+
+    Map *src = map_create(as, default_id());
+    Counter *sc = counter_create(as, votes_id);
+    counter_inc(sc, cid(2), 3);
+    map_set(src, SK("votes"), element_counter(sc), stmp(10, 1));
+
+    map_merge(dst, src);
+
+    // Concurrent later write with stamp between (1,1) and (10,1).
+    // On src this would be ignored (src.slot.stamp = 10 > 5). dst must
+    // ignore it too; otherwise replicas diverge on the same key.
+    map_set(dst, SK("votes"), EI(99), stmp(5, 1));
+
+    Element out;
+    ASSERT(map_get(dst, SK("votes"), &out) == true);
+    ASSERT_EQ(element_kind(out), ELEMENT_COUNTER);
+    ASSERT_EQ(counter_read(out.as.counter), 8);
+    arena_destroy(ad);
+    arena_destroy(as);
+}
+
+// LWW path with a composite src that LOSES the stamp comparison must NOT
+// abort. The abort guard exists for composite displacement (src wins,
+// would dangle across arenas) — when src loses, dst keeps its slot and no
+// displacement happens. Scenario: dst has newer scalar, src has older
+// Counter at same key.
+TEST(merge_composite_in_src_loses_lww_does_not_abort) {
+    Arena *ad = arena_create();
+    Arena *as = arena_create();
+
+    Map *dst = map_create(ad, default_id());
+    map_set(dst, SK("x"), EI(42), stmp(10, 1)); // newer scalar in dst
+
+    Map *src = map_create(as, default_id());
+    Counter *sc = counter_create(as, eid(7, 1));
+    counter_inc(sc, cid(2), 5);
+    map_set(src, SK("x"), element_counter(sc), stmp(1, 1)); // older composite
+
+    map_merge(dst, src); // must NOT abort
+
+    Element out;
+    ASSERT(map_get(dst, SK("x"), &out) == true);
+    ASSERT_SCALAR_EQ(out, scalar_int(42));
+    arena_destroy(ad);
+    arena_destroy(as);
+}
+
 int main(void) {
     RUN(map_create_stores_id);
 
@@ -652,6 +713,8 @@ int main(void) {
     RUN(merge_same_id_register_recurses);
     RUN(merge_same_id_nested_map_recurses);
     RUN(merge_same_id_counter_does_not_mutate_src);
+    RUN(merge_same_id_counter_advances_slot_stamp);
+    RUN(merge_composite_in_src_loses_lww_does_not_abort);
 
     TEST_SUMMARY();
 }

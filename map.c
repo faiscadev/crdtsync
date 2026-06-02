@@ -154,24 +154,39 @@ void map_merge(Map *dst, const Map *src) {
             }
             if (elementid_eq(did, sid)) {
                 element_merge(de->value, se->value);
+                // Advance slot stamp to max(dst, src) so future slot-level
+                // ops on this key are LWW-deterministic across replicas.
+                if (stamp_gt(se->stamp, de->stamp)) {
+                    de->stamp = se->stamp;
+                }
                 continue;
             }
         }
 
         // LWW fallthrough.
         if (se->is_tombstone) {
-            map_delete(dst, k, klen, se->stamp);
-        } else {
-            if (se->value.kind != ELEMENT_SCALAR) {
-                host_abortf("map_merge: cross-replica composite displacement "
-                            "at key (LWW path) — "
-                            "src %s id != dst id (or dst slot "
-                            "empty/tombstone). Use deterministic "
-                            "id derivation for composite slots.",
-                            element_kind_name(se->value.kind));
-            }
-            map_set(dst, k, klen, se->value, se->stamp);
+            map_delete(dst, k, klen,
+                       se->stamp); // map_delete is itself LWW-guarded
+            continue;
         }
+
+        // src has a live value. Only abort if src's value would actually
+        // win LWW and is a composite — that's the cross-arena displacement
+        // hazard. If src loses by stamp, dst keeps its slot and nothing
+        // dangerous happens.
+        bool src_wins = !dst_has || stamp_gt(se->stamp, de->stamp);
+        if (!src_wins) {
+            continue;
+        }
+        if (se->value.kind != ELEMENT_SCALAR) {
+            host_abortf("map_merge: cross-replica composite displacement "
+                        "at key (LWW path) — "
+                        "src %s id != dst id (or dst slot "
+                        "empty/tombstone). Use deterministic "
+                        "id derivation for composite slots.",
+                        element_kind_name(se->value.kind));
+        }
+        map_set(dst, k, klen, se->value, se->stamp);
     }
 }
 
