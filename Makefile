@@ -66,5 +66,10 @@ test-stamp: string.c clientid.c host_posix.c stamp.c test_stamp.c test_util.h
 	$(CC) $(CFLAGS) -o test_stamp string.c clientid.c host_posix.c stamp.c test_stamp.c
 	./test_stamp
 
+.PHONY: test-elementid
+test-elementid: string.c clientid.c host_posix.c elementid.c test_elementid.c test_util.h
+	$(CC) $(CFLAGS) -o test_elementid string.c clientid.c host_posix.c elementid.c test_elementid.c
+	./test_elementid
+
 .PHONY: test
-test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map
+test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-elementid
