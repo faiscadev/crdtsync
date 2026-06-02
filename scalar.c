@@ -61,10 +61,6 @@ bool scalar_eq(Scalar a, Scalar b) {
 Scalar scalar_dup(Arena *arena, Scalar value) {
     switch (value.kind) {
     case SCALAR_STRING: {
-        if (value.as.s.len == 0) {
-            // Empty string: nothing to allocate, bytes pointer is irrelevant.
-            return value;
-        }
         uint8_t *bytes_copy = arena_alloc(arena, value.as.s.len);
         if (!bytes_copy) {
             host_abortf("scalar_dup: arena OOM (requested %zu bytes for "
