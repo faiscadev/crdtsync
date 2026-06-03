@@ -1,5 +1,6 @@
 #include "element.h"
 #include "host.h"
+#include "map.h"
 
 Element element_scalar(Scalar s) {
     Element e = {.kind = ELEMENT_SCALAR, .as.scalar = s};

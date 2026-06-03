@@ -1,25 +1,28 @@
 #include "map.h"
+#include "element.h"
 #include "hashtable.h"
 #include "host.h"
 #include "string.h"
 
 typedef struct MapEntry {
     Stamp stamp;
-    Scalar value;
+    Element value;
     bool is_tombstone;
 } Entry;
 
 struct Map {
+    ElementId id;
     Arena *arena;
     HashTable *entries;
 };
 
-Map *map_create(Arena *arena) {
+Map *map_create(Arena *arena, ElementId id) {
     Map *map = arena_alloc(arena, sizeof(Map));
     if (!map) {
         host_abortf("map_create: arena OOM (requested %zu bytes for Map)",
                     sizeof(Map));
     }
+    map->id = id;
     map->arena = arena;
     map->entries = hashtable_create(arena);
     if (!map->entries) {
@@ -28,7 +31,9 @@ Map *map_create(Arena *arena) {
     return map;
 }
 
-bool map_get(const Map *map, const void *key, size_t key_len, Scalar *out) {
+ElementId map_id(const Map *map) { return map->id; }
+
+bool map_get(const Map *map, const void *key, size_t key_len, Element *out) {
     void *entry;
     bool present = hashtable_get(map->entries, key, key_len, &entry);
     if (!present) {
@@ -44,7 +49,7 @@ bool map_get(const Map *map, const void *key, size_t key_len, Scalar *out) {
     return true;
 }
 
-void map_set(Map *map, const void *key, size_t key_len, Scalar value,
+void map_set(Map *map, const void *key, size_t key_len, Element value,
              Stamp stamp) {
     Entry *entry;
     bool present = hashtable_get(map->entries, key, key_len, (void **)&entry);
@@ -65,11 +70,23 @@ void map_set(Map *map, const void *key, size_t key_len, Scalar value,
             }
         }
 
-        Scalar copy = scalar_dup(map->arena, value);
+        switch (value.kind) {
+        case ELEMENT_SCALAR: {
+            Scalar copy = scalar_dup(map->arena, value.as.scalar);
+            value.as.scalar = copy;
+            break;
+        }
+        case ELEMENT_REGISTER:
+        case ELEMENT_COUNTER:
+        case ELEMENT_MAP:
+            // Composite values are pointers to separately-allocated heap
+            // objects; no dup needed.
+            break;
+        }
 
+        entry->value = value;
         entry->stamp = stamp;
         entry->is_tombstone = false;
-        entry->value = copy;
     }
 }
 
@@ -102,16 +119,69 @@ void map_delete(Map *map, const void *key, size_t key_len, Stamp stamp) {
 
 void map_merge(Map *dst, const Map *src) {
     HashTableIter it = hashtable_iter(src->entries);
-    const void *k = NULL;
-    size_t klen = 0;
-    void *v = NULL;
+    const void *k;
+    size_t klen;
+    void *v;
     while (hashtable_iter_next(&it, &k, &klen, &v)) {
-        Entry *src_entry = v;
-        if (src_entry->is_tombstone) {
-            map_delete(dst, k, klen, src_entry->stamp);
-        } else {
-            map_set(dst, k, klen, src_entry->value, src_entry->stamp);
+        Entry *se = v;
+
+        Entry *de;
+        bool dst_has = hashtable_get(dst->entries, k, klen, (void **)&de);
+
+        // Recursive: both alive, same composite kind and same id then
+        // element_merge. This wins over slot LWW.
+        if (dst_has && !de->is_tombstone && !se->is_tombstone &&
+            de->value.kind == se->value.kind &&
+            de->value.kind != ELEMENT_SCALAR) {
+            ElementId did, sid;
+            switch (de->value.kind) {
+            case ELEMENT_SCALAR:
+                did = sid = elementid_root(); // unused, won't compare equal,
+                                              // assign to silence warning
+                break;
+            case ELEMENT_REGISTER:
+                did = register_id(de->value.as.reg);
+                sid = register_id(se->value.as.reg);
+                break;
+            case ELEMENT_COUNTER:
+                did = counter_id(de->value.as.counter);
+                sid = counter_id(se->value.as.counter);
+                break;
+            case ELEMENT_MAP:
+                did = map_id(de->value.as.map);
+                sid = map_id(se->value.as.map);
+                break;
+            }
+            if (elementid_eq(did, sid)) {
+                element_merge(de->value, se->value);
+                // Advance slot stamp to max(dst, src) so future slot-level
+                // ops on this key are LWW-deterministic across replicas.
+                if (stamp_gt(se->stamp, de->stamp)) {
+                    de->stamp = se->stamp;
+                }
+                continue;
+            }
         }
+
+        // LWW fallthrough.
+        if (se->is_tombstone) {
+            map_delete(dst, k, klen, se->stamp);
+            continue;
+        }
+
+        // Reaching the LWW path with a composite means id derivation is
+        // broken or types diverged at this key — programmer error
+        // regardless of which side's stamp wins. Abort unconditionally so
+        // the failure is not stamp-dependent (which would let the same
+        // broken state crash one replica and silently pass on another).
+        if (se->value.kind != ELEMENT_SCALAR) {
+            host_abortf("map_merge: composite at LWW path — "
+                        "src kind %s, dst id != src id (or dst empty / "
+                        "tombstoned / different kind). "
+                        "Use deterministic id derivation for composite slots.",
+                        element_kind_name(se->value.kind));
+        }
+        map_set(dst, k, klen, se->value, se->stamp);
     }
 }
 

@@ -1,9 +1,33 @@
 #ifndef _CRDT_ELEMENT_H
+#define _CRDT_ELEMENT_H
+
+// Element: tagged union over the four value kinds a Map slot can hold —
+// SCALAR (inline value), or one of REGISTER / COUNTER / MAP (pointer to
+// a separately-allocated composite).
+//
+// Constructors (element_scalar / _register / _counter / _map) tag the
+// kind and stash the payload. element_kind reads the tag back.
+//
+// element_merge dispatches on dst's kind:
+//   - REGISTER → register_merge(dst, src)
+//   - COUNTER  → counter_merge(dst, src)
+//   - MAP      → map_merge(dst, src)
+//   - SCALAR   → host_abort. Scalars do not merge as elements; their LWW
+//                lives at the slot level (in Map). Reaching this branch
+//                is a programmer error.
+//
+// Ownership: composites are referenced by pointer; element_merge mutates
+// dst's composite in place and never touches src's. Callers are
+// responsible for keeping pointed-to composites alive (typically by
+// putting them in the same arena as the containing Map).
 
 #include "counter.h"
-#include "map.h"
 #include "register.h"
 #include "scalar.h"
+
+typedef struct Map Map;
+typedef struct Register Register;
+typedef struct Counter Counter;
 
 typedef enum ElementKind {
     ELEMENT_SCALAR,

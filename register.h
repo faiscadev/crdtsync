@@ -2,7 +2,9 @@
 #define _CRDT_REGISTER_H
 
 // LWW (last-writer-wins) Register holding a Scalar value with a
-// (lamport, client_id) stamp.
+// (lamport, client_id) stamp. Carries an ElementId set at create,
+// exposed via register_id — that's how parent containers identify
+// "same logical Register across replicas".
 //
 // Semantics:
 //   - Register always holds a value (seeded at create); there is no "unset"
@@ -29,18 +31,18 @@
 // Lifetime: Register must not outlive its arena.
 
 #include "arena.h"
+#include "elementid.h"
 #include "scalar.h"
 #include "stamp.h"
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef struct Register {
-    Arena *arena;
-    Scalar value;
-    Stamp stamp;
-} Register;
+typedef struct Register Register;
 
-Register *register_create(Arena *arena, Scalar value, Stamp stamp);
+Register *register_create(Arena *arena, ElementId id, Scalar value,
+                          Stamp stamp);
+
+ElementId register_id(const Register *reg);
 
 Scalar register_read(const Register *reg);
 
