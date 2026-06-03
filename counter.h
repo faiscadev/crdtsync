@@ -2,8 +2,9 @@
 #define _CRDT_COUNTER_H
 
 // PN-Counter: integer counter with concurrent increments and decrements.
-// Carries an ElementId set at create, exposed via counter_id — that's how
-// parent containers identify "same logical Counter across replicas".
+// Identity is positional: a Counter is "the Counter for this slot" via the
+// (key, kind) tuple of the containing Map. The Counter struct itself holds
+// no identifier.
 //
 // Semantics:
 //   - Per-client (inc, dec) tallies, one CounterEntry per ClientId that

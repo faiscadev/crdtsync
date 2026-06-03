@@ -2,8 +2,9 @@
 #define _CRDT_MAP_H
 
 // LWW Map with tombstones, keyed on raw bytes (binary-safe), Element-valued.
-// Map itself carries an ElementId, set at create, exposed via map_id —
-// that's how parent containers identify "same logical Map across replicas".
+// Identity for a composite slot is positional: "the Counter / Register /
+// nested Map at this key in this Map." The composites themselves hold no
+// identifier; map_merge uses (key, kind) to decide whether to recurse.
 //
 // Semantics:
 //   - Each slot carries a Stamp. set / delete take effect iff the new stamp
@@ -15,22 +16,23 @@
 //     same delete decision.
 //
 // Merge (per src slot):
-//   - Both alive, same composite kind (REGISTER / COUNTER / MAP) and same
-//     ElementId → element_merge(dst, src) recurses in place. Slot stamps
-//     are ignored on this path; the composite owns its own merge order.
-//   - Otherwise → LWW on slot stamp. Scalar winners are dup'd into dst's
-//     arena. A composite winner is a cross-arena dangling-pointer hazard;
-//     map_merge host_aborts. Deterministic id derivation keeps this path
-//     unreachable in normal use.
+//   - Both alive AND same composite kind (REGISTER / COUNTER / MAP) →
+//     element_merge(dst, src) recurses in place. Slot stamp advances to
+//     max(dst, src) so future slot-level ops stay LWW-deterministic.
+//   - Otherwise → LWW on slot stamp. Scalar winners are scalar_clone'd into
+//     dst's arena. Composite winners are deep-cloned via element_clone into
+//     dst's arena, so dst owns its slot fully and survives src arena
+//     destroy.
 //
 // Ownership:
-//   - SCALAR_STRING values are dup'd into the Map's arena on every accepted
+//   - SCALAR_STRING values are cloned into the Map's arena on every accepted
 //     write (set, winning merge). When map_get fills *out with a SCALAR
 //     Element, the string bytes are a borrowed view into that arena; valid
 //     as long as the arena lives. Caller must not free or mutate.
 //   - Composite slots (REGISTER / COUNTER / MAP) are stored as pointers.
-//     The pointed-to object must live in the same arena as the Map, or at
-//     least outlive it. map_set does not clone composites.
+//     map_set does NOT clone composites — the pointed-to object must live
+//     in the same arena as the Map. map_merge's LWW path clones via
+//     element_clone, so the cross-arena hazard does not surface there.
 //   - Map lives in its arena; arena_destroy cleans up everything (no
 //     separate map_destroy needed).
 //
@@ -61,14 +63,20 @@ void map_merge(Map *dst, const Map *src);
 // Count of live (non-tombstone) entries.
 size_t map_size(const Map *map);
 
-// Helper for "get or create" pattern: returns the Counter at key if present;
+// Get-or-create helpers. Behaviour per call:
+//   1. Live slot with matching kind at `key` → return the existing pointer
+//      (stamp + seed value ignored).
+//   2. Else (empty, tombstone, scalar, or different-kind composite) AND
+//      `stamp` wins LWW against any existing entry → create a fresh
+//      composite in the Map's arena, install in the slot, return it.
+//   3. Else → return a DETACHED composite: created in the Map's arena but
+//      not installed in the slot. Caller always gets a usable handle; the
+//      slot is left untouched.
 Counter *map_counter(Map *map, const void *key, size_t key_len, Stamp stamp);
 
-// Helper for "get or create" pattern: returns the Register at key if present;
 Register *map_register(Map *map, const void *key, size_t key_len, Scalar seed,
                        Stamp stamp);
 
-// Helper for "get or create" pattern: returns the Map at key if present;
 Map *map_map(Map *map, const void *key, size_t key_len, Stamp stamp);
 
 Map *map_clone(Arena *arena, const Map *map);
