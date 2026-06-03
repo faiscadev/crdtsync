@@ -4,7 +4,6 @@
 #include "host.h"
 
 struct Counter {
-    ElementId id;
     Arena *arena;
     HashTable *entries; // client_id (uint32_t) -> CounterEntry
 };
@@ -17,23 +16,46 @@ static inline uint32_t max_u32(uint32_t a, uint32_t b) {
     return b;
 }
 
-Counter *counter_create(Arena *arena, ElementId id) {
+Counter *counter_create(Arena *arena) {
     Counter *counter = arena_alloc(arena, sizeof(Counter));
     if (!counter) {
         host_abortf(
             "counter_create: arena OOM (requested %zu bytes for Counter)",
             sizeof(Counter));
     }
-    counter->id = id;
     counter->arena = arena;
     counter->entries = hashtable_create(arena);
     if (!counter->entries) {
-        host_abort("counter_create: hashtable_create OOM");
+        host_abort("counter_create: hashtable_create OOM (per-client tallies "
+                   "table)");
     }
     return counter;
 }
 
-ElementId counter_id(const Counter *counter) { return counter->id; }
+// Get-or-create the per-client CounterEntry for `client_id`. Initializes a
+// fresh entry to {inc=0, dec=0} on first call for a given client.
+static CounterEntry *counter_entry_for(Counter *counter, ClientId client_id) {
+    void *entry_ptr;
+    if (hashtable_get(counter->entries, &client_id, sizeof(client_id),
+                      &entry_ptr)) {
+        return entry_ptr;
+    }
+    CounterEntry *entry = arena_alloc(counter->arena, sizeof *entry);
+    if (!entry) {
+        host_abortf("counter: arena OOM (requested %zu bytes for CounterEntry)",
+                    sizeof *entry);
+    }
+    entry->client_id = client_id;
+    entry->inc = 0;
+    entry->dec = 0;
+    HashTableInsertResult r = hashtable_insert(counter->entries, &client_id,
+                                               sizeof(client_id), entry);
+    if (r != HASHTABLE_OK) {
+        host_abortf("counter: hashtable_insert -> %s",
+                    hashtable_insert_result_name(r));
+    }
+    return entry;
+}
 
 int64_t counter_read(const Counter *counter) {
     int64_t total = 0;
@@ -80,51 +102,35 @@ void counter_merge(Counter *dst, const Counter *src) {
 }
 
 void counter_inc(Counter *counter, ClientId client_id, uint32_t amount) {
-    void *entry_ptr;
-    if (hashtable_get(counter->entries, &client_id, sizeof(client_id),
-                      &entry_ptr)) {
-        CounterEntry *entry = entry_ptr;
-        entry->inc += amount;
-    } else {
-        CounterEntry *entry = arena_alloc(counter->arena, sizeof *entry);
-        if (!entry) {
-            host_abortf("counter_inc: arena OOM (requested %zu bytes for "
-                        "CounterEntry)",
-                        sizeof *entry);
-        }
-        entry->client_id = client_id;
-        entry->inc = amount;
-        entry->dec = 0;
-        HashTableInsertResult r = hashtable_insert(counter->entries, &client_id,
-                                                   sizeof(client_id), entry);
-        if (r != HASHTABLE_OK) {
-            host_abortf("counter_inc: hashtable_insert -> %s",
-                        hashtable_insert_result_name(r));
-        }
-    }
+    counter_entry_for(counter, client_id)->inc += amount;
 }
 
 void counter_dec(Counter *counter, ClientId client_id, uint32_t amount) {
-    void *entry_ptr;
-    if (hashtable_get(counter->entries, &client_id, sizeof(client_id),
-                      &entry_ptr)) {
-        CounterEntry *entry = entry_ptr;
-        entry->dec += amount;
-    } else {
-        CounterEntry *entry = arena_alloc(counter->arena, sizeof *entry);
-        if (!entry) {
-            host_abortf("counter_dec: arena OOM (requested %zu bytes for "
+    counter_entry_for(counter, client_id)->dec += amount;
+}
+
+Counter *counter_clone(Arena *arena, const Counter *counter) {
+    Counter *clone = counter_create(arena);
+    HashTableIter it = hashtable_iter(counter->entries);
+    const void *key;
+    size_t key_len;
+    void *value;
+    while (hashtable_iter_next(&it, &key, &key_len, &value)) {
+        CounterEntry *entry = value;
+        CounterEntry *entry_copy =
+            arena_alloc(clone->arena, sizeof *entry_copy);
+        if (!entry_copy) {
+            host_abortf("counter_clone: arena OOM (requested %zu bytes for "
                         "CounterEntry)",
-                        sizeof *entry);
+                        sizeof *entry_copy);
         }
-        entry->client_id = client_id;
-        entry->inc = 0;
-        entry->dec = amount;
-        HashTableInsertResult r = hashtable_insert(counter->entries, &client_id,
-                                                   sizeof(client_id), entry);
+        *entry_copy = *entry;
+        HashTableInsertResult r =
+            hashtable_insert(clone->entries, key, key_len, entry_copy);
         if (r != HASHTABLE_OK) {
-            host_abortf("counter_dec: hashtable_insert -> %s",
+            host_abortf("counter_clone: hashtable_insert -> %s",
                         hashtable_insert_result_name(r));
         }
     }
+    return clone;
 }

@@ -37,8 +37,8 @@ test-string: string.c test_string.c test_util.h
 	./test_string
 
 .PHONY: test-counter
-test-counter: arena.c string.c hashtable.c clientid.c elementid.c host_posix.c counter.c test_counter.c test_util.h
-	$(CC) $(CFLAGS) -o test_counter arena.c string.c hashtable.c clientid.c elementid.c host_posix.c counter.c test_counter.c
+test-counter: arena.c string.c hashtable.c clientid.c host_posix.c counter.c test_counter.c test_util.h
+	$(CC) $(CFLAGS) -o test_counter arena.c string.c hashtable.c clientid.c host_posix.c counter.c test_counter.c
 	./test_counter
 
 .PHONY: test-scalar
@@ -47,25 +47,18 @@ test-scalar: arena.c string.c host_posix.c scalar.c test_scalar.c test_util.h
 	./test_scalar
 
 .PHONY: test-register
-test-register: arena.c string.c clientid.c elementid.c host_posix.c stamp.c scalar.c register.c test_register.c test_util.h
-	$(CC) $(CFLAGS) -o test_register arena.c string.c clientid.c elementid.c host_posix.c stamp.c scalar.c register.c test_register.c
+test-register: arena.c string.c clientid.c host_posix.c stamp.c scalar.c register.c test_register.c test_util.h
+	$(CC) $(CFLAGS) -o test_register arena.c string.c clientid.c host_posix.c stamp.c scalar.c register.c test_register.c
 	./test_register
 
 .PHONY: test-map
-test-map: arena.c string.c hashtable.c clientid.c elementid.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c test_util.h
-	$(CC) $(CFLAGS) -o test_map arena.c string.c hashtable.c clientid.c elementid.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c
+test-map: arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c test_util.h
+	$(CC) $(CFLAGS) -o test_map arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c
 	./test_map
 
-# Death test: binary must abort. Exit status is inverted so success means
-# the process died via host_abort.
-.PHONY: test-map-abort
-test-map-abort: arena.c string.c hashtable.c clientid.c elementid.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map_abort.c
-	$(CC) $(CFLAGS) -o test_map_abort arena.c string.c hashtable.c clientid.c elementid.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map_abort.c
-	! ./test_map_abort 2>/dev/null
-
 .PHONY: test-element
-test-element: arena.c string.c hashtable.c clientid.c elementid.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c test_util.h
-	$(CC) $(CFLAGS) -o test_element arena.c string.c hashtable.c clientid.c elementid.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c
+test-element: arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c test_util.h
+	$(CC) $(CFLAGS) -o test_element arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c
 	./test_element
 
 .PHONY: test-clientid
@@ -78,10 +71,5 @@ test-stamp: string.c clientid.c host_posix.c stamp.c test_stamp.c test_util.h
 	$(CC) $(CFLAGS) -o test_stamp string.c clientid.c host_posix.c stamp.c test_stamp.c
 	./test_stamp
 
-.PHONY: test-elementid
-test-elementid: string.c clientid.c host_posix.c elementid.c test_elementid.c test_util.h
-	$(CC) $(CFLAGS) -o test_elementid string.c clientid.c host_posix.c elementid.c test_elementid.c
-	./test_elementid
-
 .PHONY: test
-test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-map-abort test-elementid test-element
+test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-element

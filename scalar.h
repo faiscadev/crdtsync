@@ -10,7 +10,7 @@
 // Ownership: passed by value (~24 bytes). For SCALAR_STRING the struct
 // carries a BORROWED (bytes, len) view; the caller owns the underlying
 // memory at the API boundary. Anything that needs to store a Scalar past
-// the call (Register, Map, ...) must dup the bytes into its own arena.
+// the call (Register, Map, ...) must clone the bytes into its own arena.
 //
 // scalar_eq is kind-strict: cross-kind comparison is always false, even
 // for "obvious" coincidences (scalar_int(0) != scalar_bool(false)). For
@@ -51,6 +51,6 @@ Scalar scalar_string(const uint8_t *bytes, size_t len);
 
 bool scalar_eq(Scalar a, Scalar b);
 
-Scalar scalar_dup(Arena *arena, Scalar value);
+Scalar scalar_clone(Arena *arena, Scalar value);
 
 #endif // _CRDT_SCALAR_H

@@ -1,6 +1,9 @@
 #include "element.h"
+#include "counter.h"
 #include "host.h"
 #include "map.h"
+#include "register.h"
+#include "scalar.h"
 
 Element element_scalar(Scalar s) {
     Element e = {.kind = ELEMENT_SCALAR, .as.scalar = s};
@@ -57,4 +60,30 @@ void element_merge(Element dst, Element src) {
         map_merge(dst.as.map, src.as.map);
         break;
     }
+}
+
+Element element_clone(Arena *arena, Element e) {
+    Element result;
+
+    switch (e.kind) {
+    case ELEMENT_SCALAR: {
+        Scalar cloned = scalar_clone(arena, e.as.scalar);
+
+        result = element_scalar(cloned);
+    } break;
+    case ELEMENT_REGISTER: {
+        Register *reg = register_clone(arena, e.as.reg);
+        result = element_register(reg);
+    } break;
+    case ELEMENT_COUNTER: {
+        Counter *counter = counter_clone(arena, e.as.counter);
+        result = element_counter(counter);
+    } break;
+    case ELEMENT_MAP: {
+        Map *map = map_clone(arena, e.as.map);
+        result = element_map(map);
+    } break;
+    }
+
+    return result;
 }

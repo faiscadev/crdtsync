@@ -38,7 +38,6 @@
 
 #include "arena.h"
 #include "element.h"
-#include "elementid.h"
 #include "scalar.h"
 #include "stamp.h"
 #include <stdbool.h>
@@ -46,9 +45,7 @@
 
 typedef struct Map Map;
 
-Map *map_create(Arena *arena, ElementId id);
-
-ElementId map_id(const Map *map);
+Map *map_create(Arena *arena);
 
 // Returns true if the key has a live (non-tombstone) entry, in which case
 // *out is set. Returns false otherwise; *out is untouched.
@@ -63,5 +60,17 @@ void map_merge(Map *dst, const Map *src);
 
 // Count of live (non-tombstone) entries.
 size_t map_size(const Map *map);
+
+// Helper for "get or create" pattern: returns the Counter at key if present;
+Counter *map_counter(Map *map, const void *key, size_t key_len, Stamp stamp);
+
+// Helper for "get or create" pattern: returns the Register at key if present;
+Register *map_register(Map *map, const void *key, size_t key_len, Scalar seed,
+                       Stamp stamp);
+
+// Helper for "get or create" pattern: returns the Map at key if present;
+Map *map_map(Map *map, const void *key, size_t key_len, Stamp stamp);
+
+Map *map_clone(Arena *arena, const Map *map);
 
 #endif // _CRDT_MAP_H

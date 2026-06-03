@@ -11,27 +11,23 @@ typedef struct MapEntry {
 } Entry;
 
 struct Map {
-    ElementId id;
     Arena *arena;
     HashTable *entries;
 };
 
-Map *map_create(Arena *arena, ElementId id) {
+Map *map_create(Arena *arena) {
     Map *map = arena_alloc(arena, sizeof(Map));
     if (!map) {
         host_abortf("map_create: arena OOM (requested %zu bytes for Map)",
                     sizeof(Map));
     }
-    map->id = id;
     map->arena = arena;
     map->entries = hashtable_create(arena);
     if (!map->entries) {
-        host_abort("map_create: hashtable_create OOM");
+        host_abort("map_create: hashtable_create OOM (slot table)");
     }
     return map;
 }
-
-ElementId map_id(const Map *map) { return map->id; }
 
 bool map_get(const Map *map, const void *key, size_t key_len, Element *out) {
     void *entry;
@@ -72,7 +68,7 @@ void map_set(Map *map, const void *key, size_t key_len, Element value,
 
         switch (value.kind) {
         case ELEMENT_SCALAR: {
-            Scalar copy = scalar_dup(map->arena, value.as.scalar);
+            Scalar copy = scalar_clone(map->arena, value.as.scalar);
             value.as.scalar = copy;
             break;
         }
@@ -133,34 +129,13 @@ void map_merge(Map *dst, const Map *src) {
         if (dst_has && !de->is_tombstone && !se->is_tombstone &&
             de->value.kind == se->value.kind &&
             de->value.kind != ELEMENT_SCALAR) {
-            ElementId did, sid;
-            switch (de->value.kind) {
-            case ELEMENT_SCALAR:
-                did = sid = elementid_root(); // unused, won't compare equal,
-                                              // assign to silence warning
-                break;
-            case ELEMENT_REGISTER:
-                did = register_id(de->value.as.reg);
-                sid = register_id(se->value.as.reg);
-                break;
-            case ELEMENT_COUNTER:
-                did = counter_id(de->value.as.counter);
-                sid = counter_id(se->value.as.counter);
-                break;
-            case ELEMENT_MAP:
-                did = map_id(de->value.as.map);
-                sid = map_id(se->value.as.map);
-                break;
+            element_merge(de->value, se->value);
+            // Advance slot stamp to max(dst, src) so future slot-level
+            // ops on this key are LWW-deterministic across replicas.
+            if (stamp_gt(se->stamp, de->stamp)) {
+                de->stamp = se->stamp;
             }
-            if (elementid_eq(did, sid)) {
-                element_merge(de->value, se->value);
-                // Advance slot stamp to max(dst, src) so future slot-level
-                // ops on this key are LWW-deterministic across replicas.
-                if (stamp_gt(se->stamp, de->stamp)) {
-                    de->stamp = se->stamp;
-                }
-                continue;
-            }
+            continue;
         }
 
         // LWW fallthrough.
@@ -169,19 +144,8 @@ void map_merge(Map *dst, const Map *src) {
             continue;
         }
 
-        // Reaching the LWW path with a composite means id derivation is
-        // broken or types diverged at this key — programmer error
-        // regardless of which side's stamp wins. Abort unconditionally so
-        // the failure is not stamp-dependent (which would let the same
-        // broken state crash one replica and silently pass on another).
-        if (se->value.kind != ELEMENT_SCALAR) {
-            host_abortf("map_merge: composite at LWW path — "
-                        "src kind %s, dst id != src id (or dst empty / "
-                        "tombstoned / different kind). "
-                        "Use deterministic id derivation for composite slots.",
-                        element_kind_name(se->value.kind));
-        }
-        map_set(dst, k, klen, se->value, se->stamp);
+        Element cloned = element_clone(dst->arena, se->value);
+        map_set(dst, k, klen, cloned, se->stamp);
     }
 }
 
@@ -199,4 +163,84 @@ size_t map_size(const Map *map) {
     }
 
     return count;
+}
+
+Counter *map_counter(Map *map, const void *key, size_t key_len, Stamp stamp) {
+    Entry *existing;
+    bool present =
+        hashtable_get(map->entries, key, key_len, (void **)&existing);
+    if (present && !existing->is_tombstone &&
+        existing->value.kind == ELEMENT_COUNTER) {
+        return existing->value.as.counter;
+    }
+
+    Counter *fresh = counter_create(map->arena);
+    if (!present || stamp_gt(stamp, existing->stamp)) {
+        map_set(map, key, key_len, element_counter(fresh), stamp);
+    }
+    // Detached when LWW lost: returned anyway so caller always gets a usable
+    // handle.
+    return fresh;
+}
+
+Register *map_register(Map *map, const void *key, size_t key_len, Scalar seed,
+                       Stamp stamp) {
+    Entry *existing;
+    bool present =
+        hashtable_get(map->entries, key, key_len, (void **)&existing);
+    if (present && !existing->is_tombstone &&
+        existing->value.kind == ELEMENT_REGISTER) {
+        return existing->value.as.reg;
+    }
+
+    Register *fresh = register_create(map->arena, seed, stamp);
+    if (!present || stamp_gt(stamp, existing->stamp)) {
+        map_set(map, key, key_len, element_register(fresh), stamp);
+    }
+    return fresh;
+}
+
+Map *map_map(Map *map, const void *key, size_t key_len, Stamp stamp) {
+    Entry *existing;
+    bool present =
+        hashtable_get(map->entries, key, key_len, (void **)&existing);
+    if (present && !existing->is_tombstone &&
+        existing->value.kind == ELEMENT_MAP) {
+        return existing->value.as.map;
+    }
+
+    Map *fresh = map_create(map->arena);
+    if (!present || stamp_gt(stamp, existing->stamp)) {
+        map_set(map, key, key_len, element_map(fresh), stamp);
+    }
+    return fresh;
+}
+
+Map *map_clone(Arena *arena, const Map *map) {
+    Map *clone = map_create(arena);
+    HashTableIter it = hashtable_iter(map->entries);
+    const void *k;
+    size_t klen;
+    void *v;
+    while (hashtable_iter_next(&it, &k, &klen, &v)) {
+        Entry *entry = v;
+        Entry *copy = arena_alloc(clone->arena, sizeof(Entry));
+        if (!copy) {
+            host_abortf("map_clone: arena OOM (requested %zu bytes for Entry)",
+                        sizeof(Entry));
+        }
+
+        copy->stamp = entry->stamp;
+        copy->is_tombstone = entry->is_tombstone;
+        if (!entry->is_tombstone) {
+            copy->value = element_clone(clone->arena, entry->value);
+        }
+        HashTableInsertResult r =
+            hashtable_insert(clone->entries, k, klen, copy);
+        if (r != HASHTABLE_OK) {
+            host_abortf("map_clone: hashtable_insert -> %s",
+                        hashtable_insert_result_name(r));
+        }
+    }
+    return clone;
 }

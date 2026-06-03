@@ -1,7 +1,6 @@
 #include "arena.h"
 #include "clientid.h"
 #include "counter.h"
-#include "elementid.h"
 #include "test_util.h"
 
 // Build a ClientId fixture from a single byte (rest zero). Keeps tests
@@ -12,24 +11,9 @@ static ClientId cid(uint8_t first_byte) {
     return clientid_from_bytes(b);
 }
 
-static ElementId eid(uint8_t origin_byte, uint64_t seq) {
-    return elementid_new(cid(origin_byte), seq);
-}
-
-// Default id for tests that don't care about identity.
-static ElementId default_id(void) { return eid(0xFF, 0); }
-
 static Counter *fresh(void) {
     Arena *arena = arena_create();
-    return counter_create(arena, default_id());
-}
-
-TEST(counter_create_stores_id) {
-    Arena *a = arena_create();
-    ElementId id = eid(7, 42);
-    Counter *c = counter_create(a, id);
-    ASSERT(elementid_eq(counter_id(c), id) == true);
-    arena_destroy(a);
+    return counter_create(arena);
 }
 
 // --- local operations (single replica) ---
@@ -254,8 +238,64 @@ TEST(local_inc_after_merge_accumulates) {
     ASSERT_EQ(counter_read(a), 7);
 }
 
+// --- counter_clone: deep copy into a target arena ---
+
+TEST(clone_empty_counter_reads_zero) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    Counter *src = counter_create(as);
+    Counter *clone = counter_clone(ad, src);
+    ASSERT(clone != NULL);
+    ASSERT(clone != src);
+    ASSERT_EQ(counter_read(clone), 0);
+    arena_destroy(as);
+    arena_destroy(ad);
+}
+
+TEST(clone_preserves_per_client_tallies) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    Counter *src = counter_create(as);
+    counter_inc(src, cid(1), 5);
+    counter_inc(src, cid(2), 3);
+    counter_dec(src, cid(1), 2);
+    Counter *clone = counter_clone(ad, src);
+    ASSERT_EQ(counter_read(clone), counter_read(src));
+    ASSERT_EQ(counter_read(clone), 6); // (5-2) + 3
+    arena_destroy(as);
+    arena_destroy(ad);
+}
+
+// Clone owns its tallies in dst arena — destroying the source arena must
+// leave the clone intact.
+TEST(clone_survives_src_arena_destroy) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    Counter *src = counter_create(as);
+    counter_inc(src, cid(1), 5);
+    counter_inc(src, cid(2), 3);
+    Counter *clone = counter_clone(ad, src);
+    arena_destroy(as);
+    ASSERT_EQ(counter_read(clone), 8);
+    arena_destroy(ad);
+}
+
+// Mutating src after clone must not affect the clone, and vice versa.
+TEST(clone_independent_of_src) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    Counter *src = counter_create(as);
+    counter_inc(src, cid(1), 5);
+    Counter *clone = counter_clone(ad, src);
+    counter_inc(src, cid(1), 100); // src now 105
+    counter_inc(clone, cid(2), 7); // clone now 12 (5 + 7)
+    ASSERT_EQ(counter_read(src), 105);
+    ASSERT_EQ(counter_read(clone), 12);
+    arena_destroy(as);
+    arena_destroy(ad);
+}
+
 int main(void) {
-    RUN(counter_create_stores_id);
     RUN(empty_reads_zero);
     RUN(single_inc);
     RUN(inc_then_dec_nets);
@@ -272,5 +312,11 @@ int main(void) {
     RUN(merge_associative);
     RUN(merge_does_not_mutate_src);
     RUN(local_inc_after_merge_accumulates);
+
+    RUN(clone_empty_counter_reads_zero);
+    RUN(clone_preserves_per_client_tallies);
+    RUN(clone_survives_src_arena_destroy);
+    RUN(clone_independent_of_src);
+
     TEST_SUMMARY();
 }
