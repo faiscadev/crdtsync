@@ -48,6 +48,11 @@ bool scalar_eq(Scalar a, Scalar b) {
         if (a.as.s.len != b.as.s.len) {
             return false;
         }
+        // Guard zero-length: memcmp(NULL, NULL, 0) is UB pre-C2x even though
+        // libc impls typically tolerate it. Two empty strings are equal.
+        if (a.as.s.len == 0) {
+            return true;
+        }
         return memcmp(a.as.s.bytes, b.as.s.bytes, a.as.s.len) == 0;
     }
 }

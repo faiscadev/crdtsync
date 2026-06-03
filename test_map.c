@@ -660,6 +660,43 @@ TEST(merge_composite_src_wins_into_empty_slot_clones) {
     arena_destroy(ad);
 }
 
+// When src would LOSE the LWW comparison, map_merge must NOT element_clone
+// src's value into dst's arena — that clone would be unreachable garbage.
+// Probe via arena_used: a losing merge must not grow dst's arena beyond
+// trivial bookkeeping.
+TEST(merge_does_not_clone_when_src_loses_lww) {
+    Arena *ad = arena_create();
+    Arena *as = arena_create();
+    Map *dst = map_create(ad);
+    Map *src = map_create(as);
+
+    // dst has newer scalar at "k".
+    map_set(dst, SK("k"), EI(42), stmp(10, 1));
+
+    // src has big nested Counter at "k" with OLDER stamp — must lose LWW.
+    Counter *sc = counter_create(as);
+    for (int i = 0; i < 50; i++) {
+        counter_inc(sc, cid((uint8_t)(i + 1)), 1);
+    }
+    map_set(src, SK("k"), element_counter(sc), stmp(1, 1));
+
+    size_t before = arena_used(ad);
+    map_merge(dst, src);
+    size_t after = arena_used(ad);
+
+    Element out;
+    ASSERT(map_get(dst, SK("k"), &out) == true);
+    ASSERT_SCALAR_EQ(out, scalar_int(42));
+
+    // Without the fix, the Counter (~50 entries) gets cloned into ad even
+    // though src lost LWW. Cost should be near-zero on the honest path.
+    size_t cost = after - before;
+    ASSERT(cost < 256);
+
+    arena_destroy(ad);
+    arena_destroy(as);
+}
+
 TEST(merge_kind_mismatch_clones_winner_into_dst) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
@@ -1040,6 +1077,7 @@ int main(void) {
     RUN(set_different_kind_composite_displaces_at_lww);
 
     RUN(merge_composite_src_wins_into_empty_slot_clones);
+    RUN(merge_does_not_clone_when_src_loses_lww);
     RUN(merge_kind_mismatch_clones_winner_into_dst);
 
     RUN(map_counter_creates_and_installs_at_key);
