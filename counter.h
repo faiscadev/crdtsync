@@ -25,7 +25,6 @@
 
 #include "arena.h"
 #include "clientid.h"
-#include "elementid.h"
 #include "hashtable.h"
 #include <stdint.h>
 
@@ -37,9 +36,7 @@ typedef struct CounterEntry {
 
 typedef struct Counter Counter;
 
-Counter *counter_create(Arena *arena, ElementId id);
-
-ElementId counter_id(const Counter *counter);
+Counter *counter_create(Arena *arena);
 
 int64_t counter_read(const Counter *counter);
 
@@ -48,5 +45,7 @@ void counter_merge(Counter *dst, const Counter *src);
 void counter_inc(Counter *counter, ClientId client_id, uint32_t amount);
 
 void counter_dec(Counter *counter, ClientId client_id, uint32_t amount);
+
+Counter *counter_clone(Arena *arena, const Counter *counter);
 
 #endif // _CRDT_COUNTER_H

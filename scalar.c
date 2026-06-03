@@ -2,7 +2,6 @@
 #include "arena.h"
 #include "host.h"
 #include <stdbool.h>
-#include <stdio.h>
 #include <string.h>
 
 Scalar scalar_null(void) {
@@ -49,21 +48,16 @@ bool scalar_eq(Scalar a, Scalar b) {
         if (a.as.s.len != b.as.s.len) {
             return false;
         }
-        for (size_t i = 0; i < a.as.s.len; i++) {
-            if (a.as.s.bytes[i] != b.as.s.bytes[i]) {
-                return false;
-            }
-        }
-        return true;
+        return memcmp(a.as.s.bytes, b.as.s.bytes, a.as.s.len) == 0;
     }
 }
 
-Scalar scalar_dup(Arena *arena, Scalar value) {
+Scalar scalar_clone(Arena *arena, Scalar value) {
     switch (value.kind) {
     case SCALAR_STRING: {
         uint8_t *bytes_copy = arena_alloc(arena, value.as.s.len);
         if (!bytes_copy) {
-            host_abortf("scalar_dup: arena OOM (requested %zu bytes for "
+            host_abortf("scalar_clone: arena OOM (requested %zu bytes for "
                         "string value)",
                         value.as.s.len);
         }
@@ -77,7 +71,7 @@ Scalar scalar_dup(Arena *arena, Scalar value) {
     case SCALAR_INT:
     case SCALAR_BOOL:
     case SCALAR_NULL:
-        // No heap data to dup, just copy the struct.
+        // No heap data to clone, just copy the struct.
         return value;
     }
 }

@@ -31,7 +31,6 @@
 // Lifetime: Register must not outlive its arena.
 
 #include "arena.h"
-#include "elementid.h"
 #include "scalar.h"
 #include "stamp.h"
 #include <stdbool.h>
@@ -39,15 +38,14 @@
 
 typedef struct Register Register;
 
-Register *register_create(Arena *arena, ElementId id, Scalar value,
-                          Stamp stamp);
-
-ElementId register_id(const Register *reg);
+Register *register_create(Arena *arena, Scalar value, Stamp stamp);
 
 Scalar register_read(const Register *reg);
 
 void register_set(Register *reg, Scalar value, Stamp stamp);
 
 void register_merge(Register *dst, const Register *src);
+
+Register *register_clone(Arena *arena, const Register *reg);
 
 #endif // _CRDT_REGISTER_H

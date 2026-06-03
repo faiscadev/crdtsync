@@ -1,6 +1,5 @@
 #include "arena.h"
 #include "clientid.h"
-#include "elementid.h"
 #include "register.h"
 #include "scalar.h"
 #include "stamp.h"
@@ -14,12 +13,6 @@ static ClientId cid(uint8_t first_byte) {
     return clientid_from_bytes(b);
 }
 
-static ElementId eid(uint8_t origin_byte, uint64_t seq) {
-    return elementid_new(cid(origin_byte), seq);
-}
-
-static ElementId default_id(void) { return eid(0xFF, 0); }
-
 // Build a Stamp from lamport + a ClientId's first byte. Tests stay readable.
 static Stamp stmp(uint64_t lamport, uint8_t client_first_byte) {
     return (Stamp){.lamport = lamport, .client_id = cid(client_first_byte)};
@@ -27,15 +20,7 @@ static Stamp stmp(uint64_t lamport, uint8_t client_first_byte) {
 
 static Register *fresh(Scalar value, Stamp stamp) {
     Arena *arena = arena_create();
-    return register_create(arena, default_id(), value, stamp);
-}
-
-TEST(register_create_stores_id) {
-    Arena *a = arena_create();
-    ElementId id = eid(7, 42);
-    Register *r = register_create(a, id, scalar_int(0), stmp(1, 1));
-    ASSERT(elementid_eq(register_id(r), id) == true);
-    arena_destroy(a);
+    return register_create(arena, value, stamp);
 }
 
 // --- create / read ---
@@ -240,8 +225,62 @@ TEST(merge_copies_string_into_dst_arena) {
                      scalar_string((const uint8_t *)"hello", 5)));
 }
 
+// --- register_clone: deep copy into a target arena ---
+
+TEST(clone_preserves_value) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    Register *src = register_create(as, scalar_int(42), stmp(5, 1));
+    Register *clone = register_clone(ad, src);
+    ASSERT(clone != NULL);
+    ASSERT(clone != src);
+    ASSERT(scalar_eq(register_read(clone), scalar_int(42)));
+    arena_destroy(as);
+    arena_destroy(ad);
+}
+
+// Clone must own its string bytes in dst arena — destroying src arena
+// must leave the clone intact.
+TEST(clone_string_survives_src_arena_destroy) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    Register *src = register_create(
+        as, scalar_string((const uint8_t *)"hello", 5), stmp(1, 1));
+    Register *clone = register_clone(ad, src);
+    arena_destroy(as);
+    ASSERT(scalar_eq(register_read(clone),
+                     scalar_string((const uint8_t *)"hello", 5)));
+    arena_destroy(ad);
+}
+
+// Mutating src after clone must not affect the clone, and vice versa.
+TEST(clone_independent_of_src) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    Register *src = register_create(as, scalar_int(1), stmp(1, 1));
+    Register *clone = register_clone(ad, src);
+    register_set(src, scalar_int(99), stmp(10, 1));
+    register_set(clone, scalar_int(7), stmp(10, 1));
+    ASSERT(scalar_eq(register_read(src), scalar_int(99)));
+    ASSERT(scalar_eq(register_read(clone), scalar_int(7)));
+    arena_destroy(as);
+    arena_destroy(ad);
+}
+
+// Clone preserves the stamp — subsequent set with a stamp ≤ the source's
+// original stamp must lose LWW on the clone.
+TEST(clone_preserves_stamp) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    Register *src = register_create(as, scalar_int(10), stmp(5, 1));
+    Register *clone = register_clone(ad, src);
+    register_set(clone, scalar_int(99), stmp(3, 1)); // older, must lose
+    ASSERT(scalar_eq(register_read(clone), scalar_int(10)));
+    arena_destroy(as);
+    arena_destroy(ad);
+}
+
 int main(void) {
-    RUN(register_create_stores_id);
     RUN(create_seeds_value);
     RUN(create_with_string);
     RUN(create_with_null);
@@ -264,6 +303,11 @@ int main(void) {
     RUN(merge_associative);
     RUN(merge_does_not_mutate_src);
     RUN(merge_copies_string_into_dst_arena);
+
+    RUN(clone_preserves_value);
+    RUN(clone_string_survives_src_arena_destroy);
+    RUN(clone_independent_of_src);
+    RUN(clone_preserves_stamp);
 
     TEST_SUMMARY();
 }

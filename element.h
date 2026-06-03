@@ -54,5 +54,6 @@ Element element_map(Map *m);
 ElementKind element_kind(Element e);
 const char *element_kind_name(ElementKind k);
 void element_merge(Element dst, Element src);
+Element element_clone(Arena *arena, Element e);
 
 #endif // _CRDT_ELEMENT_H
