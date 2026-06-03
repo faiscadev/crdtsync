@@ -25,9 +25,9 @@
 //
 // Ownership:
 //   - SCALAR_STRING values are dup'd into the Map's arena on every accepted
-//     write (set, winning merge). map_get returns a Scalar whose string
-//     bytes are a borrowed view into that arena; valid as long as the arena
-//     lives. Caller must not free or mutate.
+//     write (set, winning merge). When map_get fills *out with a SCALAR
+//     Element, the string bytes are a borrowed view into that arena; valid
+//     as long as the arena lives. Caller must not free or mutate.
 //   - Composite slots (REGISTER / COUNTER / MAP) are stored as pointers.
 //     The pointed-to object must live in the same arena as the Map, or at
 //     least outlive it. map_set does not clone composites.
