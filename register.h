@@ -2,9 +2,9 @@
 #define _CRDT_REGISTER_H
 
 // LWW (last-writer-wins) Register holding a Scalar value with a
-// (lamport, client_id) stamp. Carries an ElementId set at create,
-// exposed via register_id — that's how parent containers identify
-// "same logical Register across replicas".
+// (lamport, client_id) stamp. Identity is positional: a Register is "the
+// Register for this slot" via the (key, kind) tuple of the containing Map.
+// The Register struct itself holds no identifier.
 //
 // Semantics:
 //   - Register always holds a value (seeded at create); there is no "unset"
