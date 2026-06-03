@@ -144,6 +144,14 @@ void map_merge(Map *dst, const Map *src) {
             continue;
         }
 
+        // Skip the clone+set if src would lose LWW — map_set would do the
+        // same stamp check internally and discard the work, but element_clone
+        // on a composite is deep recursive and leaks into dst's arena even
+        // when the value is never installed.
+        if (dst_has && !stamp_gt(se->stamp, de->stamp)) {
+            continue;
+        }
+
         Element cloned = element_clone(dst->arena, se->value);
         map_set(dst, k, klen, cloned, se->stamp);
     }
