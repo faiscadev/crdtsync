@@ -37,8 +37,8 @@ test-string: string.c test_string.c test_util.h
 	./test_string
 
 .PHONY: test-counter
-test-counter: arena.c string.c hashtable.c clientid.c host_posix.c counter.c test_counter.c test_util.h
-	$(CC) $(CFLAGS) -o test_counter arena.c string.c hashtable.c clientid.c host_posix.c counter.c test_counter.c
+test-counter: arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c counter.c test_counter.c test_util.h
+	$(CC) $(CFLAGS) -o test_counter arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c counter.c test_counter.c
 	./test_counter
 
 .PHONY: test-scalar
@@ -47,19 +47,34 @@ test-scalar: arena.c string.c host_posix.c scalar.c test_scalar.c test_util.h
 	./test_scalar
 
 .PHONY: test-register
-test-register: arena.c string.c clientid.c host_posix.c stamp.c scalar.c register.c test_register.c test_util.h
-	$(CC) $(CFLAGS) -o test_register arena.c string.c clientid.c host_posix.c stamp.c scalar.c register.c test_register.c
+test-register: arena.c string.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c test_register.c test_util.h
+	$(CC) $(CFLAGS) -o test_register arena.c string.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c test_register.c
 	./test_register
 
 .PHONY: test-map
-test-map: arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c test_util.h
-	$(CC) $(CFLAGS) -o test_map arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c
+test-map: arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c test_util.h
+	$(CC) $(CFLAGS) -o test_map arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c
 	./test_map
 
 .PHONY: test-element
-test-element: arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c test_util.h
-	$(CC) $(CFLAGS) -o test_element arena.c string.c hashtable.c clientid.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c
+test-element: arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c test_util.h
+	$(CC) $(CFLAGS) -o test_element arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c
 	./test_element
+
+.PHONY: test-elementid
+test-elementid: string.c clientid.c elementid.c uuid.c sha1.c host_posix.c test_elementid.c test_util.h
+	$(CC) $(CFLAGS) -o test_elementid string.c clientid.c elementid.c uuid.c sha1.c host_posix.c test_elementid.c
+	./test_elementid
+
+.PHONY: test-sha1
+test-sha1: sha1.c test_sha1.c test_util.h
+	$(CC) $(CFLAGS) -o test_sha1 sha1.c test_sha1.c
+	./test_sha1
+
+.PHONY: test-uuid
+test-uuid: uuid.c sha1.c test_uuid.c test_util.h
+	$(CC) $(CFLAGS) -o test_uuid uuid.c sha1.c test_uuid.c
+	./test_uuid
 
 .PHONY: test-clientid
 test-clientid: string.c clientid.c host_posix.c test_clientid.c test_util.h
@@ -72,4 +87,4 @@ test-stamp: string.c clientid.c host_posix.c stamp.c test_stamp.c test_util.h
 	./test_stamp
 
 .PHONY: test
-test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-element
+test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-sha1 test-uuid test-elementid test-element
