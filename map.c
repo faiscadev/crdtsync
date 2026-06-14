@@ -11,16 +11,18 @@ typedef struct MapEntry {
 } Entry;
 
 struct Map {
+    ElementId id;
     Arena *arena;
     HashTable *entries;
 };
 
-Map *map_create(Arena *arena) {
+Map *map_create(Arena *arena, ElementId id) {
     Map *map = arena_alloc(arena, sizeof(Map));
     if (!map) {
         host_abortf("map_create: arena OOM (requested %zu bytes for Map)",
                     sizeof(Map));
     }
+    map->id = id;
     map->arena = arena;
     map->entries = hashtable_create(arena);
     if (!map->entries) {
@@ -28,6 +30,8 @@ Map *map_create(Arena *arena) {
     }
     return map;
 }
+
+ElementId map_id(const Map *map) { return map->id; }
 
 bool map_get(const Map *map, const void *key, size_t key_len, Element *out) {
     void *entry;
@@ -124,11 +128,23 @@ void map_merge(Map *dst, const Map *src) {
         Entry *de;
         bool dst_has = hashtable_get(dst->entries, k, klen, (void **)&de);
 
-        // Recursive: both alive, same composite kind and same id then
-        // element_merge. This wins over slot LWW.
+        // Same key, both alive composites of same kind: either recurse in
+        // place (matching ids → same logical element) or LWW-clone the
+        // winner (mismatched ids → distinct logical elements that happen
+        // to share the slot).
         if (dst_has && !de->is_tombstone && !se->is_tombstone &&
             de->value.kind == se->value.kind &&
             de->value.kind != ELEMENT_SCALAR) {
+            if (!elementid_eq(element_id(de->value), element_id(se->value))) {
+                // Distinct logical elements at the same slot. LWW the
+                // slot; if src wins, replace dst's composite with a
+                // clone of src's. Loser is orphaned.
+                if (stamp_gt(se->stamp, de->stamp)) {
+                    de->value = element_clone(dst->arena, se->value);
+                    de->stamp = se->stamp;
+                }
+                continue;
+            }
             element_merge(de->value, se->value);
             // Advance slot stamp to max(dst, src) so future slot-level
             // ops on this key are LWW-deterministic across replicas.
@@ -182,7 +198,8 @@ Counter *map_counter(Map *map, const void *key, size_t key_len, Stamp stamp) {
         return existing->value.as.counter;
     }
 
-    Counter *fresh = counter_create(map->arena);
+    ElementId id = elementid_derive(map->id, key, key_len, ELEMENT_COUNTER);
+    Counter *fresh = counter_create(map->arena, id);
     if (!present || stamp_gt(stamp, existing->stamp)) {
         map_set(map, key, key_len, element_counter(fresh), stamp);
     }
@@ -201,7 +218,8 @@ Register *map_register(Map *map, const void *key, size_t key_len, Scalar seed,
         return existing->value.as.reg;
     }
 
-    Register *fresh = register_create(map->arena, seed, stamp);
+    ElementId id = elementid_derive(map->id, key, key_len, ELEMENT_REGISTER);
+    Register *fresh = register_create(map->arena, id, seed, stamp);
     if (!present || stamp_gt(stamp, existing->stamp)) {
         map_set(map, key, key_len, element_register(fresh), stamp);
     }
@@ -217,7 +235,8 @@ Map *map_map(Map *map, const void *key, size_t key_len, Stamp stamp) {
         return existing->value.as.map;
     }
 
-    Map *fresh = map_create(map->arena);
+    ElementId id = elementid_derive(map->id, key, key_len, ELEMENT_MAP);
+    Map *fresh = map_create(map->arena, id);
     if (!present || stamp_gt(stamp, existing->stamp)) {
         map_set(map, key, key_len, element_map(fresh), stamp);
     }
@@ -225,7 +244,7 @@ Map *map_map(Map *map, const void *key, size_t key_len, Stamp stamp) {
 }
 
 Map *map_clone(Arena *arena, const Map *map) {
-    Map *clone = map_create(arena);
+    Map *clone = map_create(arena, map->id);
     HashTableIter it = hashtable_iter(map->entries);
     const void *k;
     size_t klen;

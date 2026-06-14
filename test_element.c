@@ -2,6 +2,7 @@
 #include "clientid.h"
 #include "counter.h"
 #include "element.h"
+#include "elementid.h"
 #include "map.h"
 #include "register.h"
 #include "scalar.h"
@@ -17,6 +18,17 @@ static ClientId cid(uint8_t first_byte) {
     return clientid_from_bytes(b);
 }
 
+static ElementId eid(uint64_t hi, uint64_t lo) {
+    uint8_t b[16];
+    for (int i = 0; i < 8; i++) {
+        b[i] = (uint8_t)((hi >> ((7 - i) * 8)) & 0xff);
+        b[8 + i] = (uint8_t)((lo >> ((7 - i) * 8)) & 0xff);
+    }
+    return elementid_from_bytes(b);
+}
+
+static ElementId default_id(void) { return eid(0xFF, 0); }
+
 static Stamp stmp(uint64_t lamport, uint8_t client_first_byte) {
     return (Stamp){.lamport = lamport, .client_id = cid(client_first_byte)};
 }
@@ -31,7 +43,7 @@ TEST(scalar_constructor_sets_kind_and_value) {
 
 TEST(register_constructor_sets_kind_and_pointer) {
     Arena *a = arena_create();
-    Register *r = register_create(a, scalar_int(1), stmp(1, 1));
+    Register *r = register_create(a, default_id(), scalar_int(1), stmp(1, 1));
     Element e = element_register(r);
     ASSERT_EQ(element_kind(e), ELEMENT_REGISTER);
     ASSERT(e.as.reg == r);
@@ -40,7 +52,7 @@ TEST(register_constructor_sets_kind_and_pointer) {
 
 TEST(counter_constructor_sets_kind_and_pointer) {
     Arena *a = arena_create();
-    Counter *c = counter_create(a);
+    Counter *c = counter_create(a, default_id());
     Element e = element_counter(c);
     ASSERT_EQ(element_kind(e), ELEMENT_COUNTER);
     ASSERT(e.as.counter == c);
@@ -49,7 +61,7 @@ TEST(counter_constructor_sets_kind_and_pointer) {
 
 TEST(map_constructor_sets_kind_and_pointer) {
     Arena *a = arena_create();
-    Map *m = map_create(a);
+    Map *m = map_create(a, default_id());
     Element e = element_map(m);
     ASSERT_EQ(element_kind(e), ELEMENT_MAP);
     ASSERT(e.as.map == m);
@@ -79,8 +91,10 @@ TEST(kind_name_map) {
 TEST(merge_register_takes_newer_value) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
-    Register *dst = register_create(ad, scalar_int(10), stmp(1, 1));
-    Register *src = register_create(as, scalar_int(20), stmp(5, 1));
+    Register *dst =
+        register_create(ad, default_id(), scalar_int(10), stmp(1, 1));
+    Register *src =
+        register_create(as, default_id(), scalar_int(20), stmp(5, 1));
 
     element_merge(element_register(dst), element_register(src));
 
@@ -92,8 +106,8 @@ TEST(merge_register_takes_newer_value) {
 TEST(merge_counter_unions_clients) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
-    Counter *dst = counter_create(ad);
-    Counter *src = counter_create(as);
+    Counter *dst = counter_create(ad, default_id());
+    Counter *src = counter_create(as, default_id());
     counter_inc(dst, cid(1), 5);
     counter_inc(src, cid(2), 3);
 
@@ -107,8 +121,8 @@ TEST(merge_counter_unions_clients) {
 TEST(merge_map_takes_newer_slot) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
-    Map *dst = map_create(ad);
-    Map *src = map_create(as);
+    Map *dst = map_create(ad, default_id());
+    Map *src = map_create(as, default_id());
 
     const uint8_t *k = (const uint8_t *)"k";
     size_t klen = 1;
@@ -128,8 +142,10 @@ TEST(merge_map_takes_newer_slot) {
 TEST(merge_register_does_not_mutate_src) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
-    Register *dst = register_create(ad, scalar_int(99), stmp(10, 1));
-    Register *src = register_create(as, scalar_int(7), stmp(1, 1));
+    Register *dst =
+        register_create(ad, default_id(), scalar_int(99), stmp(10, 1));
+    Register *src =
+        register_create(as, default_id(), scalar_int(7), stmp(1, 1));
 
     element_merge(element_register(dst), element_register(src));
 
@@ -141,8 +157,8 @@ TEST(merge_register_does_not_mutate_src) {
 TEST(merge_counter_does_not_mutate_src) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
-    Counter *dst = counter_create(ad);
-    Counter *src = counter_create(as);
+    Counter *dst = counter_create(ad, default_id());
+    Counter *src = counter_create(as, default_id());
     counter_inc(src, cid(1), 3);
 
     element_merge(element_counter(dst), element_counter(src));
@@ -155,8 +171,8 @@ TEST(merge_counter_does_not_mutate_src) {
 TEST(merge_map_does_not_mutate_src) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
-    Map *dst = map_create(ad);
-    Map *src = map_create(as);
+    Map *dst = map_create(ad, default_id());
+    Map *src = map_create(as, default_id());
     const uint8_t *k = (const uint8_t *)"k";
     map_set(src, k, 1, element_scalar(scalar_int(7)), stmp(1, 1));
 
@@ -172,7 +188,7 @@ TEST(merge_map_does_not_mutate_src) {
 
 TEST(round_trip_via_kind_and_payload) {
     Arena *a = arena_create();
-    Counter *c = counter_create(a);
+    Counter *c = counter_create(a, default_id());
     Element e = element_counter(c);
     ASSERT_EQ(element_kind(e), ELEMENT_COUNTER);
     ASSERT(e.as.counter == c);
@@ -212,7 +228,8 @@ TEST(clone_scalar_string_owns_bytes_in_dst_arena) {
 TEST(clone_register_deep_copies_value) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Register *src = register_create(as, scalar_int(42), stmp(5, 1));
+    Register *src =
+        register_create(as, default_id(), scalar_int(42), stmp(5, 1));
     Element clone = element_clone(ad, element_register(src));
     arena_destroy(as);
     ASSERT_EQ(element_kind(clone), ELEMENT_REGISTER);
@@ -224,7 +241,7 @@ TEST(clone_register_deep_copies_value) {
 TEST(clone_counter_deep_copies_per_client_tallies) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Counter *src = counter_create(as);
+    Counter *src = counter_create(as, default_id());
     counter_inc(src, cid(1), 5);
     counter_inc(src, cid(2), 3);
     Element clone = element_clone(ad, element_counter(src));
@@ -238,7 +255,7 @@ TEST(clone_counter_deep_copies_per_client_tallies) {
 TEST(clone_map_deep_copies_recursively) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Map *src = map_create(as);
+    Map *src = map_create(as, default_id());
     map_set(src, (const void *)"a", 1, element_scalar(scalar_int(1)),
             stmp(1, 1));
     map_set(src, (const void *)"b", 1, element_scalar(scalar_int(2)),
@@ -259,12 +276,53 @@ TEST(clone_map_deep_copies_recursively) {
 TEST(clone_counter_independent_of_src) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Counter *src = counter_create(as);
+    Counter *src = counter_create(as, default_id());
     counter_inc(src, cid(1), 5);
     Element clone = element_clone(ad, element_counter(src));
     counter_inc(src, cid(1), 100);
     ASSERT_EQ(counter_read(src), 105);
     ASSERT_EQ(counter_read(clone.as.counter), 5);
+    arena_destroy(as);
+    arena_destroy(ad);
+}
+
+// --- element_clone preserves the source's id ---
+//
+// Cloned elements represent the same logical element (just materialized
+// in a different arena), so ids carry over unchanged.
+
+TEST(clone_register_preserves_id) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    ElementId id = eid(7, 42);
+    Register *src = register_create(as, id, scalar_int(1), stmp(1, 1));
+    Element clone = element_clone(ad, element_register(src));
+    ASSERT_EQ(element_kind(clone), ELEMENT_REGISTER);
+    ASSERT(elementid_eq(register_id(clone.as.reg), id) == true);
+    arena_destroy(as);
+    arena_destroy(ad);
+}
+
+TEST(clone_counter_preserves_id) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    ElementId id = eid(7, 42);
+    Counter *src = counter_create(as, id);
+    Element clone = element_clone(ad, element_counter(src));
+    ASSERT_EQ(element_kind(clone), ELEMENT_COUNTER);
+    ASSERT(elementid_eq(counter_id(clone.as.counter), id) == true);
+    arena_destroy(as);
+    arena_destroy(ad);
+}
+
+TEST(clone_map_preserves_id) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    ElementId id = eid(7, 42);
+    Map *src = map_create(as, id);
+    Element clone = element_clone(ad, element_map(src));
+    ASSERT_EQ(element_kind(clone), ELEMENT_MAP);
+    ASSERT(elementid_eq(map_id(clone.as.map), id) == true);
     arena_destroy(as);
     arena_destroy(ad);
 }
@@ -296,6 +354,10 @@ int main(void) {
     RUN(clone_counter_deep_copies_per_client_tallies);
     RUN(clone_map_deep_copies_recursively);
     RUN(clone_counter_independent_of_src);
+
+    RUN(clone_register_preserves_id);
+    RUN(clone_counter_preserves_id);
+    RUN(clone_map_preserves_id);
 
     TEST_SUMMARY();
 }

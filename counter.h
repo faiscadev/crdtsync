@@ -2,9 +2,12 @@
 #define _CRDT_COUNTER_H
 
 // PN-Counter: integer counter with concurrent increments and decrements.
-// Identity is positional: a Counter is "the Counter for this slot" via the
-// (key, kind) tuple of the containing Map. The Counter struct itself holds
-// no identifier.
+// Identity: each Counter is stamped with an ElementId at create, exposed
+// via counter_id. Two replicas independently creating "the same Counter
+// at the same slot" derive identical ids via
+// elementid_derive(parent.id, key, ELEMENT_COUNTER), which is what
+// map_merge's recursive guard uses to know they refer to the same logical
+// element.
 //
 // Semantics:
 //   - Per-client (inc, dec) tallies, one CounterEntry per ClientId that
@@ -26,6 +29,7 @@
 
 #include "arena.h"
 #include "clientid.h"
+#include "elementid.h"
 #include "hashtable.h"
 #include <stdint.h>
 
@@ -37,7 +41,9 @@ typedef struct CounterEntry {
 
 typedef struct Counter Counter;
 
-Counter *counter_create(Arena *arena);
+Counter *counter_create(Arena *arena, ElementId id);
+
+ElementId counter_id(const Counter *counter);
 
 int64_t counter_read(const Counter *counter);
 

@@ -5,6 +5,20 @@
 #include "register.h"
 #include "scalar.h"
 
+ElementId element_id(Element e) {
+    switch (e.kind) {
+    case ELEMENT_SCALAR:
+        host_abort("element_id: scalar elements have no id");
+        break;
+    case ELEMENT_REGISTER:
+        return register_id(e.as.reg);
+    case ELEMENT_COUNTER:
+        return counter_id(e.as.counter);
+    case ELEMENT_MAP:
+        return map_id(e.as.map);
+    }
+}
+
 Element element_scalar(Scalar s) {
     Element e = {.kind = ELEMENT_SCALAR, .as.scalar = s};
     return e;

@@ -1,5 +1,6 @@
 #include "arena.h"
 #include "clientid.h"
+#include "elementid.h"
 #include "register.h"
 #include "scalar.h"
 #include "stamp.h"
@@ -13,6 +14,17 @@ static ClientId cid(uint8_t first_byte) {
     return clientid_from_bytes(b);
 }
 
+static ElementId eid(uint64_t hi, uint64_t lo) {
+    uint8_t b[16];
+    for (int i = 0; i < 8; i++) {
+        b[i] = (uint8_t)((hi >> ((7 - i) * 8)) & 0xff);
+        b[8 + i] = (uint8_t)((lo >> ((7 - i) * 8)) & 0xff);
+    }
+    return elementid_from_bytes(b);
+}
+
+static ElementId default_id(void) { return eid(0xFF, 0); }
+
 // Build a Stamp from lamport + a ClientId's first byte. Tests stay readable.
 static Stamp stmp(uint64_t lamport, uint8_t client_first_byte) {
     return (Stamp){.lamport = lamport, .client_id = cid(client_first_byte)};
@@ -20,7 +32,26 @@ static Stamp stmp(uint64_t lamport, uint8_t client_first_byte) {
 
 static Register *fresh(Scalar value, Stamp stamp) {
     Arena *arena = arena_create();
-    return register_create(arena, value, stamp);
+    return register_create(arena, default_id(), value, stamp);
+}
+
+TEST(register_create_stores_id) {
+    Arena *a = arena_create();
+    ElementId id = eid(7, 42);
+    Register *r = register_create(a, id, scalar_int(0), stmp(1, 1));
+    ASSERT(elementid_eq(register_id(r), id) == true);
+    arena_destroy(a);
+}
+
+TEST(register_clone_preserves_id) {
+    Arena *as = arena_create();
+    Arena *ad = arena_create();
+    ElementId id = eid(7, 42);
+    Register *src = register_create(as, id, scalar_int(42), stmp(1, 1));
+    Register *clone = register_clone(ad, src);
+    ASSERT(elementid_eq(register_id(clone), id) == true);
+    arena_destroy(as);
+    arena_destroy(ad);
 }
 
 // --- create / read ---
@@ -230,7 +261,8 @@ TEST(merge_copies_string_into_dst_arena) {
 TEST(clone_preserves_value) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Register *src = register_create(as, scalar_int(42), stmp(5, 1));
+    Register *src =
+        register_create(as, default_id(), scalar_int(42), stmp(5, 1));
     Register *clone = register_clone(ad, src);
     ASSERT(clone != NULL);
     ASSERT(clone != src);
@@ -244,8 +276,9 @@ TEST(clone_preserves_value) {
 TEST(clone_string_survives_src_arena_destroy) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Register *src = register_create(
-        as, scalar_string((const uint8_t *)"hello", 5), stmp(1, 1));
+    Register *src =
+        register_create(as, default_id(),
+                        scalar_string((const uint8_t *)"hello", 5), stmp(1, 1));
     Register *clone = register_clone(ad, src);
     arena_destroy(as);
     ASSERT(scalar_eq(register_read(clone),
@@ -257,7 +290,8 @@ TEST(clone_string_survives_src_arena_destroy) {
 TEST(clone_independent_of_src) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Register *src = register_create(as, scalar_int(1), stmp(1, 1));
+    Register *src =
+        register_create(as, default_id(), scalar_int(1), stmp(1, 1));
     Register *clone = register_clone(ad, src);
     register_set(src, scalar_int(99), stmp(10, 1));
     register_set(clone, scalar_int(7), stmp(10, 1));
@@ -272,7 +306,8 @@ TEST(clone_independent_of_src) {
 TEST(clone_preserves_stamp) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Register *src = register_create(as, scalar_int(10), stmp(5, 1));
+    Register *src =
+        register_create(as, default_id(), scalar_int(10), stmp(5, 1));
     Register *clone = register_clone(ad, src);
     register_set(clone, scalar_int(99), stmp(3, 1)); // older, must lose
     ASSERT(scalar_eq(register_read(clone), scalar_int(10)));
@@ -281,6 +316,7 @@ TEST(clone_preserves_stamp) {
 }
 
 int main(void) {
+    RUN(register_create_stores_id);
     RUN(create_seeds_value);
     RUN(create_with_string);
     RUN(create_with_null);
@@ -304,6 +340,7 @@ int main(void) {
     RUN(merge_does_not_mutate_src);
     RUN(merge_copies_string_into_dst_arena);
 
+    RUN(register_clone_preserves_id);
     RUN(clone_preserves_value);
     RUN(clone_string_survives_src_arena_destroy);
     RUN(clone_independent_of_src);

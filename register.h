@@ -2,9 +2,12 @@
 #define _CRDT_REGISTER_H
 
 // LWW (last-writer-wins) Register holding a Scalar value with a
-// (lamport, client_id) stamp. Identity is positional: a Register is "the
-// Register for this slot" via the (key, kind) tuple of the containing Map.
-// The Register struct itself holds no identifier.
+// (lamport, client_id) stamp. Identity: each Register is stamped with an
+// ElementId at create, exposed via register_id. Two replicas independently
+// creating "the same Register at the same slot" derive identical ids via
+// elementid_derive(parent.id, key, ELEMENT_REGISTER), which is what
+// map_merge's recursive guard uses to know they refer to the same logical
+// element.
 //
 // Semantics:
 //   - Register always holds a value (seeded at create); there is no "unset"
@@ -31,6 +34,7 @@
 // Lifetime: Register must not outlive its arena.
 
 #include "arena.h"
+#include "elementid.h"
 #include "scalar.h"
 #include "stamp.h"
 #include <stdbool.h>
@@ -38,7 +42,10 @@
 
 typedef struct Register Register;
 
-Register *register_create(Arena *arena, Scalar value, Stamp stamp);
+Register *register_create(Arena *arena, ElementId id, Scalar value,
+                          Stamp stamp);
+
+ElementId register_id(const Register *reg);
 
 Scalar register_read(const Register *reg);
 
