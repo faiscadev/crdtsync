@@ -60,14 +60,15 @@ void uuid_v5_init(UuidV5Ctx *ctx, const uint8_t namespace_bytes[16]) {
     SHA1Update(&ctx->sha1_ctx, namespace_bytes, 16);
 }
 
-// Caveat: `len` is a size_t but SHA1Update takes uint32_t — single calls
-// with len > UINT32_MAX (~4 GiB) silently truncate. Not an issue for our
-// only caller (elementid_derive) where the name portion is parent.bytes
-// (16) + key bytes (typically tens to low thousands) + kind tag (1). If
-// you ever feed >4 GiB chunks through this, chunk the update at the call
-// site or fix this with a UINT32_MAX-sized loop.
+// SHA1Update takes a uint32_t length, so size_t inputs above UINT32_MAX
+// must be chunked to avoid silent truncation on 64-bit platforms.
 void uuid_v5_update(UuidV5Ctx *ctx, const uint8_t *data, size_t len) {
-    SHA1Update(&ctx->sha1_ctx, data, len);
+    while (len > 0) {
+        size_t chunk = len > UINT32_MAX ? UINT32_MAX : len;
+        SHA1Update(&ctx->sha1_ctx, data, (uint32_t)chunk);
+        data += chunk;
+        len -= chunk;
+    }
 }
 
 UuidV5 uuid_v5_final(UuidV5Ctx *ctx) {
