@@ -2,6 +2,7 @@
 #include "clientid.h"
 #include "counter.h"
 #include "element.h"
+#include "elementid.h"
 #include "map.h"
 #include "register.h"
 #include "scalar.h"
@@ -16,6 +17,18 @@ static ClientId cid(uint8_t first_byte) {
     return clientid_from_bytes(b);
 }
 
+static ElementId eid(uint64_t hi, uint64_t lo) {
+    uint8_t b[16];
+    for (int i = 0; i < 8; i++) {
+        b[i] = (uint8_t)((hi >> ((7 - i) * 8)) & 0xff);
+        b[8 + i] = (uint8_t)((lo >> ((7 - i) * 8)) & 0xff);
+    }
+    return elementid_from_bytes(b);
+}
+
+// Default id for tests where the parent Map's identity does not matter.
+static ElementId default_id(void) { return eid(0xFF, 0); }
+
 static Stamp stmp(uint64_t lamport, uint8_t client_first_byte) {
     return (Stamp){.lamport = lamport, .client_id = cid(client_first_byte)};
 }
@@ -29,7 +42,15 @@ static Stamp stmp(uint64_t lamport, uint8_t client_first_byte) {
 
 static Map *fresh(void) {
     Arena *arena = arena_create();
-    return map_create(arena);
+    return map_create(arena, default_id());
+}
+
+TEST(map_create_stores_id) {
+    Arena *a = arena_create();
+    ElementId id = eid(7, 42);
+    Map *m = map_create(a, id);
+    ASSERT(elementid_eq(map_id(m), id) == true);
+    arena_destroy(a);
 }
 
 #define ASSERT_SCALAR_EQ(out, expected)                                        \
@@ -231,8 +252,8 @@ TEST(size_recovers_on_resurrect) {
 
 TEST(set_counter_then_get_returns_element_counter) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
-    Counter *c = counter_create(ar);
+    Map *m = map_create(ar, default_id());
+    Counter *c = counter_create(ar, default_id());
     counter_inc(c, cid(1), 5);
     map_set(m, SK("votes"), element_counter(c), stmp(1, 1));
 
@@ -245,8 +266,8 @@ TEST(set_counter_then_get_returns_element_counter) {
 
 TEST(set_register_then_get_returns_element_register) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
-    Register *r = register_create(ar, scalar_int(7), stmp(1, 1));
+    Map *m = map_create(ar, default_id());
+    Register *r = register_create(ar, default_id(), scalar_int(7), stmp(1, 1));
     map_set(m, SK("title"), element_register(r), stmp(1, 1));
 
     Element out;
@@ -258,8 +279,8 @@ TEST(set_register_then_get_returns_element_register) {
 
 TEST(set_nested_map_then_get_returns_element_map) {
     Arena *ar = arena_create();
-    Map *outer = map_create(ar);
-    Map *inner = map_create(ar);
+    Map *outer = map_create(ar, default_id());
+    Map *inner = map_create(ar, default_id());
     map_set(inner, SK("a"), EI(1), stmp(1, 1));
     map_set(outer, SK("child"), element_map(inner), stmp(1, 1));
 
@@ -275,8 +296,8 @@ TEST(set_nested_map_then_get_returns_element_map) {
 // --- merge (two replicas, scalar slots) ---
 
 TEST(merge_disjoint_keys_unions) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
     map_set(a, SK("x"), EI(1), stmp(1, 1));
     map_set(b, SK("y"), EI(2), stmp(1, 2));
 
@@ -290,8 +311,8 @@ TEST(merge_disjoint_keys_unions) {
 }
 
 TEST(merge_same_key_newer_wins) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
     map_set(a, SK("k"), EI(10), stmp(1, 1));
     map_set(b, SK("k"), EI(20), stmp(2, 2));
 
@@ -302,8 +323,8 @@ TEST(merge_same_key_newer_wins) {
 }
 
 TEST(merge_src_older_loses) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
     map_set(a, SK("k"), EI(20), stmp(5, 1));
     map_set(b, SK("k"), EI(10), stmp(2, 2));
 
@@ -314,8 +335,8 @@ TEST(merge_src_older_loses) {
 }
 
 TEST(merge_delete_beats_older_set) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
     map_set(a, SK("k"), EI(10), stmp(1, 1));
     map_delete(b, SK("k"), stmp(5, 1));
 
@@ -325,8 +346,8 @@ TEST(merge_delete_beats_older_set) {
 }
 
 TEST(merge_set_beats_older_delete) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
     map_delete(a, SK("k"), stmp(1, 1));
     map_set(b, SK("k"), EI(42), stmp(5, 1));
 
@@ -337,14 +358,14 @@ TEST(merge_set_beats_older_delete) {
 }
 
 TEST(merge_commutative) {
-    Map *a1 = map_create(arena_create());
-    Map *b1 = map_create(arena_create());
+    Map *a1 = map_create(arena_create(), default_id());
+    Map *b1 = map_create(arena_create(), default_id());
     map_set(a1, SK("k"), EI(10), stmp(5, 1));
     map_set(b1, SK("k"), EI(20), stmp(5, 2));
     map_merge(a1, b1);
 
-    Map *a2 = map_create(arena_create());
-    Map *b2 = map_create(arena_create());
+    Map *a2 = map_create(arena_create(), default_id());
+    Map *b2 = map_create(arena_create(), default_id());
     map_set(a2, SK("k"), EI(10), stmp(5, 1));
     map_set(b2, SK("k"), EI(20), stmp(5, 2));
     map_merge(b2, a2);
@@ -359,8 +380,8 @@ TEST(merge_commutative) {
 }
 
 TEST(merge_idempotent) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
     map_set(a, SK("k"), EI(10), stmp(1, 1));
     map_set(b, SK("k"), EI(20), stmp(2, 1));
 
@@ -377,18 +398,18 @@ TEST(merge_idempotent) {
 }
 
 TEST(merge_associative) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
-    Map *c = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
+    Map *c = map_create(arena_create(), default_id());
     map_set(a, SK("k"), EI(10), stmp(1, 1));
     map_set(b, SK("k"), EI(20), stmp(2, 1));
     map_set(c, SK("k"), EI(30), stmp(3, 1));
     map_merge(a, b);
     map_merge(a, c);
 
-    Map *a2 = map_create(arena_create());
-    Map *b2 = map_create(arena_create());
-    Map *c2 = map_create(arena_create());
+    Map *a2 = map_create(arena_create(), default_id());
+    Map *b2 = map_create(arena_create(), default_id());
+    Map *c2 = map_create(arena_create(), default_id());
     map_set(a2, SK("k"), EI(10), stmp(1, 1));
     map_set(b2, SK("k"), EI(20), stmp(2, 1));
     map_set(c2, SK("k"), EI(30), stmp(3, 1));
@@ -405,8 +426,8 @@ TEST(merge_associative) {
 }
 
 TEST(merge_does_not_mutate_src) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
     map_set(a, SK("k"), EI(99), stmp(10, 1));
     map_set(b, SK("k"), EI(7), stmp(1, 1));
 
@@ -417,8 +438,8 @@ TEST(merge_does_not_mutate_src) {
 }
 
 TEST(merge_copies_string_into_dst_arena) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
 
     uint8_t src_bytes[8];
     memcpy(src_bytes, "hello", 5);
@@ -437,8 +458,8 @@ TEST(merge_copies_string_into_dst_arena) {
 }
 
 TEST(merge_preserves_tombstone_against_older_set) {
-    Map *a = map_create(arena_create());
-    Map *b = map_create(arena_create());
+    Map *a = map_create(arena_create(), default_id());
+    Map *b = map_create(arena_create(), default_id());
     map_delete(a, SK("k"), stmp(5, 1));
     map_set(b, SK("k"), EI(10), stmp(2, 1));
 
@@ -457,13 +478,13 @@ TEST(merge_same_kind_counter_recurses) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
 
-    Map *dst = map_create(ad);
-    Counter *dc = counter_create(ad);
+    Map *dst = map_create(ad, default_id());
+    Counter *dc = counter_create(ad, default_id());
     counter_inc(dc, cid(1), 5);
     map_set(dst, SK("votes"), element_counter(dc), stmp(1, 1));
 
-    Map *src = map_create(as);
-    Counter *sc = counter_create(as);
+    Map *src = map_create(as, default_id());
+    Counter *sc = counter_create(as, default_id());
     counter_inc(sc, cid(2), 3);
     map_set(src, SK("votes"), element_counter(sc), stmp(10, 1));
 
@@ -482,12 +503,14 @@ TEST(merge_same_kind_register_recurses) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
 
-    Map *dst = map_create(ad);
-    Register *dr = register_create(ad, scalar_int(10), stmp(1, 1));
+    Map *dst = map_create(ad, default_id());
+    Register *dr =
+        register_create(ad, default_id(), scalar_int(10), stmp(1, 1));
     map_set(dst, SK("title"), element_register(dr), stmp(1, 1));
 
-    Map *src = map_create(as);
-    Register *sr = register_create(as, scalar_int(20), stmp(5, 1));
+    Map *src = map_create(as, default_id());
+    Register *sr =
+        register_create(as, default_id(), scalar_int(20), stmp(5, 1));
     map_set(src, SK("title"), element_register(sr), stmp(1, 1));
 
     map_merge(dst, src);
@@ -505,13 +528,13 @@ TEST(merge_same_kind_nested_map_recurses) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
 
-    Map *dst = map_create(ad);
-    Map *di = map_create(ad);
+    Map *dst = map_create(ad, default_id());
+    Map *di = map_create(ad, default_id());
     map_set(di, SK("a"), EI(1), stmp(1, 1));
     map_set(dst, SK("child"), element_map(di), stmp(1, 1));
 
-    Map *src = map_create(as);
-    Map *si = map_create(as);
+    Map *src = map_create(as, default_id());
+    Map *si = map_create(as, default_id());
     map_set(si, SK("b"), EI(2), stmp(1, 2));
     map_set(src, SK("child"), element_map(si), stmp(1, 1));
 
@@ -534,13 +557,13 @@ TEST(merge_same_kind_counter_does_not_mutate_src) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
 
-    Map *dst = map_create(ad);
-    Counter *dc = counter_create(ad);
+    Map *dst = map_create(ad, default_id());
+    Counter *dc = counter_create(ad, default_id());
     counter_inc(dc, cid(1), 5);
     map_set(dst, SK("votes"), element_counter(dc), stmp(1, 1));
 
-    Map *src = map_create(as);
-    Counter *sc = counter_create(as);
+    Map *src = map_create(as, default_id());
+    Counter *sc = counter_create(as, default_id());
     counter_inc(sc, cid(2), 3);
     map_set(src, SK("votes"), element_counter(sc), stmp(1, 1));
 
@@ -559,13 +582,13 @@ TEST(merge_same_kind_counter_advances_slot_stamp) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
 
-    Map *dst = map_create(ad);
-    Counter *dc = counter_create(ad);
+    Map *dst = map_create(ad, default_id());
+    Counter *dc = counter_create(ad, default_id());
     counter_inc(dc, cid(1), 5);
     map_set(dst, SK("votes"), element_counter(dc), stmp(1, 1));
 
-    Map *src = map_create(as);
-    Counter *sc = counter_create(as);
+    Map *src = map_create(as, default_id());
+    Counter *sc = counter_create(as, default_id());
     counter_inc(sc, cid(2), 3);
     map_set(src, SK("votes"), element_counter(sc), stmp(10, 1));
 
@@ -592,10 +615,10 @@ TEST(merge_same_kind_counter_advances_slot_stamp) {
 
 TEST(set_composite_displaces_scalar_at_lww) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
+    Map *m = map_create(ar, default_id());
 
     map_set(m, SK("score"), EI(42), stmp(1, 1)); // scalar first
-    Counter *c = counter_create(ar);
+    Counter *c = counter_create(ar, default_id());
     map_set(m, SK("score"), element_counter(c), stmp(5, 1)); // newer composite
 
     Element out;
@@ -607,9 +630,9 @@ TEST(set_composite_displaces_scalar_at_lww) {
 
 TEST(set_scalar_displaces_composite_at_lww) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
+    Map *m = map_create(ar, default_id());
 
-    Counter *c = counter_create(ar);
+    Counter *c = counter_create(ar, default_id());
     map_set(m, SK("score"), element_counter(c), stmp(1, 1));
     map_set(m, SK("score"), EI(42), stmp(5, 1));
 
@@ -621,11 +644,11 @@ TEST(set_scalar_displaces_composite_at_lww) {
 
 TEST(set_different_kind_composite_displaces_at_lww) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
+    Map *m = map_create(ar, default_id());
 
-    Counter *c = counter_create(ar);
+    Counter *c = counter_create(ar, default_id());
     map_set(m, SK("score"), element_counter(c), stmp(1, 1));
-    Register *r = register_create(ar, scalar_int(42), stmp(5, 1));
+    Register *r = register_create(ar, default_id(), scalar_int(42), stmp(5, 1));
     map_set(m, SK("score"), element_register(r), stmp(5, 1));
 
     Element out;
@@ -640,9 +663,9 @@ TEST(set_different_kind_composite_displaces_at_lww) {
 TEST(merge_composite_src_wins_into_empty_slot_clones) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
-    Map *dst = map_create(ad);
-    Map *src = map_create(as);
-    Counter *sc = counter_create(as);
+    Map *dst = map_create(ad, default_id());
+    Map *src = map_create(as, default_id());
+    Counter *sc = counter_create(as, default_id());
     counter_inc(sc, cid(1), 5);
     map_set(src, SK("votes"), element_counter(sc), stmp(5, 1));
 
@@ -667,14 +690,14 @@ TEST(merge_composite_src_wins_into_empty_slot_clones) {
 TEST(merge_does_not_clone_when_src_loses_lww) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
-    Map *dst = map_create(ad);
-    Map *src = map_create(as);
+    Map *dst = map_create(ad, default_id());
+    Map *src = map_create(as, default_id());
 
     // dst has newer scalar at "k".
     map_set(dst, SK("k"), EI(42), stmp(10, 1));
 
     // src has big nested Counter at "k" with OLDER stamp — must lose LWW.
-    Counter *sc = counter_create(as);
+    Counter *sc = counter_create(as, default_id());
     for (int i = 0; i < 50; i++) {
         counter_inc(sc, cid((uint8_t)(i + 1)), 1);
     }
@@ -701,13 +724,14 @@ TEST(merge_kind_mismatch_clones_winner_into_dst) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
 
-    Map *dst = map_create(ad);
-    Counter *dc = counter_create(ad);
+    Map *dst = map_create(ad, default_id());
+    Counter *dc = counter_create(ad, default_id());
     counter_inc(dc, cid(1), 5);
     map_set(dst, SK("x"), element_counter(dc), stmp(1, 1));
 
-    Map *src = map_create(as);
-    Register *sr = register_create(as, scalar_int(42), stmp(10, 1));
+    Map *src = map_create(as, default_id());
+    Register *sr =
+        register_create(as, default_id(), scalar_int(42), stmp(10, 1));
     map_set(src, SK("x"), element_register(sr), stmp(10, 1));
 
     map_merge(dst, src);
@@ -717,6 +741,48 @@ TEST(merge_kind_mismatch_clones_winner_into_dst) {
     ASSERT_EQ(element_kind(out), ELEMENT_REGISTER);
     ASSERT(out.as.reg != sr); // clone, not src's pointer
     ASSERT(scalar_eq(register_read(out.as.reg), scalar_int(42)));
+    arena_destroy(ad);
+    arena_destroy(as);
+}
+
+// Two replicas hold a Counter of the same kind at the same slot but with
+// DIFFERENT ids. They are two distinct logical elements that happen to
+// share a key — typically because the app bypassed the helper and used
+// raw counter_create with hand-picked ids. map_merge must NOT recurse
+// (which would silently union their tallies); it must take the LWW path
+// and orphan one side.
+TEST(merge_same_kind_different_id_uses_lww_not_recurse) {
+    Arena *ad = arena_create();
+    Arena *as = arena_create();
+    Map *dst = map_create(ad, default_id());
+    Map *src = map_create(as, default_id());
+
+    // dst: distinct id, 5 increments under cid 1, older slot stamp.
+    Counter *dc = counter_create(ad, eid(7, 1));
+    counter_inc(dc, cid(1), 5);
+    map_set(dst, SK("votes"), element_counter(dc), stmp(1, 1));
+
+    // src: DIFFERENT id, 3 increments under cid 2, newer slot stamp.
+    Counter *sc = counter_create(as, eid(7, 2));
+    counter_inc(sc, cid(2), 3);
+    map_set(src, SK("votes"), element_counter(sc), stmp(5, 1));
+
+    map_merge(dst, src);
+
+    Element out;
+    ASSERT(map_get(dst, SK("votes"), &out) == true);
+    ASSERT_EQ(element_kind(out), ELEMENT_COUNTER);
+
+    // LWW (src wins on stamp 5 > 1) → dst holds a CLONE of src's Counter,
+    // not the unioned recursive-merge result. Recursive would read 8.
+    ASSERT_EQ(counter_read(out.as.counter), 3);
+
+    // Clone's id is src's id, not dst's old id (dst's Counter is orphaned).
+    ASSERT(elementid_eq(counter_id(out.as.counter), eid(7, 2)) == true);
+
+    // dst owns the clone in its arena — not src's pointer.
+    ASSERT(out.as.counter != sc);
+
     arena_destroy(ad);
     arena_destroy(as);
 }
@@ -731,7 +797,7 @@ TEST(merge_kind_mismatch_clones_winner_into_dst) {
 
 TEST(map_counter_creates_and_installs_at_key) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
+    Map *m = map_create(ar, default_id());
 
     Counter *c = map_counter(m, SK("votes"), stmp(1, 1));
     ASSERT(c != NULL);
@@ -745,7 +811,7 @@ TEST(map_counter_creates_and_installs_at_key) {
 
 TEST(map_counter_returns_same_pointer_on_repeat) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
+    Map *m = map_create(ar, default_id());
 
     Counter *first = map_counter(m, SK("votes"), stmp(1, 1));
     Counter *second = map_counter(m, SK("votes"), stmp(2, 1));
@@ -755,7 +821,7 @@ TEST(map_counter_returns_same_pointer_on_repeat) {
 
 TEST(map_register_creates_and_installs_at_key) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
+    Map *m = map_create(ar, default_id());
 
     Register *r = map_register(m, SK("title"), scalar_int(42), stmp(1, 1));
     ASSERT(r != NULL);
@@ -770,7 +836,7 @@ TEST(map_register_creates_and_installs_at_key) {
 
 TEST(map_register_returns_same_pointer_on_repeat) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
+    Map *m = map_create(ar, default_id());
 
     Register *first = map_register(m, SK("title"), scalar_int(1), stmp(1, 1));
     // Second call's seed value is ignored — slot already exists.
@@ -783,7 +849,7 @@ TEST(map_register_returns_same_pointer_on_repeat) {
 
 TEST(map_map_creates_and_installs_at_key) {
     Arena *ar = arena_create();
-    Map *outer = map_create(ar);
+    Map *outer = map_create(ar, default_id());
 
     Map *child = map_map(outer, SK("child"), stmp(1, 1));
     ASSERT(child != NULL);
@@ -797,7 +863,7 @@ TEST(map_map_creates_and_installs_at_key) {
 
 TEST(map_map_returns_same_pointer_on_repeat) {
     Arena *ar = arena_create();
-    Map *outer = map_create(ar);
+    Map *outer = map_create(ar, default_id());
 
     Map *first = map_map(outer, SK("child"), stmp(1, 1));
     Map *second = map_map(outer, SK("child"), stmp(2, 1));
@@ -809,7 +875,7 @@ TEST(map_map_returns_same_pointer_on_repeat) {
 // the kind via LWW and return a fresh composite.
 TEST(map_register_after_map_counter_flips_kind_via_lww) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
+    Map *m = map_create(ar, default_id());
 
     Counter *c = map_counter(m, SK("score"), stmp(1, 1));
     ASSERT(c != NULL);
@@ -834,7 +900,7 @@ TEST(map_register_after_map_counter_flips_kind_via_lww) {
 // just isn't reachable from the slot.
 TEST(map_helper_losing_stamp_returns_detached_and_keeps_slot) {
     Arena *ar = arena_create();
-    Map *m = map_create(ar);
+    Map *m = map_create(ar, default_id());
 
     Counter *c = map_counter(m, SK("score"), stmp(10, 1));
     ASSERT(c != NULL);
@@ -857,8 +923,8 @@ TEST(map_helper_losing_stamp_returns_detached_and_keeps_slot) {
 TEST(map_counter_cross_replica_merge_recurses) {
     Arena *ad = arena_create();
     Arena *as = arena_create();
-    Map *dst = map_create(ad);
-    Map *src = map_create(as);
+    Map *dst = map_create(ad, default_id());
+    Map *src = map_create(as, default_id());
 
     Counter *dc = map_counter(dst, SK("votes"), stmp(1, 1));
     Counter *sc = map_counter(src, SK("votes"), stmp(1, 2));
@@ -875,12 +941,88 @@ TEST(map_counter_cross_replica_merge_recurses) {
     arena_destroy(as);
 }
 
+// --- helper id derivation ---
+//
+// Helpers must derive ids deterministically from (parent_id, key, kind)
+// so two replicas independently calling the same helper land on the same
+// id. The composite's id_field is the only authoritative source of truth
+// for "are these the same logical thing?"
+
+TEST(map_counter_derives_id_from_parent_key_kind) {
+    Arena *ar = arena_create();
+    ElementId parent_id = eid(7, 42);
+    Map *m = map_create(ar, parent_id);
+
+    Counter *c = map_counter(m, SK("votes"), stmp(1, 1));
+    ElementId expected =
+        elementid_derive(parent_id, SK("votes"), (uint8_t)ELEMENT_COUNTER);
+    ASSERT(elementid_eq(counter_id(c), expected) == true);
+    arena_destroy(ar);
+}
+
+TEST(map_register_derives_id_from_parent_key_kind) {
+    Arena *ar = arena_create();
+    ElementId parent_id = eid(7, 42);
+    Map *m = map_create(ar, parent_id);
+
+    Register *r = map_register(m, SK("title"), scalar_int(0), stmp(1, 1));
+    ElementId expected =
+        elementid_derive(parent_id, SK("title"), (uint8_t)ELEMENT_REGISTER);
+    ASSERT(elementid_eq(register_id(r), expected) == true);
+    arena_destroy(ar);
+}
+
+TEST(map_map_derives_id_from_parent_key_kind) {
+    Arena *ar = arena_create();
+    ElementId parent_id = eid(7, 42);
+    Map *m = map_create(ar, parent_id);
+
+    Map *child = map_map(m, SK("child"), stmp(1, 1));
+    ElementId expected =
+        elementid_derive(parent_id, SK("child"), (uint8_t)ELEMENT_MAP);
+    ASSERT(elementid_eq(map_id(child), expected) == true);
+    arena_destroy(ar);
+}
+
+// Two replicas with the same parent_id calling the same helper at the
+// same key land on identical ids — the convergent-creation guarantee.
+TEST(helpers_converge_across_replicas) {
+    Arena *aa = arena_create();
+    Arena *ab = arena_create();
+    ElementId shared_parent = eid(7, 42);
+    Map *map_a = map_create(aa, shared_parent);
+    Map *map_b = map_create(ab, shared_parent);
+
+    Counter *ca = map_counter(map_a, SK("votes"), stmp(1, 1));
+    Counter *cb = map_counter(map_b, SK("votes"), stmp(1, 2));
+
+    ASSERT(elementid_eq(counter_id(ca), counter_id(cb)) == true);
+    arena_destroy(aa);
+    arena_destroy(ab);
+}
+
+// Different kinds at the same key derive DIFFERENT ids — that's how
+// recursive merge distinguishes Counter@"x" from Register@"x" as
+// independent logical elements.
+TEST(helpers_at_same_key_different_kind_have_distinct_ids) {
+    Arena *ar = arena_create();
+    Map *m = map_create(ar, eid(7, 42));
+
+    Counter *c = map_counter(m, SK("x"), stmp(1, 1));
+    // Counter is installed in slot. map_register loses the LWW slot here
+    // (same stamp), so returns a DETACHED Register. Its id should still
+    // be derived from (parent_id, "x", REGISTER), distinct from c's id.
+    Register *r = map_register(m, SK("x"), scalar_int(0), stmp(1, 1));
+    ASSERT(elementid_eq(counter_id(c), register_id(r)) == false);
+    arena_destroy(ar);
+}
+
 // --- map_clone: deep recursive copy into a target arena ---
 
 TEST(clone_empty_map_is_empty) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Map *src = map_create(as);
+    Map *src = map_create(as, default_id());
     Map *clone = map_clone(ad, src);
     ASSERT(clone != NULL);
     ASSERT(clone != src);
@@ -892,7 +1034,7 @@ TEST(clone_empty_map_is_empty) {
 TEST(clone_preserves_scalar_slots) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Map *src = map_create(as);
+    Map *src = map_create(as, default_id());
     map_set(src, SK("a"), EI(1), stmp(1, 1));
     map_set(src, SK("b"), ES("hi", 2), stmp(1, 1));
     Map *clone = map_clone(ad, src);
@@ -911,7 +1053,7 @@ TEST(clone_preserves_scalar_slots) {
 TEST(clone_survives_src_arena_destroy) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Map *src = map_create(as);
+    Map *src = map_create(as, default_id());
     map_set(src, SK("k"), ES("hello", 5), stmp(1, 1));
     Map *clone = map_clone(ad, src);
     arena_destroy(as);
@@ -926,8 +1068,8 @@ TEST(clone_survives_src_arena_destroy) {
 TEST(clone_recurses_into_composite_slots) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Map *src = map_create(as);
-    Counter *sc = counter_create(as);
+    Map *src = map_create(as, default_id());
+    Counter *sc = counter_create(as, default_id());
     counter_inc(sc, cid(1), 5);
     map_set(src, SK("votes"), element_counter(sc), stmp(1, 1));
 
@@ -950,7 +1092,7 @@ TEST(clone_recurses_into_composite_slots) {
 TEST(clone_preserves_tombstones) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Map *src = map_create(as);
+    Map *src = map_create(as, default_id());
     map_set(src, SK("k"), EI(1), stmp(1, 1));
     map_delete(src, SK("k"), stmp(5, 1));
 
@@ -968,7 +1110,7 @@ TEST(clone_preserves_tombstones) {
 TEST(clone_independent_of_src) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Map *src = map_create(as);
+    Map *src = map_create(as, default_id());
     map_set(src, SK("k"), EI(1), stmp(1, 1));
     Map *clone = map_clone(ad, src);
     map_set(src, SK("k"), EI(99), stmp(5, 1));
@@ -992,10 +1134,10 @@ TEST(clone_independent_of_src) {
 TEST(clone_tombstone_does_not_recurse_into_stale_value) {
     Arena *as = arena_create();
     Arena *ad = arena_create();
-    Map *src = map_create(as);
+    Map *src = map_create(as, default_id());
 
     // Big inner map under the to-be-tombstoned key.
-    Map *inner = map_create(as);
+    Map *inner = map_create(as, default_id());
     for (int i = 0; i < 50; i++) {
         char k[16];
         int n = snprintf(k, sizeof k, "k%d", i);
@@ -1026,6 +1168,7 @@ TEST(clone_tombstone_does_not_recurse_into_stale_value) {
 }
 
 int main(void) {
+    RUN(map_create_stores_id);
     RUN(empty_get_returns_false);
     RUN(set_then_get);
     RUN(set_overwrites_with_newer_stamp);
@@ -1079,6 +1222,7 @@ int main(void) {
     RUN(merge_composite_src_wins_into_empty_slot_clones);
     RUN(merge_does_not_clone_when_src_loses_lww);
     RUN(merge_kind_mismatch_clones_winner_into_dst);
+    RUN(merge_same_kind_different_id_uses_lww_not_recurse);
 
     RUN(map_counter_creates_and_installs_at_key);
     RUN(map_counter_returns_same_pointer_on_repeat);
@@ -1089,6 +1233,12 @@ int main(void) {
     RUN(map_register_after_map_counter_flips_kind_via_lww);
     RUN(map_helper_losing_stamp_returns_detached_and_keeps_slot);
     RUN(map_counter_cross_replica_merge_recurses);
+
+    RUN(map_counter_derives_id_from_parent_key_kind);
+    RUN(map_register_derives_id_from_parent_key_kind);
+    RUN(map_map_derives_id_from_parent_key_kind);
+    RUN(helpers_converge_across_replicas);
+    RUN(helpers_at_same_key_different_kind_have_distinct_ids);
 
     RUN(clone_empty_map_is_empty);
     RUN(clone_preserves_scalar_slots);

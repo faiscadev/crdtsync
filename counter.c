@@ -4,25 +4,26 @@
 #include "host.h"
 
 struct Counter {
+    ElementId id;
     Arena *arena;
-    HashTable *entries; // client_id (uint32_t) -> CounterEntry
+    HashTable *entries; // ClientId -> CounterEntry
 };
 
 static inline uint32_t max_u32(uint32_t a, uint32_t b) {
     if (a > b) {
         return a;
     }
-
     return b;
 }
 
-Counter *counter_create(Arena *arena) {
+Counter *counter_create(Arena *arena, ElementId id) {
     Counter *counter = arena_alloc(arena, sizeof(Counter));
     if (!counter) {
         host_abortf(
             "counter_create: arena OOM (requested %zu bytes for Counter)",
             sizeof(Counter));
     }
+    counter->id = id;
     counter->arena = arena;
     counter->entries = hashtable_create(arena);
     if (!counter->entries) {
@@ -31,6 +32,8 @@ Counter *counter_create(Arena *arena) {
     }
     return counter;
 }
+
+ElementId counter_id(const Counter *counter) { return counter->id; }
 
 // Get-or-create the per-client CounterEntry for `client_id`. Initializes a
 // fresh entry to {inc=0, dec=0} on first call for a given client.
@@ -110,7 +113,7 @@ void counter_dec(Counter *counter, ClientId client_id, uint32_t amount) {
 }
 
 Counter *counter_clone(Arena *arena, const Counter *counter) {
-    Counter *clone = counter_create(arena);
+    Counter *clone = counter_create(arena, counter->id);
     HashTableIter it = hashtable_iter(counter->entries);
     const void *key;
     size_t key_len;

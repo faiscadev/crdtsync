@@ -3,26 +3,30 @@
 #include "host.h"
 #include "scalar.h"
 #include <stdbool.h>
-#include <string.h>
 
 struct Register {
+    ElementId id;
     Arena *arena;
     Scalar value;
     Stamp stamp;
 };
 
-Register *register_create(Arena *arena, Scalar value, Stamp stamp) {
+Register *register_create(Arena *arena, ElementId id, Scalar value,
+                          Stamp stamp) {
     Register *reg = arena_alloc(arena, sizeof(Register));
     if (!reg) {
         host_abortf(
             "register_create: arena OOM (requested %zu bytes for Register)",
             sizeof(Register));
     }
+    reg->id = id;
     reg->arena = arena;
     reg->value = scalar_clone(arena, value);
     reg->stamp = stamp;
     return reg;
 }
+
+ElementId register_id(const Register *reg) { return reg->id; }
 
 Scalar register_read(const Register *reg) { return reg->value; }
 
@@ -47,6 +51,7 @@ Register *register_clone(Arena *arena, const Register *reg) {
             "register_clone: arena OOM (requested %zu bytes for Register)",
             sizeof(Register));
     }
+    clone->id = reg->id;
     clone->arena = arena;
     clone->value = scalar_clone(arena, reg->value);
     clone->stamp = reg->stamp;

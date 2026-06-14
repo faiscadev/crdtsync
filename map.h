@@ -2,9 +2,11 @@
 #define _CRDT_MAP_H
 
 // LWW Map with tombstones, keyed on raw bytes (binary-safe), Element-valued.
-// Identity for a composite slot is positional: "the Counter / Register /
-// nested Map at this key in this Map." The composites themselves hold no
-// identifier; map_merge uses (key, kind) to decide whether to recurse.
+// Identity: the Map itself is stamped with an ElementId at create, exposed
+// via map_id. Each composite slot value (Counter / Register / nested Map)
+// carries its own ElementId; helpers derive child ids convergently via
+// elementid_derive(parent.id, key, kind). map_merge's recursive guard
+// uses (kind, id) to know two slots refer to the same logical element.
 //
 // Semantics:
 //   - Each slot carries a Stamp. set / delete take effect iff the new stamp
@@ -16,12 +18,16 @@
 //     same delete decision.
 //
 // Merge (per src slot):
-//   - Both alive AND same composite kind (REGISTER / COUNTER / MAP) →
-//     element_merge(dst, src) recurses in place. Slot stamp advances to
-//     max(dst, src) so future slot-level ops stay LWW-deterministic.
-//   - Otherwise → LWW on slot stamp. Scalar winners are scalar_clone'd into
-//     dst's arena. Composite winners are deep-cloned via element_clone into
-//     dst's arena, so dst owns its slot fully and survives src arena
+//   - Both alive AND same composite kind AND matching ids → element_merge
+//     recurses in place. Slot stamp advances to max(dst, src) so future
+//     slot-level ops stay LWW-deterministic.
+//   - Both alive AND same composite kind BUT mismatched ids → distinct
+//     logical elements that happen to share the slot. LWW on slot stamp;
+//     if src wins, dst's composite is replaced with a deep clone of src's
+//     into dst's arena. Loser is orphaned.
+//   - Otherwise → LWW on slot stamp. Scalar winners are scalar_clone'd
+//     into dst's arena. Composite winners are deep-cloned via element_clone
+//     into dst's arena, so dst owns its slot fully and survives src arena
 //     destroy.
 //
 // Ownership:
@@ -47,7 +53,9 @@
 
 typedef struct Map Map;
 
-Map *map_create(Arena *arena);
+Map *map_create(Arena *arena, ElementId id);
+
+ElementId map_id(const Map *map);
 
 // Returns true if the key has a live (non-tombstone) entry, in which case
 // *out is set. Returns false otherwise; *out is untouched.

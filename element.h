@@ -46,6 +46,7 @@ typedef struct Element {
     } as;
 } Element;
 
+ElementId element_id(Element e);
 Element element_scalar(Scalar s);
 Element element_register(Register *r);
 Element element_counter(Counter *c);
