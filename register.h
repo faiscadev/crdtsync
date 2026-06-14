@@ -5,7 +5,7 @@
 // (lamport, client_id) stamp. Identity: each Register is stamped with an
 // ElementId at create, exposed via register_id. Two replicas independently
 // creating "the same Register at the same slot" derive identical ids via
-// elementid_derive(parent.id, key, ELEMENT_REGISTER), which is what
+// elementid_derive(parent.id, key, key_len, ELEMENT_REGISTER), which is what
 // map_merge's recursive guard uses to know they refer to the same logical
 // element.
 //

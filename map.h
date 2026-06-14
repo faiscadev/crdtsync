@@ -5,7 +5,7 @@
 // Identity: the Map itself is stamped with an ElementId at create, exposed
 // via map_id. Each composite slot value (Counter / Register / nested Map)
 // carries its own ElementId; helpers derive child ids convergently via
-// elementid_derive(parent.id, key, kind). map_merge's recursive guard
+// elementid_derive(parent.id, key, key_len, kind). map_merge's recursive guard
 // uses (kind, id) to know two slots refer to the same logical element.
 //
 // Semantics:

@@ -59,8 +59,11 @@ UuidV5 uuid_v5_final(UuidV5Ctx *ctx);
 // Used by both v5 and v7 generators. Exposed publicly so app or test
 // fixtures can construct UUIDs manually with the correct format bits.
 
-// Mask byte 6's version nibble to `version` (1..7) and force the
-// RFC 4122 variant (10xx in high two bits of byte 8). Mutates in place.
+// Mask byte 6's version nibble to the low 4 bits of `version` (the high
+// 4 bits are ignored; no range validation), and force the RFC 4122
+// variant (10xx in high two bits of byte 8). Mutates in place. Callers
+// are responsible for passing a UUID version value (1..7 per RFC 4122 +
+// RFC 9562); the helper does not enforce that.
 void uuid_set_version_and_variant(uint8_t bytes[16], uint8_t version);
 
 #endif // _CRDT_UUID_H
