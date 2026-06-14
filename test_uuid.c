@@ -67,6 +67,21 @@ TEST(parse_rejects_non_hex) {
     ASSERT(uuid_parse("0123456g-89ab-cdef-fedc-ba9876543210", out) == false);
 }
 
+// uuid_parse contract: on failure, `out` is untouched. Probe a partial-
+// parse failure (valid bytes for a while, then invalid hex deep in the
+// string) and verify the entire `out` buffer kept its original sentinel
+// bytes — not a partial mix of newly-parsed bytes and untouched bytes.
+TEST(parse_failure_leaves_out_untouched) {
+    uint8_t out[16];
+    memset(out, 0xAA, sizeof out);
+    // Valid first three groups, invalid hex 'z' inside the fourth group.
+    // A naive impl would write bytes 0..7 before bailing.
+    ASSERT(uuid_parse("01234567-89ab-cdef-fezc-ba9876543210", out) == false);
+    for (int i = 0; i < 16; i++) {
+        ASSERT_EQ(out[i], 0xAA);
+    }
+}
+
 // --- v5 derivation ---
 
 TEST(v5_deterministic) {
@@ -171,6 +186,7 @@ int main(void) {
     RUN(parse_rejects_short);
     RUN(parse_rejects_missing_hyphen);
     RUN(parse_rejects_non_hex);
+    RUN(parse_failure_leaves_out_untouched);
 
     RUN(v5_deterministic);
     RUN(v5_sets_version_5);
