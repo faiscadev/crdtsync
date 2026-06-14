@@ -18,6 +18,9 @@
 // for cases where the app provides its own convergence guarantee.
 
 #include "uuid.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 typedef struct ElementId {
     UuidV5 uuid;
