@@ -32,12 +32,24 @@ A million repetitions of "a"
     (block->l[i] = (rol(block->l[i], 24) & 0xFF00FF00) |                       \
                    (rol(block->l[i], 8) & 0x00FF00FF))
 #define blk0_be(i) block->l[i]
-#if BYTE_ORDER == LITTLE_ENDIAN
+/* Endianness selection. The original Reid code keyed on `#if BYTE_ORDER ==
+ * LITTLE_ENDIAN`, which is fragile: undefined macros become 0 in
+ * preprocessor expressions, so a system that defines neither BYTE_ORDER
+ * nor LITTLE_ENDIAN gets `0 == 0` → true → little-endian forced even on
+ * big-endian hardware. Guard with explicit `defined()` checks and let the
+ * runtime fallback handle the unknown case. Define SHA1_USE_RUNTIME_ENDIAN
+ * at build time to force the runtime path even on systems where the
+ * compile-time macros are present — used by the runtime-endian test
+ * target. */
+#if !defined(SHA1_USE_RUNTIME_ENDIAN) && defined(BYTE_ORDER) &&                \
+    defined(LITTLE_ENDIAN) && BYTE_ORDER == LITTLE_ENDIAN
 #define blk0(i) blk0_le(i)
-#elif BYTE_ORDER == BIG_ENDIAN
+#elif !defined(SHA1_USE_RUNTIME_ENDIAN) && defined(BYTE_ORDER) &&              \
+    defined(BIG_ENDIAN) && BYTE_ORDER == BIG_ENDIAN
 #define blk0(i) blk0_be(i)
 #else
-/* Fall back to a runtime endian check */
+/* Runtime endian check. The union puts a 1 in the low byte on
+ * little-endian (c == 1) or the high byte on big-endian (c == 0). */
 const union {
     long l;
     char c;

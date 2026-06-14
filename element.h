@@ -22,6 +22,7 @@
 // putting them in the same arena as the containing Map).
 
 #include "counter.h"
+#include "elementid.h"
 #include "register.h"
 #include "scalar.h"
 

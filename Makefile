@@ -71,6 +71,15 @@ test-sha1: sha1.c test_sha1.c test_util.h
 	$(CC) $(CFLAGS) -o test_sha1 sha1.c test_sha1.c
 	./test_sha1
 
+# Exercises sha1.c's runtime endian-detection fallback by forcing the
+# SHA1_USE_RUNTIME_ENDIAN path at compile time. Independent of whether the
+# host's system headers happen to predefine BYTE_ORDER. Must produce
+# byte-identical digests to the default build.
+.PHONY: test-sha1-runtime-endian
+test-sha1-runtime-endian: sha1.c test_sha1.c test_util.h
+	$(CC) $(CFLAGS) -DSHA1_USE_RUNTIME_ENDIAN -o test_sha1_runtime_endian sha1.c test_sha1.c
+	./test_sha1_runtime_endian
+
 .PHONY: test-uuid
 test-uuid: uuid.c sha1.c test_uuid.c test_util.h
 	$(CC) $(CFLAGS) -o test_uuid uuid.c sha1.c test_uuid.c
@@ -87,4 +96,4 @@ test-stamp: string.c clientid.c host_posix.c stamp.c test_stamp.c test_util.h
 	./test_stamp
 
 .PHONY: test
-test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-sha1 test-uuid test-elementid test-element
+test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-sha1 test-sha1-runtime-endian test-uuid test-elementid test-element
