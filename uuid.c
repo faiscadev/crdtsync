@@ -37,6 +37,9 @@ bool uuid_parse(const char *s, uint8_t out[16]) {
         return false;
     }
 
+    // Parse into a local buffer first so a partial-parse failure leaves
+    // the caller's `out` untouched (header contract).
+    uint8_t buf[16];
     for (int i = 0; i < 16; i++) {
         int hi = hex_digit_to_int(
             s[i * 2 + (i >= 4) + (i >= 6) + (i >= 8) + (i >= 10)]);
@@ -45,8 +48,9 @@ bool uuid_parse(const char *s, uint8_t out[16]) {
         if (hi < 0 || lo < 0) {
             return false; // Invalid hex digit
         }
-        out[i] = (hi << 4) | lo;
+        buf[i] = (hi << 4) | lo;
     }
+    memcpy(out, buf, 16);
     return true;
 }
 
@@ -56,6 +60,12 @@ void uuid_v5_init(UuidV5Ctx *ctx, const uint8_t namespace_bytes[16]) {
     SHA1Update(&ctx->sha1_ctx, namespace_bytes, 16);
 }
 
+// Caveat: `len` is a size_t but SHA1Update takes uint32_t — single calls
+// with len > UINT32_MAX (~4 GiB) silently truncate. Not an issue for our
+// only caller (elementid_derive) where the name portion is parent.bytes
+// (16) + key bytes (typically tens to low thousands) + kind tag (1). If
+// you ever feed >4 GiB chunks through this, chunk the update at the call
+// site or fix this with a UINT32_MAX-sized loop.
 void uuid_v5_update(UuidV5Ctx *ctx, const uint8_t *data, size_t len) {
     SHA1Update(&ctx->sha1_ctx, data, len);
 }
