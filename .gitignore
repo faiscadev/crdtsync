@@ -25,6 +25,7 @@ a.out
 /test_stamp
 /test_map
 /test_sha1
+/test_sha1_runtime_endian
 /test_uuid
 /test_elementid
 /test_element

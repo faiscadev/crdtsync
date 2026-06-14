@@ -46,6 +46,7 @@
 
 #include "arena.h"
 #include "element.h"
+#include "elementid.h"
 #include "scalar.h"
 #include "stamp.h"
 #include <stdbool.h>
