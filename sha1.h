@@ -1,5 +1,5 @@
-#ifndef SHA1_H
-#define SHA1_H
+#ifndef _CRDT_SHA1_H
+#define _CRDT_SHA1_H
 
 /*
    SHA-1 in C
@@ -33,4 +33,4 @@ void SHA1(char *hash_out, const char *str, uint32_t len);
 }
 #endif
 
-#endif /* SHA1_H */
+#endif /* _CRDT_SHA1_H */
