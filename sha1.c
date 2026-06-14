@@ -49,8 +49,11 @@ A million repetitions of "a"
 #define blk0(i) blk0_be(i)
 #else
 /* Runtime endian check. The union puts a 1 in the low byte on
- * little-endian (c == 1) or the high byte on big-endian (c == 0). */
-const union {
+ * little-endian (c == 1) or the high byte on big-endian (c == 0).
+ * `static` keeps the symbol TU-local so embedding sha1.c into a larger
+ * project doesn't collide with another `sha1_endian` (or pollute the
+ * global namespace). */
+static const union {
     long l;
     char c;
 } sha1_endian = {1};
