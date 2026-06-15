@@ -60,11 +60,20 @@ bool scalar_eq(Scalar a, Scalar b) {
 Scalar scalar_clone(Arena *arena, Scalar value) {
     switch (value.kind) {
     case SCALAR_STRING: {
-        uint8_t *bytes_copy = arena_alloc(arena, value.as.s.len);
+        // Empty string: no bytes to copy. Pass the value through unchanged.
+        // Avoids portability fragility around malloc(0) / arena_alloc(0)
+        // (implementation-defined return) and the matching free-leak that
+        // scalar_free would otherwise miss.
+        if (value.as.s.len == 0) {
+            return value;
+        }
+        uint8_t *bytes_copy = arena == NULL
+                                  ? host_malloc(value.as.s.len)
+                                  : arena_alloc(arena, value.as.s.len);
         if (!bytes_copy) {
-            host_abortf("scalar_clone: arena OOM (requested %zu bytes for "
+            host_abortf("scalar_clone: %s OOM (requested %zu bytes for "
                         "string value)",
-                        value.as.s.len);
+                        arena ? "arena" : "host_malloc", value.as.s.len);
         }
         memcpy(bytes_copy, value.as.s.bytes, value.as.s.len);
         Scalar copy = {0};
@@ -78,5 +87,11 @@ Scalar scalar_clone(Arena *arena, Scalar value) {
     case SCALAR_NULL:
         // No heap data to clone, just copy the struct.
         return value;
+    }
+}
+
+void scalar_free(Scalar value) {
+    if (value.kind == SCALAR_STRING && value.as.s.len > 0) {
+        host_free((void *)value.as.s.bytes);
     }
 }

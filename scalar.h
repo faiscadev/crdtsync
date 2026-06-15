@@ -51,6 +51,21 @@ Scalar scalar_string(const uint8_t *bytes, size_t len);
 
 bool scalar_eq(Scalar a, Scalar b);
 
+// Clone a Scalar into owned storage. Two modes:
+//   1. `scalar_clone(arena, value)` — string bytes (if any) allocated in
+//      the supplied Arena. Bulk lifetime: arena_destroy frees them. Do
+//      NOT call scalar_free on the result.
+//   2. `scalar_clone(NULL, value)` — string bytes (if any) allocated via
+//      host_malloc. Caller MUST release with scalar_free when done.
+//
+// For non-string kinds (NULL / BOOL / INT) cloning is a value-copy
+// regardless of mode — nothing to allocate.
 Scalar scalar_clone(Arena *arena, Scalar value);
+
+// Release a host_malloc-backed Scalar's string bytes. No-op for non-string
+// kinds and for empty strings (no allocation to release). MUST only be
+// called on Scalars produced by `scalar_clone(NULL, ...)`. Calling on an
+// arena-backed Scalar is undefined.
+void scalar_free(Scalar value);
 
 #endif // _CRDT_SCALAR_H
