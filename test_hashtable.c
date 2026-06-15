@@ -349,6 +349,91 @@ TEST(clear_empties_table) {
     ASSERT(out == &vc);
 }
 
+// --- host_malloc-backed mode (NULL arena) ---
+//
+// All existing semantics must hold when the table is allocated via
+// host_malloc instead of an arena. The caller releases via
+// hashtable_destroy. Probes a handful of representative operations rather
+// than mirroring every test above — semantics should be identical.
+
+TEST(host_malloc_create_and_destroy_empty) {
+    HashTable *t = hashtable_create(NULL);
+    ASSERT(t != NULL);
+    void *out;
+    ASSERT(hashtable_get(t, SK("missing"), &out) == false);
+    hashtable_destroy(t);
+}
+
+TEST(host_malloc_insert_then_get) {
+    HashTable *t = hashtable_create(NULL);
+    int v = 42;
+    ASSERT_EQ(hashtable_insert(t, SK("k"), &v), HASHTABLE_OK);
+    void *out;
+    ASSERT(hashtable_get(t, SK("k"), &out) == true);
+    ASSERT(out == &v);
+    hashtable_destroy(t);
+}
+
+// Key bytes must be copied in host_malloc mode too — mutating the caller's
+// buffer after insert must not affect the stored key.
+TEST(host_malloc_key_is_copied) {
+    HashTable *t = hashtable_create(NULL);
+    int v = 1;
+    char buf[8];
+    memcpy(buf, "key", 3);
+    ASSERT_EQ(hashtable_insert(t, buf, 3, &v), HASHTABLE_OK);
+    memset(buf, 'X', sizeof buf);
+    void *out;
+    ASSERT(hashtable_get(t, "key", 3, &out) == true);
+    ASSERT(out == &v);
+    hashtable_destroy(t);
+}
+
+TEST(host_malloc_remove_and_reinsert) {
+    HashTable *t = hashtable_create(NULL);
+    int v1 = 1, v2 = 2;
+    hashtable_insert(t, SK("k"), &v1);
+    ASSERT_EQ(hashtable_remove(t, SK("k")), HASHTABLE_REMOVE_OK);
+    void *out;
+    ASSERT(hashtable_get(t, SK("k"), &out) == false);
+    ASSERT_EQ(hashtable_insert(t, SK("k"), &v2), HASHTABLE_OK);
+    ASSERT(hashtable_get(t, SK("k"), &out) == true);
+    ASSERT(out == &v2);
+    hashtable_destroy(t);
+}
+
+TEST(host_malloc_iter_visits_all) {
+    HashTable *t = hashtable_create(NULL);
+    int a = 1, b = 2, c = 3;
+    hashtable_insert(t, SK("a"), &a);
+    hashtable_insert(t, SK("b"), &b);
+    hashtable_insert(t, SK("c"), &c);
+
+    HashTableIter it = hashtable_iter(t);
+    const void *k = NULL;
+    size_t klen = 0;
+    void *v = NULL;
+    int count = 0;
+    while (hashtable_iter_next(&it, &k, &klen, &v))
+        count++;
+    ASSERT_EQ(count, 3);
+    hashtable_destroy(t);
+}
+
+// `hashtable_destroy` on an arena-backed table is a no-op — must not crash
+// and must not double-free the arena's contents.
+TEST(arena_backed_destroy_is_noop) {
+    Arena *a = arena_create();
+    HashTable *t = hashtable_create(a);
+    int v = 1;
+    hashtable_insert(t, SK("k"), &v);
+    hashtable_destroy(t); // safe no-op
+    // Table still usable until arena_destroy releases it.
+    void *out;
+    ASSERT(hashtable_get(t, SK("k"), &out) == true);
+    arena_destroy(a);
+}
+
 int main(void) {
     RUN(create_empty);
     RUN(insert_then_get);
@@ -370,5 +455,13 @@ int main(void) {
     RUN(iter_empty_yields_nothing);
     RUN(iter_visits_all_once);
     RUN(clear_empties_table);
+
+    RUN(host_malloc_create_and_destroy_empty);
+    RUN(host_malloc_insert_then_get);
+    RUN(host_malloc_key_is_copied);
+    RUN(host_malloc_remove_and_reinsert);
+    RUN(host_malloc_iter_visits_all);
+    RUN(arena_backed_destroy_is_noop);
+
     TEST_SUMMARY();
 }
