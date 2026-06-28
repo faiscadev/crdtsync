@@ -10,13 +10,13 @@
 // Ownership: passed by value (~24 bytes). For SCALAR_STRING the struct
 // carries a BORROWED (bytes, len) view; the caller owns the underlying
 // memory at the API boundary. Anything that needs to store a Scalar past
-// the call (Register, Map, ...) must clone the bytes into its own arena.
+// the call (Register, Map, ...) must clone the bytes via scalar_clone and
+// release them with scalar_free.
 //
 // scalar_eq is kind-strict: cross-kind comparison is always false, even
 // for "obvious" coincidences (scalar_int(0) != scalar_bool(false)). For
 // SCALAR_STRING, equality is bytes+len memcmp (binary-safe).
 
-#include "arena.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -51,21 +51,15 @@ Scalar scalar_string(const uint8_t *bytes, size_t len);
 
 bool scalar_eq(Scalar a, Scalar b);
 
-// Clone a Scalar into owned storage. Two modes:
-//   1. `scalar_clone(arena, value)` — string bytes (if any) allocated in
-//      the supplied Arena. Bulk lifetime: arena_destroy frees them. Do
-//      NOT call scalar_free on the result.
-//   2. `scalar_clone(NULL, value)` — string bytes (if any) allocated via
-//      host_malloc. Caller MUST release with scalar_free when done.
-//
-// For non-string kinds (NULL / BOOL / INT) cloning is a value-copy
-// regardless of mode — nothing to allocate.
-Scalar scalar_clone(Arena *arena, Scalar value);
+// Clone a Scalar into owned storage: string bytes (if any) are allocated via
+// host_malloc and the caller MUST release them with scalar_free when done. For
+// non-string kinds (NULL / BOOL / INT) cloning is a value-copy — nothing to
+// allocate, and scalar_free is a harmless no-op.
+Scalar scalar_clone(Scalar value);
 
-// Release a host_malloc-backed Scalar's string bytes. No-op for non-string
-// kinds and for empty strings (no allocation to release). MUST only be
-// called on Scalars produced by `scalar_clone(NULL, ...)`. Calling on an
-// arena-backed Scalar is undefined.
+// Release a cloned Scalar's string bytes. No-op for non-string kinds and for
+// empty strings (no allocation to release). MUST only be called on Scalars
+// produced by scalar_clone.
 void scalar_free(Scalar value);
 
 #endif // _CRDT_SCALAR_H

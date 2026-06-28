@@ -9,19 +9,10 @@
 #include "string.h"
 #include "test_util.h"
 
-// NOTE: targets the refcounted lifecycle contract (Option A — Element forwards
-// lifecycle to the composite). Will not link until BOTH element.c and map.c
-// are converted, since Element's MAP arm calls into Map. Expected surface:
-//   - element_clone(Element): drops arena, makes refcount=1 children.
-//   - element_acquire(Element): SCALAR no-op; composite -> *_acquire.
-//   - element_release(Element): SCALAR scalar_free; composite -> *_release.
-//   - element_displace(Element): SCALAR no-op; composite -> *_displace.
-//   - element_is_displaced(Element): SCALAR false; composite -> *_is_displaced.
-//
-// Ownership rule mirrored from scalar_free: element_release on a SCALAR frees
-// the scalar's bytes, so it is valid ONLY on owned scalars (those produced by
-// element_clone, i.e. scalar_clone(NULL, ...) provenance) — never on a
-// borrowed-buffer element_scalar(...) passed transiently into map_set.
+// element_release on a SCALAR frees the scalar's bytes, so it is valid ONLY on
+// owned scalars (those produced by element_clone, i.e. scalar_clone provenance)
+// — never on a borrowed-buffer element_scalar(...) passed transiently into
+// map_set.
 
 // Helpers.
 
@@ -211,7 +202,7 @@ TEST(round_trip_via_kind_and_payload) {
     element_release(e);
 }
 
-// --- element_clone: deep copy, drops arena, refcount=1 children ---
+// --- element_clone: deep copy, refcount=1 children ---
 //
 // Used by map_merge when an LWW winner is a composite from a foreign replica.
 // The clone owns all its memory; releasing the source must leave the clone

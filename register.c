@@ -20,7 +20,7 @@ Register *register_create(ElementId id, Scalar value, Stamp stamp) {
                     sizeof(Register));
     }
     reg->id = id;
-    reg->value = scalar_clone(NULL, value);
+    reg->value = scalar_clone(value);
     reg->stamp = stamp;
     reg->refcount = 1;
     reg->displaced = false;
@@ -34,7 +34,7 @@ Scalar register_read(const Register *reg) { return reg->value; }
 void register_set(Register *reg, Scalar value, Stamp stamp) {
     if (stamp_gt(stamp, reg->stamp)) {
         scalar_free(reg->value);
-        reg->value = scalar_clone(NULL, value);
+        reg->value = scalar_clone(value);
         reg->stamp = stamp;
     }
 }
@@ -42,7 +42,7 @@ void register_set(Register *reg, Scalar value, Stamp stamp) {
 void register_merge(Register *dst, const Register *src) {
     if (stamp_gt(src->stamp, dst->stamp)) {
         scalar_free(dst->value);
-        dst->value = scalar_clone(NULL, src->value);
+        dst->value = scalar_clone(src->value);
         dst->stamp = src->stamp;
     }
 }
@@ -55,7 +55,7 @@ Register *register_clone(const Register *reg) {
                     sizeof(Register));
     }
     clone->id = reg->id;
-    clone->value = scalar_clone(NULL, reg->value);
+    clone->value = scalar_clone(reg->value);
     clone->stamp = reg->stamp;
     clone->refcount = 1;
     clone->displaced = false;

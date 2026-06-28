@@ -81,7 +81,7 @@ Element element_clone(Element e) {
 
     switch (e.kind) {
     case ELEMENT_SCALAR: {
-        Scalar cloned = scalar_clone(NULL, e.as.scalar);
+        Scalar cloned = scalar_clone(e.as.scalar);
 
         result = element_scalar(cloned);
     } break;

@@ -29,7 +29,7 @@
 //     winners are deep-cloned via element_clone (refcount=1) so dst owns its
 //     slot fully and is independent of src.
 //
-// Ownership (Share semantics, refcounted — no arena):
+// Ownership (Share semantics, refcounted):
 //   - SCALAR_STRING values are deep-copied into Map-owned storage on every
 //     accepted write (set, winning merge). When map_get fills *out with a
 //     SCALAR Element, the bytes are a borrowed view valid until the slot's

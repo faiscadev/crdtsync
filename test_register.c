@@ -6,16 +6,6 @@
 #include "string.h"
 #include "test_util.h"
 
-// NOTE: these tests target the refcounted lifecycle contract (host_malloc
-// backing, no arena), mirroring test_counter.c. They will not link until
-// register.h / register.c are converted:
-//   Register *register_create(ElementId id, Scalar value, Stamp stamp); // rc=1
-//   Register *register_clone(const Register *reg);                      // rc=1
-//   void register_acquire(Register *);
-//   void register_release(Register *);   // frees at rc 0; scalar_free's value
-//   void register_displace(Register *);
-//   bool register_is_displaced(const Register *);
-
 // Build a ClientId fixture from a single byte (rest zero).
 static ClientId cid(uint8_t first_byte) {
     uint8_t b[16] = {0};

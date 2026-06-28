@@ -10,16 +10,7 @@
 #include "test_util.h"
 #include <stdio.h>
 
-// NOTE: targets the refcounted "Share" lifecycle contract (no arena). Will not
-// link until map.c (and element.c) are converted. Expected Map surface:
-//   Map *map_create(ElementId id);                 // refcount = 1
-//   void map_acquire(Map *);
-//   void map_release(Map *);   // drops slot composite refs (recursive), frees
-//   void map_displace(Map *);
-//   bool map_is_displaced(const Map *);
-//   Map *map_clone(const Map *);                   // refcount = 1, deep copy
-//
-// Share semantics, exercised throughout:
+// Share lifecycle semantics, exercised throughout:
 //   - map_set of a composite: if the write is ACCEPTED (LWW wins), the Map
 //     element_acquires its own ref on the composite. If REJECTED, no-op. Either
 //     way the caller still owns the handle it passed and must release it.
@@ -783,13 +774,9 @@ TEST(merge_composite_src_wins_into_empty_slot_clones) {
 }
 
 // When src LOSES the LWW comparison, map_merge must NOT clone src's value into
-// dst — that clone would be unreachable garbage (a leak in the refcount model).
-//
-// NOTE: the original arena-based test asserted this via arena_used byte cost.
-// There is no refcount equivalent without a host alloc-counter seam, so the
-// perf-probe half is dropped; this keeps the functional guarantee (dst keeps
-// its winning scalar, and is independent of src after src is released). A true
-// "no wasteful clone" check now needs ASan/LeakSanitizer.
+// dst — that clone would be an unreachable leak. This asserts the functional
+// guarantee (dst keeps its winning scalar, independent of src after release);
+// proving no wasteful clone allocation needs ASan/LeakSanitizer.
 TEST(merge_does_not_clone_when_src_loses_lww) {
     Map *dst = fresh();
     Map *src = fresh();
@@ -1275,13 +1262,9 @@ TEST(clone_independent_of_src) {
 }
 
 // Tombstone entries carry a stale value field. map_clone must NOT recursively
-// clone that stale value into the destination.
-//
-// NOTE: the original arena-based test measured this via arena_used byte cost.
-// Without an alloc-counter seam there is no refcount equivalent, so the
-// perf-probe half is dropped; this keeps the functional guarantee (tombstone
-// survives the clone, clone is independent). A real "did not recurse the stale
-// value" check now needs ASan/LeakSanitizer.
+// clone that stale value into the destination. This asserts the functional
+// guarantee (tombstone survives the clone); proving no stale-value recursion
+// allocation needs ASan/LeakSanitizer.
 TEST(clone_tombstone_does_not_recurse_into_stale_value) {
     Map *src = fresh();
 

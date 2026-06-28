@@ -1,13 +1,8 @@
 #ifndef _CRDT_HASHTABLE_H
 #define _CRDT_HASHTABLE_H
 
-// Allocation backing — two modes:
-//   1. `hashtable_create(arena)` — node structs + key-byte copies allocated
-//      in the supplied Arena. Bulk lifetime: arena_destroy frees everything.
-//      No-op `hashtable_destroy` for this mode.
-//   2. `hashtable_create(NULL)` — node structs + key-byte copies allocated
-//      via `host_malloc`. Caller MUST call `hashtable_destroy(table)` when
-//      done to release everything.
+// Allocation: node structs + key-byte copies are allocated via host_malloc.
+// The caller MUST call hashtable_destroy(table) when done to release them.
 //
 // Ownership:
 //   Keys  — table copies key_len bytes when a new entry is inserted (insert,
@@ -21,29 +16,25 @@
 //            pointed-to memory. Lifetime must outlive any get/iter that
 //            reads the slot.
 //
-// Lifetime: For arena-backed tables, must not outlive the arena. For
-// host_malloc-backed tables, must outlive any pointer returned by get/iter.
+// Lifetime: the table must outlive any pointer returned by get/iter.
 //
 // Iteration: do NOT insert into or remove from the table while iterating it.
 
-#include "arena.h"
 #include <stdbool.h>
 #include <stddef.h>
 
 typedef struct HashTableNode HashTableNode;
 
 typedef struct HashTable {
-    Arena *arena; // NULL when host_malloc-backed
     HashTableNode *head;
 } HashTable;
 
-// `arena` may be NULL — in that case, the table allocates via host_malloc
-// and the caller must release with hashtable_destroy.
-HashTable *hashtable_create(Arena *arena);
+// Allocate an empty table via host_malloc. The caller must release it with
+// hashtable_destroy.
+HashTable *hashtable_create(void);
 
-// Release a host_malloc-backed table (frees nodes, key copies, the table
-// struct itself). No-op for arena-backed tables (their arena owns the
-// memory). Safe to call regardless of backing.
+// Release the table: frees nodes, key copies, and the table struct itself.
+// Safe to call on NULL.
 void hashtable_destroy(HashTable *table);
 
 typedef enum {

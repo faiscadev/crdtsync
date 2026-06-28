@@ -21,11 +21,11 @@ struct Map {
 Map *map_create(ElementId id) {
     Map *map = host_malloc(sizeof(Map));
     if (!map) {
-        host_abortf("map_create: arena OOM (requested %zu bytes for Map)",
+        host_abortf("map_create: host_malloc OOM (requested %zu bytes for Map)",
                     sizeof(Map));
     }
     map->id = id;
-    map->entries = hashtable_create(NULL);
+    map->entries = hashtable_create();
     map->refcount = 1;
     map->displaced = false;
     if (!map->entries) {
@@ -63,7 +63,7 @@ void map_set(Map *map, const void *key, size_t key_len, Element value,
             entry = host_malloc(sizeof(Entry));
             if (!entry) {
                 host_abortf(
-                    "map_set: arena OOM (requested %zu bytes for Entry)",
+                    "map_set: host_malloc OOM (requested %zu bytes for Entry)",
                     sizeof(Entry));
             }
             HashTableInsertResult r =
@@ -76,7 +76,7 @@ void map_set(Map *map, const void *key, size_t key_len, Element value,
 
         switch (value.kind) {
         case ELEMENT_SCALAR: {
-            Scalar copy = scalar_clone(NULL, value.as.scalar);
+            Scalar copy = scalar_clone(value.as.scalar);
             value.as.scalar = copy;
             break;
         }
@@ -111,8 +111,9 @@ void map_delete(Map *map, const void *key, size_t key_len, Stamp stamp) {
         // compare stamps and know that the delete wins over older sets.
         entry = host_malloc(sizeof(Entry));
         if (!entry) {
-            host_abortf("map_delete: arena OOM (requested %zu bytes for Entry)",
-                        sizeof(Entry));
+            host_abortf(
+                "map_delete: host_malloc OOM (requested %zu bytes for Entry)",
+                sizeof(Entry));
         }
         entry->stamp = stamp;
         entry->is_tombstone = true;
@@ -170,8 +171,8 @@ void map_merge(Map *dst, const Map *src) {
 
         // Skip the clone+set if src would lose LWW — map_set would do the
         // same stamp check internally and discard the work, but element_clone
-        // on a composite is deep recursive and leaks into dst's arena even
-        // when the value is never installed.
+        // on a composite is deep recursive and would leak a never-installed
+        // refcounted copy when the value never wins.
         if (dst_has && !stamp_gt(se->stamp, de->stamp)) {
             continue;
         }
@@ -283,8 +284,9 @@ Map *map_clone(const Map *map) {
         Entry *entry = v;
         Entry *copy = host_malloc(sizeof(Entry));
         if (!copy) {
-            host_abortf("map_clone: arena OOM (requested %zu bytes for Entry)",
-                        sizeof(Entry));
+            host_abortf(
+                "map_clone: host_malloc OOM (requested %zu bytes for Entry)",
+                sizeof(Entry));
         }
 
         copy->stamp = entry->stamp;

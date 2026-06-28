@@ -16,10 +16,11 @@
 //                lives at the slot level (in Map). Reaching this branch
 //                is a programmer error.
 //
-// Ownership: composites are referenced by pointer; element_merge mutates
-// dst's composite in place and never touches src's. Callers are
-// responsible for keeping pointed-to composites alive (typically by
-// putting them in the same arena as the containing Map).
+// Ownership: composites are referenced by refcounted pointer; element_merge
+// mutates dst's composite in place and never touches src's. element_acquire /
+// _release / _displace / _is_displaced forward to the underlying composite
+// (SCALAR is a no-op for acquire/displace and scalar_free on release). Callers
+// are responsible for keeping pointed-to composites alive via the refcount.
 
 #include "counter.h"
 #include "elementid.h"

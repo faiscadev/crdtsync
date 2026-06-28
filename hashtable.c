@@ -20,67 +20,42 @@ typedef struct HashTableNode {
     HashTableNode *next;
 } HashTableNode;
 
-HashTable *hashtable_create(Arena *arena) {
-    if (arena == NULL) {
-        HashTable *table = host_malloc(sizeof(HashTable));
-        if (!table) {
-            return NULL;
-        }
-
-        table->arena = NULL;
-        table->head = NULL;
-        return table;
-    }
-
-    HashTable *table = arena_alloc(arena, sizeof(HashTable));
+HashTable *hashtable_create(void) {
+    HashTable *table = host_malloc(sizeof(HashTable));
     if (!table) {
         return NULL;
     }
 
-    table->arena = arena;
     table->head = NULL;
-
     return table;
 }
 
 void hashtable_destroy(HashTable *table) {
-    if (table != NULL && table->arena == NULL) {
-        HashTableNode *n = table->head;
-        while (n) {
-            HashTableNode *next = n->next;
-            host_free(n->key);
-            host_free(n);
-            n = next;
-        }
-        host_free(table);
+    if (table == NULL) {
+        return;
     }
+    HashTableNode *n = table->head;
+    while (n) {
+        HashTableNode *next = n->next;
+        host_free(n->key);
+        host_free(n);
+        n = next;
+    }
+    host_free(table);
 }
 
 static HashTableInsertResult _hashtable_insert(HashTable *table,
                                                const void *key, size_t key_len,
                                                void *value) {
-    HashTableNode *node = NULL;
-    if (table->arena == NULL) {
-        node = host_malloc(sizeof(HashTableNode));
-        if (!node) {
-            return HASHTABLE_ERR_OOM;
-        }
+    HashTableNode *node = host_malloc(sizeof(HashTableNode));
+    if (!node) {
+        return HASHTABLE_ERR_OOM;
+    }
 
-        node->key = host_malloc(key_len);
-        if (!node->key) {
-            host_free(node);
-            return HASHTABLE_ERR_OOM;
-        }
-    } else {
-        node = arena_alloc(table->arena, sizeof(HashTableNode));
-        if (!node) {
-            return HASHTABLE_ERR_OOM;
-        }
-
-        node->key = arena_alloc(table->arena, key_len);
-        if (!node->key) {
-            return HASHTABLE_ERR_OOM;
-        }
+    node->key = host_malloc(key_len);
+    if (!node->key) {
+        host_free(node);
+        return HASHTABLE_ERR_OOM;
     }
 
     memcpy(node->key, key, key_len);
@@ -131,10 +106,8 @@ HashTableRemoveResult hashtable_remove(HashTable *table, const void *key,
                 table->head = n->next;
             }
 
-            if (table->arena == NULL) {
-                host_free(n->key);
-                host_free(n);
-            }
+            host_free(n->key);
+            host_free(n);
 
             return HASHTABLE_REMOVE_OK;
         }
@@ -171,14 +144,12 @@ HashTableUpsertResult hashtable_upsert(HashTable *table, const void *key,
 }
 
 void hashtable_clear(HashTable *table) {
-    if (table->arena == NULL) {
-        HashTableNode *n = table->head;
-        while (n) {
-            HashTableNode *next = n->next;
-            host_free(n->key);
-            host_free(n);
-            n = next;
-        }
+    HashTableNode *n = table->head;
+    while (n) {
+        HashTableNode *next = n->next;
+        host_free(n->key);
+        host_free(n);
+        n = next;
     }
 
     table->head = NULL;

@@ -1,4 +1,3 @@
-#include "arena.h"
 #include "scalar.h"
 #include "string.h"
 #include "test_util.h"
@@ -141,104 +140,38 @@ TEST(string_neq_null) {
     ASSERT(scalar_eq(scalar_string(NULL, 0), scalar_null()) == false);
 }
 
-// --- scalar_clone: deep copy into a target arena ---
+// --- scalar_clone: deep copy into host_malloc-backed owned storage ---
+//
+// scalar_clone allocates string bytes via host_malloc; the caller releases
+// with scalar_free. Non-string kinds pass through as value copies and do not
+// need scalar_free (it's safe to call but a no-op).
 
 TEST(clone_null_passes_through) {
-    Arena *a = arena_create();
-    Scalar c = scalar_clone(a, scalar_null());
-    ASSERT(scalar_eq(c, scalar_null()) == true);
-    arena_destroy(a);
-}
-
-TEST(clone_bool_passes_through) {
-    Arena *a = arena_create();
-    Scalar t = scalar_clone(a, scalar_bool(true));
-    Scalar f = scalar_clone(a, scalar_bool(false));
-    ASSERT(scalar_eq(t, scalar_bool(true)) == true);
-    ASSERT(scalar_eq(f, scalar_bool(false)) == true);
-    arena_destroy(a);
-}
-
-TEST(clone_int_passes_through) {
-    Arena *a = arena_create();
-    Scalar c = scalar_clone(a, scalar_int(42));
-    ASSERT(scalar_eq(c, scalar_int(42)) == true);
-    arena_destroy(a);
-}
-
-// String bytes must be deep-copied into dst arena, not borrowed from caller.
-// After clone, mutating the source bytes must NOT affect the clone.
-TEST(clone_string_owns_bytes_in_dst_arena) {
-    Arena *a = arena_create();
-    uint8_t src[5];
-    memcpy(src, "hello", 5);
-    Scalar c = scalar_clone(a, scalar_string(src, 5));
-    src[0] = 'X';
-    src[1] = 'X';
-    ASSERT(scalar_eq(c, scalar_string((const uint8_t *)"hello", 5)) == true);
-    arena_destroy(a);
-}
-
-// Clone survives destruction of the original source: the clone's bytes
-// must live in the dst arena, not anywhere tied to the caller's buffer.
-TEST(clone_string_survives_after_source_buffer_freed) {
-    Arena *a = arena_create();
-    uint8_t *src = (uint8_t *)malloc(5);
-    memcpy(src, "hello", 5);
-    Scalar c = scalar_clone(a, scalar_string(src, 5));
-    free(src);
-    ASSERT(scalar_eq(c, scalar_string((const uint8_t *)"hello", 5)) == true);
-    arena_destroy(a);
-}
-
-TEST(clone_empty_string_handled) {
-    Arena *a = arena_create();
-    Scalar c = scalar_clone(a, scalar_string((const uint8_t *)"", 0));
-    ASSERT(scalar_eq(c, scalar_string((const uint8_t *)"", 0)) == true);
-    arena_destroy(a);
-}
-
-// Bytes with embedded NUL must round-trip byte-for-byte.
-TEST(clone_string_with_embedded_nul) {
-    Arena *a = arena_create();
-    uint8_t src[4] = {0x01, 0x00, 0x02, 0x03};
-    Scalar c = scalar_clone(a, scalar_string(src, sizeof src));
-    ASSERT(scalar_eq(c, scalar_string(src, sizeof src)) == true);
-    arena_destroy(a);
-}
-
-// --- host_malloc-backed clone (NULL arena) ---
-//
-// scalar_clone(NULL, ...) allocates string bytes via host_malloc; caller
-// releases with scalar_free. Non-string kinds pass through as value copies
-// and do not need scalar_free (it's safe to call but a no-op).
-
-TEST(host_clone_null_passes_through) {
-    Scalar c = scalar_clone(NULL, scalar_null());
+    Scalar c = scalar_clone(scalar_null());
     ASSERT(scalar_eq(c, scalar_null()) == true);
     scalar_free(c); // no-op, safe
 }
 
-TEST(host_clone_bool_passes_through) {
-    Scalar t = scalar_clone(NULL, scalar_bool(true));
-    Scalar f = scalar_clone(NULL, scalar_bool(false));
+TEST(clone_bool_passes_through) {
+    Scalar t = scalar_clone(scalar_bool(true));
+    Scalar f = scalar_clone(scalar_bool(false));
     ASSERT(scalar_eq(t, scalar_bool(true)) == true);
     ASSERT(scalar_eq(f, scalar_bool(false)) == true);
     scalar_free(t);
     scalar_free(f);
 }
 
-TEST(host_clone_int_passes_through) {
-    Scalar c = scalar_clone(NULL, scalar_int(42));
+TEST(clone_int_passes_through) {
+    Scalar c = scalar_clone(scalar_int(42));
     ASSERT(scalar_eq(c, scalar_int(42)) == true);
     scalar_free(c);
 }
 
 // Source buffer mutated after clone — clone bytes must be independent.
-TEST(host_clone_string_owns_bytes) {
+TEST(clone_string_owns_bytes) {
     uint8_t src[5];
     memcpy(src, "hello", 5);
-    Scalar c = scalar_clone(NULL, scalar_string(src, 5));
+    Scalar c = scalar_clone(scalar_string(src, 5));
     src[0] = 'X';
     src[1] = 'X';
     ASSERT(scalar_eq(c, scalar_string((const uint8_t *)"hello", 5)) == true);
@@ -246,24 +179,25 @@ TEST(host_clone_string_owns_bytes) {
 }
 
 // Source buffer freed entirely — clone still readable.
-TEST(host_clone_string_survives_source_free) {
+TEST(clone_string_survives_source_free) {
     uint8_t *src = (uint8_t *)malloc(5);
     memcpy(src, "hello", 5);
-    Scalar c = scalar_clone(NULL, scalar_string(src, 5));
+    Scalar c = scalar_clone(scalar_string(src, 5));
     free(src);
     ASSERT(scalar_eq(c, scalar_string((const uint8_t *)"hello", 5)) == true);
     scalar_free(c);
 }
 
-TEST(host_clone_empty_string_handled) {
-    Scalar c = scalar_clone(NULL, scalar_string((const uint8_t *)"", 0));
+TEST(clone_empty_string_handled) {
+    Scalar c = scalar_clone(scalar_string((const uint8_t *)"", 0));
     ASSERT(scalar_eq(c, scalar_string((const uint8_t *)"", 0)) == true);
     scalar_free(c); // safe on empty (no allocation made)
 }
 
-TEST(host_clone_string_with_embedded_nul) {
+// Bytes with embedded NUL must round-trip byte-for-byte.
+TEST(clone_string_with_embedded_nul) {
     uint8_t src[4] = {0x01, 0x00, 0x02, 0x03};
-    Scalar c = scalar_clone(NULL, scalar_string(src, sizeof src));
+    Scalar c = scalar_clone(scalar_string(src, sizeof src));
     ASSERT(scalar_eq(c, scalar_string(src, sizeof src)) == true);
     scalar_free(c);
 }
@@ -310,18 +244,10 @@ int main(void) {
     RUN(clone_null_passes_through);
     RUN(clone_bool_passes_through);
     RUN(clone_int_passes_through);
-    RUN(clone_string_owns_bytes_in_dst_arena);
-    RUN(clone_string_survives_after_source_buffer_freed);
+    RUN(clone_string_owns_bytes);
+    RUN(clone_string_survives_source_free);
     RUN(clone_empty_string_handled);
     RUN(clone_string_with_embedded_nul);
-
-    RUN(host_clone_null_passes_through);
-    RUN(host_clone_bool_passes_through);
-    RUN(host_clone_int_passes_through);
-    RUN(host_clone_string_owns_bytes);
-    RUN(host_clone_string_survives_source_free);
-    RUN(host_clone_empty_string_handled);
-    RUN(host_clone_string_with_embedded_nul);
     RUN(scalar_free_noop_on_non_string_kinds);
 
     TEST_SUMMARY();

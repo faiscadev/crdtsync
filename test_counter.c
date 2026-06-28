@@ -254,7 +254,7 @@ TEST(local_inc_after_merge_accumulates) {
     ASSERT_EQ(counter_read(a), 7);
 }
 
-// --- counter_clone: deep copy into a target arena ---
+// --- counter_clone: deep copy into a fresh refcount=1 allocation ---
 
 TEST(clone_empty_counter_reads_zero) {
     Counter *src = counter_create(default_id());

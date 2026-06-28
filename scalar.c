@@ -1,5 +1,4 @@
 #include "scalar.h"
-#include "arena.h"
 #include "host.h"
 #include <stdbool.h>
 #include <string.h>
@@ -57,23 +56,21 @@ bool scalar_eq(Scalar a, Scalar b) {
     }
 }
 
-Scalar scalar_clone(Arena *arena, Scalar value) {
+Scalar scalar_clone(Scalar value) {
     switch (value.kind) {
     case SCALAR_STRING: {
         // Empty string: no bytes to copy. Pass the value through unchanged.
-        // Avoids portability fragility around malloc(0) / arena_alloc(0)
-        // (implementation-defined return) and the matching free-leak that
-        // scalar_free would otherwise miss.
+        // Avoids portability fragility around malloc(0) (implementation-defined
+        // return) and the matching free-leak that scalar_free would otherwise
+        // miss.
         if (value.as.s.len == 0) {
             return value;
         }
-        uint8_t *bytes_copy = arena == NULL
-                                  ? host_malloc(value.as.s.len)
-                                  : arena_alloc(arena, value.as.s.len);
+        uint8_t *bytes_copy = host_malloc(value.as.s.len);
         if (!bytes_copy) {
-            host_abortf("scalar_clone: %s OOM (requested %zu bytes for "
-                        "string value)",
-                        arena ? "arena" : "host_malloc", value.as.s.len);
+            host_abortf("scalar_clone: host_malloc OOM (requested %zu bytes "
+                        "for string value)",
+                        value.as.s.len);
         }
         memcpy(bytes_copy, value.as.s.bytes, value.as.s.len);
         Scalar copy = {0};

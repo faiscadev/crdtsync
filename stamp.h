@@ -17,7 +17,7 @@
 //   - transitive     — stamp_gt(a, b) and stamp_gt(b, c) implies stamp_gt(a, c)
 //   - trichotomous   — for any a, b: exactly one of (a > b, b > a, equal)
 //
-// Ownership: pass-by-value. No allocation, no arena.
+// Ownership: pass-by-value. No allocation.
 
 #include "clientid.h"
 #include <stdbool.h>

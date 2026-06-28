@@ -25,7 +25,7 @@ Counter *counter_create(ElementId id) {
             sizeof(Counter));
     }
     counter->id = id;
-    counter->entries = hashtable_create(NULL);
+    counter->entries = hashtable_create();
     if (!counter->entries) {
         host_free(counter);
         host_abort("counter_create: hashtable_create OOM (per-client tallies "
