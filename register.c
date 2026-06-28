@@ -1,28 +1,29 @@
 #include "register.h"
-#include "arena.h"
 #include "host.h"
 #include "scalar.h"
 #include <stdbool.h>
 
 struct Register {
     ElementId id;
-    Arena *arena;
     Scalar value;
     Stamp stamp;
+
+    size_t refcount;
+    bool displaced;
 };
 
-Register *register_create(Arena *arena, ElementId id, Scalar value,
-                          Stamp stamp) {
-    Register *reg = arena_alloc(arena, sizeof(Register));
+Register *register_create(ElementId id, Scalar value, Stamp stamp) {
+    Register *reg = host_malloc(sizeof(Register));
     if (!reg) {
-        host_abortf(
-            "register_create: arena OOM (requested %zu bytes for Register)",
-            sizeof(Register));
+        host_abortf("register_create: host_malloc OOM (requested %zu bytes for "
+                    "Register)",
+                    sizeof(Register));
     }
     reg->id = id;
-    reg->arena = arena;
-    reg->value = scalar_clone(arena, value);
+    reg->value = scalar_clone(NULL, value);
     reg->stamp = stamp;
+    reg->refcount = 1;
+    reg->displaced = false;
     return reg;
 }
 
@@ -32,28 +33,48 @@ Scalar register_read(const Register *reg) { return reg->value; }
 
 void register_set(Register *reg, Scalar value, Stamp stamp) {
     if (stamp_gt(stamp, reg->stamp)) {
-        reg->value = scalar_clone(reg->arena, value);
+        scalar_free(reg->value);
+        reg->value = scalar_clone(NULL, value);
         reg->stamp = stamp;
     }
 }
 
 void register_merge(Register *dst, const Register *src) {
     if (stamp_gt(src->stamp, dst->stamp)) {
-        dst->value = scalar_clone(dst->arena, src->value);
+        scalar_free(dst->value);
+        dst->value = scalar_clone(NULL, src->value);
         dst->stamp = src->stamp;
     }
 }
 
-Register *register_clone(Arena *arena, const Register *reg) {
-    Register *clone = arena_alloc(arena, sizeof(Register));
+Register *register_clone(const Register *reg) {
+    Register *clone = host_malloc(sizeof(Register));
     if (!clone) {
-        host_abortf(
-            "register_clone: arena OOM (requested %zu bytes for Register)",
-            sizeof(Register));
+        host_abortf("register_clone: host_malloc OOM (requested %zu bytes for "
+                    "Register)",
+                    sizeof(Register));
     }
     clone->id = reg->id;
-    clone->arena = arena;
-    clone->value = scalar_clone(arena, reg->value);
+    clone->value = scalar_clone(NULL, reg->value);
     clone->stamp = reg->stamp;
+    clone->refcount = 1;
+    clone->displaced = false;
     return clone;
 }
+
+void register_acquire(Register *reg) { reg->refcount++; }
+
+void register_release(Register *reg) {
+    if (reg->refcount == 0) {
+        host_abort("register_release: refcount already zero");
+    }
+    reg->refcount--;
+    if (reg->refcount == 0) {
+        scalar_free(reg->value);
+        host_free(reg);
+    }
+}
+
+void register_displace(Register *reg) { reg->displaced = true; }
+
+bool register_is_displaced(const Register *reg) { return reg->displaced; }
