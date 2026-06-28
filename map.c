@@ -325,6 +325,9 @@ Map *map_clone(const Map *map) {
 
 void map_acquire(Map *map) { map->refcount++; }
 void map_release(Map *map) {
+    if (map->refcount == 0) {
+        host_abort("map_release: refcount already zero");
+    }
     if (--map->refcount == 0) {
         HashTableIter it = hashtable_iter(map->entries);
         const void *k;
@@ -343,4 +346,4 @@ void map_release(Map *map) {
 }
 
 void map_displace(Map *map) { map->displaced = true; }
-bool map_is_displaced(Map *map) { return map->displaced; }
+bool map_is_displaced(const Map *map) { return map->displaced; }

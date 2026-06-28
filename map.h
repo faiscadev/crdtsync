@@ -107,6 +107,6 @@ void map_release(Map *map);
 // slot path calls this when it LWW-displaces this Map). Independent of
 // refcount; see the lifetime notes above.
 void map_displace(Map *map);
-bool map_is_displaced(Map *map);
+bool map_is_displaced(const Map *map);
 
 #endif // _CRDT_MAP_H

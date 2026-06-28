@@ -25,9 +25,9 @@
 //     / _INT the payload is in the struct.
 //   - For SCALAR_STRING, the Scalar carries a borrowed (bytes, len) view.
 //     Register owns its value: on every accepted write (create, set, winning
-//     merge) it deep-copies the bytes via scalar_clone(NULL, ...) into a
-//     host_malloc allocation, and frees the previous value's bytes. No leak
-//     across overwrites.
+//     merge) it deep-copies the bytes via scalar_clone into a host_malloc
+//     allocation, and frees the previous value's bytes. No leak across
+//     overwrites.
 //   - register_read returns a Scalar by value; for SCALAR_STRING the bytes
 //     pointer is a borrowed view into the Register's own storage. Valid until
 //     the next accepted write or until the Register is freed (refcount 0).
