@@ -88,8 +88,13 @@ void map_set(Map *map, const void *key, size_t key_len, Element value,
             break;
         }
 
-        element_displace(entry->value);
-        element_release(entry->value);
+        // Drop the displaced value only when overwriting an existing live
+        // slot. A brand-new entry has no prior value, and a tombstone's value
+        // field is not a live handle — neither holds a ref to release.
+        if (present && !entry->is_tombstone) {
+            element_displace(entry->value);
+            element_release(entry->value);
+        }
         entry->value = value;
         entry->stamp = stamp;
         entry->is_tombstone = false;
@@ -102,9 +107,13 @@ void map_delete(Map *map, const void *key, size_t key_len, Stamp stamp) {
     if (present) {
         if (stamp_gt(stamp, entry->stamp)) {
             entry->stamp = stamp;
+            // Drop the live composite (if any) before tombstoning. A
+            // re-delete over an existing tombstone has no live handle.
+            if (!entry->is_tombstone) {
+                element_displace(entry->value);
+                element_release(entry->value);
+            }
             entry->is_tombstone = true;
-            element_displace(entry->value);
-            element_release(entry->value);
         }
     } else {
         // Install a tombstone for the absent key, so that future merges can
@@ -117,6 +126,9 @@ void map_delete(Map *map, const void *key, size_t key_len, Stamp stamp) {
         }
         entry->stamp = stamp;
         entry->is_tombstone = true;
+        // A tombstone holds no live composite; give value a safe sentinel so
+        // nothing ever releases an uninitialized handle.
+        entry->value = element_scalar(scalar_null());
         HashTableInsertResult r =
             hashtable_insert(map->entries, key, key_len, entry);
         if (r != HASHTABLE_OK) {
@@ -293,6 +305,8 @@ Map *map_clone(const Map *map) {
         copy->is_tombstone = entry->is_tombstone;
         if (!entry->is_tombstone) {
             copy->value = element_clone(entry->value);
+        } else {
+            copy->value = element_scalar(scalar_null());
         }
         HashTableInsertResult r =
             hashtable_insert(clone->entries, k, klen, copy);
