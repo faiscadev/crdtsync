@@ -37,6 +37,7 @@ TEST(create_empty) {
     ASSERT(hashtable_get(t, &k, sizeof k, &out) == false);
     // out must be untouched on miss.
     ASSERT(out == (void *)0xdead);
+    hashtable_destroy(t);
 }
 
 // uint32 key, fetched via a separate variable holding the same value — proves
@@ -53,6 +54,7 @@ TEST(insert_then_get) {
     ASSERT(hashtable_get(t, &k2, sizeof k2, &out) == true);
     ASSERT(out == &v);
     ASSERT_EQ(*(int *)out, 99);
+    hashtable_destroy(t);
 }
 
 TEST(insert_duplicate_rejected) {
@@ -65,6 +67,7 @@ TEST(insert_duplicate_rejected) {
     void *out = NULL;
     ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &a);
+    hashtable_destroy(t);
 }
 
 TEST(get_missing_returns_false) {
@@ -75,6 +78,7 @@ TEST(get_missing_returns_false) {
 
     void *out = NULL;
     ASSERT(hashtable_get(t, SK("absent"), &out) == false);
+    hashtable_destroy(t);
 }
 
 // NULL is a storable value, distinguishable from "not found".
@@ -89,6 +93,7 @@ TEST(stored_null_is_distinguishable) {
 
     out = (void *)0xbeef;
     ASSERT(hashtable_get(t, SK("other"), &out) == false);
+    hashtable_destroy(t);
 }
 
 TEST(update_existing) {
@@ -101,6 +106,7 @@ TEST(update_existing) {
     void *out = NULL;
     ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &b);
+    hashtable_destroy(t);
 }
 
 TEST(update_missing_rejected) {
@@ -109,6 +115,7 @@ TEST(update_missing_rejected) {
     int b = 2;
     ASSERT_EQ(hashtable_update(t, SK("ghost"), &b),
               HASHTABLE_UPDATE_ERR_NOT_FOUND);
+    hashtable_destroy(t);
 }
 
 TEST(upsert_inserts_when_absent) {
@@ -120,6 +127,7 @@ TEST(upsert_inserts_when_absent) {
     void *out = NULL;
     ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &v);
+    hashtable_destroy(t);
 }
 
 TEST(upsert_updates_when_present) {
@@ -132,6 +140,7 @@ TEST(upsert_updates_when_present) {
     void *out = NULL;
     ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &b);
+    hashtable_destroy(t);
 }
 
 TEST(remove_existing) {
@@ -143,12 +152,14 @@ TEST(remove_existing) {
 
     void *out = NULL;
     ASSERT(hashtable_get(t, SK("k"), &out) == false);
+    hashtable_destroy(t);
 }
 
 TEST(remove_missing_rejected) {
     HashTable *t = fresh();
 
     ASSERT_EQ(hashtable_remove(t, SK("nope")), HASHTABLE_REMOVE_ERR_NOT_FOUND);
+    hashtable_destroy(t);
 }
 
 TEST(remove_then_reinsert) {
@@ -162,6 +173,7 @@ TEST(remove_then_reinsert) {
     void *out = NULL;
     ASSERT(hashtable_get(t, SK("k"), &out) == true);
     ASSERT(out == &b);
+    hashtable_destroy(t);
 }
 
 // Table must copy the key bytes: mutating the caller's buffer after insert
@@ -185,6 +197,7 @@ TEST(key_is_copied_not_borrowed) {
     uint8_t mutated[4] = {9, 9, 3, 4};
     out = NULL;
     ASSERT(hashtable_get(t, mutated, sizeof mutated, &out) == false);
+    hashtable_destroy(t);
 }
 
 // The headline reason for byte keys: keys with embedded NUL bytes must be
@@ -209,6 +222,7 @@ TEST(embedded_nul_keys_distinct) {
     ASSERT(out == &vb);
     ASSERT(hashtable_get(t, k3, sizeof k3, &out) == true);
     ASSERT(out == &vc);
+    hashtable_destroy(t);
 }
 
 // Same prefix, different length: must be distinct keys.
@@ -227,6 +241,7 @@ TEST(length_distinguishes_keys) {
     ASSERT(out == &va);
     ASSERT(hashtable_get(t, b, sizeof b, &out) == true);
     ASSERT(out == &vb);
+    hashtable_destroy(t);
 }
 
 TEST(collisions_resolve) {
@@ -247,6 +262,7 @@ TEST(collisions_resolve) {
     ASSERT(out == &vc);
     ASSERT(hashtable_get(t, SK("delta"), &out) == true);
     ASSERT(out == &vd);
+    hashtable_destroy(t);
 }
 
 // Insert many more than initial size to force at least one grow/rehash.
@@ -269,6 +285,7 @@ TEST(grow_preserves_entries) {
         ASSERT(hashtable_get(t, &keys[i], sizeof keys[i], &out) == true);
         ASSERT(out == &vals[i]);
     }
+    hashtable_destroy(t);
 }
 
 TEST(iter_empty_yields_nothing) {
@@ -279,6 +296,7 @@ TEST(iter_empty_yields_nothing) {
     size_t klen = 0;
     void *v = NULL;
     ASSERT(hashtable_iter_next(&it, &k, &klen, &v) == false);
+    hashtable_destroy(t);
 }
 
 // Iteration must visit every entry exactly once (order unspecified), yielding
@@ -321,6 +339,7 @@ TEST(iter_visits_all_once) {
     ASSERT_EQ(seen1, 1);
     ASSERT_EQ(seen2, 1);
     ASSERT_EQ(seen3, 1);
+    hashtable_destroy(t);
 }
 
 TEST(clear_empties_table) {
@@ -346,6 +365,7 @@ TEST(clear_empties_table) {
     ASSERT_EQ(hashtable_insert(t, SK("c"), &vc), HASHTABLE_OK);
     ASSERT(hashtable_get(t, SK("c"), &out) == true);
     ASSERT(out == &vc);
+    hashtable_destroy(t);
 }
 
 // --- hashtable_destroy ---

@@ -35,55 +35,54 @@ TEST(counter_create_stores_id) {
 // --- local operations (single replica) ---
 
 TEST(empty_reads_zero) {
-
     Counter *c = fresh();
     ASSERT_EQ(counter_read(c), 0);
+    counter_release(c);
 }
 
 TEST(single_inc) {
-
     Counter *c = fresh();
     counter_inc(c, cid(1), 5);
     ASSERT_EQ(counter_read(c), 5);
+    counter_release(c);
 }
 
 TEST(inc_then_dec_nets) {
-
     Counter *c = fresh();
     counter_inc(c, cid(1), 5);
     counter_dec(c, cid(1), 2);
     ASSERT_EQ(counter_read(c), 3);
+    counter_release(c);
 }
 
 // Local repeated ops on the same client accumulate (this is NOT max).
 TEST(local_inc_accumulates) {
-
     Counter *c = fresh();
     counter_inc(c, cid(1), 5);
     counter_inc(c, cid(1), 2);
     ASSERT_EQ(counter_read(c), 7);
+    counter_release(c);
 }
 
 TEST(read_can_go_negative) {
-
     Counter *c = fresh();
     counter_dec(c, cid(1), 3);
     ASSERT_EQ(counter_read(c), -3);
+    counter_release(c);
 }
 
 TEST(two_clients_sum_in_one_replica) {
-
     Counter *c = fresh();
     counter_inc(c, cid(1), 5);
     counter_inc(c, cid(2), 3);
     counter_dec(c, cid(2), 1);
     ASSERT_EQ(counter_read(c), 7); // (5-0) + (3-1)
+    counter_release(c);
 }
 
 // Two clients are distinguished by the FULL 16-byte ClientId, not the first
 // byte (proves the hashtable key uses sizeof(ClientId) and not just a prefix).
 TEST(client_ids_distinguished_by_full_bytes) {
-
     Counter *c = fresh();
 
     uint8_t a_bytes[16] = {1, 2,  3,  4,  5,  6,  7,  8,
@@ -96,12 +95,12 @@ TEST(client_ids_distinguished_by_full_bytes) {
     counter_inc(c, a, 5);
     counter_inc(c, b, 3);
     ASSERT_EQ(counter_read(c), 8); // distinct clients -> two entries
+    counter_release(c);
 }
 
 // --- merge (two replicas) ---
 
 TEST(merge_disjoint_clients_unions) {
-
     Counter *a = fresh();
     Counter *b = fresh();
 
@@ -110,12 +109,13 @@ TEST(merge_disjoint_clients_unions) {
 
     counter_merge(a, b);
     ASSERT_EQ(counter_read(a), 8);
+    counter_release(a);
+    counter_release(b);
 }
 
 // Classic CRDT result: concurrent increments on different clients converge,
 // both replicas read the same value after exchanging state.
 TEST(concurrent_inc_converges) {
-
     Counter *a = fresh();
     Counter *b = fresh();
 
@@ -127,12 +127,13 @@ TEST(concurrent_inc_converges) {
 
     ASSERT_EQ(counter_read(a), 8);
     ASSERT_EQ(counter_read(b), 8);
+    counter_release(a);
+    counter_release(b);
 }
 
 // Same client seen with different counts on two replicas: merge takes the MAX,
 // not the sum (the lower replica was simply behind).
 TEST(merge_same_client_takes_max_not_sum) {
-
     Counter *a = fresh();
     Counter *b = fresh();
 
@@ -141,10 +142,11 @@ TEST(merge_same_client_takes_max_not_sum) {
 
     counter_merge(a, b);
     ASSERT_EQ(counter_read(a), 5); // max(5,3), NOT 8
+    counter_release(a);
+    counter_release(b);
 }
 
 TEST(merge_same_client_max_on_both_directions) {
-
     Counter *a = fresh();
     Counter *b = fresh();
 
@@ -158,10 +160,11 @@ TEST(merge_same_client_max_on_both_directions) {
     counter_merge(a, b);
     // max(inc)=10, max(dec)=6 -> 10 - 6 = 4
     ASSERT_EQ(counter_read(a), 4);
+    counter_release(a);
+    counter_release(b);
 }
 
 TEST(merge_idempotent) {
-
     Counter *a = fresh();
     Counter *b = fresh();
 
@@ -175,11 +178,12 @@ TEST(merge_idempotent) {
 
     ASSERT_EQ(once, twice);
     ASSERT_EQ(twice, 8);
+    counter_release(a);
+    counter_release(b);
 }
 
 TEST(merge_commutative) {
     // (a <- b)
-
     Counter *a1 = fresh();
     Counter *b1 = fresh();
     counter_inc(a1, cid(1), 5);
@@ -188,7 +192,6 @@ TEST(merge_commutative) {
     counter_merge(a1, b1);
 
     // (b <- a)
-
     Counter *a2 = fresh();
     Counter *b2 = fresh();
     counter_inc(a2, cid(1), 5);
@@ -197,10 +200,13 @@ TEST(merge_commutative) {
     counter_merge(b2, a2);
 
     ASSERT_EQ(counter_read(a1), counter_read(b2));
+    counter_release(a1);
+    counter_release(b1);
+    counter_release(a2);
+    counter_release(b2);
 }
 
 TEST(merge_associative) {
-
     Counter *a = fresh();
     Counter *b = fresh();
     Counter *c = fresh();
@@ -213,7 +219,6 @@ TEST(merge_associative) {
     counter_merge(a, c);
 
     // a <- (b <- c)  (rebuild on a fresh accumulator)
-
     Counter *a2 = fresh();
     Counter *b2 = fresh();
     Counter *c2 = fresh();
@@ -225,11 +230,16 @@ TEST(merge_associative) {
 
     ASSERT_EQ(counter_read(a), counter_read(a2));
     ASSERT_EQ(counter_read(a), 10);
+    counter_release(a);
+    counter_release(b);
+    counter_release(c);
+    counter_release(a2);
+    counter_release(b2);
+    counter_release(c2);
 }
 
 // Merge leaves the source untouched.
 TEST(merge_does_not_mutate_src) {
-
     Counter *a = fresh();
     Counter *b = fresh();
 
@@ -238,12 +248,13 @@ TEST(merge_does_not_mutate_src) {
 
     counter_merge(a, b);
     ASSERT_EQ(counter_read(b), 3); // b unchanged
+    counter_release(a);
+    counter_release(b);
 }
 
 // After merge, a subsequent local inc on a newly-learned client accumulates
 // from the merged-in value (not from zero).
 TEST(local_inc_after_merge_accumulates) {
-
     Counter *a = fresh();
     Counter *b = fresh();
 
@@ -252,6 +263,8 @@ TEST(local_inc_after_merge_accumulates) {
 
     counter_inc(a, cid(2), 4); // a now also acting as client 2: accumulate to 7
     ASSERT_EQ(counter_read(a), 7);
+    counter_release(a);
+    counter_release(b);
 }
 
 // --- counter_clone: deep copy into a fresh refcount=1 allocation ---
