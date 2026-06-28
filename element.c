@@ -122,7 +122,10 @@ void element_acquire(Element e) {
 void element_release(Element e) {
     switch (e.kind) {
     case ELEMENT_SCALAR:
-        // No-op: scalar elements have no refcount.
+        // Scalars have no refcount, but an owned (scalar_clone'd) string holds
+        // host_malloc'd bytes that must be freed. Valid only on owned scalars
+        // — slots always store owned copies.
+        scalar_free(e.as.scalar);
         break;
     case ELEMENT_REGISTER:
         register_release(e.as.reg);

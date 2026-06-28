@@ -158,9 +158,11 @@ void map_merge(Map *dst, const Map *src) {
             de->value.kind != ELEMENT_SCALAR) {
             if (!elementid_eq(element_id(de->value), element_id(se->value))) {
                 // Distinct logical elements at the same slot. LWW the
-                // slot; if src wins, replace dst's composite with a
-                // clone of src's. Loser is orphaned.
+                // slot; if src wins, replace dst's composite with a clone of
+                // src's and displace + release the loser.
                 if (stamp_gt(se->stamp, de->stamp)) {
+                    element_displace(de->value);
+                    element_release(de->value);
                     de->value = element_clone(se->value);
                     de->stamp = se->stamp;
                 }
@@ -189,8 +191,11 @@ void map_merge(Map *dst, const Map *src) {
             continue;
         }
 
+        // map_set acquires the slot's own ref (and deep-copies a scalar), so
+        // drop this clone's create-ref afterward — the slot is the sole owner.
         Element cloned = element_clone(se->value);
         map_set(dst, k, klen, cloned, se->stamp);
+        element_release(cloned);
     }
 }
 
