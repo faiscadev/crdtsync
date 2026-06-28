@@ -24,27 +24,30 @@
 //   - Both alive AND same composite kind BUT mismatched ids → distinct
 //     logical elements that happen to share the slot. LWW on slot stamp;
 //     if src wins, dst's composite is replaced with a deep clone of src's
-//     into dst's arena. Loser is orphaned.
-//   - Otherwise → LWW on slot stamp. Scalar winners are scalar_clone'd
-//     into dst's arena. Composite winners are deep-cloned via element_clone
-//     into dst's arena, so dst owns its slot fully and survives src arena
-//     destroy.
+//     (element_clone, refcount=1). The loser is displaced + released.
+//   - Otherwise → LWW on slot stamp. Scalar winners are deep-copied; composite
+//     winners are deep-cloned via element_clone (refcount=1) so dst owns its
+//     slot fully and is independent of src.
 //
-// Ownership:
-//   - SCALAR_STRING values are cloned into the Map's arena on every accepted
-//     write (set, winning merge). When map_get fills *out with a SCALAR
-//     Element, the string bytes are a borrowed view into that arena; valid
-//     as long as the arena lives. Caller must not free or mutate.
-//   - Composite slots (REGISTER / COUNTER / MAP) are stored as pointers.
-//     map_set does NOT clone composites — the pointed-to object must live
-//     in the same arena as the Map. map_merge's LWW path clones via
-//     element_clone, so the cross-arena hazard does not surface there.
-//   - Map lives in its arena; arena_destroy cleans up everything (no
-//     separate map_destroy needed).
+// Ownership (Share semantics, refcounted — no arena):
+//   - SCALAR_STRING values are deep-copied into Map-owned storage on every
+//     accepted write (set, winning merge). When map_get fills *out with a
+//     SCALAR Element, the bytes are a borrowed view valid until the slot's
+//     next accepted write or until the Map is freed. Caller must not free or
+//     mutate.
+//   - Composite slots (REGISTER / COUNTER / MAP) are stored as refcounted
+//     pointers. An accepted map_set element_acquires the slot's own ref, so
+//     the caller always retains and releases the handle it passed, regardless
+//     of the LWW outcome. Eviction (winning set/delete, merge LWW-replace)
+//     displaces then releases the slot's ref on the loser.
+//   - map_get and the helper install path return BORROWS (the slot owns the
+//     ref); acquire to keep one valid past the next eviction.
 //
-// Lifetime: Map must not outlive its arena.
+// Lifetime — refcounted: map_create returns refcount=1; map_acquire /
+// map_release manage it. At refcount 0 the Map releases each live slot
+// composite (recursive for nested maps), then frees itself. map_displace marks
+// the Map as evicted from a parent slot (it is itself a composite kind).
 
-#include "arena.h"
 #include "element.h"
 #include "elementid.h"
 #include "scalar.h"
@@ -54,7 +57,7 @@
 
 typedef struct Map Map;
 
-Map *map_create(Arena *arena, ElementId id);
+Map *map_create(ElementId id);
 
 ElementId map_id(const Map *map);
 
@@ -73,14 +76,15 @@ void map_merge(Map *dst, const Map *src);
 size_t map_size(const Map *map);
 
 // Get-or-create helpers. Behaviour per call:
-//   1. Live slot with matching kind at `key` → return the existing pointer
-//      (stamp + seed value ignored).
+//   1. Live slot with matching kind at `key` → return the existing pointer as
+//      a borrow (stamp + seed value ignored).
 //   2. Else (empty, tombstone, scalar, or different-kind composite) AND
-//      `stamp` wins LWW against any existing entry → create a fresh
-//      composite in the Map's arena, install in the slot, return it.
-//   3. Else → return a DETACHED composite: created in the Map's arena but
-//      not installed in the slot. Caller always gets a usable handle; the
-//      slot is left untouched.
+//      `stamp` wins LWW against any existing entry → create and install a
+//      fresh composite, returning a BORROW (the slot owns the ref).
+//   3. Else → return a DETACHED composite: created but not installed, born
+//      displaced and OWNED by the caller (refcount=1, must release). The slot
+//      is left untouched.
+// In all cases the caller may acquire a borrow to keep it past eviction.
 Counter *map_counter(Map *map, const void *key, size_t key_len, Stamp stamp);
 
 Register *map_register(Map *map, const void *key, size_t key_len, Scalar seed,
@@ -88,6 +92,21 @@ Register *map_register(Map *map, const void *key, size_t key_len, Scalar seed,
 
 Map *map_map(Map *map, const void *key, size_t key_len, Stamp stamp);
 
-Map *map_clone(Arena *arena, const Map *map);
+// Deep recursive copy into a fresh allocation with refcount=1 (composite slots
+// cloned via element_clone). The clone is NOT displaced and is independent of
+// the source.
+Map *map_clone(const Map *map);
+
+// Reference counting. Acquire bumps the refcount; release drops it. On reaching
+// zero, the Map releases each live slot composite (recursive) then frees
+// itself.
+void map_acquire(Map *map);
+void map_release(Map *map);
+
+// Displacement signal — marks the Map as no-longer-in-a-slot (a parent Map's
+// slot path calls this when it LWW-displaces this Map). Independent of
+// refcount; see the lifetime notes above.
+void map_displace(Map *map);
+bool map_is_displaced(Map *map);
 
 #endif // _CRDT_MAP_H

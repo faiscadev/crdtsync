@@ -76,28 +76,92 @@ void element_merge(Element dst, Element src) {
     }
 }
 
-Element element_clone(Arena *arena, Element e) {
+Element element_clone(Element e) {
     Element result;
 
     switch (e.kind) {
     case ELEMENT_SCALAR: {
-        Scalar cloned = scalar_clone(arena, e.as.scalar);
+        Scalar cloned = scalar_clone(NULL, e.as.scalar);
 
         result = element_scalar(cloned);
     } break;
     case ELEMENT_REGISTER: {
-        Register *reg = register_clone(arena, e.as.reg);
+        Register *reg = register_clone(e.as.reg);
         result = element_register(reg);
     } break;
     case ELEMENT_COUNTER: {
-        Counter *counter = counter_clone(arena, e.as.counter);
+        Counter *counter = counter_clone(e.as.counter);
         result = element_counter(counter);
     } break;
     case ELEMENT_MAP: {
-        Map *map = map_clone(arena, e.as.map);
+        Map *map = map_clone(e.as.map);
         result = element_map(map);
     } break;
     }
 
     return result;
+}
+
+void element_acquire(Element e) {
+    switch (e.kind) {
+    case ELEMENT_SCALAR:
+        // No-op: scalar elements have no refcount.
+        break;
+    case ELEMENT_REGISTER:
+        register_acquire(e.as.reg);
+        break;
+    case ELEMENT_COUNTER:
+        counter_acquire(e.as.counter);
+        break;
+    case ELEMENT_MAP:
+        map_acquire(e.as.map);
+        break;
+    }
+}
+
+void element_release(Element e) {
+    switch (e.kind) {
+    case ELEMENT_SCALAR:
+        // No-op: scalar elements have no refcount.
+        break;
+    case ELEMENT_REGISTER:
+        register_release(e.as.reg);
+        break;
+    case ELEMENT_COUNTER:
+        counter_release(e.as.counter);
+        break;
+    case ELEMENT_MAP:
+        map_release(e.as.map);
+        break;
+    }
+}
+
+void element_displace(Element e) {
+    switch (e.kind) {
+    case ELEMENT_SCALAR:
+        // No-op: scalar elements are never displaced.
+        break;
+    case ELEMENT_REGISTER:
+        register_displace(e.as.reg);
+        break;
+    case ELEMENT_COUNTER:
+        counter_displace(e.as.counter);
+        break;
+    case ELEMENT_MAP:
+        map_displace(e.as.map);
+        break;
+    }
+}
+
+bool element_is_displaced(Element e) {
+    switch (e.kind) {
+    case ELEMENT_SCALAR:
+        return false; // scalar elements are never displaced
+    case ELEMENT_REGISTER:
+        return register_is_displaced(e.as.reg);
+    case ELEMENT_COUNTER:
+        return counter_is_displaced(e.as.counter);
+    case ELEMENT_MAP:
+        return map_is_displaced(e.as.map);
+    }
 }
