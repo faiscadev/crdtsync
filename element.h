@@ -16,10 +16,18 @@
 //                lives at the slot level (in Map). Reaching this branch
 //                is a programmer error.
 //
-// Ownership: composites are referenced by pointer; element_merge mutates
-// dst's composite in place and never touches src's. Callers are
-// responsible for keeping pointed-to composites alive (typically by
-// putting them in the same arena as the containing Map).
+// Ownership: composites are referenced by refcounted pointer; element_merge
+// mutates dst's composite in place and never touches src's. element_acquire /
+// _release / _displace / _is_displaced forward to the underlying composite
+// (SCALAR is a no-op for acquire/displace and scalar_free on release). Callers
+// are responsible for keeping pointed-to composites alive via the refcount.
+//
+// Sharp edge: element_release on a SCALAR frees the value's string bytes
+// (scalar_free), so it is valid ONLY on an OWNED scalar — one produced by
+// element_clone, or stored in a container that owns its copy (e.g. a Map slot,
+// which clones on set). Do NOT call it on a borrowed-buffer scalar such as
+// element_scalar(scalar_string(...)) or on a SCALAR Element returned by
+// map_get — that would free memory still owned by the caller or the Map.
 
 #include "counter.h"
 #include "elementid.h"
@@ -56,6 +64,12 @@ Element element_map(Map *m);
 ElementKind element_kind(Element e);
 const char *element_kind_name(ElementKind k);
 void element_merge(Element dst, Element src);
-Element element_clone(Arena *arena, Element e);
+Element element_clone(Element e);
+
+void element_acquire(Element e);
+void element_release(Element e);
+
+void element_displace(Element e);
+bool element_is_displaced(Element e);
 
 #endif // _CRDT_ELEMENT_H

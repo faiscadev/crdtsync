@@ -21,14 +21,9 @@ fmt: $(CLANG_FORMAT)
 fmt-check: $(CLANG_FORMAT)
 	$(CLANG_FORMAT) --dry-run --Werror $(SRC)
 
-.PHONY: test-arena
-test-arena: arena.c string.c host_posix.c test_arena.c test_util.h
-	$(CC) $(CFLAGS) -o test_arena arena.c string.c host_posix.c test_arena.c
-	./test_arena
-
 .PHONY: test-hashtable
-test-hashtable: arena.c string.c host_posix.c hashtable.c test_hashtable.c test_util.h
-	$(CC) $(CFLAGS) -o test_hashtable arena.c string.c host_posix.c hashtable.c test_hashtable.c
+test-hashtable: string.c host_posix.c hashtable.c test_hashtable.c test_util.h
+	$(CC) $(CFLAGS) -o test_hashtable string.c host_posix.c hashtable.c test_hashtable.c
 	./test_hashtable
 
 .PHONY: test-string
@@ -37,28 +32,28 @@ test-string: string.c test_string.c test_util.h
 	./test_string
 
 .PHONY: test-counter
-test-counter: arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c counter.c test_counter.c test_util.h
-	$(CC) $(CFLAGS) -o test_counter arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c counter.c test_counter.c
+test-counter: string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c counter.c test_counter.c test_util.h
+	$(CC) $(CFLAGS) -o test_counter string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c counter.c test_counter.c
 	./test_counter
 
 .PHONY: test-scalar
-test-scalar: arena.c string.c host_posix.c scalar.c test_scalar.c test_util.h
-	$(CC) $(CFLAGS) -o test_scalar arena.c string.c host_posix.c scalar.c test_scalar.c
+test-scalar: string.c host_posix.c scalar.c test_scalar.c test_util.h
+	$(CC) $(CFLAGS) -o test_scalar string.c host_posix.c scalar.c test_scalar.c
 	./test_scalar
 
 .PHONY: test-register
-test-register: arena.c string.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c test_register.c test_util.h
-	$(CC) $(CFLAGS) -o test_register arena.c string.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c test_register.c
+test-register: string.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c test_register.c test_util.h
+	$(CC) $(CFLAGS) -o test_register string.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c test_register.c
 	./test_register
 
 .PHONY: test-map
-test-map: arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c test_util.h
-	$(CC) $(CFLAGS) -o test_map arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c
+test-map: string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c test_util.h
+	$(CC) $(CFLAGS) -o test_map string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c element.c map.c test_map.c
 	./test_map
 
 .PHONY: test-element
-test-element: arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c test_util.h
-	$(CC) $(CFLAGS) -o test_element arena.c string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c
+test-element: string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c test_util.h
+	$(CC) $(CFLAGS) -o test_element string.c hashtable.c clientid.c elementid.c uuid.c sha1.c host_posix.c stamp.c scalar.c register.c counter.c map.c element.c test_element.c
 	./test_element
 
 .PHONY: test-elementid
@@ -96,4 +91,4 @@ test-stamp: string.c clientid.c host_posix.c stamp.c test_stamp.c test_util.h
 	./test_stamp
 
 .PHONY: test
-test: test-arena test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-sha1 test-sha1-runtime-endian test-uuid test-elementid test-element
+test: test-hashtable test-string test-counter test-scalar test-register test-clientid test-stamp test-map test-sha1 test-sha1-runtime-endian test-uuid test-elementid test-element

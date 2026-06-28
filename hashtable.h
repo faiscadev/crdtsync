@@ -1,37 +1,41 @@
 #ifndef _CRDT_HASHTABLE_H
 #define _CRDT_HASHTABLE_H
 
-// Ownership:
-//   Keys  — table copies key_len bytes into its arena when a new entry is
-//           inserted (insert, and the insert path of upsert). Keys are raw
-//           bytes: embedded NULs and the length are significant — they are not
-//           NUL-terminated strings. Caller's `key` pointer may be transient
-//           (stack, freed after the call). Keys returned by
-//           `hashtable_iter_next` are table-owned; valid as long as the arena
-//           lives. Caller must not free them.
-//   Values — stored as opaque `void *`; table does NOT copy. Caller owns the
-//            pointed-to memory (typically arena-allocated). Lifetime must
-//            outlive any get/iter that reads the slot.
+// Allocation: node structs + key-byte copies are allocated via host_malloc.
+// The caller MUST call hashtable_destroy(table) when done to release them.
 //
-// Lifetime: HashTable must not outlive its arena. Resetting the arena
-// invalidates every key, value, and the table itself.
+// Ownership:
+//   Keys  — table copies key_len bytes when a new entry is inserted (insert,
+//           and the insert path of upsert). Keys are raw bytes: embedded
+//           NULs and the length are significant — they are not NUL-terminated
+//           strings. Caller's `key` pointer may be transient (stack, freed
+//           after the call). Keys returned by `hashtable_iter_next` are
+//           table-owned; valid as long as the table lives. Caller must not
+//           free them.
+//   Values — stored as opaque `void *`; table does NOT copy. Caller owns the
+//            pointed-to memory. Lifetime must outlive any get/iter that
+//            reads the slot.
+//
+// Lifetime: the table must outlive any pointer returned by get/iter.
 //
 // Iteration: do NOT insert into or remove from the table while iterating it.
-// Mutation can leave the iterator's cursor pointing at an unlinked entry or
-// cause entries to be skipped. Finish iterating first, then mutate.
 
-#include "arena.h"
 #include <stdbool.h>
 #include <stddef.h>
 
 typedef struct HashTableNode HashTableNode;
 
 typedef struct HashTable {
-    Arena *arena;
     HashTableNode *head;
 } HashTable;
 
-HashTable *hashtable_create(Arena *arena);
+// Allocate an empty table via host_malloc. The caller must release it with
+// hashtable_destroy.
+HashTable *hashtable_create(void);
+
+// Release the table: frees nodes, key copies, and the table struct itself.
+// Safe to call on NULL.
+void hashtable_destroy(HashTable *table);
 
 typedef enum {
     HASHTABLE_OK,

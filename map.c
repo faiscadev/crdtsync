@@ -12,19 +12,22 @@ typedef struct MapEntry {
 
 struct Map {
     ElementId id;
-    Arena *arena;
     HashTable *entries;
+
+    size_t refcount;
+    bool displaced;
 };
 
-Map *map_create(Arena *arena, ElementId id) {
-    Map *map = arena_alloc(arena, sizeof(Map));
+Map *map_create(ElementId id) {
+    Map *map = host_malloc(sizeof(Map));
     if (!map) {
-        host_abortf("map_create: arena OOM (requested %zu bytes for Map)",
+        host_abortf("map_create: host_malloc OOM (requested %zu bytes for Map)",
                     sizeof(Map));
     }
     map->id = id;
-    map->arena = arena;
-    map->entries = hashtable_create(arena);
+    map->entries = hashtable_create();
+    map->refcount = 1;
+    map->displaced = false;
     if (!map->entries) {
         host_abort("map_create: hashtable_create OOM (slot table)");
     }
@@ -55,11 +58,23 @@ void map_set(Map *map, const void *key, size_t key_len, Element value,
     bool present = hashtable_get(map->entries, key, key_len, (void **)&entry);
     bool update = !present || stamp_gt(stamp, entry->stamp);
     if (update) {
+        // Re-setting the exact composite already installed in the slot: just
+        // advance the stamp. Acquiring then displacing + releasing it would
+        // spuriously flag a still-installed handle as displaced (and churn its
+        // refcount). The union aliases all composite pointers, so comparing
+        // as.counter compares the stored pointer regardless of kind.
+        if (present && !entry->is_tombstone && value.kind != ELEMENT_SCALAR &&
+            value.kind == entry->value.kind &&
+            value.as.counter == entry->value.as.counter) {
+            entry->stamp = stamp;
+            return;
+        }
+        element_acquire(value);
         if (!present) {
-            entry = arena_alloc(map->arena, sizeof(Entry));
+            entry = host_malloc(sizeof(Entry));
             if (!entry) {
                 host_abortf(
-                    "map_set: arena OOM (requested %zu bytes for Entry)",
+                    "map_set: host_malloc OOM (requested %zu bytes for Entry)",
                     sizeof(Entry));
             }
             HashTableInsertResult r =
@@ -72,7 +87,7 @@ void map_set(Map *map, const void *key, size_t key_len, Element value,
 
         switch (value.kind) {
         case ELEMENT_SCALAR: {
-            Scalar copy = scalar_clone(map->arena, value.as.scalar);
+            Scalar copy = scalar_clone(value.as.scalar);
             value.as.scalar = copy;
             break;
         }
@@ -84,6 +99,13 @@ void map_set(Map *map, const void *key, size_t key_len, Element value,
             break;
         }
 
+        // Drop the displaced value only when overwriting an existing live
+        // slot. A brand-new entry has no prior value, and a tombstone's value
+        // field is not a live handle — neither holds a ref to release.
+        if (present && !entry->is_tombstone) {
+            element_displace(entry->value);
+            element_release(entry->value);
+        }
         entry->value = value;
         entry->stamp = stamp;
         entry->is_tombstone = false;
@@ -96,18 +118,28 @@ void map_delete(Map *map, const void *key, size_t key_len, Stamp stamp) {
     if (present) {
         if (stamp_gt(stamp, entry->stamp)) {
             entry->stamp = stamp;
+            // Drop the live composite (if any) before tombstoning. A
+            // re-delete over an existing tombstone has no live handle.
+            if (!entry->is_tombstone) {
+                element_displace(entry->value);
+                element_release(entry->value);
+            }
             entry->is_tombstone = true;
         }
     } else {
         // Install a tombstone for the absent key, so that future merges can
         // compare stamps and know that the delete wins over older sets.
-        entry = arena_alloc(map->arena, sizeof(Entry));
+        entry = host_malloc(sizeof(Entry));
         if (!entry) {
-            host_abortf("map_delete: arena OOM (requested %zu bytes for Entry)",
-                        sizeof(Entry));
+            host_abortf(
+                "map_delete: host_malloc OOM (requested %zu bytes for Entry)",
+                sizeof(Entry));
         }
         entry->stamp = stamp;
         entry->is_tombstone = true;
+        // A tombstone holds no live composite; give value a safe sentinel so
+        // nothing ever releases an uninitialized handle.
+        entry->value = element_scalar(scalar_null());
         HashTableInsertResult r =
             hashtable_insert(map->entries, key, key_len, entry);
         if (r != HASHTABLE_OK) {
@@ -137,10 +169,12 @@ void map_merge(Map *dst, const Map *src) {
             de->value.kind != ELEMENT_SCALAR) {
             if (!elementid_eq(element_id(de->value), element_id(se->value))) {
                 // Distinct logical elements at the same slot. LWW the
-                // slot; if src wins, replace dst's composite with a
-                // clone of src's. Loser is orphaned.
+                // slot; if src wins, replace dst's composite with a clone of
+                // src's and displace + release the loser.
                 if (stamp_gt(se->stamp, de->stamp)) {
-                    de->value = element_clone(dst->arena, se->value);
+                    element_displace(de->value);
+                    element_release(de->value);
+                    de->value = element_clone(se->value);
                     de->stamp = se->stamp;
                 }
                 continue;
@@ -162,14 +196,17 @@ void map_merge(Map *dst, const Map *src) {
 
         // Skip the clone+set if src would lose LWW — map_set would do the
         // same stamp check internally and discard the work, but element_clone
-        // on a composite is deep recursive and leaks into dst's arena even
-        // when the value is never installed.
+        // on a composite is deep recursive and would leak a never-installed
+        // refcounted copy when the value never wins.
         if (dst_has && !stamp_gt(se->stamp, de->stamp)) {
             continue;
         }
 
-        Element cloned = element_clone(dst->arena, se->value);
+        // map_set acquires the slot's own ref (and deep-copies a scalar), so
+        // drop this clone's create-ref afterward — the slot is the sole owner.
+        Element cloned = element_clone(se->value);
         map_set(dst, k, klen, cloned, se->stamp);
+        element_release(cloned);
     }
 }
 
@@ -199,12 +236,18 @@ Counter *map_counter(Map *map, const void *key, size_t key_len, Stamp stamp) {
     }
 
     ElementId id = elementid_derive(map->id, key, key_len, ELEMENT_COUNTER);
-    Counter *fresh = counter_create(map->arena, id);
+    Counter *fresh = counter_create(id); // create-ref: rc = 1
     if (!present || stamp_gt(stamp, existing->stamp)) {
+        // Installed: map_set acquires the slot's ref (rc = 2). Drop our
+        // create-ref so the slot is the sole owner and the returned handle is
+        // a borrow (rc = 1).
         map_set(map, key, key_len, element_counter(fresh), stamp);
+        counter_release(fresh);
+    } else {
+        // Detached when LWW lost: never installed, so born displaced. The
+        // caller owns this rc = 1 handle and must release it.
+        counter_displace(fresh);
     }
-    // Detached when LWW lost: returned anyway so caller always gets a usable
-    // handle.
     return fresh;
 }
 
@@ -219,9 +262,17 @@ Register *map_register(Map *map, const void *key, size_t key_len, Scalar seed,
     }
 
     ElementId id = elementid_derive(map->id, key, key_len, ELEMENT_REGISTER);
-    Register *fresh = register_create(map->arena, id, seed, stamp);
+    Register *fresh = register_create(id, seed, stamp); // create-ref: rc = 1
     if (!present || stamp_gt(stamp, existing->stamp)) {
+        // Installed: map_set acquires the slot's ref (rc = 2). Drop our
+        // create-ref so the slot is the sole owner and the returned handle is
+        // a borrow (rc = 1).
         map_set(map, key, key_len, element_register(fresh), stamp);
+        register_release(fresh);
+    } else {
+        // Detached when LWW lost: never installed, so born displaced. The
+        // caller owns this rc = 1 handle and must release it.
+        register_displace(fresh);
     }
     return fresh;
 }
@@ -236,31 +287,42 @@ Map *map_map(Map *map, const void *key, size_t key_len, Stamp stamp) {
     }
 
     ElementId id = elementid_derive(map->id, key, key_len, ELEMENT_MAP);
-    Map *fresh = map_create(map->arena, id);
+    Map *fresh = map_create(id); // create-ref: rc = 1
     if (!present || stamp_gt(stamp, existing->stamp)) {
+        // Installed: map_set acquires the slot's ref (rc = 2). Drop our
+        // create-ref so the slot is the sole owner and the returned handle is
+        // a borrow (rc = 1).
         map_set(map, key, key_len, element_map(fresh), stamp);
+        map_release(fresh);
+    } else {
+        // Detached when LWW lost: never installed, so born displaced. The
+        // caller owns this rc = 1 handle and must release it.
+        map_displace(fresh);
     }
     return fresh;
 }
 
-Map *map_clone(Arena *arena, const Map *map) {
-    Map *clone = map_create(arena, map->id);
+Map *map_clone(const Map *map) {
+    Map *clone = map_create(map->id);
     HashTableIter it = hashtable_iter(map->entries);
     const void *k;
     size_t klen;
     void *v;
     while (hashtable_iter_next(&it, &k, &klen, &v)) {
         Entry *entry = v;
-        Entry *copy = arena_alloc(clone->arena, sizeof(Entry));
+        Entry *copy = host_malloc(sizeof(Entry));
         if (!copy) {
-            host_abortf("map_clone: arena OOM (requested %zu bytes for Entry)",
-                        sizeof(Entry));
+            host_abortf(
+                "map_clone: host_malloc OOM (requested %zu bytes for Entry)",
+                sizeof(Entry));
         }
 
         copy->stamp = entry->stamp;
         copy->is_tombstone = entry->is_tombstone;
         if (!entry->is_tombstone) {
-            copy->value = element_clone(clone->arena, entry->value);
+            copy->value = element_clone(entry->value);
+        } else {
+            copy->value = element_scalar(scalar_null());
         }
         HashTableInsertResult r =
             hashtable_insert(clone->entries, k, klen, copy);
@@ -271,3 +333,28 @@ Map *map_clone(Arena *arena, const Map *map) {
     }
     return clone;
 }
+
+void map_acquire(Map *map) { map->refcount++; }
+void map_release(Map *map) {
+    if (map->refcount == 0) {
+        host_abort("map_release: refcount already zero");
+    }
+    if (--map->refcount == 0) {
+        HashTableIter it = hashtable_iter(map->entries);
+        const void *k;
+        size_t klen;
+        void *v;
+        while (hashtable_iter_next(&it, &k, &klen, &v)) {
+            Entry *entry = v;
+            if (!entry->is_tombstone) {
+                element_release(entry->value);
+            }
+            host_free(entry);
+        }
+        hashtable_destroy(map->entries);
+        host_free(map);
+    }
+}
+
+void map_displace(Map *map) { map->displaced = true; }
+bool map_is_displaced(const Map *map) { return map->displaced; }

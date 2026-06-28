@@ -19,3 +19,20 @@ jobs:
 
       - name: Build and run tests
         run: make test
+
+  sanitize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang make
+
+      # AddressSanitizer + UndefinedBehaviorSanitizer, with LeakSanitizer
+      # (bundled into ASan on Linux, on by default) gating memory leaks.
+      # -fno-sanitize-recover=all makes UBSan findings fail the build.
+      - name: Build and run tests (ASan + UBSan + LSan)
+        run: make test CFLAGS="-Wall -Wextra -g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1

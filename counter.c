@@ -1,12 +1,13 @@
 #include "counter.h"
-#include "arena.h"
 #include "hashtable.h"
 #include "host.h"
 
 struct Counter {
     ElementId id;
-    Arena *arena;
     HashTable *entries; // ClientId -> CounterEntry
+
+    size_t refcount;
+    bool displaced;
 };
 
 static inline uint32_t max_u32(uint32_t a, uint32_t b) {
@@ -16,20 +17,22 @@ static inline uint32_t max_u32(uint32_t a, uint32_t b) {
     return b;
 }
 
-Counter *counter_create(Arena *arena, ElementId id) {
-    Counter *counter = arena_alloc(arena, sizeof(Counter));
+Counter *counter_create(ElementId id) {
+    Counter *counter = host_malloc(sizeof(Counter));
     if (!counter) {
         host_abortf(
-            "counter_create: arena OOM (requested %zu bytes for Counter)",
+            "counter_create: host_malloc OOM (requested %zu bytes for Counter)",
             sizeof(Counter));
     }
     counter->id = id;
-    counter->arena = arena;
-    counter->entries = hashtable_create(arena);
+    counter->entries = hashtable_create();
     if (!counter->entries) {
+        host_free(counter);
         host_abort("counter_create: hashtable_create OOM (per-client tallies "
                    "table)");
     }
+    counter->refcount = 1;
+    counter->displaced = false;
     return counter;
 }
 
@@ -43,10 +46,11 @@ static CounterEntry *counter_entry_for(Counter *counter, ClientId client_id) {
                       &entry_ptr)) {
         return entry_ptr;
     }
-    CounterEntry *entry = arena_alloc(counter->arena, sizeof *entry);
+    CounterEntry *entry = host_malloc(sizeof *entry);
     if (!entry) {
-        host_abortf("counter: arena OOM (requested %zu bytes for CounterEntry)",
-                    sizeof *entry);
+        host_abortf(
+            "counter: host_malloc OOM (requested %zu bytes for CounterEntry)",
+            sizeof *entry);
     }
     entry->client_id = client_id;
     entry->inc = 0;
@@ -87,10 +91,10 @@ void counter_merge(Counter *dst, const Counter *src) {
             dst_entry->inc = max_u32(dst_entry->inc, src_entry->inc);
             dst_entry->dec = max_u32(dst_entry->dec, src_entry->dec);
         } else {
-            CounterEntry *copy = arena_alloc(dst->arena, sizeof *copy);
+            CounterEntry *copy = host_malloc(sizeof *copy);
             if (!copy) {
-                host_abortf("counter_merge: arena OOM (requested %zu bytes for "
-                            "CounterEntry)",
+                host_abortf("counter_merge: host_malloc OOM (requested %zu "
+                            "bytes for CounterEntry)",
                             sizeof *copy);
             }
             *copy = *src_entry;
@@ -112,19 +116,18 @@ void counter_dec(Counter *counter, ClientId client_id, uint32_t amount) {
     counter_entry_for(counter, client_id)->dec += amount;
 }
 
-Counter *counter_clone(Arena *arena, const Counter *counter) {
-    Counter *clone = counter_create(arena, counter->id);
+Counter *counter_clone(const Counter *counter) {
+    Counter *clone = counter_create(counter->id);
     HashTableIter it = hashtable_iter(counter->entries);
     const void *key;
     size_t key_len;
     void *value;
     while (hashtable_iter_next(&it, &key, &key_len, &value)) {
         CounterEntry *entry = value;
-        CounterEntry *entry_copy =
-            arena_alloc(clone->arena, sizeof *entry_copy);
+        CounterEntry *entry_copy = host_malloc(sizeof *entry_copy);
         if (!entry_copy) {
-            host_abortf("counter_clone: arena OOM (requested %zu bytes for "
-                        "CounterEntry)",
+            host_abortf("counter_clone: host_malloc OOM (requested %zu bytes "
+                        "for CounterEntry)",
                         sizeof *entry_copy);
         }
         *entry_copy = *entry;
@@ -137,3 +140,29 @@ Counter *counter_clone(Arena *arena, const Counter *counter) {
     }
     return clone;
 }
+
+void counter_acquire(Counter *counter) { counter->refcount++; }
+
+void counter_release(Counter *counter) {
+    if (counter->refcount == 0) {
+        host_abort("counter_release: refcount already zero");
+    }
+    counter->refcount--;
+    if (counter->refcount == 0) {
+        // Per-client entries were host_malloc'd individually; free each before
+        // tearing down the table.
+        HashTableIter it = hashtable_iter(counter->entries);
+        const void *key;
+        size_t key_len;
+        void *value;
+        while (hashtable_iter_next(&it, &key, &key_len, &value)) {
+            host_free(value);
+        }
+        hashtable_destroy(counter->entries);
+        host_free(counter);
+    }
+}
+
+void counter_displace(Counter *counter) { counter->displaced = true; }
+
+bool counter_is_displaced(const Counter *counter) { return counter->displaced; }
