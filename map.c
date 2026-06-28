@@ -58,6 +58,17 @@ void map_set(Map *map, const void *key, size_t key_len, Element value,
     bool present = hashtable_get(map->entries, key, key_len, (void **)&entry);
     bool update = !present || stamp_gt(stamp, entry->stamp);
     if (update) {
+        // Re-setting the exact composite already installed in the slot: just
+        // advance the stamp. Acquiring then displacing + releasing it would
+        // spuriously flag a still-installed handle as displaced (and churn its
+        // refcount). The union aliases all composite pointers, so comparing
+        // as.counter compares the stored pointer regardless of kind.
+        if (present && !entry->is_tombstone && value.kind != ELEMENT_SCALAR &&
+            value.kind == entry->value.kind &&
+            value.as.counter == entry->value.as.counter) {
+            entry->stamp = stamp;
+            return;
+        }
         element_acquire(value);
         if (!present) {
             entry = host_malloc(sizeof(Entry));

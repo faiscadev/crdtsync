@@ -749,6 +749,26 @@ TEST(delete_composite_displaces_it) {
     map_release(m);
 }
 
+// Re-setting the exact composite already in the slot (newer stamp) must NOT
+// mark it displaced — it is still installed — and must not churn its refcount.
+TEST(set_same_composite_newer_stamp_keeps_it_live) {
+    Map *m = fresh();
+    Counter *c = counter_create(default_id());
+    counter_inc(c, cid(1), 5);
+    map_set(m, SK("votes"), element_counter(c), stmp(1, 1));
+    counter_release(c); // slot owns the sole ref
+
+    // Same pointer, higher stamp.
+    map_set(m, SK("votes"), element_counter(c), stmp(5, 1));
+
+    ASSERT(counter_is_displaced(c) == false); // still installed, not orphaned
+    Element out;
+    ASSERT(map_get(m, SK("votes"), &out) == true);
+    ASSERT(out.as.counter == c);
+    ASSERT_EQ(counter_read(out.as.counter), 5);
+    map_release(m); // frees c exactly once (refcount stayed 1)
+}
+
 // --- cross-replica composite LWW: clone winner, displace+release loser ---
 
 TEST(merge_composite_src_wins_into_empty_slot_clones) {
@@ -1344,6 +1364,7 @@ int main(void) {
     RUN(set_different_kind_composite_displaces_at_lww);
     RUN(evicted_composite_is_displaced_and_outlives_via_held_ref);
     RUN(delete_composite_displaces_it);
+    RUN(set_same_composite_newer_stamp_keeps_it_live);
 
     RUN(merge_composite_src_wins_into_empty_slot_clones);
     RUN(merge_does_not_clone_when_src_loses_lww);

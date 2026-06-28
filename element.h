@@ -21,6 +21,13 @@
 // _release / _displace / _is_displaced forward to the underlying composite
 // (SCALAR is a no-op for acquire/displace and scalar_free on release). Callers
 // are responsible for keeping pointed-to composites alive via the refcount.
+//
+// Sharp edge: element_release on a SCALAR frees the value's string bytes
+// (scalar_free), so it is valid ONLY on an OWNED scalar — one produced by
+// element_clone, or stored in a container that owns its copy (e.g. a Map slot,
+// which clones on set). Do NOT call it on a borrowed-buffer scalar such as
+// element_scalar(scalar_string(...)) or on a SCALAR Element returned by
+// map_get — that would free memory still owned by the caller or the Map.
 
 #include "counter.h"
 #include "elementid.h"
