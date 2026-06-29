@@ -24,8 +24,11 @@ pub mod map;
 pub mod register;
 
 pub use clientid::ClientId;
+pub use counter::Counter;
 pub use element::{Element, ElementKind};
 pub use elementid::ElementId;
 pub use host::Host;
+pub use map::Map;
+pub use register::Register;
 pub use scalar::Scalar;
 pub use stamp::Stamp;
