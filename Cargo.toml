@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/ffi"]
+
+# Rust rewrite of the CRDT core. See RUST_REWRITE_PLAN.md.
+# The C sources at the repo root remain until the port reaches parity, then
+# they are removed.

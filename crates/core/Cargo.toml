@@ -1,0 +1,11 @@
+[package]
+name = "crdtsync-core"
+version = "0.0.0"
+edition = "2021"
+description = "Portable CRDT core: refcounted lifecycle, Share slot semantics, no I/O."
+
+[dependencies]
+# v5 (SHA-1-based, deterministic) for ElementId derivation. No "v7"/"rng"
+# feature on purpose: ClientId v7 is built from injected Host entropy + clock,
+# so we avoid pulling getrandom into the core (keeps wasm/embedding clean).
+uuid = { version = "1", default-features = false, features = ["v5"] }

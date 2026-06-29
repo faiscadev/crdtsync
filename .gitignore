@@ -37,3 +37,7 @@ a.out
 .idea/
 *.swp
 .DS_Store
+
+# Rust
+/target
+Cargo.lock
