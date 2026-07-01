@@ -35,6 +35,8 @@ jobs:
       # The SDK loads the cdylib at runtime; build it, then run pytest.
       - name: Build the native library
         run: cargo build -p crdtsync-ffi
+      - name: Install pytest
+        run: python -m pip install --upgrade pytest
       - name: Test
         run: python -m pytest -q
         working-directory: sdks/python
