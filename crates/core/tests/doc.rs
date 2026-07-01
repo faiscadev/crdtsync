@@ -1,13 +1,12 @@
-//! Document — the top-level replica: a root Map, a lamport clock, and the
+//! Document — the top-level replica: a tree of Maps, a lamport clock, and the
 //! transact/apply seam that turns editing intentions into ops and ops back
 //! into state.
 //!
-//! Scope here is the root-level document. A `transact` mutates the live tree
-//! and returns the ops it emitted; `apply` folds a foreign op back in. Two
-//! documents that exchange ops converge regardless of arrival order. Ops are
-//! keyed by `(client, seq)` for idempotent dedup, ordered by their stamp for
-//! LWW, and route to map children by key (the receiver re-derives the child
-//! id), so no separate "create element" op is needed.
+//! A `transact` mutates the live tree through a cursor and returns the ops it
+//! emitted; `apply` folds a foreign op back in. Two documents that exchange
+//! ops converge regardless of arrival order. Ops are keyed by `(client, seq)`
+//! for idempotent dedup, ordered by their stamp for LWW, and target a Map by
+//! id plus a slot key; a nested map is reached by resolving that target.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::{Op, OpId, OpKind};
@@ -294,4 +293,94 @@ fn apply_ignores_ops_for_a_foreign_target() {
     let mut d = doc(1);
     assert!(!d.apply(&foreign));
     assert!(d.get(b"k").is_none());
+}
+
+// --- nested maps ---
+
+use crdtsync_core::Map;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+fn child_map(e: Option<Element>) -> Rc<RefCell<Map>> {
+    match e {
+        Some(Element::Map(m)) => m,
+        _ => panic!("expected a nested Map"),
+    }
+}
+
+#[test]
+fn nested_map_edit_reads_back() {
+    let mut d = doc(1);
+    d.transact(|tx| {
+        let mut sub = tx.map(b"profile");
+        sub.register(b"age", Scalar::Int(30));
+    });
+    let profile = child_map(d.get(b"profile"));
+    let age = profile.borrow().get(b"age");
+    assert_eq!(int(age), 30);
+}
+
+#[test]
+fn nested_edit_converges_on_a_peer() {
+    let mut a = doc(1);
+    let ops = a.transact(|tx| {
+        let mut sub = tx.map(b"p");
+        sub.inc(b"hits", 4);
+    });
+    let mut b = doc(2);
+    replay(&mut b, &ops);
+    let p = child_map(b.get(b"p"));
+    let hits = p.borrow().get(b"hits");
+    assert_eq!(counter(hits), 4);
+}
+
+#[test]
+fn deeply_nested_maps() {
+    let mut d = doc(1);
+    d.transact(|tx| {
+        let mut a = tx.map(b"a");
+        let mut b = a.map(b"b");
+        b.register(b"deep", Scalar::Int(7));
+    });
+    let a = child_map(d.get(b"a"));
+    let b = child_map(a.borrow().get(b"b"));
+    assert_eq!(int(b.borrow().get(b"deep")), 7);
+}
+
+#[test]
+fn concurrent_edits_to_the_same_nested_map_merge() {
+    // Both clients create "shared" (same derived id) and write different keys.
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let oa = a.transact(|tx| {
+        let mut s = tx.map(b"shared");
+        s.register(b"x", Scalar::Int(1));
+    });
+    let ob = b.transact(|tx| {
+        let mut s = tx.map(b"shared");
+        s.register(b"y", Scalar::Int(2));
+    });
+
+    replay(&mut a, &ob);
+    replay(&mut b, &oa);
+
+    let sa = child_map(a.get(b"shared"));
+    let sb = child_map(b.get(b"shared"));
+    assert_eq!(int(sa.borrow().get(b"x")), int(sb.borrow().get(b"x")));
+    assert_eq!(int(sa.borrow().get(b"y")), int(sb.borrow().get(b"y")));
+    assert_eq!(int(sa.borrow().get(b"x")), 1);
+    assert_eq!(int(sa.borrow().get(b"y")), 2);
+}
+
+#[test]
+fn nested_ops_target_the_child_map_not_root() {
+    // A nested edit must not write into the root slot of the same key.
+    let mut d = doc(1);
+    d.transact(|tx| {
+        let mut sub = tx.map(b"n");
+        sub.register(b"n", Scalar::Int(5)); // key "n" inside the nested map "n"
+    });
+    // Root "n" is the nested Map, not the register 5.
+    let n = child_map(d.get(b"n"));
+    assert_eq!(int(n.borrow().get(b"n")), 5);
 }
