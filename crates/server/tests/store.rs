@@ -1,0 +1,261 @@
+// Real filesystem I/O, which Miri does not model.
+#![cfg(not(miri))]
+
+//! Store — the durable, append-only op log behind the hub.
+//!
+//! A [`Store`] persists each room's ops to disk so a restarted node replays
+//! back to the same state. One append-only file per room; each op is one
+//! record, framed as a `u32` little-endian length prefix followed by its
+//! `encode_op` bytes. `append` is durable — a second handle (a restart) sees
+//! ops the moment the call returns. Loading tolerates a torn tail (a record
+//! half-written when the process died) but rejects a complete, corrupt record.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+
+use crdtsync_core::doc::Document;
+use crdtsync_core::{encode_op, ClientId, Op, Scalar};
+use crdtsync_server::store::Store;
+use crdtsync_server::RoomId;
+
+fn cid(first: u8) -> ClientId {
+    let mut b = [0u8; 16];
+    b[0] = first;
+    ClientId::from_bytes(b)
+}
+
+/// A couple of real ops from client `first`, distinct per call site via `key`.
+fn ops(first: u8, key: &[u8], value: i64) -> Vec<Op> {
+    Document::new(cid(first)).transact(|tx| tx.register(key, Scalar::Int(value)))
+}
+
+/// Frame an op the way the store does: `u32` LE length prefix, then its bytes.
+fn frame(op: &Op) -> Vec<u8> {
+    let body = encode_op(op);
+    let mut rec = (body.len() as u32).to_le_bytes().to_vec();
+    rec.extend(body);
+    rec
+}
+
+/// The single file in a store's root (each test writes exactly one room).
+fn sole_file(root: &std::path::Path) -> std::path::PathBuf {
+    let mut entries: Vec<_> = fs::read_dir(root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1, "expected exactly one room file");
+    entries.pop().unwrap()
+}
+
+/// The ops loaded for `room`, or panic if the room is absent.
+fn loaded(store: &Store, room: &[u8]) -> Vec<Op> {
+    let logs = store.load().unwrap();
+    logs.into_iter()
+        .find(|(r, _)| r == room)
+        .map(|(_, ops)| ops)
+        .unwrap_or_else(|| panic!("room not found in load"))
+}
+
+const ROOM: &[u8] = b"room-1";
+
+// --- open ---
+
+#[test]
+fn open_creates_a_missing_root() {
+    let tmp = tempdir();
+    let root = tmp.path().join("nested/does/not/exist");
+    assert!(!root.exists());
+    Store::open(&root).unwrap();
+    assert!(root.is_dir());
+}
+
+#[test]
+fn loading_an_empty_store_yields_no_rooms() {
+    let tmp = tempdir();
+    let store = Store::open(tmp.path()).unwrap();
+    assert!(store.load().unwrap().is_empty());
+}
+
+// --- append / load round-trip ---
+
+#[test]
+fn appended_ops_load_back_in_order() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let ops = ops(1, b"age", 30);
+    store.append(ROOM, &ops).unwrap();
+    assert_eq!(loaded(&store, ROOM), ops);
+}
+
+#[test]
+fn appends_accumulate_across_calls() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let first = ops(1, b"a", 1);
+    let second = ops(1, b"b", 2);
+    store.append(ROOM, &first).unwrap();
+    store.append(ROOM, &second).unwrap();
+
+    let mut want = first;
+    want.extend(second);
+    assert_eq!(loaded(&store, ROOM), want);
+}
+
+#[test]
+fn an_empty_append_writes_nothing() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.append(ROOM, &[]).unwrap();
+    // No records, so no room surfaces on load.
+    assert!(store.load().unwrap().is_empty());
+}
+
+#[test]
+fn rooms_are_stored_independently() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let a = ops(1, b"k", 1);
+    let b = ops(2, b"k", 2);
+    store.append(b"room-a", &a).unwrap();
+    store.append(b"room-b", &b).unwrap();
+
+    assert_eq!(loaded(&store, b"room-a"), a);
+    assert_eq!(loaded(&store, b"room-b"), b);
+    assert_eq!(store.load().unwrap().len(), 2);
+}
+
+#[test]
+fn a_room_id_of_arbitrary_bytes_round_trips_without_escaping() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    // Bytes a filename can't hold verbatim: a separator, dot-dot, and non-utf8.
+    let room: RoomId = vec![0xff, 0x00, b'/', b'.', b'.', b'/', 0xfe];
+    let ops = ops(1, b"x", 7);
+    store.append(&room, &ops).unwrap();
+
+    // The room id survives the encoding exactly, and stays inside the root.
+    assert_eq!(loaded(&store, &room), ops);
+    assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+}
+
+// --- durability ---
+
+#[test]
+fn a_reopened_store_replays_prior_appends() {
+    let tmp = tempdir();
+    let ops = ops(1, b"age", 30);
+    {
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.append(ROOM, &ops).unwrap();
+    }
+    // A restart: a fresh handle over the same root sees the committed log.
+    let reopened = Store::open(tmp.path()).unwrap();
+    assert_eq!(loaded(&reopened, ROOM), ops);
+}
+
+#[test]
+fn an_append_is_visible_to_a_concurrent_handle() {
+    let tmp = tempdir();
+    let mut writer = Store::open(tmp.path()).unwrap();
+    let ops = ops(1, b"age", 30);
+    writer.append(ROOM, &ops).unwrap();
+    // append flushes, so a second handle opened afterward reads it immediately.
+    let reader = Store::open(tmp.path()).unwrap();
+    assert_eq!(loaded(&reader, ROOM), ops);
+}
+
+// --- corruption tolerance ---
+
+#[test]
+fn a_torn_tail_record_is_dropped_and_earlier_ops_survive() {
+    let tmp = tempdir();
+    let mut want;
+    {
+        let mut store = Store::open(tmp.path()).unwrap();
+        let mut batch = ops(1, b"a", 1);
+        batch.extend(ops(1, b"b", 2));
+        store.append(ROOM, &batch).unwrap();
+        want = batch;
+    }
+    // Simulate a crash mid-write: lop a byte off the final record so its length
+    // prefix outruns the bytes present.
+    let file = sole_file(tmp.path());
+    let len = fs::metadata(&file).unwrap().len();
+    OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_len(len - 1)
+        .unwrap();
+
+    // The intact first record still loads; the torn tail is discarded.
+    want.pop();
+    let store = Store::open(tmp.path()).unwrap();
+    assert_eq!(loaded(&store, ROOM), want);
+}
+
+#[test]
+fn a_complete_but_undecodable_record_is_an_error() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.append(ROOM, &ops(1, b"a", 1)).unwrap();
+
+    // Append a fully-present record whose body is not a decodable op. This is
+    // real corruption, not a torn tail, so loading must surface it.
+    let file = sole_file(tmp.path());
+    let garbage = {
+        let body = [0xffu8, 0xff, 0xff];
+        let mut rec = (body.len() as u32).to_le_bytes().to_vec();
+        rec.extend(body);
+        rec
+    };
+    OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .unwrap()
+        .write_all(&garbage)
+        .unwrap();
+
+    assert!(Store::open(tmp.path()).unwrap().load().is_err());
+}
+
+#[test]
+fn framing_matches_a_length_prefixed_encode_op() {
+    // The on-disk record format is stable contract: readers of an older file
+    // must keep decoding it. One op is its `u32` LE length prefix then bytes.
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let op = ops(1, b"age", 30);
+    store.append(ROOM, &op).unwrap();
+
+    let on_disk = fs::read(sole_file(tmp.path())).unwrap();
+    assert_eq!(on_disk, frame(&op[0]));
+}
+
+// --- a tempdir without pulling in a dev-dependency ---
+
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempdir() -> TempDir {
+    // A process- and test-unique directory under the OS temp root.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("crdtsync-store-{pid}-{n}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    TempDir(dir)
+}

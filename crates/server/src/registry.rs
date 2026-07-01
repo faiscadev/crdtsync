@@ -7,10 +7,11 @@
 //! pumps bytes through it.
 
 use std::collections::HashMap;
+use std::io;
 
 use crdtsync_core::{ClientId, Message};
 
-use crate::{step, Hub, Session};
+use crate::{step, Hub, Session, Store};
 
 /// A live connection's handle, minted by [`Registry::connect`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -22,21 +23,35 @@ struct Conn {
     outbox: Vec<Message>,
 }
 
-/// The set of live connections sharing one hub.
+/// The set of live connections sharing one hub, optionally over a durable log.
 pub struct Registry {
     hub: Hub,
     conns: HashMap<ConnId, Conn>,
     next: u64,
+    store: Option<Store>,
 }
 
 impl Registry {
-    /// A registry whose hub's replicas are owned by `server`.
+    /// An in-memory registry whose hub's replicas are owned by `server`.
     pub fn new(server: ClientId) -> Self {
         Self {
             hub: Hub::new(server),
             conns: HashMap::new(),
             next: 0,
+            store: None,
         }
+    }
+
+    /// A registry backed by `store`: its hub replays the persisted log, and
+    /// every op it ingests is appended before it fans out to peers.
+    pub fn with_store(server: ClientId, store: Store) -> io::Result<Self> {
+        let hub = Hub::from_logs(server, store.load()?);
+        Ok(Self {
+            hub,
+            conns: HashMap::new(),
+            next: 0,
+            store: Some(store),
+        })
     }
 
     /// Open a connection, returning its handle.
@@ -73,6 +88,14 @@ impl Registry {
         };
         if !broadcast.is_empty() {
             if let Some(room) = room {
+                // Persist before broadcasting: a node that cannot durably
+                // record a write must not advertise it to peers. A failed
+                // append closes this connection and drops the fan-out.
+                if let Some(store) = &mut self.store {
+                    if store.append(&room, &broadcast).is_err() {
+                        return false;
+                    }
+                }
                 for (peer, conn) in self.conns.iter_mut() {
                     if *peer != id && conn.session.room() == Some(room.as_slice()) {
                         conn.outbox.push(Message::Ops(broadcast.clone()));

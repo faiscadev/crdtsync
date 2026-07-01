@@ -52,7 +52,7 @@ impl Drop for Server {
 async fn start_server() -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(serve(listener, cid(0xFF)));
+    let task = tokio::spawn(serve(listener, cid(0xFF), None));
     Server {
         url: format!("ws://{addr}"),
         task,

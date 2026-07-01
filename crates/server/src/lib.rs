@@ -15,8 +15,10 @@ use crdtsync_core::{ClientId, Document, Element, Op};
 pub mod registry;
 pub mod runtime;
 pub mod session;
+pub mod store;
 pub use registry::{ConnId, Registry};
 pub use session::{negotiate, step, Response, Session};
+pub use store::Store;
 
 /// A room name, opaque bytes chosen by the deployment.
 pub type RoomId = Vec<u8>;
@@ -52,6 +54,17 @@ impl Hub {
             server,
             rooms: HashMap::new(),
         }
+    }
+
+    /// A hub rebuilt by replaying each room's persisted log. Replaying the ops
+    /// restores the merged state, the server sequence, and the dedup set, so a
+    /// reloaded node is indistinguishable from the one that wrote the log.
+    pub fn from_logs(server: ClientId, logs: Vec<(RoomId, Vec<Op>)>) -> Self {
+        let mut hub = Self::new(server);
+        for (room, ops) in logs {
+            hub.ingest(&room, ops);
+        }
+        hub
     }
 
     /// Apply a client's ops to `room` (creating it if new), skipping any op
