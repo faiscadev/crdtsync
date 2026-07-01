@@ -68,15 +68,19 @@ pub fn decode_ops(bytes: &[u8]) -> Result<Vec<Op>, DecodeError> {
 
 // --- encode ---
 
-fn put_u8(out: &mut Vec<u8>, v: u8) {
+pub(crate) fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
 }
 
-fn put_u32(out: &mut Vec<u8>, v: u32) {
+pub(crate) fn put_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn put_u64(out: &mut Vec<u8>, v: u64) {
+pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+pub(crate) fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
@@ -90,7 +94,7 @@ fn len_u32(n: usize) -> u32 {
     u32::try_from(n).expect("codec: length exceeds 4 GiB")
 }
 
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_u32(out, len_u32(b.len()));
     out.extend_from_slice(b);
 }
@@ -215,17 +219,27 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
 
 // --- decode ---
 
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+    /// Whether every byte has been consumed — the total-decode check.
+    pub(crate) fn at_end(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+
+    /// The bytes not yet consumed.
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
+    }
+
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         let end = self.pos.checked_add(n).ok_or(DecodeError::UnexpectedEof)?;
         let slice = self
             .buf
@@ -241,17 +255,23 @@ impl<'a> Cursor<'a> {
         Ok(a)
     }
 
-    fn u8(&mut self) -> Result<u8, DecodeError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, DecodeError> {
+    pub(crate) fn u16(&mut self) -> Result<u16, DecodeError> {
+        let mut a = [0u8; 2];
+        a.copy_from_slice(self.take(2)?);
+        Ok(u16::from_le_bytes(a))
+    }
+
+    pub(crate) fn u32(&mut self) -> Result<u32, DecodeError> {
         let mut a = [0u8; 4];
         a.copy_from_slice(self.take(4)?);
         Ok(u32::from_le_bytes(a))
     }
 
-    fn u64(&mut self) -> Result<u64, DecodeError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, DecodeError> {
         let mut a = [0u8; 8];
         a.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(a))
@@ -263,12 +283,12 @@ impl<'a> Cursor<'a> {
         Ok(i64::from_le_bytes(a))
     }
 
-    fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
+    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
         let len = self.u32()? as usize;
         Ok(self.take(len)?.to_vec())
     }
 
-    fn string(&mut self) -> Result<String, DecodeError> {
+    pub(crate) fn string(&mut self) -> Result<String, DecodeError> {
         let len = self.u32()? as usize;
         let raw = self.take(len)?;
         std::str::from_utf8(raw)
@@ -276,7 +296,7 @@ impl<'a> Cursor<'a> {
             .map_err(|_| DecodeError::BadUtf8)
     }
 
-    fn client(&mut self) -> Result<ClientId, DecodeError> {
+    pub(crate) fn client(&mut self) -> Result<ClientId, DecodeError> {
         Ok(ClientId::from_bytes(self.array16()?))
     }
 
