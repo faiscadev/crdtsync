@@ -504,6 +504,38 @@ fn concurrent_list_inserts_converge_without_interleaving() {
 }
 
 #[test]
+fn a_re_navigated_list_defends_its_slot_against_a_stale_scalar() {
+    // Re-entering a list to edit it re-stamps its parent slot, so a scalar set
+    // carrying a lower stamp can no longer displace the list — the ListCreate
+    // has to advance the slot stamp, matching register/counter child ops.
+    let mut d = doc(1);
+    d.transact(|tx| tx.list(b"cards").insert(0, sb(b'x')));
+    d.transact(|tx| {
+        for _ in 0..3 {
+            tx.set(b"pad", Scalar::Int(0));
+        }
+    });
+    d.transact(|tx| tx.list(b"cards").insert(1, sb(b'y')));
+
+    // A stale scalar set, stamped below the list's re-navigation, must lose.
+    let stale = Op::new(
+        OpId {
+            client: cid(9),
+            seq: 0,
+        },
+        stmp(4, 9),
+        d.root_id(),
+        OpKind::MapSet {
+            key: b"cards".to_vec(),
+            value: Scalar::Int(0),
+        },
+    );
+    d.apply(&stale);
+
+    assert_eq!(list_str(&child_list(d.get(b"cards"))), "xy");
+}
+
+#[test]
 fn list_in_a_nested_map() {
     let mut d = doc(1);
     d.transact(|tx| {

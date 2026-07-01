@@ -196,6 +196,9 @@ impl Document {
                 OpKind::MapCreate { key } => {
                     let prior = m.get(key);
                     let child = m.map(key, stamp);
+                    // Advance the slot stamp so a re-navigated child defends its
+                    // slot against a stale scalar set.
+                    m.set(key, Element::Map(Rc::clone(&child)), stamp);
                     // A losing create yields a detached, displaced child; only a
                     // reachable one belongs in the index.
                     if !child.borrow().is_displaced() {
@@ -206,6 +209,7 @@ impl Document {
                 OpKind::ListCreate { key } => {
                     let prior = m.get(key);
                     let child = m.list(key, stamp);
+                    m.set(key, Element::List(Rc::clone(&child)), stamp);
                     if !child.borrow().is_displaced() {
                         new_list = Some(Rc::clone(&child));
                     }
