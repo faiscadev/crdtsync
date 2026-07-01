@@ -1,0 +1,126 @@
+//! WebAssembly bindings — the JS SDK end to end, run under wasm.
+//!
+//! Two documents that exchange ops converge. A slot is addressed by a path;
+//! edits return the ops to broadcast and `apply` folds a peer's ops back in.
+//! Run with `wasm-pack test --node crates/wasm`.
+
+use crdtsync_core::path::encode_path;
+use crdtsync_wasm::WasmDocument;
+use wasm_bindgen_test::*;
+
+fn cid(first: u8) -> Vec<u8> {
+    let mut b = vec![0u8; 16];
+    b[0] = first;
+    b
+}
+
+fn doc(first: u8) -> WasmDocument {
+    WasmDocument::new(&cid(first)).ok().unwrap()
+}
+
+fn path(keys: &[&str]) -> Vec<u8> {
+    let keys: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+    encode_path(&keys)
+}
+
+#[wasm_bindgen_test]
+fn a_bad_client_id_is_rejected() {
+    assert!(WasmDocument::new(&[0u8; 4]).is_err());
+}
+
+#[wasm_bindgen_test]
+fn register_reads_back_and_converges() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let p = path(&["age"]);
+    let ops = a.register_int(&p, 30);
+    assert_eq!(a.get_int(&p), Some(30));
+    assert_eq!(b.apply(&ops), 1);
+    assert_eq!(b.get_int(&p), Some(30));
+}
+
+#[wasm_bindgen_test]
+fn a_missing_slot_is_absent() {
+    let a = doc(1);
+    assert_eq!(a.get_int(&path(&["nope"])), None);
+}
+
+#[wasm_bindgen_test]
+fn a_counter_accumulates_across_replicas() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let p = path(&["n"]);
+    let oa = a.inc(&p, 3);
+    let ob = b.inc(&p, 4);
+    b.apply(&oa);
+    a.apply(&ob);
+    assert_eq!(a.get_counter(&p), Some(7));
+    assert_eq!(b.get_counter(&p), Some(7));
+}
+
+#[wasm_bindgen_test]
+fn a_nested_path_converges() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let p = path(&["profile", "stats", "score"]);
+    b.apply(&a.register_int(&p, 7));
+    assert_eq!(b.get_int(&p), Some(7));
+}
+
+#[wasm_bindgen_test]
+fn bytes_round_trip() {
+    let mut a = doc(1);
+    let p = path(&["blob"]);
+    let want = vec![0u8, 1, 255, 0];
+    a.set_bytes(&p, &want);
+    assert_eq!(a.get_bytes(&p), Some(want));
+}
+
+#[wasm_bindgen_test]
+fn delete_removes_a_slot() {
+    let mut a = doc(1);
+    let p = path(&["age"]);
+    a.register_int(&p, 30);
+    a.delete(&p);
+    assert_eq!(a.get_int(&p), None);
+}
+
+#[wasm_bindgen_test]
+fn a_list_converges() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let p = path(&["board", "cards"]);
+    b.apply(&a.list_insert(&p, 0, b"x"));
+    b.apply(&a.list_insert(&p, 1, b"y"));
+    assert_eq!(b.list_len(&p), Some(2));
+    assert_eq!(b.list_get(&p, 0), Some(b"x".to_vec()));
+    // A delete of an absent list is inert.
+    assert!(a.list_delete(&path(&["ghost"]), 0).is_empty());
+    assert_eq!(a.list_len(&path(&["ghost"])), None);
+}
+
+#[wasm_bindgen_test]
+fn a_text_converges_and_deletes() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let p = path(&["doc", "title"]);
+    b.apply(&a.text_insert(&p, 0, "héllo"));
+    assert_eq!(b.text_len(&p), Some(5));
+    assert_eq!(b.text_get(&p), Some("héllo".to_string()));
+    b.apply(&a.text_delete(&p, 1, 3));
+    assert_eq!(b.text_get(&p), Some("ho".to_string()));
+}
+
+#[wasm_bindgen_test]
+fn apply_rejects_garbage() {
+    let mut a = doc(1);
+    assert_eq!(a.apply(&[0xff; 8]), -1);
+}
+
+#[wasm_bindgen_test]
+fn encode_path_frames_keys() {
+    let k1 = js_sys::Uint8Array::from(&b"ab"[..]);
+    let k2 = js_sys::Uint8Array::from(&b"c"[..]);
+    let got = WasmDocument::encode_path(vec![k1, k2]);
+    assert_eq!(got, vec![2, 0, 0, 0, b'a', b'b', 1, 0, 0, 0, b'c']);
+}
