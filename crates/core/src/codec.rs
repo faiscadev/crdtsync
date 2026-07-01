@@ -99,12 +99,12 @@ pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(b);
 }
 
-fn put_stamp(out: &mut Vec<u8>, s: &Stamp) {
+pub(crate) fn put_stamp(out: &mut Vec<u8>, s: &Stamp) {
     put_u64(out, s.lamport);
     out.extend_from_slice(&s.client.as_bytes());
 }
 
-fn put_scalar(out: &mut Vec<u8>, s: &Scalar) {
+pub(crate) fn put_scalar(out: &mut Vec<u8>, s: &Scalar) {
     match s {
         Scalar::Null => put_u8(out, 0),
         Scalar::Bool(b) => {
@@ -300,17 +300,17 @@ impl<'a> Cursor<'a> {
         Ok(ClientId::from_bytes(self.array16()?))
     }
 
-    fn element_id(&mut self) -> Result<ElementId, DecodeError> {
+    pub(crate) fn element_id(&mut self) -> Result<ElementId, DecodeError> {
         Ok(ElementId::from_bytes(self.array16()?))
     }
 
-    fn stamp(&mut self) -> Result<Stamp, DecodeError> {
+    pub(crate) fn stamp(&mut self) -> Result<Stamp, DecodeError> {
         let lamport = self.u64()?;
         let client = self.client()?;
         Ok(Stamp { lamport, client })
     }
 
-    fn scalar(&mut self) -> Result<Scalar, DecodeError> {
+    pub(crate) fn scalar(&mut self) -> Result<Scalar, DecodeError> {
         match self.u8()? {
             0 => Ok(Scalar::Null),
             1 => Ok(Scalar::Bool(self.u8()? != 0)),

@@ -5,6 +5,7 @@
 //! layer can skip op emission for it.
 
 use crate::clientid::ClientId;
+use crate::codec::{put_u32, Cursor, DecodeError};
 use crate::elementid::ElementId;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -32,6 +33,56 @@ impl Counter {
 
     pub fn id(&self) -> ElementId {
         self.id
+    }
+
+    /// Append this counter's state — id and every per-client tally — to `out`.
+    /// Entries are ordered by client so equal states encode identically.
+    pub(crate) fn encode_state_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.id.as_bytes());
+        let mut entries: Vec<(&ClientId, &Tally)> = self.entries.iter().collect();
+        entries.sort_by_key(|(client, _)| client.as_bytes());
+        put_u32(out, entries.len() as u32);
+        for (client, tally) in entries {
+            out.extend_from_slice(&client.as_bytes());
+            put_u32(out, tally.inc);
+            put_u32(out, tally.dec);
+        }
+    }
+
+    /// Read a counter from `cur`, advancing it.
+    pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<Counter, DecodeError> {
+        let id = cur.element_id()?;
+        let count = cur.u32()?;
+        let mut entries = HashMap::with_capacity(count as usize);
+        for _ in 0..count {
+            let client = cur.client()?;
+            let inc = cur.u32()?;
+            let dec = cur.u32()?;
+            entries.insert(client, Tally { inc, dec });
+        }
+        Ok(Counter {
+            id,
+            entries,
+            displaced: Cell::new(false),
+        })
+    }
+
+    /// Serialize this counter's state to self-contained bytes.
+    pub fn encode_state(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_state_into(&mut out);
+        out
+    }
+
+    /// Read a counter from a complete byte slice, rejecting trailing bytes.
+    pub fn decode_state(bytes: &[u8]) -> Result<Counter, DecodeError> {
+        let mut cur = Cursor::new(bytes);
+        let counter = Counter::decode_state_from(&mut cur)?;
+        if cur.at_end() {
+            Ok(counter)
+        } else {
+            Err(DecodeError::TrailingBytes)
+        }
     }
 
     pub fn inc(&mut self, client: ClientId, amount: u32) {
