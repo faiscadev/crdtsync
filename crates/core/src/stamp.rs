@@ -8,10 +8,12 @@ pub struct Stamp {
     pub client: ClientId,
 }
 
-impl Stamp {
-    /// Strictly greater: larger lamport, or equal lamport and larger client id.
-    pub fn gt(&self, other: &Stamp) -> bool {
-        let _ = other;
-        todo!()
+impl PartialOrd for Stamp {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        if self.lamport == other.lamport {
+            Some(self.client.cmp(&other.client))
+        } else {
+            Some(self.lamport.cmp(&other.lamport))
+        }
     }
 }

@@ -15,38 +15,51 @@ pub struct Register {
 
 impl Register {
     pub fn new(id: ElementId, value: Scalar, stamp: Stamp) -> Self {
-        let _ = (id, value, stamp);
-        todo!()
+        Self {
+            id,
+            value,
+            stamp,
+            displaced: Cell::new(false),
+        }
     }
 
     pub fn id(&self) -> ElementId {
-        todo!()
+        self.id
     }
 
     pub fn read(&self) -> &Scalar {
-        todo!()
+        &self.value
     }
 
     /// LWW write: takes effect iff `stamp` strictly beats the current stamp.
     pub fn set(&mut self, value: Scalar, stamp: Stamp) {
-        let _ = (value, stamp);
-        todo!()
+        if stamp > self.stamp {
+            self.value = value;
+            self.stamp = stamp;
+        }
     }
 
-    pub fn merge(&mut self, other: &Register) {
-        let _ = other;
-        todo!()
+    pub fn merge(&mut self, other: &Self) {
+        if other.stamp > self.stamp {
+            self.value = other.value.clone();
+            self.stamp = other.stamp;
+        }
     }
 
-    pub fn deep_clone(&self) -> Register {
-        todo!()
+    pub fn deep_clone(&self) -> Self {
+        Self {
+            id: self.id,
+            value: self.value.clone(),
+            stamp: self.stamp,
+            displaced: Cell::new(false),
+        }
     }
 
     pub fn displace(&self) {
-        todo!()
+        self.displaced.set(true);
     }
 
     pub fn is_displaced(&self) -> bool {
-        todo!()
+        self.displaced.get()
     }
 }
