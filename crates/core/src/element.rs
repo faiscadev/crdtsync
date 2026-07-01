@@ -4,9 +4,11 @@
 
 use crate::counter::Counter;
 use crate::elementid::ElementId;
+use crate::list::List;
 use crate::map::Map;
 use crate::register::Register;
 use crate::scalar::Scalar;
+use crate::text::Text;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -16,6 +18,8 @@ pub enum Element {
     Register(Rc<RefCell<Register>>),
     Counter(Rc<RefCell<Counter>>),
     Map(Rc<RefCell<Map>>),
+    List(Rc<RefCell<List>>),
+    Text(Rc<RefCell<Text>>),
 }
 
 pub use crate::elementid::ElementKind;
@@ -27,6 +31,8 @@ impl Element {
             Element::Register(_) => ElementKind::Register,
             Element::Counter(_) => ElementKind::Counter,
             Element::Map(_) => ElementKind::Map,
+            Element::List(_) => ElementKind::List,
+            Element::Text(_) => ElementKind::Text,
         }
     }
 
@@ -37,6 +43,8 @@ impl Element {
             Element::Register(r) => r.borrow().id(),
             Element::Counter(c) => c.borrow().id(),
             Element::Map(m) => m.borrow().id(),
+            Element::List(l) => l.borrow().id(),
+            Element::Text(t) => t.borrow().id(),
         }
     }
 
@@ -46,6 +54,8 @@ impl Element {
             (Element::Register(d), Element::Register(s)) => d.borrow_mut().merge(&s.borrow()),
             (Element::Counter(d), Element::Counter(s)) => d.borrow_mut().merge(&s.borrow()),
             (Element::Map(d), Element::Map(s)) => d.borrow_mut().merge(&s.borrow()),
+            (Element::List(d), Element::List(s)) => d.borrow_mut().merge(&s.borrow()),
+            (Element::Text(d), Element::Text(s)) => d.borrow_mut().merge(&s.borrow()),
             _ => panic!("element merge: scalar or kind mismatch"),
         }
     }
@@ -59,6 +69,8 @@ impl Element {
             }
             Element::Counter(c) => Element::Counter(Rc::new(RefCell::new(c.borrow().deep_clone()))),
             Element::Map(m) => Element::Map(Rc::new(RefCell::new(m.borrow().deep_clone()))),
+            Element::List(l) => Element::List(Rc::new(RefCell::new(l.borrow().deep_clone()))),
+            Element::Text(t) => Element::Text(Rc::new(RefCell::new(t.borrow().deep_clone()))),
         }
     }
 
@@ -68,6 +80,8 @@ impl Element {
             Element::Register(r) => r.borrow().displace(),
             Element::Counter(c) => c.borrow().displace(),
             Element::Map(m) => m.borrow().displace(),
+            Element::List(l) => l.borrow().displace(),
+            Element::Text(t) => t.borrow().displace(),
         }
     }
 
@@ -77,6 +91,8 @@ impl Element {
             Element::Register(r) => r.borrow().is_displaced(),
             Element::Counter(c) => c.borrow().is_displaced(),
             Element::Map(m) => m.borrow().is_displaced(),
+            Element::List(l) => l.borrow().is_displaced(),
+            Element::Text(t) => t.borrow().is_displaced(),
         }
     }
 }

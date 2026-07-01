@@ -8,9 +8,11 @@
 use crate::counter::Counter;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
+use crate::list::List;
 use crate::register::Register;
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
+use crate::text::Text;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -45,6 +47,8 @@ fn same_composite_kind(a: &Element, b: &Element) -> bool {
         (Element::Counter(_), Element::Counter(_))
             | (Element::Register(_), Element::Register(_))
             | (Element::Map(_), Element::Map(_))
+            | (Element::List(_), Element::List(_))
+            | (Element::Text(_), Element::Text(_))
     )
 }
 
@@ -211,6 +215,36 @@ impl Map {
         if self.wins(key, stamp) {
             self.evict(key);
             self.install(key, Element::Map(Rc::clone(&fresh)), stamp);
+        } else {
+            fresh.borrow().displace();
+        }
+        fresh
+    }
+
+    pub fn list(&mut self, key: &[u8], stamp: Stamp) -> Rc<RefCell<List>> {
+        if let Some(Element::List(l)) = self.live_value(key) {
+            return l;
+        }
+        let id = ElementId::derive(self.id, key, ElementKind::List);
+        let fresh = Rc::new(RefCell::new(List::new(id)));
+        if self.wins(key, stamp) {
+            self.evict(key);
+            self.install(key, Element::List(Rc::clone(&fresh)), stamp);
+        } else {
+            fresh.borrow().displace();
+        }
+        fresh
+    }
+
+    pub fn text(&mut self, key: &[u8], stamp: Stamp) -> Rc<RefCell<Text>> {
+        if let Some(Element::Text(t)) = self.live_value(key) {
+            return t;
+        }
+        let id = ElementId::derive(self.id, key, ElementKind::Text);
+        let fresh = Rc::new(RefCell::new(Text::new(id)));
+        if self.wins(key, stamp) {
+            self.evict(key);
+            self.install(key, Element::Text(Rc::clone(&fresh)), stamp);
         } else {
             fresh.borrow().displace();
         }

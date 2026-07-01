@@ -14,6 +14,8 @@ pub enum ElementKind {
     Register,
     Counter,
     Map,
+    List,
+    Text,
 }
 
 impl ElementId {
