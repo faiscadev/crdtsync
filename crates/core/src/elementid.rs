@@ -6,7 +6,7 @@ use uuid::{Builder, Uuid};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ElementId(Uuid);
 
-/// The four value kinds a Map slot can hold. The discriminant feeds id
+/// The value kinds a Map slot can hold. The discriminant feeds id
 /// derivation, so Counter@"x" and Register@"x" get distinct ids.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ElementKind {
@@ -14,6 +14,8 @@ pub enum ElementKind {
     Register,
     Counter,
     Map,
+    List,
+    Text,
 }
 
 impl ElementId {

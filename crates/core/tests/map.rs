@@ -652,6 +652,74 @@ fn helper_map_returns_same_on_repeat() {
     assert!(Rc::ptr_eq(&first, &second));
 }
 
+#[test]
+fn helper_list_creates_and_installs() {
+    let mut m = fresh();
+    let l = m.list(b"items", stmp(1, 1));
+    match m.get(b"items").unwrap() {
+        Element::List(got) => assert!(Rc::ptr_eq(&got, &l)),
+        _ => panic!("expected list"),
+    }
+}
+
+#[test]
+fn helper_list_returns_same_on_repeat() {
+    let mut m = fresh();
+    let first = m.list(b"items", stmp(1, 1));
+    let second = m.list(b"items", stmp(2, 1));
+    assert!(Rc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn resetting_same_list_handle_advances_stamp_not_displaced() {
+    // Re-setting the exact installed handle at a higher stamp advances the slot
+    // stamp only; the still-installed sequence must not be flagged displaced.
+    let mut m = fresh();
+    let l = m.list(b"items", stmp(1, 1));
+    m.set(b"items", Element::List(Rc::clone(&l)), stmp(5, 1));
+    assert!(!l.borrow().is_displaced());
+    match m.get(b"items").unwrap() {
+        Element::List(got) => assert!(Rc::ptr_eq(&got, &l)),
+        _ => panic!("expected list"),
+    }
+}
+
+#[test]
+fn helper_list_derives_id() {
+    let parent = eid(3, 9);
+    let mut m = Map::new(parent);
+    let l = m.list(b"items", stmp(1, 1));
+    let expected = ElementId::derive(parent, b"items", ElementKind::List);
+    assert_eq!(l.borrow().id(), expected);
+}
+
+#[test]
+fn helper_text_creates_and_installs() {
+    let mut m = fresh();
+    let t = m.text(b"body", stmp(1, 1));
+    match m.get(b"body").unwrap() {
+        Element::Text(got) => assert!(Rc::ptr_eq(&got, &t)),
+        _ => panic!("expected text"),
+    }
+}
+
+#[test]
+fn helper_text_returns_same_on_repeat() {
+    let mut m = fresh();
+    let first = m.text(b"body", stmp(1, 1));
+    let second = m.text(b"body", stmp(2, 1));
+    assert!(Rc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn helper_text_derives_id() {
+    let parent = eid(3, 9);
+    let mut m = Map::new(parent);
+    let t = m.text(b"body", stmp(1, 1));
+    let expected = ElementId::derive(parent, b"body", ElementKind::Text);
+    assert_eq!(t.borrow().id(), expected);
+}
+
 // Winning helper over a different-kind slot flips the kind; the evicted handle
 // is displaced (observed via a retained clone).
 #[test]
@@ -711,6 +779,21 @@ fn helper_counter_cross_replica_merge_recurses() {
     match dst.get(b"votes").unwrap() {
         Element::Counter(got) => assert_eq!(got.borrow().read(), 8),
         _ => panic!("expected counter"),
+    }
+}
+
+#[test]
+fn helper_list_cross_replica_merge_recurses() {
+    let mut dst = fresh();
+    let mut src = fresh();
+    let dl = dst.list(b"items", stmp(1, 1));
+    let sl = src.list(b"items", stmp(1, 2));
+    dl.borrow_mut().insert(0, ei(1), stmp(2, 1));
+    sl.borrow_mut().insert(0, ei(2), stmp(2, 2));
+    dst.merge(&src);
+    match dst.get(b"items").unwrap() {
+        Element::List(got) => assert_eq!(got.borrow().len(), 2),
+        _ => panic!("expected list"),
     }
 }
 

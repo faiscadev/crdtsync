@@ -1,4 +1,4 @@
-use crdtsync_core::{Counter, Element, ElementKind, Map, Register, Scalar};
+use crdtsync_core::{Counter, Element, ElementKind, List, Map, Register, Scalar, Text};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -13,6 +13,12 @@ fn register(id: crdtsync_core::ElementId, v: Scalar) -> Rc<RefCell<Register>> {
 }
 fn map(id: crdtsync_core::ElementId) -> Rc<RefCell<Map>> {
     Rc::new(RefCell::new(Map::new(id)))
+}
+fn list(id: crdtsync_core::ElementId) -> Rc<RefCell<List>> {
+    Rc::new(RefCell::new(List::new(id)))
+}
+fn text(id: crdtsync_core::ElementId) -> Rc<RefCell<Text>> {
+    Rc::new(RefCell::new(Text::new(id)))
 }
 
 // --- constructors set kind ---
@@ -41,6 +47,16 @@ fn map_kind() {
     assert_eq!(Element::Map(map(default_id())).kind(), ElementKind::Map);
 }
 
+#[test]
+fn list_kind() {
+    assert_eq!(Element::List(list(default_id())).kind(), ElementKind::List);
+}
+
+#[test]
+fn text_kind() {
+    assert_eq!(Element::Text(text(default_id())).kind(), ElementKind::Text);
+}
+
 // --- id reads the composite's id ---
 
 #[test]
@@ -59,6 +75,18 @@ fn id_counter() {
 fn id_map() {
     let id = eid(7, 42);
     assert_eq!(Element::Map(map(id)).id(), id);
+}
+
+#[test]
+fn id_list() {
+    let id = eid(7, 42);
+    assert_eq!(Element::List(list(id)).id(), id);
+}
+
+#[test]
+fn id_text() {
+    let id = eid(7, 42);
+    assert_eq!(Element::Text(text(id)).id(), id);
 }
 
 // --- merge dispatches by kind ---
@@ -99,6 +127,28 @@ fn merge_map_takes_newer_slot() {
         .set(b"k", Element::Scalar(Scalar::Int(20)), stmp(5, 1));
     Element::Map(dst.clone()).merge(&Element::Map(src));
     assert_scalar(&dst.borrow().get(b"k").unwrap(), Scalar::Int(20));
+}
+
+#[test]
+fn merge_list_unions() {
+    let dst = list(default_id());
+    let src = list(default_id());
+    dst.borrow_mut()
+        .insert(0, Element::Scalar(Scalar::Int(1)), stmp(1, 1));
+    src.borrow_mut()
+        .insert(0, Element::Scalar(Scalar::Int(2)), stmp(1, 2));
+    Element::List(dst.clone()).merge(&Element::List(src));
+    assert_eq!(dst.borrow().len(), 2);
+}
+
+#[test]
+fn merge_text_converges() {
+    let dst = text(default_id());
+    let src = text(default_id());
+    dst.borrow_mut().insert(0, "ABC", stmp(1, 1));
+    src.borrow_mut().insert(0, "XYZ", stmp(1, 2));
+    Element::Text(dst.clone()).merge(&Element::Text(src));
+    assert_eq!(dst.borrow().len(), 6);
 }
 
 #[test]
@@ -162,6 +212,39 @@ fn clone_map_recurses() {
     }
 }
 
+#[test]
+fn clone_list_is_independent() {
+    let src = list(default_id());
+    src.borrow_mut()
+        .insert(0, Element::Scalar(Scalar::Int(1)), stmp(1, 1));
+    let clone = Element::List(src.clone()).deep_clone();
+    src.borrow_mut()
+        .insert(1, Element::Scalar(Scalar::Int(2)), stmp(2, 1));
+    match clone {
+        Element::List(rc) => {
+            assert!(!Rc::ptr_eq(&rc, &src));
+            assert_eq!(rc.borrow().len(), 1);
+        }
+        _ => panic!("expected list"),
+    }
+}
+
+#[test]
+fn clone_text_is_independent() {
+    let src = text(eid(7, 42));
+    src.borrow_mut().insert(0, "ab", stmp(1, 1));
+    let clone = Element::Text(src.clone()).deep_clone();
+    src.borrow_mut().insert(2, "c", stmp(3, 1));
+    match clone {
+        Element::Text(rc) => {
+            assert!(!Rc::ptr_eq(&rc, &src));
+            assert_eq!(rc.borrow().as_string(), "ab");
+            assert_eq!(rc.borrow().id(), eid(7, 42));
+        }
+        _ => panic!("expected text"),
+    }
+}
+
 // --- displacement forwarding ---
 
 #[test]
@@ -179,6 +262,20 @@ fn displace_forwards_to_register() {
     let r = register(default_id(), Scalar::Int(1));
     Element::Register(r.clone()).displace();
     assert!(r.borrow().is_displaced());
+}
+
+#[test]
+fn displace_forwards_to_list() {
+    let l = list(default_id());
+    Element::List(l.clone()).displace();
+    assert!(l.borrow().is_displaced());
+}
+
+#[test]
+fn displace_forwards_to_text() {
+    let t = text(default_id());
+    Element::Text(t.clone()).displace();
+    assert!(t.borrow().is_displaced());
 }
 
 #[test]
