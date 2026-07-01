@@ -10,7 +10,7 @@
 use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::{ClientId, ErrorCode, Message, Op};
 
-use crate::{Hub, RoomId};
+use crate::{Catchup, Hub, RoomId};
 
 /// One client connection's protocol state. A connection binds a single active
 /// room; Subscribe switches it. Multiplexing many rooms over one connection is
@@ -74,10 +74,13 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
             if session.client.is_none() {
                 return violation("subscribe before hello");
             }
-            let catchup = hub.catch_up(&room, last_seen_seq);
+            let reply = match hub.catch_up(&room, last_seen_seq) {
+                Catchup::Ops(ops) => Message::Ops(ops),
+                Catchup::Snapshot { seq, state } => Message::Snapshot { seq, state },
+            };
             session.room = Some(room);
             Response {
-                replies: vec![Message::Ops(catchup)],
+                replies: vec![reply],
                 ..Response::default()
             }
         }
@@ -113,6 +116,7 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
                 },
             }
         }
+        Message::Snapshot { .. } => violation("client sent a snapshot"),
         Message::Error { .. } => violation("client sent an error"),
     }
 }

@@ -13,9 +13,9 @@
 use std::fs;
 
 use crdtsync_core::doc::Document;
-use crdtsync_core::{ClientId, Element, Scalar};
+use crdtsync_core::{ClientId, Element, Op, Scalar};
 use crdtsync_server::store::Store;
-use crdtsync_server::Hub;
+use crdtsync_server::{Catchup, Hub};
 
 struct Rng(u64);
 
@@ -108,6 +108,15 @@ fn fingerprint(hub: &Hub) -> String {
 }
 
 /// The same rendering for a plain document — the catch-up oracle.
+/// Unwrap a catch-up that must be a plain op delta — these rooms are never
+/// compacted.
+fn ops(c: Catchup) -> Vec<Op> {
+    match c {
+        Catchup::Ops(v) => v,
+        Catchup::Snapshot { .. } => panic!("expected an op delta, got a snapshot"),
+    }
+}
+
 fn doc_fingerprint(d: &Document) -> String {
     KEYS.iter()
         .map(|k| {
@@ -155,7 +164,7 @@ fn a_reopened_hub_reproduces_state_sequence_and_catch_up() {
 
         // A subscriber catching up from zero converges to the same state.
         let mut fresh = Document::new(cid(9));
-        for op in reloaded.catch_up(ROOM, 0) {
+        for op in ops(reloaded.catch_up(ROOM, 0)) {
             fresh.apply(&op);
         }
         assert_eq!(
@@ -165,7 +174,7 @@ fn a_reopened_hub_reproduces_state_sequence_and_catch_up() {
         );
 
         // Re-ingesting the whole log is idempotent — no double-count, no growth.
-        let replay = reloaded.catch_up(ROOM, 0);
+        let replay = ops(reloaded.catch_up(ROOM, 0));
         assert!(
             reloaded.ingest(ROOM, replay).unwrap().is_empty(),
             "seed {seed}: a resend of the log grew it"

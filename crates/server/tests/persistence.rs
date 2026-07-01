@@ -11,9 +11,9 @@
 
 use std::fs;
 
-use crdtsync_core::{ClientId, Document, Element, Message, Scalar};
+use crdtsync_core::{ClientId, Document, Element, Message, Op, Scalar};
 use crdtsync_server::store::Store;
-use crdtsync_server::{Hub, Registry, RoomId};
+use crdtsync_server::{Catchup, Hub, Registry, RoomId};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -23,6 +23,15 @@ fn cid(first: u8) -> ClientId {
 
 fn doc(first: u8) -> Document {
     Document::new(cid(first))
+}
+
+/// Unwrap a catch-up that must be a plain op delta — these rooms are never
+/// compacted.
+fn ops(c: Catchup) -> Vec<Op> {
+    match c {
+        Catchup::Ops(v) => v,
+        Catchup::Snapshot { .. } => panic!("expected an op delta, got a snapshot"),
+    }
 }
 
 fn int(e: Option<Element>) -> i64 {
@@ -179,8 +188,8 @@ fn catch_up_uses_stable_sequences_across_a_restart() {
         cid(SERVER),
         Store::open(tmp.path()).unwrap().load().unwrap(),
     );
-    assert_eq!(h.catch_up(ROOM, 0).len(), 2);
-    assert_eq!(h.catch_up(ROOM, 1), second);
+    assert_eq!(ops(h.catch_up(ROOM, 0)).len(), 2);
+    assert_eq!(ops(h.catch_up(ROOM, 1)), second);
 }
 
 // --- a tempdir without pulling in a dev-dependency ---

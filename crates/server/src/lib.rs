@@ -24,12 +24,15 @@ pub use store::Store;
 /// A room name, opaque bytes chosen by the deployment.
 pub type RoomId = Vec<u8>;
 
-/// One room's authoritative replica and its durable op log. A server sequence
-/// is a 1-based position in `log`, so `log[i]` carries seq `i + 1`.
+/// One room's authoritative replica and its op log. A server sequence is a
+/// 1-based position across the room's whole history; `base_seq` counts the ops
+/// already compacted away (sequences `1..=base_seq`), so a retained op at
+/// `log[i]` carries seq `base_seq + i + 1`.
 struct Room {
     doc: Document,
     log: Vec<Op>,
     seen: HashSet<OpId>,
+    base_seq: u64,
 }
 
 impl Room {
@@ -38,8 +41,24 @@ impl Room {
             doc: Document::new(server),
             log: Vec::new(),
             seen: HashSet::new(),
+            base_seq: 0,
         }
     }
+
+    /// The room's high-water server sequence.
+    fn head(&self) -> u64 {
+        self.base_seq + self.log.len() as u64
+    }
+}
+
+/// What a subscriber needs to catch up, given the sequence it last saw.
+pub enum Catchup {
+    /// The subscriber is at or above the compaction floor: fold these ops, in
+    /// server-sequence order.
+    Ops(Vec<Op>),
+    /// The subscriber fell below the floor: load this whole-replica state, then
+    /// treat `seq` as the sequence it has now caught up to.
+    Snapshot { seq: u64, state: Vec<u8> },
 }
 
 /// The set of rooms a single node serves, optionally over a durable log.
@@ -114,22 +133,53 @@ impl Hub {
         Ok(fresh)
     }
 
-    /// The catch-up batch for a subscriber: every op with server-sequence
-    /// greater than `last_seen_seq`, in order. Seq 0 yields the whole log.
-    pub fn catch_up(&mut self, room: &[u8], last_seen_seq: u64) -> Vec<Op> {
+    /// What a subscriber needs given the sequence it last saw. Above the
+    /// compaction floor it gets the ops past `last_seen_seq` as a delta; below
+    /// it — the ops it missed are compacted away — it gets a snapshot of the
+    /// current state tagged with the head sequence. An unknown room yields an
+    /// empty delta.
+    pub fn catch_up(&mut self, room: &[u8], last_seen_seq: u64) -> Catchup {
         let Some(room) = self.rooms.get(room) else {
-            return Vec::new();
+            return Catchup::Ops(Vec::new());
         };
-        let start = usize::try_from(last_seen_seq).unwrap_or(usize::MAX);
-        match room.log.get(start..) {
-            Some(rest) => rest.to_vec(),
-            None => Vec::new(),
+        if last_seen_seq < room.base_seq {
+            return Catchup::Snapshot {
+                seq: room.head(),
+                state: room.doc.encode_state(),
+            };
+        }
+        // An offset past what the platform's usize can hold is far beyond the
+        // head: nothing to send. The checked conversion avoids truncating it
+        // back into the log's range.
+        let Ok(start) = usize::try_from(last_seen_seq - room.base_seq) else {
+            return Catchup::Ops(Vec::new());
+        };
+        let delta = room
+            .log
+            .get(start..)
+            .map(<[Op]>::to_vec)
+            .unwrap_or_default();
+        Catchup::Ops(delta)
+    }
+
+    /// Fold the room's logged ops into the merged replica and drop them,
+    /// advancing the compaction floor to the head. The replica, the dedup set,
+    /// and every op's sequence are untouched — only the retained log shrinks, so
+    /// a below-floor subscriber is served a snapshot instead of a delta.
+    ///
+    /// In-memory only: the durable log on disk is unchanged, so a restart
+    /// replays it and re-derives the same state and sequence. Compacting the
+    /// on-disk log is a separate concern.
+    pub fn compact(&mut self, room: &[u8]) {
+        if let Some(room) = self.rooms.get_mut(room) {
+            room.base_seq += room.log.len() as u64;
+            room.log.clear();
         }
     }
 
     /// The room's current high-water server sequence (0 if unseen or empty).
     pub fn seq(&self, room: &[u8]) -> u64 {
-        self.rooms.get(room).map_or(0, |r| r.log.len() as u64)
+        self.rooms.get(room).map_or(0, Room::head)
     }
 
     /// Read the merged state of a top-level slot in `room`.
