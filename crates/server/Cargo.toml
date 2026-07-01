@@ -6,3 +6,9 @@ description = "Single-node sync server: per-room op logs, idempotent ingest, cat
 
 [dependencies]
 crdtsync-core = { path = "../core" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }

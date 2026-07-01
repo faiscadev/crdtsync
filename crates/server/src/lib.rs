@@ -13,6 +13,7 @@ use crdtsync_core::op::OpId;
 use crdtsync_core::{ClientId, Document, Element, Op};
 
 pub mod registry;
+pub mod runtime;
 pub mod session;
 pub use registry::{ConnId, Registry};
 pub use session::{negotiate, step, Response, Session};
