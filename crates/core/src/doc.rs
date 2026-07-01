@@ -86,8 +86,9 @@ impl Document {
         txn.ops
     }
 
-    /// Fold a foreign op into local state. Returns `false` if the op was
-    /// already applied (deduped on its id).
+    /// Fold a foreign op into local state. Returns `false` without applying it
+    /// when the op targets a parent other than the root, or when it was already
+    /// applied (deduped on its id).
     pub fn apply(&mut self, op: &Op) -> bool {
         if op.target != self.root_id() {
             // Only the root map is addressable at this scope; an op naming any
