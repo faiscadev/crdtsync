@@ -11,6 +11,7 @@
 use crate::clientid::ClientId;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
+use crate::list::List;
 use crate::map::Map;
 use crate::op::{Op, OpId, OpKind};
 use crate::scalar::Scalar;
@@ -34,6 +35,8 @@ pub struct Document {
     root: Rc<RefCell<Map>>,
     /// Every map in the tree, keyed by id, for resolving an op's target.
     maps: HashMap<ElementId, Rc<RefCell<Map>>>,
+    /// Every list in the tree, keyed by id, for resolving a sequence op.
+    lists: HashMap<ElementId, Rc<RefCell<List>>>,
     lamport: u64,
     seq: u64,
     seen: HashSet<OpId>,
@@ -51,6 +54,7 @@ impl Document {
             client,
             root,
             maps,
+            lists: HashMap::new(),
             lamport: 0,
             seq: 0,
             seen: HashSet::new(),
@@ -136,34 +140,74 @@ impl Document {
         self.pending.push(Op::new(id, stamp, target, kind));
     }
 
-    /// Route a mutation to its target map, recording any displaced composite
-    /// and indexing any nested map it creates.
-    /// A target is reachable when it names a map that is present and still
-    /// installed in the tree (a displaced map is unreachable).
+    /// A target is reachable when it names a map or list that is present and
+    /// still installed in the tree (a displaced element is unreachable).
     fn resolvable(&self, target: ElementId) -> bool {
         self.maps
             .get(&target)
             .is_some_and(|m| !m.borrow().is_displaced())
+            || self
+                .lists
+                .get(&target)
+                .is_some_and(|l| !l.borrow().is_displaced())
     }
 
+    /// A live list handle for `target`, if any.
+    fn live_list(&self, target: ElementId) -> Option<Rc<RefCell<List>>> {
+        self.lists
+            .get(&target)
+            .filter(|l| !l.borrow().is_displaced())
+            .cloned()
+    }
+
+    /// Route a mutation to its target, recording any displaced composite and
+    /// indexing any container it creates.
     fn apply_kind(&mut self, target: ElementId, kind: &OpKind, stamp: Stamp, author: ClientId) {
+        // Sequence ops address a list directly.
+        match kind {
+            OpKind::ListInsert { value, anchor } => {
+                if let Some(list) = self.live_list(target) {
+                    list.borrow_mut()
+                        .insert_at(stamp, Element::Scalar(value.clone()), *anchor);
+                }
+                return;
+            }
+            OpKind::ListDelete { id } => {
+                if let Some(list) = self.live_list(target) {
+                    list.borrow_mut().delete_id(*id);
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // The rest address a map slot (ListCreate installs a list child there).
         let Some(map) = self.maps.get(&target).cloned() else {
             return;
         };
         if map.borrow().is_displaced() {
             return;
         }
-        let mut new_child: Option<Rc<RefCell<Map>>> = None;
+        let mut new_map: Option<Rc<RefCell<Map>>> = None;
+        let mut new_list: Option<Rc<RefCell<List>>> = None;
         let orphan = {
             let mut m = map.borrow_mut();
             match kind {
                 OpKind::MapCreate { key } => {
                     let prior = m.get(key);
                     let child = m.map(key, stamp);
-                    // A losing create yields a detached, displaced map; only a
-                    // reachable child belongs in the index.
+                    // A losing create yields a detached, displaced child; only a
+                    // reachable one belongs in the index.
                     if !child.borrow().is_displaced() {
-                        new_child = Some(Rc::clone(&child));
+                        new_map = Some(Rc::clone(&child));
+                    }
+                    displaced(prior)
+                }
+                OpKind::ListCreate { key } => {
+                    let prior = m.get(key);
+                    let child = m.list(key, stamp);
+                    if !child.borrow().is_displaced() {
+                        new_list = Some(Rc::clone(&child));
                     }
                     displaced(prior)
                 }
@@ -198,11 +242,16 @@ impl Document {
                     m.set(key, Element::Counter(Rc::clone(&c)), stamp);
                     displaced(prior)
                 }
+                OpKind::ListInsert { .. } | OpKind::ListDelete { .. } => unreachable!(),
             }
         };
-        if let Some(child) = new_child {
+        if let Some(child) = new_map {
             let id = child.borrow().id();
             self.maps.insert(id, child);
+        }
+        if let Some(child) = new_list {
+            let id = child.borrow().id();
+            self.lists.insert(id, child);
         }
         if let Some(o) = orphan {
             self.orphans.push(o);
@@ -287,6 +336,47 @@ impl MapCursor<'_> {
         MapCursor {
             doc: self.doc,
             map_id: child,
+        }
+    }
+
+    /// Descend into a List at `key`, creating it if absent.
+    pub fn list(&mut self, key: &[u8]) -> ListCursor<'_> {
+        self.doc
+            .emit(self.map_id, OpKind::ListCreate { key: key.to_vec() });
+        let list_id = ElementId::derive(self.map_id, key, ElementKind::List);
+        ListCursor {
+            doc: self.doc,
+            list_id,
+        }
+    }
+}
+
+/// A cursor over one List in the tree.
+pub struct ListCursor<'a> {
+    doc: &'a mut Document,
+    list_id: ElementId,
+}
+
+impl ListCursor<'_> {
+    /// Insert `value` at live `index`. The op carries the Fugue placement, so
+    /// it applies identically on every replica.
+    pub fn insert(&mut self, index: usize, value: Scalar) {
+        let anchor = match self.doc.lists.get(&self.list_id) {
+            Some(list) => list.borrow().place(index),
+            None => return,
+        };
+        self.doc
+            .emit(self.list_id, OpKind::ListInsert { value, anchor });
+    }
+
+    /// Tombstone the live item at `index`.
+    pub fn delete(&mut self, index: usize) {
+        let id = match self.doc.lists.get(&self.list_id) {
+            Some(list) => list.borrow().node_at(index),
+            None => return,
+        };
+        if let Some(id) = id {
+            self.doc.emit(self.list_id, OpKind::ListDelete { id });
         }
     }
 }
