@@ -93,6 +93,9 @@ impl List {
     /// Insert `value` at live `index`, identified by `stamp`. A stamp already
     /// seen is a replay and leaves the node untouched.
     pub fn insert(&mut self, index: usize, value: Element, stamp: Stamp) {
+        if self.nodes.contains_key(&stamp) {
+            return;
+        }
         let anchor = self.place(index);
         self.insert_at(stamp, value, anchor);
     }
