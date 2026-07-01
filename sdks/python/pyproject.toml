@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crdtsync"
+version = "0.0.0"
+description = "Python bindings for the crdtsync CRDT core, over its C ABI."
+requires-python = ">=3.8"
+readme = "README.md"
+
+[tool.setuptools]
+packages = ["crdtsync"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
