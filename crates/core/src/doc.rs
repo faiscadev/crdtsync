@@ -120,7 +120,7 @@ impl Document {
         }
         // A text run occupies one char_id per codepoint from the op's stamp;
         // the clock must clear the last of them, not just the base.
-        let last = op.stamp.lamport + span(&op.kind) - 1;
+        let last = op.stamp.lamport.saturating_add(span(&op.kind) - 1);
         if last > self.lamport {
             self.lamport = last;
         }
