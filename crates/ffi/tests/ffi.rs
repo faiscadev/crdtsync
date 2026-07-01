@@ -348,7 +348,53 @@ fn non_utf8_text_insert_yields_no_ops() {
         let bad = [0xFFu8, 0xFE];
         let buf = crdtsync_doc_text_insert(doc, p.as_ptr(), p.len(), 0, bad.as_ptr(), bad.len());
         assert_eq!(buf.len, 0, "invalid UTF-8 must not emit");
+        // ...and must not materialise the text either.
+        let mut len: usize = 0;
+        assert_eq!(
+            crdtsync_doc_text_len(doc, p.as_ptr(), p.len(), &mut len),
+            0,
+            "no text may exist"
+        );
         crdtsync_buf_free(buf);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn a_no_op_delete_does_not_create_a_container() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let lp = path(&[b"list"]);
+        let tp = path(&[b"text"]);
+
+        // Deleting from absent / out-of-range sequences must emit nothing and
+        // leave no empty container behind.
+        let a = crdtsync_doc_list_delete(doc, lp.as_ptr(), lp.len(), 0);
+        let b = crdtsync_doc_text_delete(doc, tp.as_ptr(), tp.len(), 0, 3);
+        assert_eq!(a.len, 0, "absent list delete emits nothing");
+        assert_eq!(b.len, 0, "absent text delete emits nothing");
+
+        let mut len: usize = 0;
+        assert_eq!(
+            crdtsync_doc_list_len(doc, lp.as_ptr(), lp.len(), &mut len),
+            0
+        );
+        assert_eq!(
+            crdtsync_doc_text_len(doc, tp.as_ptr(), tp.len(), &mut len),
+            0
+        );
+
+        // A zero-count delete on an existing text is also a no-op.
+        let s = "hi";
+        let ins = crdtsync_doc_text_insert(doc, tp.as_ptr(), tp.len(), 0, s.as_ptr(), s.len());
+        let z = crdtsync_doc_text_delete(doc, tp.as_ptr(), tp.len(), 0, 0);
+        assert_eq!(z.len, 0, "zero-count delete emits nothing");
+        assert_eq!(text_get(doc, &tp), "hi");
+
+        for buf in [a, b, ins, z] {
+            crdtsync_buf_free(buf);
+        }
         crdtsync_doc_free(doc);
     }
 }

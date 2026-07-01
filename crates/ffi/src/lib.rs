@@ -287,6 +287,15 @@ pub unsafe extern "C" fn crdtsync_doc_list_delete(
     path_len: usize,
     index: usize,
 ) -> CrdtBuf {
+    // A delete that targets no live item must not create or re-stamp a list.
+    if !slot_ok(
+        doc,
+        path,
+        path_len,
+        |e| matches!(e, Element::List(l) if index < l.borrow().len()),
+    ) {
+        return CrdtBuf::empty();
+    }
     emit(doc, path, path_len, move |cur, key| {
         cur.list(key).delete(index)
     })
@@ -323,8 +332,8 @@ pub unsafe extern "C" fn crdtsync_doc_list_get(
     out: *mut CrdtBuf,
 ) -> i32 {
     read_buf(doc, path, path_len, out, |e| match e {
-        Element::List(l) => match l.borrow().values().get(index) {
-            Some(Element::Scalar(Scalar::Bytes(b))) => Some(b.clone()),
+        Element::List(l) => match l.borrow().get(index) {
+            Some(Element::Scalar(Scalar::Bytes(b))) => Some(b),
             _ => None,
         },
         _ => None,
@@ -370,6 +379,15 @@ pub unsafe extern "C" fn crdtsync_doc_text_delete(
     index: usize,
     count: usize,
 ) -> CrdtBuf {
+    // A delete that removes no codepoint must not create or re-stamp a text.
+    if !slot_ok(
+        doc,
+        path,
+        path_len,
+        |e| matches!(e, Element::Text(t) if count > 0 && index < t.borrow().len()),
+    ) {
+        return CrdtBuf::empty();
+    }
     emit(doc, path, path_len, move |cur, key| {
         cur.text(key).delete(index, count)
     })
@@ -557,6 +575,24 @@ where
         }
     }))
     .unwrap_or(-1)
+}
+
+/// Whether the element at a path satisfies `ok`. False on a bad handle or an
+/// unresolved path — used to keep a no-op delete from materialising a container.
+unsafe fn slot_ok<F>(doc: *const CrdtDoc, path: *const u8, path_len: usize, ok: F) -> bool
+where
+    F: FnOnce(&Element) -> bool,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return false;
+        }
+        slot(&*doc, path, path_len)
+            .as_ref()
+            .map(ok)
+            .unwrap_or(false)
+    }))
+    .unwrap_or(false)
 }
 
 /// The live element at a path, if the whole path resolves.
