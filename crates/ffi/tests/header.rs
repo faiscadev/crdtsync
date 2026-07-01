@@ -7,8 +7,7 @@ const HEADER: &str = include_str!("../include/crdtsync.h");
 #[test]
 fn the_header_declares_every_exported_symbol() {
     let required = [
-        // types + guard
-        "CRDTSYNC_H",
+        // types (the include guard is checked in the_header_is_c_and_cpp_safe)
         "typedef struct CrdtDoc CrdtDoc;",
         "} CrdtBuf;",
         "extern \"C\"",
@@ -47,9 +46,15 @@ fn the_header_declares_every_exported_symbol() {
 
 #[test]
 fn the_header_is_c_and_cpp_safe() {
+    // A functional guard needs both halves; the bare name also appears in the
+    // `#ifndef` and closing comment, so check the `#define` independently.
     assert!(
         HEADER.contains("#ifndef CRDTSYNC_H"),
-        "missing include guard"
+        "missing include guard #ifndef"
+    );
+    assert!(
+        HEADER.contains("#define CRDTSYNC_H"),
+        "missing include guard #define"
     );
     assert!(
         HEADER.contains("#ifdef __cplusplus"),
