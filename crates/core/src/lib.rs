@@ -28,6 +28,7 @@ pub mod text;
 pub mod codec;
 pub mod doc;
 pub mod op;
+pub mod path;
 pub mod protocol;
 
 pub use clientid::ClientId;
