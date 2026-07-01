@@ -71,6 +71,21 @@ pub enum OpKind {
     ListDelete {
         id: Stamp,
     },
+    /// Install a Text child at `key` in the target map.
+    TextCreate {
+        key: Vec<u8>,
+    },
+    /// Insert a run into the target Text. The op's stamp is the first
+    /// codepoint's char_id; the rest run consecutively from it. `anchor` fixes
+    /// the run's Fugue position.
+    TextInsert {
+        s: String,
+        anchor: Anchor,
+    },
+    /// Tombstone the codepoints with these char_ids in the target Text.
+    TextDelete {
+        ids: Vec<Stamp>,
+    },
 }
 
 /// A single CRDT operation. Immutable once minted; the op log is append-only.
