@@ -20,13 +20,16 @@ fn oid(client_first: u8, seq: u64) -> OpId {
     }
 }
 
-/// A register-set op targeting the default element, from client 1.
+/// A register-set op targeting the default map, from client 1.
 fn set_op(seq: u64, lamport: u64, value: Scalar) -> Op {
     Op::new(
         oid(1, seq),
         stmp(lamport, 1),
         eid(0xEE, 0),
-        OpKind::RegisterSet { value },
+        OpKind::RegisterSet {
+            key: b"k".to_vec(),
+            value,
+        },
     )
 }
 
@@ -76,16 +79,15 @@ fn distinct_seq_is_not_a_duplicate() {
 
 #[test]
 fn new_populates_every_field() {
-    let op = Op::new(
-        oid(1, 2),
-        stmp(3, 1),
-        eid(7, 42),
-        OpKind::CounterInc { amount: 5 },
-    );
+    let kind = OpKind::CounterInc {
+        key: b"n".to_vec(),
+        amount: 5,
+    };
+    let op = Op::new(oid(1, 2), stmp(3, 1), eid(7, 42), kind.clone());
     assert_eq!(op.id, oid(1, 2));
     assert_eq!(op.stamp, stmp(3, 1));
     assert_eq!(op.target, eid(7, 42));
-    assert_eq!(op.kind, OpKind::CounterInc { amount: 5 });
+    assert_eq!(op.kind, kind);
 }
 
 #[test]
@@ -134,10 +136,14 @@ fn equal_lamport_breaks_by_client() {
 #[test]
 fn register_set_holds_a_scalar() {
     let k = OpKind::RegisterSet {
+        key: b"greeting".to_vec(),
         value: Scalar::Bytes(b"hi".to_vec()),
     };
     match k {
-        OpKind::RegisterSet { value } => assert_eq!(value, Scalar::Bytes(b"hi".to_vec())),
+        OpKind::RegisterSet { key, value } => {
+            assert_eq!(key, b"greeting".to_vec());
+            assert_eq!(value, Scalar::Bytes(b"hi".to_vec()));
+        }
         _ => panic!("expected RegisterSet"),
     }
 }
@@ -147,8 +153,14 @@ fn counter_inc_and_dec_are_distinct() {
     // The direction is encoded in the kind, matching Counter::inc / ::dec; the
     // amount is unsigned, the acting client comes from op_id.
     assert_ne!(
-        OpKind::CounterInc { amount: 3 },
-        OpKind::CounterDec { amount: 3 },
+        OpKind::CounterInc {
+            key: b"n".to_vec(),
+            amount: 3,
+        },
+        OpKind::CounterDec {
+            key: b"n".to_vec(),
+            amount: 3,
+        },
     );
 }
 

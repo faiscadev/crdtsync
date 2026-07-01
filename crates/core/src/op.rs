@@ -24,14 +24,16 @@ pub struct OpId {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TxId(pub u64);
 
-/// A primitive mutation. Closed: one variant per composite operation the core
-/// understands. The acting client and causal order live on the [`Op`], not
-/// here.
+/// A primitive mutation, addressed by the key of a slot in the target Map.
+/// The receiver reaches the child through the map's get-or-create, re-deriving
+/// its id, so no separate create op is needed. Closed: one variant per
+/// composite operation the core understands. The acting client and causal
+/// order live on the [`Op`], not here.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum OpKind {
-    RegisterSet { value: Scalar },
-    CounterInc { amount: u32 },
-    CounterDec { amount: u32 },
+    RegisterSet { key: Vec<u8>, value: Scalar },
+    CounterInc { key: Vec<u8>, amount: u32 },
+    CounterDec { key: Vec<u8>, amount: u32 },
     MapSet { key: Vec<u8>, value: Scalar },
     MapDelete { key: Vec<u8> },
 }
