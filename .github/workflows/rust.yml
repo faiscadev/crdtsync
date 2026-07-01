@@ -56,3 +56,18 @@ jobs:
       - name: Test
         run: go test ./...
         working-directory: sdks/go
+
+  wasm-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install the wasm target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Test
+        run: wasm-pack test --node
+        working-directory: crates/wasm
