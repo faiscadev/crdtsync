@@ -1,9 +1,11 @@
 //! C ABI — the boundary the server and SDKs drive the core through.
 //!
-//! Handles and byte buffers cross; the `Rc<RefCell>` graph never does. A local
-//! edit returns the encoded ops to broadcast and applies locally; `apply` folds
-//! a peer's op back; two docs that exchange those bytes converge. Every entry
-//! point isolates panics rather than unwinding across the boundary.
+//! Handles and byte buffers cross; the `Rc<RefCell>` graph never does. A slot
+//! is addressed by a path — a length-prefixed sequence of keys naming nested
+//! maps, the last key the slot itself. A local edit returns the encoded ops to
+//! broadcast and applies locally; `apply` folds a peer's op back; two docs that
+//! exchange those bytes converge. Every entry point isolates panics rather than
+//! unwinding across the boundary.
 
 use crdtsync_ffi::*;
 use std::ptr;
@@ -14,9 +16,38 @@ fn client(first: u8) -> [u8; 16] {
     b
 }
 
-/// Apply every op in an encoded buffer from `src` into `dst`.
+/// Encode a path: each key as a u32 length prefix followed by its bytes.
+fn path(keys: &[&[u8]]) -> Vec<u8> {
+    let mut b = Vec::new();
+    for k in keys {
+        b.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        b.extend_from_slice(k);
+    }
+    b
+}
+
 unsafe fn exchange(dst: *mut CrdtDoc, ops: &CrdtBuf) {
     crdtsync_doc_apply(dst, ops.ptr, ops.len);
+}
+
+unsafe fn register_int(doc: *mut CrdtDoc, p: &[u8], v: i64) -> CrdtBuf {
+    crdtsync_doc_register_int(doc, p.as_ptr(), p.len(), v)
+}
+
+unsafe fn inc(doc: *mut CrdtDoc, p: &[u8], amount: u32) -> CrdtBuf {
+    crdtsync_doc_inc(doc, p.as_ptr(), p.len(), amount)
+}
+
+unsafe fn get_int(doc: *const CrdtDoc, p: &[u8]) -> (i32, i64) {
+    let mut out: i64 = 0;
+    let rc = crdtsync_doc_get_int(doc, p.as_ptr(), p.len(), &mut out);
+    (rc, out)
+}
+
+unsafe fn get_counter(doc: *const CrdtDoc, p: &[u8]) -> (i32, i64) {
+    let mut out: i64 = 0;
+    let rc = crdtsync_doc_get_counter(doc, p.as_ptr(), p.len(), &mut out);
+    (rc, out)
 }
 
 #[test]
@@ -34,10 +65,8 @@ fn a_register_reads_back_locally() {
     unsafe {
         let c = client(1);
         let doc = crdtsync_doc_new(c.as_ptr());
-        let ops = crdtsync_doc_register_int(doc, b"age".as_ptr(), 3, 30);
-        let mut out: i64 = 0;
-        assert_eq!(crdtsync_doc_get_int(doc, b"age".as_ptr(), 3, &mut out), 1);
-        assert_eq!(out, 30);
+        let ops = register_int(doc, &path(&[b"age"]), 30);
+        assert_eq!(get_int(doc, &path(&[b"age"])), (1, 30));
         crdtsync_buf_free(ops);
         crdtsync_doc_free(doc);
     }
@@ -49,7 +78,8 @@ fn a_missing_key_reports_not_found() {
         let c = client(1);
         let doc = crdtsync_doc_new(c.as_ptr());
         let mut out: i64 = 7;
-        assert_eq!(crdtsync_doc_get_int(doc, b"nope".as_ptr(), 4, &mut out), 0);
+        let p = path(&[b"nope"]);
+        assert_eq!(crdtsync_doc_get_int(doc, p.as_ptr(), p.len(), &mut out), 0);
         assert_eq!(out, 7, "out must be left untouched when not found");
         crdtsync_doc_free(doc);
     }
@@ -62,23 +92,16 @@ fn edits_broadcast_and_converge_on_a_peer() {
         let a = crdtsync_doc_new(ca.as_ptr());
         let b = crdtsync_doc_new(cb.as_ptr());
 
-        let reg = crdtsync_doc_register_int(a, b"age".as_ptr(), 3, 30);
-        let inc = crdtsync_doc_inc(a, b"hits".as_ptr(), 4, 5);
+        let reg = register_int(a, &path(&[b"age"]), 30);
+        let hit = inc(a, &path(&[b"hits"]), 5);
         exchange(b, &reg);
-        exchange(b, &inc);
+        exchange(b, &hit);
 
-        let mut age: i64 = 0;
-        let mut hits: i64 = 0;
-        assert_eq!(crdtsync_doc_get_int(b, b"age".as_ptr(), 3, &mut age), 1);
-        assert_eq!(
-            crdtsync_doc_get_counter(b, b"hits".as_ptr(), 4, &mut hits),
-            1
-        );
-        assert_eq!(age, 30);
-        assert_eq!(hits, 5);
+        assert_eq!(get_int(b, &path(&[b"age"])), (1, 30));
+        assert_eq!(get_counter(b, &path(&[b"hits"])), (1, 5));
 
         crdtsync_buf_free(reg);
-        crdtsync_buf_free(inc);
+        crdtsync_buf_free(hit);
         crdtsync_doc_free(a);
         crdtsync_doc_free(b);
     }
@@ -91,17 +114,13 @@ fn a_counter_accumulates_across_replicas() {
         let a = crdtsync_doc_new(ca.as_ptr());
         let b = crdtsync_doc_new(cb.as_ptr());
 
-        let ia = crdtsync_doc_inc(a, b"n".as_ptr(), 1, 3);
-        let ib = crdtsync_doc_inc(b, b"n".as_ptr(), 1, 4);
+        let ia = inc(a, &path(&[b"n"]), 3);
+        let ib = inc(b, &path(&[b"n"]), 4);
         exchange(b, &ia);
         exchange(a, &ib);
 
-        let mut na: i64 = 0;
-        let mut nb: i64 = 0;
-        crdtsync_doc_get_counter(a, b"n".as_ptr(), 1, &mut na);
-        crdtsync_doc_get_counter(b, b"n".as_ptr(), 1, &mut nb);
-        assert_eq!(na, 7);
-        assert_eq!(na, nb);
+        assert_eq!(get_counter(a, &path(&[b"n"])), (1, 7));
+        assert_eq!(get_counter(b, &path(&[b"n"])).1, 7);
 
         crdtsync_buf_free(ia);
         crdtsync_buf_free(ib);
@@ -109,6 +128,109 @@ fn a_counter_accumulates_across_replicas() {
         crdtsync_doc_free(b);
     }
 }
+
+// --- nested paths ---
+
+#[test]
+fn a_nested_edit_reads_back_and_converges() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+
+        // profile.stats.score = 7, two maps deep
+        let p = path(&[b"profile", b"stats", b"score"]);
+        let ops = register_int(a, &p, 7);
+        assert_eq!(get_int(a, &p), (1, 7));
+
+        exchange(b, &ops);
+        assert_eq!(get_int(b, &p), (1, 7));
+
+        crdtsync_buf_free(ops);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn a_path_through_a_missing_map_is_not_found() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        assert_eq!(get_int(doc, &path(&[b"missing", b"x"])).0, 0);
+        crdtsync_doc_free(doc);
+    }
+}
+
+// --- bytes + delete ---
+
+#[test]
+fn bytes_round_trip_through_the_boundary() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let p = path(&[b"blob"]);
+        let val = [0u8, 1, 2, 255, 0];
+        let ops = crdtsync_doc_set_bytes(doc, p.as_ptr(), p.len(), val.as_ptr(), val.len());
+
+        let mut out = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            crdtsync_doc_get_bytes(doc, p.as_ptr(), p.len(), &mut out),
+            1
+        );
+        let got = std::slice::from_raw_parts(out.ptr, out.len);
+        assert_eq!(got, &val);
+
+        crdtsync_buf_free(out);
+        crdtsync_buf_free(ops);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn delete_removes_a_slot_and_converges() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let p = path(&[b"k"]);
+
+        let set = register_int(a, &p, 5);
+        let del = crdtsync_doc_delete(a, p.as_ptr(), p.len());
+        assert_eq!(get_int(a, &p).0, 0, "deleted locally");
+
+        exchange(b, &set);
+        exchange(b, &del);
+        assert_eq!(get_int(b, &p).0, 0, "delete converges");
+
+        crdtsync_buf_free(set);
+        crdtsync_buf_free(del);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "stack depth is a native concern; slow under Miri")]
+fn a_very_deep_path_does_not_overflow_the_stack() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        // Path depth is caller-supplied; a deep walk must stay iterative.
+        let mut keys: Vec<&[u8]> = vec![b"k"; 10_000];
+        keys.push(b"leaf");
+        let p = path(&keys);
+        let ops = register_int(doc, &p, 42);
+        assert_eq!(get_int(doc, &p), (1, 42));
+        crdtsync_buf_free(ops);
+        crdtsync_doc_free(doc);
+    }
+}
+
+// --- robustness ---
 
 #[test]
 fn applying_garbage_bytes_is_reported_not_fatal() {
@@ -122,12 +244,28 @@ fn applying_garbage_bytes_is_reported_not_fatal() {
 }
 
 #[test]
+fn a_malformed_path_is_rejected_not_fatal() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        // A key length that runs past the buffer end must not be read.
+        let bad = 0xFFFF_FFFEu32.to_le_bytes();
+        let mut out: i64 = 0;
+        assert_eq!(crdtsync_doc_get_int(doc, bad.as_ptr(), 4, &mut out), 0);
+        let buf = crdtsync_doc_register_int(doc, bad.as_ptr(), 4, 1);
+        assert_eq!(buf.len, 0, "a malformed path yields no ops");
+        crdtsync_buf_free(buf);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
 fn a_null_document_is_handled_not_dereferenced() {
     unsafe {
         let mut out: i64 = 0;
-        // A null handle must be reported, never dereferenced.
+        let p = path(&[b"k"]);
         assert_eq!(
-            crdtsync_doc_get_int(ptr::null_mut(), b"k".as_ptr(), 1, &mut out),
+            crdtsync_doc_get_int(ptr::null(), p.as_ptr(), p.len(), &mut out),
             -1
         );
         assert_eq!(crdtsync_doc_apply(ptr::null_mut(), b"".as_ptr(), 0), -1);
@@ -140,11 +278,10 @@ fn a_null_data_pointer_is_rejected_not_dereferenced() {
         let c = client(1);
         let doc = crdtsync_doc_new(c.as_ptr());
         let mut out: i64 = 0;
-        // Null key/bytes with a nonzero length must be reported, not read.
-        assert_eq!(crdtsync_doc_get_int(doc, ptr::null(), 4, &mut out), -1);
+        assert_eq!(crdtsync_doc_get_int(doc, ptr::null(), 4, &mut out), 0);
         assert_eq!(crdtsync_doc_apply(doc, ptr::null(), 8), -1);
         let buf = crdtsync_doc_register_int(doc, ptr::null(), 4, 1);
-        assert_eq!(buf.len, 0, "a null key yields no ops");
+        assert_eq!(buf.len, 0, "a null path yields no ops");
         crdtsync_buf_free(buf);
         crdtsync_doc_free(doc);
     }

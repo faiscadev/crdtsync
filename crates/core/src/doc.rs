@@ -57,6 +57,20 @@ pub struct Document {
     pending: Vec<Op>,
 }
 
+impl Drop for Document {
+    fn drop(&mut self) {
+        // Break every parent→child link first, via the flat registry, so a
+        // deeply nested tree frees iteratively instead of recursing through the
+        // chain of Rc drops (which a caller-supplied path depth could overflow).
+        // Skip a handle a caller is still borrowing rather than panic in drop.
+        for map in self.maps.values() {
+            if let Ok(mut map) = map.try_borrow_mut() {
+                map.clear();
+            }
+        }
+    }
+}
+
 impl Document {
     pub fn new(client: ClientId) -> Self {
         let root = Rc::new(RefCell::new(Map::new(ElementId::from_bytes(ROOT_ID))));
@@ -462,7 +476,7 @@ pub struct MapCursor<'a> {
     map_id: ElementId,
 }
 
-impl MapCursor<'_> {
+impl<'a> MapCursor<'a> {
     /// Set a scalar directly in this map's slot.
     pub fn set(&mut self, key: &[u8], value: Scalar) {
         self.doc.emit(
@@ -515,6 +529,18 @@ impl MapCursor<'_> {
 
     /// Descend into a nested Map at `key`, creating it if absent.
     pub fn map(&mut self, key: &[u8]) -> MapCursor<'_> {
+        self.doc
+            .emit(self.map_id, OpKind::MapCreate { key: key.to_vec() });
+        let child = ElementId::derive(self.map_id, key, ElementKind::Map);
+        MapCursor {
+            doc: self.doc,
+            map_id: child,
+        }
+    }
+
+    /// Descend into a nested Map at `key`, consuming this cursor. Chains without
+    /// nesting borrows, so a caller can walk a runtime-length path in a loop.
+    pub fn into_map(self, key: &[u8]) -> MapCursor<'a> {
         self.doc
             .emit(self.map_id, OpKind::MapCreate { key: key.to_vec() });
         let child = ElementId::derive(self.map_id, key, ElementKind::Map);
