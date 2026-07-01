@@ -24,3 +24,21 @@ jobs:
         run: rustup toolchain install nightly --component miri
       - name: Miri
         run: cargo +nightly miri test -p crdtsync-core -p crdtsync-ffi
+
+  python-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The SDK loads the cdylib at runtime; build it, then run pytest.
+      - name: Build the native library
+        run: cargo build -p crdtsync-ffi
+      - name: Install pytest
+        run: python -m pip install --upgrade pytest
+      - name: Test
+        run: python -m pytest -q
+        working-directory: sdks/python
+        env:
+          PYTHONPATH: .
