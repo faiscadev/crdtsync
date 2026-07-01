@@ -7,7 +7,8 @@
 //! A slot is addressed by a path: a length-prefixed sequence of keys (`u32` len
 //! then bytes, repeated) naming nested maps from the root, the last key the slot
 //! itself. A local edit returns the ops to broadcast (encoded) and applies
-//! locally; `apply` folds a peer's op log back in.
+//! locally; `apply` folds a peer's op log back in. Navigation itself lives in
+//! [`crdtsync_core::path`]; this layer only marshals pointers and buffers.
 //!
 //! Ownership contract:
 //!   - Each `*_new` hands the caller a handle; the matching `*_free` reclaims it.
@@ -17,11 +18,9 @@
 //! Every entry point catches panics so one never unwinds across the C frame, and
 //! rejects null or malformed input rather than dereferencing it.
 
-use crdtsync_core::doc::MapCursor;
-use crdtsync_core::{decode_ops, encode_ops, ClientId, Document, Element, Map, Scalar};
-use std::cell::RefCell;
+use crdtsync_core::op::Op;
+use crdtsync_core::{encode_ops, path, ClientId, Document};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::rc::Rc;
 use std::slice;
 
 /// Opaque document handle.
@@ -63,26 +62,6 @@ unsafe fn as_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     } else {
         Some(slice::from_raw_parts(ptr, len))
     }
-}
-
-/// Split a path buffer into its keys. `None` on null or a length that runs past
-/// the buffer.
-///
-/// # Safety
-/// `ptr`/`len` follow the [`as_slice`] contract.
-unsafe fn parse_path(ptr: *const u8, len: usize) -> Option<Vec<Vec<u8>>> {
-    let buf = as_slice(ptr, len)?;
-    let mut keys = Vec::new();
-    let mut i = 0usize;
-    while i < buf.len() {
-        let hdr = buf.get(i..i.checked_add(4)?)?;
-        let klen = u32::from_le_bytes(hdr.try_into().unwrap()) as usize;
-        i += 4;
-        let key = buf.get(i..i.checked_add(klen)?)?;
-        keys.push(key.to_vec());
-        i += klen;
-    }
-    Some(keys)
 }
 
 /// Open a document for the 16-byte client id at `client`. Null on a bad handle.
@@ -139,9 +118,7 @@ pub unsafe extern "C" fn crdtsync_doc_register_int(
     path_len: usize,
     value: i64,
 ) -> CrdtBuf {
-    emit(doc, path, path_len, |cur, key| {
-        cur.register(key, Scalar::Int(value))
-    })
+    edit(doc, path, path_len, |d, p| path::register_int(d, p, value))
 }
 
 /// Install-or-increment a Counter at a path. Returns the ops to broadcast.
@@ -155,7 +132,7 @@ pub unsafe extern "C" fn crdtsync_doc_inc(
     path_len: usize,
     amount: u32,
 ) -> CrdtBuf {
-    emit(doc, path, path_len, |cur, key| cur.inc(key, amount))
+    edit(doc, path, path_len, |d, p| path::inc(d, p, amount))
 }
 
 /// Set a bytes scalar at a path. Returns the ops to broadcast.
@@ -174,10 +151,7 @@ pub unsafe extern "C" fn crdtsync_doc_set_bytes(
     let Some(val) = as_slice(value, value_len) else {
         return CrdtBuf::empty();
     };
-    let val = val.to_vec();
-    emit(doc, path, path_len, move |cur, key| {
-        cur.set(key, Scalar::Bytes(val))
-    })
+    edit(doc, path, path_len, |d, p| path::set_bytes(d, p, val))
 }
 
 /// Tombstone the slot at a path. Returns the ops to broadcast.
@@ -190,7 +164,7 @@ pub unsafe extern "C" fn crdtsync_doc_delete(
     path: *const u8,
     path_len: usize,
 ) -> CrdtBuf {
-    emit(doc, path, path_len, |cur, key| cur.delete(key))
+    edit(doc, path, path_len, path::delete)
 }
 
 /// Read an integer Register at a path into `out`. Returns 1 when found and an
@@ -206,13 +180,7 @@ pub unsafe extern "C" fn crdtsync_doc_get_int(
     path_len: usize,
     out: *mut i64,
 ) -> i32 {
-    read_i64(doc, path, path_len, out, |e| match e {
-        Element::Register(r) => match r.borrow().read() {
-            Scalar::Int(n) => Some(*n),
-            _ => None,
-        },
-        _ => None,
-    })
+    read_i64(doc, path, path_len, out, path::get_int)
 }
 
 /// Read a Counter's value at a path into `out`. Returns 1/0/-1 as
@@ -227,10 +195,7 @@ pub unsafe extern "C" fn crdtsync_doc_get_counter(
     path_len: usize,
     out: *mut i64,
 ) -> i32 {
-    read_i64(doc, path, path_len, out, |e| match e {
-        Element::Counter(c) => Some(c.borrow().read()),
-        _ => None,
-    })
+    read_i64(doc, path, path_len, out, path::get_counter)
 }
 
 /// Read a bytes scalar at a path into `out` (a fresh buffer the caller frees).
@@ -246,10 +211,7 @@ pub unsafe extern "C" fn crdtsync_doc_get_bytes(
     path_len: usize,
     out: *mut CrdtBuf,
 ) -> i32 {
-    read_buf(doc, path, path_len, out, |e| match e {
-        Element::Scalar(Scalar::Bytes(b)) => Some(b.clone()),
-        _ => None,
-    })
+    read_buf(doc, path, path_len, out, path::get_bytes)
 }
 
 /// Insert a bytes item into the List at a path, at live `index`. Returns the ops
@@ -270,9 +232,8 @@ pub unsafe extern "C" fn crdtsync_doc_list_insert(
     let Some(val) = as_slice(value, value_len) else {
         return CrdtBuf::empty();
     };
-    let val = val.to_vec();
-    emit(doc, path, path_len, move |cur, key| {
-        cur.list(key).insert(index, Scalar::Bytes(val))
+    edit(doc, path, path_len, |d, p| {
+        path::list_insert(d, p, index, val)
     })
 }
 
@@ -287,18 +248,7 @@ pub unsafe extern "C" fn crdtsync_doc_list_delete(
     path_len: usize,
     index: usize,
 ) -> CrdtBuf {
-    // A delete that targets no live item must not create or re-stamp a list.
-    if !slot_ok(
-        doc,
-        path,
-        path_len,
-        |e| matches!(e, Element::List(l) if index < l.borrow().len()),
-    ) {
-        return CrdtBuf::empty();
-    }
-    emit(doc, path, path_len, move |cur, key| {
-        cur.list(key).delete(index)
-    })
+    edit(doc, path, path_len, |d, p| path::list_delete(d, p, index))
 }
 
 /// Read the live length of the List at a path into `out`. Returns 1/0/-1.
@@ -312,10 +262,7 @@ pub unsafe extern "C" fn crdtsync_doc_list_len(
     path_len: usize,
     out: *mut usize,
 ) -> i32 {
-    read_usize(doc, path, path_len, out, |e| match e {
-        Element::List(l) => Some(l.borrow().len()),
-        _ => None,
-    })
+    read_usize(doc, path, path_len, out, path::list_len)
 }
 
 /// Read the bytes item at live `index` in the List at a path into `out`. Returns
@@ -331,13 +278,7 @@ pub unsafe extern "C" fn crdtsync_doc_list_get(
     index: usize,
     out: *mut CrdtBuf,
 ) -> i32 {
-    read_buf(doc, path, path_len, out, |e| match e {
-        Element::List(l) => match l.borrow().get(index) {
-            Some(Element::Scalar(Scalar::Bytes(b))) => Some(b),
-            _ => None,
-        },
-        _ => None,
-    })
+    read_buf(doc, path, path_len, out, |d, p| path::list_get(d, p, index))
 }
 
 /// Insert UTF-8 `text` into the Text at a path, at codepoint `index`. Returns the
@@ -361,9 +302,8 @@ pub unsafe extern "C" fn crdtsync_doc_text_insert(
     let Ok(s) = std::str::from_utf8(raw) else {
         return CrdtBuf::empty();
     };
-    let s = s.to_owned();
-    emit(doc, path, path_len, move |cur, key| {
-        cur.text(key).insert(index, &s)
+    edit(doc, path, path_len, |d, p| {
+        path::text_insert(d, p, index, s)
     })
 }
 
@@ -379,17 +319,8 @@ pub unsafe extern "C" fn crdtsync_doc_text_delete(
     index: usize,
     count: usize,
 ) -> CrdtBuf {
-    // A delete that removes no codepoint must not create or re-stamp a text.
-    if !slot_ok(
-        doc,
-        path,
-        path_len,
-        |e| matches!(e, Element::Text(t) if count > 0 && index < t.borrow().len()),
-    ) {
-        return CrdtBuf::empty();
-    }
-    emit(doc, path, path_len, move |cur, key| {
-        cur.text(key).delete(index, count)
+    edit(doc, path, path_len, |d, p| {
+        path::text_delete(d, p, index, count)
     })
 }
 
@@ -404,10 +335,7 @@ pub unsafe extern "C" fn crdtsync_doc_text_len(
     path_len: usize,
     out: *mut usize,
 ) -> i32 {
-    read_usize(doc, path, path_len, out, |e| match e {
-        Element::Text(t) => Some(t.borrow().len()),
-        _ => None,
-    })
+    read_usize(doc, path, path_len, out, path::text_len)
 }
 
 /// Read the Text at a path into `out` as UTF-8 bytes. Returns 1/0/-1.
@@ -421,9 +349,8 @@ pub unsafe extern "C" fn crdtsync_doc_text_get(
     path_len: usize,
     out: *mut CrdtBuf,
 ) -> i32 {
-    read_buf(doc, path, path_len, out, |e| match e {
-        Element::Text(t) => Some(t.borrow().as_string().into_bytes()),
-        _ => None,
+    read_buf(doc, path, path_len, out, |d, p| {
+        path::text_get(d, p).map(String::into_bytes)
     })
 }
 
@@ -448,7 +375,7 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
         let Some(raw) = as_slice(bytes, len) else {
             return -1;
         };
-        match decode_ops(raw) {
+        match crdtsync_core::decode_ops(raw) {
             Ok(ops) => ops.iter().filter(|op| handle.doc.apply(op)).count() as i32,
             Err(_) => -1,
         }
@@ -456,64 +383,44 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
     .unwrap_or(-1)
 }
 
-/// Run a path-addressed edit, apply it locally, and return its encoded ops.
-unsafe fn emit<F>(doc: *mut CrdtDoc, path: *const u8, path_len: usize, leaf: F) -> CrdtBuf
+/// Marshal a path-addressed edit: delegate the navigation to `run`, encode the
+/// emitted ops, and never let a panic cross the C frame.
+unsafe fn edit<F>(doc: *mut CrdtDoc, path: *const u8, path_len: usize, run: F) -> CrdtBuf
 where
-    F: FnOnce(&mut MapCursor, &[u8]),
+    F: FnOnce(&mut Document, &[u8]) -> Vec<Op>,
 {
     catch_unwind(AssertUnwindSafe(|| {
         if doc.is_null() {
             return CrdtBuf::empty();
         }
-        let Some(keys) = parse_path(path, path_len) else {
+        let Some(p) = as_slice(path, path_len) else {
             return CrdtBuf::empty();
         };
-        let Some((leaf_key, parents)) = keys.split_last() else {
-            return CrdtBuf::empty();
-        };
-        let handle = &mut *doc;
-        let ops = handle
-            .doc
-            .transact(|tx| descend(tx, parents, |cur| leaf(cur, leaf_key)));
+        let ops = run(&mut (*doc).doc, p);
         CrdtBuf::from_vec(encode_ops(&ops))
     }))
     .unwrap_or_else(|_| CrdtBuf::empty())
 }
 
-/// Descend `parents` from `cur`, creating maps as needed, then run `f` on the
-/// map that holds the leaf. Iterative — path depth is caller-supplied, so a
-/// recursive walk could overflow the stack.
-fn descend<F>(cur: &mut MapCursor, parents: &[Vec<u8>], f: F)
-where
-    F: FnOnce(&mut MapCursor),
-{
-    let Some((first, rest)) = parents.split_first() else {
-        f(cur);
-        return;
-    };
-    let mut child = cur.map(first);
-    for key in rest {
-        child = child.into_map(key);
-    }
-    f(&mut child);
-}
-
-/// Read the `i64`-valued slot at a path through `pick`.
+/// Read an `i64`-valued slot through `run` into `out`.
 unsafe fn read_i64<F>(
     doc: *const CrdtDoc,
     path: *const u8,
     path_len: usize,
     out: *mut i64,
-    pick: F,
+    run: F,
 ) -> i32
 where
-    F: FnOnce(&Element) -> Option<i64>,
+    F: FnOnce(&Document, &[u8]) -> Option<i64>,
 {
     catch_unwind(AssertUnwindSafe(|| {
         if doc.is_null() || out.is_null() {
             return -1;
         }
-        match slot(&*doc, path, path_len).as_ref().and_then(pick) {
+        let Some(p) = as_slice(path, path_len) else {
+            return 0;
+        };
+        match run(&(*doc).doc, p) {
             Some(n) => {
                 *out = n;
                 1
@@ -524,22 +431,25 @@ where
     .unwrap_or(-1)
 }
 
-/// Read the `usize`-valued property of the slot at a path through `pick`.
+/// Read a `usize`-valued slot through `run` into `out`.
 unsafe fn read_usize<F>(
     doc: *const CrdtDoc,
     path: *const u8,
     path_len: usize,
     out: *mut usize,
-    pick: F,
+    run: F,
 ) -> i32
 where
-    F: FnOnce(&Element) -> Option<usize>,
+    F: FnOnce(&Document, &[u8]) -> Option<usize>,
 {
     catch_unwind(AssertUnwindSafe(|| {
         if doc.is_null() || out.is_null() {
             return -1;
         }
-        match slot(&*doc, path, path_len).as_ref().and_then(pick) {
+        let Some(p) = as_slice(path, path_len) else {
+            return 0;
+        };
+        match run(&(*doc).doc, p) {
             Some(n) => {
                 *out = n;
                 1
@@ -550,23 +460,25 @@ where
     .unwrap_or(-1)
 }
 
-/// Read the byte payload of the slot at a path through `pick` into a fresh
-/// buffer the caller frees.
+/// Read a byte payload through `run` into a fresh buffer at `out` the caller frees.
 unsafe fn read_buf<F>(
     doc: *const CrdtDoc,
     path: *const u8,
     path_len: usize,
     out: *mut CrdtBuf,
-    pick: F,
+    run: F,
 ) -> i32
 where
-    F: FnOnce(&Element) -> Option<Vec<u8>>,
+    F: FnOnce(&Document, &[u8]) -> Option<Vec<u8>>,
 {
     catch_unwind(AssertUnwindSafe(|| {
         if doc.is_null() || out.is_null() {
             return -1;
         }
-        match slot(&*doc, path, path_len).as_ref().and_then(pick) {
+        let Some(p) = as_slice(path, path_len) else {
+            return 0;
+        };
+        match run(&(*doc).doc, p) {
             Some(b) => {
                 *out = CrdtBuf::from_vec(b);
                 1
@@ -575,44 +487,4 @@ where
         }
     }))
     .unwrap_or(-1)
-}
-
-/// Whether the element at a path satisfies `ok`. False on a bad handle or an
-/// unresolved path — used to keep a no-op delete from materialising a container.
-unsafe fn slot_ok<F>(doc: *const CrdtDoc, path: *const u8, path_len: usize, ok: F) -> bool
-where
-    F: FnOnce(&Element) -> bool,
-{
-    catch_unwind(AssertUnwindSafe(|| {
-        if doc.is_null() {
-            return false;
-        }
-        slot(&*doc, path, path_len)
-            .as_ref()
-            .map(ok)
-            .unwrap_or(false)
-    }))
-    .unwrap_or(false)
-}
-
-/// The live element at a path, if the whole path resolves.
-unsafe fn slot(handle: &CrdtDoc, path: *const u8, path_len: usize) -> Option<Element> {
-    let keys = parse_path(path, path_len)?;
-    let (leaf_key, parents) = keys.split_last()?;
-    let map = resolve_map(&handle.doc, parents)?;
-    let value = map.borrow().get(leaf_key);
-    value
-}
-
-/// Walk `parents` from the root, following nested maps.
-fn resolve_map(doc: &Document, parents: &[Vec<u8>]) -> Option<Rc<RefCell<Map>>> {
-    let mut cur = doc.root();
-    for key in parents {
-        let next = match cur.borrow().get(key) {
-            Some(Element::Map(m)) => m,
-            _ => return None,
-        };
-        cur = next;
-    }
-    Some(cur)
 }
