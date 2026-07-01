@@ -146,6 +146,78 @@ fn subscribe_replies_with_the_catch_up_batch() {
 }
 
 #[test]
+fn subscribe_below_a_compaction_floor_replies_with_a_snapshot() {
+    let mut h = hub();
+    let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
+    h.ingest(ROOM, ops).unwrap();
+    let head = h.seq(ROOM);
+    h.compact(ROOM);
+
+    let mut s = Session::new();
+    hello(&mut h, &mut s, 2);
+    // A subscriber that saw nothing is below the floor: it gets a snapshot.
+    let r = step(
+        &mut h,
+        &mut s,
+        Message::Subscribe {
+            room: ROOM.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    match r.replies.as_slice() {
+        [Message::Snapshot { seq, state }] => {
+            assert_eq!(*seq, head);
+            let restored = Document::decode_state(state).unwrap();
+            match restored.get(b"age") {
+                Some(crdtsync_core::Element::Register(reg)) => {
+                    assert_eq!(reg.borrow().read(), &Scalar::Int(30))
+                }
+                _ => panic!("expected the register in the snapshot"),
+            }
+        }
+        other => panic!("expected a single snapshot reply, got {other:?}"),
+    }
+    assert!(!r.close);
+}
+
+#[test]
+fn subscribe_at_the_head_of_a_compacted_room_replies_with_an_empty_batch() {
+    let mut h = hub();
+    let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
+    h.ingest(ROOM, ops).unwrap();
+    let head = h.seq(ROOM);
+    h.compact(ROOM);
+
+    let mut s = Session::new();
+    hello(&mut h, &mut s, 2);
+    let r = step(
+        &mut h,
+        &mut s,
+        Message::Subscribe {
+            room: ROOM.to_vec(),
+            last_seen_seq: head,
+        },
+    );
+    assert_eq!(r.replies, vec![Message::Ops(Vec::new())]);
+}
+
+#[test]
+fn a_client_sending_a_snapshot_is_a_violation() {
+    let mut h = hub();
+    let mut s = Session::new();
+    hello(&mut h, &mut s, 1);
+    let r = step(
+        &mut h,
+        &mut s,
+        Message::Snapshot {
+            seq: 1,
+            state: Vec::new(),
+        },
+    );
+    assert!(r.replies.iter().any(is_violation) && r.close);
+}
+
+#[test]
 fn subscribe_on_a_fresh_room_replies_with_an_empty_batch() {
     let mut h = hub();
     let mut s = Session::new();

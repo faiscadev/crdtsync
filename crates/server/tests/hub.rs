@@ -12,7 +12,7 @@
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::{ClientId, Element, Op, Scalar};
-use crdtsync_server::Hub;
+use crdtsync_server::{Catchup, Hub};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -32,6 +32,15 @@ fn doc(first: u8) -> Document {
 /// Ingest into an in-memory hub, where persistence can never fail.
 fn ingest(h: &mut Hub, room: &[u8], ops: Vec<Op>) -> Vec<Op> {
     h.ingest(room, ops).unwrap()
+}
+
+/// Unwrap a catch-up that must be a plain op delta — every room here is
+/// uncompacted, so catch-up never returns a snapshot.
+fn ops(c: Catchup) -> Vec<Op> {
+    match c {
+        Catchup::Ops(v) => v,
+        Catchup::Snapshot { .. } => panic!("expected an op delta, got a snapshot"),
+    }
 }
 
 fn int(e: Option<Element>) -> i64 {
@@ -65,7 +74,7 @@ fn a_fresh_room_is_empty_at_seq_zero() {
 #[test]
 fn catch_up_on_an_unknown_room_is_empty() {
     let mut h = hub();
-    assert!(h.catch_up(ROOM, 0).is_empty());
+    assert!(ops(h.catch_up(ROOM, 0)).is_empty());
 }
 
 #[test]
@@ -151,7 +160,7 @@ fn catch_up_from_zero_replays_the_whole_log() {
         a.transact(|tx| tx.register(b"b", Scalar::Int(2))),
     );
 
-    let log = h.catch_up(ROOM, 0);
+    let log = ops(h.catch_up(ROOM, 0));
     assert_eq!(log.len(), 2);
 
     // A fresh replica replaying the catch-up reconstructs the room's state.
@@ -171,7 +180,7 @@ fn catch_up_returns_only_ops_past_the_last_seen_seq() {
     let second = a.transact(|tx| tx.register(b"b", Scalar::Int(2)));
     ingest(&mut h, ROOM, first);
     ingest(&mut h, ROOM, second.clone());
-    assert_eq!(h.catch_up(ROOM, 1), second);
+    assert_eq!(ops(h.catch_up(ROOM, 1)), second);
 }
 
 #[test]
@@ -183,8 +192,8 @@ fn catch_up_at_or_past_head_is_empty() {
         ROOM,
         a.transact(|tx| tx.register(b"a", Scalar::Int(1))),
     );
-    assert!(h.catch_up(ROOM, 1).is_empty());
-    assert!(h.catch_up(ROOM, 99).is_empty());
+    assert!(ops(h.catch_up(ROOM, 1)).is_empty());
+    assert!(ops(h.catch_up(ROOM, 99)).is_empty());
 }
 
 // --- isolation + convergence ---
