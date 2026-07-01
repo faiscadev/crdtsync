@@ -9,24 +9,29 @@
 //! and thus `Send` — reach it over channels: they forward decoded messages in
 //! and receive outbound messages back through a per-connection channel. A
 //! deliver's broadcast reaches the room's other connections because the actor
-//! flushes every connection's outbox after each step.
+//! flushes every connection's outbox after each step. A connection whose
+//! outbound queue overflows is too slow to keep up and is dropped.
 
 use std::collections::HashMap;
 
 use crdtsync_core::{decode_header, decode_message, encode_message, ClientId, Message};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, unbounded_channel, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{negotiate, ConnId, Registry};
 
+/// How many outbound messages may queue for one connection before it is judged
+/// too slow and dropped — a bound on per-connection memory.
+const OUTBOX_CAPACITY: usize = 1024;
+
 /// A request to the registry actor from a connection task.
 enum Cmd {
     /// Open a connection, returning its id and registering its outbound sink.
     Connect {
-        writer: UnboundedSender<Message>,
+        writer: Sender<Message>,
         reply: oneshot::Sender<ConnId>,
     },
     /// Route one inbound message, replying whether the connection stays open.
@@ -62,7 +67,7 @@ pub async fn serve(listener: TcpListener, server: ClientId) -> std::io::Result<(
 /// connection's sink after every routed message.
 async fn registry_actor(server: ClientId, mut cmds: UnboundedReceiver<Cmd>) {
     let mut reg = Registry::new(server);
-    let mut writers: HashMap<ConnId, UnboundedSender<Message>> = HashMap::new();
+    let mut writers: HashMap<ConnId, Sender<Message>> = HashMap::new();
     while let Some(cmd) = cmds.recv().await {
         match cmd {
             Cmd::Connect { writer, reply } => {
@@ -72,11 +77,7 @@ async fn registry_actor(server: ClientId, mut cmds: UnboundedReceiver<Cmd>) {
             }
             Cmd::Deliver { id, msg, reply } => {
                 let keep = reg.deliver(id, msg);
-                for (id, sink) in writers.iter() {
-                    for out in reg.take_outbox(*id) {
-                        let _ = sink.send(out);
-                    }
-                }
+                flush(&mut reg, &mut writers);
                 let _ = reply.send(keep);
             }
             Cmd::Disconnect { id } => {
@@ -87,6 +88,25 @@ async fn registry_actor(server: ClientId, mut cmds: UnboundedReceiver<Cmd>) {
     }
 }
 
+/// Push every connection's queued outbox into its sink — how a deliver's
+/// broadcast reaches the room's other connections. A connection whose sink is
+/// full or gone is too slow (or closed) and is dropped.
+fn flush(reg: &mut Registry, writers: &mut HashMap<ConnId, Sender<Message>>) {
+    let mut dropped = Vec::new();
+    for (id, sink) in writers.iter() {
+        for out in reg.take_outbox(*id) {
+            if sink.try_send(out).is_err() {
+                dropped.push(*id);
+                break;
+            }
+        }
+    }
+    for id in dropped {
+        reg.disconnect(id);
+        writers.remove(&id);
+    }
+}
+
 /// Drive one connection: handshake, then the message loop, then teardown.
 async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
@@ -94,7 +114,7 @@ async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
     };
     let (mut write, mut read) = ws.split();
 
-    let (out, mut out_rx) = unbounded_channel::<Message>();
+    let (out, mut out_rx) = channel::<Message>(OUTBOX_CAPACITY);
     let (id_tx, id_rx) = oneshot::channel();
     if cmds
         .send(Cmd::Connect {
@@ -129,7 +149,7 @@ async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
         Some(bytes) => match decode_header(&bytes).map(negotiate) {
             Ok(Ok(())) => run_messages(id, &mut read, &cmds).await,
             Ok(Err(refusal)) => {
-                let _ = out.send(refusal);
+                let _ = out.send(refusal).await;
             }
             Err(_) => {}
         },
@@ -162,7 +182,9 @@ where
     }
 }
 
-/// The next binary frame's bytes, or `None` once the stream ends or closes.
+/// The next binary frame's bytes, or `None` once the stream ends. A text frame
+/// is a protocol violation (the wire is binary) and ends the stream; control
+/// frames are tolerated.
 async fn next_binary<R>(read: &mut R) -> Option<Vec<u8>>
 where
     R: StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -170,7 +192,7 @@ where
     while let Some(frame) = read.next().await {
         match frame {
             Ok(WsMessage::Binary(b)) => return Some(b.into()),
-            Ok(WsMessage::Close(_)) | Err(_) => return None,
+            Ok(WsMessage::Text(_)) | Ok(WsMessage::Close(_)) | Err(_) => return None,
             Ok(_) => continue,
         }
     }

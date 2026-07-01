@@ -34,12 +34,29 @@ fn doc(first: u8) -> Document {
 
 const ROOM: &[u8] = b"room-1";
 
-/// Start a server on an ephemeral loopback port; return its ws:// URL.
-async fn start_server() -> String {
+/// A running test server: its ws:// URL and the accept-loop task. The handle is
+/// retained so the task isn't dropped, and aborted when the test ends. The
+/// server loop runs until the listener errors, so it is never awaited.
+struct Server {
+    url: String,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Start a server on an ephemeral loopback port.
+async fn start_server() -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, cid(0xFF)));
-    format!("ws://{addr}")
+    let task = tokio::spawn(serve(listener, cid(0xFF)));
+    Server {
+        url: format!("ws://{addr}"),
+        task,
+    }
 }
 
 async fn open(url: &str) -> Ws {
@@ -94,17 +111,19 @@ fn sample_ops() -> Vec<Op> {
 
 #[tokio::test]
 async fn subscribe_returns_a_catch_up_batch() {
-    let url = start_server().await;
-    let mut a = join(&url, 1).await;
+    let server = start_server().await;
+    let url = &server.url;
+    let mut a = join(url, 1).await;
     // A fresh room's catch-up is empty.
     assert_eq!(recv(&mut a).await, Message::Ops(Vec::new()));
 }
 
 #[tokio::test]
 async fn an_op_broadcasts_to_another_subscriber() {
-    let url = start_server().await;
-    let mut a = join(&url, 1).await;
-    let mut b = join(&url, 2).await;
+    let server = start_server().await;
+    let url = &server.url;
+    let mut a = join(url, 1).await;
+    let mut b = join(url, 2).await;
     assert_eq!(recv(&mut a).await, Message::Ops(Vec::new()));
     assert_eq!(recv(&mut b).await, Message::Ops(Vec::new()));
 
@@ -116,8 +135,9 @@ async fn an_op_broadcasts_to_another_subscriber() {
 
 #[tokio::test]
 async fn a_late_joiner_catches_up() {
-    let url = start_server().await;
-    let mut a = join(&url, 1).await;
+    let server = start_server().await;
+    let url = &server.url;
+    let mut a = join(url, 1).await;
     assert_eq!(recv(&mut a).await, Message::Ops(Vec::new()));
 
     let ops = sample_ops();
@@ -136,14 +156,15 @@ async fn a_late_joiner_catches_up() {
     assert_eq!(recv(&mut a).await, Message::Ops(ops.clone()));
 
     // A connection that subscribes afterward draws the room's history.
-    let mut b = join(&url, 2).await;
+    let mut b = join(url, 2).await;
     assert_eq!(recv(&mut b).await, Message::Ops(ops));
 }
 
 #[tokio::test]
 async fn a_foreign_version_is_refused() {
-    let url = start_server().await;
-    let mut ws = open(&url).await;
+    let server = start_server().await;
+    let url = &server.url;
+    let mut ws = open(url).await;
     send_bytes(&mut ws, encode_header(PROTOCOL_VERSION + 1).to_vec()).await;
     assert!(matches!(
         recv(&mut ws).await,
