@@ -11,6 +11,17 @@ func cid(first byte) []byte {
 	return b
 }
 
+// newDoc opens a document, failing the test (rather than nil-panicking on a
+// deferred Close) if construction errors.
+func newDoc(t *testing.T, first byte) *Document {
+	t.Helper()
+	d, err := New(cid(first))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return d
+}
+
 func key(s string) []byte { return []byte(s) }
 
 func path(keys ...string) [][]byte {
@@ -22,12 +33,9 @@ func path(keys ...string) [][]byte {
 }
 
 func TestRegisterReadsBackAndConverges(t *testing.T) {
-	a, err := New(cid(1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	a := newDoc(t, 1)
 	defer a.Close()
-	b, _ := New(cid(2))
+	b := newDoc(t, 2)
 	defer b.Close()
 
 	ops := a.RegisterInt(path("age"), 30)
@@ -43,7 +51,7 @@ func TestRegisterReadsBackAndConverges(t *testing.T) {
 }
 
 func TestMissingKeyIsAbsent(t *testing.T) {
-	a, _ := New(cid(1))
+	a := newDoc(t, 1)
 	defer a.Close()
 	if _, ok := a.GetInt(path("nope")); ok {
 		t.Fatal("expected absent")
@@ -51,9 +59,9 @@ func TestMissingKeyIsAbsent(t *testing.T) {
 }
 
 func TestCounterAccumulatesAcrossReplicas(t *testing.T) {
-	a, _ := New(cid(1))
+	a := newDoc(t, 1)
 	defer a.Close()
-	b, _ := New(cid(2))
+	b := newDoc(t, 2)
 	defer b.Close()
 
 	oa := a.Inc(path("n"), 3)
@@ -69,9 +77,9 @@ func TestCounterAccumulatesAcrossReplicas(t *testing.T) {
 }
 
 func TestNestedPathConverges(t *testing.T) {
-	a, _ := New(cid(1))
+	a := newDoc(t, 1)
 	defer a.Close()
-	b, _ := New(cid(2))
+	b := newDoc(t, 2)
 	defer b.Close()
 
 	p := path("profile", "stats", "score")
@@ -82,7 +90,7 @@ func TestNestedPathConverges(t *testing.T) {
 }
 
 func TestBytesRoundTrip(t *testing.T) {
-	a, _ := New(cid(1))
+	a := newDoc(t, 1)
 	defer a.Close()
 	want := []byte{0, 1, 255, 0}
 	a.SetBytes(path("blob"), want)
@@ -93,9 +101,9 @@ func TestBytesRoundTrip(t *testing.T) {
 }
 
 func TestListConvergesAndNoOpDeleteInert(t *testing.T) {
-	a, _ := New(cid(1))
+	a := newDoc(t, 1)
 	defer a.Close()
-	b, _ := New(cid(2))
+	b := newDoc(t, 2)
 	defer b.Close()
 
 	p := path("board", "cards")
@@ -117,9 +125,9 @@ func TestListConvergesAndNoOpDeleteInert(t *testing.T) {
 }
 
 func TestTextConvergesAndDeletes(t *testing.T) {
-	a, _ := New(cid(1))
+	a := newDoc(t, 1)
 	defer a.Close()
-	b, _ := New(cid(2))
+	b := newDoc(t, 2)
 	defer b.Close()
 
 	p := path("doc", "title")
@@ -137,7 +145,7 @@ func TestTextConvergesAndDeletes(t *testing.T) {
 }
 
 func TestApplyRejectsGarbage(t *testing.T) {
-	a, _ := New(cid(1))
+	a := newDoc(t, 1)
 	defer a.Close()
 	if rc := a.Apply([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}); rc != -1 {
 		t.Fatalf("garbage apply: got %d", rc)

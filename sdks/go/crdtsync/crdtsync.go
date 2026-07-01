@@ -57,6 +57,9 @@ func EncodePath(keys [][]byte) []byte {
 	var buf []byte
 	var hdr [4]byte
 	for _, k := range keys {
+		if uint64(len(k)) > uint64(^uint32(0)) {
+			panic("crdtsync: path key length exceeds uint32")
+		}
 		binary.LittleEndian.PutUint32(hdr[:], uint32(len(k)))
 		buf = append(buf, hdr[:]...)
 		buf = append(buf, k...)
@@ -78,7 +81,11 @@ func takeBuf(b C.CrdtBuf) []byte {
 	if b.ptr == nil {
 		return nil
 	}
-	out := C.GoBytes(unsafe.Pointer(b.ptr), C.int(b.len))
+	// Copy through a Go-sized slice so a buffer larger than a C int can't be
+	// truncated; free the FFI buffer regardless.
+	src := unsafe.Slice((*byte)(unsafe.Pointer(b.ptr)), int(b.len))
+	out := make([]byte, len(src))
+	copy(out, src)
 	C.crdtsync_buf_free(b)
 	return out
 }
