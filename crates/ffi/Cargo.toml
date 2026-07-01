@@ -5,7 +5,7 @@ edition = "2021"
 description = "C ABI for the CRDT core: opaque handles for Go/Python embedding."
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 crdtsync-core = { path = "../core" }
