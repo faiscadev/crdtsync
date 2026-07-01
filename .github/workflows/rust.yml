@@ -23,7 +23,7 @@ jobs:
       - name: Install Miri
         run: rustup toolchain install nightly --component miri
       - name: Miri
-        run: cargo +nightly miri test -p crdtsync-core -p crdtsync-ffi
+        run: cargo +nightly miri test -p crdtsync-core -p crdtsync-ffi -p crdtsync-server
 
   python-sdk:
     runs-on: ubuntu-latest

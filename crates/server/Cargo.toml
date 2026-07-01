@@ -1,0 +1,8 @@
+[package]
+name = "crdtsync-server"
+version = "0.0.0"
+edition = "2021"
+description = "Single-node sync server: per-room op logs, idempotent ingest, catch-up replay."
+
+[dependencies]
+crdtsync-core = { path = "../core" }
