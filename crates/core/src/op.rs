@@ -9,6 +9,7 @@
 
 use crate::clientid::ClientId;
 use crate::elementid::ElementId;
+use crate::list::Anchor;
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 
@@ -55,6 +56,20 @@ pub enum OpKind {
     /// Install a nested Map child at `key` in the target map.
     MapCreate {
         key: Vec<u8>,
+    },
+    /// Install a List child at `key` in the target map.
+    ListCreate {
+        key: Vec<u8>,
+    },
+    /// Insert an item into the target List. The new node's id is the op's
+    /// stamp; `anchor` fixes its Fugue position.
+    ListInsert {
+        value: Scalar,
+        anchor: Anchor,
+    },
+    /// Tombstone the node `id` in the target List.
+    ListDelete {
+        id: Stamp,
     },
 }
 

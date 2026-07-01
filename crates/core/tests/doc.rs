@@ -411,3 +411,139 @@ fn nested_ops_target_the_child_map_not_root() {
     let n = child_map(d.get(b"n"));
     assert_eq!(int(n.borrow().get(b"n")), 5);
 }
+
+// --- lists in the document ---
+
+use crdtsync_core::List;
+
+fn child_list(e: Option<Element>) -> Rc<RefCell<List>> {
+    match e {
+        Some(Element::List(l)) => l,
+        _ => panic!("expected a List"),
+    }
+}
+
+/// A one-byte scalar list item.
+fn sb(c: u8) -> Scalar {
+    Scalar::Bytes(vec![c])
+}
+
+/// The live list as a string (each item is one byte).
+fn list_str(l: &Rc<RefCell<List>>) -> String {
+    l.borrow()
+        .values()
+        .iter()
+        .map(|e| match e {
+            Element::Scalar(Scalar::Bytes(b)) if b.len() == 1 => b[0] as char,
+            _ => panic!("expected a one-byte scalar item"),
+        })
+        .collect()
+}
+
+#[test]
+fn list_insert_reads_back() {
+    let mut d = doc(1);
+    d.transact(|tx| {
+        let mut l = tx.list(b"items");
+        l.insert(0, sb(b'a'));
+        l.insert(1, sb(b'b'));
+        l.insert(1, sb(b'x'));
+    });
+    let items = child_list(d.get(b"items"));
+    assert_eq!(list_str(&items), "axb");
+}
+
+#[test]
+fn list_edits_converge_on_a_peer() {
+    let mut a = doc(1);
+    let ops = a.transact(|tx| {
+        let mut l = tx.list(b"items");
+        l.insert(0, sb(b'h'));
+        l.insert(1, sb(b'i'));
+    });
+    let mut b = doc(2);
+    replay(&mut b, &ops);
+    assert_eq!(list_str(&child_list(b.get(b"items"))), "hi");
+}
+
+#[test]
+fn list_delete_removes_an_item() {
+    let mut d = doc(1);
+    d.transact(|tx| {
+        let mut l = tx.list(b"items");
+        l.insert(0, sb(b'a'));
+        l.insert(1, sb(b'b'));
+        l.insert(2, sb(b'c'));
+    });
+    d.transact(|tx| tx.list(b"items").delete(1));
+    assert_eq!(list_str(&child_list(d.get(b"items"))), "ac");
+}
+
+#[test]
+fn concurrent_list_inserts_converge_without_interleaving() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let oa = a.transact(|tx| {
+        let mut l = tx.list(b"items");
+        l.insert(0, sb(b'A'));
+        l.insert(1, sb(b'B'));
+    });
+    let ob = b.transact(|tx| {
+        let mut l = tx.list(b"items");
+        l.insert(0, sb(b'X'));
+        l.insert(1, sb(b'Y'));
+    });
+
+    replay(&mut a, &ob);
+    replay(&mut b, &oa);
+
+    let sa = list_str(&child_list(a.get(b"items")));
+    let sb_ = list_str(&child_list(b.get(b"items")));
+    assert_eq!(sa, sb_, "replicas diverged");
+    assert!(sa == "ABXY" || sa == "XYAB", "runs interleaved: {sa}");
+}
+
+#[test]
+fn a_re_navigated_list_defends_its_slot_against_a_stale_scalar() {
+    // Re-entering a list to edit it re-stamps its parent slot, so a scalar set
+    // carrying a lower stamp can no longer displace the list — the ListCreate
+    // has to advance the slot stamp, matching register/counter child ops.
+    let mut d = doc(1);
+    d.transact(|tx| tx.list(b"cards").insert(0, sb(b'x')));
+    d.transact(|tx| {
+        for _ in 0..3 {
+            tx.set(b"pad", Scalar::Int(0));
+        }
+    });
+    d.transact(|tx| tx.list(b"cards").insert(1, sb(b'y')));
+
+    // A stale scalar set, stamped below the list's re-navigation, must lose.
+    let stale = Op::new(
+        OpId {
+            client: cid(9),
+            seq: 0,
+        },
+        stmp(4, 9),
+        d.root_id(),
+        OpKind::MapSet {
+            key: b"cards".to_vec(),
+            value: Scalar::Int(0),
+        },
+    );
+    d.apply(&stale);
+
+    assert_eq!(list_str(&child_list(d.get(b"cards"))), "xy");
+}
+
+#[test]
+fn list_in_a_nested_map() {
+    let mut d = doc(1);
+    d.transact(|tx| {
+        let mut sub = tx.map(b"board");
+        let mut l = sub.list(b"cards");
+        l.insert(0, sb(b'z'));
+    });
+    let board = child_map(d.get(b"board"));
+    let cards = child_list(board.borrow().get(b"cards"));
+    assert_eq!(list_str(&cards), "z");
+}
