@@ -1,25 +1,24 @@
 //! ClientId — a per-replica UUIDv7 identity.
 
 use crate::host::Host;
-use uuid::Uuid;
+use uuid::{Builder, Uuid};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Ord, PartialOrd)]
 pub struct ClientId(Uuid);
 
 impl ClientId {
-    /// Generate a fresh v7 id from injected host entropy + clock. Built
-    /// manually (not the uuid crate's `v7` feature) to avoid a getrandom dep.
     pub fn generate(host: &dyn Host) -> Self {
-        let _ = host;
-        todo!()
+        let mut rand = [0u8; 10];
+        host.entropy(&mut rand);
+        let uuid = Builder::from_unix_timestamp_millis(host.now_unix_millis(), &rand).into_uuid();
+        Self(uuid)
     }
 
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        let _ = bytes;
-        todo!()
+        Self(Builder::from_bytes(bytes).into_uuid())
     }
 
     pub fn as_bytes(&self) -> [u8; 16] {
-        todo!()
+        self.0.into_bytes()
     }
 }
