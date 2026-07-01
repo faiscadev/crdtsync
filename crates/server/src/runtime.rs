@@ -69,10 +69,19 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     // Replay the persisted log here, before serving: a corrupt log fails
     // startup rather than panicking inside the detached actor thread and
-    // leaving a live port with no registry behind it.
-    let logs = match &store {
-        Some(store) => store.load()?,
-        None => Vec::new(),
+    // leaving a live port with no registry behind it. The read is blocking, so
+    // it runs on the blocking pool to keep the runtime free for other tasks.
+    let (logs, store) = match store {
+        Some(store) => {
+            let (result, store) = tokio::task::spawn_blocking(move || {
+                let result = store.load();
+                (result, store)
+            })
+            .await
+            .expect("replay task panicked");
+            (result?, Some(store))
+        }
+        None => (Vec::new(), None),
     };
     let (cmds, cmd_rx) = unbounded_channel::<Cmd>();
     // The replicas are single-threaded; keep them on one dedicated thread.
