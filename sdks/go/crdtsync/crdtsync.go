@@ -12,7 +12,7 @@ package crdtsync
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../../crates/ffi/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../target/release -lcrdtsync_ffi
+#cgo LDFLAGS: ${SRCDIR}/../../../target/release/libcrdtsync_ffi.a
 #cgo darwin LDFLAGS: -lm
 #cgo linux LDFLAGS: -lm -ldl -lpthread
 #include <stdlib.h>
