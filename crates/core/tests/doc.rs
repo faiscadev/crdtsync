@@ -851,3 +851,150 @@ fn a_local_create_drains_buffered_child_ops() {
     let sub = child_map(b.get(b"k"));
     assert_eq!(int(sub.borrow().get(b"x")), 9);
 }
+
+// --- counter identity across displacement ---
+//
+// A counter's value is the sum of every increment applied to its id; an
+// intervening scalar displacement never removes those increments. So a counter
+// re-won after displacement resumes its total, and two replicas that saw the
+// same ops converge on that total regardless of arrival order.
+
+#[test]
+fn a_counter_converges_across_concurrent_displace_and_inc() {
+    // One replica overwrites a counter with a scalar while another increments
+    // it. Both saw the same three ops, so both must agree on the total.
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let seed = a.transact(|tx| tx.inc(b"n", 5));
+    replay(&mut b, &seed);
+
+    let ra = a.transact(|tx| tx.set(b"n", Scalar::Int(10))); // scalar displaces the counter
+    let rb = b.transact(|tx| tx.inc(b"n", 2)); // concurrent increment
+    replay(&mut a, &rb);
+    replay(&mut b, &ra);
+
+    assert_eq!(
+        counter(a.get(b"n")),
+        counter(b.get(b"n")),
+        "replicas must converge on the recreated counter"
+    );
+    assert_eq!(counter(a.get(b"n")), 7, "5 + 2, the sum of the increments");
+}
+
+#[test]
+fn a_recreated_counter_keeps_its_total() {
+    // A counter displaced by a scalar, then re-won by a later increment, is the
+    // same logical counter: its earlier increments survive.
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let t1 = a.transact(|tx| tx.inc(b"n", 5));
+    replay(&mut b, &t1);
+
+    let t2 = b.transact(|tx| tx.set(b"n", Scalar::Int(0))); // scalar displaces
+    replay(&mut a, &t2);
+
+    a.transact(|tx| {
+        for _ in 0..3 {
+            tx.set(b"pad", Scalar::Int(0));
+        }
+    });
+    let t3 = a.transact(|tx| tx.inc(b"n", 3)); // re-win the slot
+    replay(&mut b, &t3);
+
+    assert_eq!(
+        counter(a.get(b"n")),
+        8,
+        "5 survived the displacement, plus 3"
+    );
+    assert_eq!(counter(b.get(b"n")), counter(a.get(b"n")));
+}
+
+#[test]
+fn a_counter_incremented_on_both_replicas_across_displacement_converges() {
+    // The additive many-writer case: a displacement between concurrent
+    // increments from two clients loses none of them.
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let seed = a.transact(|tx| tx.inc(b"n", 1));
+    replay(&mut b, &seed);
+
+    let disp = b.transact(|tx| tx.set(b"n", Scalar::Int(0)));
+    replay(&mut a, &disp);
+
+    a.transact(|tx| {
+        for _ in 0..5 {
+            tx.set(b"pad", Scalar::Int(0));
+        }
+    });
+    let ia = a.transact(|tx| tx.inc(b"n", 10));
+    let ib = b.transact(|tx| tx.inc(b"n", 20));
+    replay(&mut a, &ib);
+    replay(&mut b, &ia);
+
+    assert_eq!(counter(a.get(b"n")), counter(b.get(b"n")), "must converge");
+    assert_eq!(
+        counter(a.get(b"n")),
+        31,
+        "1 + 10 + 20 across the displacement"
+    );
+}
+
+#[test]
+fn counter_ops_around_a_displacement_commute() {
+    // The same op set, applied in opposite orders to fresh replicas, yields one
+    // value — the increments commute past the displacing scalar.
+    let mut g1 = doc(1);
+    let mut g2 = doc(2);
+    let o1 = g1.transact(|tx| tx.inc(b"n", 5));
+    replay(&mut g2, &o1);
+    let o2 = g1.transact(|tx| tx.set(b"n", Scalar::Int(9))); // displace on g1
+    let o3 = g2.transact(|tx| tx.inc(b"n", 4)); // concurrent inc on g2
+
+    let mut all = Vec::new();
+    all.extend(o1);
+    all.extend(o2);
+    all.extend(o3);
+
+    let mut forward = doc(3);
+    for op in &all {
+        forward.apply(op);
+    }
+    let mut backward = doc(4);
+    for op in all.iter().rev() {
+        backward.apply(op);
+    }
+    assert_eq!(
+        counter(forward.get(b"n")),
+        counter(backward.get(b"n")),
+        "arrival order must not change the total"
+    );
+    assert_eq!(counter(forward.get(b"n")), 9, "5 + 4");
+}
+
+#[test]
+fn a_register_converges_across_displace_recreate() {
+    // Register is last-writer-wins, so displacement is already order-independent
+    // — this pins that a displaced-then-recreated register still converges.
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let seed = a.transact(|tx| tx.register(b"r", Scalar::Int(1)));
+    replay(&mut b, &seed);
+
+    let ra = a.transact(|tx| tx.set(b"r", Scalar::Int(99))); // scalar displaces
+    let rb = b.transact(|tx| tx.register(b"r", Scalar::Int(2))); // concurrent re-register
+    replay(&mut a, &rb);
+    replay(&mut b, &ra);
+
+    assert_eq!(
+        format!("{:?}", a.get(b"r").map(|e| e.kind())),
+        format!("{:?}", b.get(b"r").map(|e| e.kind())),
+        "the slot's kind must converge",
+    );
+    if let (Some(Element::Register(x)), Some(Element::Register(y))) = (a.get(b"r"), b.get(b"r")) {
+        assert_eq!(
+            x.borrow().read(),
+            y.borrow().read(),
+            "register value converges"
+        );
+    }
+}

@@ -13,6 +13,7 @@
 //! converges.
 
 use crate::clientid::ClientId;
+use crate::counter::Counter;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
 use crate::list::List;
@@ -44,6 +45,11 @@ pub struct Document {
     maps: HashMap<ElementId, Rc<RefCell<Map>>>,
     lists: HashMap<ElementId, Rc<RefCell<List>>>,
     texts: HashMap<ElementId, Rc<RefCell<Text>>>,
+    /// Every counter the replica has materialised, keyed by id. A counter's
+    /// value is the sum of the increments applied to its id, so it is retained
+    /// here across displacement: a slot re-won by a later increment resumes the
+    /// same total.
+    counters: HashMap<ElementId, Rc<RefCell<Counter>>>,
     /// Each container's parent map, for walking reachability up to the root.
     parents: HashMap<ElementId, ElementId>,
     lamport: u64,
@@ -82,6 +88,7 @@ impl Document {
             maps,
             lists: HashMap::new(),
             texts: HashMap::new(),
+            counters: HashMap::new(),
             parents: HashMap::new(),
             lamport: 0,
             seq: 0,
@@ -312,6 +319,16 @@ impl Document {
                 self.create_container(target, key, stamp, Container::Text);
                 return;
             }
+            // Counter ops go through the persistent registry too, so a
+            // displaced counter keeps accumulating toward its total.
+            OpKind::CounterInc { key, amount } => {
+                self.apply_counter(target, key, author, CounterDelta::Inc(*amount), stamp);
+                return;
+            }
+            OpKind::CounterDec { key, amount } => {
+                self.apply_counter(target, key, author, CounterDelta::Dec(*amount), stamp);
+                return;
+            }
             _ => {}
         }
 
@@ -342,21 +359,7 @@ impl Document {
                     m.set(key, Element::Register(Rc::clone(&r)), stamp);
                     displaced(prior)
                 }
-                OpKind::CounterInc { key, amount } => {
-                    let prior = m.get(key);
-                    let c = m.counter(key, stamp);
-                    c.borrow_mut().inc(author, *amount);
-                    m.set(key, Element::Counter(Rc::clone(&c)), stamp);
-                    displaced(prior)
-                }
-                OpKind::CounterDec { key, amount } => {
-                    let prior = m.get(key);
-                    let c = m.counter(key, stamp);
-                    c.borrow_mut().dec(author, *amount);
-                    m.set(key, Element::Counter(Rc::clone(&c)), stamp);
-                    displaced(prior)
-                }
-                _ => unreachable!("container, sequence, and text ops routed above"),
+                _ => unreachable!("container, counter, sequence, and text ops routed above"),
             }
         };
         if let Some(o) = orphan {
@@ -398,6 +401,55 @@ impl Document {
         }
     }
 
+    /// Fold a counter delta into the counter at `key` in `map_id`. The counter
+    /// comes from the persistent registry, so its total accumulates by id even
+    /// while a scalar holds the slot; the delta re-wins the slot only if its
+    /// stamp is the latest there, otherwise the counter stays displaced with its
+    /// total intact.
+    fn apply_counter(
+        &mut self,
+        map_id: ElementId,
+        key: &[u8],
+        author: ClientId,
+        delta: CounterDelta,
+        stamp: Stamp,
+    ) {
+        let Some(map) = self.maps.get(&map_id).cloned() else {
+            return;
+        };
+        if map.borrow().is_displaced() {
+            return;
+        }
+        let id = ElementId::derive(map_id, key, ElementKind::Counter);
+        let counter = Rc::clone(
+            self.counters
+                .entry(id)
+                .or_insert_with(|| Rc::new(RefCell::new(Counter::new(id)))),
+        );
+        match delta {
+            CounterDelta::Inc(amount) => counter.borrow_mut().inc(author, amount),
+            CounterDelta::Dec(amount) => counter.borrow_mut().dec(author, amount),
+        }
+        let (won, orphan) = {
+            let mut m = map.borrow_mut();
+            let prior = m.get(key);
+            m.set(key, Element::Counter(Rc::clone(&counter)), stamp);
+            let won = m
+                .get(key)
+                .as_ref()
+                .is_some_and(|cur| handles_eq(cur, &Element::Counter(Rc::clone(&counter))));
+            (won, displaced(prior))
+        };
+        if won {
+            counter.borrow().reinstate();
+        } else {
+            counter.borrow().displace();
+        }
+        if let Some(o) = orphan {
+            self.orphans.push(o);
+        }
+    }
+
     /// The registered container handle for `id`, wrapped as an Element,
     /// materialising and registering a fresh one on first sight.
     fn registered_handle(&mut self, id: ElementId, kind: Container) -> Element {
@@ -421,6 +473,14 @@ impl Document {
     }
 }
 
+/// A directional counter change, so the registry keeps inc and dec tallies
+/// apart for a PN-counter's per-client merge.
+#[derive(Clone, Copy)]
+enum CounterDelta {
+    Inc(u32),
+    Dec(u32),
+}
+
 /// The container kinds a create op installs.
 #[derive(Clone, Copy)]
 enum Container {
@@ -439,12 +499,13 @@ impl Container {
     }
 }
 
-/// Whether two Elements hold the exact same container handle.
+/// Whether two Elements hold the exact same registered handle.
 fn handles_eq(a: &Element, b: &Element) -> bool {
     match (a, b) {
         (Element::Map(x), Element::Map(y)) => Rc::ptr_eq(x, y),
         (Element::List(x), Element::List(y)) => Rc::ptr_eq(x, y),
         (Element::Text(x), Element::Text(y)) => Rc::ptr_eq(x, y),
+        (Element::Counter(x), Element::Counter(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
