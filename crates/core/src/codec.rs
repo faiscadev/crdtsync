@@ -48,7 +48,7 @@ pub fn encode_ops(ops: &[Op]) -> Vec<u8> {
     let mut out = Vec::new();
     for op in ops {
         let body = encode_op(op);
-        put_u32(&mut out, body.len() as u32);
+        put_u32(&mut out, len_u32(body.len()));
         out.extend_from_slice(&body);
     }
     out
@@ -84,8 +84,14 @@ fn put_i64(out: &mut Vec<u8>, v: i64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+/// A length as a u32, failing loudly rather than truncating — a 4 GiB single
+/// field is pathological, and a silent wrap would corrupt the stream.
+fn len_u32(n: usize) -> u32 {
+    u32::try_from(n).expect("codec: length exceeds 4 GiB")
+}
+
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    put_u32(out, b.len() as u32);
+    put_u32(out, len_u32(b.len()));
     out.extend_from_slice(b);
 }
 
@@ -184,7 +190,7 @@ fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
         }
         OpKind::TextDelete { ids } => {
             put_u8(out, 11);
-            put_u32(out, ids.len() as u32);
+            put_u32(out, len_u32(ids.len()));
             for id in ids {
                 put_stamp(out, id);
             }
