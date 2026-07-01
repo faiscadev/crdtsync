@@ -23,6 +23,7 @@ pub mod element;
 pub mod list;
 pub mod map;
 pub mod register;
+pub mod text;
 
 pub mod doc;
 pub mod op;
@@ -39,3 +40,4 @@ pub use op::{Op, OpId, OpKind, TxId};
 pub use register::Register;
 pub use scalar::Scalar;
 pub use stamp::Stamp;
+pub use text::Text;
