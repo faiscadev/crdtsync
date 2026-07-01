@@ -28,6 +28,7 @@ pub mod text;
 pub mod codec;
 pub mod doc;
 pub mod op;
+pub mod protocol;
 
 pub use clientid::ClientId;
 pub use codec::{decode_op, decode_ops, encode_op, encode_ops, DecodeError};
@@ -39,6 +40,9 @@ pub use host::Host;
 pub use list::{Anchor, List, Side};
 pub use map::Map;
 pub use op::{Op, OpId, OpKind, TxId};
+pub use protocol::{
+    decode_header, decode_message, encode_header, encode_message, ErrorCode, Message, ProtocolError,
+};
 pub use register::Register;
 pub use scalar::Scalar;
 pub use stamp::Stamp;
