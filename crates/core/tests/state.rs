@@ -53,6 +53,15 @@ fn an_unknown_scalar_tag_is_an_error() {
     ));
 }
 
+#[test]
+fn a_non_canonical_bool_byte_is_rejected() {
+    // Tag 1 is Bool; a payload outside {0, 1} would re-encode differently.
+    assert!(matches!(
+        Scalar::decode_state(&[1, 2]),
+        Err(DecodeError::BadTag { .. })
+    ));
+}
+
 // --- Register ---
 
 #[test]
@@ -137,4 +146,23 @@ fn a_truncated_counter_is_an_error() {
     c.inc(cid(1), 5);
     let bytes = c.encode_state();
     assert!(Counter::decode_state(&bytes[..bytes.len() - 1]).is_err());
+}
+
+#[test]
+fn a_counter_with_a_duplicate_client_is_rejected() {
+    // Two clients encode as [16 id][4 count][entry 0][entry 1], each entry a
+    // 16-byte client + inc + dec. Rewriting the second client to equal the
+    // first makes a non-canonical, tally-losing state that must not decode.
+    let mut c = Counter::new(eid(7, 7));
+    c.inc(cid(1), 5);
+    c.inc(cid(2), 9);
+    let mut bytes = c.encode_state();
+    let first_client = 20..36;
+    let second_client = 44..60;
+    let dup = bytes[first_client].to_vec();
+    bytes[second_client].copy_from_slice(&dup);
+    assert!(matches!(
+        Counter::decode_state(&bytes),
+        Err(DecodeError::BadTag { .. })
+    ));
 }

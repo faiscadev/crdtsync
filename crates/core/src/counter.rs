@@ -5,7 +5,7 @@
 //! layer can skip op emission for it.
 
 use crate::clientid::ClientId;
-use crate::codec::{put_u32, Cursor, DecodeError};
+use crate::codec::{len_u32, put_u32, Cursor, DecodeError};
 use crate::elementid::ElementId;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ impl Counter {
         out.extend_from_slice(&self.id.as_bytes());
         let mut entries: Vec<(&ClientId, &Tally)> = self.entries.iter().collect();
         entries.sort_by_key(|(client, _)| client.as_bytes());
-        put_u32(out, entries.len() as u32);
+        put_u32(out, len_u32(entries.len()));
         for (client, tally) in entries {
             out.extend_from_slice(&client.as_bytes());
             put_u32(out, tally.inc);
@@ -58,7 +58,14 @@ impl Counter {
             let client = cur.client()?;
             let inc = cur.u32()?;
             let dec = cur.u32()?;
-            entries.insert(client, Tally { inc, dec });
+            // A client must appear once; a duplicate would silently drop a tally
+            // and let a non-canonical state decode.
+            if entries.insert(client, Tally { inc, dec }).is_some() {
+                return Err(DecodeError::BadTag {
+                    what: "counter: duplicate client",
+                    tag: 0,
+                });
+            }
         }
         Ok(Counter {
             id,
