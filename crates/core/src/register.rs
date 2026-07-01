@@ -1,6 +1,7 @@
 //! Register — LWW single value (Scalar) with a (lamport, client) stamp. A write
 //! or merge takes effect iff its stamp strictly beats the current one.
 
+use crate::codec::{put_scalar, put_stamp, Cursor, DecodeError};
 use crate::elementid::ElementId;
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
@@ -25,6 +26,45 @@ impl Register {
 
     pub fn id(&self) -> ElementId {
         self.id
+    }
+
+    /// Append this register's state — id, value, and LWW stamp — to `out`.
+    pub(crate) fn encode_state_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.id.as_bytes());
+        put_scalar(out, &self.value);
+        put_stamp(out, &self.stamp);
+    }
+
+    /// Read a register from `cur`, advancing it. The stamp comes back too, so a
+    /// decoded register still resolves LWW against later writes.
+    pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<Register, DecodeError> {
+        let id = cur.element_id()?;
+        let value = cur.scalar()?;
+        let stamp = cur.stamp()?;
+        Ok(Register {
+            id,
+            value,
+            stamp,
+            displaced: Cell::new(false),
+        })
+    }
+
+    /// Serialize this register's state to self-contained bytes.
+    pub fn encode_state(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_state_into(&mut out);
+        out
+    }
+
+    /// Read a register from a complete byte slice, rejecting trailing bytes.
+    pub fn decode_state(bytes: &[u8]) -> Result<Register, DecodeError> {
+        let mut cur = Cursor::new(bytes);
+        let register = Register::decode_state_from(&mut cur)?;
+        if cur.at_end() {
+            Ok(register)
+        } else {
+            Err(DecodeError::TrailingBytes)
+        }
     }
 
     pub fn read(&self) -> &Scalar {

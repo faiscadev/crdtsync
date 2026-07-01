@@ -90,7 +90,7 @@ fn put_i64(out: &mut Vec<u8>, v: i64) {
 
 /// A length as a u32, failing loudly rather than truncating — a 4 GiB single
 /// field is pathological, and a silent wrap would corrupt the stream.
-fn len_u32(n: usize) -> u32 {
+pub(crate) fn len_u32(n: usize) -> u32 {
     u32::try_from(n).expect("codec: length exceeds 4 GiB")
 }
 
@@ -99,12 +99,12 @@ pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(b);
 }
 
-fn put_stamp(out: &mut Vec<u8>, s: &Stamp) {
+pub(crate) fn put_stamp(out: &mut Vec<u8>, s: &Stamp) {
     put_u64(out, s.lamport);
     out.extend_from_slice(&s.client.as_bytes());
 }
 
-fn put_scalar(out: &mut Vec<u8>, s: &Scalar) {
+pub(crate) fn put_scalar(out: &mut Vec<u8>, s: &Scalar) {
     match s {
         Scalar::Null => put_u8(out, 0),
         Scalar::Bool(b) => {
@@ -300,20 +300,29 @@ impl<'a> Cursor<'a> {
         Ok(ClientId::from_bytes(self.array16()?))
     }
 
-    fn element_id(&mut self) -> Result<ElementId, DecodeError> {
+    pub(crate) fn element_id(&mut self) -> Result<ElementId, DecodeError> {
         Ok(ElementId::from_bytes(self.array16()?))
     }
 
-    fn stamp(&mut self) -> Result<Stamp, DecodeError> {
+    pub(crate) fn stamp(&mut self) -> Result<Stamp, DecodeError> {
         let lamport = self.u64()?;
         let client = self.client()?;
         Ok(Stamp { lamport, client })
     }
 
-    fn scalar(&mut self) -> Result<Scalar, DecodeError> {
+    pub(crate) fn scalar(&mut self) -> Result<Scalar, DecodeError> {
         match self.u8()? {
             0 => Ok(Scalar::Null),
-            1 => Ok(Scalar::Bool(self.u8()? != 0)),
+            1 => match self.u8()? {
+                0 => Ok(Scalar::Bool(false)),
+                1 => Ok(Scalar::Bool(true)),
+                // A bool byte outside {0, 1} is non-canonical: reject it so an
+                // encoding round-trips to the same bytes.
+                tag => Err(DecodeError::BadTag {
+                    what: "scalar bool",
+                    tag,
+                }),
+            },
             2 => Ok(Scalar::Int(self.i64()?)),
             3 => Ok(Scalar::Bytes(self.bytes()?)),
             tag => Err(DecodeError::BadTag {
