@@ -7,10 +7,11 @@
 //! pumps bytes through it.
 
 use std::collections::HashMap;
+use std::io;
 
 use crdtsync_core::{ClientId, Message};
 
-use crate::{step, Hub, Session};
+use crate::{step, Hub, Session, Store};
 
 /// A live connection's handle, minted by [`Registry::connect`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -30,13 +31,26 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// A registry whose hub's replicas are owned by `server`.
+    /// An in-memory registry whose hub's replicas are owned by `server`.
     pub fn new(server: ClientId) -> Self {
+        Self::from_hub(Hub::new(server))
+    }
+
+    /// A registry over an existing hub — durable or not.
+    pub(crate) fn from_hub(hub: Hub) -> Self {
         Self {
-            hub: Hub::new(server),
+            hub,
             conns: HashMap::new(),
             next: 0,
         }
+    }
+
+    /// A registry backed by `store`: its hub replays the persisted log, and
+    /// every op the hub ingests is appended before it fans out to peers.
+    pub fn with_store(server: ClientId, store: Store) -> io::Result<Self> {
+        let mut hub = Hub::from_logs(server, store.load()?);
+        hub.attach_store(store);
+        Ok(Self::from_hub(hub))
     }
 
     /// Open a connection, returning its handle.
@@ -71,6 +85,8 @@ impl Registry {
             let room = conn.session.room().map(<[u8]>::to_vec);
             (resp.broadcast, resp.close, room)
         };
+        // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),
+        // so fanning it out never advertises an unpersisted write.
         if !broadcast.is_empty() {
             if let Some(room) = room {
                 for (peer, conn) in self.conns.iter_mut() {

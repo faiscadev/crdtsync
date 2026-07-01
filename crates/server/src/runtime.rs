@@ -22,7 +22,7 @@ use tokio::sync::mpsc::{channel, unbounded_channel, Sender, UnboundedReceiver, U
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::{negotiate, ConnId, Registry};
+use crate::{negotiate, ConnId, Registry, Store};
 
 /// How many outbound messages may queue for one connection before it is judged
 /// too slow and dropped — a bound on per-connection memory.
@@ -60,15 +60,36 @@ struct Peer {
 }
 
 /// Serve the wire protocol on `listener` until it errors, with room replicas
-/// owned by `server`.
-pub async fn serve(listener: TcpListener, server: ClientId) -> std::io::Result<()> {
+/// owned by `server`. A `store` makes the replicas durable: the hub replays it
+/// on startup and every ingested op is appended before it fans out.
+pub async fn serve(
+    listener: TcpListener,
+    server: ClientId,
+    store: Option<Store>,
+) -> std::io::Result<()> {
+    // Replay the persisted log here, before serving: a corrupt log fails
+    // startup rather than panicking inside the detached actor thread and
+    // leaving a live port with no registry behind it. The read is blocking, so
+    // it runs on the blocking pool to keep the runtime free for other tasks.
+    let (logs, store) = match store {
+        Some(store) => {
+            let (result, store) = tokio::task::spawn_blocking(move || {
+                let result = store.load();
+                (result, store)
+            })
+            .await
+            .expect("replay task panicked");
+            (result?, Some(store))
+        }
+        None => (Vec::new(), None),
+    };
     let (cmds, cmd_rx) = unbounded_channel::<Cmd>();
     // The replicas are single-threaded; keep them on one dedicated thread.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("build registry runtime");
-        rt.block_on(registry_actor(server, cmd_rx));
+        rt.block_on(registry_actor(server, logs, store, cmd_rx));
     });
 
     loop {
@@ -80,8 +101,17 @@ pub async fn serve(listener: TcpListener, server: ClientId) -> std::io::Result<(
 
 /// Own the registry and serve connection commands, flushing outboxes to each
 /// connection's sink after every routed message.
-async fn registry_actor(server: ClientId, mut cmds: UnboundedReceiver<Cmd>) {
-    let mut reg = Registry::new(server);
+async fn registry_actor(
+    server: ClientId,
+    logs: Vec<(crate::RoomId, Vec<crdtsync_core::Op>)>,
+    store: Option<Store>,
+    mut cmds: UnboundedReceiver<Cmd>,
+) {
+    let mut hub = crate::Hub::from_logs(server, logs);
+    if let Some(store) = store {
+        hub.attach_store(store);
+    }
+    let mut reg = Registry::from_hub(hub);
     let mut peers: HashMap<ConnId, Peer> = HashMap::new();
     while let Some(cmd) = cmds.recv().await {
         match cmd {
