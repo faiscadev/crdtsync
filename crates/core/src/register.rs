@@ -59,6 +59,10 @@ impl Register {
         self.displaced.set(true);
     }
 
+    pub fn reinstate(&self) {
+        self.displaced.set(false);
+    }
+
     pub fn is_displaced(&self) -> bool {
         self.displaced.get()
     }

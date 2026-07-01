@@ -140,6 +140,11 @@ impl List {
         }
     }
 
+    /// Whether the node `id` is present (live or tombstoned).
+    pub fn contains(&self, id: Stamp) -> bool {
+        self.nodes.contains_key(&id)
+    }
+
     /// Tombstone the node with `id`. Idempotent: a no-op if absent or already
     /// tombstoned.
     pub fn delete_id(&mut self, id: Stamp) {
@@ -182,6 +187,12 @@ impl List {
 
     pub fn displace(&self) {
         self.displaced.set(true);
+    }
+
+    /// Re-install a previously displaced list: it has re-won its slot as the
+    /// same logical element, retaining its content.
+    pub fn reinstate(&self) {
+        self.displaced.set(false);
     }
 
     pub fn is_displaced(&self) -> bool {
