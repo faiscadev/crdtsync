@@ -23,10 +23,12 @@ pub mod element;
 pub mod map;
 pub mod register;
 
+pub mod doc;
 pub mod op;
 
 pub use clientid::ClientId;
 pub use counter::Counter;
+pub use doc::{Document, OrphanEvent};
 pub use element::{Element, ElementKind};
 pub use elementid::ElementId;
 pub use host::Host;
