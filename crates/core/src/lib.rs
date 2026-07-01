@@ -25,16 +25,18 @@ pub mod map;
 pub mod register;
 pub mod text;
 
+pub mod codec;
 pub mod doc;
 pub mod op;
 
 pub use clientid::ClientId;
+pub use codec::{decode_op, decode_ops, encode_op, encode_ops, DecodeError};
 pub use counter::Counter;
 pub use doc::{Document, OrphanEvent};
 pub use element::{Element, ElementKind};
 pub use elementid::ElementId;
 pub use host::Host;
-pub use list::{Anchor, List};
+pub use list::{Anchor, List, Side};
 pub use map::Map;
 pub use op::{Op, OpId, OpKind, TxId};
 pub use register::Register;
