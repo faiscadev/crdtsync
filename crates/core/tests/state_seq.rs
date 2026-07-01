@@ -133,6 +133,24 @@ fn a_decoded_text_still_converges_with_a_concurrent_replica() {
 }
 
 #[test]
+fn a_text_snapshot_with_an_invalid_codepoint_is_rejected() {
+    // A List can hold any scalar, but Text nodes must be valid codepoints.
+    // Decoding a list whose node is out of Unicode range as Text must error,
+    // not decode-then-panic on read. 0x11FFFF exceeds the max scalar value.
+    let mut l = List::new(eid(2, 2));
+    l.insert(0, int(0x11_FFFF), stmp(1, 1));
+    assert!(matches!(
+        Text::decode_state(&l.encode_state()),
+        Err(DecodeError::BadTag { .. })
+    ));
+
+    // A surrogate is a valid u32 but not a scalar value — also rejected.
+    let mut s = List::new(eid(2, 2));
+    s.insert(0, int(0xD800), stmp(1, 1));
+    assert!(Text::decode_state(&s.encode_state()).is_err());
+}
+
+#[test]
 fn a_truncated_text_is_an_error() {
     let mut t = Text::new(eid(2, 2));
     t.insert(0, "z", stmp(1, 1));

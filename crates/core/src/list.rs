@@ -98,7 +98,9 @@ impl List {
     pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<List, DecodeError> {
         let id = cur.element_id()?;
         let count = cur.u32()?;
-        let mut nodes = HashMap::with_capacity(count as usize);
+        // Cap the pre-allocation: the count is untrusted, so a valid stream
+        // grows the map incrementally rather than reserving on a bad length.
+        let mut nodes = HashMap::with_capacity(count.min(1024) as usize);
         for _ in 0..count {
             let node_id = cur.stamp()?;
             let value = Element::Scalar(cur.scalar()?);
@@ -132,6 +134,12 @@ impl List {
             nodes,
             displaced: Cell::new(false),
         })
+    }
+
+    /// The value of every node, live or tombstoned — so a wrapper like Text can
+    /// validate a decoded snapshot.
+    pub(crate) fn node_values(&self) -> impl Iterator<Item = &Element> + '_ {
+        self.nodes.values().map(|node| &node.value)
     }
 
     /// Serialize this list's state to self-contained bytes.
