@@ -14,9 +14,18 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Side {
+pub enum Side {
     Left,
     Right,
+}
+
+/// Where a new node attaches in the Fugue tree: a parent node (or the root
+/// when `None`) and the side it hangs on. Computed once at insert time so the
+/// placement is replica-independent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Anchor {
+    pub parent: Option<Stamp>,
+    pub side: Side,
 }
 
 struct Node {
@@ -84,28 +93,55 @@ impl List {
     /// Insert `value` at live `index`, identified by `stamp`. A stamp already
     /// seen is a replay and leaves the node untouched.
     pub fn insert(&mut self, index: usize, value: Element, stamp: Stamp) {
-        if self.nodes.contains_key(&stamp) {
-            return;
-        }
+        let anchor = self.place(index);
+        self.insert_at(stamp, value, anchor);
+    }
+
+    /// The Fugue placement for inserting at live `index`, computed without
+    /// mutating. Feed it to [`insert_at`](Self::insert_at) to reproduce the
+    /// insert on any replica.
+    pub fn place(&self, index: usize) -> Anchor {
         let order = self.tree_order();
         let (left, right) = self.gap(&order, index);
         let (parent, side) = self.placement(left, right);
+        Anchor { parent, side }
+    }
+
+    /// Insert a node with an explicit id and placement. Idempotent on the id:
+    /// a replayed op leaves the existing node untouched.
+    pub fn insert_at(&mut self, id: Stamp, value: Element, anchor: Anchor) {
+        if self.nodes.contains_key(&id) {
+            return;
+        }
         self.nodes.insert(
-            stamp,
+            id,
             Node {
-                id: stamp,
+                id,
                 value,
-                parent,
-                side,
+                parent: anchor.parent,
+                side: anchor.side,
                 tombstone: false,
             },
         );
     }
 
+    /// The id of the live node at `index`, if any.
+    pub fn node_at(&self, index: usize) -> Option<Stamp> {
+        self.live_order().get(index).copied()
+    }
+
     /// Tombstone the live item at `index`.
     pub fn delete(&mut self, index: usize) {
-        if let Some(&s) = self.live_order().get(index) {
-            self.nodes.get_mut(&s).unwrap().tombstone = true;
+        if let Some(id) = self.node_at(index) {
+            self.delete_id(id);
+        }
+    }
+
+    /// Tombstone the node with `id`. Idempotent: a no-op if absent or already
+    /// tombstoned.
+    pub fn delete_id(&mut self, id: Stamp) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.tombstone = true;
         }
     }
 

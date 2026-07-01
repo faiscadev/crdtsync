@@ -12,6 +12,9 @@ use std::rc::Rc;
 mod common;
 use common::{cid, default_id, eid, stmp};
 
+/// One captured insert op: the node id, its value, and its placement.
+type InsertOp = (crdtsync_core::Stamp, Element, crdtsync_core::list::Anchor);
+
 fn list() -> List {
     List::new(default_id())
 }
@@ -264,6 +267,98 @@ fn displace_flags_the_handle() {
     assert!(!l.is_displaced());
     l.displace();
     assert!(l.is_displaced());
+}
+
+// --- op-oriented placement (an insert op carries its Fugue placement, so it
+//     applies identically on every replica regardless of local index) ---
+
+/// Build a run on `l`, capturing each insert as an op (id + value + anchor).
+fn capture_run(l: &mut List, s: &str, client: u8) -> Vec<InsertOp> {
+    let mut ops = Vec::new();
+    for (k, c) in s.bytes().enumerate() {
+        let anchor = l.place(k);
+        let id = stmp(k as u64 + 1, client);
+        let value = ch(c);
+        l.insert_at(id, value.clone(), anchor);
+        ops.push((id, value, anchor));
+    }
+    ops
+}
+
+fn apply_ops(l: &mut List, ops: &[InsertOp]) {
+    for (id, value, anchor) in ops {
+        l.insert_at(*id, value.clone(), *anchor);
+    }
+}
+
+#[test]
+fn place_then_insert_at_matches_index_insert() {
+    let mut l = list();
+    capture_run(&mut l, "abc", 1);
+    assert_eq!(text(&l), "abc");
+}
+
+#[test]
+fn captured_ops_replay_on_a_fresh_replica() {
+    let mut a = list();
+    let ops = capture_run(&mut a, "abc", 1);
+    let mut b = list();
+    apply_ops(&mut b, &ops);
+    assert_eq!(text(&b), "abc");
+}
+
+#[test]
+fn concurrent_op_runs_converge_without_interleaving() {
+    let mut a = list();
+    let mut b = list();
+    let oa = capture_run(&mut a, "ABC", 1);
+    let ob = capture_run(&mut b, "XYZ", 2);
+    apply_ops(&mut a, &ob);
+    apply_ops(&mut b, &oa);
+    assert_eq!(text(&a), text(&b));
+    let s = text(&a);
+    assert!(s == "ABCXYZ" || s == "XYZABC", "interleaved: {s}");
+}
+
+#[test]
+fn op_apply_order_does_not_matter() {
+    let mut a = list();
+    let oa = capture_run(&mut a, "hi", 1);
+    let mut b = list();
+    // apply in reverse order
+    for op in oa.iter().rev() {
+        apply_ops(&mut b, std::slice::from_ref(op));
+    }
+    assert_eq!(text(&b), "hi");
+}
+
+#[test]
+fn insert_at_is_idempotent_on_node_id() {
+    let mut l = list();
+    let anchor = l.place(0);
+    l.insert_at(stmp(1, 1), ch(b'x'), anchor);
+    l.insert_at(stmp(1, 1), ch(b'y'), anchor); // same id, replayed
+    assert_eq!(text(&l), "x");
+}
+
+#[test]
+fn node_at_reads_the_live_node_id() {
+    let mut l = list();
+    ins_run(&mut l, 0, "abc", 1, 1);
+    let b_id = l.node_at(1).unwrap();
+    l.delete_id(b_id);
+    assert_eq!(text(&l), "ac");
+    assert!(l.node_at(5).is_none());
+}
+
+#[test]
+fn delete_id_is_idempotent() {
+    let mut l = list();
+    ins_run(&mut l, 0, "ab", 1, 1);
+    let id = l.node_at(0).unwrap();
+    l.delete_id(id);
+    l.delete_id(id); // repeat must not disturb the rest
+    assert_eq!(text(&l), "b");
 }
 
 // --- idempotence / composite items ---
