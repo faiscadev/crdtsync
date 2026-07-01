@@ -10,7 +10,8 @@
 //! and receive outbound messages back through a per-connection channel. A
 //! deliver's broadcast reaches the room's other connections because the actor
 //! flushes every connection's outbox after each step. A connection whose
-//! outbound queue overflows is too slow to keep up and is dropped.
+//! outbound queue overflows is too slow to keep up: it is dropped and its
+//! socket closed.
 
 use std::collections::HashMap;
 
@@ -29,9 +30,11 @@ const OUTBOX_CAPACITY: usize = 1024;
 
 /// A request to the registry actor from a connection task.
 enum Cmd {
-    /// Open a connection, returning its id and registering its outbound sink.
+    /// Open a connection, returning its id and registering its outbound sink
+    /// and a one-shot the actor fires to close a dropped connection.
     Connect {
         writer: Sender<Message>,
+        closer: oneshot::Sender<()>,
         reply: oneshot::Sender<ConnId>,
     },
     /// Route one inbound message, replying whether the connection stays open.
@@ -42,6 +45,13 @@ enum Cmd {
     },
     /// Close a connection.
     Disconnect { id: ConnId },
+}
+
+/// The actor's view of a live connection: where to send its outbound messages,
+/// and how to tell it to close.
+struct Peer {
+    writer: Sender<Message>,
+    closer: Option<oneshot::Sender<()>>,
 }
 
 /// Serve the wire protocol on `listener` until it errors, with room replicas
@@ -67,22 +77,32 @@ pub async fn serve(listener: TcpListener, server: ClientId) -> std::io::Result<(
 /// connection's sink after every routed message.
 async fn registry_actor(server: ClientId, mut cmds: UnboundedReceiver<Cmd>) {
     let mut reg = Registry::new(server);
-    let mut writers: HashMap<ConnId, Sender<Message>> = HashMap::new();
+    let mut peers: HashMap<ConnId, Peer> = HashMap::new();
     while let Some(cmd) = cmds.recv().await {
         match cmd {
-            Cmd::Connect { writer, reply } => {
+            Cmd::Connect {
+                writer,
+                closer,
+                reply,
+            } => {
                 let id = reg.connect();
-                writers.insert(id, writer);
+                peers.insert(
+                    id,
+                    Peer {
+                        writer,
+                        closer: Some(closer),
+                    },
+                );
                 let _ = reply.send(id);
             }
             Cmd::Deliver { id, msg, reply } => {
                 let keep = reg.deliver(id, msg);
-                flush(&mut reg, &mut writers);
+                flush(&mut reg, &mut peers);
                 let _ = reply.send(keep);
             }
             Cmd::Disconnect { id } => {
                 reg.disconnect(id);
-                writers.remove(&id);
+                peers.remove(&id);
             }
         }
     }
@@ -90,12 +110,12 @@ async fn registry_actor(server: ClientId, mut cmds: UnboundedReceiver<Cmd>) {
 
 /// Push every connection's queued outbox into its sink — how a deliver's
 /// broadcast reaches the room's other connections. A connection whose sink is
-/// full or gone is too slow (or closed) and is dropped.
-fn flush(reg: &mut Registry, writers: &mut HashMap<ConnId, Sender<Message>>) {
+/// full is too slow: it is dropped from the registry and signalled to close.
+fn flush(reg: &mut Registry, peers: &mut HashMap<ConnId, Peer>) {
     let mut dropped = Vec::new();
-    for (id, sink) in writers.iter() {
+    for (id, peer) in peers.iter() {
         for out in reg.take_outbox(*id) {
-            if sink.try_send(out).is_err() {
+            if peer.writer.try_send(out).is_err() {
                 dropped.push(*id);
                 break;
             }
@@ -103,7 +123,11 @@ fn flush(reg: &mut Registry, writers: &mut HashMap<ConnId, Sender<Message>>) {
     }
     for id in dropped {
         reg.disconnect(id);
-        writers.remove(&id);
+        if let Some(mut peer) = peers.remove(&id) {
+            if let Some(closer) = peer.closer.take() {
+                let _ = closer.send(());
+            }
+        }
     }
 }
 
@@ -115,10 +139,12 @@ async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
     let (mut write, mut read) = ws.split();
 
     let (out, mut out_rx) = channel::<Message>(OUTBOX_CAPACITY);
+    let (close_tx, mut close_rx) = oneshot::channel();
     let (id_tx, id_rx) = oneshot::channel();
     if cmds
         .send(Cmd::Connect {
             writer: out.clone(),
+            closer: close_tx,
             reply: id_tx,
         })
         .is_err()
@@ -147,7 +173,7 @@ async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
     // any message, queueing a refusal the client can read before the close.
     match next_binary(&mut read).await {
         Some(bytes) => match decode_header(&bytes).map(negotiate) {
-            Ok(Ok(())) => run_messages(id, &mut read, &cmds).await,
+            Ok(Ok(())) => run_messages(id, &mut read, &cmds, &mut close_rx).await,
             Ok(Err(refusal)) => {
                 let _ = out.send(refusal).await;
             }
@@ -161,13 +187,25 @@ async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
     let _ = writer.await;
 }
 
-/// Read and route messages until the peer closes, sends garbage, or violates
-/// the protocol.
-async fn run_messages<R>(id: ConnId, read: &mut R, cmds: &UnboundedSender<Cmd>)
-where
+/// Read and route messages until the peer closes, sends garbage, violates the
+/// protocol, or the server drops the connection for falling behind.
+async fn run_messages<R>(
+    id: ConnId,
+    read: &mut R,
+    cmds: &UnboundedSender<Cmd>,
+    close_rx: &mut oneshot::Receiver<()>,
+) where
     R: StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    while let Some(bytes) = next_binary(read).await {
+    loop {
+        let bytes = tokio::select! {
+            biased;
+            _ = &mut *close_rx => break,
+            frame = next_binary(read) => match frame {
+                Some(bytes) => bytes,
+                None => break,
+            },
+        };
         let Ok(msg) = decode_message(&bytes) else {
             break;
         };
