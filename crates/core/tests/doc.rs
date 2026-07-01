@@ -373,6 +373,33 @@ fn concurrent_edits_to_the_same_nested_map_merge() {
 }
 
 #[test]
+fn child_ops_of_a_losing_map_create_are_not_applied() {
+    // If a MapCreate loses its slot to a higher-stamped value, the nested map
+    // is unreachable; ops targeting it must not be marked applied.
+    let mut a = doc(1);
+    let a_ops = a.transact(|tx| {
+        let mut sub = tx.map(b"k");
+        sub.register(b"x", Scalar::Int(9));
+    });
+
+    // A peer already holding a higher-stamped register at "k".
+    let mut b = doc(2);
+    b.transact(|tx| {
+        for _ in 0..5 {
+            tx.set(b"pad", Scalar::Int(0));
+        }
+    });
+    let breg = b.transact(|tx| tx.register(b"k", Scalar::Int(6)));
+
+    let mut c = doc(3);
+    replay(&mut c, &breg); // c: "k" = register(6) at a high stamp
+
+    assert!(c.apply(&a_ops[0])); // MapCreate applies at root but loses the slot
+    assert!(!c.apply(&a_ops[1])); // child op targets the unreachable map
+    assert_eq!(int(c.get(b"k")), 6); // slot is still the register
+}
+
+#[test]
 fn nested_ops_target_the_child_map_not_root() {
     // A nested edit must not write into the root slot of the same key.
     let mut d = doc(1);

@@ -104,7 +104,7 @@ impl Document {
     /// when the op targets a map this replica hasn't materialised, or when it
     /// was already applied (deduped on its id).
     pub fn apply(&mut self, op: &Op) -> bool {
-        if !self.maps.contains_key(&op.target) {
+        if !self.resolvable(op.target) {
             return false;
         }
         if !self.seen.insert(op.id) {
@@ -138,10 +138,21 @@ impl Document {
 
     /// Route a mutation to its target map, recording any displaced composite
     /// and indexing any nested map it creates.
+    /// A target is reachable when it names a map that is present and still
+    /// installed in the tree (a displaced map is unreachable).
+    fn resolvable(&self, target: ElementId) -> bool {
+        self.maps
+            .get(&target)
+            .is_some_and(|m| !m.borrow().is_displaced())
+    }
+
     fn apply_kind(&mut self, target: ElementId, kind: &OpKind, stamp: Stamp, author: ClientId) {
         let Some(map) = self.maps.get(&target).cloned() else {
             return;
         };
+        if map.borrow().is_displaced() {
+            return;
+        }
         let mut new_child: Option<Rc<RefCell<Map>>> = None;
         let orphan = {
             let mut m = map.borrow_mut();
@@ -149,7 +160,11 @@ impl Document {
                 OpKind::MapCreate { key } => {
                     let prior = m.get(key);
                     let child = m.map(key, stamp);
-                    new_child = Some(Rc::clone(&child));
+                    // A losing create yields a detached, displaced map; only a
+                    // reachable child belongs in the index.
+                    if !child.borrow().is_displaced() {
+                        new_child = Some(Rc::clone(&child));
+                    }
                     displaced(prior)
                 }
                 OpKind::MapSet { key, value } => {
