@@ -1,0 +1,19 @@
+language = "C"
+include_guard = "CRDTSYNC_H"
+pragma_once = true
+cpp_compat = true
+tab_width = 4
+style = "type"
+documentation = true
+documentation_style = "c99"
+
+header = "/* crdtsync C ABI — generated from the Rust source by build.rs (cbindgen). Do not edit by hand. */"
+
+[parse]
+parse_deps = false
+
+[export]
+prefix = ""
+
+[enum]
+prefix_with_name = true

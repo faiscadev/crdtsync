@@ -9,3 +9,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 crdtsync-core = { path = "../core" }
+
+[build-dependencies]
+# Regenerates the C header from the ABI on build. `clap` (its CLI) isn't needed.
+cbindgen = { version = "0.29", default-features = false }
