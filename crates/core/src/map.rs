@@ -36,6 +36,8 @@ fn same_handle(a: &Element, b: &Element) -> bool {
         (Element::Counter(x), Element::Counter(y)) => Rc::ptr_eq(x, y),
         (Element::Register(x), Element::Register(y)) => Rc::ptr_eq(x, y),
         (Element::Map(x), Element::Map(y)) => Rc::ptr_eq(x, y),
+        (Element::List(x), Element::List(y)) => Rc::ptr_eq(x, y),
+        (Element::Text(x), Element::Text(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }

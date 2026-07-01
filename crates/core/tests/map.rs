@@ -671,6 +671,20 @@ fn helper_list_returns_same_on_repeat() {
 }
 
 #[test]
+fn resetting_same_list_handle_advances_stamp_not_displaced() {
+    // Re-setting the exact installed handle at a higher stamp advances the slot
+    // stamp only; the still-installed sequence must not be flagged displaced.
+    let mut m = fresh();
+    let l = m.list(b"items", stmp(1, 1));
+    m.set(b"items", Element::List(Rc::clone(&l)), stmp(5, 1));
+    assert!(!l.borrow().is_displaced());
+    match m.get(b"items").unwrap() {
+        Element::List(got) => assert!(Rc::ptr_eq(&got, &l)),
+        _ => panic!("expected list"),
+    }
+}
+
+#[test]
 fn helper_list_derives_id() {
     let parent = eid(3, 9);
     let mut m = Map::new(parent);
