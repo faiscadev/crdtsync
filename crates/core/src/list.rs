@@ -7,6 +7,7 @@
 //! must survive to anchor inserts placed against it. The same algorithm backs
 //! Text.
 
+use crate::codec::{len_u32, put_anchor, put_stamp, put_u32, put_u8, Cursor, DecodeError};
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
 use crate::stamp::Stamp;
@@ -65,6 +66,98 @@ impl List {
 
     pub fn id(&self) -> ElementId {
         self.id
+    }
+
+    /// Append this list's state — id and every node, live or tombstoned — to
+    /// `out`. Nodes are ordered by their stamp so equal states encode
+    /// identically. A tombstoned node is kept: it anchors later inserts.
+    pub(crate) fn encode_state_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.id.as_bytes());
+        let mut nodes: Vec<&Node> = self.nodes.values().collect();
+        nodes.sort_by_key(|n| n.id);
+        put_u32(out, len_u32(nodes.len()));
+        for node in nodes {
+            put_stamp(out, &node.id);
+            match &node.value {
+                // List inserts and Text codepoints always store scalars.
+                Element::Scalar(s) => s.encode_state_into(out),
+                _ => unreachable!("a sequence node holds a scalar"),
+            }
+            put_anchor(
+                out,
+                &Anchor {
+                    parent: node.parent,
+                    side: node.side,
+                },
+            );
+            put_u8(out, node.tombstone as u8);
+        }
+    }
+
+    /// Read a list from `cur`, advancing it.
+    pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<List, DecodeError> {
+        let id = cur.element_id()?;
+        let count = cur.u32()?;
+        // Cap the pre-allocation: the count is untrusted, so a valid stream
+        // grows the map incrementally rather than reserving on a bad length.
+        let mut nodes = HashMap::with_capacity(count.min(1024) as usize);
+        for _ in 0..count {
+            let node_id = cur.stamp()?;
+            let value = Element::Scalar(cur.scalar()?);
+            let anchor = cur.anchor()?;
+            let tombstone = match cur.u8()? {
+                0 => false,
+                1 => true,
+                tag => {
+                    return Err(DecodeError::BadTag {
+                        what: "list node tombstone",
+                        tag,
+                    })
+                }
+            };
+            let node = Node {
+                id: node_id,
+                value,
+                parent: anchor.parent,
+                side: anchor.side,
+                tombstone,
+            };
+            if nodes.insert(node_id, node).is_some() {
+                return Err(DecodeError::BadTag {
+                    what: "list: duplicate node id",
+                    tag: 0,
+                });
+            }
+        }
+        Ok(List {
+            id,
+            nodes,
+            displaced: Cell::new(false),
+        })
+    }
+
+    /// The value of every node, live or tombstoned — so a wrapper like Text can
+    /// validate a decoded snapshot.
+    pub(crate) fn node_values(&self) -> impl Iterator<Item = &Element> + '_ {
+        self.nodes.values().map(|node| &node.value)
+    }
+
+    /// Serialize this list's state to self-contained bytes.
+    pub fn encode_state(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.encode_state_into(&mut out);
+        out
+    }
+
+    /// Read a list from a complete byte slice, rejecting trailing bytes.
+    pub fn decode_state(bytes: &[u8]) -> Result<List, DecodeError> {
+        let mut cur = Cursor::new(bytes);
+        let list = List::decode_state_from(&mut cur)?;
+        if cur.at_end() {
+            Ok(list)
+        } else {
+            Err(DecodeError::TrailingBytes)
+        }
     }
 
     pub fn len(&self) -> usize {

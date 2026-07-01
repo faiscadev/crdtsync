@@ -122,7 +122,7 @@ pub(crate) fn put_scalar(out: &mut Vec<u8>, s: &Scalar) {
     }
 }
 
-fn put_anchor(out: &mut Vec<u8>, a: &Anchor) {
+pub(crate) fn put_anchor(out: &mut Vec<u8>, a: &Anchor) {
     match &a.parent {
         None => put_u8(out, 0),
         Some(p) => {
@@ -332,7 +332,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn anchor(&mut self) -> Result<Anchor, DecodeError> {
+    pub(crate) fn anchor(&mut self) -> Result<Anchor, DecodeError> {
         let parent = match self.u8()? {
             0 => None,
             1 => Some(self.stamp()?),
