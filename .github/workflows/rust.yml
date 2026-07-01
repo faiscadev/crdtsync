@@ -42,3 +42,17 @@ jobs:
         working-directory: sdks/python
         env:
           PYTHONPATH: .
+
+  go-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+      # cgo links the static library; build it, then run go test.
+      - name: Build the native library
+        run: cargo build -p crdtsync-ffi --release
+      - name: Test
+        run: go test ./...
+        working-directory: sdks/go
