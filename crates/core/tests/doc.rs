@@ -642,6 +642,22 @@ fn text_in_a_nested_map() {
 // --- out-of-order buffering + persistent identity ---
 
 #[test]
+#[cfg_attr(miri, ignore = "stack depth is a native concern; slow under Miri")]
+fn a_deeply_nested_document_drops_without_overflowing() {
+    // Teardown must not recurse through the parent→child Rc chain: a deep tree
+    // has to free iteratively.
+    let mut d = doc(1);
+    d.transact(|tx| {
+        let mut cur = tx.map(b"k");
+        for _ in 0..10_000 {
+            cur = cur.into_map(b"k");
+        }
+        cur.register(b"leaf", Scalar::Int(1));
+    });
+    drop(d); // must not overflow the stack
+}
+
+#[test]
 fn a_child_op_before_its_parent_create_is_buffered_then_applied() {
     // A child op naming a map that hasn't been created yet can't resolve; it is
     // held, not dropped, and lands once the parent create arrives.

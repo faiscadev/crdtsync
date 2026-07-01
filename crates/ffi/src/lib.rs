@@ -315,18 +315,21 @@ where
 }
 
 /// Descend `parents` from `cur`, creating maps as needed, then run `f` on the
-/// map that holds the leaf.
+/// map that holds the leaf. Iterative — path depth is caller-supplied, so a
+/// recursive walk could overflow the stack.
 fn descend<F>(cur: &mut MapCursor, parents: &[Vec<u8>], f: F)
 where
     F: FnOnce(&mut MapCursor),
 {
-    match parents.split_first() {
-        Some((head, rest)) => {
-            let mut child = cur.map(head);
-            descend(&mut child, rest, f);
-        }
-        None => f(cur),
+    let Some((first, rest)) = parents.split_first() else {
+        f(cur);
+        return;
+    };
+    let mut child = cur.map(first);
+    for key in rest {
+        child = child.into_map(key);
     }
+    f(&mut child);
 }
 
 /// Read the `i64`-valued slot at a path through `pick`.

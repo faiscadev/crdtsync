@@ -297,6 +297,12 @@ impl Map {
         }
     }
 
+    /// Drop every slot entry. Used at document teardown to break parent→child
+    /// links so a deeply nested tree frees without recursing.
+    pub fn clear(&mut self) {
+        self.slots.clear();
+    }
+
     pub fn displace(&self) {
         self.displaced.set(true);
     }

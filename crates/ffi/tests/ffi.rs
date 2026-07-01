@@ -213,6 +213,23 @@ fn delete_removes_a_slot_and_converges() {
     }
 }
 
+#[test]
+#[cfg_attr(miri, ignore = "stack depth is a native concern; slow under Miri")]
+fn a_very_deep_path_does_not_overflow_the_stack() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        // Path depth is caller-supplied; a deep walk must stay iterative.
+        let mut keys: Vec<&[u8]> = vec![b"k"; 10_000];
+        keys.push(b"leaf");
+        let p = path(&keys);
+        let ops = register_int(doc, &p, 42);
+        assert_eq!(get_int(doc, &p), (1, 42));
+        crdtsync_buf_free(ops);
+        crdtsync_doc_free(doc);
+    }
+}
+
 // --- robustness ---
 
 #[test]
