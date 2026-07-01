@@ -19,7 +19,10 @@ use crate::{Element, Scalar};
 pub fn encode_path(keys: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     for key in keys {
-        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        // A key longer than a u32 can't be framed; fail loudly rather than
+        // truncate the length into a corrupt path.
+        let len = u32::try_from(key.len()).expect("path: key length exceeds u32");
+        out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(key);
     }
     out
