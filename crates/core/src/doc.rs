@@ -1,12 +1,16 @@
-//! Document — a replica: a tree of Maps rooted at a well-known id, a lamport
-//! clock, and the transact/apply seam.
+//! Document — a replica: a tree of containers rooted at a well-known id, a
+//! lamport clock, and the transact/apply seam.
 //!
 //! A `transact` mutates the live tree through a cursor and returns the ops it
 //! emitted; `apply` folds a foreign op back in. Ops are keyed by `(client,
-//! seq)` for idempotent dedup and ordered by their stamp for LWW. Every op
-//! targets a Map by id and names a slot key; the receiver reaches the child
-//! through the map's get-or-create, re-deriving its id. Nested maps are
-//! reached by resolving `Op.target` against an index of every map in the tree.
+//! seq)` for idempotent dedup and ordered by their stamp for LWW. Each op
+//! names its target container by id, resolved against a registry of every
+//! container the replica has materialised. That registry retains displaced
+//! containers, so a slot re-won after displacement is the same logical
+//! element: identity persists across displacement. An op whose target isn't
+//! reachable yet — its parent unseen, or an ancestor displaced — is buffered
+//! and replays once a create restores reachability, so out-of-order delivery
+//! converges.
 
 use crate::clientid::ClientId;
 use crate::element::Element;
@@ -34,15 +38,20 @@ pub struct OrphanEvent {
 pub struct Document {
     client: ClientId,
     root: Rc<RefCell<Map>>,
-    /// Every map in the tree, keyed by id, for resolving an op's target.
+    /// Every container the replica has ever materialised, keyed by id — the
+    /// persistent identity registry. A displaced container stays here with its
+    /// content so a later create re-installs the same logical element.
     maps: HashMap<ElementId, Rc<RefCell<Map>>>,
-    /// Every list in the tree, keyed by id, for resolving a sequence op.
     lists: HashMap<ElementId, Rc<RefCell<List>>>,
-    /// Every text in the tree, keyed by id, for resolving a text op.
     texts: HashMap<ElementId, Rc<RefCell<Text>>>,
+    /// Each container's parent map, for walking reachability up to the root.
+    parents: HashMap<ElementId, ElementId>,
     lamport: u64,
     seq: u64,
     seen: HashSet<OpId>,
+    /// Ops whose target isn't reachable yet, held until a create makes it so.
+    buffer: Vec<Op>,
+    buffered: HashSet<OpId>,
     orphans: Vec<OrphanEvent>,
     /// Ops emitted by the transact currently in progress.
     pending: Vec<Op>,
@@ -59,9 +68,12 @@ impl Document {
             maps,
             lists: HashMap::new(),
             texts: HashMap::new(),
+            parents: HashMap::new(),
             lamport: 0,
             seq: 0,
             seen: HashSet::new(),
+            buffer: Vec::new(),
+            buffered: HashSet::new(),
             orphans: Vec::new(),
             pending: Vec::new(),
         }
@@ -108,16 +120,28 @@ impl Document {
         std::mem::take(&mut self.pending)
     }
 
-    /// Fold a foreign op into local state. Returns `false` without applying it
-    /// when the op targets a map this replica hasn't materialised, or when it
-    /// was already applied (deduped on its id).
+    /// Fold a foreign op into local state. An op whose target isn't reachable
+    /// yet is buffered and returns `false`; it replays once a create makes the
+    /// target reachable. Returns `false` for an already-applied or already-held
+    /// op. Returns `true` only when the op is applied now.
     pub fn apply(&mut self, op: &Op) -> bool {
+        if self.seen.contains(&op.id) || self.buffered.contains(&op.id) {
+            return false;
+        }
         if !self.resolvable(op.target) {
+            self.buffered.insert(op.id);
+            self.buffer.push(op.clone());
             return false;
         }
-        if !self.seen.insert(op.id) {
-            return false;
-        }
+        self.apply_now(op);
+        self.drain_buffer();
+        true
+    }
+
+    /// Apply a resolvable op unconditionally: mark it seen, advance the clock,
+    /// and route it.
+    fn apply_now(&mut self, op: &Op) {
+        self.seen.insert(op.id);
         // A text run occupies one char_id per codepoint from the op's stamp;
         // the clock must clear the last of them, not just the base.
         let last = op.stamp.lamport.saturating_add(span(&op.kind) - 1);
@@ -125,7 +149,16 @@ impl Document {
             self.lamport = last;
         }
         self.apply_kind(op.target, &op.kind, op.stamp, op.id.client);
-        true
+    }
+
+    /// Replay buffered ops that a state change just made reachable, to a
+    /// fixpoint — one applied op can unblock a whole causal chain.
+    fn drain_buffer(&mut self) {
+        while let Some(i) = self.buffer.iter().position(|op| self.resolvable(op.target)) {
+            let op = self.buffer.remove(i);
+            self.buffered.remove(&op.id);
+            self.apply_now(&op);
+        }
     }
 
     /// Mint identity + causal position for a local edit, apply it, and record
@@ -149,20 +182,38 @@ impl Document {
         self.pending.push(Op::new(id, stamp, target, kind));
     }
 
-    /// A target is reachable when it names a map or list that is present and
-    /// still installed in the tree (a displaced element is unreachable).
+    /// A target is reachable when it names a materialised container that is
+    /// installed, and every ancestor up to the root is too. A displaced
+    /// container anywhere on the chain breaks reachability.
     fn resolvable(&self, target: ElementId) -> bool {
-        self.maps
-            .get(&target)
-            .is_some_and(|m| !m.borrow().is_displaced())
-            || self
-                .lists
-                .get(&target)
-                .is_some_and(|l| !l.borrow().is_displaced())
-            || self
-                .texts
-                .get(&target)
-                .is_some_and(|t| !t.borrow().is_displaced())
+        let mut cur = target;
+        loop {
+            if cur == self.root_id() {
+                return true;
+            }
+            if self.displaced_container(cur) != Some(false) {
+                return false;
+            }
+            match self.parents.get(&cur) {
+                Some(&parent) => cur = parent,
+                None => return false,
+            }
+        }
+    }
+
+    /// Whether the container `id` is displaced: `Some(false)` installed,
+    /// `Some(true)` displaced, `None` not materialised.
+    fn displaced_container(&self, id: ElementId) -> Option<bool> {
+        if let Some(m) = self.maps.get(&id) {
+            return Some(m.borrow().is_displaced());
+        }
+        if let Some(l) = self.lists.get(&id) {
+            return Some(l.borrow().is_displaced());
+        }
+        if let Some(t) = self.texts.get(&id) {
+            return Some(t.borrow().is_displaced());
+        }
+        None
     }
 
     /// A live list handle for `target`, if any.
@@ -182,10 +233,10 @@ impl Document {
     }
 
     /// Route a mutation to its target, recording any displaced composite and
-    /// indexing any container it creates.
+    /// registering any container it creates.
     fn apply_kind(&mut self, target: ElementId, kind: &OpKind, stamp: Stamp, author: ClientId) {
-        // Sequence ops address a list directly.
         match kind {
+            // Sequence and text ops address a list or text directly.
             OpKind::ListInsert { value, anchor } => {
                 if let Some(list) = self.live_list(target) {
                     list.borrow_mut()
@@ -211,53 +262,32 @@ impl Document {
                 }
                 return;
             }
+            // Container creates go through the persistent registry.
+            OpKind::MapCreate { key } => {
+                self.create_container(target, key, stamp, Container::Map);
+                return;
+            }
+            OpKind::ListCreate { key } => {
+                self.create_container(target, key, stamp, Container::List);
+                return;
+            }
+            OpKind::TextCreate { key } => {
+                self.create_container(target, key, stamp, Container::Text);
+                return;
+            }
             _ => {}
         }
 
-        // The rest address a map slot (ListCreate installs a list child there).
+        // The rest address a scalar or leaf composite in a map slot.
         let Some(map) = self.maps.get(&target).cloned() else {
             return;
         };
         if map.borrow().is_displaced() {
             return;
         }
-        let mut new_map: Option<Rc<RefCell<Map>>> = None;
-        let mut new_list: Option<Rc<RefCell<List>>> = None;
-        let mut new_text: Option<Rc<RefCell<Text>>> = None;
         let orphan = {
             let mut m = map.borrow_mut();
             match kind {
-                OpKind::MapCreate { key } => {
-                    let prior = m.get(key);
-                    let child = m.map(key, stamp);
-                    // Advance the slot stamp so a re-navigated child defends its
-                    // slot against a stale scalar set.
-                    m.set(key, Element::Map(Rc::clone(&child)), stamp);
-                    // A losing create yields a detached, displaced child; only a
-                    // reachable one belongs in the index.
-                    if !child.borrow().is_displaced() {
-                        new_map = Some(Rc::clone(&child));
-                    }
-                    displaced(prior)
-                }
-                OpKind::ListCreate { key } => {
-                    let prior = m.get(key);
-                    let child = m.list(key, stamp);
-                    m.set(key, Element::List(Rc::clone(&child)), stamp);
-                    if !child.borrow().is_displaced() {
-                        new_list = Some(Rc::clone(&child));
-                    }
-                    displaced(prior)
-                }
-                OpKind::TextCreate { key } => {
-                    let prior = m.get(key);
-                    let child = m.text(key, stamp);
-                    m.set(key, Element::Text(Rc::clone(&child)), stamp);
-                    if !child.borrow().is_displaced() {
-                        new_text = Some(Rc::clone(&child));
-                    }
-                    displaced(prior)
-                }
                 OpKind::MapSet { key, value } => {
                     let prior = m.get(key);
                     m.set(key, Element::Scalar(value.clone()), stamp);
@@ -289,27 +319,96 @@ impl Document {
                     m.set(key, Element::Counter(Rc::clone(&c)), stamp);
                     displaced(prior)
                 }
-                OpKind::ListInsert { .. }
-                | OpKind::ListDelete { .. }
-                | OpKind::TextInsert { .. }
-                | OpKind::TextDelete { .. } => unreachable!(),
+                _ => unreachable!("container, sequence, and text ops routed above"),
             }
         };
-        if let Some(child) = new_map {
-            let id = child.borrow().id();
-            self.maps.insert(id, child);
-        }
-        if let Some(child) = new_list {
-            let id = child.borrow().id();
-            self.lists.insert(id, child);
-        }
-        if let Some(child) = new_text {
-            let id = child.borrow().id();
-            self.texts.insert(id, child);
-        }
         if let Some(o) = orphan {
             self.orphans.push(o);
         }
+    }
+
+    /// Install a container child in `map_id`'s slot at `key`. The handle comes
+    /// from the registry, so a slot re-won after displacement is the same
+    /// logical element with its content intact; a fresh id is registered on
+    /// first sight. A losing create leaves the handle displaced but retained.
+    fn create_container(&mut self, map_id: ElementId, key: &[u8], stamp: Stamp, kind: Container) {
+        let Some(map) = self.maps.get(&map_id).cloned() else {
+            return;
+        };
+        if map.borrow().is_displaced() {
+            return;
+        }
+        let child_id = ElementId::derive(map_id, key, kind.element_kind());
+        let element = self.registered_handle(child_id, kind);
+        let (won, orphan) = {
+            let mut m = map.borrow_mut();
+            let prior = m.get(key);
+            m.set(key, element.clone(), stamp);
+            let won = m
+                .get(key)
+                .as_ref()
+                .is_some_and(|cur| handles_eq(cur, &element));
+            (won, displaced(prior))
+        };
+        if won {
+            element.reinstate();
+        } else {
+            element.displace();
+        }
+        self.parents.insert(child_id, map_id);
+        if let Some(o) = orphan {
+            self.orphans.push(o);
+        }
+    }
+
+    /// The registered container handle for `id`, wrapped as an Element,
+    /// materialising and registering a fresh one on first sight.
+    fn registered_handle(&mut self, id: ElementId, kind: Container) -> Element {
+        match kind {
+            Container::Map => Element::Map(Rc::clone(
+                self.maps
+                    .entry(id)
+                    .or_insert_with(|| Rc::new(RefCell::new(Map::new(id)))),
+            )),
+            Container::List => Element::List(Rc::clone(
+                self.lists
+                    .entry(id)
+                    .or_insert_with(|| Rc::new(RefCell::new(List::new(id)))),
+            )),
+            Container::Text => Element::Text(Rc::clone(
+                self.texts
+                    .entry(id)
+                    .or_insert_with(|| Rc::new(RefCell::new(Text::new(id)))),
+            )),
+        }
+    }
+}
+
+/// The container kinds a create op installs.
+#[derive(Clone, Copy)]
+enum Container {
+    Map,
+    List,
+    Text,
+}
+
+impl Container {
+    fn element_kind(self) -> ElementKind {
+        match self {
+            Container::Map => ElementKind::Map,
+            Container::List => ElementKind::List,
+            Container::Text => ElementKind::Text,
+        }
+    }
+}
+
+/// Whether two Elements hold the exact same container handle.
+fn handles_eq(a: &Element, b: &Element) -> bool {
+    match (a, b) {
+        (Element::Map(x), Element::Map(y)) => Rc::ptr_eq(x, y),
+        (Element::List(x), Element::List(y)) => Rc::ptr_eq(x, y),
+        (Element::Text(x), Element::Text(y)) => Rc::ptr_eq(x, y),
+        _ => false,
     }
 }
 

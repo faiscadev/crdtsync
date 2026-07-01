@@ -638,3 +638,153 @@ fn text_in_a_nested_map() {
     let title = child_text(sub.borrow().get(b"title"));
     assert_eq!(text_str(&title), "hi");
 }
+
+// --- out-of-order buffering + persistent identity ---
+
+#[test]
+fn a_child_op_before_its_parent_create_is_buffered_then_applied() {
+    // A child op naming a map that hasn't been created yet can't resolve; it is
+    // held, not dropped, and lands once the parent create arrives.
+    let mut a = doc(1);
+    let ops = a.transact(|tx| {
+        let mut sub = tx.map(b"k");
+        sub.register(b"x", Scalar::Int(9));
+    });
+    let mut b = doc(2);
+    assert!(!b.apply(&ops[1]), "child op has no target yet"); // RegisterSet in "k"
+    assert!(b.get(b"k").is_none());
+    assert!(b.apply(&ops[0]), "parent create resolves"); // MapCreate "k"
+    let sub = child_map(b.get(b"k"));
+    assert_eq!(int(sub.borrow().get(b"x")), 9);
+}
+
+#[test]
+fn a_buffered_op_is_not_double_counted() {
+    // The same child op arriving twice before its parent must apply once.
+    let mut a = doc(1);
+    let ops = a.transact(|tx| {
+        let mut sub = tx.map(b"k");
+        sub.inc(b"n", 5);
+    });
+    let mut b = doc(2);
+    b.apply(&ops[1]); // buffered
+    b.apply(&ops[1]); // duplicate, still buffered
+    b.apply(&ops[0]); // unlock
+    let sub = child_map(b.get(b"k"));
+    assert_eq!(counter(sub.borrow().get(b"n")), 5);
+}
+
+#[test]
+fn reverse_order_delivery_converges() {
+    // A causal chain (create a → create b → edit) delivered back-to-front must
+    // buffer through and settle to the same state.
+    let mut a = doc(1);
+    let ops = a.transact(|tx| {
+        let mut outer = tx.map(b"a");
+        let mut inner = outer.map(b"b");
+        inner.register(b"deep", Scalar::Int(7));
+    });
+    let mut d = doc(2);
+    for op in ops.iter().rev() {
+        d.apply(op);
+    }
+    let a2 = child_map(d.get(b"a"));
+    let b2 = child_map(a2.borrow().get(b"b"));
+    assert_eq!(int(b2.borrow().get(b"deep")), 7);
+}
+
+#[test]
+fn a_recreated_container_keeps_its_content_and_converges() {
+    // A map displaced by a scalar, then re-won by a later create, is the same
+    // logical element: its prior fields survive, and both replicas agree.
+    let mut a = doc(1);
+    let mut b = doc(2);
+
+    let t1 = a.transact(|tx| {
+        tx.map(b"k").register(b"x", Scalar::Int(9));
+    });
+    replay(&mut b, &t1);
+
+    let t2 = b.transact(|tx| tx.set(b"k", Scalar::Int(5))); // scalar displaces the map
+    replay(&mut a, &t2);
+
+    a.transact(|tx| {
+        for _ in 0..3 {
+            tx.set(b"pad", Scalar::Int(0));
+        }
+    });
+    let t3 = a.transact(|tx| {
+        tx.map(b"k").register(b"y", Scalar::Int(8));
+    });
+    replay(&mut b, &t3);
+
+    let ka = child_map(a.get(b"k"));
+    let kb = child_map(b.get(b"k"));
+    assert_eq!(
+        int(ka.borrow().get(b"x")),
+        9,
+        "original field survived recreate"
+    );
+    assert_eq!(int(ka.borrow().get(b"y")), 8);
+    assert_eq!(int(kb.borrow().get(b"x")), int(ka.borrow().get(b"x")));
+    assert_eq!(int(kb.borrow().get(b"y")), int(ka.borrow().get(b"y")));
+}
+
+#[test]
+fn an_op_under_a_displaced_ancestor_does_not_touch_an_orphan() {
+    // A list under a map that has been overwritten by a scalar is unreachable;
+    // a late insert must buffer against that, never resurrect the orphan.
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let t1 = a.transact(|tx| {
+        tx.map(b"board").list(b"cards").insert(0, sb(b'p'));
+    });
+    replay(&mut b, &t1);
+
+    // a keeps editing the live list.
+    let ins = a.transact(|tx| tx.map(b"board").list(b"cards").insert(1, sb(b'q')));
+
+    // b overwrites "board" with a scalar stamped above that insert.
+    b.transact(|tx| {
+        for _ in 0..5 {
+            tx.set(b"pad", Scalar::Int(0));
+        }
+    });
+    let scal = b.transact(|tx| tx.set(b"board", Scalar::Int(0)));
+    assert!(scal[0].stamp > ins.last().unwrap().stamp);
+
+    // The insert reaches b while "board" is the scalar: it must not appear.
+    for op in &ins {
+        b.apply(op);
+    }
+    assert!(
+        matches!(b.get(b"board"), Some(Element::Scalar(_))),
+        "board slot must still be the scalar"
+    );
+}
+
+#[test]
+fn concurrent_recreate_converges_either_way() {
+    // Two replicas each displace and recreate the same slot in opposite orders;
+    // they must agree on the surviving element and its content.
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let seed = a.transact(|tx| {
+        tx.map(b"k").register(b"x", Scalar::Int(1));
+    });
+    replay(&mut b, &seed);
+
+    let ra = a.transact(|tx| tx.set(b"k", Scalar::Int(10)));
+    let rb = b.transact(|tx| {
+        tx.map(b"k").register(b"y", Scalar::Int(2));
+    });
+
+    replay(&mut a, &rb);
+    replay(&mut b, &ra);
+
+    // Whatever wins the slot, both replicas land there identically.
+    assert_eq!(
+        format!("{:?}", a.get(b"k").map(|e| e.kind())),
+        format!("{:?}", b.get(b"k").map(|e| e.kind())),
+    );
+}

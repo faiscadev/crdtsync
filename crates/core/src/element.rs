@@ -85,6 +85,17 @@ impl Element {
         }
     }
 
+    pub fn reinstate(&self) {
+        match self {
+            Element::Scalar(_) => {}
+            Element::Register(r) => r.borrow().reinstate(),
+            Element::Counter(c) => c.borrow().reinstate(),
+            Element::Map(m) => m.borrow().reinstate(),
+            Element::List(l) => l.borrow().reinstate(),
+            Element::Text(t) => t.borrow().reinstate(),
+        }
+    }
+
     pub fn is_displaced(&self) -> bool {
         match self {
             Element::Scalar(_) => false,

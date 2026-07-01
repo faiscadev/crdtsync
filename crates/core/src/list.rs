@@ -184,6 +184,12 @@ impl List {
         self.displaced.set(true);
     }
 
+    /// Re-install a previously displaced list: it has re-won its slot as the
+    /// same logical element, retaining its content.
+    pub fn reinstate(&self) {
+        self.displaced.set(false);
+    }
+
     pub fn is_displaced(&self) -> bool {
         self.displaced.get()
     }

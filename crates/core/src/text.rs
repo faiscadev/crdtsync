@@ -109,6 +109,10 @@ impl Text {
         self.inner.displace();
     }
 
+    pub fn reinstate(&self) {
+        self.inner.reinstate();
+    }
+
     pub fn is_displaced(&self) -> bool {
         self.inner.is_displaced()
     }
