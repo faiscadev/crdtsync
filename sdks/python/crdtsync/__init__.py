@@ -93,6 +93,27 @@ def encode_path(keys: Path) -> bytes:
     return bytes(out)
 
 
+def _u32(name: str, value: int) -> int:
+    """Reject values that ctypes would silently wrap into a C `uint32_t`."""
+    if not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError(f"{name} must be an int in 0..=4294967295, got {value!r}")
+    return value
+
+
+def _usize(name: str, value: int) -> int:
+    """Reject negatives that ctypes would wrap into a huge C `size_t`."""
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative int, got {value!r}")
+    return value
+
+
+def _i64(name: str, value: int) -> int:
+    """Reject values that ctypes would silently wrap into a C `int64_t`."""
+    if not isinstance(value, int) or not -(2**63) <= value <= 2**63 - 1:
+        raise ValueError(f"{name} must fit in a signed 64-bit int, got {value!r}")
+    return value
+
+
 def _take_buf(buf: _CrdtBuf) -> bytes:
     """Copy an owned buffer out and free it."""
     if not buf.ptr:
@@ -129,10 +150,12 @@ class Document:
     # --- map / scalar ---
 
     def register_int(self, path: Path, value: int) -> bytes:
+        _i64("value", value)
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_doc_register_int(self._handle, p, len(p), value))
 
     def inc(self, path: Path, amount: int) -> bytes:
+        _u32("amount", amount)
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_doc_inc(self._handle, p, len(p), amount))
 
@@ -158,12 +181,14 @@ class Document:
     # --- list ---
 
     def list_insert(self, path: Path, index: int, value: bytes) -> bytes:
+        _usize("index", index)
         p = encode_path(path)
         return _take_buf(
             _LIB.crdtsync_doc_list_insert(self._handle, p, len(p), index, value, len(value))
         )
 
     def list_delete(self, path: Path, index: int) -> bytes:
+        _usize("index", index)
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_doc_list_delete(self._handle, p, len(p), index))
 
@@ -171,6 +196,7 @@ class Document:
         return self._read_usize(_LIB.crdtsync_doc_list_len, path)
 
     def list_get(self, path: Path, index: int) -> Optional[bytes]:
+        _usize("index", index)
         p = encode_path(path)
         out = _CrdtBuf()
         rc = _LIB.crdtsync_doc_list_get(self._handle, p, len(p), index, ctypes.byref(out))
@@ -179,6 +205,7 @@ class Document:
     # --- text ---
 
     def text_insert(self, path: Path, index: int, text: str) -> bytes:
+        _usize("index", index)
         p = encode_path(path)
         s = text.encode("utf-8")
         return _take_buf(
@@ -186,6 +213,8 @@ class Document:
         )
 
     def text_delete(self, path: Path, index: int, count: int) -> bytes:
+        _usize("index", index)
+        _usize("count", count)
         p = encode_path(path)
         return _take_buf(
             _LIB.crdtsync_doc_text_delete(self._handle, p, len(p), index, count)

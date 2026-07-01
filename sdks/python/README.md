@@ -18,8 +18,10 @@ assert b.get_int([b"user", b"age"]) == 30      # converged
 ```
 
 A slot is addressed by a **path** — a list of `bytes` keys naming nested maps,
-the last the slot. Edits (`register_int`, `inc`, `set_bytes`, `delete`,
-`list_*`, `text_*`) apply locally and return the encoded ops to send to peers;
-`apply` folds a peer's ops back in.
+the last the slot. Edit methods (`register_int`, `inc`, `set_bytes`, `delete`,
+`list_insert`, `list_delete`, `text_insert`, `text_delete`) apply locally and
+return the encoded ops to send to peers; `apply` folds a peer's ops back in.
+Read methods (`get_int`, `get_counter`, `get_bytes`, `list_len`, `list_get`,
+`text_len`, `text_get`) return the value or `None`.
 
 The native library is found under `target/{release,debug}` or via `$CRDTSYNC_LIB`.

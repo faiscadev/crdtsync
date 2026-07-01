@@ -65,7 +65,7 @@ def test_list_converges_and_no_op_delete_is_inert():
         assert a.list_len([b"ghost"]) is None
 
 
-def test_text_converges_and_rejects_bad_utf8():
+def test_text_converges_and_deletes():
     with Document(cid(1)) as a, Document(cid(2)) as b:
         p = [b"doc", b"title"]
         b.apply(a.text_insert(p, 0, "héllo"))
@@ -73,6 +73,22 @@ def test_text_converges_and_rejects_bad_utf8():
         assert b.text_get(p) == "héllo"
         b.apply(a.text_delete(p, 1, 3))
         assert b.text_get(p) == "ho"
+
+
+def test_out_of_range_arguments_raise():
+    import pytest
+
+    with Document(cid(1)) as a:
+        # A negative index would wrap to a huge size_t across the ABI; reject it.
+        with pytest.raises(ValueError):
+            a.list_insert([b"l"], -1, b"x")
+        with pytest.raises(ValueError):
+            a.text_delete([b"t"], 0, -1)
+        # An increment must fit an unsigned 32-bit int.
+        with pytest.raises(ValueError):
+            a.inc([b"n"], -1)
+        with pytest.raises(ValueError):
+            a.inc([b"n"], 2**32)
 
 
 def test_apply_rejects_garbage():
