@@ -148,7 +148,12 @@ impl Hub {
                 state: room.doc.encode_state(),
             };
         }
-        let start = (last_seen_seq - room.base_seq) as usize;
+        // An offset past what the platform's usize can hold is far beyond the
+        // head: nothing to send. The checked conversion avoids truncating it
+        // back into the log's range.
+        let Ok(start) = usize::try_from(last_seen_seq - room.base_seq) else {
+            return Catchup::Ops(Vec::new());
+        };
         let delta = room
             .log
             .get(start..)

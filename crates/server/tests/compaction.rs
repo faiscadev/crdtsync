@@ -228,6 +228,13 @@ fn a_snapshot_round_trips_a_nested_document() {
         Some(Element::Map(m)) => assert_eq!(int(m.borrow().get(b"inner")), 9),
         _ => panic!("expected a nested map"),
     }
+    match restored.get(b"lst") {
+        Some(Element::List(l)) => match l.borrow().get(0) {
+            Some(Element::Scalar(Scalar::Int(n))) => assert_eq!(n, 1),
+            _ => panic!("expected an int at the head of the list"),
+        },
+        _ => panic!("expected a list"),
+    }
     match restored.get(b"txt") {
         Some(Element::Text(t)) => assert_eq!(t.borrow().as_string(), "hi"),
         _ => panic!("expected a text"),
