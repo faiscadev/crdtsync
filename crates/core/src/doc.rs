@@ -308,7 +308,7 @@ impl Document {
         // live slot still holds its handle, so mark every other one displaced.
         mark_displaced(&maps, &lists, &texts, &counters, root_id);
 
-        Ok(Document {
+        let mut doc = Document {
             client,
             root,
             maps,
@@ -323,7 +323,13 @@ impl Document {
             buffered,
             orphans: Vec::new(),
             pending: Vec::new(),
-        })
+        };
+        // The buffer holds only ops still waiting on their target; a well-formed
+        // snapshot already satisfies that, so this is a no-op there. Draining
+        // restores the invariant for any op decoded as already reachable rather
+        // than leaving it stuck until an unrelated mutation.
+        doc.drain_buffer();
+        Ok(doc)
     }
 
     /// Gather local edits into ops, applying each as it is emitted.
