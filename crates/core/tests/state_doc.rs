@@ -9,7 +9,7 @@
 //! converges with a concurrent replica. The encoding is canonical.
 
 use crdtsync_core::doc::Document;
-use crdtsync_core::{Element, Scalar};
+use crdtsync_core::{DecodeError, Element, Scalar};
 
 mod common;
 use common::cid;
@@ -196,6 +196,18 @@ fn a_displaced_counter_survives_a_snapshot() {
 fn a_truncated_document_is_an_error() {
     let bytes = populated().encode_state();
     assert!(Document::decode_state(&bytes[..bytes.len() - 1]).is_err());
+}
+
+#[test]
+fn a_snapshot_with_an_unknown_version_is_rejected() {
+    // The leading version byte gates the format; an unrecognized one must be
+    // refused rather than misread against a future layout.
+    let mut bytes = populated().encode_state();
+    bytes[0] = 0xFF;
+    assert!(matches!(
+        Document::decode_state(&bytes),
+        Err(DecodeError::BadTag { .. })
+    ));
 }
 
 #[test]

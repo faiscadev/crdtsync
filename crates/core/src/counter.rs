@@ -53,7 +53,9 @@ impl Counter {
     pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<Counter, DecodeError> {
         let id = cur.element_id()?;
         let count = cur.u32()?;
-        let mut entries = HashMap::with_capacity(count as usize);
+        // Cap the pre-allocation: the count is untrusted, so a valid stream
+        // grows the map incrementally rather than reserving on a bad length.
+        let mut entries = HashMap::with_capacity((count as usize).min(1024));
         for _ in 0..count {
             let client = cur.client()?;
             let inc = cur.u32()?;

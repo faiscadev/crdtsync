@@ -263,6 +263,12 @@ impl Document {
             }
         }
 
+        let root_id = ElementId::from_bytes(ROOT_ID);
+        // Following parents must terminate: a cycle would hang `resolvable` on a
+        // later op. Memoize chains already proven to terminate so the walk stays
+        // linear over an untrusted graph.
+        reject_parent_cycles(&parents, root_id)?;
+
         let seen_count = cur.u32()?;
         let mut seen = HashSet::with_capacity((seen_count as usize).min(1024));
         for _ in 0..seen_count {
@@ -281,9 +287,18 @@ impl Document {
         let buf_len = cur.u32()? as usize;
         let framed = cur.take(buf_len)?;
         let buffer = decode_ops(framed)?;
-        let buffered = buffer.iter().map(|op| op.id).collect();
+        // A buffered op that is already applied, or repeated, would be replayed
+        // by `drain_buffer` (which applies unconditionally): reject both.
+        let mut buffered = HashSet::with_capacity(buffer.len().min(1024));
+        for op in &buffer {
+            if seen.contains(&op.id) || !buffered.insert(op.id) {
+                return Err(DecodeError::BadTag {
+                    what: "document: buffered op already applied or repeated",
+                    tag: 0,
+                });
+            }
+        }
 
-        let root_id = ElementId::from_bytes(ROOT_ID);
         let root = maps.get(&root_id).cloned().ok_or(DecodeError::BadTag {
             what: "document: missing root map",
             tag: 0,
@@ -761,6 +776,44 @@ fn decode_registry<T>(
         }
     }
     Ok(reg)
+}
+
+/// Reject a decoded parent graph that doesn't terminate: every chain of parent
+/// links must reach the root (or a container with no recorded parent) without
+/// revisiting a node. A cycle would spin `resolvable` forever on a later op.
+fn reject_parent_cycles(
+    parents: &HashMap<ElementId, ElementId>,
+    root_id: ElementId,
+) -> Result<(), DecodeError> {
+    let mut terminates: HashSet<ElementId> = HashSet::new();
+    terminates.insert(root_id);
+    for &start in parents.keys() {
+        if terminates.contains(&start) {
+            continue;
+        }
+        let mut chain: HashSet<ElementId> = HashSet::new();
+        let mut cur = start;
+        let ends = loop {
+            if terminates.contains(&cur) {
+                break true;
+            }
+            if !chain.insert(cur) {
+                break false;
+            }
+            match parents.get(&cur) {
+                Some(&parent) => cur = parent,
+                None => break true,
+            }
+        };
+        if !ends {
+            return Err(DecodeError::BadTag {
+                what: "document: parent cycle",
+                tag: 0,
+            });
+        }
+        terminates.extend(chain);
+    }
+    Ok(())
 }
 
 /// Resolve a decoded slot reference to the registered handle it names.
