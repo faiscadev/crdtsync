@@ -20,3 +20,7 @@ build/
 
 # Rust
 /target
+
+# clang-format venv (legacy C tooling)
+/.venv-fmt/
+*.dSYM/
