@@ -213,6 +213,146 @@ fn delete_removes_a_slot_and_converges() {
     }
 }
 
+// --- list + text ---
+
+unsafe fn list_get(doc: *const CrdtDoc, p: &[u8], index: usize) -> Vec<u8> {
+    let mut out = CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let rc = crdtsync_doc_list_get(doc, p.as_ptr(), p.len(), index, &mut out);
+    assert_eq!(rc, 1, "list_get missed");
+    let v = std::slice::from_raw_parts(out.ptr, out.len).to_vec();
+    crdtsync_buf_free(out);
+    v
+}
+
+unsafe fn text_get(doc: *const CrdtDoc, p: &[u8]) -> String {
+    let mut out = CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let rc = crdtsync_doc_text_get(doc, p.as_ptr(), p.len(), &mut out);
+    assert_eq!(rc, 1, "text_get missed");
+    let s = String::from_utf8(std::slice::from_raw_parts(out.ptr, out.len).to_vec()).unwrap();
+    crdtsync_buf_free(out);
+    s
+}
+
+#[test]
+fn a_list_edits_read_back_and_converge() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let p = path(&[b"board", b"cards"]); // list under a nested map
+
+        let o0 = crdtsync_doc_list_insert(a, p.as_ptr(), p.len(), 0, b"x".as_ptr(), 1);
+        let o1 = crdtsync_doc_list_insert(a, p.as_ptr(), p.len(), 1, b"y".as_ptr(), 1);
+        exchange(b, &o0);
+        exchange(b, &o1);
+
+        let mut len: usize = 0;
+        assert_eq!(crdtsync_doc_list_len(b, p.as_ptr(), p.len(), &mut len), 1);
+        assert_eq!(len, 2);
+        assert_eq!(list_get(b, &p, 0), b"x");
+        assert_eq!(list_get(b, &p, 1), b"y");
+
+        crdtsync_buf_free(o0);
+        crdtsync_buf_free(o1);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn a_list_delete_converges() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let p = path(&[b"items"]);
+
+        let o0 = crdtsync_doc_list_insert(a, p.as_ptr(), p.len(), 0, b"a".as_ptr(), 1);
+        let o1 = crdtsync_doc_list_insert(a, p.as_ptr(), p.len(), 1, b"b".as_ptr(), 1);
+        let od = crdtsync_doc_list_delete(a, p.as_ptr(), p.len(), 0);
+        exchange(b, &o0);
+        exchange(b, &o1);
+        exchange(b, &od);
+
+        let mut len: usize = 0;
+        crdtsync_doc_list_len(b, p.as_ptr(), p.len(), &mut len);
+        assert_eq!(len, 1);
+        assert_eq!(list_get(b, &p, 0), b"b");
+
+        for buf in [o0, o1, od] {
+            crdtsync_buf_free(buf);
+        }
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn a_text_edits_read_back_and_converge() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let p = path(&[b"doc", b"title"]);
+
+        let s = "héllo";
+        let o0 = crdtsync_doc_text_insert(a, p.as_ptr(), p.len(), 0, s.as_ptr(), s.len());
+        exchange(b, &o0);
+
+        let mut len: usize = 0;
+        assert_eq!(crdtsync_doc_text_len(b, p.as_ptr(), p.len(), &mut len), 1);
+        assert_eq!(len, 5, "codepoint count");
+        assert_eq!(text_get(b, &p), "héllo");
+
+        crdtsync_buf_free(o0);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn a_text_delete_converges() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let p = path(&[b"t"]);
+
+        let s = "hello";
+        let ins = crdtsync_doc_text_insert(a, p.as_ptr(), p.len(), 0, s.as_ptr(), s.len());
+        let del = crdtsync_doc_text_delete(a, p.as_ptr(), p.len(), 1, 3); // drop "ell"
+        exchange(b, &ins);
+        exchange(b, &del);
+
+        assert_eq!(text_get(b, &p), "ho");
+
+        crdtsync_buf_free(ins);
+        crdtsync_buf_free(del);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn non_utf8_text_insert_yields_no_ops() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let p = path(&[b"t"]);
+        let bad = [0xFFu8, 0xFE];
+        let buf = crdtsync_doc_text_insert(doc, p.as_ptr(), p.len(), 0, bad.as_ptr(), bad.len());
+        assert_eq!(buf.len, 0, "invalid UTF-8 must not emit");
+        crdtsync_buf_free(buf);
+        crdtsync_doc_free(doc);
+    }
+}
+
 #[test]
 #[cfg_attr(miri, ignore = "stack depth is a native concern; slow under Miri")]
 fn a_very_deep_path_does_not_overflow_the_stack() {
