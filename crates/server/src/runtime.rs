@@ -67,13 +67,20 @@ pub async fn serve(
     server: ClientId,
     store: Option<Store>,
 ) -> std::io::Result<()> {
+    // Replay the persisted log here, before serving: a corrupt log fails
+    // startup rather than panicking inside the detached actor thread and
+    // leaving a live port with no registry behind it.
+    let logs = match &store {
+        Some(store) => store.load()?,
+        None => Vec::new(),
+    };
     let (cmds, cmd_rx) = unbounded_channel::<Cmd>();
     // The replicas are single-threaded; keep them on one dedicated thread.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("build registry runtime");
-        rt.block_on(registry_actor(server, store, cmd_rx));
+        rt.block_on(registry_actor(server, logs, store, cmd_rx));
     });
 
     loop {
@@ -85,11 +92,17 @@ pub async fn serve(
 
 /// Own the registry and serve connection commands, flushing outboxes to each
 /// connection's sink after every routed message.
-async fn registry_actor(server: ClientId, store: Option<Store>, mut cmds: UnboundedReceiver<Cmd>) {
-    let mut reg = match store {
-        Some(store) => Registry::with_store(server, store).expect("replay persisted log"),
-        None => Registry::new(server),
-    };
+async fn registry_actor(
+    server: ClientId,
+    logs: Vec<(crate::RoomId, Vec<crdtsync_core::Op>)>,
+    store: Option<Store>,
+    mut cmds: UnboundedReceiver<Cmd>,
+) {
+    let mut hub = crate::Hub::from_logs(server, logs);
+    if let Some(store) = store {
+        hub.attach_store(store);
+    }
+    let mut reg = Registry::from_hub(hub);
     let mut peers: HashMap<ConnId, Peer> = HashMap::new();
     while let Some(cmd) = cmds.recv().await {
         match cmd {

@@ -63,7 +63,7 @@ fn from_logs_restores_the_dedup_set() {
     let mut h = Hub::from_logs(cid(SERVER), one_room_log(ROOM, ops.clone()));
     // A client that reconnects and resends a replayed op grows nothing: the
     // log's identities came back with the state.
-    assert!(h.ingest(ROOM, ops).is_empty());
+    assert!(h.ingest(ROOM, ops).unwrap().is_empty());
     assert_eq!(h.seq(ROOM), 1);
 }
 

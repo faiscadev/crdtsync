@@ -129,7 +129,7 @@ fn subscribe_replies_with_the_catch_up_batch() {
     let mut h = hub();
     // Seed the room with prior ops.
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    h.ingest(ROOM, ops.clone());
+    h.ingest(ROOM, ops.clone()).unwrap();
 
     let mut s = Session::new();
     hello(&mut h, &mut s, 2);

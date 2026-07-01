@@ -23,35 +23,34 @@ struct Conn {
     outbox: Vec<Message>,
 }
 
-/// The set of live connections sharing one hub, optionally over a durable log.
+/// The set of live connections sharing one hub.
 pub struct Registry {
     hub: Hub,
     conns: HashMap<ConnId, Conn>,
     next: u64,
-    store: Option<Store>,
 }
 
 impl Registry {
     /// An in-memory registry whose hub's replicas are owned by `server`.
     pub fn new(server: ClientId) -> Self {
+        Self::from_hub(Hub::new(server))
+    }
+
+    /// A registry over an existing hub — durable or not.
+    pub(crate) fn from_hub(hub: Hub) -> Self {
         Self {
-            hub: Hub::new(server),
+            hub,
             conns: HashMap::new(),
             next: 0,
-            store: None,
         }
     }
 
     /// A registry backed by `store`: its hub replays the persisted log, and
-    /// every op it ingests is appended before it fans out to peers.
+    /// every op the hub ingests is appended before it fans out to peers.
     pub fn with_store(server: ClientId, store: Store) -> io::Result<Self> {
-        let hub = Hub::from_logs(server, store.load()?);
-        Ok(Self {
-            hub,
-            conns: HashMap::new(),
-            next: 0,
-            store: Some(store),
-        })
+        let mut hub = Hub::from_logs(server, store.load()?);
+        hub.attach_store(store);
+        Ok(Self::from_hub(hub))
     }
 
     /// Open a connection, returning its handle.
@@ -86,16 +85,10 @@ impl Registry {
             let room = conn.session.room().map(<[u8]>::to_vec);
             (resp.broadcast, resp.close, room)
         };
+        // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),
+        // so fanning it out never advertises an unpersisted write.
         if !broadcast.is_empty() {
             if let Some(room) = room {
-                // Persist before broadcasting: a node that cannot durably
-                // record a write must not advertise it to peers. A failed
-                // append closes this connection and drops the fan-out.
-                if let Some(store) = &mut self.store {
-                    if store.append(&room, &broadcast).is_err() {
-                        return false;
-                    }
-                }
                 for (peer, conn) in self.conns.iter_mut() {
                     if *peer != id && conn.session.room() == Some(room.as_slice()) {
                         conn.outbox.push(Message::Ops(broadcast.clone()));

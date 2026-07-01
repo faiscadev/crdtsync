@@ -96,11 +96,21 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
                 return violation("op client mismatch");
             }
             // The deduped ops fan out to the room's other subscribers; nothing
-            // echoes back to the sender.
-            let applied = hub.ingest(room, ops);
-            Response {
-                broadcast: applied,
-                ..Response::default()
+            // echoes back to the sender. A hub that cannot durably record the
+            // ops rejects the write rather than advertising an unpersisted one.
+            match hub.ingest(room, ops) {
+                Ok(applied) => Response {
+                    broadcast: applied,
+                    ..Response::default()
+                },
+                Err(_) => Response {
+                    replies: vec![Message::Error {
+                        code: ErrorCode::Internal,
+                        message: "failed to persist ops".to_string(),
+                    }],
+                    broadcast: Vec::new(),
+                    close: true,
+                },
             }
         }
         Message::Error { .. } => violation("client sent an error"),
