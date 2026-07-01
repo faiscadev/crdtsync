@@ -8,7 +8,7 @@
 //! Text.
 
 use crate::element::Element;
-use crate::elementid::ElementId;
+use crate::elementid::{ElementId, ElementKind};
 use crate::stamp::Stamp;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -81,8 +81,12 @@ impl List {
             .collect()
     }
 
-    /// Insert `value` at live `index`, identified by `stamp`.
+    /// Insert `value` at live `index`, identified by `stamp`. A stamp already
+    /// seen is a replay and leaves the node untouched.
     pub fn insert(&mut self, index: usize, value: Element, stamp: Stamp) {
+        if self.nodes.contains_key(&stamp) {
+            return;
+        }
         let order = self.tree_order();
         let (left, right) = self.gap(&order, index);
         let (parent, side) = self.placement(left, right);
@@ -108,8 +112,16 @@ impl List {
     pub fn merge(&mut self, other: &Self) {
         for (id, on) in &other.nodes {
             match self.nodes.get_mut(id) {
-                // Same node: deletion is monotonic, so a tombstone anywhere wins.
-                Some(sn) => sn.tombstone |= on.tombstone,
+                Some(sn) => {
+                    // Deletion is monotonic, so a tombstone anywhere wins.
+                    sn.tombstone |= on.tombstone;
+                    // Same logical item: fold composite values together; scalars
+                    // are immutable so their shared id already agrees.
+                    if sn.value.kind() != ElementKind::Scalar && sn.value.kind() == on.value.kind()
+                    {
+                        sn.value.merge(&on.value);
+                    }
+                }
                 None => {
                     self.nodes.insert(*id, on.deep_clone());
                 }

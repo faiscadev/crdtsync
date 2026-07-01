@@ -5,10 +5,12 @@
 //! survive to anchor concurrent inserts); the same algorithm backs Text.
 
 use crdtsync_core::list::List;
-use crdtsync_core::{Element, Scalar};
+use crdtsync_core::{Counter, Element, Scalar};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 mod common;
-use common::{default_id, eid, stmp};
+use common::{cid, default_id, eid, stmp};
 
 fn list() -> List {
     List::new(default_id())
@@ -262,4 +264,45 @@ fn displace_flags_the_handle() {
     assert!(!l.is_displaced());
     l.displace();
     assert!(l.is_displaced());
+}
+
+// --- idempotence / composite items ---
+
+#[test]
+fn replayed_insert_does_not_resurrect_a_tombstone() {
+    // A retried/duplicated insert carries the same stamp; re-applying it must
+    // not overwrite (and un-delete) the node.
+    let mut l = list();
+    ins(&mut l, 0, b'a', 1, 1);
+    l.delete(0);
+    ins(&mut l, 0, b'a', 1, 1); // same stamp, replayed
+    assert_eq!(l.len(), 0);
+    assert_eq!(text(&l), "");
+}
+
+#[test]
+fn merge_folds_composite_item_values() {
+    // An item that is itself a CRDT must merge, not just survive by tombstone —
+    // concurrent edits to the same list item have to converge.
+    let counter = || Element::Counter(Rc::new(RefCell::new(Counter::new(eid(9, 9)))));
+    let mut a = list();
+    a.insert(0, counter(), stmp(1, 1));
+    let mut b = a.deep_clone(); // same node stamp, independent counter handle
+
+    if let Some(Element::Counter(c)) = a.get(0) {
+        c.borrow_mut().inc(cid(1), 3);
+    }
+    if let Some(Element::Counter(c)) = b.get(0) {
+        c.borrow_mut().inc(cid(2), 4);
+    }
+
+    a.merge(&b);
+    b.merge(&a);
+
+    let read = |l: &List| match l.get(0) {
+        Some(Element::Counter(c)) => c.borrow().read(),
+        _ => panic!("expected a counter item"),
+    };
+    assert_eq!(read(&a), 7);
+    assert_eq!(read(&b), 7);
 }
