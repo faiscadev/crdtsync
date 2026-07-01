@@ -421,11 +421,20 @@ impl Document {
             return;
         }
         let id = ElementId::derive(map_id, key, ElementKind::Counter);
-        let counter = Rc::clone(
-            self.counters
-                .entry(id)
-                .or_insert_with(|| Rc::new(RefCell::new(Counter::new(id)))),
-        );
+        let counter = match self.counters.get(&id) {
+            Some(c) => Rc::clone(c),
+            None => {
+                // A counter installed straight through the Map API isn't in the
+                // registry yet; adopt its tally rather than shadow it with a
+                // fresh zero.
+                let counter = match map.borrow().get(key) {
+                    Some(Element::Counter(live)) if live.borrow().id() == id => live,
+                    _ => Rc::new(RefCell::new(Counter::new(id))),
+                };
+                self.counters.insert(id, Rc::clone(&counter));
+                counter
+            }
+        };
         match delta {
             CounterDelta::Inc(amount) => counter.borrow_mut().inc(author, amount),
             CounterDelta::Dec(amount) => counter.borrow_mut().dec(author, amount),

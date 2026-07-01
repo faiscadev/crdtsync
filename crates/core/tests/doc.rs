@@ -972,6 +972,26 @@ fn counter_ops_around_a_displacement_commute() {
 }
 
 #[test]
+fn a_counter_installed_through_the_map_api_keeps_its_tally() {
+    // A counter can be installed directly on a live Map handle; a later
+    // Document counter op must fold into that same counter, not shadow it with
+    // a fresh zero.
+    let mut d = doc(1);
+    {
+        let root = d.root();
+        let mut m = root.borrow_mut();
+        let c = m.counter(b"n", stmp(1, 1));
+        c.borrow_mut().inc(cid(1), 5);
+    }
+    d.transact(|tx| tx.inc(b"n", 3));
+    assert_eq!(
+        counter(d.get(b"n")),
+        8,
+        "5 from the Map API survives the op's 3"
+    );
+}
+
+#[test]
 fn a_register_converges_across_displace_recreate() {
     // Register is last-writer-wins, so displacement is already order-independent
     // — this pins that a displaced-then-recreated register still converges.
