@@ -2,18 +2,22 @@
 
 use crate::clientid::ClientId;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Stamp {
     pub lamport: u64,
     pub client: ClientId,
 }
 
+impl Ord for Stamp {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.lamport
+            .cmp(&other.lamport)
+            .then_with(|| self.client.cmp(&other.client))
+    }
+}
+
 impl PartialOrd for Stamp {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if self.lamport == other.lamport {
-            Some(self.client.cmp(&other.client))
-        } else {
-            Some(self.lamport.cmp(&other.lamport))
-        }
+        Some(self.cmp(other))
     }
 }
