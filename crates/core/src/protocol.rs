@@ -65,6 +65,9 @@ pub enum Message {
     Subscribe { room: Vec<u8>, last_seen_seq: u64 },
     /// A batch of ops to fold in.
     Ops(Vec<Op>),
+    /// A whole-replica state snapshot the server sends a subscriber that fell
+    /// below a room's compaction floor, tagged with the sequence it lands at.
+    Snapshot { seq: u64, state: Vec<u8> },
     /// A failure the server reports to the client.
     Error { code: ErrorCode, message: String },
 }
@@ -112,6 +115,11 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u8(&mut out, 2);
             out.extend_from_slice(&encode_ops(ops));
         }
+        Message::Snapshot { seq, state } => {
+            put_u8(&mut out, 4);
+            put_u64(&mut out, *seq);
+            put_bytes(&mut out, state);
+        }
         Message::Error { code, message } => {
             put_u8(&mut out, 3);
             put_u16(&mut out, error_code_tag(*code));
@@ -147,6 +155,11 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let code = error_code(cur.u16()?)?;
             let message = cur.string()?;
             Message::Error { code, message }
+        }
+        4 => {
+            let seq = cur.u64()?;
+            let state = cur.bytes()?;
+            Message::Snapshot { seq, state }
         }
         tag => {
             return Err(ProtocolError::BadTag {

@@ -123,6 +123,52 @@ fn ops_round_trips_an_empty_batch() {
 }
 
 #[test]
+fn snapshot_round_trips() {
+    round_trips(Message::Snapshot {
+        seq: 4_200_000,
+        state: vec![1, 2, 3, 0, 255, 128],
+    });
+}
+
+#[test]
+fn snapshot_round_trips_an_empty_state() {
+    round_trips(Message::Snapshot {
+        seq: 0,
+        state: Vec::new(),
+    });
+}
+
+#[test]
+fn snapshot_round_trips_a_large_state() {
+    round_trips(Message::Snapshot {
+        seq: 1,
+        state: (0..4096).map(|i| i as u8).collect(),
+    });
+}
+
+#[test]
+fn a_truncated_snapshot_is_an_error() {
+    let bytes = encode_message(&Message::Snapshot {
+        seq: 9,
+        state: vec![7, 7, 7],
+    });
+    assert_eq!(
+        decode_message(&bytes[..bytes.len() - 1]),
+        Err(ProtocolError::UnexpectedEof)
+    );
+}
+
+#[test]
+fn trailing_bytes_after_a_snapshot_are_an_error() {
+    let mut bytes = encode_message(&Message::Snapshot {
+        seq: 9,
+        state: vec![7],
+    });
+    bytes.push(0);
+    assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
+}
+
+#[test]
 fn error_round_trips() {
     round_trips(Message::Error {
         code: ErrorCode::UnsupportedVersion,
