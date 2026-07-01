@@ -9,7 +9,7 @@
 
 use crate::element::Element;
 use crate::elementid::ElementId;
-use crate::list::List;
+use crate::list::{Anchor, List, Side};
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 
@@ -45,20 +45,53 @@ impl Text {
     /// Insert `s` at codepoint `index`; its codepoints take consecutive
     /// char_ids from `stamp`.
     pub fn insert(&mut self, index: usize, s: &str, stamp: Stamp) {
+        let anchor = self.place(index);
+        self.insert_run(stamp, s, anchor);
+    }
+
+    /// The Fugue placement for inserting at codepoint `index`, computed without
+    /// mutating. Feed it to [`insert_run`](Self::insert_run) to reproduce the
+    /// insert on any replica.
+    pub fn place(&self, index: usize) -> Anchor {
+        self.inner.place(index)
+    }
+
+    /// Insert the codepoints of `s` with explicit placement: the first uses
+    /// `anchor`, each subsequent one hangs to the right of its predecessor, and
+    /// char_ids run consecutively from `base`. Idempotent per char_id.
+    pub fn insert_run(&mut self, base: Stamp, s: &str, anchor: Anchor) {
+        let mut anchor = anchor;
         for (k, c) in s.chars().enumerate() {
             let char_id = Stamp {
-                lamport: stamp.lamport + k as u64,
-                client: stamp.client,
+                lamport: base.lamport + k as u64,
+                client: base.client,
             };
             self.inner
-                .insert(index + k, Element::Scalar(Scalar::Int(c as i64)), char_id);
+                .insert_at(char_id, Element::Scalar(Scalar::Int(c as i64)), anchor);
+            anchor = Anchor {
+                parent: Some(char_id),
+                side: Side::Right,
+            };
         }
+    }
+
+    /// The char_ids of up to `count` live codepoints starting at `index`.
+    pub fn node_ids(&self, index: usize, count: usize) -> Vec<Stamp> {
+        (index..index.saturating_add(count))
+            .map_while(|i| self.inner.node_at(i))
+            .collect()
     }
 
     /// Tombstone `count` live codepoints starting at `index`.
     pub fn delete(&mut self, index: usize, count: usize) {
-        for _ in 0..count {
-            self.inner.delete(index);
+        let ids = self.node_ids(index, count);
+        self.delete_ids(&ids);
+    }
+
+    /// Tombstone the codepoints with these char_ids. Idempotent.
+    pub fn delete_ids(&mut self, ids: &[Stamp]) {
+        for id in ids {
+            self.inner.delete_id(*id);
         }
     }
 

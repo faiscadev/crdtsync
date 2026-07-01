@@ -7,9 +7,14 @@
 //! helper); indices here are codepoint indices.
 
 use crdtsync_core::text::Text;
+use crdtsync_core::{Anchor, Stamp};
 
 mod common;
 use common::{default_id, eid, stmp};
+
+/// One captured text-insert op: the run's base stamp, its string, and the
+/// placement of its first codepoint.
+type TextOp = (Stamp, String, Anchor);
 
 fn text() -> Text {
     Text::new(default_id())
@@ -204,4 +209,86 @@ fn displace_flags_the_handle() {
     assert!(!t.is_displaced());
     t.displace();
     assert!(t.is_displaced());
+}
+
+// --- op-oriented placement (a text-insert op carries its run's placement, so
+//     it applies identically on every replica regardless of local index) ---
+
+/// Insert `s` at codepoint `index`, capturing it as a replica-independent op.
+fn capture(t: &mut Text, index: usize, s: &str, lamport: u64, client: u8) -> TextOp {
+    let anchor = t.place(index);
+    let base = stmp(lamport, client);
+    t.insert_run(base, s, anchor);
+    (base, s.to_string(), anchor)
+}
+
+fn apply_ops(t: &mut Text, ops: &[TextOp]) {
+    for (base, s, anchor) in ops {
+        t.insert_run(*base, s, *anchor);
+    }
+}
+
+#[test]
+fn place_then_insert_run_matches_insert() {
+    let mut t = text();
+    capture(&mut t, 0, "hello", 1, 1);
+    assert_eq!(t.as_string(), "hello");
+}
+
+#[test]
+fn captured_text_op_replays_on_a_fresh_replica() {
+    let mut a = text();
+    let op = capture(&mut a, 0, "hi 😀", 1, 1);
+    let mut b = text();
+    apply_ops(&mut b, &[op]);
+    assert_eq!(b.as_string(), "hi 😀");
+}
+
+#[test]
+fn concurrent_text_runs_converge_without_interleaving() {
+    let mut a = text();
+    let mut b = text();
+    let oa = capture(&mut a, 0, "ABC", 1, 1);
+    let ob = capture(&mut b, 0, "XYZ", 1, 2);
+    apply_ops(&mut a, &[ob]);
+    apply_ops(&mut b, &[oa]);
+    assert_eq!(a.as_string(), b.as_string());
+    let s = a.as_string();
+    assert!(s == "ABCXYZ" || s == "XYZABC", "interleaved: {s}");
+}
+
+#[test]
+fn insert_run_is_idempotent() {
+    let mut t = text();
+    let op = capture(&mut t, 0, "abc", 1, 1);
+    apply_ops(&mut t, &[op]); // replay the same run
+    assert_eq!(t.as_string(), "abc");
+    assert_eq!(t.len(), 3);
+}
+
+#[test]
+fn node_ids_and_delete_ids_remove_a_range() {
+    let mut t = text();
+    ins(&mut t, 0, "abcde", 1, 1);
+    let ids = t.node_ids(1, 3); // "bcd"
+    assert_eq!(ids.len(), 3);
+    t.delete_ids(&ids);
+    assert_eq!(t.as_string(), "ae");
+}
+
+#[test]
+fn delete_ids_is_idempotent() {
+    let mut t = text();
+    ins(&mut t, 0, "ab", 1, 1);
+    let ids = t.node_ids(0, 1); // "a"
+    t.delete_ids(&ids);
+    t.delete_ids(&ids); // repeat
+    assert_eq!(t.as_string(), "b");
+}
+
+#[test]
+fn node_ids_clamps_past_the_end() {
+    let mut t = text();
+    ins(&mut t, 0, "ab", 1, 1);
+    assert_eq!(t.node_ids(1, 10).len(), 1); // only "b" remains
 }
