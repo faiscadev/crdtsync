@@ -47,12 +47,13 @@ fn sole_file(root: &std::path::Path) -> std::path::PathBuf {
     entries.pop().unwrap()
 }
 
-/// The ops loaded for `room`, or panic if the room is absent.
+/// The ops loaded for `room`, or panic if the room is absent. These rooms are
+/// never compacted, so a room carries only its log.
 fn loaded(store: &Store, room: &[u8]) -> Vec<Op> {
     let logs = store.load().unwrap();
     logs.into_iter()
         .find(|(r, _)| r == room)
-        .map(|(_, ops)| ops)
+        .map(|(_, rl)| rl.ops)
         .unwrap_or_else(|| panic!("room not found in load"))
 }
 

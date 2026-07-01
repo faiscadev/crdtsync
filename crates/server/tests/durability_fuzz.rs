@@ -107,7 +107,6 @@ fn fingerprint(hub: &Hub) -> String {
         .join(";")
 }
 
-/// The same rendering for a plain document — the catch-up oracle.
 /// Unwrap a catch-up that must be a plain op delta — these rooms are never
 /// compacted.
 fn ops(c: Catchup) -> Vec<Op> {
@@ -117,6 +116,7 @@ fn ops(c: Catchup) -> Vec<Op> {
     }
 }
 
+/// The same rendering for a plain document — the catch-up oracle.
 fn doc_fingerprint(d: &Document) -> String {
     KEYS.iter()
         .map(|k| {
@@ -155,10 +155,11 @@ fn a_reopened_hub_reproduces_state_sequence_and_catch_up() {
         let seq = hub.seq(ROOM);
 
         // Reopen the store into a fresh hub: same state, same sequence.
-        let mut reloaded = Hub::from_logs(
+        let mut reloaded = Hub::from_rooms(
             cid(SERVER),
             Store::open(tmp.path()).unwrap().load().unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(fingerprint(&reloaded), live, "seed {seed}: reload diverged");
         assert_eq!(reloaded.seq(ROOM), seq, "seed {seed}: sequence drifted");
 

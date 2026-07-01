@@ -15,14 +15,14 @@
 
 use std::collections::HashMap;
 
-use crdtsync_core::{decode_header, decode_message, encode_message, ClientId, Message};
+use crdtsync_core::{decode_header, decode_message, encode_message, ClientId, Document, Message};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{channel, unbounded_channel, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::{negotiate, ConnId, Registry, Store};
+use crate::{negotiate, ConnId, Registry, RoomId, RoomLog, Store};
 
 /// How many outbound messages may queue for one connection before it is judged
 /// too slow and dropped — a bound on per-connection memory.
@@ -71,10 +71,10 @@ pub async fn serve(
     // startup rather than panicking inside the detached actor thread and
     // leaving a live port with no registry behind it. The read is blocking, so
     // it runs on the blocking pool to keep the runtime free for other tasks.
-    let (logs, store) = match store {
+    let (rooms, store) = match store {
         Some(store) => {
             let (result, store) = tokio::task::spawn_blocking(move || {
-                let result = store.load();
+                let result = store.load().and_then(validated);
                 (result, store)
             })
             .await
@@ -89,7 +89,7 @@ pub async fn serve(
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("build registry runtime");
-        rt.block_on(registry_actor(server, logs, store, cmd_rx));
+        rt.block_on(registry_actor(server, rooms, store, cmd_rx));
     });
 
     loop {
@@ -99,15 +99,30 @@ pub async fn serve(
     }
 }
 
+/// Surface a corrupt persisted snapshot as a startup error: every snapshot must
+/// decode. The rooms pass through unchanged for the actor to rebuild, so this
+/// runs on the blocking pool alongside the load, off the async runtime.
+fn validated(rooms: Vec<(RoomId, RoomLog)>) -> std::io::Result<Vec<(RoomId, RoomLog)>> {
+    for (_, log) in &rooms {
+        if let Some(snapshot) = &log.snapshot {
+            Document::decode_state(&snapshot.state).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
+            })?;
+        }
+    }
+    Ok(rooms)
+}
+
 /// Own the registry and serve connection commands, flushing outboxes to each
 /// connection's sink after every routed message.
 async fn registry_actor(
     server: ClientId,
-    logs: Vec<(crate::RoomId, Vec<crdtsync_core::Op>)>,
+    rooms: Vec<(RoomId, RoomLog)>,
     store: Option<Store>,
     mut cmds: UnboundedReceiver<Cmd>,
 ) {
-    let mut hub = crate::Hub::from_logs(server, logs);
+    // The rooms were validated during startup, so reconstruction can't fail.
+    let mut hub = crate::Hub::from_rooms(server, rooms).expect("startup validated the store");
     if let Some(store) = store {
         hub.attach_store(store);
     }

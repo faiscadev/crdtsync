@@ -48,7 +48,7 @@ impl Registry {
     /// A registry backed by `store`: its hub replays the persisted log, and
     /// every op the hub ingests is appended before it fans out to peers.
     pub fn with_store(server: ClientId, store: Store) -> io::Result<Self> {
-        let mut hub = Hub::from_logs(server, store.load()?);
+        let mut hub = Hub::from_rooms(server, store.load()?)?;
         hub.attach_store(store);
         Ok(Self::from_hub(hub))
     }

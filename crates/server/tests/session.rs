@@ -151,7 +151,7 @@ fn subscribe_below_a_compaction_floor_replies_with_a_snapshot() {
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
     h.ingest(ROOM, ops).unwrap();
     let head = h.seq(ROOM);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
 
     let mut s = Session::new();
     hello(&mut h, &mut s, 2);
@@ -186,7 +186,7 @@ fn subscribe_at_the_head_of_a_compacted_room_replies_with_an_empty_batch() {
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
     h.ingest(ROOM, ops).unwrap();
     let head = h.seq(ROOM);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
 
     let mut s = Session::new();
     hello(&mut h, &mut s, 2);

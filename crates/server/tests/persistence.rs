@@ -3,17 +3,17 @@
 
 //! Persistence — the hub and registry backed by a durable op log.
 //!
-//! [`Hub::from_logs`] rebuilds a hub by replaying a loaded log: the merged
-//! state, the server sequence, and the dedup set all come back. A
-//! [`Registry`] opened over a [`Store`] persists every op it ingests, so a
-//! node that drops and reopens the same store resumes exactly where it left
-//! off — same state, same sequence, same catch-up.
+//! [`Hub::from_rooms`] rebuilds a hub from each room's persisted snapshot and
+//! log: the merged state, the server sequence, and the dedup set all come back.
+//! A [`Registry`] opened over a [`Store`] persists every op it ingests and its
+//! compaction snapshots, so a node that drops and reopens the same store
+//! resumes exactly where it left off — same state, same sequence, same catch-up.
 
 use std::fs;
 
 use crdtsync_core::{ClientId, Document, Element, Message, Op, Scalar};
 use crdtsync_server::store::Store;
-use crdtsync_server::{Catchup, Hub, Registry, RoomId};
+use crdtsync_server::{Catchup, Hub, Registry, RoomId, RoomLog};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -47,29 +47,36 @@ fn int(e: Option<Element>) -> i64 {
 const SERVER: u8 = 0xFF;
 const ROOM: &[u8] = b"room-1";
 
-/// A log for one room built from a client's transactions, as `load` returns it.
-fn one_room_log(room: &[u8], ops: Vec<crdtsync_core::Op>) -> Vec<(RoomId, Vec<crdtsync_core::Op>)> {
-    vec![(room.to_vec(), ops)]
+/// A room built from a client's transactions with no snapshot, as `load`
+/// returns an uncompacted room.
+fn one_room_log(room: &[u8], ops: Vec<Op>) -> Vec<(RoomId, RoomLog)> {
+    vec![(
+        room.to_vec(),
+        RoomLog {
+            snapshot: None,
+            ops,
+        },
+    )]
 }
 
-// --- from_logs replay ---
+// --- from_rooms replay ---
 
 #[test]
-fn from_logs_rebuilds_state_and_sequence() {
+fn from_rooms_rebuilds_state_and_sequence() {
     let mut a = doc(1);
     let mut ops = a.transact(|tx| tx.register(b"a", Scalar::Int(1)));
     ops.extend(a.transact(|tx| tx.register(b"b", Scalar::Int(2))));
 
-    let h = Hub::from_logs(cid(SERVER), one_room_log(ROOM, ops));
+    let h = Hub::from_rooms(cid(SERVER), one_room_log(ROOM, ops)).unwrap();
     assert_eq!(h.seq(ROOM), 2);
     assert_eq!(int(h.get(ROOM, b"a")), 1);
     assert_eq!(int(h.get(ROOM, b"b")), 2);
 }
 
 #[test]
-fn from_logs_restores_the_dedup_set() {
+fn from_rooms_restores_the_dedup_set() {
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    let mut h = Hub::from_logs(cid(SERVER), one_room_log(ROOM, ops.clone()));
+    let mut h = Hub::from_rooms(cid(SERVER), one_room_log(ROOM, ops.clone())).unwrap();
     // A client that reconnects and resends a replayed op grows nothing: the
     // log's identities came back with the state.
     assert!(h.ingest(ROOM, ops).unwrap().is_empty());
@@ -77,19 +84,34 @@ fn from_logs_restores_the_dedup_set() {
 }
 
 #[test]
-fn from_logs_with_no_rooms_is_a_fresh_hub() {
-    let h = Hub::from_logs(cid(SERVER), Vec::new());
+fn from_rooms_with_no_rooms_is_a_fresh_hub() {
+    let h = Hub::from_rooms(cid(SERVER), Vec::new()).unwrap();
     assert_eq!(h.seq(ROOM), 0);
     assert!(h.get(ROOM, b"age").is_none());
 }
 
 #[test]
-fn from_logs_replays_independent_rooms() {
+fn from_rooms_replays_independent_rooms() {
     let a = doc(1).transact(|tx| tx.register(b"k", Scalar::Int(1)));
     let b = doc(2).transact(|tx| tx.register(b"k", Scalar::Int(2)));
-    let logs = vec![(b"room-a".to_vec(), a), (b"room-b".to_vec(), b)];
+    let rooms = vec![
+        (
+            b"room-a".to_vec(),
+            RoomLog {
+                snapshot: None,
+                ops: a,
+            },
+        ),
+        (
+            b"room-b".to_vec(),
+            RoomLog {
+                snapshot: None,
+                ops: b,
+            },
+        ),
+    ];
 
-    let h = Hub::from_logs(cid(SERVER), logs);
+    let h = Hub::from_rooms(cid(SERVER), rooms).unwrap();
     assert_eq!(int(h.get(b"room-a", b"k")), 1);
     assert_eq!(int(h.get(b"room-b", b"k")), 2);
 }
@@ -157,7 +179,7 @@ fn a_reingested_op_after_restart_is_deduped() {
         .into_iter()
         .find(|(room, _)| room == ROOM)
         .unwrap();
-    assert_eq!(logged.len(), 1);
+    assert_eq!(logged.ops.len(), 1);
 }
 
 #[test]
@@ -184,12 +206,143 @@ fn catch_up_uses_stable_sequences_across_a_restart() {
 
     // After a restart the sequence numbering is unchanged: a subscriber that
     // saw seq 1 catches up on only the second op.
-    let mut h = Hub::from_logs(
+    let mut h = Hub::from_rooms(
         cid(SERVER),
         Store::open(tmp.path()).unwrap().load().unwrap(),
-    );
+    )
+    .unwrap();
     assert_eq!(ops(h.catch_up(ROOM, 0)).len(), 2);
     assert_eq!(ops(h.catch_up(ROOM, 1)), second);
+}
+
+// --- durable compaction ---
+
+/// The `.snap` file path for `room`, matching the store's hex-of-id naming.
+fn snap_path(root: &std::path::Path, room: &[u8]) -> std::path::PathBuf {
+    let hex: String = room.iter().map(|b| format!("{b:02x}")).collect();
+    root.join(format!("{hex}.snap"))
+}
+
+/// Write a snapshot file directly: an 8-byte little-endian base sequence then
+/// the state. Used to stage a crash between snapshot-write and log-truncate.
+fn write_snapshot(root: &std::path::Path, room: &[u8], base_seq: u64, state: &[u8]) {
+    let mut bytes = base_seq.to_le_bytes().to_vec();
+    bytes.extend_from_slice(state);
+    fs::write(snap_path(root, room), bytes).unwrap();
+}
+
+/// An in-memory reference: the merged state and sequence a store-less hub reaches.
+fn hub_over(ops: &[Op]) -> Hub {
+    let mut hub = Hub::new(cid(SERVER));
+    hub.ingest(ROOM, ops.to_vec()).unwrap();
+    hub
+}
+
+#[test]
+fn a_compacted_hub_reloads_from_its_snapshot() {
+    let tmp = tempdir();
+    let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
+    let seq;
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        hub.ingest(ROOM, ops).unwrap();
+        hub.compact(ROOM).unwrap();
+        seq = hub.seq(ROOM);
+    }
+    // On disk: a snapshot, and the log prefix it covers is gone.
+    let rooms = Store::open(tmp.path()).unwrap().load().unwrap();
+    let (_, rl) = rooms.iter().find(|(room, _)| room == ROOM).unwrap();
+    assert!(rl.snapshot.is_some(), "compaction persisted a snapshot");
+    assert!(rl.ops.is_empty(), "the log prefix was truncated");
+
+    let reloaded = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(int(reloaded.get(ROOM, b"age")), 30);
+    assert_eq!(reloaded.seq(ROOM), seq);
+}
+
+#[test]
+fn a_reingested_op_after_a_compacted_restart_is_deduped() {
+    let tmp = tempdir();
+    let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        hub.ingest(ROOM, ops.clone()).unwrap();
+        hub.compact(ROOM).unwrap();
+    }
+    // The compacted op's id returns with the snapshot, so a resend is a no-op.
+    let mut hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    hub.attach_store(Store::open(tmp.path()).unwrap());
+    assert!(hub.ingest(ROOM, ops).unwrap().is_empty());
+    assert_eq!(hub.seq(ROOM), 1);
+    assert_eq!(int(hub.get(ROOM, b"age")), 30);
+}
+
+#[test]
+fn a_snapshot_and_a_tail_reload_together() {
+    let tmp = tempdir();
+    let mut a = doc(1);
+    let first = a.transact(|tx| tx.register(b"a", Scalar::Int(1)));
+    let second = a.transact(|tx| tx.register(b"b", Scalar::Int(2)));
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        hub.ingest(ROOM, first).unwrap();
+        hub.compact(ROOM).unwrap(); // snapshot at seq 1
+        hub.ingest(ROOM, second).unwrap(); // tail: seq 2
+    }
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(int(hub.get(ROOM, b"a")), 1);
+    assert_eq!(int(hub.get(ROOM, b"b")), 2);
+    assert_eq!(hub.seq(ROOM), 2);
+}
+
+#[test]
+fn a_snapshot_beside_a_full_log_reconstructs_correctly() {
+    // A crash after the snapshot is durable but before the log is truncated:
+    // snapshot at seq 2 sits beside the full log. Reconstruction dedups the
+    // overlap and lands on the same state and head as a clean reload.
+    let tmp = tempdir();
+    let mut a = doc(1);
+    let first = a.transact(|tx| tx.register(b"a", Scalar::Int(1)));
+    let second = a.transact(|tx| tx.register(b"b", Scalar::Int(2)));
+    let mut all = first.clone();
+    all.extend(second.clone());
+
+    {
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.append(ROOM, &first).unwrap();
+        store.append(ROOM, &second).unwrap();
+    }
+    // A snapshot of the state at seq 2, written beside the untruncated log.
+    let mut snap = Document::new(cid(SERVER));
+    for op in &all {
+        snap.apply(op);
+    }
+    write_snapshot(tmp.path(), ROOM, 2, &snap.encode_state());
+
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    let reference = hub_over(&all);
+    assert_eq!(int(hub.get(ROOM, b"a")), 1);
+    assert_eq!(int(hub.get(ROOM, b"b")), 2);
+    assert_eq!(hub.seq(ROOM), reference.seq(ROOM));
 }
 
 // --- a tempdir without pulling in a dev-dependency ---

@@ -80,7 +80,7 @@ fn populate_two(h: &mut Hub) -> u64 {
 fn compaction_preserves_the_high_water_sequence() {
     let mut h = hub();
     let seq = populate_two(&mut h);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
     // The log is gone, but no op's sequence changes: the head stays put.
     assert_eq!(h.seq(ROOM), seq);
 }
@@ -89,7 +89,7 @@ fn compaction_preserves_the_high_water_sequence() {
 fn compaction_keeps_the_merged_state() {
     let mut h = hub();
     populate_two(&mut h);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
     assert_eq!(int(h.get(ROOM, b"a")), 1);
     assert_eq!(int(h.get(ROOM, b"b")), 2);
 }
@@ -98,7 +98,7 @@ fn compaction_keeps_the_merged_state() {
 fn a_compacted_room_serves_a_below_floor_subscriber_a_snapshot() {
     let mut h = hub();
     let seq = populate_two(&mut h);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
     // A subscriber that saw nothing is below the floor: it gets the whole
     // current state as a snapshot, tagged with the head sequence, not ops.
     let (snap_seq, restored) = snapshot(h.catch_up(ROOM, 0));
@@ -111,7 +111,7 @@ fn a_compacted_room_serves_a_below_floor_subscriber_a_snapshot() {
 fn a_subscriber_at_the_floor_gets_no_ops() {
     let mut h = hub();
     let seq = populate_two(&mut h);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
     // Exactly at the head: nothing to send.
     assert!(ops(h.catch_up(ROOM, seq)).is_empty());
 }
@@ -122,7 +122,7 @@ fn a_subscriber_at_the_floor_gets_no_ops() {
 fn ops_after_compaction_are_a_delta_for_a_current_subscriber() {
     let mut h = hub();
     let floor = populate_two(&mut h);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
 
     let mut c = doc(3);
     let later = ingest(
@@ -140,7 +140,7 @@ fn ops_after_compaction_are_a_delta_for_a_current_subscriber() {
 fn a_below_floor_snapshot_includes_ops_applied_after_compaction() {
     let mut h = hub();
     populate_two(&mut h);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
     let mut c = doc(3);
     ingest(
         &mut h,
@@ -165,7 +165,7 @@ fn dedup_survives_compaction() {
     let first = a.transact(|tx| tx.register(b"a", Scalar::Int(1)));
     ingest(&mut h, ROOM, first.clone());
     let seq = h.seq(ROOM);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
     // Replaying a compacted op must not re-apply or grow the log.
     assert!(ingest(&mut h, ROOM, first).is_empty());
     assert_eq!(h.seq(ROOM), seq);
@@ -178,8 +178,8 @@ fn dedup_survives_compaction() {
 fn compacting_twice_is_stable() {
     let mut h = hub();
     let seq = populate_two(&mut h);
-    h.compact(ROOM);
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
+    h.compact(ROOM).unwrap();
     assert_eq!(h.seq(ROOM), seq);
     let (snap_seq, restored) = snapshot(h.catch_up(ROOM, 0));
     assert_eq!(snap_seq, seq);
@@ -189,7 +189,7 @@ fn compacting_twice_is_stable() {
 #[test]
 fn compacting_an_unknown_room_is_a_no_op() {
     let mut h = hub();
-    h.compact(b"nope");
+    h.compact(b"nope").unwrap();
     assert_eq!(h.seq(b"nope"), 0);
 }
 
@@ -219,7 +219,7 @@ fn a_snapshot_round_trips_a_nested_document() {
             tx.text(b"txt").insert(0, "hi");
         }),
     );
-    h.compact(ROOM);
+    h.compact(ROOM).unwrap();
 
     let (_, restored) = snapshot(h.catch_up(ROOM, 0));
     assert_eq!(int(restored.get(b"reg")), 7);
