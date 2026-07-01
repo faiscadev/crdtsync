@@ -88,8 +88,10 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
             let Some(room) = session.room.as_deref() else {
                 return violation("ops before subscribe");
             };
-            // Every op must be stamped by the connection's established client;
-            // the server never lets a client assert another's identity.
+            // Every op must carry the client declared at Hello, so a
+            // connection's ops stay self-consistent. Authenticating that the
+            // client is who it claims is the transport's credential check;
+            // this driver only enforces consistency.
             if ops.iter().any(|op| op.id.client != client) {
                 return violation("op client mismatch");
             }
