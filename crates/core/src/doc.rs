@@ -89,6 +89,11 @@ impl Document {
     /// Fold a foreign op into local state. Returns `false` if the op was
     /// already applied (deduped on its id).
     pub fn apply(&mut self, op: &Op) -> bool {
+        if op.target != self.root_id() {
+            // Only the root map is addressable at this scope; an op naming any
+            // other parent is not applied here.
+            return false;
+        }
         if !self.seen.insert(op.id) {
             return false;
         }
@@ -138,18 +143,21 @@ impl Document {
                     let prior = m.get(key);
                     let r = m.register(key, value.clone(), stamp);
                     r.borrow_mut().set(value.clone(), stamp);
+                    m.set(key, Element::Register(Rc::clone(&r)), stamp);
                     displaced(prior)
                 }
                 OpKind::CounterInc { key, amount } => {
                     let prior = m.get(key);
                     let c = m.counter(key, stamp);
                     c.borrow_mut().inc(author, *amount);
+                    m.set(key, Element::Counter(Rc::clone(&c)), stamp);
                     displaced(prior)
                 }
                 OpKind::CounterDec { key, amount } => {
                     let prior = m.get(key);
                     let c = m.counter(key, stamp);
                     c.borrow_mut().dec(author, *amount);
+                    m.set(key, Element::Counter(Rc::clone(&c)), stamp);
                     displaced(prior)
                 }
             }

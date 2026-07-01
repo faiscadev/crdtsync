@@ -10,11 +10,11 @@
 //! id), so no separate "create element" op is needed.
 
 use crdtsync_core::doc::Document;
-use crdtsync_core::op::OpKind;
+use crdtsync_core::op::{Op, OpId, OpKind};
 use crdtsync_core::{Element, Scalar};
 
 mod common;
-use common::cid;
+use common::{cid, eid, stmp};
 
 fn doc(client_first: u8) -> Document {
     Document::new(cid(client_first))
@@ -242,4 +242,56 @@ fn plain_scalar_overwrite_does_not_orphan() {
     d.transact(|tx| tx.set(b"k", Scalar::Int(1)));
     d.transact(|tx| tx.set(b"k", Scalar::Int(2)));
     assert!(d.take_orphans().is_empty());
+}
+
+// --- slot stamp tracks composite child ops ---
+
+#[test]
+fn composite_update_survives_a_stale_concurrent_scalar_set() {
+    // A register updated at a high stamp must not be displaced by a concurrent
+    // scalar set carrying a lower stamp — the child op has to advance the
+    // parent slot stamp, or the two replicas diverge.
+    let mut a = doc(1);
+    let mut b = doc(2);
+
+    let create = a.transact(|tx| tx.register(b"slot", Scalar::Int(1)));
+    replay(&mut b, &create);
+
+    let scalar = b.transact(|tx| tx.set(b"slot", Scalar::Bool(true)));
+
+    // Push a's clock ahead so its register update outranks b's scalar set.
+    a.transact(|tx| {
+        tx.set(b"pad", Scalar::Int(0));
+        tx.set(b"pad", Scalar::Int(0));
+        tx.set(b"pad", Scalar::Int(0));
+    });
+    let update = a.transact(|tx| tx.register(b"slot", Scalar::Int(2)));
+    assert!(update[0].stamp > scalar[0].stamp);
+
+    replay(&mut a, &scalar); // a: local update then stale remote scalar
+    replay(&mut b, &update); // b: remote update over local scalar
+
+    assert_eq!(int(a.get(b"slot")), 2);
+    assert_eq!(int(b.get(b"slot")), int(a.get(b"slot")));
+}
+
+#[test]
+fn apply_ignores_ops_for_a_foreign_target() {
+    // An op naming a parent that isn't this replica's root must not leak into
+    // the root map.
+    let foreign = Op::new(
+        OpId {
+            client: cid(9),
+            seq: 0,
+        },
+        stmp(1, 9),
+        eid(0xAB, 0),
+        OpKind::MapSet {
+            key: b"k".to_vec(),
+            value: Scalar::Int(99),
+        },
+    );
+    let mut d = doc(1);
+    assert!(!d.apply(&foreign));
+    assert!(d.get(b"k").is_none());
 }
