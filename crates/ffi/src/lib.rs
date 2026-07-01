@@ -246,19 +246,185 @@ pub unsafe extern "C" fn crdtsync_doc_get_bytes(
     path_len: usize,
     out: *mut CrdtBuf,
 ) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if doc.is_null() || out.is_null() {
-            return -1;
-        }
-        match slot(&*doc, path, path_len) {
-            Some(Element::Scalar(Scalar::Bytes(b))) => {
-                *out = CrdtBuf::from_vec(b);
-                1
-            }
-            _ => 0,
-        }
-    }))
-    .unwrap_or(-1)
+    read_buf(doc, path, path_len, out, |e| match e {
+        Element::Scalar(Scalar::Bytes(b)) => Some(b.clone()),
+        _ => None,
+    })
+}
+
+/// Insert a bytes item into the List at a path, at live `index`. Returns the ops
+/// to broadcast.
+///
+/// # Safety
+/// `doc` is a live handle; `path`/`path_len` and `value`/`value_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_list_insert(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    value: *const u8,
+    value_len: usize,
+) -> CrdtBuf {
+    let Some(val) = as_slice(value, value_len) else {
+        return CrdtBuf::empty();
+    };
+    let val = val.to_vec();
+    emit(doc, path, path_len, move |cur, key| {
+        cur.list(key).insert(index, Scalar::Bytes(val))
+    })
+}
+
+/// Tombstone the live item at `index` in the List at a path.
+///
+/// # Safety
+/// As [`crdtsync_doc_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_list_delete(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+) -> CrdtBuf {
+    // A delete that targets no live item must not create or re-stamp a list.
+    if !slot_ok(
+        doc,
+        path,
+        path_len,
+        |e| matches!(e, Element::List(l) if index < l.borrow().len()),
+    ) {
+        return CrdtBuf::empty();
+    }
+    emit(doc, path, path_len, move |cur, key| {
+        cur.list(key).delete(index)
+    })
+}
+
+/// Read the live length of the List at a path into `out`. Returns 1/0/-1.
+///
+/// # Safety
+/// As [`crdtsync_doc_get_int`], with `out` a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_list_len(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    out: *mut usize,
+) -> i32 {
+    read_usize(doc, path, path_len, out, |e| match e {
+        Element::List(l) => Some(l.borrow().len()),
+        _ => None,
+    })
+}
+
+/// Read the bytes item at live `index` in the List at a path into `out`. Returns
+/// 1 when present and a bytes item, 0 otherwise, -1 on a bad handle.
+///
+/// # Safety
+/// As [`crdtsync_doc_get_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_list_get(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    read_buf(doc, path, path_len, out, |e| match e {
+        Element::List(l) => match l.borrow().get(index) {
+            Some(Element::Scalar(Scalar::Bytes(b))) => Some(b),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Insert UTF-8 `text` into the Text at a path, at codepoint `index`. Returns the
+/// ops to broadcast; empty on a bad handle/path or non-UTF-8 input.
+///
+/// # Safety
+/// `doc` is a live handle; `path`/`path_len` and `text`/`text_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_text_insert(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    text: *const u8,
+    text_len: usize,
+) -> CrdtBuf {
+    let Some(raw) = as_slice(text, text_len) else {
+        return CrdtBuf::empty();
+    };
+    let Ok(s) = std::str::from_utf8(raw) else {
+        return CrdtBuf::empty();
+    };
+    let s = s.to_owned();
+    emit(doc, path, path_len, move |cur, key| {
+        cur.text(key).insert(index, &s)
+    })
+}
+
+/// Tombstone `count` codepoints from codepoint `index` in the Text at a path.
+///
+/// # Safety
+/// As [`crdtsync_doc_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_text_delete(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    count: usize,
+) -> CrdtBuf {
+    // A delete that removes no codepoint must not create or re-stamp a text.
+    if !slot_ok(
+        doc,
+        path,
+        path_len,
+        |e| matches!(e, Element::Text(t) if count > 0 && index < t.borrow().len()),
+    ) {
+        return CrdtBuf::empty();
+    }
+    emit(doc, path, path_len, move |cur, key| {
+        cur.text(key).delete(index, count)
+    })
+}
+
+/// Read the codepoint length of the Text at a path into `out`. Returns 1/0/-1.
+///
+/// # Safety
+/// As [`crdtsync_doc_list_len`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_text_len(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    out: *mut usize,
+) -> i32 {
+    read_usize(doc, path, path_len, out, |e| match e {
+        Element::Text(t) => Some(t.borrow().len()),
+        _ => None,
+    })
+}
+
+/// Read the Text at a path into `out` as UTF-8 bytes. Returns 1/0/-1.
+///
+/// # Safety
+/// As [`crdtsync_doc_get_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_text_get(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    read_buf(doc, path, path_len, out, |e| match e {
+        Element::Text(t) => Some(t.borrow().as_string().into_bytes()),
+        _ => None,
+    })
 }
 
 /// Fold an encoded op log (as returned by an edit) from a peer into the
@@ -356,6 +522,77 @@ where
         }
     }))
     .unwrap_or(-1)
+}
+
+/// Read the `usize`-valued property of the slot at a path through `pick`.
+unsafe fn read_usize<F>(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    out: *mut usize,
+    pick: F,
+) -> i32
+where
+    F: FnOnce(&Element) -> Option<usize>,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() || out.is_null() {
+            return -1;
+        }
+        match slot(&*doc, path, path_len).as_ref().and_then(pick) {
+            Some(n) => {
+                *out = n;
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Read the byte payload of the slot at a path through `pick` into a fresh
+/// buffer the caller frees.
+unsafe fn read_buf<F>(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+    pick: F,
+) -> i32
+where
+    F: FnOnce(&Element) -> Option<Vec<u8>>,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() || out.is_null() {
+            return -1;
+        }
+        match slot(&*doc, path, path_len).as_ref().and_then(pick) {
+            Some(b) => {
+                *out = CrdtBuf::from_vec(b);
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Whether the element at a path satisfies `ok`. False on a bad handle or an
+/// unresolved path — used to keep a no-op delete from materialising a container.
+unsafe fn slot_ok<F>(doc: *const CrdtDoc, path: *const u8, path_len: usize, ok: F) -> bool
+where
+    F: FnOnce(&Element) -> bool,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return false;
+        }
+        slot(&*doc, path, path_len)
+            .as_ref()
+            .map(ok)
+            .unwrap_or(false)
+    }))
+    .unwrap_or(false)
 }
 
 /// The live element at a path, if the whole path resolves.
