@@ -7,6 +7,7 @@
 //! beyond codepoint identity (normalization and grapheme segmentation are SDK
 //! concerns).
 
+use crate::codec::{Cursor, DecodeError};
 use crate::element::Element;
 use crate::elementid::ElementId;
 use crate::list::{Anchor, List, Side};
@@ -26,6 +27,30 @@ impl Text {
 
     pub fn id(&self) -> ElementId {
         self.inner.id()
+    }
+
+    /// Append this text's state to `out` — the same sequence encoding as List.
+    pub(crate) fn encode_state_into(&self, out: &mut Vec<u8>) {
+        self.inner.encode_state_into(out);
+    }
+
+    /// Read a text from `cur`, advancing it.
+    pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<Text, DecodeError> {
+        Ok(Text {
+            inner: List::decode_state_from(cur)?,
+        })
+    }
+
+    /// Serialize this text's state to self-contained bytes.
+    pub fn encode_state(&self) -> Vec<u8> {
+        self.inner.encode_state()
+    }
+
+    /// Read a text from a complete byte slice, rejecting trailing bytes.
+    pub fn decode_state(bytes: &[u8]) -> Result<Text, DecodeError> {
+        Ok(Text {
+            inner: List::decode_state(bytes)?,
+        })
     }
 
     /// Number of live codepoints.
