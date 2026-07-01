@@ -13,11 +13,14 @@
 //! converges.
 
 use crate::clientid::ClientId;
+use crate::codec::{
+    decode_ops, encode_ops, len_u32, put_u32, put_u64, put_u8, Cursor, DecodeError,
+};
 use crate::counter::Counter;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
 use crate::list::List;
-use crate::map::Map;
+use crate::map::{DecodedMap, Map, SlotValue};
 use crate::op::{Op, OpId, OpKind};
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
@@ -29,6 +32,10 @@ use std::rc::Rc;
 /// The well-known root slot every replica shares, so children derive under the
 /// same parent.
 const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
+
+/// The snapshot format version, bumped when the encoding changes so an old
+/// reader rejects a newer stream rather than misreading it.
+const STATE_VERSION: u8 = 1;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +129,207 @@ impl Document {
     /// Drain the orphan events accumulated since the last call.
     pub fn take_orphans(&mut self) -> Vec<OrphanEvent> {
         std::mem::take(&mut self.orphans)
+    }
+
+    /// Serialize the whole replica to a self-contained, canonical snapshot:
+    /// every container in the by-id registries, the parent links, the LWW
+    /// stamps, the dedup set, and any buffered ops. Equal states encode to
+    /// identical bytes, so a re-encode of a decoded snapshot is byte-stable.
+    pub fn encode_state(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, STATE_VERSION);
+        out.extend_from_slice(&self.client.as_bytes());
+        put_u64(&mut out, self.lamport);
+        put_u64(&mut out, self.seq);
+
+        encode_registry(&mut out, &self.counters, |c, o| {
+            c.borrow().encode_state_into(o)
+        });
+        encode_registry(&mut out, &self.lists, |l, o| {
+            l.borrow().encode_state_into(o)
+        });
+        encode_registry(&mut out, &self.texts, |t, o| {
+            t.borrow().encode_state_into(o)
+        });
+        encode_registry(&mut out, &self.maps, |m, o| m.borrow().encode_state_into(o));
+
+        let mut parents: Vec<(&ElementId, &ElementId)> = self.parents.iter().collect();
+        parents.sort_by_key(|(child, _)| child.as_bytes());
+        put_u32(&mut out, len_u32(parents.len()));
+        for (child, parent) in parents {
+            out.extend_from_slice(&child.as_bytes());
+            out.extend_from_slice(&parent.as_bytes());
+        }
+
+        let mut seen: Vec<&OpId> = self.seen.iter().collect();
+        seen.sort_by_key(|op| (op.client.as_bytes(), op.seq));
+        put_u32(&mut out, len_u32(seen.len()));
+        for op in seen {
+            out.extend_from_slice(&op.client.as_bytes());
+            put_u64(&mut out, op.seq);
+        }
+
+        // The buffer is a framed op log, itself length-prefixed so the reader
+        // knows where it ends inside the document stream.
+        let framed = encode_ops(&self.buffer);
+        put_u32(&mut out, len_u32(framed.len()));
+        out.extend_from_slice(&framed);
+        out
+    }
+
+    /// Rebuild a replica from a snapshot, rejecting trailing bytes.
+    pub fn decode_state(bytes: &[u8]) -> Result<Document, DecodeError> {
+        let mut cur = Cursor::new(bytes);
+        let doc = Document::read_state(&mut cur)?;
+        if cur.at_end() {
+            Ok(doc)
+        } else {
+            Err(DecodeError::TrailingBytes)
+        }
+    }
+
+    fn read_state(cur: &mut Cursor) -> Result<Document, DecodeError> {
+        let version = cur.u8()?;
+        if version != STATE_VERSION {
+            return Err(DecodeError::BadTag {
+                what: "document state version",
+                tag: version,
+            });
+        }
+        let client = cur.client()?;
+        let lamport = cur.u64()?;
+        let seq = cur.u64()?;
+
+        let counters = decode_registry(cur, |c| Counter::decode_state_from(c), |c| c.id())?;
+        let lists = decode_registry(cur, |c| List::decode_state_from(c), |l| l.id())?;
+        let texts = decode_registry(cur, |c| Text::decode_state_from(c), |t| t.id())?;
+
+        // Maps decode in two phases: read each map as an id plus unresolved
+        // slots, building an empty shell per id first, so a slot referencing
+        // another map resolves against a shell that already exists.
+        let map_count = cur.u32()?;
+        let cap = (map_count as usize).min(1024);
+        let mut decoded: Vec<DecodedMap> = Vec::with_capacity(cap);
+        let mut maps: HashMap<ElementId, Rc<RefCell<Map>>> = HashMap::with_capacity(cap);
+        for _ in 0..map_count {
+            let dm = Map::decode_state_from(cur)?;
+            if maps
+                .insert(dm.id, Rc::new(RefCell::new(Map::new(dm.id))))
+                .is_some()
+            {
+                return Err(DecodeError::BadTag {
+                    what: "document: duplicate map id",
+                    tag: 0,
+                });
+            }
+            decoded.push(dm);
+        }
+
+        // Resolve each slot: leaves inline, composites cloned from the matching
+        // registry handle by id, so the whole tree shares the registry Rcs.
+        for dm in decoded {
+            let shell = Rc::clone(&maps[&dm.id]);
+            let mut m = shell.borrow_mut();
+            for slot in dm.slots {
+                let value = match slot.value {
+                    None => None,
+                    Some(SlotValue::Scalar(s)) => Some(Element::Scalar(s)),
+                    Some(SlotValue::Register(r)) => {
+                        Some(Element::Register(Rc::new(RefCell::new(r))))
+                    }
+                    Some(SlotValue::Ref(kind, id)) => {
+                        Some(resolve_ref(kind, id, &counters, &lists, &texts, &maps)?)
+                    }
+                };
+                if m.insert_decoded(slot.key, slot.stamp, value, slot.tombstone) {
+                    return Err(DecodeError::BadTag {
+                        what: "document: duplicate map slot",
+                        tag: 0,
+                    });
+                }
+            }
+        }
+
+        let parent_count = cur.u32()?;
+        let mut parents = HashMap::with_capacity((parent_count as usize).min(1024));
+        for _ in 0..parent_count {
+            let child = cur.element_id()?;
+            let parent = cur.element_id()?;
+            if parents.insert(child, parent).is_some() {
+                return Err(DecodeError::BadTag {
+                    what: "document: duplicate parent link",
+                    tag: 0,
+                });
+            }
+        }
+
+        let root_id = ElementId::from_bytes(ROOT_ID);
+        // Following parents must terminate: a cycle would hang `resolvable` on a
+        // later op. Memoize chains already proven to terminate so the walk stays
+        // linear over an untrusted graph.
+        reject_parent_cycles(&parents, root_id)?;
+
+        let seen_count = cur.u32()?;
+        let mut seen = HashSet::with_capacity((seen_count as usize).min(1024));
+        for _ in 0..seen_count {
+            let op = OpId {
+                client: cur.client()?,
+                seq: cur.u64()?,
+            };
+            if !seen.insert(op) {
+                return Err(DecodeError::BadTag {
+                    what: "document: duplicate seen op",
+                    tag: 0,
+                });
+            }
+        }
+
+        let buf_len = cur.u32()? as usize;
+        let framed = cur.take(buf_len)?;
+        let buffer = decode_ops(framed)?;
+        // A buffered op that is already applied, or repeated, would be replayed
+        // by `drain_buffer` (which applies unconditionally): reject both.
+        let mut buffered = HashSet::with_capacity(buffer.len().min(1024));
+        for op in &buffer {
+            if seen.contains(&op.id) || !buffered.insert(op.id) {
+                return Err(DecodeError::BadTag {
+                    what: "document: buffered op already applied or repeated",
+                    tag: 0,
+                });
+            }
+        }
+
+        let root = maps.get(&root_id).cloned().ok_or(DecodeError::BadTag {
+            what: "document: missing root map",
+            tag: 0,
+        })?;
+
+        // Displacement isn't stored: a registered container is installed iff a
+        // live slot still holds its handle, so mark every other one displaced.
+        mark_displaced(&maps, &lists, &texts, &counters, root_id);
+
+        let mut doc = Document {
+            client,
+            root,
+            maps,
+            lists,
+            texts,
+            counters,
+            parents,
+            lamport,
+            seq,
+            seen,
+            buffer,
+            buffered,
+            orphans: Vec::new(),
+            pending: Vec::new(),
+        };
+        // The buffer holds only ops still waiting on their target; a well-formed
+        // snapshot already satisfies that, so this is a no-op there. Draining
+        // restores the invariant for any op decoded as already reachable rather
+        // than leaving it stuck until an unrelated mutation.
+        doc.drain_buffer();
+        Ok(doc)
     }
 
     /// Gather local edits into ops, applying each as it is emitted.
@@ -536,6 +744,144 @@ fn displaced(prior: Option<Element>) -> Option<OrphanEvent> {
             Some(OrphanEvent { id: e.id() })
         }
         _ => None,
+    }
+}
+
+/// Encode a container registry: a count followed by each container, ordered by
+/// id so equal states encode identically.
+fn encode_registry<T>(
+    out: &mut Vec<u8>,
+    reg: &HashMap<ElementId, Rc<RefCell<T>>>,
+    encode: impl Fn(&Rc<RefCell<T>>, &mut Vec<u8>),
+) {
+    let mut items: Vec<(&ElementId, &Rc<RefCell<T>>)> = reg.iter().collect();
+    items.sort_by_key(|(id, _)| id.as_bytes());
+    put_u32(out, len_u32(items.len()));
+    for (_, item) in items {
+        encode(item, out);
+    }
+}
+
+/// Decode a container registry into handles keyed by id, rejecting a repeated
+/// id as non-canonical.
+fn decode_registry<T>(
+    cur: &mut Cursor,
+    decode: impl Fn(&mut Cursor) -> Result<T, DecodeError>,
+    id_of: impl Fn(&T) -> ElementId,
+) -> Result<HashMap<ElementId, Rc<RefCell<T>>>, DecodeError> {
+    let count = cur.u32()?;
+    let mut reg = HashMap::with_capacity((count as usize).min(1024));
+    for _ in 0..count {
+        let item = decode(cur)?;
+        let id = id_of(&item);
+        if reg.insert(id, Rc::new(RefCell::new(item))).is_some() {
+            return Err(DecodeError::BadTag {
+                what: "document: duplicate registry id",
+                tag: 0,
+            });
+        }
+    }
+    Ok(reg)
+}
+
+/// Reject a decoded parent graph that doesn't terminate: every chain of parent
+/// links must reach the root (or a container with no recorded parent) without
+/// revisiting a node. A cycle would spin `resolvable` forever on a later op.
+fn reject_parent_cycles(
+    parents: &HashMap<ElementId, ElementId>,
+    root_id: ElementId,
+) -> Result<(), DecodeError> {
+    let mut terminates: HashSet<ElementId> = HashSet::new();
+    terminates.insert(root_id);
+    for &start in parents.keys() {
+        if terminates.contains(&start) {
+            continue;
+        }
+        let mut chain: HashSet<ElementId> = HashSet::new();
+        let mut cur = start;
+        let ends = loop {
+            if terminates.contains(&cur) {
+                break true;
+            }
+            if !chain.insert(cur) {
+                break false;
+            }
+            match parents.get(&cur) {
+                Some(&parent) => cur = parent,
+                None => break true,
+            }
+        };
+        if !ends {
+            return Err(DecodeError::BadTag {
+                what: "document: parent cycle",
+                tag: 0,
+            });
+        }
+        terminates.extend(chain);
+    }
+    Ok(())
+}
+
+/// Resolve a decoded slot reference to the registered handle it names.
+fn resolve_ref(
+    kind: ElementKind,
+    id: ElementId,
+    counters: &HashMap<ElementId, Rc<RefCell<Counter>>>,
+    lists: &HashMap<ElementId, Rc<RefCell<List>>>,
+    texts: &HashMap<ElementId, Rc<RefCell<Text>>>,
+    maps: &HashMap<ElementId, Rc<RefCell<Map>>>,
+) -> Result<Element, DecodeError> {
+    let element = match kind {
+        ElementKind::Counter => counters.get(&id).map(|c| Element::Counter(Rc::clone(c))),
+        ElementKind::List => lists.get(&id).map(|l| Element::List(Rc::clone(l))),
+        ElementKind::Text => texts.get(&id).map(|t| Element::Text(Rc::clone(t))),
+        ElementKind::Map => maps.get(&id).map(|m| Element::Map(Rc::clone(m))),
+        ElementKind::Scalar | ElementKind::Register => None,
+    };
+    element.ok_or(DecodeError::BadTag {
+        what: "document: dangling slot reference",
+        tag: 0,
+    })
+}
+
+/// Restore displacement flags a snapshot doesn't store: a registered container
+/// is installed iff a live slot still holds it; every other one lost its slot
+/// and decodes displaced, so reachability and op emission stay correct.
+fn mark_displaced(
+    maps: &HashMap<ElementId, Rc<RefCell<Map>>>,
+    lists: &HashMap<ElementId, Rc<RefCell<List>>>,
+    texts: &HashMap<ElementId, Rc<RefCell<Text>>>,
+    counters: &HashMap<ElementId, Rc<RefCell<Counter>>>,
+    root_id: ElementId,
+) {
+    let mut installed: HashSet<ElementId> = HashSet::new();
+    installed.insert(root_id);
+    for m in maps.values() {
+        for value in m.borrow().live_values() {
+            if value.kind() != ElementKind::Scalar {
+                installed.insert(value.id());
+            }
+        }
+    }
+    for (id, c) in counters {
+        if !installed.contains(id) {
+            c.borrow().displace();
+        }
+    }
+    for (id, l) in lists {
+        if !installed.contains(id) {
+            l.borrow().displace();
+        }
+    }
+    for (id, t) in texts {
+        if !installed.contains(id) {
+            t.borrow().displace();
+        }
+    }
+    for (id, m) in maps {
+        if *id != root_id && !installed.contains(id) {
+            m.borrow().displace();
+        }
     }
 }
 

@@ -5,6 +5,7 @@
 //! displaces the loser. `get` and the installing helper path return a slot
 //! handle; the helper's losing path returns a detached, displaced one.
 
+use crate::codec::{len_u32, put_bytes, put_stamp, put_u32, put_u8, Cursor, DecodeError};
 use crate::counter::Counter;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
@@ -16,6 +17,44 @@ use crate::text::Text;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// Slot-value tags in a map snapshot. Leaves (scalar, register) are inline; a
+/// composite is a kind-tagged reference to its child's id, resolved from the
+/// document registry on decode.
+const SLOT_SCALAR: u8 = 0;
+const SLOT_REGISTER: u8 = 1;
+const SLOT_COUNTER: u8 = 2;
+const SLOT_MAP: u8 = 3;
+const SLOT_LIST: u8 = 4;
+const SLOT_TEXT: u8 = 5;
+
+/// A map read from a snapshot: its id and slots, with composite children still
+/// unresolved references into the document's by-id registries.
+pub(crate) struct DecodedMap {
+    pub(crate) id: ElementId,
+    pub(crate) slots: Vec<DecodedSlot>,
+}
+
+/// One decoded slot before its composite reference is wired to a handle.
+pub(crate) struct DecodedSlot {
+    pub(crate) key: Vec<u8>,
+    pub(crate) stamp: Stamp,
+    pub(crate) tombstone: bool,
+    pub(crate) value: Option<SlotValue>,
+}
+
+/// A decoded slot value: a leaf is self-contained; a composite is a kind-tagged
+/// reference resolved from the document's by-id registry.
+pub(crate) enum SlotValue {
+    Scalar(Scalar),
+    Register(Register),
+    Ref(ElementKind, ElementId),
+}
+
+fn put_ref(out: &mut Vec<u8>, tag: u8, id: ElementId) {
+    put_u8(out, tag);
+    out.extend_from_slice(&id.as_bytes());
+}
 
 struct Entry {
     stamp: Stamp,
@@ -65,6 +104,116 @@ impl Map {
 
     pub fn id(&self) -> ElementId {
         self.id
+    }
+
+    /// Append this map's state — id and every slot, live or tombstoned — to
+    /// `out`. Slots are ordered by key so equal states encode identically. A
+    /// composite slot stores a kind-tagged reference to its child's id for the
+    /// document registry to resolve; a scalar or register is inline.
+    pub(crate) fn encode_state_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.id.as_bytes());
+        let mut slots: Vec<(&Vec<u8>, &Entry)> = self.slots.iter().collect();
+        slots.sort_by(|a, b| a.0.cmp(b.0));
+        put_u32(out, len_u32(slots.len()));
+        for (key, entry) in slots {
+            put_bytes(out, key);
+            put_stamp(out, &entry.stamp);
+            put_u8(out, entry.tombstone as u8);
+            if entry.tombstone {
+                continue;
+            }
+            match entry.value.as_ref().expect("a live slot holds a value") {
+                Element::Scalar(s) => {
+                    put_u8(out, SLOT_SCALAR);
+                    s.encode_state_into(out);
+                }
+                Element::Register(r) => {
+                    put_u8(out, SLOT_REGISTER);
+                    r.borrow().encode_state_into(out);
+                }
+                Element::Counter(c) => put_ref(out, SLOT_COUNTER, c.borrow().id()),
+                Element::Map(m) => put_ref(out, SLOT_MAP, m.borrow().id()),
+                Element::List(l) => put_ref(out, SLOT_LIST, l.borrow().id()),
+                Element::Text(t) => put_ref(out, SLOT_TEXT, t.borrow().id()),
+            }
+        }
+    }
+
+    /// Read a map's id and slots from `cur`, advancing it. Composite slots come
+    /// back as unresolved references for the document to wire against its
+    /// registries once every container is materialised.
+    pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<DecodedMap, DecodeError> {
+        let id = cur.element_id()?;
+        let count = cur.u32()?;
+        let mut slots = Vec::with_capacity((count as usize).min(1024));
+        for _ in 0..count {
+            let key = cur.bytes()?;
+            let stamp = cur.stamp()?;
+            let tombstone = match cur.u8()? {
+                0 => false,
+                1 => true,
+                tag => {
+                    return Err(DecodeError::BadTag {
+                        what: "map slot tombstone",
+                        tag,
+                    })
+                }
+            };
+            let value = if tombstone {
+                None
+            } else {
+                Some(match cur.u8()? {
+                    SLOT_SCALAR => SlotValue::Scalar(Scalar::decode_state_from(cur)?),
+                    SLOT_REGISTER => SlotValue::Register(Register::decode_state_from(cur)?),
+                    SLOT_COUNTER => SlotValue::Ref(ElementKind::Counter, cur.element_id()?),
+                    SLOT_MAP => SlotValue::Ref(ElementKind::Map, cur.element_id()?),
+                    SLOT_LIST => SlotValue::Ref(ElementKind::List, cur.element_id()?),
+                    SLOT_TEXT => SlotValue::Ref(ElementKind::Text, cur.element_id()?),
+                    tag => {
+                        return Err(DecodeError::BadTag {
+                            what: "map slot value",
+                            tag,
+                        })
+                    }
+                })
+            };
+            slots.push(DecodedSlot {
+                key,
+                stamp,
+                tombstone,
+                value,
+            });
+        }
+        Ok(DecodedMap { id, slots })
+    }
+
+    /// Install a slot decoded from a snapshot, reporting whether it displaced a
+    /// prior entry — a repeated key in the stream is non-canonical.
+    pub(crate) fn insert_decoded(
+        &mut self,
+        key: Vec<u8>,
+        stamp: Stamp,
+        value: Option<Element>,
+        tombstone: bool,
+    ) -> bool {
+        self.slots
+            .insert(
+                key,
+                Entry {
+                    stamp,
+                    value,
+                    tombstone,
+                },
+            )
+            .is_some()
+    }
+
+    /// The live slot values, for recomputing displacement after a decode.
+    pub(crate) fn live_values(&self) -> impl Iterator<Item = Element> + '_ {
+        self.slots
+            .values()
+            .filter(|e| !e.tombstone)
+            .filter_map(|e| e.value.clone())
     }
 
     pub fn size(&self) -> usize {
