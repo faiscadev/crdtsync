@@ -16,6 +16,7 @@ use crate::map::Map;
 use crate::op::{Op, OpId, OpKind};
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
+use crate::text::Text;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -37,6 +38,8 @@ pub struct Document {
     maps: HashMap<ElementId, Rc<RefCell<Map>>>,
     /// Every list in the tree, keyed by id, for resolving a sequence op.
     lists: HashMap<ElementId, Rc<RefCell<List>>>,
+    /// Every text in the tree, keyed by id, for resolving a text op.
+    texts: HashMap<ElementId, Rc<RefCell<Text>>>,
     lamport: u64,
     seq: u64,
     seen: HashSet<OpId>,
@@ -55,6 +58,7 @@ impl Document {
             root,
             maps,
             lists: HashMap::new(),
+            texts: HashMap::new(),
             lamport: 0,
             seq: 0,
             seen: HashSet::new(),
@@ -114,8 +118,11 @@ impl Document {
         if !self.seen.insert(op.id) {
             return false;
         }
-        if op.stamp.lamport > self.lamport {
-            self.lamport = op.stamp.lamport;
+        // A text run occupies one char_id per codepoint from the op's stamp;
+        // the clock must clear the last of them, not just the base.
+        let last = op.stamp.lamport.saturating_add(span(&op.kind) - 1);
+        if last > self.lamport {
+            self.lamport = last;
         }
         self.apply_kind(op.target, &op.kind, op.stamp, op.id.client);
         true
@@ -129,6 +136,8 @@ impl Document {
             lamport: self.lamport,
             client: self.client,
         };
+        // Reserve the rest of a run's char_ids so the next op sorts after it.
+        self.lamport += span(&kind) - 1;
         let id = OpId {
             client: self.client,
             seq: self.seq,
@@ -150,6 +159,10 @@ impl Document {
                 .lists
                 .get(&target)
                 .is_some_and(|l| !l.borrow().is_displaced())
+            || self
+                .texts
+                .get(&target)
+                .is_some_and(|t| !t.borrow().is_displaced())
     }
 
     /// A live list handle for `target`, if any.
@@ -157,6 +170,14 @@ impl Document {
         self.lists
             .get(&target)
             .filter(|l| !l.borrow().is_displaced())
+            .cloned()
+    }
+
+    /// A live text handle for `target`, if any.
+    fn live_text(&self, target: ElementId) -> Option<Rc<RefCell<Text>>> {
+        self.texts
+            .get(&target)
+            .filter(|t| !t.borrow().is_displaced())
             .cloned()
     }
 
@@ -178,6 +199,18 @@ impl Document {
                 }
                 return;
             }
+            OpKind::TextInsert { s, anchor } => {
+                if let Some(text) = self.live_text(target) {
+                    text.borrow_mut().insert_run(stamp, s, *anchor);
+                }
+                return;
+            }
+            OpKind::TextDelete { ids } => {
+                if let Some(text) = self.live_text(target) {
+                    text.borrow_mut().delete_ids(ids);
+                }
+                return;
+            }
             _ => {}
         }
 
@@ -190,6 +223,7 @@ impl Document {
         }
         let mut new_map: Option<Rc<RefCell<Map>>> = None;
         let mut new_list: Option<Rc<RefCell<List>>> = None;
+        let mut new_text: Option<Rc<RefCell<Text>>> = None;
         let orphan = {
             let mut m = map.borrow_mut();
             match kind {
@@ -212,6 +246,15 @@ impl Document {
                     m.set(key, Element::List(Rc::clone(&child)), stamp);
                     if !child.borrow().is_displaced() {
                         new_list = Some(Rc::clone(&child));
+                    }
+                    displaced(prior)
+                }
+                OpKind::TextCreate { key } => {
+                    let prior = m.get(key);
+                    let child = m.text(key, stamp);
+                    m.set(key, Element::Text(Rc::clone(&child)), stamp);
+                    if !child.borrow().is_displaced() {
+                        new_text = Some(Rc::clone(&child));
                     }
                     displaced(prior)
                 }
@@ -246,7 +289,10 @@ impl Document {
                     m.set(key, Element::Counter(Rc::clone(&c)), stamp);
                     displaced(prior)
                 }
-                OpKind::ListInsert { .. } | OpKind::ListDelete { .. } => unreachable!(),
+                OpKind::ListInsert { .. }
+                | OpKind::ListDelete { .. }
+                | OpKind::TextInsert { .. }
+                | OpKind::TextDelete { .. } => unreachable!(),
             }
         };
         if let Some(child) = new_map {
@@ -257,9 +303,22 @@ impl Document {
             let id = child.borrow().id();
             self.lists.insert(id, child);
         }
+        if let Some(child) = new_text {
+            let id = child.borrow().id();
+            self.texts.insert(id, child);
+        }
         if let Some(o) = orphan {
             self.orphans.push(o);
         }
+    }
+}
+
+/// How many consecutive char_ids an op consumes from its stamp. A text run
+/// takes one per codepoint; every other op takes one.
+fn span(kind: &OpKind) -> u64 {
+    match kind {
+        OpKind::TextInsert { s, .. } => s.chars().count().max(1) as u64,
+        _ => 1,
     }
 }
 
@@ -353,6 +412,17 @@ impl MapCursor<'_> {
             list_id,
         }
     }
+
+    /// Descend into a Text at `key`, creating it if absent.
+    pub fn text(&mut self, key: &[u8]) -> TextCursor<'_> {
+        self.doc
+            .emit(self.map_id, OpKind::TextCreate { key: key.to_vec() });
+        let text_id = ElementId::derive(self.map_id, key, ElementKind::Text);
+        TextCursor {
+            doc: self.doc,
+            text_id,
+        }
+    }
 }
 
 /// A cursor over one List in the tree.
@@ -381,6 +451,41 @@ impl ListCursor<'_> {
         };
         if let Some(id) = id {
             self.doc.emit(self.list_id, OpKind::ListDelete { id });
+        }
+    }
+}
+
+/// A cursor over one Text in the tree.
+pub struct TextCursor<'a> {
+    doc: &'a mut Document,
+    text_id: ElementId,
+}
+
+impl TextCursor<'_> {
+    /// Insert `s` at codepoint `index`. The op carries the Fugue placement, so
+    /// it applies identically on every replica.
+    pub fn insert(&mut self, index: usize, s: &str) {
+        let anchor = match self.doc.texts.get(&self.text_id) {
+            Some(text) => text.borrow().place(index),
+            None => return,
+        };
+        self.doc.emit(
+            self.text_id,
+            OpKind::TextInsert {
+                s: s.to_string(),
+                anchor,
+            },
+        );
+    }
+
+    /// Tombstone `count` live codepoints starting at `index`.
+    pub fn delete(&mut self, index: usize, count: usize) {
+        let ids = match self.doc.texts.get(&self.text_id) {
+            Some(text) => text.borrow().node_ids(index, count),
+            None => return,
+        };
+        if !ids.is_empty() {
+            self.doc.emit(self.text_id, OpKind::TextDelete { ids });
         }
     }
 }

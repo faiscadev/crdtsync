@@ -547,3 +547,94 @@ fn list_in_a_nested_map() {
     let cards = child_list(board.borrow().get(b"cards"));
     assert_eq!(list_str(&cards), "z");
 }
+
+// --- text in the document ---
+
+use crdtsync_core::Text;
+
+fn child_text(e: Option<Element>) -> Rc<RefCell<Text>> {
+    match e {
+        Some(Element::Text(t)) => t,
+        _ => panic!("expected a Text"),
+    }
+}
+
+fn text_str(t: &Rc<RefCell<Text>>) -> String {
+    t.borrow().as_string()
+}
+
+#[test]
+fn text_insert_reads_back() {
+    let mut d = doc(1);
+    d.transact(|tx| {
+        let mut t = tx.text(b"body");
+        t.insert(0, "hlo");
+        t.insert(1, "el"); // "h" + "el" + "lo"
+    });
+    assert_eq!(text_str(&child_text(d.get(b"body"))), "hello");
+}
+
+#[test]
+fn text_edits_converge_on_a_peer() {
+    let mut a = doc(1);
+    let ops = a.transact(|tx| {
+        let mut t = tx.text(b"body");
+        t.insert(0, "hi there");
+    });
+    let mut b = doc(2);
+    replay(&mut b, &ops);
+    assert_eq!(text_str(&child_text(b.get(b"body"))), "hi there");
+}
+
+#[test]
+fn text_delete_removes_codepoints() {
+    let mut d = doc(1);
+    d.transact(|tx| tx.text(b"body").insert(0, "hello"));
+    d.transact(|tx| tx.text(b"body").delete(1, 3)); // drop "ell"
+    assert_eq!(text_str(&child_text(d.get(b"body"))), "ho");
+}
+
+#[test]
+fn a_text_run_reserves_its_lamports() {
+    // Each codepoint in a run takes its own char_id, so the whole run must
+    // reserve that many lamports — the next op has to sort after the last
+    // codepoint, not after the run's base.
+    let mut d = doc(1);
+    let run = d.transact(|tx| tx.text(b"body").insert(0, "abcde"));
+    let next = d.transact(|tx| tx.set(b"k", Scalar::Int(1)));
+    let last_char = run.last().unwrap().stamp.lamport + 4; // base + (len-1)
+    assert!(
+        next[0].stamp.lamport > last_char,
+        "next op {} did not clear the run's last codepoint {last_char}",
+        next[0].stamp.lamport
+    );
+}
+
+#[test]
+fn concurrent_text_inserts_converge_without_interleaving() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let oa = a.transact(|tx| tx.text(b"body").insert(0, "AB"));
+    let ob = b.transact(|tx| tx.text(b"body").insert(0, "XY"));
+
+    replay(&mut a, &ob);
+    replay(&mut b, &oa);
+
+    let sa = text_str(&child_text(a.get(b"body")));
+    let sb_ = text_str(&child_text(b.get(b"body")));
+    assert_eq!(sa, sb_, "replicas diverged");
+    assert!(sa == "ABXY" || sa == "XYAB", "runs interleaved: {sa}");
+}
+
+#[test]
+fn text_in_a_nested_map() {
+    let mut d = doc(1);
+    d.transact(|tx| {
+        let mut sub = tx.map(b"doc");
+        let mut t = sub.text(b"title");
+        t.insert(0, "hi");
+    });
+    let sub = child_map(d.get(b"doc"));
+    let title = child_text(sub.borrow().get(b"title"));
+    assert_eq!(text_str(&title), "hi");
+}
