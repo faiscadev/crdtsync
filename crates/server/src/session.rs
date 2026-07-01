@@ -82,15 +82,20 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
             }
         }
         Message::Ops(ops) => {
-            if session.client.is_none() {
+            let Some(client) = session.client else {
                 return violation("ops before hello");
-            }
-            let Some(room) = session.room.clone() else {
+            };
+            let Some(room) = session.room.as_deref() else {
                 return violation("ops before subscribe");
             };
+            // Every op must be stamped by the connection's established client;
+            // the server never lets a client assert another's identity.
+            if ops.iter().any(|op| op.id.client != client) {
+                return violation("op client mismatch");
+            }
             // The deduped ops fan out to the room's other subscribers; nothing
             // echoes back to the sender.
-            let applied = hub.ingest(&room, ops);
+            let applied = hub.ingest(room, ops);
             Response {
                 broadcast: applied,
                 ..Response::default()

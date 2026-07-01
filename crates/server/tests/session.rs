@@ -230,6 +230,28 @@ fn a_resent_op_batch_broadcasts_nothing() {
     assert_eq!(h.seq(ROOM), 1);
 }
 
+#[test]
+fn ops_stamped_by_another_client_are_a_violation() {
+    let mut h = hub();
+    let mut s = Session::new();
+    hello(&mut h, &mut s, 1);
+    step(
+        &mut h,
+        &mut s,
+        Message::Subscribe {
+            room: ROOM.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    // The session belongs to client 1; ops minted by client 2 assert a foreign
+    // identity and must be refused, not ingested.
+    let foreign = doc(2).transact(|tx| tx.register(b"age", Scalar::Int(30)));
+    let r = step(&mut h, &mut s, Message::Ops(foreign));
+    assert!(r.close);
+    assert!(is_violation(&r.replies[0]));
+    assert_eq!(h.seq(ROOM), 0);
+}
+
 // --- version negotiation ---
 
 #[test]
