@@ -133,3 +133,19 @@ fn a_null_document_is_handled_not_dereferenced() {
         assert_eq!(crdtsync_doc_apply(ptr::null_mut(), b"".as_ptr(), 0), -1);
     }
 }
+
+#[test]
+fn a_null_data_pointer_is_rejected_not_dereferenced() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let mut out: i64 = 0;
+        // Null key/bytes with a nonzero length must be reported, not read.
+        assert_eq!(crdtsync_doc_get_int(doc, ptr::null(), 4, &mut out), -1);
+        assert_eq!(crdtsync_doc_apply(doc, ptr::null(), 8), -1);
+        let buf = crdtsync_doc_register_int(doc, ptr::null(), 4, 1);
+        assert_eq!(buf.len, 0, "a null key yields no ops");
+        crdtsync_buf_free(buf);
+        crdtsync_doc_free(doc);
+    }
+}

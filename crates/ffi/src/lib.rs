@@ -44,6 +44,23 @@ impl CrdtBuf {
     }
 }
 
+/// Borrow `len` bytes at `ptr` as a slice. A zero length is always the empty
+/// slice; a null pointer with a nonzero length is rejected (`None`) rather than
+/// dereferenced, since that would be UB the boundary's `catch_unwind` can't
+/// contain.
+///
+/// # Safety
+/// When `ptr` is non-null and `len > 0`, it must point to `len` readable bytes.
+unsafe fn as_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        Some(&[])
+    } else if ptr.is_null() {
+        None
+    } else {
+        Some(slice::from_raw_parts(ptr, len))
+    }
+}
+
 /// Open a document for the 16-byte client id at `client`. Null on a bad handle.
 ///
 /// # Safety
@@ -175,10 +192,8 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
             return -1;
         }
         let handle = &mut *doc;
-        let raw = if len == 0 {
-            &[][..]
-        } else {
-            slice::from_raw_parts(bytes, len)
+        let Some(raw) = as_slice(bytes, len) else {
+            return -1;
         };
         match decode_ops(raw) {
             Ok(ops) => ops.iter().filter(|op| handle.doc.apply(op)).count() as i32,
@@ -198,7 +213,10 @@ where
             return CrdtBuf::empty();
         }
         let handle = &mut *doc;
-        let key = slice::from_raw_parts(key, key_len).to_vec();
+        let Some(key) = as_slice(key, key_len) else {
+            return CrdtBuf::empty();
+        };
+        let key = key.to_vec();
         let ops = handle.doc.transact(|tx| edit(tx, &key));
         CrdtBuf::from_vec(encode_ops(&ops))
     }))
@@ -221,7 +239,9 @@ where
             return -1;
         }
         let handle = &*doc;
-        let key = slice::from_raw_parts(key, key_len);
+        let Some(key) = as_slice(key, key_len) else {
+            return -1;
+        };
         match handle.doc.get(key).as_ref().and_then(pick) {
             Some(n) => {
                 *out = n;
