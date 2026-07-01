@@ -52,10 +52,28 @@ fn subkey(rng: &mut Rng) -> &'static [u8] {
     SUBKEYS[rng.below(SUBKEYS.len())]
 }
 
-/// Apply one random edit to a document, returning the ops it emitted.
+/// The live length of a list slot, or 0 if the slot holds anything else.
+fn list_len(d: &Document, k: &[u8]) -> usize {
+    match d.get(k) {
+        Some(Element::List(l)) => l.borrow().len(),
+        _ => 0,
+    }
+}
+
+/// The live length of a text slot, or 0 if the slot holds anything else.
+fn text_len(d: &Document, k: &[u8]) -> usize {
+    match d.get(k) {
+        Some(Element::Text(t)) => t.borrow().len(),
+        _ => 0,
+    }
+}
+
+/// Apply one random edit to a document, returning the ops it emitted. Deletes
+/// on a list or text pick a live index off the generating replica, so they are
+/// real removals; on the peers the same op waits for its target to arrive.
 fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
     let k = key(rng);
-    match rng.below(11) {
+    match rng.below(15) {
         0 => d.transact(|tx| tx.register(k, Scalar::Int(rng_val(rng)))),
         1 => d.transact(|tx| tx.inc(k, 1 + rng.below(4) as u32)),
         2 => d.transact(|tx| tx.dec(k, 1 + rng.below(4) as u32)),
@@ -70,8 +88,41 @@ fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
             let sk = subkey(rng);
             d.transact(|tx| tx.map(k).inc(sk, 1 + rng.below(4) as u32))
         }
-        8 => d.transact(|tx| tx.list(k).insert(0, Scalar::Int(rng_val(rng)))),
-        9 => d.transact(|tx| tx.text(k).insert(0, "z")),
+        8 => {
+            let idx = rng.below(list_len(d, k) + 1);
+            d.transact(|tx| tx.list(k).insert(idx, Scalar::Int(rng_val(rng))))
+        }
+        9 => {
+            let len = list_len(d, k);
+            if len == 0 {
+                return Vec::new();
+            }
+            let idx = rng.below(len);
+            d.transact(|tx| tx.list(k).delete(idx))
+        }
+        10 => {
+            let idx = rng.below(text_len(d, k) + 1);
+            d.transact(|tx| tx.text(k).insert(idx, "z"))
+        }
+        11 => {
+            let len = text_len(d, k);
+            if len == 0 {
+                return Vec::new();
+            }
+            let idx = rng.below(len);
+            d.transact(|tx| tx.text(k).delete(idx, 1))
+        }
+        12 => {
+            // A second level of nesting: a map inside a map.
+            let sk = subkey(rng);
+            let ssk = subkey(rng);
+            d.transact(|tx| tx.map(k).map(sk).register(ssk, Scalar::Int(rng_val(rng))))
+        }
+        13 => {
+            let sk = subkey(rng);
+            let ssk = subkey(rng);
+            d.transact(|tx| tx.map(k).map(sk).inc(ssk, 1 + rng.below(4) as u32))
+        }
         _ => d.transact(|tx| tx.map(k).set(subkey(rng), Scalar::Bool(true))),
     }
 }
@@ -156,9 +207,19 @@ fn pooled_ops_converge_under_every_permutation() {
             Document::new(cid(2)),
             Document::new(cid(3)),
         ];
+        // Each replica edits; between edits it sometimes catches up on the ops
+        // its peers have pooled so far, so later edits build on a partly-merged
+        // state — richer displacement histories than pure concurrency.
         let mut pool: Vec<Op> = Vec::new();
-        for _ in 0..16 {
+        let mut delivered = [0usize; 3];
+        for _ in 0..18 {
             let which = rng.below(replicas.len());
+            if rng.below(2) == 0 {
+                for op in &pool[delivered[which]..] {
+                    replicas[which].apply(op);
+                }
+                delivered[which] = pool.len();
+            }
             let ops = random_edit(&mut replicas[which], &mut rng);
             pool.extend(ops);
         }
