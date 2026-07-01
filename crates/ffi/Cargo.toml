@@ -1,0 +1,11 @@
+[package]
+name = "crdtsync-ffi"
+version = "0.0.0"
+edition = "2021"
+description = "C ABI for the CRDT core: opaque handles for Go/Python embedding."
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+crdtsync-core = { path = "../core" }
