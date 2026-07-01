@@ -100,10 +100,13 @@ def _u32(name: str, value: int) -> int:
     return value
 
 
+_SIZE_T_MAX = (1 << (ctypes.sizeof(ctypes.c_size_t) * 8)) - 1
+
+
 def _usize(name: str, value: int) -> int:
-    """Reject negatives that ctypes would wrap into a huge C `size_t`."""
-    if not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative int, got {value!r}")
+    """Reject values that ctypes would wrap around C `size_t` (both signs)."""
+    if not isinstance(value, int) or not 0 <= value <= _SIZE_T_MAX:
+        raise ValueError(f"{name} must be an int in 0..={_SIZE_T_MAX}, got {value!r}")
     return value
 
 

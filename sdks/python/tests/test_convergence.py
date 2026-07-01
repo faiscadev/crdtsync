@@ -89,6 +89,9 @@ def test_out_of_range_arguments_raise():
             a.inc([b"n"], -1)
         with pytest.raises(ValueError):
             a.inc([b"n"], 2**32)
+        # An oversized index wraps around size_t; reject it too.
+        with pytest.raises(ValueError):
+            a.list_insert([b"l"], 2**64, b"x")
 
 
 def test_apply_rejects_garbage():
