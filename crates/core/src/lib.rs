@@ -20,6 +20,7 @@ pub mod stamp;
 
 pub mod counter;
 pub mod element;
+pub mod list;
 pub mod map;
 pub mod register;
 
@@ -32,6 +33,7 @@ pub use doc::{Document, OrphanEvent};
 pub use element::{Element, ElementKind};
 pub use elementid::ElementId;
 pub use host::Host;
+pub use list::List;
 pub use map::Map;
 pub use op::{Op, OpId, OpKind, TxId};
 pub use register::Register;
