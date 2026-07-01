@@ -26,16 +26,36 @@ pub struct TxId(pub u64);
 
 /// A primitive mutation, addressed by the key of a slot in the target Map.
 /// The receiver reaches the child through the map's get-or-create, re-deriving
-/// its id, so no separate create op is needed. Closed: one variant per
-/// composite operation the core understands. The acting client and causal
-/// order live on the [`Op`], not here.
+/// its id. Leaf children (Register, Counter) are created implicitly by their
+/// first value op; a nested Map is created explicitly by `MapCreate` so that
+/// later ops can target it. Closed: one variant per composite operation the
+/// core understands. The acting client and causal order live on the [`Op`],
+/// not here.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum OpKind {
-    RegisterSet { key: Vec<u8>, value: Scalar },
-    CounterInc { key: Vec<u8>, amount: u32 },
-    CounterDec { key: Vec<u8>, amount: u32 },
-    MapSet { key: Vec<u8>, value: Scalar },
-    MapDelete { key: Vec<u8> },
+    RegisterSet {
+        key: Vec<u8>,
+        value: Scalar,
+    },
+    CounterInc {
+        key: Vec<u8>,
+        amount: u32,
+    },
+    CounterDec {
+        key: Vec<u8>,
+        amount: u32,
+    },
+    MapSet {
+        key: Vec<u8>,
+        value: Scalar,
+    },
+    MapDelete {
+        key: Vec<u8>,
+    },
+    /// Install a nested Map child at `key` in the target map.
+    MapCreate {
+        key: Vec<u8>,
+    },
 }
 
 /// A single CRDT operation. Immutable once minted; the op log is append-only.
