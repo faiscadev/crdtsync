@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 use crdtsync_core::op::OpId;
 use crdtsync_core::{ClientId, Document, Element, Op};
 
+pub mod registry;
 pub mod session;
+pub use registry::{ConnId, Registry};
 pub use session::{negotiate, step, Response, Session};
 
 /// A room name, opaque bytes chosen by the deployment.
