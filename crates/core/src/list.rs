@@ -140,6 +140,11 @@ impl List {
         }
     }
 
+    /// Whether the node `id` is present (live or tombstoned).
+    pub fn contains(&self, id: Stamp) -> bool {
+        self.nodes.contains_key(&id)
+    }
+
     /// Tombstone the node with `id`. Idempotent: a no-op if absent or already
     /// tombstoned.
     pub fn delete_id(&mut self, id: Stamp) {

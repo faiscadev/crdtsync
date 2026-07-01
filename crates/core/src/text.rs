@@ -88,6 +88,11 @@ impl Text {
         self.delete_ids(&ids);
     }
 
+    /// Whether the codepoint with char_id `id` is present (live or tombstoned).
+    pub fn contains(&self, id: Stamp) -> bool {
+        self.inner.contains(id)
+    }
+
     /// Tombstone the codepoints with these char_ids. Idempotent.
     pub fn delete_ids(&mut self, ids: &[Stamp]) {
         for id in ids {

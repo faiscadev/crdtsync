@@ -117,6 +117,9 @@ impl Document {
             };
             f(&mut cursor);
         }
+        // A local create can restore a container that buffered remote ops were
+        // waiting on; replay them now, not only on the next remote apply.
+        self.drain_buffer();
         std::mem::take(&mut self.pending)
     }
 
@@ -128,7 +131,7 @@ impl Document {
         if self.seen.contains(&op.id) || self.buffered.contains(&op.id) {
             return false;
         }
-        if !self.resolvable(op.target) {
+        if !self.ready(op) {
             self.buffered.insert(op.id);
             self.buffer.push(op.clone());
             return false;
@@ -154,10 +157,30 @@ impl Document {
     /// Replay buffered ops that a state change just made reachable, to a
     /// fixpoint — one applied op can unblock a whole causal chain.
     fn drain_buffer(&mut self) {
-        while let Some(i) = self.buffer.iter().position(|op| self.resolvable(op.target)) {
+        while let Some(i) = self.buffer.iter().position(|op| self.ready(op)) {
             let op = self.buffer.remove(i);
             self.buffered.remove(&op.id);
             self.apply_now(&op);
+        }
+    }
+
+    /// Whether `op` can apply now: its target is reachable, and — for a delete —
+    /// the nodes it removes are present. A delete of a not-yet-inserted node
+    /// would silently no-op and be lost, so it waits for the insert.
+    fn ready(&self, op: &Op) -> bool {
+        if !self.resolvable(op.target) {
+            return false;
+        }
+        match &op.kind {
+            OpKind::ListDelete { id } => self
+                .lists
+                .get(&op.target)
+                .is_some_and(|l| l.borrow().contains(*id)),
+            OpKind::TextDelete { ids } => self.texts.get(&op.target).is_some_and(|t| {
+                let t = t.borrow();
+                ids.iter().all(|id| t.contains(*id))
+            }),
+            _ => true,
         }
     }
 

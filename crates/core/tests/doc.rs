@@ -788,3 +788,50 @@ fn concurrent_recreate_converges_either_way() {
         format!("{:?}", b.get(b"k").map(|e| e.kind())),
     );
 }
+
+#[test]
+fn a_delete_waits_for_the_insert_it_removes() {
+    // A delete naming a node whose insert hasn't arrived would silently no-op
+    // and be lost; it must buffer until the insert lands, then tombstone it.
+    let mut a = doc(1);
+    let ops = a.transact(|tx| {
+        let mut l = tx.list(b"items");
+        l.insert(0, sb(b'a'));
+        l.insert(1, sb(b'b'));
+    });
+    // ops: [ListCreate, insert 'a', insert 'b']
+    let del = a.transact(|tx| tx.list(b"items").delete(1)); // removes 'b'
+    assert_eq!(list_str(&child_list(a.get(b"items"))), "a");
+
+    let mut b = doc(2);
+    b.apply(&ops[0]); // ListCreate
+    b.apply(&ops[1]); // insert 'a'
+    b.apply(&del[1]); // ListDelete of 'b' — 'b' absent, must buffer
+    assert_eq!(list_str(&child_list(b.get(b"items"))), "a");
+    b.apply(&ops[2]); // insert 'b' — unblocks the buffered delete
+    assert_eq!(
+        list_str(&child_list(b.get(b"items"))),
+        "a",
+        "the buffered delete must tombstone 'b', not leave it live"
+    );
+}
+
+#[test]
+fn a_local_create_drains_buffered_child_ops() {
+    // A child op buffered against an unseen parent must apply once this replica
+    // creates that container locally, not wait for another remote op.
+    let mut a = doc(1);
+    let ops = a.transact(|tx| {
+        let mut sub = tx.map(b"k");
+        sub.register(b"x", Scalar::Int(9));
+    });
+    let mut b = doc(2);
+    b.apply(&ops[1]); // RegisterSet in "k" — parent unseen, buffered
+    assert!(b.get(b"k").is_none());
+
+    b.transact(|tx| {
+        tx.map(b"k");
+    });
+    let sub = child_map(b.get(b"k"));
+    assert_eq!(int(sub.borrow().get(b"x")), 9);
+}
