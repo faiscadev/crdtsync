@@ -28,6 +28,11 @@ use crate::{negotiate, ConnId, Registry};
 /// too slow and dropped — a bound on per-connection memory.
 const OUTBOX_CAPACITY: usize = 1024;
 
+/// How long teardown lets the writer flush queued messages (e.g. a refusal)
+/// before forcing the socket closed — a peer that has stopped reading can wedge
+/// the writer in `send`.
+const WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A request to the registry actor from a connection task.
 enum Cmd {
     /// Open a connection, returning its id and registering its outbound sink
@@ -157,7 +162,7 @@ async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
 
     // The writer task owns the sink, draining queued messages until the last
     // sender is dropped at teardown.
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
             if write
                 .send(WsMessage::Binary(encode_message(&m).into()))
@@ -184,7 +189,15 @@ async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
 
     let _ = cmds.send(Cmd::Disconnect { id });
     drop(out);
-    let _ = writer.await;
+    // Let the writer flush what's queued, but don't let a peer that stopped
+    // reading wedge it in `send` and keep the socket half-open.
+    if tokio::time::timeout(WRITER_GRACE, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+        let _ = writer.await;
+    }
 }
 
 /// Read and route messages until the peer closes, sends garbage, violates the
