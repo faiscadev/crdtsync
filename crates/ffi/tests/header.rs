@@ -18,6 +18,7 @@ fn the_header_declares_every_exported_symbol() {
         // map / scalar edits + reads
         "crdtsync_doc_register_int",
         "crdtsync_doc_inc",
+        "crdtsync_doc_dec",
         "crdtsync_doc_set_bytes",
         "crdtsync_doc_delete",
         "crdtsync_doc_get_int",
@@ -45,6 +46,7 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_last_seen_seq",
         "crdtsync_client_register_int",
         "crdtsync_client_inc",
+        "crdtsync_client_dec",
         "crdtsync_client_set_bytes",
         "crdtsync_client_delete",
         "crdtsync_client_get_int",

@@ -56,6 +56,12 @@ CrdtBuf crdtsync_doc_register_int(CrdtDoc *doc,
 // As [`crdtsync_doc_register_int`].
 CrdtBuf crdtsync_doc_inc(CrdtDoc *doc, const uint8_t *path, uintptr_t path_len, uint32_t amount);
 
+// Install-or-decrement a Counter at a path. Returns the ops to broadcast.
+//
+// # Safety
+// As [`crdtsync_doc_register_int`].
+CrdtBuf crdtsync_doc_dec(CrdtDoc *doc, const uint8_t *path, uintptr_t path_len, uint32_t amount);
+
 // Set a bytes scalar at a path. Returns the ops to broadcast.
 //
 // # Safety
@@ -268,6 +274,17 @@ CrdtBuf crdtsync_client_register_int(CrdtClient *client,
 // # Safety
 // As [`crdtsync_client_register_int`].
 CrdtBuf crdtsync_client_inc(CrdtClient *client,
+                            uint32_t channel,
+                            const uint8_t *path,
+                            uintptr_t path_len,
+                            uint32_t amount);
+
+// Install-or-decrement a Counter at a path in `channel`'s room. Returns the Ops
+// frame to send.
+//
+// # Safety
+// As [`crdtsync_client_register_int`].
+CrdtBuf crdtsync_client_dec(CrdtClient *client,
                             uint32_t channel,
                             const uint8_t *path,
                             uintptr_t path_len,

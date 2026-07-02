@@ -60,6 +60,21 @@ fn a_counter_accumulates() {
 }
 
 #[test]
+fn a_counter_decrements() {
+    let mut d = doc(1);
+    path::inc(&mut d, &p(&["stock"]), 10);
+    path::dec(&mut d, &p(&["stock"]), 4);
+    assert_eq!(path::get_counter(&d, &p(&["stock"])), Some(6));
+}
+
+#[test]
+fn dec_below_zero_is_negative() {
+    let mut d = doc(1);
+    path::dec(&mut d, &p(&["balance"]), 5);
+    assert_eq!(path::get_counter(&d, &p(&["balance"])), Some(-5));
+}
+
+#[test]
 fn bytes_round_trip() {
     let mut d = doc(1);
     let want = vec![0u8, 1, 255, 0];

@@ -65,6 +65,11 @@ impl WasmDocument {
         encode_ops(&path::inc(&mut self.inner, path, amount))
     }
 
+    /// Install-or-decrement a Counter at a path.
+    pub fn dec(&mut self, path: &[u8], amount: u32) -> Vec<u8> {
+        encode_ops(&path::dec(&mut self.inner, path, amount))
+    }
+
     /// Set a bytes scalar at a path.
     #[wasm_bindgen(js_name = setBytes)]
     pub fn set_bytes(&mut self, path: &[u8], value: &[u8]) -> Vec<u8> {
@@ -260,6 +265,11 @@ impl WasmClient {
     /// Install-or-increment a Counter at a path in `channel`'s room.
     pub fn inc(&mut self, channel: u32, path: &[u8], amount: u32) -> Vec<u8> {
         self.ops_frame(channel, |d| path::inc(d, path, amount))
+    }
+
+    /// Install-or-decrement a Counter at a path in `channel`'s room.
+    pub fn dec(&mut self, channel: u32, path: &[u8], amount: u32) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::dec(d, path, amount))
     }
 
     /// Set a bytes scalar at a path in `channel`'s room.

@@ -76,6 +76,24 @@ func TestCounterAccumulatesAcrossReplicas(t *testing.T) {
 	}
 }
 
+func TestCounterDecrementsAcrossReplicas(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	b := newDoc(t, 2)
+	defer b.Close()
+
+	up := a.Inc(path("stock"), 10)
+	down := a.Dec(path("stock"), 4)
+	b.Apply(up)
+	b.Apply(down)
+
+	va, _ := a.GetCounter(path("stock"))
+	vb, _ := b.GetCounter(path("stock"))
+	if va != 6 || vb != 6 {
+		t.Fatalf("counter diverged: a=%d b=%d", va, vb)
+	}
+}
+
 func TestNestedPathConverges(t *testing.T) {
 	a := newDoc(t, 1)
 	defer a.Close()

@@ -53,6 +53,11 @@ pub fn inc(doc: &mut Document, path: &[u8], amount: u32) -> Vec<Op> {
     emit(doc, path, |cur, key| cur.inc(key, amount))
 }
 
+/// Install-or-decrement a Counter at a path.
+pub fn dec(doc: &mut Document, path: &[u8], amount: u32) -> Vec<Op> {
+    emit(doc, path, |cur, key| cur.dec(key, amount))
+}
+
 /// Set a bytes scalar at a path.
 pub fn set_bytes(doc: &mut Document, path: &[u8], value: &[u8]) -> Vec<Op> {
     let value = value.to_vec();
