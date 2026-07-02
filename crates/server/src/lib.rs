@@ -19,7 +19,7 @@ pub mod session;
 pub mod store;
 pub use registry::{ConnId, Registry};
 pub use session::{negotiate, step, Response, Session};
-pub use store::Store;
+pub use store::{RoomLog, Snapshot, Store};
 
 /// A room name, opaque bytes chosen by the deployment.
 pub type RoomId = Vec<u8>;
@@ -78,24 +78,49 @@ impl Hub {
         }
     }
 
-    /// A hub rebuilt by replaying each room's persisted log. Replaying the ops
-    /// restores the merged state, the server sequence, and the dedup set, so a
-    /// reloaded node is indistinguishable from the one that wrote the log. The
-    /// hub is in-memory until [`attach_store`](Hub::attach_store) makes further
-    /// ingests durable.
-    pub fn from_logs(server: ClientId, logs: Vec<(RoomId, Vec<Op>)>) -> Self {
+    /// A hub rebuilt from each room's persisted snapshot and log. A room with a
+    /// snapshot loads its merged state and sequence floor from it, then replays
+    /// the tail; one without replays its whole log from scratch. Either way the
+    /// reloaded node reproduces the merged state, the server sequence, and the
+    /// dedup set of the node that wrote the store. A corrupt snapshot is an
+    /// error. The hub is in-memory until [`attach_store`](Hub::attach_store)
+    /// makes further ingests durable.
+    pub fn from_rooms(server: ClientId, rooms: Vec<(RoomId, RoomLog)>) -> io::Result<Self> {
         let mut hub = Self::new(server);
-        for (room, ops) in logs {
-            // Replay is in-memory: these ops are already on disk.
-            hub.ingest(&room, ops)
-                .expect("a store-less replay never fails");
+        for (room, log) in rooms {
+            hub.install_room(room, log)?;
         }
-        hub
+        Ok(hub)
     }
 
-    /// Persist every future ingest to `store`. The log it already holds is
-    /// assumed to be `store`'s contents, as [`from_logs`](Hub::from_logs) leaves
-    /// it — this only redirects new writes to disk.
+    /// Restore one room from its snapshot (if any) and replay its retained log.
+    /// A snapshot seeds the merged state, the sequence floor, and the dedup set;
+    /// the log then replays through the same dedup as a live ingest, so a record
+    /// the snapshot already covers is a no-op and a crash-left overlap converges.
+    fn install_room(&mut self, room: RoomId, log: RoomLog) -> io::Result<()> {
+        if let Some(snapshot) = log.snapshot {
+            let doc = Document::decode_state(&snapshot.state)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
+            let seen = doc.seen().collect();
+            self.rooms.insert(
+                room.clone(),
+                Room {
+                    doc,
+                    log: Vec::new(),
+                    seen,
+                    base_seq: snapshot.base_seq,
+                },
+            );
+        }
+        // Store-less replay: these ops are already durable, so ingest can't fail.
+        self.ingest(&room, log.ops)
+            .expect("a store-less replay never fails");
+        Ok(())
+    }
+
+    /// Persist every future ingest to `store`. The rooms it already holds are
+    /// assumed to be `store`'s contents, as [`from_rooms`](Hub::from_rooms)
+    /// leaves them — this only redirects new writes to disk.
     pub fn attach_store(&mut self, store: Store) {
         self.store = Some(store);
     }
@@ -165,16 +190,22 @@ impl Hub {
     /// Fold the room's logged ops into the merged replica and drop them,
     /// advancing the compaction floor to the head. The replica, the dedup set,
     /// and every op's sequence are untouched — only the retained log shrinks, so
-    /// a below-floor subscriber is served a snapshot instead of a delta.
-    ///
-    /// In-memory only: the durable log on disk is unchanged, so a restart
-    /// replays it and re-derives the same state and sequence. Compacting the
-    /// on-disk log is a separate concern.
-    pub fn compact(&mut self, room: &[u8]) {
-        if let Some(room) = self.rooms.get_mut(room) {
-            room.base_seq += room.log.len() as u64;
-            room.log.clear();
+    /// a below-floor subscriber is served a snapshot instead of a delta. With a
+    /// store attached, the snapshot is persisted and the on-disk log truncated,
+    /// so the reclaim survives a restart.
+    pub fn compact(&mut self, room: &[u8]) -> io::Result<()> {
+        let snapshot = match self.rooms.get_mut(room) {
+            None => return Ok(()),
+            Some(r) => {
+                r.base_seq += r.log.len() as u64;
+                r.log.clear();
+                (r.base_seq, r.doc.encode_state())
+            }
+        };
+        if let Some(store) = self.store.as_mut() {
+            store.compact(room, snapshot.0, &snapshot.1)?;
         }
+        Ok(())
     }
 
     /// The room's current high-water server sequence (0 if unseen or empty).

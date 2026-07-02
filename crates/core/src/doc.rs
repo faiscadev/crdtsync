@@ -111,6 +111,12 @@ impl Document {
         self.client
     }
 
+    /// The ids of every op this replica has applied — the dedup set, so a
+    /// reconstructing server can restore its own dedup from a decoded snapshot.
+    pub fn seen(&self) -> impl Iterator<Item = OpId> + '_ {
+        self.seen.iter().copied()
+    }
+
     /// The shared root id.
     pub fn root_id(&self) -> ElementId {
         self.root.borrow().id()
