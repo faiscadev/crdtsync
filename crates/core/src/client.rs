@@ -240,6 +240,18 @@ impl ClientSession {
             Message::Unsubscribe { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent unsubscribe"))
             }
+            // Version responses are folded into a client view in a later slice;
+            // the requests only travel client-to-server.
+            Message::Versions { .. } | Message::VersionState { .. } => Err(
+                ClientError::UnexpectedMessage("versions are not yet handled"),
+            ),
+            Message::VersionCreate { .. }
+            | Message::VersionRename { .. }
+            | Message::VersionDelete { .. }
+            | Message::VersionList { .. }
+            | Message::VersionFetch { .. } => Err(ClientError::UnexpectedMessage(
+                "server sent a version request",
+            )),
         }
     }
 

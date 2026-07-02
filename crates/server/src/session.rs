@@ -271,6 +271,15 @@ pub fn step(
         // Peer updates and clears only travel server-to-client.
         Message::AwarenessUpdate { .. } => violation("client sent an awareness update"),
         Message::AwarenessClear { .. } => violation("client sent an awareness clear"),
+        // Version requests are wired here in a later slice; the responses only
+        // travel server-to-client, so a client sending one is out of order.
+        Message::VersionCreate { .. }
+        | Message::VersionRename { .. }
+        | Message::VersionDelete { .. }
+        | Message::VersionList { .. }
+        | Message::VersionFetch { .. } => violation("version requests are not yet served"),
+        Message::Versions { .. } => violation("client sent a versions list"),
+        Message::VersionState { .. } => violation("client sent a version state"),
     }
 }
 

@@ -112,6 +112,34 @@ pub enum Message {
     /// Drops all of `actor`'s awareness on `channel` — sent when that actor's
     /// presence expires (disconnect past the grace window, or TTL).
     AwarenessClear { channel: Channel, actor: Vec<u8> },
+    /// Captures the current state of `channel`'s room as a named version.
+    VersionCreate { channel: Channel, name: Vec<u8> },
+    /// Renames a version of `channel`'s room.
+    VersionRename {
+        channel: Channel,
+        from: Vec<u8>,
+        to: Vec<u8>,
+    },
+    /// Deletes a named version of `channel`'s room.
+    VersionDelete { channel: Channel, name: Vec<u8> },
+    /// Requests the names of the versions of `channel`'s room.
+    VersionList { channel: Channel },
+    /// Requests the captured state of a named version of `channel`'s room.
+    VersionFetch { channel: Channel, name: Vec<u8> },
+    /// The current version names of `channel`'s room — the server's reply to a
+    /// list request and the authoritative post-state after any version mutation.
+    Versions {
+        channel: Channel,
+        names: Vec<Vec<u8>>,
+    },
+    /// A named version's captured state, the server's reply to a fetch of a
+    /// version that exists, tagged with the sequence it covered.
+    VersionState {
+        channel: Channel,
+        name: Vec<u8>,
+        seq: u64,
+        state: Vec<u8>,
+    },
     /// A failure the server reports to the client.
     Error { code: ErrorCode, message: String },
 }
@@ -211,6 +239,54 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u32(&mut out, channel.0);
             put_bytes(&mut out, actor);
         }
+        Message::VersionCreate { channel, name } => {
+            put_u8(&mut out, 11);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, name);
+        }
+        Message::VersionRename { channel, from, to } => {
+            put_u8(&mut out, 12);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, from);
+            put_bytes(&mut out, to);
+        }
+        Message::VersionDelete { channel, name } => {
+            put_u8(&mut out, 13);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, name);
+        }
+        Message::VersionList { channel } => {
+            put_u8(&mut out, 14);
+            put_u32(&mut out, channel.0);
+        }
+        Message::VersionFetch { channel, name } => {
+            put_u8(&mut out, 15);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, name);
+        }
+        Message::Versions { channel, names } => {
+            put_u8(&mut out, 16);
+            put_u32(&mut out, channel.0);
+            put_u32(
+                &mut out,
+                u32::try_from(names.len()).expect("version count exceeds u32"),
+            );
+            for name in names {
+                put_bytes(&mut out, name);
+            }
+        }
+        Message::VersionState {
+            channel,
+            name,
+            seq,
+            state,
+        } => {
+            put_u8(&mut out, 17);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, name);
+            put_u64(&mut out, *seq);
+            put_bytes(&mut out, state);
+        }
         Message::Error { code, message } => {
             put_u8(&mut out, 3);
             put_u16(&mut out, error_code_tag(*code));
@@ -296,6 +372,51 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let channel = Channel(cur.u32()?);
             let actor = cur.bytes()?;
             Message::AwarenessClear { channel, actor }
+        }
+        11 => Message::VersionCreate {
+            channel: Channel(cur.u32()?),
+            name: cur.bytes()?,
+        },
+        12 => {
+            let channel = Channel(cur.u32()?);
+            let from = cur.bytes()?;
+            let to = cur.bytes()?;
+            Message::VersionRename { channel, from, to }
+        }
+        13 => Message::VersionDelete {
+            channel: Channel(cur.u32()?),
+            name: cur.bytes()?,
+        },
+        14 => Message::VersionList {
+            channel: Channel(cur.u32()?),
+        },
+        15 => Message::VersionFetch {
+            channel: Channel(cur.u32()?),
+            name: cur.bytes()?,
+        },
+        16 => {
+            let channel = Channel(cur.u32()?);
+            let count = cur.u32()?;
+            // Grow as records are read rather than trusting `count` to size the
+            // allocation — a bogus count then fails on the missing bytes, not on
+            // a giant up-front reservation.
+            let mut names = Vec::new();
+            for _ in 0..count {
+                names.push(cur.bytes()?);
+            }
+            Message::Versions { channel, names }
+        }
+        17 => {
+            let channel = Channel(cur.u32()?);
+            let name = cur.bytes()?;
+            let seq = cur.u64()?;
+            let state = cur.bytes()?;
+            Message::VersionState {
+                channel,
+                name,
+                seq,
+                state,
+            }
         }
         tag => {
             return Err(ProtocolError::BadTag {
