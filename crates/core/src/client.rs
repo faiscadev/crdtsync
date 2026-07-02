@@ -28,12 +28,16 @@ pub enum ClientError {
 }
 
 /// One subscribed room: its local replica, the room name, how far it has caught
-/// up, and the peers' ephemeral awareness entries keyed by `(actor, key)`.
+/// up, the peers' ephemeral awareness entries keyed by `(actor, key)`, and the
+/// version view — the last name list the server reported and any fetched version
+/// states keyed by name.
 struct Room {
     room: Vec<u8>,
     doc: Document,
     last_seen_seq: u64,
     awareness: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
+    version_names: Vec<Vec<u8>>,
+    version_states: HashMap<Vec<u8>, (u64, Vec<u8>)>,
 }
 
 /// A replica's connection carrying several room subscriptions, each keyed by the
@@ -88,6 +92,8 @@ impl ClientSession {
                 doc: Document::new(self.client),
                 last_seen_seq: 0,
                 awareness: HashMap::new(),
+                version_names: Vec::new(),
+                version_states: HashMap::new(),
             },
         );
         (
@@ -151,6 +157,74 @@ impl ClientSession {
     /// How many awareness entries `channel` currently holds.
     pub fn awareness_len(&self, channel: Channel) -> usize {
         self.rooms.get(&channel).map_or(0, |r| r.awareness.len())
+    }
+
+    /// Capture the current state of `channel`'s room as version `name`, returning
+    /// the request frame. `None` if the channel isn't held. The server's reply
+    /// updates the [`versions`](ClientSession::versions) view.
+    pub fn create_version(&self, channel: Channel, name: &[u8]) -> Option<Message> {
+        self.rooms.get(&channel)?;
+        Some(Message::VersionCreate {
+            channel,
+            name: name.to_vec(),
+        })
+    }
+
+    /// Rename version `from` to `to` on `channel`'s room, returning the request
+    /// frame. `None` if the channel isn't held.
+    pub fn rename_version(&self, channel: Channel, from: &[u8], to: &[u8]) -> Option<Message> {
+        self.rooms.get(&channel)?;
+        Some(Message::VersionRename {
+            channel,
+            from: from.to_vec(),
+            to: to.to_vec(),
+        })
+    }
+
+    /// Delete version `name` on `channel`'s room, returning the request frame.
+    /// `None` if the channel isn't held.
+    pub fn delete_version(&self, channel: Channel, name: &[u8]) -> Option<Message> {
+        self.rooms.get(&channel)?;
+        Some(Message::VersionDelete {
+            channel,
+            name: name.to_vec(),
+        })
+    }
+
+    /// Request the version names of `channel`'s room, returning the request
+    /// frame. `None` if the channel isn't held. The reply updates the
+    /// [`versions`](ClientSession::versions) view.
+    pub fn list_versions(&self, channel: Channel) -> Option<Message> {
+        self.rooms.get(&channel)?;
+        Some(Message::VersionList { channel })
+    }
+
+    /// Request the captured state of version `name` on `channel`'s room,
+    /// returning the request frame. `None` if the channel isn't held. A hit
+    /// updates the [`version_state`](ClientSession::version_state) view.
+    pub fn fetch_version(&self, channel: Channel, name: &[u8]) -> Option<Message> {
+        self.rooms.get(&channel)?;
+        Some(Message::VersionFetch {
+            channel,
+            name: name.to_vec(),
+        })
+    }
+
+    /// The version names last reported for `channel`'s room, or `None` if the
+    /// channel isn't held. Empty until a list request or a mutation is answered.
+    pub fn versions(&self, channel: Channel) -> Option<&[Vec<u8>]> {
+        self.rooms.get(&channel).map(|r| r.version_names.as_slice())
+    }
+
+    /// The captured state of a fetched version of `channel`'s room, by name, once
+    /// a fetch has returned it. `None` if the channel isn't held or no such
+    /// version state has been fetched.
+    pub fn version_state(&self, channel: Channel, name: &[u8]) -> Option<&[u8]> {
+        self.rooms
+            .get(&channel)?
+            .version_states
+            .get(name)
+            .map(|(_, state)| state.as_slice())
     }
 
     /// Leave the room on `channel`, dropping its replica. Returns the Unsubscribe
@@ -240,11 +314,30 @@ impl ClientSession {
             Message::Unsubscribe { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent unsubscribe"))
             }
-            // Version responses are folded into a client view in a later slice;
-            // the requests only travel client-to-server.
-            Message::Versions { .. } | Message::VersionState { .. } => Err(
-                ClientError::UnexpectedMessage("versions are not yet handled"),
-            ),
+            Message::Versions { channel, names } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
+                // The server's list is authoritative — it replaces the view.
+                room.version_names = names;
+                Ok(())
+            }
+            Message::VersionState {
+                channel,
+                name,
+                seq,
+                state,
+            } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
+                // Cache the fetched state under its name for the embedder to read.
+                room.version_states.insert(name, (seq, state));
+                Ok(())
+            }
+            // Version requests only travel client-to-server.
             Message::VersionCreate { .. }
             | Message::VersionRename { .. }
             | Message::VersionDelete { .. }
