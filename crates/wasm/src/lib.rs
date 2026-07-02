@@ -7,6 +7,8 @@
 //! in. Navigation lives in `crdtsync_core::path`; this layer only marshals
 //! JS values.
 
+use crdtsync_core::diff::{diff as core_diff, Change, SeqItem};
+use crdtsync_core::element::ElementKind;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_ops, path, Channel, ClientId, ClientSession,
@@ -52,6 +54,19 @@ impl WasmDocument {
     pub fn encode_path(keys: Vec<js_sys::Uint8Array>) -> Vec<u8> {
         let owned: Vec<Vec<u8>> = keys.iter().map(js_sys::Uint8Array::to_vec).collect();
         path::encode_path(&owned.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    }
+
+    /// Diff two snapshots — each a state buffer from [`WasmDocument::encode_state`],
+    /// a named version, or an exported room — into an array of structural change
+    /// objects turning the old state into the new. Each change has an `op` tag, a
+    /// `path` (Uint8Array), and its variant's fields; a scalar is a tagged
+    /// `{ t, v }` object so it is read unambiguously. Throws on a malformed
+    /// snapshot.
+    #[wasm_bindgen(js_name = diff)]
+    pub fn diff(old_state: &[u8], new_state: &[u8]) -> Result<Vec<JsValue>, JsError> {
+        let old = Document::decode_state(old_state).map_err(|e| JsError::new(&format!("{e:?}")))?;
+        let new = Document::decode_state(new_state).map_err(|e| JsError::new(&format!("{e:?}")))?;
+        Ok(core_diff(&old, &new).iter().map(change_to_js).collect())
     }
 
     /// Install-or-set an integer Register at a path. Returns the ops to broadcast.
@@ -541,4 +556,126 @@ impl WasmClient {
             None => Vec::new(),
         }
     }
+}
+
+/// Set an own property on a plain object; infallible for a fresh `Object`.
+fn set(obj: &js_sys::Object, key: &str, val: &JsValue) {
+    js_sys::Reflect::set(obj, &JsValue::from_str(key), val).unwrap();
+}
+
+fn kind_name(k: ElementKind) -> &'static str {
+    match k {
+        ElementKind::Scalar => "scalar",
+        ElementKind::Register => "register",
+        ElementKind::Counter => "counter",
+        ElementKind::Map => "map",
+        ElementKind::List => "list",
+        ElementKind::Text => "text",
+    }
+}
+
+/// A scalar as a tagged `{ t, v }` object, so `Bytes` and a `BlobRef` (both
+/// binary) are told apart and an `Int` keeps full 64-bit range as a BigInt.
+fn scalar_to_js(s: &Scalar) -> JsValue {
+    let obj = js_sys::Object::new();
+    match s {
+        Scalar::Null => set(&obj, "t", &JsValue::from_str("null")),
+        Scalar::Bool(b) => {
+            set(&obj, "t", &JsValue::from_str("bool"));
+            set(&obj, "v", &JsValue::from_bool(*b));
+        }
+        Scalar::Int(n) => {
+            set(&obj, "t", &JsValue::from_str("int"));
+            set(&obj, "v", &js_sys::BigInt::from(*n).into());
+        }
+        Scalar::Bytes(b) => {
+            set(&obj, "t", &JsValue::from_str("bytes"));
+            set(&obj, "v", &js_sys::Uint8Array::from(b.as_slice()).into());
+        }
+        Scalar::BlobRef(_) => {
+            set(&obj, "t", &JsValue::from_str("blobref"));
+            set(
+                &obj,
+                "v",
+                &js_sys::Uint8Array::from(s.encode_state().as_slice()).into(),
+            );
+        }
+    }
+    obj.into()
+}
+
+fn item_to_js(item: &SeqItem) -> JsValue {
+    let obj = js_sys::Object::new();
+    match item {
+        SeqItem::Scalar(s) => set(&obj, "scalar", &scalar_to_js(s)),
+        SeqItem::Composite(k) => set(&obj, "kind", &JsValue::from_str(kind_name(*k))),
+    }
+    obj.into()
+}
+
+fn items_to_js(items: &[SeqItem]) -> JsValue {
+    items
+        .iter()
+        .map(item_to_js)
+        .collect::<js_sys::Array>()
+        .into()
+}
+
+fn path_to_js(path: &[u8]) -> JsValue {
+    js_sys::Uint8Array::from(path).into()
+}
+
+/// One structural change as a plain JS object: an `op` tag, a `path`, and the
+/// variant's fields.
+fn change_to_js(change: &Change) -> JsValue {
+    let obj = js_sys::Object::new();
+    match change {
+        Change::Added { path, kind } => {
+            set(&obj, "op", &JsValue::from_str("add"));
+            set(&obj, "path", &path_to_js(path));
+            set(&obj, "kind", &JsValue::from_str(kind_name(*kind)));
+        }
+        Change::Removed { path, kind } => {
+            set(&obj, "op", &JsValue::from_str("remove"));
+            set(&obj, "path", &path_to_js(path));
+            set(&obj, "kind", &JsValue::from_str(kind_name(*kind)));
+        }
+        Change::Value { path, old, new } => {
+            set(&obj, "op", &JsValue::from_str("value"));
+            set(&obj, "path", &path_to_js(path));
+            set(&obj, "old", &scalar_to_js(old));
+            set(&obj, "new", &scalar_to_js(new));
+        }
+        Change::Counter { path, old, new } => {
+            set(&obj, "op", &JsValue::from_str("counter"));
+            set(&obj, "path", &path_to_js(path));
+            set(&obj, "old", &js_sys::BigInt::from(*old).into());
+            set(&obj, "new", &js_sys::BigInt::from(*new).into());
+        }
+        Change::ListInsert { path, index, items } => {
+            set(&obj, "op", &JsValue::from_str("listInsert"));
+            set(&obj, "path", &path_to_js(path));
+            set(&obj, "index", &JsValue::from_f64(*index as f64));
+            set(&obj, "items", &items_to_js(items));
+        }
+        Change::ListDelete { path, index, items } => {
+            set(&obj, "op", &JsValue::from_str("listDelete"));
+            set(&obj, "path", &path_to_js(path));
+            set(&obj, "index", &JsValue::from_f64(*index as f64));
+            set(&obj, "items", &items_to_js(items));
+        }
+        Change::TextInsert { path, index, text } => {
+            set(&obj, "op", &JsValue::from_str("textInsert"));
+            set(&obj, "path", &path_to_js(path));
+            set(&obj, "index", &JsValue::from_f64(*index as f64));
+            set(&obj, "text", &JsValue::from_str(text));
+        }
+        Change::TextDelete { path, index, text } => {
+            set(&obj, "op", &JsValue::from_str("textDelete"));
+            set(&obj, "path", &path_to_js(path));
+            set(&obj, "index", &JsValue::from_f64(*index as f64));
+            set(&obj, "text", &JsValue::from_str(text));
+        }
+    }
+    obj.into()
 }
