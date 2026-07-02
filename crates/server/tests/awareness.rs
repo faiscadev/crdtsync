@@ -1,0 +1,173 @@
+//! Awareness fan-out — ephemeral presence over the registry.
+//!
+//! A client publishes an awareness entry on a subscribed channel; the server
+//! fans it out to the room's *other* subscribers as an AwarenessUpdate tagged
+//! with the publisher's actor and each peer's own channel. Awareness never
+//! touches the op log or a snapshot, and never echoes to the sender. Publishing
+//! before auth, or on an unbound channel, is a protocol violation.
+
+use crdtsync_core::protocol::Channel;
+use crdtsync_core::{ClientId, ErrorCode, Message};
+use crdtsync_server::{ConnId, Registry};
+
+fn cid(first: u8) -> ClientId {
+    let mut b = [0u8; 16];
+    b[0] = first;
+    ClientId::from_bytes(b)
+}
+
+fn registry() -> Registry {
+    Registry::new(cid(0xFF))
+}
+
+const ROOM_A: &[u8] = b"room-a";
+const ROOM_B: &[u8] = b"room-b";
+
+/// The dev verifier (AllowAll) adopts the credential as the actor, so a client's
+/// actor is its credential bytes.
+fn actor_of(client: u8) -> Vec<u8> {
+    format!("actor-{client}").into_bytes()
+}
+
+fn hello_auth(r: &mut Registry, client: u8) -> ConnId {
+    let id = r.connect();
+    assert!(r.deliver(
+        id,
+        Message::Hello {
+            client: cid(client)
+        }
+    ));
+    assert!(r.deliver(
+        id,
+        Message::Auth {
+            credential: actor_of(client),
+        }
+    ));
+    r.take_outbox(id);
+    id
+}
+
+fn subscribe(r: &mut Registry, id: ConnId, channel: u32, room: &[u8]) {
+    assert!(r.deliver(
+        id,
+        Message::Subscribe {
+            channel: Channel(channel),
+            room: room.to_vec(),
+            last_seen_seq: 0,
+        }
+    ));
+    r.take_outbox(id);
+}
+
+fn is_violation(m: &Message) -> bool {
+    matches!(
+        m,
+        Message::Error {
+            code: ErrorCode::ProtocolViolation,
+            ..
+        }
+    )
+}
+
+// --- fan-out ---
+
+#[test]
+fn awareness_fans_out_to_room_peers_tagged_with_actor_and_their_channel() {
+    let mut r = registry();
+    let a = hello_auth(&mut r, 1);
+    subscribe(&mut r, a, 5, ROOM_A);
+    let b = hello_auth(&mut r, 2);
+    subscribe(&mut r, b, 9, ROOM_A);
+
+    assert!(r.deliver(
+        a,
+        Message::AwarenessSet {
+            channel: Channel(5),
+            key: b"cursor".to_vec(),
+            value: vec![1, 2, 3],
+        }
+    ));
+
+    assert_eq!(
+        r.take_outbox(b),
+        vec![Message::AwarenessUpdate {
+            channel: Channel(9),
+            actor: actor_of(1),
+            key: b"cursor".to_vec(),
+            value: vec![1, 2, 3],
+        }]
+    );
+    assert!(r.take_outbox(a).is_empty(), "no echo to the sender");
+}
+
+#[test]
+fn awareness_is_isolated_per_room() {
+    let mut r = registry();
+    let a = hello_auth(&mut r, 1);
+    subscribe(&mut r, a, 1, ROOM_A);
+    let other = hello_auth(&mut r, 2);
+    subscribe(&mut r, other, 1, ROOM_B);
+
+    r.deliver(
+        a,
+        Message::AwarenessSet {
+            channel: Channel(1),
+            key: b"cursor".to_vec(),
+            value: vec![7],
+        },
+    );
+    assert!(r.take_outbox(other).is_empty());
+}
+
+#[test]
+fn awareness_does_not_advance_the_op_log() {
+    let mut r = registry();
+    let a = hello_auth(&mut r, 1);
+    subscribe(&mut r, a, 1, ROOM_A);
+    r.deliver(
+        a,
+        Message::AwarenessSet {
+            channel: Channel(1),
+            key: b"cursor".to_vec(),
+            value: vec![1],
+        },
+    );
+    assert_eq!(r.hub().seq(ROOM_A), 0, "awareness is not an op");
+}
+
+// --- violations ---
+
+#[test]
+fn awareness_before_auth_is_a_violation() {
+    let mut r = registry();
+    let c = r.connect();
+    r.deliver(c, Message::Hello { client: cid(1) });
+    r.take_outbox(c);
+    let keep_open = r.deliver(
+        c,
+        Message::AwarenessSet {
+            channel: Channel(0),
+            key: b"cursor".to_vec(),
+            value: vec![1],
+        },
+    );
+    assert!(!keep_open);
+    assert!(is_violation(&r.take_outbox(c)[0]));
+}
+
+#[test]
+fn awareness_on_an_unbound_channel_is_a_violation() {
+    let mut r = registry();
+    let a = hello_auth(&mut r, 1);
+    subscribe(&mut r, a, 1, ROOM_A);
+    let keep_open = r.deliver(
+        a,
+        Message::AwarenessSet {
+            channel: Channel(2), // never subscribed
+            key: b"cursor".to_vec(),
+            value: vec![1],
+        },
+    );
+    assert!(!keep_open);
+    assert!(is_violation(&r.take_outbox(a)[0]));
+}
