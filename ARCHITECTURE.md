@@ -174,7 +174,7 @@ SDK ships a documented cookbook of "build this custom-feeling type from these pr
 
 Every operation is immutable and append-only. This describes the **wire/stored envelope**: identity, authorship (`client_id` + `actor_id`), scope (`room` / `branch` / `zone`), versioning (`schema_version`), causality (`lamport`), wall time (informational, not used for causality), kind, target, payload. The **core op** the CRDT engine actually merges is the inner subset — `{id, stamp, target, kind, tx}`; authorship, scope, schema version, and wall time are envelope concerns layered around the core op, not core op fields (see *Implementation Status & Divergences*).
 
-Value types in op payloads: scalars, blob refs, element refs. (The blob-ref slot is part of the model but is not yet reserved in the built op envelope — see *Implementation Status & Divergences*.)
+Value types in op payloads: scalars, blob refs, element refs. (The blob-ref slot is reserved in the built op envelope as `Scalar::BlobRef`; the element-ref slot is not yet reserved — see *Implementation Status & Divergences*.)
 
 ---
 
@@ -934,7 +934,7 @@ CRDT correctness (convergence, tombstones, id derivation, displacement semantics
 
 Decisions that shape the wire format, op model, or schema language. Bind early — adding them after v0.1 ships requires breaking changes.
 
-**Status: all foundational decisions are decided.** Implementation choices (wire codec, compression, framing details, TLS profile, keepalive intervals, op size limits) are deferred to implementation time and can be revisited without breaking the model. ("Decided" means the *design* is settled, not that it is built — several rows are still planned; see *Implementation Status & Divergences* for what has shipped. Note the blob-ref envelope slot is decided but **not yet reserved** in the built op.)
+**Status: all foundational decisions are decided.** Implementation choices (wire codec, compression, framing details, TLS profile, keepalive intervals, op size limits) are deferred to implementation time and can be revisited without breaking the model. ("Decided" means the *design* is settled, not that it is built — several rows are still planned; see *Implementation Status & Divergences* for what has shipped.)
 
 | Status | Decision | Why foundational |
 |--------|----------|------------------|
@@ -976,7 +976,7 @@ This document is the **end-state** — the full scope + intended design; everyth
 - **Auth** — the handshake is Hello → Subscribe today; no Auth phase, no token validation, no `actor_id` (the `AuthFailed` code is reserved, unused). `Hello` carries an untrusted, peer-asserted `client_id`. Three-phase auth + `actor_id` is a v0.2 item.
 - **Connection multiplexing** — a connection binds one room; a second Subscribe switches it. One-connection-many-channels is not built.
 - **Tombstone GC / watermark** — compaction retains all tombstones; no `min(last_seen_seq)` watermark, no retention window ("keep last 3"), only an op-count trigger (no time/migration triggers). Snapshot state grows with tombstones until GC lands.
-- **Blob-ref envelope slot** — the `tx` slot is reserved as promised; the **blob-ref slot is not**. It should be reserved (the doc's own "reserve early, cheap now / painful later" rationale) or the reservation consciously dropped. Tracked in KANBAN.
+- **Element-ref envelope slot** — the `tx` and blob-ref slots are reserved (`Scalar::BlobRef`); the **element-ref value slot is not**. Its shape is under-specified and it carries no v0.1 reservation promise, so it is deferred until its design settles. Tracked in KANBAN.
 - **Op-batching RLE** — the codec frames one op per record; cross-op run-length encoding is a later additive op kind.
 - **Also absent:** Error `details` field, `RelativePosition`/anchor SDK type, client_id generation/persistence in the SDKs (they take a caller-supplied 16-byte id), codec negotiation, and the XmlElement / XmlFragment / RangedElement primitives (v0.5).
 

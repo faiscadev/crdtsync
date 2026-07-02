@@ -11,6 +11,26 @@ pub enum Scalar {
     Bool(bool),
     Int(i64),
     Bytes(Vec<u8>),
+    /// A handle to out-of-band binary content (file, image, media). The bytes
+    /// live in a separate blob store, fetched by handle on render; only the ref
+    /// travels in the op stream. Assigning a new ref is a plain LWW replace, so
+    /// a ref is a leaf value like any other — it has no substructure and does
+    /// not merge.
+    BlobRef(BlobRef),
+}
+
+/// An opaque reference to a blob in the store.
+///
+/// `id` is a public, unguessable handle (never the content hash), so it can
+/// travel to any recipient without leaking whether the store already holds the
+/// bytes. Small blobs carry their bytes in `inline` to skip the fetch round
+/// trip; larger ones leave it empty and are fetched by `id`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BlobRef {
+    pub id: [u8; 16],
+    pub mime: String,
+    pub size: u64,
+    pub inline: Option<Vec<u8>>,
 }
 
 impl Scalar {

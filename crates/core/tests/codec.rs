@@ -8,7 +8,8 @@
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::{Op, OpId, OpKind};
 use crdtsync_core::{
-    decode_op, decode_ops, encode_op, encode_ops, Anchor, DecodeError, Element, Scalar, Side,
+    decode_op, decode_ops, encode_op, encode_ops, Anchor, BlobRef, DecodeError, Element, Scalar,
+    Side,
 };
 
 mod common;
@@ -60,6 +61,24 @@ fn one_of_each() -> Vec<Op> {
         op(OpKind::MapSet {
             key: Vec::new(),
             value: Scalar::Bytes(vec![0, 1, 0, 255]), // embedded NUL is part of the value
+        }),
+        op(OpKind::MapSet {
+            key: b"cover".to_vec(),
+            value: Scalar::BlobRef(BlobRef {
+                id: [3u8; 16],
+                mime: "image/png".to_string(),
+                size: 2048,
+                inline: Some(vec![0x89, b'P', b'N', b'G']),
+            }),
+        }),
+        op(OpKind::RegisterSet {
+            key: b"doc".to_vec(),
+            value: Scalar::BlobRef(BlobRef {
+                id: [4u8; 16],
+                mime: "application/pdf".to_string(),
+                size: 9_000_000,
+                inline: None,
+            }),
         }),
         op(OpKind::MapDelete { key: b"d".to_vec() }),
         op(OpKind::MapCreate { key: b"n".to_vec() }),

@@ -47,6 +47,6 @@ pub use protocol::{
     decode_header, decode_message, encode_header, encode_message, ErrorCode, Message, ProtocolError,
 };
 pub use register::Register;
-pub use scalar::Scalar;
+pub use scalar::{BlobRef, Scalar};
 pub use stamp::Stamp;
 pub use text::Text;
