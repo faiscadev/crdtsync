@@ -586,13 +586,13 @@ WebSocket. WSS over TLS in production.
 
 **One WebSocket per `(server, actor session)`. Logical channels multiplexed per `(room, branch, zone)` subscription.** Subscribe / unsubscribe via in-band control messages, runtime-mutable.
 
-*As built (v0.2):* the server multiplexes many rooms over one connection — each Subscribe opens a client-assigned `Channel`, ops/snapshots/unsubscribes name their channel, and fan-out tags each peer on the channel it opened for the room. The SDK-side `ClientSession` still drives a single room (pinned to one channel); its multi-room extension is planned (see *Implementation Status & Divergences*).
+*As built (v0.2):* the server multiplexes many rooms over one connection — each Subscribe opens a client-assigned `Channel`, ops/snapshots/unsubscribes name their channel, and fan-out tags each peer on the channel it opened for the room. The SDK-side `ClientSession` holds N rooms too, each with its own replica and last-seen sequence, routing inbound frames by channel and resuming per channel. Channels still key on `room`; widening to `(room, branch, zone)` waits on the branch/zone layers.
 
 Five docs in five tabs = five connections (per-tab `client_id`). Five docs in one tab = one connection with five channels.
 
 ## Handshake
 
-Three phases (planned). *As built (v0.2):* two phases — Hello → Subscribe. There is no Auth phase, no `actor_id`, and no token validation yet (the `AuthFailed` error code is reserved but unused); `Hello` carries an untrusted, peer-asserted `client_id`. The Auth phase below is a v0.2 target (see *Implementation Status & Divergences*). Wire structure fixed; credential carrier deployment-pluggable.
+Three phases. *As built (v0.2):* all three — Hello → Auth → Subscribe. The server derives the actor from a verified credential through a pluggable `Verifier` (dev-mode `AllowAll` default; real JWT/OIDC/API-key verifiers plug in via `serve_with_verifier`), `AuthOk` carries the server-derived actor, and `AuthFailed` closes a rejected credential. `Hello` still carries a peer-asserted `client_id` — an addressing handle, not an identity claim; identity is the server-derived actor. Wire structure fixed; credential carrier deployment-pluggable.
 
 1. **Hello** — version + codec negotiation. Format-stable header in the first 8 bytes (4-byte magic + 4-byte protocol version) so new codecs ship in later releases without breaking older clients.
 2. **Auth** — only if credentials weren't present at upgrade. Pluggable carriers: cookie, WS subprotocol, `Authorization` header, in-band, mTLS, API key, query param (supported but logs leak). Credentials opaque bytes interpreted by deployment-configured verifier. Clients never assert `actor_id` — server derives it from verified credential.
@@ -973,12 +973,10 @@ This document is the **end-state** — the full scope + intended design; everyth
 
 ## Planned, not yet built (the prose above reads present-tense — it isn't yet)
 
-- **Auth** — the handshake is Hello → Subscribe today; no Auth phase, no token validation, no `actor_id` (the `AuthFailed` code is reserved, unused). `Hello` carries an untrusted, peer-asserted `client_id`. Three-phase auth + `actor_id` is a v0.2 item.
-- **Connection multiplexing** — the server multiplexes many rooms over one connection via client-assigned channels; the SDK-side `ClientSession` still holds a single room on one channel. Multi-room `ClientSession` is the remaining piece.
 - **Tombstone GC / watermark** — compaction retains all tombstones; no `min(last_seen_seq)` watermark, no retention window ("keep last 3"), only an op-count trigger (no time/migration triggers). Snapshot state grows with tombstones until GC lands.
 - **Element-ref envelope slot** — the `tx` and blob-ref slots are reserved (`Scalar::BlobRef`); the **element-ref value slot is not**. Its shape is under-specified and it carries no v0.1 reservation promise, so it is deferred until its design settles. Tracked in KANBAN.
 - **Op-batching RLE** — the codec frames one op per record; cross-op run-length encoding is a later additive op kind.
-- **Also absent:** Error `details` field, `RelativePosition`/anchor SDK type, client_id generation/persistence in the SDKs (they take a caller-supplied 16-byte id), codec negotiation, and the XmlElement / XmlFragment / RangedElement primitives (v0.5).
+- **Also absent:** `RelativePosition`/anchor SDK type, client_id generation/persistence in the SDKs (they take a caller-supplied 16-byte id), codec negotiation, and the XmlElement / XmlFragment / RangedElement primitives (v0.5). (The Error `details` field is now reserved on the wire — round-tripped, empty, no producer — see §Error Envelope.)
 
 ## Revisit items (accepted now, flagged for a later look)
 
