@@ -271,15 +271,108 @@ pub fn step(
         // Peer updates and clears only travel server-to-client.
         Message::AwarenessUpdate { .. } => violation("client sent an awareness update"),
         Message::AwarenessClear { .. } => violation("client sent an awareness clear"),
-        // Version requests are wired here in a later slice; the responses only
-        // travel server-to-client, so a client sending one is out of order.
-        Message::VersionCreate { .. }
-        | Message::VersionRename { .. }
-        | Message::VersionDelete { .. }
-        | Message::VersionList { .. }
-        | Message::VersionFetch { .. } => violation("version requests are not yet served"),
+        // Versioning is a request/response sub-protocol over the channel's room.
+        // A mutation replies with the fresh name list — the authoritative
+        // post-state — and a list request the same; a fetch that hits replies
+        // with the version's state, and one that misses falls back to the list.
+        Message::VersionCreate { channel, name } => {
+            let Some(room) = version_room(session, channel, authorizer, Action::Write) else {
+                return version_denied(session, channel);
+            };
+            match hub.create_version(&room, &name) {
+                Ok(_) => versions_list(hub, channel, &room),
+                Err(_) => internal("failed to persist version"),
+            }
+        }
+        Message::VersionRename { channel, from, to } => {
+            let Some(room) = version_room(session, channel, authorizer, Action::Write) else {
+                return version_denied(session, channel);
+            };
+            match hub.rename_version(&room, &from, &to) {
+                Ok(_) => versions_list(hub, channel, &room),
+                Err(_) => internal("failed to persist version"),
+            }
+        }
+        Message::VersionDelete { channel, name } => {
+            let Some(room) = version_room(session, channel, authorizer, Action::Write) else {
+                return version_denied(session, channel);
+            };
+            match hub.delete_version(&room, &name) {
+                Ok(_) => versions_list(hub, channel, &room),
+                Err(_) => internal("failed to persist version"),
+            }
+        }
+        Message::VersionList { channel } => {
+            let Some(room) = version_room(session, channel, authorizer, Action::Read) else {
+                return version_denied(session, channel);
+            };
+            versions_list(hub, channel, &room)
+        }
+        Message::VersionFetch { channel, name } => {
+            let Some(room) = version_room(session, channel, authorizer, Action::Read) else {
+                return version_denied(session, channel);
+            };
+            match hub.version_state(&room, &name) {
+                Some(state) => {
+                    let seq = hub.version_seq(&room, &name).unwrap_or(0);
+                    let state = state.to_vec();
+                    Response {
+                        replies: vec![Message::VersionState {
+                            channel,
+                            name,
+                            seq,
+                            state,
+                        }],
+                        ..Response::default()
+                    }
+                }
+                None => versions_list(hub, channel, &room),
+            }
+        }
+        // Version responses only travel server-to-client.
         Message::Versions { .. } => violation("client sent a versions list"),
         Message::VersionState { .. } => violation("client sent a version state"),
+    }
+}
+
+/// Resolve the room a version request targets, having checked the connection is
+/// authenticated, the channel is bound, and the actor is authorized for
+/// `action`. `None` means the request cannot proceed — [`version_denied`]
+/// distinguishes an unbound channel (a violation) from a denial (forbidden).
+fn version_room(
+    session: &Session,
+    channel: Channel,
+    authorizer: &dyn Authorizer,
+    action: Action,
+) -> Option<RoomId> {
+    let actor = session.actor.as_deref()?;
+    let room = session.channels.get(&channel)?.clone();
+    authorizer
+        .authorize(actor, action, &Resource::Room(&room))
+        .then_some(room)
+}
+
+/// The refusal for a version request that [`version_room`] rejected: a violation
+/// if the connection is unauthenticated or the channel is unbound, otherwise a
+/// non-closing forbidden.
+fn version_denied(session: &Session, channel: Channel) -> Response {
+    if session.actor.is_none() {
+        violation("version request before auth")
+    } else if !session.channels.contains_key(&channel) {
+        violation("version request on an unbound channel")
+    } else {
+        forbidden("version request denied")
+    }
+}
+
+/// The reply carrying `room`'s current version names on `channel`.
+fn versions_list(hub: &Hub, channel: Channel, room: &[u8]) -> Response {
+    Response {
+        replies: vec![Message::Versions {
+            channel,
+            names: hub.version_names(room),
+        }],
+        ..Response::default()
     }
 }
 
@@ -299,6 +392,19 @@ fn violation(reason: &str) -> Response {
     Response {
         replies: vec![Message::Error {
             code: ErrorCode::ProtocolViolation,
+            message: reason.to_string(),
+        }],
+        close: true,
+        ..Response::default()
+    }
+}
+
+/// A server-side failure that could not be completed — the write did not land,
+/// so the connection closes rather than advertise a result it cannot back.
+fn internal(reason: &str) -> Response {
+    Response {
+        replies: vec![Message::Error {
+            code: ErrorCode::Internal,
             message: reason.to_string(),
         }],
         close: true,
