@@ -69,6 +69,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **ACL decision flow** — `acl::Acl`, a concrete tuple-walking `Authorizer` (the first real policy on the seam): allow/deny rules over `Subject` (`Actor`/`Authenticated`/`Anonymous`/`Anyone`) × action (`Option<Action>`) × `ResourceMatch` (`AnyRoom`/`Room`), evaluated explicit-deny-wins → allow → default-deny; order-independent; plugs in via `set_authorizer` (#84). Role/group subjects (need a claims model) and schema `@auth` role grants (need the schema layer) deferred. Doc-level ACL-as-CRDT feeds this same evaluator later.
 
+**Access log** — `audit::{AccessLog, AccessRecord, Audited, Decision}`: an `Audited` decorator wraps any inner `Authorizer`, forwards its verdict, and emits each decision (actor, action, resource, verdict) to a pluggable sink — logged at the seam every enforcement point consults, so read-only accesses (subscribe) are captured alongside the writes the op log already records (#85). Never logs the credential; an awareness publish logs the decision only, never the entry's key/value. A distinct `Connect`/snapshot/branch audit action + the query surface are follow-ons (need those actions / an admin CLI).
+
 ---
 
 ## 🚧 In progress
@@ -80,7 +82,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 ## ⏭ Next
 
 - **Authorization — remaining policy layers** — atop the seam (#82), read redaction (#83), and the ACL decision flow (#84): doc-level ACL as CRDT-merged state (tuples live in the document, merge, and feed the #84 evaluator — needs the ACL-CRDT design + per-recipient ACL-tuple redaction, since ACL state is itself privacy-sensitive), role/group subjects (need a claims model threaded from the verifier to the enforcement point), and finer-grain wire redaction (element/zone + cold-start snapshot — room-level per-send landed in #83). Schema-level `@auth` defaults and zones are gated on the unbuilt schema + zone layers. Large — slice per layer. → *Authorization*. (v0.2, needs design)
-- **Audit log** — the op log is already the authoritative record (actor + lamport + timestamp); add the query surface + a separate access log for read-only actions (connect, snapshot export, branch read) that generate no ops. → *Authorization / Audit*. (v0.2)
+- **Audit log — query surface + distinct read-only actions** — the access-decision half landed in #85 (`Audited` emits every authz decision to a pluggable sink). Remaining: an audit *query* surface (admin/CLI over the trail — pairs with the file-log-vs-DB revisit note) and distinct audit actions for accesses that today reach no `authorize` call — `Connect`, snapshot export, branch/version reads — each gated on that action/resource existing (`Action::Connect`, the branch/version layers). → *Authorization / Audit*. (v0.2, partly blocked)
 - **mTLS credential carrier** — a client certificate as the fast-path credential. Blocked: the server terminates plain TCP with no TLS layer to expose the cert; land TLS termination first. → *Networking / Handshake*. (v0.2, blocked on TLS)
 
 ---
