@@ -3,12 +3,12 @@
 //! A document is a structured Element tree, not an opaque blob, so the change
 //! from one snapshot to another is computable as a list of structural changes:
 //! slots added and removed, scalar / register / counter values changed, and a
-//! nested map walked so a deep edit reports at its own path. Sequences (List /
-//! Text) report *that* they changed — element- and char-level detail is a
-//! follow-on. The change list is path-addressed and deterministically ordered,
-//! so two callers diffing the same pair agree.
+//! nested map walked so a deep edit reports at its own path. Sequences diff to
+//! runs by stable id: a List to item inserts/deletes, a Text to codepoint
+//! inserts/deletes. The change list is path-addressed and deterministically
+//! ordered, so two callers diffing the same pair agree.
 
-use crdtsync_core::diff::{diff, Change};
+use crdtsync_core::diff::{diff, Change, SeqItem};
 use crdtsync_core::doc::Document;
 use crdtsync_core::element::ElementKind;
 use crdtsync_core::path::encode_path;
@@ -168,16 +168,43 @@ fn a_slot_that_changes_kind_is_a_remove_then_add() {
 }
 
 #[test]
-fn a_changed_list_reports_the_sequence_differs() {
+fn a_list_insert_reports_the_items_at_their_new_index() {
     let mut d = doc();
     d.transact(|tx| tx.list(b"items").insert(0, Scalar::Int(1)));
     let old = snapshot(&d);
-    d.transact(|tx| tx.list(b"items").insert(1, Scalar::Int(2)));
+    d.transact(|tx| {
+        tx.list(b"items").insert(1, Scalar::Int(2));
+        tx.list(b"items").insert(2, Scalar::Int(3));
+    });
     assert_eq!(
         diff(&old, &d),
-        vec![Change::Sequence {
+        vec![Change::ListInsert {
             path: p(&[b"items"]),
-            kind: ElementKind::List,
+            index: 1,
+            items: vec![
+                SeqItem::Scalar(Scalar::Int(2)),
+                SeqItem::Scalar(Scalar::Int(3))
+            ],
+        }]
+    );
+}
+
+#[test]
+fn a_list_delete_reports_the_items_at_their_old_index() {
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.list(b"items").insert(0, Scalar::Int(1));
+        tx.list(b"items").insert(1, Scalar::Int(2));
+        tx.list(b"items").insert(2, Scalar::Int(3));
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| tx.list(b"items").delete(1)); // [1,2,3] -> [1,3]
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::ListDelete {
+            path: p(&[b"items"]),
+            index: 1,
+            items: vec![SeqItem::Scalar(Scalar::Int(2))],
         }]
     );
 }
