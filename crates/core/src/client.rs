@@ -340,6 +340,13 @@ impl ClientSession {
                 Ok(())
             }
             Message::Error { code, message, .. } => Err(ClientError::Server { code, message }),
+            // The outbox that folds `Accepted` in — pruning acknowledged ops — is
+            // the next unit; until it lands the session holds no outbox to drain,
+            // so an ack is refused rather than silently dropped.
+            Message::Accepted { .. } => Err(ClientError::UnexpectedMessage("server sent accepted")),
+            // `Ack` reports a client's applied sequence to the server; it never
+            // travels the other way.
+            Message::Ack { .. } => Err(ClientError::UnexpectedMessage("server sent an ack")),
             Message::Auth { .. } => Err(ClientError::UnexpectedMessage("server sent auth")),
             Message::AwarenessSet { .. } => Err(ClientError::UnexpectedMessage(
                 "server sent an awareness set",

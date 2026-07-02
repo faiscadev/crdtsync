@@ -240,6 +240,14 @@ pub fn step(
         Message::Snapshot { .. } => violation("client sent a snapshot"),
         Message::Error { .. } => violation("client sent an error"),
         Message::AuthOk { .. } => violation("client sent an authok"),
+        // The client reports its applied sequence; recording it into the
+        // per-client GC watermark is the next unit. Until then the report is
+        // accepted and ignored rather than treated as a violation — a
+        // well-behaved client will send it.
+        Message::Ack { .. } => Response::default(),
+        // `Accepted` is the server's own reply to an author; a client never sends
+        // one.
+        Message::Accepted { .. } => violation("client sent an accepted"),
         Message::AwarenessSet {
             channel,
             key,
