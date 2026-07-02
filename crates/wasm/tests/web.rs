@@ -303,3 +303,52 @@ fn a_client_atomic_transaction_travels_to_a_peer() {
     assert_eq!(b.get_int(sb.channel(), &path(&["x"])), Some(1));
     assert_eq!(b.get_int(sb.channel(), &path(&["y"])), Some(2));
 }
+
+// --- schema-aware diff ---
+
+fn get_str(obj: &wasm_bindgen::JsValue, key: &str) -> String {
+    js_sys::Reflect::get(obj, &wasm_bindgen::JsValue::from_str(key))
+        .unwrap()
+        .as_string()
+        .unwrap()
+}
+
+#[wasm_bindgen_test]
+fn diff_reports_a_value_change_as_a_tagged_object() {
+    let mut a = doc(1);
+    let p = path(&["age"]);
+    a.register_int(&p, 30);
+    let old = a.encode_state();
+    a.register_int(&p, 31);
+    let new = a.encode_state();
+
+    let changes = WasmDocument::diff(&old, &new).unwrap();
+    assert_eq!(changes.len(), 1);
+    let c = &changes[0];
+    assert_eq!(get_str(c, "op"), "value");
+    let newv = js_sys::Reflect::get(c, &"new".into()).unwrap();
+    assert_eq!(get_str(&newv, "t"), "int");
+}
+
+#[wasm_bindgen_test]
+fn diff_reports_a_list_insert_with_an_items_array() {
+    let mut a = doc(1);
+    let p = path(&["xs"]);
+    a.list_insert(&p, 0, &[1, 0, 0, 0, 0, 0, 0, 0]); // one scalar item
+    let old = a.encode_state();
+    a.list_insert(&p, 1, &[2, 0, 0, 0, 0, 0, 0, 0]);
+    let new = a.encode_state();
+
+    let changes = WasmDocument::diff(&old, &new).unwrap();
+    assert_eq!(changes.len(), 1);
+    let c = &changes[0];
+    assert_eq!(get_str(c, "op"), "listInsert");
+    let items = js_sys::Reflect::get(c, &"items".into()).unwrap();
+    let items = js_sys::Array::from(&items);
+    assert_eq!(items.length(), 1);
+}
+
+#[wasm_bindgen_test]
+fn diff_of_a_malformed_snapshot_throws() {
+    assert!(WasmDocument::diff(&[1, 2, 3], &[1, 2, 3]).is_err());
+}
