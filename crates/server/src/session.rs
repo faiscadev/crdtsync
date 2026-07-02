@@ -194,6 +194,10 @@ pub fn step(
         Message::Snapshot { .. } => violation("client sent a snapshot"),
         Message::Error { .. } => violation("client sent an error"),
         Message::AuthOk { .. } => violation("client sent an authok"),
+        // Awareness publish is handled once the ephemeral store lands; a peer
+        // update only travels server-to-client.
+        Message::AwarenessSet { .. } => violation("awareness is not enabled"),
+        Message::AwarenessUpdate { .. } => violation("client sent an awareness update"),
     }
 }
 

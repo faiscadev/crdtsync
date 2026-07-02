@@ -92,6 +92,21 @@ pub enum Message {
         seq: u64,
         state: Vec<u8>,
     },
+    /// Publishes this client's ephemeral awareness entry `key` on `channel`'s
+    /// room, replacing any prior value. Not durable — never logged or snapshotted.
+    AwarenessSet {
+        channel: Channel,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// A peer's awareness entry, fanned out to the room, tagged with the
+    /// publishing actor so receivers know whose it is.
+    AwarenessUpdate {
+        channel: Channel,
+        actor: Vec<u8>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
     /// A failure the server reports to the client.
     Error { code: ErrorCode, message: String },
 }
@@ -164,6 +179,28 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u8(&mut out, 7);
             put_bytes(&mut out, actor);
         }
+        Message::AwarenessSet {
+            channel,
+            key,
+            value,
+        } => {
+            put_u8(&mut out, 8);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, key);
+            put_bytes(&mut out, value);
+        }
+        Message::AwarenessUpdate {
+            channel,
+            actor,
+            key,
+            value,
+        } => {
+            put_u8(&mut out, 9);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, actor);
+            put_bytes(&mut out, key);
+            put_bytes(&mut out, value);
+        }
         Message::Error { code, message } => {
             put_u8(&mut out, 3);
             put_u16(&mut out, error_code_tag(*code));
@@ -223,6 +260,28 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
         7 => Message::AuthOk {
             actor: cur.bytes()?,
         },
+        8 => {
+            let channel = Channel(cur.u32()?);
+            let key = cur.bytes()?;
+            let value = cur.bytes()?;
+            Message::AwarenessSet {
+                channel,
+                key,
+                value,
+            }
+        }
+        9 => {
+            let channel = Channel(cur.u32()?);
+            let actor = cur.bytes()?;
+            let key = cur.bytes()?;
+            let value = cur.bytes()?;
+            Message::AwarenessUpdate {
+                channel,
+                actor,
+                key,
+                value,
+            }
+        }
         tag => {
             return Err(ProtocolError::BadTag {
                 what: "message",

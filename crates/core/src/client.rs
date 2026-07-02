@@ -178,6 +178,12 @@ impl ClientSession {
             }
             Message::Error { code, message } => Err(ClientError::Server { code, message }),
             Message::Auth { .. } => Err(ClientError::UnexpectedMessage("server sent auth")),
+            Message::AwarenessUpdate { .. } => {
+                Err(ClientError::UnexpectedMessage("awareness is not enabled"))
+            }
+            Message::AwarenessSet { .. } => Err(ClientError::UnexpectedMessage(
+                "server sent an awareness set",
+            )),
             Message::Hello { .. } => Err(ClientError::UnexpectedMessage("server sent hello")),
             Message::Subscribe { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent subscribe"))
