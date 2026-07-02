@@ -91,6 +91,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **UndoManager (grouping)** — an undo step is one *intention*: `group(doc, |b| …)` records several edits (via a `Batch`) as a single undo/redo step, reverting them together; the single-edit methods are one-edit groups (#95). Matches ARCHITECTURE's "intentions = op groups." Nested paths + list/text revival are the next slices.
 
+**Counter `dec` end-to-end** — a Counter decrement surfaced through the whole binding stack: `path::dec` → FFI `crdtsync_doc_dec`/`crdtsync_client_dec` → Python/Go/wasm `dec`, mirroring `inc` (#96). Closes an SDK gap (the PN-counter's negative direction had no path/FFI/SDK entry point) and readies nested-counter undo.
+
 ---
 
 ## 🚧 In progress

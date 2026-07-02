@@ -64,6 +64,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_buf_free, [buf], None)
     sig(lib.crdtsync_doc_register_int, [doc, cbytes, size, c.c_int64], buf)
     sig(lib.crdtsync_doc_inc, [doc, cbytes, size, c.c_uint32], buf)
+    sig(lib.crdtsync_doc_dec, [doc, cbytes, size, c.c_uint32], buf)
     sig(lib.crdtsync_doc_set_bytes, [doc, cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_doc_delete, [doc, cbytes, size], buf)
     sig(lib.crdtsync_doc_get_int, [doc, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
@@ -95,6 +96,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_last_seen_seq, [doc, ch, c.POINTER(c.c_uint64)], c.c_int32)
     sig(lib.crdtsync_client_register_int, [doc, ch, cbytes, size, c.c_int64], buf)
     sig(lib.crdtsync_client_inc, [doc, ch, cbytes, size, c.c_uint32], buf)
+    sig(lib.crdtsync_client_dec, [doc, ch, cbytes, size, c.c_uint32], buf)
     sig(lib.crdtsync_client_set_bytes, [doc, ch, cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_client_delete, [doc, ch, cbytes, size], buf)
     sig(lib.crdtsync_client_get_int, [doc, ch, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
@@ -197,6 +199,11 @@ class Document:
         _u32("amount", amount)
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_doc_inc(self._handle, p, len(p), amount))
+
+    def dec(self, path: Path, amount: int) -> bytes:
+        _u32("amount", amount)
+        p = encode_path(path)
+        return _take_buf(_LIB.crdtsync_doc_dec(self._handle, p, len(p), amount))
 
     def set_bytes(self, path: Path, value: bytes) -> bytes:
         p = encode_path(path)
@@ -401,6 +408,12 @@ class Client:
         _u32("amount", amount)
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_client_inc(self._handle, channel, p, len(p), amount))
+
+    def dec(self, channel: int, path: Path, amount: int) -> bytes:
+        _u32("channel", channel)
+        _u32("amount", amount)
+        p = encode_path(path)
+        return _take_buf(_LIB.crdtsync_client_dec(self._handle, channel, p, len(p), amount))
 
     def set_bytes(self, channel: int, path: Path, value: bytes) -> bytes:
         _u32("channel", channel)

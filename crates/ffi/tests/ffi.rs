@@ -38,6 +38,10 @@ unsafe fn inc(doc: *mut CrdtDoc, p: &[u8], amount: u32) -> CrdtBuf {
     crdtsync_doc_inc(doc, p.as_ptr(), p.len(), amount)
 }
 
+unsafe fn dec(doc: *mut CrdtDoc, p: &[u8], amount: u32) -> CrdtBuf {
+    crdtsync_doc_dec(doc, p.as_ptr(), p.len(), amount)
+}
+
 unsafe fn get_int(doc: *const CrdtDoc, p: &[u8]) -> (i32, i64) {
     let mut out: i64 = 0;
     let rc = crdtsync_doc_get_int(doc, p.as_ptr(), p.len(), &mut out);
@@ -124,6 +128,28 @@ fn a_counter_accumulates_across_replicas() {
 
         crdtsync_buf_free(ia);
         crdtsync_buf_free(ib);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn a_counter_decrements_across_replicas() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+
+        let up = inc(a, &path(&[b"stock"]), 10);
+        let down = dec(a, &path(&[b"stock"]), 4);
+        exchange(b, &up);
+        exchange(b, &down);
+
+        assert_eq!(get_counter(a, &path(&[b"stock"])), (1, 6));
+        assert_eq!(get_counter(b, &path(&[b"stock"])).1, 6);
+
+        crdtsync_buf_free(up);
+        crdtsync_buf_free(down);
         crdtsync_doc_free(a);
         crdtsync_doc_free(b);
     }

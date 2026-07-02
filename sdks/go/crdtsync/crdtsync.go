@@ -120,6 +120,12 @@ func (d *Document) Inc(path [][]byte, amount uint32) []byte {
 	return takeBuf(C.crdtsync_doc_inc(d.h, pp, pl, C.uint32_t(amount)))
 }
 
+// Dec installs-or-decrements a Counter at path.
+func (d *Document) Dec(path [][]byte, amount uint32) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_doc_dec(d.h, pp, pl, C.uint32_t(amount)))
+}
+
 // SetBytes sets a bytes scalar at path.
 func (d *Document) SetBytes(path [][]byte, value []byte) []byte {
 	pp, pl := bytesArg(EncodePath(path))
@@ -328,6 +334,12 @@ func (c *Client) RegisterInt(channel uint32, path [][]byte, value int64) []byte 
 func (c *Client) Inc(channel uint32, path [][]byte, amount uint32) []byte {
 	pp, pl := bytesArg(EncodePath(path))
 	return takeBuf(C.crdtsync_client_inc(c.h, C.uint32_t(channel), pp, pl, C.uint32_t(amount)))
+}
+
+// Dec installs-or-decrements a Counter in channel's room.
+func (c *Client) Dec(channel uint32, path [][]byte, amount uint32) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_client_dec(c.h, C.uint32_t(channel), pp, pl, C.uint32_t(amount)))
 }
 
 // SetBytes sets a bytes scalar in channel's room.

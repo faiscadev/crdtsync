@@ -138,6 +138,20 @@ pub unsafe extern "C" fn crdtsync_doc_inc(
     edit(doc, path, path_len, |d, p| path::inc(d, p, amount))
 }
 
+/// Install-or-decrement a Counter at a path. Returns the ops to broadcast.
+///
+/// # Safety
+/// As [`crdtsync_doc_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_dec(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    amount: u32,
+) -> CrdtBuf {
+    edit(doc, path, path_len, |d, p| path::dec(d, p, amount))
+}
+
 /// Set a bytes scalar at a path. Returns the ops to broadcast.
 ///
 /// # Safety
@@ -698,6 +712,24 @@ pub unsafe extern "C" fn crdtsync_client_inc(
 ) -> CrdtBuf {
     client_edit(client, channel, path, path_len, |d, p| {
         path::inc(d, p, amount)
+    })
+}
+
+/// Install-or-decrement a Counter at a path in `channel`'s room. Returns the Ops
+/// frame to send.
+///
+/// # Safety
+/// As [`crdtsync_client_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_dec(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    amount: u32,
+) -> CrdtBuf {
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::dec(d, p, amount)
     })
 }
 

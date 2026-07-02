@@ -32,6 +32,16 @@ def test_counter_accumulates_across_replicas():
         assert b.get_counter([b"n"]) == 7
 
 
+def test_counter_decrements_across_replicas():
+    with Document(cid(1)) as a, Document(cid(2)) as b:
+        up = a.inc([b"stock"], 10)
+        down = a.dec([b"stock"], 4)
+        b.apply(up)
+        b.apply(down)
+        assert a.get_counter([b"stock"]) == 6
+        assert b.get_counter([b"stock"]) == 6
+
+
 def test_nested_path_converges():
     with Document(cid(1)) as a, Document(cid(2)) as b:
         path = [b"profile", b"stats", b"score"]
