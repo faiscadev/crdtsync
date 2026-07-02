@@ -8,7 +8,7 @@
 
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, put_bytes, put_u16, put_u64, put_u8, Cursor, DecodeError,
+    decode_ops, encode_ops, put_bytes, put_u16, put_u32, put_u64, put_u8, Cursor, DecodeError,
 };
 use crate::op::Op;
 
@@ -46,6 +46,13 @@ impl From<DecodeError> for ProtocolError {
     }
 }
 
+/// A connection-local handle for one room subscription. The client assigns it
+/// at Subscribe; every op batch, snapshot, and unsubscribe on that subscription
+/// names it, so several rooms multiplex over one connection. The handle is what
+/// stays stable as a subscription later widens to `(room, branch, zone)`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Channel(pub u32);
+
 /// A closed set of failure reasons the server reports to a client.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ErrorCode {
@@ -61,13 +68,24 @@ pub enum ErrorCode {
 pub enum Message {
     /// Opens a connection, naming the client.
     Hello { client: ClientId },
-    /// Joins a room, requesting every op past `last_seen_seq`.
-    Subscribe { room: Vec<u8>, last_seen_seq: u64 },
-    /// A batch of ops to fold in.
-    Ops(Vec<Op>),
+    /// Joins a room on `channel`, requesting every op past `last_seen_seq`.
+    Subscribe {
+        channel: Channel,
+        room: Vec<u8>,
+        last_seen_seq: u64,
+    },
+    /// Leaves the room bound to `channel`, freeing the handle.
+    Unsubscribe { channel: Channel },
+    /// A batch of ops to fold into `channel`'s room.
+    Ops { channel: Channel, ops: Vec<Op> },
     /// A whole-replica state snapshot the server sends a subscriber that fell
-    /// below a room's compaction floor, tagged with the sequence it lands at.
-    Snapshot { seq: u64, state: Vec<u8> },
+    /// below a room's compaction floor, tagged with the channel it answers and
+    /// the sequence it lands at.
+    Snapshot {
+        channel: Channel,
+        seq: u64,
+        state: Vec<u8>,
+    },
     /// A failure the server reports to the client.
     Error { code: ErrorCode, message: String },
 }
@@ -104,21 +122,33 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             out.extend_from_slice(&client.as_bytes());
         }
         Message::Subscribe {
+            channel,
             room,
             last_seen_seq,
         } => {
             put_u8(&mut out, 1);
+            put_u32(&mut out, channel.0);
             put_bytes(&mut out, room);
             put_u64(&mut out, *last_seen_seq);
         }
-        Message::Ops(ops) => {
+        Message::Ops { channel, ops } => {
             put_u8(&mut out, 2);
+            put_u32(&mut out, channel.0);
             out.extend_from_slice(&encode_ops(ops));
         }
-        Message::Snapshot { seq, state } => {
+        Message::Snapshot {
+            channel,
+            seq,
+            state,
+        } => {
             put_u8(&mut out, 4);
+            put_u32(&mut out, channel.0);
             put_u64(&mut out, *seq);
             put_bytes(&mut out, state);
+        }
+        Message::Unsubscribe { channel } => {
+            put_u8(&mut out, 5);
+            put_u32(&mut out, channel.0);
         }
         Message::Error { code, message } => {
             put_u8(&mut out, 3);
@@ -137,19 +167,23 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             client: cur.client()?,
         },
         1 => {
+            let channel = Channel(cur.u32()?);
             let room = cur.bytes()?;
             let last_seen_seq = cur.u64()?;
             Message::Subscribe {
+                channel,
                 room,
                 last_seen_seq,
             }
         }
-        // An op batch is length-framed and consumes the remainder, so decoding
-        // it is already total.
+        // An op batch is length-framed and consumes the remainder after the
+        // channel, so decoding it is already total.
         2 => {
-            return Ok(Message::Ops(
-                decode_ops(cur.rest()).map_err(ProtocolError::Op)?,
-            ))
+            let channel = Channel(cur.u32()?);
+            return Ok(Message::Ops {
+                channel,
+                ops: decode_ops(cur.rest()).map_err(ProtocolError::Op)?,
+            });
         }
         3 => {
             let code = error_code(cur.u16()?)?;
@@ -157,10 +191,18 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             Message::Error { code, message }
         }
         4 => {
+            let channel = Channel(cur.u32()?);
             let seq = cur.u64()?;
             let state = cur.bytes()?;
-            Message::Snapshot { seq, state }
+            Message::Snapshot {
+                channel,
+                seq,
+                state,
+            }
         }
+        5 => Message::Unsubscribe {
+            channel: Channel(cur.u32()?),
+        },
         tag => {
             return Err(ProtocolError::BadTag {
                 what: "message",

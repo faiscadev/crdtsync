@@ -11,6 +11,7 @@
 
 use std::fs;
 
+use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, Message, Op, Scalar};
 use crdtsync_server::store::Store;
 use crdtsync_server::{Catchup, Hub, Registry, RoomId, RoomLog};
@@ -130,11 +131,18 @@ fn ingest_via(r: &mut Registry, client: u8, room: &[u8], ops: Vec<crdtsync_core:
     assert!(r.deliver(
         id,
         Message::Subscribe {
+            channel: Channel(0),
             room: room.to_vec(),
             last_seen_seq: 0,
         }
     ));
-    assert!(r.deliver(id, Message::Ops(ops)));
+    assert!(r.deliver(
+        id,
+        Message::Ops {
+            channel: Channel(0),
+            ops,
+        }
+    ));
     r.take_outbox(id);
 }
 
@@ -196,12 +204,25 @@ fn catch_up_uses_stable_sequences_across_a_restart() {
         r.deliver(
             id,
             Message::Subscribe {
+                channel: Channel(0),
                 room: ROOM.to_vec(),
                 last_seen_seq: 0,
             },
         );
-        r.deliver(id, Message::Ops(first.clone()));
-        r.deliver(id, Message::Ops(second.clone()));
+        r.deliver(
+            id,
+            Message::Ops {
+                channel: Channel(0),
+                ops: first.clone(),
+            },
+        );
+        r.deliver(
+            id,
+            Message::Ops {
+                channel: Channel(0),
+                ops: second.clone(),
+            },
+        );
     }
 
     // After a restart the sequence numbering is unchanged: a subscriber that

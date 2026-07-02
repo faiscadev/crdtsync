@@ -82,16 +82,23 @@ impl Registry {
             };
             let resp = step(&mut self.hub, &mut conn.session, msg);
             conn.outbox.extend(resp.replies);
-            let room = conn.session.room().map(<[u8]>::to_vec);
-            (resp.broadcast, resp.close, room)
+            (resp.broadcast, resp.close, resp.broadcast_room)
         };
         // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),
-        // so fanning it out never advertises an unpersisted write.
+        // so fanning it out never advertises an unpersisted write. Each peer is
+        // sent the ops on the channel it opened for the room, so a peer
+        // multiplexing several rooms can route what it receives.
         if !broadcast.is_empty() {
             if let Some(room) = room {
                 for (peer, conn) in self.conns.iter_mut() {
-                    if *peer != id && conn.session.room() == Some(room.as_slice()) {
-                        conn.outbox.push(Message::Ops(broadcast.clone()));
+                    if *peer == id {
+                        continue;
+                    }
+                    for channel in conn.session.channels_for_room(&room) {
+                        conn.outbox.push(Message::Ops {
+                            channel,
+                            ops: broadcast.clone(),
+                        });
                     }
                 }
             }

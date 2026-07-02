@@ -9,7 +9,10 @@
 //! messages out; the transport moves the bytes.
 
 use crate::doc::MapCursor;
-use crate::{ClientId, Document, ErrorCode, Message};
+use crate::{Channel, ClientId, Document, ErrorCode, Message};
+
+/// The single room a `ClientSession` holds, until it multiplexes several.
+const CHANNEL: Channel = Channel(0);
 
 /// Why an inbound message could not be folded into the replica.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -56,6 +59,7 @@ impl ClientSession {
     pub fn subscribe(&mut self, room: &[u8]) -> Message {
         self.room = Some(room.to_vec());
         Message::Subscribe {
+            channel: CHANNEL,
             room: room.to_vec(),
             last_seen_seq: self.last_seen_seq,
         }
@@ -68,7 +72,10 @@ impl ClientSession {
     where
         F: FnOnce(&mut MapCursor),
     {
-        Message::Ops(self.doc.transact(f))
+        Message::Ops {
+            channel: CHANNEL,
+            ops: self.doc.transact(f),
+        }
     }
 
     /// Fold one server message into the replica. An op delta applies in place; a
@@ -77,7 +84,7 @@ impl ClientSession {
     /// decode, are refused without touching the replica.
     pub fn receive(&mut self, msg: Message) -> Result<(), ClientError> {
         match msg {
-            Message::Ops(ops) => {
+            Message::Ops { ops, .. } => {
                 // The delta is a contiguous run of ops at the head, each holding
                 // one server sequence, so the seen sequence advances by the
                 // batch length — a redelivered op still occupies its slot even
@@ -89,7 +96,7 @@ impl ClientSession {
                 self.last_seen_seq += count;
                 Ok(())
             }
-            Message::Snapshot { seq, state } => {
+            Message::Snapshot { seq, state, .. } => {
                 // Adopt the server's state but keep our own identity for the ops
                 // we author next.
                 let doc = Document::decode_state_as(self.client, &state)
@@ -102,6 +109,9 @@ impl ClientSession {
             Message::Hello { .. } => Err(ClientError::UnexpectedMessage("server sent hello")),
             Message::Subscribe { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent subscribe"))
+            }
+            Message::Unsubscribe { .. } => {
+                Err(ClientError::UnexpectedMessage("server sent unsubscribe"))
             }
         }
     }

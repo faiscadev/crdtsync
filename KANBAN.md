@@ -45,6 +45,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Forward-compat reservations** — blob-ref value slot `Scalar::BlobRef` reserved in the op envelope + codec (#60).
 
+**Channel multiplexing (server)** — one connection multiplexes many rooms via client-assigned `Channel`; `Subscribe`/`Ops`/`Snapshot` carry a channel, new `Unsubscribe`; server session holds channel→room, registry fans out per peer-channel (#61).
+
 ---
 
 ## 🚧 In progress
@@ -55,7 +57,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Multi-room subscription over one connection** — a session holds several rooms, an inbound op batch names its room, fan-out routes per room. Needs a wire decision (an `Ops`→room tag, or a per-room channel id) — a protocol change, scope as one. First step of channel multiplexing.
+- **ClientSession multi-room** — the SDK-side driver holds several rooms at once, each on its own `Channel`, routing inbound ops/snapshots by channel and tracking a per-room last-seen sequence. The client half of channel multiplexing (server half landed #61). No wire change — the `Channel`-bearing protocol is already in place.
 
 ---
 

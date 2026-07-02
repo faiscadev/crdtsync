@@ -14,7 +14,16 @@
 //! replica deduplicates.
 
 use crdtsync_core::client::{ClientError, ClientSession};
-use crdtsync_core::{ClientId, Document, Element, ErrorCode, Message, Op, Scalar};
+use crdtsync_core::{Channel, ClientId, Document, Element, ErrorCode, Message, Op, Scalar};
+
+/// A server-to-client op delta. The channel is immaterial to a single-room
+/// `ClientSession`, which folds the ops regardless.
+fn ops_msg(ops: Vec<Op>) -> Message {
+    Message::Ops {
+        channel: Channel(0),
+        ops,
+    }
+}
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -50,7 +59,7 @@ fn counter(e: Option<Element>) -> i64 {
 /// Unwrap the ops of a `Message::Ops`.
 fn ops_of(m: Message) -> Vec<Op> {
     match m {
-        Message::Ops(ops) => ops,
+        Message::Ops { ops, .. } => ops,
         other => panic!("expected Ops, got {other:?}"),
     }
 }
@@ -75,6 +84,7 @@ fn subscribe_binds_the_room_and_requests_from_zero() {
         Message::Subscribe {
             room,
             last_seen_seq,
+            ..
         } => {
             assert_eq!(room, ROOM);
             // A fresh client has caught up to nothing.
@@ -97,7 +107,7 @@ fn an_ops_catch_up_converges_the_replica_and_tracks_the_sequence() {
 
     let mut session = ClientSession::new(cid(2));
     session.subscribe(ROOM);
-    session.receive(Message::Ops(delta)).unwrap();
+    session.receive(ops_msg(delta)).unwrap();
 
     assert_eq!(int(session.document().get(b"a")), 1);
     assert_eq!(int(session.document().get(b"b")), 2);
@@ -119,6 +129,7 @@ fn a_snapshot_catch_up_rebuilds_the_replica_and_adopts_the_sequence() {
     session.subscribe(ROOM);
     session
         .receive(Message::Snapshot {
+            channel: Channel(0),
             seq: 9,
             state: srv.encode_state(),
         })
@@ -137,12 +148,12 @@ fn live_ops_advance_the_replica_and_the_sequence() {
 
     let mut session = ClientSession::new(cid(2));
     session.subscribe(ROOM);
-    session.receive(Message::Ops(first)).unwrap();
+    session.receive(ops_msg(first)).unwrap();
     assert_eq!(session.last_seen_seq(), 1);
 
     // A later broadcast lands on top and carries the sequence forward.
     let later = srv.transact(|tx| tx.register(b"b", Scalar::Int(2)));
-    session.receive(Message::Ops(later)).unwrap();
+    session.receive(ops_msg(later)).unwrap();
     assert_eq!(int(session.document().get(b"b")), 2);
     assert_eq!(session.last_seen_seq(), 2);
 }
@@ -157,7 +168,7 @@ fn reconnect_subscribes_from_the_last_seen_sequence() {
 
     let mut session = ClientSession::new(cid(2));
     session.subscribe(ROOM);
-    session.receive(Message::Ops(delta)).unwrap();
+    session.receive(ops_msg(delta)).unwrap();
 
     // Reconnecting, the client asks only for what it missed past its position —
     // the server can answer with a small delta instead of the whole log.
@@ -174,12 +185,12 @@ fn a_redelivered_op_is_idempotent_but_still_advances_the_sequence() {
 
     let mut session = ClientSession::new(cid(2));
     session.subscribe(ROOM);
-    session.receive(Message::Ops(op.clone())).unwrap();
+    session.receive(ops_msg(op.clone())).unwrap();
     assert_eq!(session.last_seen_seq(), 1);
 
     // The same op redelivered (a resend, or the client's own write echoed on a
     // reconnect) does not re-apply, but it still holds a server sequence.
-    session.receive(Message::Ops(op)).unwrap();
+    session.receive(ops_msg(op)).unwrap();
     assert_eq!(int(session.document().get(b"a")), 1);
     assert_eq!(session.last_seen_seq(), 2);
 }
@@ -217,13 +228,14 @@ fn a_snapshot_replaces_prior_local_state_with_the_server_state() {
     let mut session = ClientSession::new(cid(2));
     session.subscribe(ROOM);
     session
-        .receive(Message::Ops(
+        .receive(ops_msg(
             peer.transact(|tx| tx.register(b"a", Scalar::Int(99))),
         ))
         .unwrap();
 
     session
         .receive(Message::Snapshot {
+            channel: Channel(0),
             seq: 2,
             state: srv.encode_state(),
         })
@@ -244,6 +256,7 @@ fn edits_after_a_snapshot_still_carry_the_clients_own_id() {
     session.subscribe(ROOM);
     session
         .receive(Message::Snapshot {
+            channel: Channel(0),
             seq: 1,
             state: srv.encode_state(),
         })
@@ -262,9 +275,10 @@ fn a_garbage_snapshot_is_rejected_and_leaves_the_replica_intact() {
 
     let mut session = ClientSession::new(cid(2));
     session.subscribe(ROOM);
-    session.receive(Message::Ops(op)).unwrap();
+    session.receive(ops_msg(op)).unwrap();
 
     let err = session.receive(Message::Snapshot {
+        channel: Channel(0),
         seq: 5,
         state: vec![0xFF, 0xFF, 0xFF, 0xFF],
     });
@@ -301,6 +315,7 @@ fn a_client_only_message_from_the_server_is_a_violation() {
     ));
     assert!(matches!(
         session.receive(Message::Subscribe {
+            channel: Channel(0),
             room: ROOM.to_vec(),
             last_seen_seq: 0,
         }),
