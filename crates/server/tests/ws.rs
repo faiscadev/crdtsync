@@ -220,7 +220,16 @@ async fn a_late_joiner_catches_up() {
     assert_eq!(recv(&mut a).await, ops_msg(Vec::new()));
 
     let ops = sample_ops();
+    let through = ops.iter().map(|o| o.id.seq).max().unwrap();
     send(&mut a, &ops_msg(ops.clone())).await;
+    // The server acknowledges the author's batch before anything else.
+    assert_eq!(
+        recv(&mut a).await,
+        Message::Accepted {
+            channel: Channel(0),
+            through
+        }
+    );
 
     // Barrier: a subscribes the room again on a second channel and reads its own
     // op back, proving the server ingested it before the late joiner subscribes.

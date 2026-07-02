@@ -217,11 +217,21 @@ pub fn step(
             if !authorizer.authorize(actor, Action::Write, &Resource::Room(&room)) {
                 return forbidden("write denied");
             }
+            // The batch's highest per-client op sequence: the frontier the author
+            // is acknowledged through once the ops are durably logged, so it can
+            // prune its outbox. Computed over the whole submitted batch, not just
+            // the fresh ops, so a resent op the hub already holds is still acked
+            // and pruned. An empty batch acknowledges nothing.
+            let through = ops.iter().map(|op| op.id.seq).max();
             // The deduped ops fan out to the room's other subscribers; nothing
             // echoes back to the sender. A hub that cannot durably record the
             // ops rejects the write rather than advertising an unpersisted one.
             match hub.ingest(&room, ops) {
                 Ok(applied) => Response {
+                    replies: through
+                        .map(|through| Message::Accepted { channel, through })
+                        .into_iter()
+                        .collect(),
                     broadcast: applied,
                     broadcast_room: Some(room),
                     ..Response::default()
