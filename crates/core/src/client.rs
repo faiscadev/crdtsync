@@ -27,12 +27,13 @@ pub enum ClientError {
     Server { code: ErrorCode, message: String },
 }
 
-/// One subscribed room: its local replica, the room name, and how far it has
-/// caught up.
+/// One subscribed room: its local replica, the room name, how far it has caught
+/// up, and the peers' ephemeral awareness entries keyed by `(actor, key)`.
 struct Room {
     room: Vec<u8>,
     doc: Document,
     last_seen_seq: u64,
+    awareness: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
 }
 
 /// A replica's connection carrying several room subscriptions, each keyed by the
@@ -86,6 +87,7 @@ impl ClientSession {
                 room: room.to_vec(),
                 doc: Document::new(self.client),
                 last_seen_seq: 0,
+                awareness: HashMap::new(),
             },
         );
         (
@@ -123,6 +125,32 @@ impl ClientSession {
             channel,
             ops: room.doc.transact(f),
         })
+    }
+
+    /// Publish an ephemeral awareness entry on `channel`'s room, returning the
+    /// frame to send. `None` if the channel isn't held. The entry is transient —
+    /// it is not stored locally or reflected back.
+    pub fn set_awareness(&self, channel: Channel, key: &[u8], value: &[u8]) -> Option<Message> {
+        self.rooms.get(&channel)?;
+        Some(Message::AwarenessSet {
+            channel,
+            key: key.to_vec(),
+            value: value.to_vec(),
+        })
+    }
+
+    /// A peer's awareness entry on `channel`, by publishing actor and key.
+    pub fn awareness(&self, channel: Channel, actor: &[u8], key: &[u8]) -> Option<&[u8]> {
+        self.rooms
+            .get(&channel)?
+            .awareness
+            .get(&(actor.to_vec(), key.to_vec()))
+            .map(Vec::as_slice)
+    }
+
+    /// How many awareness entries `channel` currently holds.
+    pub fn awareness_len(&self, channel: Channel) -> usize {
+        self.rooms.get(&channel).map_or(0, |r| r.awareness.len())
     }
 
     /// Leave the room on `channel`, dropping its replica. Returns the Unsubscribe
@@ -176,11 +204,23 @@ impl ClientSession {
                 self.actor = Some(actor);
                 Ok(())
             }
+            Message::AwarenessUpdate {
+                channel,
+                actor,
+                key,
+                value,
+            } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
+                // Last-writer-wins per (actor, key); the peer's latest entry
+                // replaces any prior one.
+                room.awareness.insert((actor, key), value);
+                Ok(())
+            }
             Message::Error { code, message } => Err(ClientError::Server { code, message }),
             Message::Auth { .. } => Err(ClientError::UnexpectedMessage("server sent auth")),
-            Message::AwarenessUpdate { .. } => {
-                Err(ClientError::UnexpectedMessage("awareness is not enabled"))
-            }
             Message::AwarenessSet { .. } => Err(ClientError::UnexpectedMessage(
                 "server sent an awareness set",
             )),
