@@ -17,7 +17,7 @@ import platform
 import struct
 from typing import List, Optional, Tuple
 
-__all__ = ["Client", "Document", "encode_path"]
+__all__ = ["Client", "Document", "Undo", "encode_path"]
 
 Path = List[bytes]
 
@@ -81,6 +81,23 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_apply, [doc, cbytes, size], c.c_int32)
     sig(lib.crdtsync_doc_encode_state, [doc], buf)
     sig(lib.crdtsync_doc_decode_state, [cbytes, size], doc)
+
+    # undo / redo
+    undo = c.c_void_p
+    sig(lib.crdtsync_undo_new, [], undo)
+    sig(lib.crdtsync_undo_free, [undo], None)
+    sig(lib.crdtsync_undo_register_int, [undo, doc, cbytes, size, c.c_int64], buf)
+    sig(lib.crdtsync_undo_inc, [undo, doc, cbytes, size, c.c_uint32], buf)
+    sig(lib.crdtsync_undo_dec, [undo, doc, cbytes, size, c.c_uint32], buf)
+    sig(lib.crdtsync_undo_delete, [undo, doc, cbytes, size], buf)
+    sig(lib.crdtsync_undo_list_insert, [undo, doc, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_undo_list_delete, [undo, doc, cbytes, size, size], buf)
+    sig(lib.crdtsync_undo_text_insert, [undo, doc, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_undo_text_delete, [undo, doc, cbytes, size, size, size], buf)
+    sig(lib.crdtsync_undo_undo, [undo, doc], buf)
+    sig(lib.crdtsync_undo_redo, [undo, doc], buf)
+    sig(lib.crdtsync_undo_can_undo, [undo], c.c_int32)
+    sig(lib.crdtsync_undo_can_redo, [undo], c.c_int32)
 
     # wire client session
     ch = c.c_uint32
@@ -311,6 +328,106 @@ class Document:
         out = _CrdtBuf()
         rc = fn(self._handle, p, len(p), ctypes.byref(out))
         return _take_buf(out) if rc == 1 else None
+
+
+class Undo:
+    """A per-user undo/redo manager over a :class:`Document`.
+
+    Each edit made through the manager records its inverse; :meth:`undo` and
+    :meth:`redo` emit ordinary ops that converge on peers like any edit. The
+    manager is separate from the document it drives, so every call names the
+    document.
+    """
+
+    def __init__(self):
+        self._handle = _LIB.crdtsync_undo_new()
+        if not self._handle:
+            raise RuntimeError("failed to open undo manager")
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None):
+            _LIB.crdtsync_undo_free(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> "Undo":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+    def register_int(self, doc: "Document", path: Path, value: int) -> bytes:
+        _i64("value", value)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_undo_register_int(self._handle, doc._handle, p, len(p), value)
+        )
+
+    def inc(self, doc: "Document", path: Path, amount: int) -> bytes:
+        _u32("amount", amount)
+        p = encode_path(path)
+        return _take_buf(_LIB.crdtsync_undo_inc(self._handle, doc._handle, p, len(p), amount))
+
+    def dec(self, doc: "Document", path: Path, amount: int) -> bytes:
+        _u32("amount", amount)
+        p = encode_path(path)
+        return _take_buf(_LIB.crdtsync_undo_dec(self._handle, doc._handle, p, len(p), amount))
+
+    def delete(self, doc: "Document", path: Path) -> bytes:
+        p = encode_path(path)
+        return _take_buf(_LIB.crdtsync_undo_delete(self._handle, doc._handle, p, len(p)))
+
+    def list_insert(self, doc: "Document", path: Path, index: int, value: bytes) -> bytes:
+        _usize("index", index)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_undo_list_insert(
+                self._handle, doc._handle, p, len(p), index, value, len(value)
+            )
+        )
+
+    def list_delete(self, doc: "Document", path: Path, index: int) -> bytes:
+        _usize("index", index)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_undo_list_delete(self._handle, doc._handle, p, len(p), index)
+        )
+
+    def text_insert(self, doc: "Document", path: Path, index: int, text: str) -> bytes:
+        _usize("index", index)
+        p = encode_path(path)
+        s = text.encode("utf-8")
+        return _take_buf(
+            _LIB.crdtsync_undo_text_insert(
+                self._handle, doc._handle, p, len(p), index, s, len(s)
+            )
+        )
+
+    def text_delete(self, doc: "Document", path: Path, index: int, count: int) -> bytes:
+        _usize("index", index)
+        _usize("count", count)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_undo_text_delete(
+                self._handle, doc._handle, p, len(p), index, count
+            )
+        )
+
+    def undo(self, doc: "Document") -> bytes:
+        """Revert the most recent intention; returns the ops (empty if none)."""
+        return _take_buf(_LIB.crdtsync_undo_undo(self._handle, doc._handle))
+
+    def redo(self, doc: "Document") -> bytes:
+        """Replay the most recently undone intention; returns the ops (empty if none)."""
+        return _take_buf(_LIB.crdtsync_undo_redo(self._handle, doc._handle))
+
+    def can_undo(self) -> bool:
+        return _LIB.crdtsync_undo_can_undo(self._handle) == 1
+
+    def can_redo(self) -> bool:
+        return _LIB.crdtsync_undo_can_redo(self._handle) == 1
 
 
 class Client:

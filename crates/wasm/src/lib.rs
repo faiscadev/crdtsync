@@ -10,7 +10,7 @@
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_ops, path, Channel, ClientId, ClientSession,
-    Document, Message,
+    Document, Message, Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
 
@@ -153,6 +153,122 @@ impl WasmDocument {
             Ok(ops) => ops.iter().filter(|op| self.inner.apply(op)).count() as i32,
             Err(_) => -1,
         }
+    }
+}
+
+/// A per-user undo/redo manager over a [`WasmDocument`]. Each edit made through
+/// it records its inverse; `undo`/`redo` emit ordinary ops that converge on peers
+/// like any edit. The manager is separate from the document it drives, so every
+/// call names the document.
+#[wasm_bindgen]
+pub struct WasmUndo {
+    inner: UndoManager,
+}
+
+#[wasm_bindgen]
+impl WasmUndo {
+    /// Open an undo manager.
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmUndo {
+        WasmUndo {
+            inner: UndoManager::new(),
+        }
+    }
+
+    /// Set an integer Register at a path as one undo step. Returns the ops.
+    #[wasm_bindgen(js_name = registerInt)]
+    pub fn register_int(&mut self, doc: &mut WasmDocument, path: &[u8], value: i64) -> Vec<u8> {
+        encode_ops(
+            &self
+                .inner
+                .register(&mut doc.inner, path, Scalar::Int(value)),
+        )
+    }
+
+    /// Increment a Counter at a path as one undo step.
+    pub fn inc(&mut self, doc: &mut WasmDocument, path: &[u8], amount: u32) -> Vec<u8> {
+        encode_ops(&self.inner.inc(&mut doc.inner, path, amount))
+    }
+
+    /// Decrement a Counter at a path as one undo step.
+    pub fn dec(&mut self, doc: &mut WasmDocument, path: &[u8], amount: u32) -> Vec<u8> {
+        encode_ops(&self.inner.dec(&mut doc.inner, path, amount))
+    }
+
+    /// Tombstone the Register slot at a path as one undo step.
+    pub fn delete(&mut self, doc: &mut WasmDocument, path: &[u8]) -> Vec<u8> {
+        encode_ops(&self.inner.delete(&mut doc.inner, path))
+    }
+
+    /// Insert a bytes item at a live index in the List at a path as one undo step.
+    #[wasm_bindgen(js_name = listInsert)]
+    pub fn list_insert(
+        &mut self,
+        doc: &mut WasmDocument,
+        path: &[u8],
+        index: usize,
+        value: &[u8],
+    ) -> Vec<u8> {
+        encode_ops(&self.inner.list_insert(&mut doc.inner, path, index, value))
+    }
+
+    /// Tombstone the live item at an index in the List at a path as one undo step.
+    #[wasm_bindgen(js_name = listDelete)]
+    pub fn list_delete(&mut self, doc: &mut WasmDocument, path: &[u8], index: usize) -> Vec<u8> {
+        encode_ops(&self.inner.list_delete(&mut doc.inner, path, index))
+    }
+
+    /// Insert text at a codepoint index in the Text at a path as one undo step.
+    #[wasm_bindgen(js_name = textInsert)]
+    pub fn text_insert(
+        &mut self,
+        doc: &mut WasmDocument,
+        path: &[u8],
+        index: usize,
+        s: &str,
+    ) -> Vec<u8> {
+        encode_ops(&self.inner.text_insert(&mut doc.inner, path, index, s))
+    }
+
+    /// Tombstone `count` codepoints from an index in the Text at a path as one
+    /// undo step.
+    #[wasm_bindgen(js_name = textDelete)]
+    pub fn text_delete(
+        &mut self,
+        doc: &mut WasmDocument,
+        path: &[u8],
+        index: usize,
+        count: usize,
+    ) -> Vec<u8> {
+        encode_ops(&self.inner.text_delete(&mut doc.inner, path, index, count))
+    }
+
+    /// Revert the most recent intention; returns the ops (empty if none).
+    pub fn undo(&mut self, doc: &mut WasmDocument) -> Vec<u8> {
+        encode_ops(&self.inner.undo(&mut doc.inner).unwrap_or_default())
+    }
+
+    /// Replay the most recently undone intention; returns the ops (empty if none).
+    pub fn redo(&mut self, doc: &mut WasmDocument) -> Vec<u8> {
+        encode_ops(&self.inner.redo(&mut doc.inner).unwrap_or_default())
+    }
+
+    /// Whether there is a recorded intention to undo.
+    #[wasm_bindgen(js_name = canUndo)]
+    pub fn can_undo(&self) -> bool {
+        self.inner.can_undo()
+    }
+
+    /// Whether there is an undone intention to redo.
+    #[wasm_bindgen(js_name = canRedo)]
+    pub fn can_redo(&self) -> bool {
+        self.inner.can_redo()
+    }
+}
+
+impl Default for WasmUndo {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

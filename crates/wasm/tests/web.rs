@@ -158,6 +158,55 @@ fn encode_path_frames_keys() {
     assert_eq!(got, vec![2, 0, 0, 0, b'a', b'b', 1, 0, 0, 0, b'c']);
 }
 
+use crdtsync_wasm::WasmUndo;
+
+#[wasm_bindgen_test]
+fn undo_and_redo_a_register() {
+    let mut d = doc(1);
+    let mut u = WasmUndo::new();
+    let p = path(&["title"]);
+    u.register_int(&mut d, &p, 1);
+    u.register_int(&mut d, &p, 2);
+    assert_eq!(d.get_int(&p), Some(2));
+    assert!(u.can_undo());
+
+    u.undo(&mut d);
+    assert_eq!(d.get_int(&p), Some(1));
+    u.redo(&mut d);
+    assert_eq!(d.get_int(&p), Some(2));
+    assert!(!u.can_redo());
+}
+
+#[wasm_bindgen_test]
+fn undo_covers_list_and_text() {
+    let mut d = doc(1);
+    let mut u = WasmUndo::new();
+
+    let items = path(&["items"]);
+    u.list_insert(&mut d, &items, 0, b"a");
+    assert_eq!(d.list_len(&items), Some(1));
+    u.undo(&mut d);
+    assert_eq!(d.list_len(&items), Some(0));
+
+    let body = path(&["body"]);
+    u.text_insert(&mut d, &body, 0, "hi");
+    assert_eq!(d.text_get(&body), Some("hi".to_string()));
+    u.undo(&mut d);
+    assert_eq!(d.text_get(&body), Some(String::new()));
+}
+
+#[wasm_bindgen_test]
+fn a_wasm_undo_converges_on_a_peer() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let mut u = WasmUndo::new();
+    let p = path(&["votes"]);
+    b.apply(&u.inc(&mut a, &p, 5));
+    assert_eq!(b.get_counter(&p), Some(5));
+    b.apply(&u.undo(&mut a));
+    assert_eq!(b.get_counter(&p), Some(0));
+}
+
 use crdtsync_wasm::WasmClient;
 
 fn wasm_client(first: u8) -> WasmClient {
