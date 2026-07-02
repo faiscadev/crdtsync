@@ -957,7 +957,7 @@ Can land cleanly later without breaking the v0.1 model: editor adapter contract,
 
 # Implementation Status & Divergences
 
-This document is the **plan of record** — the design intent. The **live build board is [KANBAN.md](KANBAN.md)**. As the Rust core, server, and SDKs were built (v0.1 → v0.2, 2026-07), several concrete choices diverged from the prose above. This section is the reconciliation: where they disagree, the note here (and the code) is authoritative.
+This document is the **end-state** — the full scope + intended design; everything here is meant to be built eventually. The **live worklist is [KANBAN.md](KANBAN.md)** (the prioritized breakdown of what's not yet built), and design changes that implementation forced are logged in [DECISIONS.md](DECISIONS.md). As the Rust core, server, and SDKs were built (v0.1 → v0.2, 2026-07), several concrete choices diverged from the prose above. This section is the reconciliation: where they disagree, the note here (and the code) is authoritative.
 
 ## Deliberate divergences — code is authoritative
 
