@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::doc::MapCursor;
-use crate::{Channel, ClientId, Document, ErrorCode, Message};
+use crate::{Channel, ClientId, Document, ErrorCode, Message, Op};
 
 /// Why an inbound message could not be folded into a replica.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -28,13 +28,14 @@ pub enum ClientError {
 }
 
 /// One subscribed room: its local replica, the room name, how far it has caught
-/// up, the peers' ephemeral awareness entries keyed by `(actor, key)`, and the
-/// version view — the last name list the server reported and any fetched version
-/// states keyed by name.
+/// up, the outbox of authored-but-unacknowledged ops, the peers' ephemeral
+/// awareness entries keyed by `(actor, key)`, and the version view — the last
+/// name list the server reported and any fetched version states keyed by name.
 struct Room {
     room: Vec<u8>,
     doc: Document,
     last_seen_seq: u64,
+    outbox: Vec<Op>,
     awareness: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
     version_names: Vec<Vec<u8>>,
     version_states: HashMap<Vec<u8>, (u64, Vec<u8>)>,
@@ -91,6 +92,7 @@ impl ClientSession {
                 room: room.to_vec(),
                 doc: Document::new(self.client),
                 last_seen_seq: 0,
+                outbox: Vec::new(),
                 awareness: HashMap::new(),
                 version_names: Vec::new(),
                 version_states: HashMap::new(),
@@ -118,6 +120,27 @@ impl ClientSession {
         })
     }
 
+    /// Re-emit the authored ops on `channel` the server has not yet acknowledged,
+    /// as one `Message::Ops` to replay after a reconnect. `None` if the channel
+    /// isn't held or nothing is outstanding. The server deduplicates a replayed
+    /// op by its id, so replaying more than it kept is harmless.
+    pub fn resend(&self, channel: Channel) -> Option<Message> {
+        let room = self.rooms.get(&channel)?;
+        if room.outbox.is_empty() {
+            return None;
+        }
+        Some(Message::Ops {
+            channel,
+            ops: room.outbox.clone(),
+        })
+    }
+
+    /// How many authored ops on `channel` await acknowledgement — the depth of
+    /// the offline queue. `0` if the channel isn't held.
+    pub fn outbox_len(&self, channel: Channel) -> usize {
+        self.rooms.get(&channel).map_or(0, |r| r.outbox.len())
+    }
+
     /// Apply a local edit to `channel`'s room and return the ops to broadcast.
     /// The seen sequence is the server's, so an unacknowledged local write
     /// leaves it untouched until the ops come back with a sequence assigned.
@@ -127,10 +150,9 @@ impl ClientSession {
         F: FnOnce(&mut MapCursor),
     {
         let room = self.rooms.get_mut(&channel)?;
-        Some(Message::Ops {
-            channel,
-            ops: room.doc.transact(f),
-        })
+        let ops = room.doc.transact(f);
+        room.outbox.extend(ops.iter().cloned());
+        Some(Message::Ops { channel, ops })
     }
 
     /// Like [`edit`](Self::edit), but the emitted ops form one atomic
@@ -143,10 +165,9 @@ impl ClientSession {
         F: FnOnce(&mut MapCursor),
     {
         let room = self.rooms.get_mut(&channel)?;
-        Some(Message::Ops {
-            channel,
-            ops: room.doc.atomic_transact(f),
-        })
+        let ops = room.doc.atomic_transact(f);
+        room.outbox.extend(ops.iter().cloned());
+        Some(Message::Ops { channel, ops })
     }
 
     /// Begin recording an atomic transaction on `channel`'s room: subsequent
@@ -164,10 +185,9 @@ impl ClientSession {
     /// `None` if the channel isn't held.
     pub fn commit_atomic(&mut self, channel: Channel) -> Option<Message> {
         let room = self.rooms.get_mut(&channel)?;
-        Some(Message::Ops {
-            channel,
-            ops: room.doc.commit_atomic(),
-        })
+        let ops = room.doc.commit_atomic();
+        room.outbox.extend(ops.iter().cloned());
+        Some(Message::Ops { channel, ops })
     }
 
     /// Publish an ephemeral awareness entry on `channel`'s room, returning the
@@ -340,10 +360,18 @@ impl ClientSession {
                 Ok(())
             }
             Message::Error { code, message, .. } => Err(ClientError::Server { code, message }),
-            // The outbox that folds `Accepted` in — pruning acknowledged ops — is
-            // the next unit; until it lands the session holds no outbox to drain,
-            // so an ack is refused rather than silently dropped.
-            Message::Accepted { .. } => Err(ClientError::UnexpectedMessage("server sent accepted")),
+            Message::Accepted { channel, through } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
+                // Drop every authored op the server has durably logged. The
+                // per-client op sequence is the stable ack key — it is the dedup
+                // identity, so a resent op re-acks to the same frontier and the
+                // prune is idempotent.
+                room.outbox.retain(|op| op.id.seq > through);
+                Ok(())
+            }
             // `Ack` reports a client's applied sequence to the server; it never
             // travels the other way.
             Message::Ack { .. } => Err(ClientError::UnexpectedMessage("server sent an ack")),
