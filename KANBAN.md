@@ -37,7 +37,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **SDKs** — C ABI / FFI (#34–#36), cbindgen header (#37), Python (#38), Go (#39), shared `core::path` navigation façade (#45), WebAssembly / JS (#46).
 
-**Correctness** — counter identity across displacement fixed (#48); randomized convergence property harness (#49/#50); server durability property fuzz (#51).
+**Correctness** — counter identity across displacement fixed (#48); randomized convergence property harness (#49/#50); server durability property fuzz (#51); schema-aware diff soundness/completeness property (#114 — over random edit sequences, `diff` is empty iff an observable read of the two replicas is equal, round-trips through its codec, and is deterministic; oracle is a materialized read, not `encode_state`, since a no-op edit shifts causal metadata the diff correctly ignores).
 
 **v0.2 state codec + compaction (arc complete)** — leaf-value (#52), sequence-CRDT (#53), whole-replica document (#54) state serialization, in-memory op-log compaction + `Message::Snapshot` (#55), durable disk-log compaction crash-safe (#56), SDK snapshot-decode (#57), automatic compaction policy (#58).
 
