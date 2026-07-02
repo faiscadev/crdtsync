@@ -103,6 +103,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **UndoManager (SDK wrappers)** — Python `Undo`, Go `Undo`, and wasm `WasmUndo` over the FFI/core surface: register_int/inc/dec/delete/list_insert/list_delete/text_insert/text_delete + undo/redo/can_undo/can_redo, each naming the document it drives (#101). Undo/redo now works end-to-end in every SDK; the subsystem is complete.
 
+**Atomic transactions (core)** — `Document::atomic_transact` tags a group's ops with `Tx { id, count }` (op envelope + codec extended from the reserved `tx` slot); a receiver buffers members until the whole group is present and its external deps resolve, then applies them together in seq order — an all-or-nothing *view* boundary that preserves convergence (verified against the convergence harness) (#102). Buffered partials ride the existing op-buffer, so they survive a snapshot. Design logged in DECISIONS. Wire/server/client drive path + SDK surface are the follow-on slices.
+
 ---
 
 ## 🚧 In progress
@@ -113,6 +115,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
+- **Atomic transactions — drive path + SDK surface** — core landed (#102). Next slices: (1) client/server drive path — a `ClientSession` (and server) route that sends an atomic tx's ops as one batch and folds a received atomic group in (the op codec already carries `Tx`, so this is wiring, not a wire change); (2) SDK `atomic_transact` over FFI + Python/Go/wasm (a batch-building entry point returning the tagged ops to broadcast). Atomic-tx **undo** ("a transaction is naturally an undo intention") and scope constraints (one branch/zone/schema version, member cap) are gated on the branch/zone/schema layers. → *Transactions*. (v0.2)
 - **Authorization — remaining policy layers** — atop the seam (#82), read redaction (#83), and the ACL decision flow (#84): doc-level ACL as CRDT-merged state (tuples live in the document, merge, and feed the #84 evaluator — needs the ACL-CRDT design + per-recipient ACL-tuple redaction, since ACL state is itself privacy-sensitive), role/group subjects (need a claims model threaded from the verifier to the enforcement point), and finer-grain wire redaction (element/zone + cold-start snapshot — room-level per-send landed in #83). Schema-level `@auth` defaults and zones are gated on the unbuilt schema + zone layers. Large — slice per layer. → *Authorization*. (v0.2, needs design)
 - **Audit log — query surface + distinct read-only actions** — the access-decision half landed in #85 (`Audited` emits every authz decision to a pluggable sink). Remaining: an audit *query* surface (admin/CLI over the trail — pairs with the file-log-vs-DB revisit note) and distinct audit actions for accesses that today reach no `authorize` call — `Connect`, snapshot export, branch/version reads — each gated on that action/resource existing (`Action::Connect`, the branch/version layers). → *Authorization / Audit*. (v0.2, partly blocked)
 - **Named versions — DONE (#86–#92)** — index → durable persistence → wire → server handling → client view → FFI → Python/Go/wasm, all merged. Remaining versioning work is dependency-gated: **restore-as-branch** (needs the branch layer) and **auto-version triggers** (need engine-event hooks / schedules) — both tracked under *Auto-version triggers* in the queue.

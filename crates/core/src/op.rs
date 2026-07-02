@@ -25,6 +25,15 @@ pub struct OpId {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TxId(pub u64);
 
+/// An op's membership in an atomic transaction: the shared [`TxId`] and the size
+/// of the group, so a receiver knows when every member has arrived and can apply
+/// them together. Members are ordered by their op seq within the group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Tx {
+    pub id: TxId,
+    pub count: u32,
+}
+
 /// A primitive mutation, addressed by the key of a slot in the target Map.
 /// The receiver reaches the child through the map's get-or-create, re-deriving
 /// its id. Leaf children (Register, Counter) are created implicitly by their
@@ -95,7 +104,7 @@ pub struct Op {
     pub stamp: Stamp,
     pub target: ElementId,
     pub kind: OpKind,
-    pub tx: Option<TxId>,
+    pub tx: Option<Tx>,
 }
 
 impl Op {

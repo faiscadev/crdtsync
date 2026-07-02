@@ -130,9 +130,12 @@ fn an_empty_log_round_trips() {
 
 #[test]
 fn a_tx_id_round_trips() {
-    use crdtsync_core::op::TxId;
+    use crdtsync_core::op::{Tx, TxId};
     let mut o = op(OpKind::MapDelete { key: b"k".to_vec() });
-    o.tx = Some(TxId(99));
+    o.tx = Some(Tx {
+        id: TxId(99),
+        count: 3,
+    });
     assert_eq!(decode_op(&encode_op(&o)).unwrap(), o);
 }
 

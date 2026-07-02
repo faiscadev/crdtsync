@@ -21,7 +21,7 @@ use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
 use crate::list::List;
 use crate::map::{DecodedMap, Map, SlotValue};
-use crate::op::{Op, OpId, OpKind};
+use crate::op::{Op, OpId, OpKind, Tx, TxId};
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 use crate::text::Text;
@@ -61,6 +61,9 @@ pub struct Document {
     parents: HashMap<ElementId, ElementId>,
     lamport: u64,
     seq: u64,
+    /// The next atomic-transaction id to mint; namespaced by this replica's
+    /// client, so `(client, tx)` is globally unique.
+    next_tx: u64,
     seen: HashSet<OpId>,
     /// Ops whose target isn't reachable yet, held until a create makes it so.
     buffer: Vec<Op>,
@@ -99,6 +102,7 @@ impl Document {
             parents: HashMap::new(),
             lamport: 0,
             seq: 0,
+            next_tx: 0,
             seen: HashSet::new(),
             buffer: Vec::new(),
             buffered: HashSet::new(),
@@ -333,6 +337,11 @@ impl Document {
             parents,
             lamport,
             seq,
+            // Tx ids scope only the buffering of remote partial transactions,
+            // keyed by their author's client; a restored replica mints its own
+            // under its own client with fresh op ids, so restarting at 0 cannot
+            // collide with anything still buffered.
+            next_tx: 0,
             seen,
             buffer,
             buffered,
@@ -367,6 +376,32 @@ impl Document {
         std::mem::take(&mut self.pending)
     }
 
+    /// Like [`transact`](Self::transact), but tag the emitted ops as one atomic
+    /// transaction. A receiver holds the members until the whole group arrives,
+    /// then applies them together, so no peer observes a partial transaction. The
+    /// author applies its own edits immediately, as with any local edit. An empty
+    /// transaction tags nothing.
+    pub fn atomic_transact<F>(&mut self, f: F) -> Vec<Op>
+    where
+        F: FnOnce(&mut MapCursor),
+    {
+        let ops = self.transact(f);
+        let Ok(count) = u32::try_from(ops.len()) else {
+            return ops;
+        };
+        if count == 0 {
+            return ops;
+        }
+        let id = TxId(self.next_tx);
+        self.next_tx += 1;
+        ops.into_iter()
+            .map(|mut op| {
+                op.tx = Some(Tx { id, count });
+                op
+            })
+            .collect()
+    }
+
     /// Fold a foreign op into local state. An op whose target isn't reachable
     /// yet is buffered and returns `false`; it replays once a create makes the
     /// target reachable. Returns `false` for an already-applied or already-held
@@ -374,6 +409,15 @@ impl Document {
     pub fn apply(&mut self, op: &Op) -> bool {
         if self.seen.contains(&op.id) || self.buffered.contains(&op.id) {
             return false;
+        }
+        // An atomic-transaction member is always held first; its group commits
+        // together once every member is present and the group's external
+        // dependencies resolve. A lone (single-member) tx completes immediately.
+        if op.tx.is_some() {
+            self.buffered.insert(op.id);
+            self.buffer.push(op.clone());
+            self.drain_buffer();
+            return self.seen.contains(&op.id);
         }
         if !self.ready(op) {
             self.buffered.insert(op.id);
@@ -399,12 +443,35 @@ impl Document {
     }
 
     /// Replay buffered ops that a state change just made reachable, to a
-    /// fixpoint — one applied op can unblock a whole causal chain.
+    /// fixpoint — one applied op can unblock a whole causal chain, and a
+    /// non-atomic apply can complete a waiting transaction (or vice versa).
     fn drain_buffer(&mut self) {
-        while let Some(i) = self.buffer.iter().position(|op| self.ready(op)) {
-            let op = self.buffer.remove(i);
-            self.buffered.remove(&op.id);
-            self.apply_now(&op);
+        loop {
+            let mut progressed = false;
+            while let Some(i) = self
+                .buffer
+                .iter()
+                .position(|op| op.tx.is_none() && self.ready(op))
+            {
+                let op = self.buffer.remove(i);
+                self.buffered.remove(&op.id);
+                self.apply_now(&op);
+                progressed = true;
+            }
+            // One complete atomic transaction: apply every member in seq order,
+            // so a member that targets a container an earlier member creates
+            // lands after it.
+            if let Some(mut members) = self.take_complete_tx() {
+                members.sort_by_key(|op| op.id.seq);
+                for op in &members {
+                    self.buffered.remove(&op.id);
+                    self.apply_now(op);
+                }
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
         }
     }
 
@@ -426,6 +493,91 @@ impl Document {
             }),
             _ => true,
         }
+    }
+
+    /// Remove and return the members of one atomic transaction whose whole group
+    /// is buffered and whose external dependencies resolve — or `None` if no
+    /// buffered transaction is ready to commit.
+    fn take_complete_tx(&mut self) -> Option<Vec<Op>> {
+        let mut groups: HashMap<(ClientId, TxId), Vec<usize>> = HashMap::new();
+        for (i, op) in self.buffer.iter().enumerate() {
+            if let Some(tx) = &op.tx {
+                groups.entry((op.id.client, tx.id)).or_default().push(i);
+            }
+        }
+        let ready = groups.into_values().find(|idxs| {
+            let members: Vec<&Op> = idxs.iter().map(|&i| &self.buffer[i]).collect();
+            let count = members[0].tx.as_ref().map_or(0, |tx| tx.count) as usize;
+            members.len() == count && self.tx_group_ready(&members)
+        })?;
+        // Remove in descending index order so earlier indices stay valid.
+        let mut idxs = ready;
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        Some(idxs.into_iter().map(|i| self.buffer.remove(i)).collect())
+    }
+
+    /// Whether a whole transaction can commit: every member either targets a
+    /// container reachable now or one an earlier member creates, and every delete
+    /// removes a node present now or inserted by an earlier member. Intra-group
+    /// dependencies are satisfied by seq-order application, so they are counted
+    /// as met here.
+    fn tx_group_ready(&self, members: &[&Op]) -> bool {
+        let mut ordered: Vec<&Op> = members.to_vec();
+        ordered.sort_by_key(|op| op.id.seq);
+        let mut created: HashSet<ElementId> = HashSet::new();
+        let mut inserted: HashSet<Stamp> = HashSet::new();
+        for op in &ordered {
+            let target_ok = self.resolvable(op.target) || created.contains(&op.target);
+            if !target_ok {
+                return false;
+            }
+            match &op.kind {
+                OpKind::MapCreate { key } => {
+                    created.insert(ElementId::derive(op.target, key, ElementKind::Map));
+                }
+                OpKind::ListCreate { key } => {
+                    created.insert(ElementId::derive(op.target, key, ElementKind::List));
+                }
+                OpKind::TextCreate { key } => {
+                    created.insert(ElementId::derive(op.target, key, ElementKind::Text));
+                }
+                OpKind::ListInsert { .. } => {
+                    inserted.insert(op.stamp);
+                }
+                OpKind::TextInsert { s, .. } => {
+                    for k in 0..s.chars().count() as u64 {
+                        inserted.insert(Stamp {
+                            lamport: op.stamp.lamport + k,
+                            client: op.stamp.client,
+                        });
+                    }
+                }
+                OpKind::ListDelete { id } => {
+                    let present = inserted.contains(id)
+                        || self
+                            .lists
+                            .get(&op.target)
+                            .is_some_and(|l| l.borrow().contains(*id));
+                    if !present {
+                        return false;
+                    }
+                }
+                OpKind::TextDelete { ids } => {
+                    let present = ids.iter().all(|id| {
+                        inserted.contains(id)
+                            || self
+                                .texts
+                                .get(&op.target)
+                                .is_some_and(|t| t.borrow().contains(*id))
+                    });
+                    if !present {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     /// Mint identity + causal position for a local edit, apply it, and record
