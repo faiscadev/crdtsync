@@ -35,6 +35,14 @@ fn awareness_update_round_trips() {
 }
 
 #[test]
+fn awareness_clear_round_trips() {
+    round_trip(Message::AwarenessClear {
+        channel: Channel(3),
+        actor: b"alice".to_vec(),
+    });
+}
+
+#[test]
 fn empty_key_and_value_round_trip() {
     round_trip(Message::AwarenessSet {
         channel: Channel(0),

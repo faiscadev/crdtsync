@@ -242,8 +242,9 @@ pub fn step(
                 ..Response::default()
             }
         }
-        // A peer update only travels server-to-client.
+        // Peer updates and clears only travel server-to-client.
         Message::AwarenessUpdate { .. } => violation("client sent an awareness update"),
+        Message::AwarenessClear { .. } => violation("client sent an awareness clear"),
     }
 }
 

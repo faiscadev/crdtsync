@@ -107,6 +107,9 @@ pub enum Message {
         key: Vec<u8>,
         value: Vec<u8>,
     },
+    /// Drops all of `actor`'s awareness on `channel` — sent when that actor's
+    /// presence expires (disconnect past the grace window, or TTL).
+    AwarenessClear { channel: Channel, actor: Vec<u8> },
     /// A failure the server reports to the client.
     Error { code: ErrorCode, message: String },
 }
@@ -201,6 +204,11 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, key);
             put_bytes(&mut out, value);
         }
+        Message::AwarenessClear { channel, actor } => {
+            put_u8(&mut out, 10);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, actor);
+        }
         Message::Error { code, message } => {
             put_u8(&mut out, 3);
             put_u16(&mut out, error_code_tag(*code));
@@ -281,6 +289,11 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 key,
                 value,
             }
+        }
+        10 => {
+            let channel = Channel(cur.u32()?);
+            let actor = cur.bytes()?;
+            Message::AwarenessClear { channel, actor }
         }
         tag => {
             return Err(ProtocolError::BadTag {

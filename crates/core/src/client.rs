@@ -219,6 +219,15 @@ impl ClientSession {
                 room.awareness.insert((actor, key), value);
                 Ok(())
             }
+            Message::AwarenessClear { channel, actor } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
+                // The actor's presence expired; drop all of its entries.
+                room.awareness.retain(|(a, _), _| *a != actor);
+                Ok(())
+            }
             Message::Error { code, message } => Err(ClientError::Server { code, message }),
             Message::Auth { .. } => Err(ClientError::UnexpectedMessage("server sent auth")),
             Message::AwarenessSet { .. } => Err(ClientError::UnexpectedMessage(

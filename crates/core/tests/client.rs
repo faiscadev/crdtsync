@@ -184,6 +184,44 @@ fn an_update_on_an_unknown_channel_is_rejected() {
 }
 
 #[test]
+fn a_clear_drops_all_of_an_actors_entries() {
+    let mut session = ClientSession::new(cid(1));
+    let (ch, _) = session.subscribe(ROOM_A);
+    let upd = |actor: &[u8], key: &[u8]| Message::AwarenessUpdate {
+        channel: ch,
+        actor: actor.to_vec(),
+        key: key.to_vec(),
+        value: vec![1],
+    };
+    session.receive(upd(b"alice", b"cursor")).unwrap();
+    session.receive(upd(b"alice", b"typing")).unwrap();
+    session.receive(upd(b"bob", b"cursor")).unwrap();
+
+    session
+        .receive(Message::AwarenessClear {
+            channel: ch,
+            actor: b"alice".to_vec(),
+        })
+        .unwrap();
+
+    assert_eq!(session.awareness(ch, b"alice", b"cursor"), None);
+    assert_eq!(session.awareness(ch, b"alice", b"typing"), None);
+    assert_eq!(session.awareness(ch, b"bob", b"cursor"), Some(&[1][..]));
+    assert_eq!(session.awareness_len(ch), 1);
+}
+
+#[test]
+fn a_clear_on_an_unknown_channel_is_rejected() {
+    let mut session = ClientSession::new(cid(1));
+    session.subscribe(ROOM_A);
+    let err = session.receive(Message::AwarenessClear {
+        channel: Channel(9),
+        actor: b"alice".to_vec(),
+    });
+    assert!(matches!(err, Err(ClientError::UnknownChannel(_))));
+}
+
+#[test]
 fn subscribe_assigns_a_channel_and_requests_from_zero() {
     let mut session = ClientSession::new(cid(1));
     let (channel, msg) = session.subscribe(ROOM_A);
