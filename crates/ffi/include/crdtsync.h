@@ -16,6 +16,9 @@ typedef struct CrdtClient CrdtClient;
 // Opaque document handle.
 typedef struct CrdtDoc CrdtDoc;
 
+// Opaque undo-manager handle.
+typedef struct CrdtUndo CrdtUndo;
+
 // Owned byte buffer handed to the caller, released by [`crdtsync_buf_free`].
 typedef struct {
     uint8_t *ptr;
@@ -215,6 +218,128 @@ CrdtBuf crdtsync_doc_encode_state(const CrdtDoc *doc);
 // # Safety
 // `bytes`/`len` follow [`as_slice`].
 CrdtDoc *crdtsync_doc_decode_state(const uint8_t *bytes, uintptr_t len);
+
+// Open an undo manager. It drives whichever document is passed to each call.
+//
+// # Safety
+// The returned handle is freed with [`crdtsync_undo_free`].
+CrdtUndo *crdtsync_undo_new(void);
+
+// # Safety
+// `undo` must be a handle from `crdtsync_undo_new`, not yet freed.
+void crdtsync_undo_free(CrdtUndo *undo);
+
+// Set an integer Register at a path as one undo step. Returns the ops.
+//
+// # Safety
+// `undo`/`doc` are live handles; `path`/`path_len` follow [`as_slice`].
+CrdtBuf crdtsync_undo_register_int(CrdtUndo *undo,
+                                   CrdtDoc *doc,
+                                   const uint8_t *path,
+                                   uintptr_t path_len,
+                                   int64_t value);
+
+// Increment a Counter at a path as one undo step. Returns the ops.
+//
+// # Safety
+// As [`crdtsync_undo_register_int`].
+CrdtBuf crdtsync_undo_inc(CrdtUndo *undo,
+                          CrdtDoc *doc,
+                          const uint8_t *path,
+                          uintptr_t path_len,
+                          uint32_t amount);
+
+// Decrement a Counter at a path as one undo step. Returns the ops.
+//
+// # Safety
+// As [`crdtsync_undo_register_int`].
+CrdtBuf crdtsync_undo_dec(CrdtUndo *undo,
+                          CrdtDoc *doc,
+                          const uint8_t *path,
+                          uintptr_t path_len,
+                          uint32_t amount);
+
+// Tombstone the Register slot at a path as one undo step. Returns the ops.
+//
+// # Safety
+// As [`crdtsync_undo_register_int`].
+CrdtBuf crdtsync_undo_delete(CrdtUndo *undo, CrdtDoc *doc, const uint8_t *path, uintptr_t path_len);
+
+// Insert a bytes item at a live index in the List at a path as one undo step.
+//
+// # Safety
+// `undo`/`doc` are live handles; `path`/`path_len` and `value`/`value_len` each
+// follow [`as_slice`].
+CrdtBuf crdtsync_undo_list_insert(CrdtUndo *undo,
+                                  CrdtDoc *doc,
+                                  const uint8_t *path,
+                                  uintptr_t path_len,
+                                  uintptr_t index,
+                                  const uint8_t *value,
+                                  uintptr_t value_len);
+
+// Tombstone the live item at an index in the List at a path as one undo step.
+//
+// # Safety
+// As [`crdtsync_undo_register_int`].
+CrdtBuf crdtsync_undo_list_delete(CrdtUndo *undo,
+                                  CrdtDoc *doc,
+                                  const uint8_t *path,
+                                  uintptr_t path_len,
+                                  uintptr_t index);
+
+// Insert UTF-8 text at a codepoint index in the Text at a path as one undo step.
+//
+// # Safety
+// `undo`/`doc` are live handles; `path`/`path_len` and `s`/`s_len` each follow
+// [`as_slice`]. `s` must be valid UTF-8; invalid bytes yield an empty result.
+CrdtBuf crdtsync_undo_text_insert(CrdtUndo *undo,
+                                  CrdtDoc *doc,
+                                  const uint8_t *path,
+                                  uintptr_t path_len,
+                                  uintptr_t index,
+                                  const uint8_t *s,
+                                  uintptr_t s_len);
+
+// Tombstone `count` codepoints from an index in the Text at a path as one undo
+// step. Returns the ops.
+//
+// # Safety
+// As [`crdtsync_undo_register_int`].
+CrdtBuf crdtsync_undo_text_delete(CrdtUndo *undo,
+                                  CrdtDoc *doc,
+                                  const uint8_t *path,
+                                  uintptr_t path_len,
+                                  uintptr_t index,
+                                  uintptr_t count);
+
+// Revert the most recent intention, applying it to `doc` and returning the ops
+// to broadcast — empty when there is nothing to undo.
+//
+// # Safety
+// `undo`/`doc` are live handles.
+CrdtBuf crdtsync_undo_undo(CrdtUndo *undo, CrdtDoc *doc);
+
+// Replay the most recently undone intention. Returns the ops — empty when there
+// is nothing to redo.
+//
+// # Safety
+// `undo`/`doc` are live handles.
+CrdtBuf crdtsync_undo_redo(CrdtUndo *undo, CrdtDoc *doc);
+
+// Whether there is a recorded intention to undo (1), none (0), or a bad handle
+// (-1).
+//
+// # Safety
+// `undo` is a live handle.
+int32_t crdtsync_undo_can_undo(const CrdtUndo *undo);
+
+// Whether there is an undone intention to redo (1), none (0), or a bad handle
+// (-1).
+//
+// # Safety
+// `undo` is a live handle.
+int32_t crdtsync_undo_can_redo(const CrdtUndo *undo);
 
 // Open a wire client for the 16-byte client id at `client`. Null on bad input.
 //
