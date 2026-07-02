@@ -9,7 +9,7 @@
 use crate::clientid::ClientId;
 use crate::elementid::ElementId;
 use crate::list::{Anchor, Side};
-use crate::op::{Op, OpId, OpKind, TxId};
+use crate::op::{Op, OpId, OpKind, Tx, TxId};
 use crate::scalar::{BlobRef, Scalar};
 use crate::stamp::Stamp;
 
@@ -225,7 +225,8 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
         None => put_u8(out, 0),
         Some(tx) => {
             put_u8(out, 1);
-            put_u64(out, tx.0);
+            put_u64(out, tx.id.0);
+            put_u32(out, tx.count);
         }
     }
 }
@@ -441,7 +442,10 @@ impl<'a> Cursor<'a> {
         let kind = self.opkind()?;
         let tx = match self.u8()? {
             0 => None,
-            1 => Some(TxId(self.u64()?)),
+            1 => Some(Tx {
+                id: TxId(self.u64()?),
+                count: self.u32()?,
+            }),
             tag => return Err(DecodeError::BadTag { what: "tx", tag }),
         };
         Ok(Op {

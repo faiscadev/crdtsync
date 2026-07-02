@@ -43,7 +43,7 @@ pub use elementid::ElementId;
 pub use host::Host;
 pub use list::{Anchor, List, Side};
 pub use map::Map;
-pub use op::{Op, OpId, OpKind, TxId};
+pub use op::{Op, OpId, OpKind, Tx, TxId};
 pub use protocol::{
     decode_header, decode_message, encode_header, encode_message, Channel, ErrorCode, Message,
     ProtocolError,

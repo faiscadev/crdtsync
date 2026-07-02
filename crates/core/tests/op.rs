@@ -6,7 +6,7 @@
 //! and a reserved atomic-transaction slot. Authorship, scope, schema version,
 //! and wall time are wire/server concerns and live outside the core.
 
-use crdtsync_core::op::{Op, OpId, OpKind, TxId};
+use crdtsync_core::op::{Op, OpId, OpKind, Tx, TxId};
 use crdtsync_core::Scalar;
 
 mod common;
@@ -196,16 +196,29 @@ fn map_delete_holds_a_binary_key() {
 #[test]
 fn tx_slot_can_carry_membership() {
     let mut op = set_op(1, 1, Scalar::Null);
-    op.tx = Some(TxId(77));
-    assert_eq!(op.tx, Some(TxId(77)));
+    op.tx = Some(Tx {
+        id: TxId(77),
+        count: 1,
+    });
+    assert_eq!(
+        op.tx,
+        Some(Tx {
+            id: TxId(77),
+            count: 1,
+        })
+    );
 }
 
 #[test]
 fn ops_share_a_tx_id_when_in_the_same_transaction() {
-    let tx = TxId(1);
+    let tx = Tx {
+        id: TxId(1),
+        count: 2,
+    };
     let mut a = set_op(1, 1, Scalar::Int(1));
     let mut b = set_op(2, 2, Scalar::Int(2));
     a.tx = Some(tx);
     b.tx = Some(tx);
     assert_eq!(a.tx, b.tx);
+    assert_eq!(a.tx.unwrap().id, b.tx.unwrap().id);
 }
