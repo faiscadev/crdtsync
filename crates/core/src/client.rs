@@ -133,6 +133,22 @@ impl ClientSession {
         })
     }
 
+    /// Like [`edit`](Self::edit), but the emitted ops form one atomic
+    /// transaction: a peer folds them in all-or-nothing, never observing a
+    /// partial group. The ops travel as an ordinary `Message::Ops` — the
+    /// transaction membership rides on the ops themselves. `None` if the channel
+    /// isn't held.
+    pub fn atomic_edit<F>(&mut self, channel: Channel, f: F) -> Option<Message>
+    where
+        F: FnOnce(&mut MapCursor),
+    {
+        let room = self.rooms.get_mut(&channel)?;
+        Some(Message::Ops {
+            channel,
+            ops: room.doc.atomic_transact(f),
+        })
+    }
+
     /// Publish an ephemeral awareness entry on `channel`'s room, returning the
     /// frame to send. `None` if the channel isn't held. The entry is transient —
     /// it is not stored locally or reflected back.
