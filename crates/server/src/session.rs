@@ -64,14 +64,24 @@ impl Default for Session {
     }
 }
 
+/// An ephemeral awareness entry to fan out to a room's other subscribers.
+pub struct AwarenessBroadcast {
+    pub room: RoomId,
+    pub actor: Vec<u8>,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
 /// What a [`step`] yields: replies to this client, ops to broadcast to the
-/// other subscribers of `broadcast_room`, and whether the connection should
-/// close. `broadcast_room` is `None` when there is nothing to fan out.
+/// other subscribers of `broadcast_room`, an ephemeral awareness entry to fan
+/// out, and whether the connection should close. The broadcast fields are
+/// `None`/empty when there is nothing to fan out.
 #[derive(Default)]
 pub struct Response {
     pub replies: Vec<Message>,
     pub broadcast: Vec<Op>,
     pub broadcast_room: Option<RoomId>,
+    pub awareness: Option<AwarenessBroadcast>,
     pub close: bool,
 }
 
@@ -194,9 +204,29 @@ pub fn step(
         Message::Snapshot { .. } => violation("client sent a snapshot"),
         Message::Error { .. } => violation("client sent an error"),
         Message::AuthOk { .. } => violation("client sent an authok"),
-        // Awareness publish is handled once the ephemeral store lands; a peer
-        // update only travels server-to-client.
-        Message::AwarenessSet { .. } => violation("awareness is not enabled"),
+        Message::AwarenessSet {
+            channel,
+            key,
+            value,
+        } => {
+            let Some(actor) = session.actor.clone() else {
+                return violation("awareness before auth");
+            };
+            let Some(room) = session.channels.get(&channel).cloned() else {
+                return violation("awareness on an unbound channel");
+            };
+            // Ephemeral: fanned to the room's peers, never logged or snapshotted.
+            Response {
+                awareness: Some(AwarenessBroadcast {
+                    room,
+                    actor,
+                    key,
+                    value,
+                }),
+                ..Response::default()
+            }
+        }
+        // A peer update only travels server-to-client.
         Message::AwarenessUpdate { .. } => violation("client sent an awareness update"),
     }
 }

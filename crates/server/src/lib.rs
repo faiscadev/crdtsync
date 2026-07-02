@@ -20,7 +20,7 @@ pub mod session;
 pub mod store;
 pub use auth::{AllowAll, Verifier};
 pub use registry::{ConnId, Registry};
-pub use session::{negotiate, step, Response, Session};
+pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{RoomLog, Snapshot, Store};
 
 /// A room name, opaque bytes chosen by the deployment.

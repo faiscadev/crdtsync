@@ -85,13 +85,18 @@ impl Registry {
     /// replies and fanning any broadcast out to the room's other connections.
     /// Returns whether the connection should stay open.
     pub fn deliver(&mut self, id: ConnId, msg: Message) -> bool {
-        let (broadcast, close, room) = {
+        let (broadcast, close, room, awareness) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
             let resp = step(&mut self.hub, &mut conn.session, &*self.verifier, msg);
             conn.outbox.extend(resp.replies);
-            (resp.broadcast, resp.close, resp.broadcast_room)
+            (
+                resp.broadcast,
+                resp.close,
+                resp.broadcast_room,
+                resp.awareness,
+            )
         };
         // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),
         // so fanning it out never advertises an unpersisted write. Each peer is
@@ -109,6 +114,23 @@ impl Registry {
                             ops: broadcast.clone(),
                         });
                     }
+                }
+            }
+        }
+        // Awareness is ephemeral: fan the entry out to the room's other
+        // subscribers on each peer's channel; nothing is stored or echoed back.
+        if let Some(a) = awareness {
+            for (peer, conn) in self.conns.iter_mut() {
+                if *peer == id {
+                    continue;
+                }
+                for channel in conn.session.channels_for_room(&a.room) {
+                    conn.outbox.push(Message::AwarenessUpdate {
+                        channel,
+                        actor: a.actor.clone(),
+                        key: a.key.clone(),
+                        value: a.value.clone(),
+                    });
                 }
             }
         }
