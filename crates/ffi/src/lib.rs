@@ -1228,10 +1228,12 @@ where
             return CrdtBuf::empty();
         };
         let ops = run(doc, p);
-        CrdtBuf::from_vec(encode_message(&Message::Ops {
-            channel: Channel(channel),
-            ops,
-        }))
+        // Route through the session so the ops enter the outbox and are resent /
+        // acknowledged like a closure edit, not just framed and forgotten.
+        match (*client).session.enqueue_ops(Channel(channel), ops) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
     }))
     .unwrap_or_else(|_| CrdtBuf::empty())
 }
@@ -1336,6 +1338,51 @@ pub unsafe extern "C" fn crdtsync_client_resume(
         }
     }))
     .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Re-emit the authored ops on `channel` the server has not yet acknowledged,
+/// as one Ops frame to replay after a reconnect. Empty on a bad handle, an
+/// unheld channel, or nothing outstanding.
+///
+/// # Safety
+/// `client` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_resend(
+    client: *const CrdtClient,
+    channel: u32,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        match (*client).session.resend(Channel(channel)) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// How many authored ops on `channel` await acknowledgement — the offline queue
+/// depth — into `out`. Returns 1 on success, -1 on a bad handle (an unheld
+/// channel reports 0).
+///
+/// # Safety
+/// `client` is a live handle; `out` points to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_outbox_len(
+    client: *const CrdtClient,
+    channel: u32,
+    out: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        *out = (*client).session.outbox_len(Channel(channel));
+        1
+    }))
+    .unwrap_or(-1)
 }
 
 /// Leave the room on `channel`, dropping its replica; returns the Unsubscribe

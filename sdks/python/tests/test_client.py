@@ -22,6 +22,25 @@ def test_a_local_edit_travels_to_a_peer():
         assert b.last_seen_seq(cb) == 1
 
 
+def test_offline_queue_outbox_drains_on_ack():
+    import struct
+
+    with Client(cid(1)) as a:
+        ca, _ = a.subscribe(b"room-1")
+        a.register_int(ca, [b"age"], 30)
+        assert a.outbox_len(ca) == 1
+        a.register_int(ca, [b"age"], 31)
+        assert a.outbox_len(ca) == 2
+        # The unacknowledged tail replays as one Ops frame.
+        assert len(a.resend(ca)) > 0
+        # An Accepted through u64::MAX drains the outbox: tag 18, u32 channel,
+        # u64 frontier.
+        accepted = struct.pack("<BIQ", 18, ca, (1 << 64) - 1)
+        assert a.receive(accepted) == 1
+        assert a.outbox_len(ca) == 0
+        assert a.resend(ca) == b""
+
+
 def test_bytes_scalar_round_trips():
     with Client(cid(1)) as a, Client(cid(2)) as b:
         ca, _ = a.subscribe(b"room-1")

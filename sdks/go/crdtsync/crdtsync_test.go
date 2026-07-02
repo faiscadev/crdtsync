@@ -2,6 +2,8 @@ package crdtsync
 
 import (
 	"bytes"
+	"encoding/binary"
+	"math"
 	"testing"
 )
 
@@ -279,6 +281,40 @@ func TestClientEditTravelsToAPeer(t *testing.T) {
 	}
 	if seq, ok := b.LastSeenSeq(cb); !ok || seq != 1 {
 		t.Fatalf("last seen: got (%d,%v), want (1,true)", seq, ok)
+	}
+}
+
+func TestClientOutboxDrainsOnAck(t *testing.T) {
+	a := newClient(t, 1)
+	defer a.Close()
+	ca, _ := a.Subscribe(key("room-1"))
+
+	a.RegisterInt(ca, path("age"), 30)
+	if n := a.OutboxLen(ca); n != 1 {
+		t.Fatalf("outbox after one edit: got %d, want 1", n)
+	}
+	a.RegisterInt(ca, path("age"), 31)
+	if n := a.OutboxLen(ca); n != 2 {
+		t.Fatalf("outbox after two edits: got %d, want 2", n)
+	}
+	if len(a.Resend(ca)) == 0 {
+		t.Fatal("resend should replay the unacked tail")
+	}
+
+	// An Accepted through u64::MAX drains the outbox: tag 18, u32 channel,
+	// u64 frontier.
+	accepted := make([]byte, 13)
+	accepted[0] = 18
+	binary.LittleEndian.PutUint32(accepted[1:], ca)
+	binary.LittleEndian.PutUint64(accepted[5:], math.MaxUint64)
+	if rc := a.Receive(accepted); rc != 1 {
+		t.Fatalf("receive accepted: got %d, want 1", rc)
+	}
+	if n := a.OutboxLen(ca); n != 0 {
+		t.Fatalf("outbox after ack: got %d, want 0", n)
+	}
+	if len(a.Resend(ca)) != 0 {
+		t.Fatal("resend should be empty after a full ack")
 	}
 }
 

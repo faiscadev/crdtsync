@@ -264,6 +264,30 @@ fn a_client_handshake_and_awareness_marshal() {
 }
 
 #[wasm_bindgen_test]
+fn a_client_outbox_drains_on_ack() {
+    use crdtsync_core::protocol::{encode_message, Channel, Message};
+    let mut a = wasm_client(1);
+    let sa = a.subscribe(b"room-1");
+    let ch = sa.channel();
+
+    a.register_int(ch, &path(&["age"]), 30);
+    assert_eq!(a.outbox_len(ch), 1);
+    a.register_int(ch, &path(&["age"]), 31);
+    assert_eq!(a.outbox_len(ch), 2);
+    // The unacknowledged tail replays as one Ops frame.
+    assert!(a.resend(ch).is_some());
+
+    // An Accepted through u64::MAX drains the outbox.
+    let accepted = encode_message(&Message::Accepted {
+        channel: Channel(ch),
+        through: u64::MAX,
+    });
+    assert!(a.receive(&accepted));
+    assert_eq!(a.outbox_len(ch), 0);
+    assert!(a.resend(ch).is_none());
+}
+
+#[wasm_bindgen_test]
 fn a_client_version_requests_marshal() {
     let mut c = wasm_client(1);
     let sub = c.subscribe(b"room-1");
