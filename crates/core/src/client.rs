@@ -39,6 +39,7 @@ struct Room {
 /// channel the client assigned it.
 pub struct ClientSession {
     client: ClientId,
+    actor: Option<Vec<u8>>,
     rooms: HashMap<Channel, Room>,
     next_channel: u32,
 }
@@ -48,6 +49,7 @@ impl ClientSession {
     pub fn new(client: ClientId) -> Self {
         Self {
             client,
+            actor: None,
             rooms: HashMap::new(),
             next_channel: 0,
         }
@@ -58,6 +60,19 @@ impl ClientSession {
         Message::Hello {
             client: self.client,
         }
+    }
+
+    /// Present an opaque credential for the server to verify. The server derives
+    /// the actor and returns it in AuthOk; the client never asserts its own.
+    pub fn auth(&self, credential: &[u8]) -> Message {
+        Message::Auth {
+            credential: credential.to_vec(),
+        }
+    }
+
+    /// The server-derived actor for this session, once AuthOk has arrived.
+    pub fn actor(&self) -> Option<&[u8]> {
+        self.actor.as_deref()
     }
 
     /// Join `room` on a fresh channel, requesting everything from the start.
@@ -157,9 +172,12 @@ impl ClientSession {
                 room.last_seen_seq = seq;
                 Ok(())
             }
+            Message::AuthOk { actor } => {
+                self.actor = Some(actor);
+                Ok(())
+            }
             Message::Error { code, message } => Err(ClientError::Server { code, message }),
             Message::Auth { .. } => Err(ClientError::UnexpectedMessage("server sent auth")),
-            Message::AuthOk { .. } => Err(ClientError::UnexpectedMessage("server sent authok")),
             Message::Hello { .. } => Err(ClientError::UnexpectedMessage("server sent hello")),
             Message::Subscribe { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent subscribe"))
