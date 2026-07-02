@@ -400,6 +400,37 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
     .unwrap_or(-1)
 }
 
+/// Begin recording an atomic transaction: until [`crdtsync_doc_commit_atomic`],
+/// edits accumulate into one group and each returns an empty ops buffer.
+///
+/// # Safety
+/// `doc` must be a handle returned by a constructor and not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_begin_atomic(doc: *mut CrdtDoc) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !doc.is_null() {
+            (*doc).doc.begin_atomic();
+        }
+    }));
+}
+
+/// Commit the atomic transaction opened by [`crdtsync_doc_begin_atomic`],
+/// returning the group's ops tagged for all-or-nothing delivery. Empty on a bad
+/// handle, no open transaction, or an empty group.
+///
+/// # Safety
+/// `doc` must be a handle returned by a constructor and not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_commit_atomic(doc: *mut CrdtDoc) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return CrdtBuf::empty();
+        }
+        CrdtBuf::from_vec(encode_ops(&(*doc).doc.commit_atomic()))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
 /// Serialize the whole replica to a canonical snapshot. Empty on a bad handle.
 ///
 /// # Safety

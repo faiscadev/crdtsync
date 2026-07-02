@@ -81,6 +81,8 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_apply, [doc, cbytes, size], c.c_int32)
     sig(lib.crdtsync_doc_encode_state, [doc], buf)
     sig(lib.crdtsync_doc_decode_state, [cbytes, size], doc)
+    sig(lib.crdtsync_doc_begin_atomic, [doc], None)
+    sig(lib.crdtsync_doc_commit_atomic, [doc], buf)
 
     # undo / redo
     undo = c.c_void_p
@@ -295,6 +297,14 @@ class Document:
     def apply(self, ops: bytes) -> int:
         """Fold a peer's encoded ops in. Returns the number applied, -1 on error."""
         return _LIB.crdtsync_doc_apply(self._handle, ops, len(ops))
+
+    def begin_atomic(self) -> None:
+        """Start recording an atomic transaction; edits accumulate until commit."""
+        _LIB.crdtsync_doc_begin_atomic(self._handle)
+
+    def commit_atomic(self) -> bytes:
+        """Commit the atomic transaction; returns the group's ops to broadcast."""
+        return _take_buf(_LIB.crdtsync_doc_commit_atomic(self._handle))
 
     def encode_state(self) -> bytes:
         """Serialize the whole replica to a canonical snapshot."""

@@ -206,6 +206,21 @@ int32_t crdtsync_doc_text_get(const CrdtDoc *doc,
 // `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`].
 int32_t crdtsync_doc_apply(CrdtDoc *doc, const uint8_t *bytes, uintptr_t len);
 
+// Begin recording an atomic transaction: until [`crdtsync_doc_commit_atomic`],
+// edits accumulate into one group and each returns an empty ops buffer.
+//
+// # Safety
+// `doc` must be a handle returned by a constructor and not yet freed.
+void crdtsync_doc_begin_atomic(CrdtDoc *doc);
+
+// Commit the atomic transaction opened by [`crdtsync_doc_begin_atomic`],
+// returning the group's ops tagged for all-or-nothing delivery. Empty on a bad
+// handle, no open transaction, or an empty group.
+//
+// # Safety
+// `doc` must be a handle returned by a constructor and not yet freed.
+CrdtBuf crdtsync_doc_commit_atomic(CrdtDoc *doc);
+
 // Serialize the whole replica to a canonical snapshot. Empty on a bad handle.
 //
 // # Safety

@@ -36,6 +36,9 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_doc_text_get",
         // sync
         "crdtsync_doc_apply",
+        // atomic transactions
+        "crdtsync_doc_begin_atomic",
+        "crdtsync_doc_commit_atomic",
         // undo / redo
         "typedef struct CrdtUndo CrdtUndo;",
         "crdtsync_undo_new",

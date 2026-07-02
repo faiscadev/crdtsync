@@ -445,3 +445,29 @@ func TestUndoConvergesOnAPeer(t *testing.T) {
 		t.Fatalf("peer after undo want 0, got %d", v)
 	}
 }
+
+func TestAtomicTransactionGroupsEditsAndConverges(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	b := newDoc(t, 2)
+	defer b.Close()
+
+	a.BeginAtomic()
+	// Edits accumulate while recording; each returns no ops of its own.
+	if got := a.RegisterInt(path("x"), 1); len(got) != 0 {
+		t.Fatalf("recording edit returned %d bytes, want 0", len(got))
+	}
+	a.RegisterInt(path("y"), 2)
+	group := a.CommitAtomic()
+	if len(group) == 0 {
+		t.Fatal("commit returned no ops")
+	}
+
+	b.Apply(group)
+	if v, _ := b.GetInt(path("x")); v != 1 {
+		t.Fatalf("peer x want 1, got %d", v)
+	}
+	if v, _ := b.GetInt(path("y")); v != 2 {
+		t.Fatalf("peer y want 2, got %d", v)
+	}
+}

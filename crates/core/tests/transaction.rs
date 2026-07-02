@@ -187,6 +187,47 @@ fn a_buffered_partial_tx_survives_a_snapshot_round_trip() {
 }
 
 #[test]
+fn begin_and_commit_group_separate_edits_into_one_tx() {
+    let mut d = doc(1);
+    d.begin_atomic();
+    assert!(d.is_atomic());
+    // Each edit accumulates and returns nothing of its own while recording.
+    assert!(d.transact(|c| c.register(b"x", Scalar::Int(1))).is_empty());
+    assert!(d.transact(|c| c.register(b"y", Scalar::Int(2))).is_empty());
+    let ops = d.commit_atomic();
+    assert!(!d.is_atomic());
+    assert_eq!(ops.len(), 2);
+    let id = ops[0].tx.clone().expect("tagged").id;
+    assert!(ops.iter().all(|o| o.tx.as_ref().unwrap().id == id));
+    assert!(ops.iter().all(|o| o.tx.as_ref().unwrap().count == 2));
+    // The author sees its own edits immediately.
+    assert_eq!(reg(&d, b"x"), Some(Scalar::Int(1)));
+}
+
+#[test]
+fn committing_with_no_recorded_edits_yields_nothing() {
+    let mut d = doc(1);
+    d.begin_atomic();
+    assert!(d.commit_atomic().is_empty());
+}
+
+#[test]
+fn a_begin_commit_group_commits_atomically_on_a_peer() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    a.begin_atomic();
+    a.transact(|c| c.register(b"x", Scalar::Int(1)));
+    a.transact(|c| c.register(b"y", Scalar::Int(2)));
+    let ops = a.commit_atomic();
+
+    assert!(!b.apply(&ops[0]));
+    assert_eq!(reg(&b, b"x"), None);
+    assert!(b.apply(&ops[1]));
+    assert_eq!(reg(&b, b"x"), Some(Scalar::Int(1)));
+    assert_eq!(reg(&b, b"y"), Some(Scalar::Int(2)));
+}
+
+#[test]
 fn ops_from_a_plain_transact_carry_no_tx() {
     let mut d = doc(1);
     let ops = d.transact(|tx| {

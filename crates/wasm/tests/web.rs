@@ -158,6 +158,23 @@ fn encode_path_frames_keys() {
     assert_eq!(got, vec![2, 0, 0, 0, b'a', b'b', 1, 0, 0, 0, b'c']);
 }
 
+#[wasm_bindgen_test]
+fn an_atomic_transaction_groups_edits_and_converges() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    a.begin_atomic();
+    // Edits accumulate while recording; each returns no ops of its own.
+    assert!(a.register_int(&path(&["x"]), 1).is_empty());
+    assert!(a.register_int(&path(&["y"]), 2).is_empty());
+    let group = a.commit_atomic();
+    assert!(!group.is_empty());
+
+    assert_eq!(a.get_int(&path(&["x"])), Some(1));
+    b.apply(&group);
+    assert_eq!(b.get_int(&path(&["x"])), Some(1));
+    assert_eq!(b.get_int(&path(&["y"])), Some(2));
+}
+
 use crdtsync_wasm::WasmUndo;
 
 #[wasm_bindgen_test]

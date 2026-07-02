@@ -111,3 +111,19 @@ def test_apply_rejects_garbage():
 
 def test_encode_path_shape():
     assert crdtsync.encode_path([b"ab", b"c"]) == b"\x02\x00\x00\x00ab\x01\x00\x00\x00c"
+
+
+def test_atomic_transaction_groups_edits_and_converges():
+    with Document(cid(1)) as a, Document(cid(2)) as b:
+        a.begin_atomic()
+        # Edits accumulate while recording; each returns no ops of its own.
+        assert a.register_int([b"x"], 1) == b""
+        assert a.register_int([b"y"], 2) == b""
+        group = a.commit_atomic()
+        assert len(group) > 0
+
+        # The author sees its own edits; the peer converges on the whole group.
+        assert a.get_int([b"x"]) == 1
+        b.apply(group)
+        assert b.get_int([b"x"]) == 1
+        assert b.get_int([b"y"]) == 2
