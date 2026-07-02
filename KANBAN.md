@@ -1,12 +1,12 @@
-# crdtsync — build board
+# crdtsync — worklist
 
-Live status of the Rust core + server + SDKs. [ARCHITECTURE.md](ARCHITECTURE.md) is the plan of record (the *what* and *why*); this file is the *where we are*.
+**Derived from [ARCHITECTURE.md](ARCHITECTURE.md).** ARCHITECTURE is the end-state — the full scope + design, everything meant to be built *eventually*. This board is the **prioritized breakdown of what's not built yet**: a rolling queue `cs-next` cuts from ARCHITECTURE and **refills as it drains**. It is regenerable — if the board and the code disagree, the code wins. Status lives here + in the code, never in ARCHITECTURE; design changes that implementation forced are logged in [DECISIONS.md](DECISIONS.md).
 
-`/cs-next` reads this board plus the dependency graph below to pick the next unit, then hands it to `/cs-implement`. The **test suites are the spec** — a unit is "done" when its suite is green and Miri-clean, merged to `main`.
+`/cs-next` reads this + the dependency graph, replenishes the queue from ARCHITECTURE when it's thin, breaks work into units, and hands the next to `/cs-implement`. **Test suites are the spec** — a unit is "done" when its suite is green + Miri-clean, merged to `main`. Breakdown + prioritization is autonomous; the human only edits ARCHITECTURE.
 
 ## Dependency order
 
-Primitives are built bottom-up; never advance a unit whose dependencies are red.
+Bottom-up; never advance a unit whose dependencies are red.
 
 ```
 host → stamp → clientid → elementid → scalar → counter → register → element → map
@@ -17,7 +17,7 @@ host → stamp → clientid → elementid → scalar → counter → register �
                                                     ↓
               wire framing → room hub → session driver → connection registry → websocket
                                                     ↓
-                            persistence → state codec → compaction
+                            persistence → state codec → compaction → client session
                                                     ↓
                                     SDKs (FFI / wasm / Python / Go)
 ```
@@ -28,6 +28,8 @@ Element + Map are one coupled unit (Map slots hold Elements; Element forwards li
 
 ## ✅ Done (on `main`)
 
+_Derived from code + git; a convenience view, not the source of truth._
+
 **Core primitives** — all green, Miri-clean:
 scalar / counter / register / element / map (#22–#27), list Fugue (#24), text codepoint (#25), op envelope (#22), doc transact/apply (#30/#31), out-of-order buffering + persistent container identity (#32), binary op codec + log framing (#33).
 
@@ -37,9 +39,9 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Correctness** — counter identity across displacement fixed (#48); randomized convergence property harness (#49/#50); server durability property fuzz (#51).
 
-**v0.2 state codec + compaction (arc complete)** — leaf-value state serialization (#52), sequence-CRDT state serialization (#53), whole-replica document state serialization (#54), in-memory op-log compaction + `Message::Snapshot` (#55), durable disk-log compaction, crash-safe (#56), SDK snapshot-decode across FFI/wasm/Go/Python (#57), automatic compaction policy — a retained-log threshold auto-compacts in `ingest`, `0` disables (#58).
+**v0.2 state codec + compaction (arc complete)** — leaf-value (#52), sequence-CRDT (#53), whole-replica document (#54) state serialization, in-memory op-log compaction + `Message::Snapshot` (#55), durable disk-log compaction crash-safe (#56), SDK snapshot-decode (#57), automatic compaction policy (#58).
 
-**v0.2 wire / client** — client session / reconnect driver: `core::client::ClientSession`, the replica-side mirror of `session::step` — Hello/Subscribe framing, op-delta and `Message::Snapshot` catch-up folded into a local replica, `last_seen_seq` tracked by count so a reconnect resumes, snapshot adoption keeps the client's own id (#59).
+**v0.2 wire / client** — client session / reconnect driver `core::client::ClientSession` (#59).
 
 ---
 
@@ -51,23 +53,25 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Multi-room subscription over one connection** — a session holds several rooms, an inbound op batch names its room, and fan-out routes per room. Needs a wire decision (an `Ops`→room tag, or a per-room channel id) — a protocol change, so scope it as one. Unblocks the awareness/multiplex backlog. _(cs-next to confirm vs. handshake auth or wiring the client driver into an SDK.)_
+- **Multi-room subscription over one connection** — a session holds several rooms, an inbound op batch names its room, fan-out routes per room. Needs a wire decision (an `Ops`→room tag, or a per-room channel id) — a protocol change, scope as one. First step of channel multiplexing.
 
 ---
 
-## 📋 Backlog (v0.2+, ordered loosely; several are product calls)
+## 📋 Queue — current cut of ARCHITECTURE, prioritized
 
-- **Awareness subsystem** — ephemeral presence (cursors/selections/typing), TTL + throttle + auth filtering + reconnect grace. (v0.2)
-- **Handshake auth** — three-phase Hello/Auth/Subscribe, pluggable credential verifier, opaque credentials, server-derived `actor_id`. (v0.2)
-- **Declarative policy + audit log** — authorization enforcement. (v0.2)
-- **Channel multiplexing** — logical channels per `(room, branch, zone)` over one WebSocket. (v0.2)
-- **Named versions + auto-version triggers**, **UndoManager** for v0.1 primitives, **composition cookbook**, **admin dashboard**, **replay tooling**. (v0.2)
-- **Blob-ref envelope slot** — reserve the blob-ref slot in the op envelope now (foundational forward-compat, per ARCHITECTURE), or consciously drop the reservation. The `tx` slot was reserved; the blob slot was missed — inconsistent, likely oversight. Small, do early. (foundational)
-- **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window, time/migration compaction triggers. Compaction retains all tombstones until this lands. (v0.2)
-- **Blob refs (full)** — refs in ops, bytes in a separate content-addressable store. (v0.5)
-- **Mixed-version migrations** — migration entries as log entries, per-op `schema_version`, four detection gates. (v0.6)
-- **Distributed cluster** — room sharding, replication, failover, leader election, first-class branches. (v0.4)
-- **XmlElement / marks / schema / invariant repair / zones**. (v0.5)
+Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized slice `cs-next` has broken out so far; when it drains, `cs-next` cuts the next slice from ARCHITECTURE. Order = dependency → foundational/forward-compat → roadmap/value. Each item cites the ARCHITECTURE section it derives from.
+
+- **Blob-ref envelope slot** — reserve the blob-ref slot in the op envelope now; the `tx` slot was reserved but blob was missed (inconsistent, likely oversight). Small; jumps ahead of features. → *Binary Blobs*, *Internal Data Model*. (foundational)
+- **Handshake auth** — three-phase Hello/Auth/Subscribe, pluggable credential verifier, opaque credentials, server-derived `actor_id`. → *Networking / Handshake*, *Authentication*. (v0.2)
+- **Channel multiplexing** — logical channels per `(room, branch, zone)` over one WS (Next above is step one). → *Networking / Connection*. (v0.2)
+- **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window, time/migration compaction triggers. Compaction retains all tombstones until this lands. → *Snapshots / Tombstone GC*. (v0.2)
+- **Awareness subsystem** — ephemeral presence (cursors/selections/typing), TTL + throttle + auth filtering + reconnect grace. → *Awareness*. (v0.2)
+- **Declarative policy + audit log** — authorization enforcement. → *Authorization*. (v0.2)
+- **Named versions + auto-version triggers**, **UndoManager**, **composition cookbook**, **admin dashboard**, **replay tooling**. → *Versioning*, *Undo/Redo*, *Admin UI*, *Debugging*. (v0.2)
+- **Blob refs (full)** — refs in ops, bytes in a content-addressable store. → *Binary Blobs*. (v0.5)
+- **XmlElement / marks / schema / invariant repair / zones**. → *CRDT Model*, *Marks*, *Schema*, *Invariant Repair*, *Authorization/zones*. (v0.5)
+- **Mixed-version migrations** — migration log entries, per-op `schema_version`, four detection gates. → *Schema Migration*. (v0.6)
+- **Distributed cluster** — sharding, replication, failover, leader election, branches. → *Horizontal Scaling*, *Versioning and Branches*. (v0.4)
 
 ---
 
@@ -80,4 +84,4 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## Loop
 
-Each unit runs `/cs-next` → `/cs-implement`: spec-first tests → implement to green → Miri gate (UB + leaks) → `make fmt` → PR → react to CI + review with pushback → squash-merge → continue up the chain.
+`cs-next` (derive worklist from ARCHITECTURE → break down → prioritize → refill when thin) → `cs-implement` (spec-first tests → implement to green → Miri gate → `make fmt` → PR → react to CI + review → squash-merge → update this board; log any forced ARCHITECTURE change to DECISIONS.md) → continue up the chain.
