@@ -857,3 +857,187 @@ where
     }))
     .unwrap_or(-1)
 }
+
+// --- client auth ---
+
+/// Present an opaque credential; the returned Auth frame asks the server to
+/// verify it and derive the actor. Empty on a bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `cred`/`cred_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_auth(
+    client: *const CrdtClient,
+    cred: *const u8,
+    cred_len: usize,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        let Some(credential) = as_slice(cred, cred_len) else {
+            return CrdtBuf::empty();
+        };
+        CrdtBuf::from_vec(encode_message(&(*client).session.auth(credential)))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// The server-derived actor for this session into a fresh buffer at `out`.
+/// Returns 1 once AuthOk has arrived, 0 before, -1 on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_actor(
+    client: *const CrdtClient,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        match (*client).session.actor() {
+            Some(actor) => {
+                *out = CrdtBuf::from_vec(actor.to_vec());
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+// --- client subscription lifecycle ---
+
+/// Re-issue the Subscribe for a held channel from its caught-up position, so a
+/// reconnect resumes with a delta. Empty on a bad handle or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_resume(
+    client: *const CrdtClient,
+    channel: u32,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        match (*client).session.resume(Channel(channel)) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Leave the room on `channel`, dropping its replica; returns the Unsubscribe
+/// frame to send. Empty on a bad handle or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_unsubscribe(
+    client: *mut CrdtClient,
+    channel: u32,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        match (*client).session.unsubscribe(Channel(channel)) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+// --- client awareness ---
+
+/// Publish an ephemeral awareness entry `key` on `channel`'s room; returns the
+/// frame to send. Empty on a bad handle, input, or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle; `key`/`key_len` and `value`/`value_len` each follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_set_awareness(
+    client: *const CrdtClient,
+    channel: u32,
+    key: *const u8,
+    key_len: usize,
+    value: *const u8,
+    value_len: usize,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        let (Some(k), Some(v)) = (as_slice(key, key_len), as_slice(value, value_len)) else {
+            return CrdtBuf::empty();
+        };
+        match (*client).session.set_awareness(Channel(channel), k, v) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// A peer's awareness entry on `channel` — by publishing `actor` and `key` — into
+/// a fresh buffer at `out`. Returns 1 if present, 0 if absent or the channel
+/// isn't held, -1 on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle; `actor`/`actor_len` and `key`/`key_len` each follow
+/// [`as_slice`]; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_awareness(
+    client: *const CrdtClient,
+    channel: u32,
+    actor: *const u8,
+    actor_len: usize,
+    key: *const u8,
+    key_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        let (Some(a), Some(k)) = (as_slice(actor, actor_len), as_slice(key, key_len)) else {
+            return 0;
+        };
+        match (*client).session.awareness(Channel(channel), a, k) {
+            Some(value) => {
+                *out = CrdtBuf::from_vec(value.to_vec());
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// How many awareness entries `channel` currently holds, into `out`. Returns 1
+/// on success, -1 on a bad handle (an unheld channel reports 0 entries).
+///
+/// # Safety
+/// `client` is a live handle; `out` points to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_awareness_len(
+    client: *const CrdtClient,
+    channel: u32,
+    out: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        *out = (*client).session.awareness_len(Channel(channel));
+        1
+    }))
+    .unwrap_or(-1)
+}

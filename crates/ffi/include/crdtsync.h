@@ -319,6 +319,69 @@ int32_t crdtsync_client_get_bytes(const CrdtClient *client,
                                   uintptr_t path_len,
                                   CrdtBuf *out);
 
+// Present an opaque credential; the returned Auth frame asks the server to
+// verify it and derive the actor. Empty on a bad handle or input.
+//
+// # Safety
+// `client` is a live handle; `cred`/`cred_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_auth(const CrdtClient *client, const uint8_t *cred, uintptr_t cred_len);
+
+// The server-derived actor for this session into a fresh buffer at `out`.
+// Returns 1 once AuthOk has arrived, 0 before, -1 on a bad handle.
+//
+// # Safety
+// `client` is a live handle; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_client_actor(const CrdtClient *client, CrdtBuf *out);
+
+// Re-issue the Subscribe for a held channel from its caught-up position, so a
+// reconnect resumes with a delta. Empty on a bad handle or unheld channel.
+//
+// # Safety
+// `client` is a live handle.
+CrdtBuf crdtsync_client_resume(const CrdtClient *client, uint32_t channel);
+
+// Leave the room on `channel`, dropping its replica; returns the Unsubscribe
+// frame to send. Empty on a bad handle or unheld channel.
+//
+// # Safety
+// `client` is a live handle.
+CrdtBuf crdtsync_client_unsubscribe(CrdtClient *client, uint32_t channel);
+
+// Publish an ephemeral awareness entry `key` on `channel`'s room; returns the
+// frame to send. Empty on a bad handle, input, or unheld channel.
+//
+// # Safety
+// `client` is a live handle; `key`/`key_len` and `value`/`value_len` each follow
+// [`as_slice`].
+CrdtBuf crdtsync_client_set_awareness(const CrdtClient *client,
+                                      uint32_t channel,
+                                      const uint8_t *key,
+                                      uintptr_t key_len,
+                                      const uint8_t *value,
+                                      uintptr_t value_len);
+
+// A peer's awareness entry on `channel` — by publishing `actor` and `key` — into
+// a fresh buffer at `out`. Returns 1 if present, 0 if absent or the channel
+// isn't held, -1 on a bad handle.
+//
+// # Safety
+// `client` is a live handle; `actor`/`actor_len` and `key`/`key_len` each follow
+// [`as_slice`]; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_client_awareness(const CrdtClient *client,
+                                  uint32_t channel,
+                                  const uint8_t *actor,
+                                  uintptr_t actor_len,
+                                  const uint8_t *key,
+                                  uintptr_t key_len,
+                                  CrdtBuf *out);
+
+// How many awareness entries `channel` currently holds, into `out`. Returns 1
+// on success, -1 on a bad handle (an unheld channel reports 0 entries).
+//
+// # Safety
+// `client` is a live handle; `out` points to a writable `usize`.
+int32_t crdtsync_client_awareness_len(const CrdtClient *client, uint32_t channel, uintptr_t *out);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

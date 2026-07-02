@@ -49,6 +49,14 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_delete",
         "crdtsync_client_get_int",
         "crdtsync_client_get_bytes",
+        // client auth + lifecycle + awareness
+        "crdtsync_client_auth",
+        "crdtsync_client_actor",
+        "crdtsync_client_resume",
+        "crdtsync_client_unsubscribe",
+        "crdtsync_client_set_awareness",
+        "crdtsync_client_awareness",
+        "crdtsync_client_awareness_len",
     ];
     for sym in required {
         assert!(

@@ -6,8 +6,17 @@
 //! channel the client assigned at subscribe. Every buffer and handle is freed so
 //! the round trip is leak-clean under Miri.
 
+use crdtsync_core::{encode_message, Channel, Message};
 use crdtsync_ffi::*;
 use std::ptr;
+
+/// A freshly-nulled output buffer for the read entry points to fill.
+fn out_buf() -> CrdtBuf {
+    CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    }
+}
 
 fn client_id(first: u8) -> [u8; 16] {
     let mut b = [0u8; 16];
@@ -126,5 +135,89 @@ fn a_bad_handle_is_rejected_not_dereferenced() {
             crdtsync_client_receive(ptr::null_mut(), p.as_ptr(), p.len()),
             -1
         );
+    }
+}
+
+#[test]
+fn auth_establishes_the_actor_once_authok_arrives() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        let cred = b"token";
+        let auth = crdtsync_client_auth(c, cred.as_ptr(), cred.len());
+        assert!(auth.len > 0);
+        crdtsync_buf_free(auth);
+
+        // No actor until the server's AuthOk is folded in.
+        let mut out = out_buf();
+        assert_eq!(crdtsync_client_actor(c, &mut out), 0);
+
+        let frame = encode_message(&Message::AuthOk {
+            actor: b"alice".to_vec(),
+        });
+        assert_eq!(crdtsync_client_receive(c, frame.as_ptr(), frame.len()), 1);
+        assert_eq!(crdtsync_client_actor(c, &mut out), 1);
+        assert_eq!(std::slice::from_raw_parts(out.ptr, out.len), b"alice");
+
+        crdtsync_buf_free(out);
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
+fn a_peer_awareness_update_is_folded_and_readable() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        let (ch, sub) = subscribe(c, b"room-1");
+        crdtsync_buf_free(sub);
+
+        // Publishing yields a frame to send.
+        let published =
+            crdtsync_client_set_awareness(c, ch, b"cursor".as_ptr(), 6, b"x".as_ptr(), 1);
+        assert!(published.len > 0);
+        crdtsync_buf_free(published);
+
+        // A peer's update on this channel folds in and reads back by (actor, key).
+        let frame = encode_message(&Message::AwarenessUpdate {
+            channel: Channel(ch),
+            actor: b"bob".to_vec(),
+            key: b"cursor".to_vec(),
+            value: vec![9],
+        });
+        assert_eq!(crdtsync_client_receive(c, frame.as_ptr(), frame.len()), 1);
+
+        let mut out = out_buf();
+        let rc =
+            crdtsync_client_awareness(c, ch, b"bob".as_ptr(), 3, b"cursor".as_ptr(), 6, &mut out);
+        assert_eq!(rc, 1);
+        assert_eq!(std::slice::from_raw_parts(out.ptr, out.len), &[9]);
+        crdtsync_buf_free(out);
+
+        let mut n: usize = 0;
+        assert_eq!(crdtsync_client_awareness_len(c, ch, &mut n), 1);
+        assert_eq!(n, 1);
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
+fn unsubscribe_drops_the_channel() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        let (ch, sub) = subscribe(c, b"room-1");
+        crdtsync_buf_free(sub);
+
+        let un = crdtsync_client_unsubscribe(c, ch);
+        assert!(un.len > 0);
+        crdtsync_buf_free(un);
+
+        // The channel is gone: reads report absent, resume yields nothing.
+        let mut seen: u64 = 0;
+        assert_eq!(crdtsync_client_last_seen_seq(c, ch, &mut seen), 0);
+        let resume = crdtsync_client_resume(c, ch);
+        assert_eq!(resume.len, 0);
+        crdtsync_buf_free(resume);
+
+        crdtsync_client_free(c);
     }
 }
