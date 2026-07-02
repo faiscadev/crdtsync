@@ -9,7 +9,7 @@
 //! *that* they changed — element- and char-level detail is a follow-on. The
 //! change list is ordered by path, so diffing the same pair is deterministic.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::doc::Document;
 use crate::element::{Element, ElementKind};
@@ -17,6 +17,7 @@ use crate::list::List;
 use crate::map::Map;
 use crate::path::encode_path;
 use crate::scalar::Scalar;
+use crate::stamp::Stamp;
 use crate::text::Text;
 
 /// One structural change between two snapshots, addressed by its path.
@@ -34,9 +35,21 @@ pub enum Change {
     },
     /// A Counter whose value changed.
     Counter { path: Vec<u8>, old: i64, new: i64 },
-    /// A sequence (List / Text) whose contents changed. Element- and char-level
-    /// detail is a follow-on; this reports that the sequence at `path` differs.
+    /// A List whose contents changed. Element-level detail is a follow-on; this
+    /// reports that the list at `path` differs.
     Sequence { path: Vec<u8>, kind: ElementKind },
+    /// A run of codepoints inserted into a Text, at its index in the new text.
+    TextInsert {
+        path: Vec<u8>,
+        index: usize,
+        text: String,
+    },
+    /// A run of codepoints deleted from a Text, at its index in the old text.
+    TextDelete {
+        path: Vec<u8>,
+        index: usize,
+        text: String,
+    },
 }
 
 /// The structural changes turning `old` into `new`, ordered by path.
@@ -110,12 +123,7 @@ fn diff_elem(a: &Element, b: &Element, prefix: &mut Vec<Vec<u8>>, out: &mut Vec<
             }
         }
         (Element::Text(a), Element::Text(b)) => {
-            if text_state(&a.borrow()) != text_state(&b.borrow()) {
-                out.push(Change::Sequence {
-                    path: path_of(prefix),
-                    kind: ElementKind::Text,
-                });
-            }
+            diff_text(&a.borrow(), &b.borrow(), prefix, out);
         }
         _ => {
             // Both are the same scalar-valued kind (inline Scalar or Register).
@@ -148,9 +156,58 @@ fn list_state(l: &List) -> Vec<u8> {
     out
 }
 
-fn text_state(t: &Text) -> Vec<u8> {
-    let mut out = Vec::new();
-    t.encode_state_into(&mut out);
+/// Char-level diff of two Text snapshots by char id. A codepoint is identified
+/// by its stable char id, so a codepoint live in one snapshot and not the other
+/// is an exact insert or delete — no heuristic alignment. Consecutive same-op
+/// codepoints coalesce into one run: deletes at their index in the old text
+/// (ascending) first, then inserts at their index in the new text.
+fn diff_text(old: &Text, new: &Text, prefix: &[Vec<u8>], out: &mut Vec<Change>) {
+    let old_seq = char_seq(old);
+    let new_seq = char_seq(new);
+    let old_ids: HashSet<Stamp> = old_seq.iter().map(|(id, _)| *id).collect();
+    let new_ids: HashSet<Stamp> = new_seq.iter().map(|(id, _)| *id).collect();
+
+    for (index, run) in runs(&old_seq, &new_ids) {
+        out.push(Change::TextDelete {
+            path: path_of(prefix),
+            index,
+            text: run,
+        });
+    }
+    for (index, run) in runs(&new_seq, &old_ids) {
+        out.push(Change::TextInsert {
+            path: path_of(prefix),
+            index,
+            text: run,
+        });
+    }
+}
+
+/// A Text's live codepoints in order, each with its stable char id.
+fn char_seq(t: &Text) -> Vec<(Stamp, char)> {
+    t.node_ids(0, t.len())
+        .into_iter()
+        .zip(t.as_string().chars())
+        .collect()
+}
+
+/// Coalesce the codepoints of `seq` whose id is absent from `present` into runs,
+/// each tagged with the run's start index within `seq`.
+fn runs(seq: &[(Stamp, char)], present: &HashSet<Stamp>) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut run: Option<(usize, String)> = None;
+    for (index, (id, ch)) in seq.iter().enumerate() {
+        if present.contains(id) {
+            if let Some(r) = run.take() {
+                out.push(r);
+            }
+        } else {
+            run.get_or_insert((index, String::new())).1.push(*ch);
+        }
+    }
+    if let Some(r) = run.take() {
+        out.push(r);
+    }
     out
 }
 
