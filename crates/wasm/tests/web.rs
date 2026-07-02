@@ -283,3 +283,23 @@ fn a_client_rejects_garbage_frames() {
     let mut c = wasm_client(1);
     assert!(!c.receive(&[0xff, 0xff, 0xff, 0xff]));
 }
+
+#[wasm_bindgen_test]
+fn a_client_atomic_transaction_travels_to_a_peer() {
+    let mut a = wasm_client(1);
+    let mut b = wasm_client(2);
+    let sa = a.subscribe(b"room-1");
+    let sb = b.subscribe(b"room-1");
+
+    a.begin_atomic(sa.channel());
+    // Edits accumulate while recording; only the commit frame is sent.
+    a.register_int(sa.channel(), &path(&["x"]), 1);
+    a.register_int(sa.channel(), &path(&["y"]), 2);
+    let frame = a.commit_atomic(sa.channel());
+    assert!(!frame.is_empty());
+    assert_eq!(a.get_int(sa.channel(), &path(&["x"])), Some(1));
+
+    assert!(b.receive(&frame));
+    assert_eq!(b.get_int(sb.channel(), &path(&["x"])), Some(1));
+    assert_eq!(b.get_int(sb.channel(), &path(&["y"])), Some(2));
+}

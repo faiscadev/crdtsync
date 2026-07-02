@@ -118,6 +118,8 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_dec, [doc, ch, cbytes, size, c.c_uint32], buf)
     sig(lib.crdtsync_client_set_bytes, [doc, ch, cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_client_delete, [doc, ch, cbytes, size], buf)
+    sig(lib.crdtsync_client_begin_atomic, [doc, ch], None)
+    sig(lib.crdtsync_client_commit_atomic, [doc, ch], buf)
     sig(lib.crdtsync_client_get_int, [doc, ch, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
     sig(lib.crdtsync_client_get_bytes, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_set_awareness, [doc, ch, cbytes, size, cbytes, size], buf)
@@ -553,6 +555,16 @@ class Client:
         _u32("channel", channel)
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_client_delete(self._handle, channel, p, len(p)))
+
+    def begin_atomic(self, channel: int) -> None:
+        """Start an atomic transaction on ``channel``; edits accumulate until commit."""
+        _u32("channel", channel)
+        _LIB.crdtsync_client_begin_atomic(self._handle, channel)
+
+    def commit_atomic(self, channel: int) -> bytes:
+        """Commit the atomic transaction on ``channel``; returns the Ops frame to send."""
+        _u32("channel", channel)
+        return _take_buf(_LIB.crdtsync_client_commit_atomic(self._handle, channel))
 
     # --- per-channel reads ---
 

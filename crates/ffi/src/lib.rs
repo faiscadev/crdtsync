@@ -1134,6 +1134,44 @@ pub unsafe extern "C" fn crdtsync_client_get_bytes(
     )
 }
 
+/// Begin recording an atomic transaction on `channel`'s room: subsequent edits
+/// on the channel accumulate into one group until
+/// [`crdtsync_client_commit_atomic`], each returning an empty frame.
+///
+/// # Safety
+/// `client` must be a handle from a constructor and not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_begin_atomic(client: *mut CrdtClient, channel: u32) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !client.is_null() {
+            (*client).session.begin_atomic(Channel(channel));
+        }
+    }));
+}
+
+/// Commit the atomic transaction opened on `channel` by
+/// [`crdtsync_client_begin_atomic`], returning the Ops frame carrying the tagged
+/// group. Empty on a bad handle, an unheld channel, or an empty group.
+///
+/// # Safety
+/// `client` must be a handle from a constructor and not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_commit_atomic(
+    client: *mut CrdtClient,
+    channel: u32,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        match (*client).session.commit_atomic(Channel(channel)) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
 /// Marshal a path-addressed edit on `channel`'s room: run the navigation against
 /// the room's replica, wrap the emitted ops in the Ops frame to send, and never
 /// let a panic cross the C frame. Empty when the channel isn't held.

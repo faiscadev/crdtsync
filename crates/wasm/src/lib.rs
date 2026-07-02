@@ -411,6 +411,22 @@ impl WasmClient {
         self.ops_frame(channel, |d| path::delete(d, path))
     }
 
+    /// Begin an atomic transaction on `channel`'s room; edits accumulate until
+    /// commit.
+    #[wasm_bindgen(js_name = beginAtomic)]
+    pub fn begin_atomic(&mut self, channel: u32) {
+        if let Some(doc) = self.inner.document_mut(Channel(channel)) {
+            doc.begin_atomic();
+        }
+    }
+
+    /// Commit the atomic transaction on `channel`, returning the Ops frame to
+    /// send.
+    #[wasm_bindgen(js_name = commitAtomic)]
+    pub fn commit_atomic(&mut self, channel: u32) -> Vec<u8> {
+        self.ops_frame(channel, |d| d.commit_atomic())
+    }
+
     /// Read an integer Register at a path in `channel`'s room.
     #[wasm_bindgen(js_name = getInt)]
     pub fn get_int(&self, channel: u32, path: &[u8]) -> Option<i64> {

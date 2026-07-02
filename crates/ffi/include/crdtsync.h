@@ -476,6 +476,22 @@ int32_t crdtsync_client_get_bytes(const CrdtClient *client,
                                   uintptr_t path_len,
                                   CrdtBuf *out);
 
+// Begin recording an atomic transaction on `channel`'s room: subsequent edits
+// on the channel accumulate into one group until
+// [`crdtsync_client_commit_atomic`], each returning an empty frame.
+//
+// # Safety
+// `client` must be a handle from a constructor and not yet freed.
+void crdtsync_client_begin_atomic(CrdtClient *client, uint32_t channel);
+
+// Commit the atomic transaction opened on `channel` by
+// [`crdtsync_client_begin_atomic`], returning the Ops frame carrying the tagged
+// group. Empty on a bad handle, an unheld channel, or an empty group.
+//
+// # Safety
+// `client` must be a handle from a constructor and not yet freed.
+CrdtBuf crdtsync_client_commit_atomic(CrdtClient *client, uint32_t channel);
+
 // Present an opaque credential; the returned Auth frame asks the server to
 // verify it and derive the actor. Empty on a bad handle or input.
 //

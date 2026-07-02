@@ -288,3 +288,36 @@ fn unsubscribe_drops_the_channel() {
         crdtsync_client_free(c);
     }
 }
+
+#[test]
+fn an_atomic_transaction_travels_over_the_wire_client() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (ca, sub_a) = subscribe(a, b"room-1");
+        let (cb, sub_b) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sub_a);
+        crdtsync_buf_free(sub_b);
+
+        let x = path(&[b"x"]);
+        let y = path(&[b"y"]);
+        crdtsync_client_begin_atomic(a, ca);
+        // Edits accumulate while recording; each frame carries no ops.
+        let e1 = register_int(a, ca, &x, 1);
+        let e2 = register_int(a, ca, &y, 2);
+        let frame = crdtsync_client_commit_atomic(a, ca);
+        assert!(frame.len > 0);
+        assert_eq!(get_int(a, ca, &x), (1, 1));
+
+        // The whole group folds into the peer atomically.
+        assert!(receive(b, &frame) >= 1);
+        assert_eq!(get_int(b, cb, &x), (1, 1));
+        assert_eq!(get_int(b, cb, &y), (1, 2));
+
+        crdtsync_buf_free(e1);
+        crdtsync_buf_free(e2);
+        crdtsync_buf_free(frame);
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}

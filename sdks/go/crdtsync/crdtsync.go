@@ -468,6 +468,18 @@ func (c *Client) Delete(channel uint32, path [][]byte) []byte {
 	return takeBuf(C.crdtsync_client_delete(c.h, C.uint32_t(channel), pp, pl))
 }
 
+// BeginAtomic starts an atomic transaction on channel's room; edits accumulate
+// until CommitAtomic.
+func (c *Client) BeginAtomic(channel uint32) {
+	C.crdtsync_client_begin_atomic(c.h, C.uint32_t(channel))
+}
+
+// CommitAtomic commits the atomic transaction on channel, returning the Ops
+// frame to send.
+func (c *Client) CommitAtomic(channel uint32) []byte {
+	return takeBuf(C.crdtsync_client_commit_atomic(c.h, C.uint32_t(channel)))
+}
+
 // GetInt reads an integer Register at path in channel's room.
 func (c *Client) GetInt(channel uint32, path [][]byte) (int64, bool) {
 	pp, pl := bytesArg(EncodePath(path))
