@@ -1,11 +1,13 @@
-//! Per-user undo / redo over scalar slots, at the root and inside nested maps.
+//! Per-user undo / redo over scalar slots and list items, at the root and inside
+//! nested maps.
 //!
 //! An `UndoManager` wraps a replica and records each edit made through it, so a
 //! later undo replays a forward op that restores the prior value and a redo
 //! replays the edit again. It tracks only edits made through the manager — a
 //! user's own intentions — and emits ordinary ops, so an undo converges on peers
 //! exactly like any other edit. Edits are addressed by path, so a slot in a
-//! nested map undoes exactly as a root one does.
+//! nested map undoes exactly as a root one does. Undo of a list insert removes
+//! the inserted item; undo of a list delete revives the removed value.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::{path, ClientId, Op, Scalar, UndoManager};
@@ -36,6 +38,11 @@ fn reg(d: &Document, path: &[u8]) -> Option<Scalar> {
 
 fn counter(d: &Document, path: &[u8]) -> i64 {
     path::get_counter(d, path).unwrap_or(0)
+}
+
+fn list_vals(d: &Document, path: &[u8]) -> Vec<Vec<u8>> {
+    let n = path::list_len(d, path).unwrap_or(0);
+    (0..n).filter_map(|i| path::list_get(d, path, i)).collect()
 }
 
 #[test]
@@ -290,5 +297,110 @@ fn an_undo_is_an_ordinary_op_a_peer_converges_on() {
         reg(&b, &name),
         Some(Scalar::Int(1)),
         "the peer sees the nested undo"
+    );
+}
+
+#[test]
+fn undo_of_a_list_insert_removes_the_item() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let items = p(&[b"items"]);
+    u.list_insert(&mut d, &items, 0, b"a");
+    assert_eq!(list_vals(&d, &items), vec![b"a".to_vec()]);
+
+    u.undo(&mut d);
+    assert_eq!(
+        list_vals(&d, &items),
+        Vec::<Vec<u8>>::new(),
+        "insert undone"
+    );
+    u.redo(&mut d);
+    assert_eq!(
+        list_vals(&d, &items),
+        vec![b"a".to_vec()],
+        "redo re-inserts the item"
+    );
+}
+
+#[test]
+fn undo_of_a_list_delete_revives_the_value() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let items = p(&[b"items"]);
+    u.list_insert(&mut d, &items, 0, b"a");
+    u.list_insert(&mut d, &items, 1, b"b");
+    u.list_insert(&mut d, &items, 2, b"c");
+
+    u.list_delete(&mut d, &items, 1);
+    assert_eq!(list_vals(&d, &items), vec![b"a".to_vec(), b"c".to_vec()]);
+
+    u.undo(&mut d);
+    assert_eq!(
+        list_vals(&d, &items),
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+        "the deleted value returns to its place"
+    );
+    u.redo(&mut d);
+    assert_eq!(
+        list_vals(&d, &items),
+        vec![b"a".to_vec(), b"c".to_vec()],
+        "redo removes it again"
+    );
+}
+
+#[test]
+fn a_group_of_list_inserts_undoes_as_one() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let items = p(&[b"items"]);
+    u.group(&mut d, |b| {
+        b.list_insert(&items, 0, b"x");
+        b.list_insert(&items, 1, b"y");
+    });
+    assert_eq!(list_vals(&d, &items), vec![b"x".to_vec(), b"y".to_vec()]);
+
+    u.undo(&mut d);
+    assert_eq!(
+        list_vals(&d, &items),
+        Vec::<Vec<u8>>::new(),
+        "the whole group is one step"
+    );
+    assert!(!u.can_undo());
+}
+
+#[test]
+fn undo_of_a_nested_list_insert_removes_the_item() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let items = p(&[b"board", b"cards"]);
+    u.list_insert(&mut d, &items, 0, b"card");
+    assert_eq!(list_vals(&d, &items), vec![b"card".to_vec()]);
+
+    u.undo(&mut d);
+    assert_eq!(
+        list_vals(&d, &items),
+        Vec::<Vec<u8>>::new(),
+        "nested insert undone"
+    );
+}
+
+#[test]
+fn a_list_undo_converges_on_a_peer() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let mut u = UndoManager::new();
+    let items = p(&[b"items"]);
+
+    apply_all(&mut b, &u.list_insert(&mut a, &items, 0, b"a"));
+    apply_all(&mut b, &u.list_insert(&mut a, &items, 1, b"b"));
+    assert_eq!(list_vals(&b, &items), vec![b"a".to_vec(), b"b".to_vec()]);
+
+    // Undo removes the last insert; the peer converges on the removal.
+    let undo_ops = u.undo(&mut a).expect("something to undo");
+    apply_all(&mut b, &undo_ops);
+    assert_eq!(
+        list_vals(&b, &items),
+        vec![b"a".to_vec()],
+        "the peer sees the item removed"
     );
 }

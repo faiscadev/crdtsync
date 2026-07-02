@@ -226,6 +226,11 @@ impl List {
         self.live_order().get(index).copied()
     }
 
+    /// The live position of node `id`, if it is present and not tombstoned.
+    pub fn live_index(&self, id: Stamp) -> Option<usize> {
+        self.live_order().iter().position(|s| *s == id)
+    }
+
     /// Tombstone the live item at `index`.
     pub fn delete(&mut self, index: usize) {
         if let Some(id) = self.node_at(index) {

@@ -13,6 +13,7 @@ use std::rc::Rc;
 use crate::doc::{Document, MapCursor};
 use crate::map::Map;
 use crate::op::Op;
+use crate::stamp::Stamp;
 use crate::{Element, Scalar};
 
 /// Encode a path from its keys.
@@ -95,6 +96,27 @@ pub fn list_delete(doc: &mut Document, path: &[u8], index: usize) -> Vec<Op> {
         return Vec::new();
     }
     emit(doc, path, move |cur, key| cur.list(key).delete(index))
+}
+
+/// Tombstone the list node `id` at a path, addressing it by stable id rather
+/// than a shifting index. Inert if the list or node is absent.
+pub fn list_delete_id(doc: &mut Document, path: &[u8], id: Stamp) -> Vec<Op> {
+    if !slot_ok(
+        doc,
+        path,
+        |e| matches!(e, Element::List(l) if l.borrow().contains(id)),
+    ) {
+        return Vec::new();
+    }
+    emit(doc, path, move |cur, key| cur.list(key).delete_id(id))
+}
+
+/// The live index of list node `id` at a path, if it is present and live.
+pub fn list_live_index(doc: &Document, path: &[u8], id: Stamp) -> Option<usize> {
+    slot(doc, path).and_then(|e| match e {
+        Element::List(l) => l.borrow().live_index(id),
+        _ => None,
+    })
 }
 
 /// Insert text at a codepoint index in the Text at a path.
