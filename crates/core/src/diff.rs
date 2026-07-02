@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use crate::codec::{put_bytes, put_scalar, put_u32, put_u64, put_u8, Cursor, DecodeError};
 use crate::doc::Document;
 use crate::element::{Element, ElementKind};
 use crate::list::List;
@@ -283,4 +284,174 @@ fn runs(seq: &[(Stamp, char)], present: &HashSet<Stamp>) -> Vec<(usize, String)>
 fn path_of(prefix: &[Vec<u8>]) -> Vec<u8> {
     let keys: Vec<&[u8]> = prefix.iter().map(Vec::as_slice).collect();
     encode_path(&keys)
+}
+
+/// Serialize a change list to bytes, so a diff computed in the core crosses the
+/// language SDK boundary as one buffer the binding decodes. The encoding is a
+/// `u32` count then each change, tag-led; it is not a durable format — a diff is
+/// a transient computed result, not stored.
+pub fn encode_changes(changes: &[Change]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, changes.len() as u32);
+    for change in changes {
+        put_change(&mut out, change);
+    }
+    out
+}
+
+/// Decode a change list encoded by [`encode_changes`], rejecting trailing bytes.
+pub fn decode_changes(bytes: &[u8]) -> Result<Vec<Change>, DecodeError> {
+    let mut cur = Cursor::new(bytes);
+    let count = cur.u32()?;
+    let mut changes = Vec::new();
+    for _ in 0..count {
+        changes.push(read_change(&mut cur)?);
+    }
+    if cur.at_end() {
+        Ok(changes)
+    } else {
+        Err(DecodeError::TrailingBytes)
+    }
+}
+
+fn put_change(out: &mut Vec<u8>, change: &Change) {
+    match change {
+        Change::Added { path, kind } => {
+            put_u8(out, 0);
+            put_bytes(out, path);
+            put_u8(out, *kind as u8);
+        }
+        Change::Removed { path, kind } => {
+            put_u8(out, 1);
+            put_bytes(out, path);
+            put_u8(out, *kind as u8);
+        }
+        Change::Value { path, old, new } => {
+            put_u8(out, 2);
+            put_bytes(out, path);
+            put_scalar(out, old);
+            put_scalar(out, new);
+        }
+        Change::Counter { path, old, new } => {
+            put_u8(out, 3);
+            put_bytes(out, path);
+            put_u64(out, *old as u64);
+            put_u64(out, *new as u64);
+        }
+        Change::ListInsert { path, index, items } => {
+            put_u8(out, 4);
+            put_bytes(out, path);
+            put_u64(out, *index as u64);
+            put_items(out, items);
+        }
+        Change::ListDelete { path, index, items } => {
+            put_u8(out, 5);
+            put_bytes(out, path);
+            put_u64(out, *index as u64);
+            put_items(out, items);
+        }
+        Change::TextInsert { path, index, text } => {
+            put_u8(out, 6);
+            put_bytes(out, path);
+            put_u64(out, *index as u64);
+            put_bytes(out, text.as_bytes());
+        }
+        Change::TextDelete { path, index, text } => {
+            put_u8(out, 7);
+            put_bytes(out, path);
+            put_u64(out, *index as u64);
+            put_bytes(out, text.as_bytes());
+        }
+    }
+}
+
+fn put_items(out: &mut Vec<u8>, items: &[SeqItem]) {
+    put_u32(out, items.len() as u32);
+    for item in items {
+        match item {
+            SeqItem::Scalar(s) => {
+                put_u8(out, 0);
+                put_scalar(out, s);
+            }
+            SeqItem::Composite(kind) => {
+                put_u8(out, 1);
+                put_u8(out, *kind as u8);
+            }
+        }
+    }
+}
+
+fn read_change(cur: &mut Cursor) -> Result<Change, DecodeError> {
+    Ok(match cur.u8()? {
+        0 => Change::Added {
+            path: cur.bytes()?,
+            kind: read_kind(cur)?,
+        },
+        1 => Change::Removed {
+            path: cur.bytes()?,
+            kind: read_kind(cur)?,
+        },
+        2 => Change::Value {
+            path: cur.bytes()?,
+            old: cur.scalar()?,
+            new: cur.scalar()?,
+        },
+        3 => Change::Counter {
+            path: cur.bytes()?,
+            old: cur.u64()? as i64,
+            new: cur.u64()? as i64,
+        },
+        4 => Change::ListInsert {
+            path: cur.bytes()?,
+            index: cur.u64()? as usize,
+            items: read_items(cur)?,
+        },
+        5 => Change::ListDelete {
+            path: cur.bytes()?,
+            index: cur.u64()? as usize,
+            items: read_items(cur)?,
+        },
+        6 => Change::TextInsert {
+            path: cur.bytes()?,
+            index: cur.u64()? as usize,
+            text: cur.string()?,
+        },
+        7 => Change::TextDelete {
+            path: cur.bytes()?,
+            index: cur.u64()? as usize,
+            text: cur.string()?,
+        },
+        tag => {
+            return Err(DecodeError::BadTag {
+                what: "diff change",
+                tag,
+            })
+        }
+    })
+}
+
+fn read_kind(cur: &mut Cursor) -> Result<ElementKind, DecodeError> {
+    let tag = cur.u8()?;
+    ElementKind::from_tag(tag).ok_or(DecodeError::BadTag {
+        what: "element kind",
+        tag,
+    })
+}
+
+fn read_items(cur: &mut Cursor) -> Result<Vec<SeqItem>, DecodeError> {
+    let count = cur.u32()?;
+    let mut items = Vec::new();
+    for _ in 0..count {
+        items.push(match cur.u8()? {
+            0 => SeqItem::Scalar(cur.scalar()?),
+            1 => SeqItem::Composite(read_kind(cur)?),
+            tag => {
+                return Err(DecodeError::BadTag {
+                    what: "diff item",
+                    tag,
+                })
+            }
+        });
+    }
+    Ok(items)
 }
