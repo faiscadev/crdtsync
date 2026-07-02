@@ -69,6 +69,9 @@ pub struct Hub {
     rooms: HashMap<RoomId, Room>,
     store: Option<Store>,
     compaction_threshold: u64,
+    /// Ephemeral presence per room: each owner client's latest entry per key,
+    /// with the actor to surface it under. Never persisted or snapshotted.
+    awareness: HashMap<RoomId, HashMap<(ClientId, Vec<u8>), (Vec<u8>, Vec<u8>)>>,
 }
 
 impl Hub {
@@ -79,6 +82,43 @@ impl Hub {
             rooms: HashMap::new(),
             store: None,
             compaction_threshold: 0,
+            awareness: HashMap::new(),
+        }
+    }
+
+    /// Record `client`'s ephemeral awareness entry `key` in `room`, last-writer-
+    /// wins, so a later subscriber can be replayed the current presence.
+    pub fn set_awareness(
+        &mut self,
+        room: &[u8],
+        client: ClientId,
+        actor: Vec<u8>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) {
+        self.awareness
+            .entry(room.to_vec())
+            .or_default()
+            .insert((client, key), (actor, value));
+    }
+
+    /// The current awareness entries in `room` as `(actor, key, value)`, for
+    /// replaying presence to a joining subscriber.
+    pub fn awareness_entries(&self, room: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        self.awareness
+            .get(room)
+            .into_iter()
+            .flatten()
+            .map(|((_, key), (actor, value))| (actor.clone(), key.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Drop every awareness entry owned by `client` across all rooms — called
+    /// when its connection ends, so a later subscriber is not replayed a
+    /// departed client's presence.
+    pub fn clear_client_awareness(&mut self, client: ClientId) {
+        for entries in self.awareness.values_mut() {
+            entries.retain(|(owner, _), _| *owner != client);
         }
     }
 

@@ -150,9 +150,20 @@ pub fn step(
                     state,
                 },
             };
+            // After the catch-up, replay the room's current presence so the
+            // joiner sees who is already here without waiting for a republish.
+            let mut replies = vec![reply];
+            for (actor, key, value) in hub.awareness_entries(&room) {
+                replies.push(Message::AwarenessUpdate {
+                    channel,
+                    actor,
+                    key,
+                    value,
+                });
+            }
             session.channels.insert(channel, room);
             Response {
-                replies: vec![reply],
+                replies,
                 ..Response::default()
             }
         }
@@ -212,10 +223,15 @@ pub fn step(
             let Some(actor) = session.actor.clone() else {
                 return violation("awareness before auth");
             };
+            let Some(client) = session.client else {
+                return violation("awareness before hello");
+            };
             let Some(room) = session.channels.get(&channel).cloned() else {
                 return violation("awareness on an unbound channel");
             };
-            // Ephemeral: fanned to the room's peers, never logged or snapshotted.
+            // Ephemeral: retained for late-joiner replay and fanned to the room's
+            // peers, but never logged or snapshotted.
+            hub.set_awareness(&room, client, actor.clone(), key.clone(), value.clone());
             Response {
                 awareness: Some(AwarenessBroadcast {
                     room,

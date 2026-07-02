@@ -135,6 +135,130 @@ fn awareness_does_not_advance_the_op_log() {
     assert_eq!(r.hub().seq(ROOM_A), 0, "awareness is not an op");
 }
 
+// --- late-joiner replay ---
+
+fn awareness_updates(msgs: Vec<Message>) -> Vec<Message> {
+    msgs.into_iter()
+        .filter(|m| matches!(m, Message::AwarenessUpdate { .. }))
+        .collect()
+}
+
+#[test]
+fn a_late_joiner_is_replayed_current_presence() {
+    let mut r = registry();
+    let a = hello_auth(&mut r, 1);
+    subscribe(&mut r, a, 1, ROOM_A);
+    r.deliver(
+        a,
+        Message::AwarenessSet {
+            channel: Channel(1),
+            key: b"cursor".to_vec(),
+            value: vec![5],
+        },
+    );
+
+    // A client subscribing afterward is replayed A's entry on its own channel.
+    let b = hello_auth(&mut r, 2);
+    assert!(r.deliver(
+        b,
+        Message::Subscribe {
+            channel: Channel(7),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        }
+    ));
+    assert_eq!(
+        awareness_updates(r.take_outbox(b)),
+        vec![Message::AwarenessUpdate {
+            channel: Channel(7),
+            actor: actor_of(1),
+            key: b"cursor".to_vec(),
+            value: vec![5],
+        }]
+    );
+}
+
+#[test]
+fn replay_reflects_the_latest_value_per_key() {
+    let mut r = registry();
+    let a = hello_auth(&mut r, 1);
+    subscribe(&mut r, a, 1, ROOM_A);
+    for v in [vec![1], vec![2]] {
+        r.deliver(
+            a,
+            Message::AwarenessSet {
+                channel: Channel(1),
+                key: b"cursor".to_vec(),
+                value: v,
+            },
+        );
+    }
+    let b = hello_auth(&mut r, 2);
+    r.deliver(
+        b,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert_eq!(
+        awareness_updates(r.take_outbox(b)),
+        vec![Message::AwarenessUpdate {
+            channel: Channel(1),
+            actor: actor_of(1),
+            key: b"cursor".to_vec(),
+            value: vec![2],
+        }]
+    );
+}
+
+#[test]
+fn a_departed_clients_presence_is_not_replayed() {
+    let mut r = registry();
+    let a = hello_auth(&mut r, 1);
+    subscribe(&mut r, a, 1, ROOM_A);
+    r.deliver(
+        a,
+        Message::AwarenessSet {
+            channel: Channel(1),
+            key: b"cursor".to_vec(),
+            value: vec![5],
+        },
+    );
+    r.disconnect(a);
+
+    let b = hello_auth(&mut r, 2);
+    r.deliver(
+        b,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(
+        awareness_updates(r.take_outbox(b)).is_empty(),
+        "a gone client's presence is cleared"
+    );
+}
+
+#[test]
+fn a_fresh_room_replays_no_presence() {
+    let mut r = registry();
+    let a = hello_auth(&mut r, 1);
+    assert!(r.deliver(
+        a,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        }
+    ));
+    // Only the empty catch-up, no awareness replay.
+    assert!(awareness_updates(r.take_outbox(a)).is_empty());
+}
+
 // --- violations ---
 
 #[test]
