@@ -201,6 +201,73 @@ fn a_peer_awareness_update_is_folded_and_readable() {
 }
 
 #[test]
+fn named_versions_round_trip_over_the_client() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        let (ch, sub) = subscribe(c, b"room-1");
+        crdtsync_buf_free(sub);
+
+        // Every issue method frames a non-empty request to send.
+        for frame in [
+            crdtsync_client_create_version(c, ch, b"v1".as_ptr(), 2),
+            crdtsync_client_rename_version(c, ch, b"v1".as_ptr(), 2, b"v2".as_ptr(), 2),
+            crdtsync_client_delete_version(c, ch, b"v1".as_ptr(), 2),
+            crdtsync_client_list_versions(c, ch),
+            crdtsync_client_fetch_version(c, ch, b"v1".as_ptr(), 2),
+        ] {
+            assert!(frame.len > 0, "a version request frames bytes to send");
+            crdtsync_buf_free(frame);
+        }
+
+        // The server's name list lands in the view.
+        let listing = encode_message(&Message::Versions {
+            channel: Channel(ch),
+            names: vec![b"v1".to_vec(), b"v2".to_vec()],
+        });
+        assert_eq!(
+            crdtsync_client_receive(c, listing.as_ptr(), listing.len()),
+            1
+        );
+
+        let mut n: usize = 0;
+        assert_eq!(crdtsync_client_version_count(c, ch, &mut n), 1);
+        assert_eq!(n, 2);
+        let mut name = out_buf();
+        assert_eq!(crdtsync_client_version_name(c, ch, 1, &mut name), 1);
+        assert_eq!(std::slice::from_raw_parts(name.ptr, name.len), b"v2");
+        crdtsync_buf_free(name);
+        // Out of range reports absent.
+        let mut oob = out_buf();
+        assert_eq!(crdtsync_client_version_name(c, ch, 9, &mut oob), 0);
+
+        // A fetched state is cached by name.
+        let state = encode_message(&Message::VersionState {
+            channel: Channel(ch),
+            name: b"v1".to_vec(),
+            seq: 1,
+            state: vec![7, 8, 9],
+        });
+        assert_eq!(crdtsync_client_receive(c, state.as_ptr(), state.len()), 1);
+        let mut st = out_buf();
+        assert_eq!(
+            crdtsync_client_version_state(c, ch, b"v1".as_ptr(), 2, &mut st),
+            1
+        );
+        assert_eq!(std::slice::from_raw_parts(st.ptr, st.len), &[7, 8, 9]);
+        crdtsync_buf_free(st);
+
+        // An unfetched name has no cached state.
+        let mut none = out_buf();
+        assert_eq!(
+            crdtsync_client_version_state(c, ch, b"other".as_ptr(), 5, &mut none),
+            0
+        );
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
 fn unsubscribe_drops_the_channel() {
     unsafe {
         let c = crdtsync_client_new(client_id(1).as_ptr());

@@ -382,6 +382,88 @@ int32_t crdtsync_client_awareness(const CrdtClient *client,
 // `client` is a live handle; `out` points to a writable `usize`.
 int32_t crdtsync_client_awareness_len(const CrdtClient *client, uint32_t channel, uintptr_t *out);
 
+// Frame a request to capture `channel`'s room as version `name`; returns the
+// frame to send. Empty on a bad handle, input, or unheld channel.
+//
+// # Safety
+// `client` is a live handle; `name`/`name_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_create_version(const CrdtClient *client,
+                                       uint32_t channel,
+                                       const uint8_t *name,
+                                       uintptr_t name_len);
+
+// Frame a request to rename version `from` to `to` on `channel`'s room. Empty on
+// a bad handle, input, or unheld channel.
+//
+// # Safety
+// `client` is a live handle; `from`/`from_len` and `to`/`to_len` follow
+// [`as_slice`].
+CrdtBuf crdtsync_client_rename_version(const CrdtClient *client,
+                                       uint32_t channel,
+                                       const uint8_t *from,
+                                       uintptr_t from_len,
+                                       const uint8_t *to,
+                                       uintptr_t to_len);
+
+// Frame a request to delete version `name` on `channel`'s room. Empty on a bad
+// handle, input, or unheld channel.
+//
+// # Safety
+// `client` is a live handle; `name`/`name_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_delete_version(const CrdtClient *client,
+                                       uint32_t channel,
+                                       const uint8_t *name,
+                                       uintptr_t name_len);
+
+// Frame a request for the version names of `channel`'s room. Empty on a bad
+// handle or unheld channel.
+//
+// # Safety
+// `client` is a live handle.
+CrdtBuf crdtsync_client_list_versions(const CrdtClient *client, uint32_t channel);
+
+// Frame a request for the captured state of version `name` on `channel`'s room.
+// Empty on a bad handle, input, or unheld channel.
+//
+// # Safety
+// `client` is a live handle; `name`/`name_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_fetch_version(const CrdtClient *client,
+                                      uint32_t channel,
+                                      const uint8_t *name,
+                                      uintptr_t name_len);
+
+// How many version names `channel`'s room currently holds in the client view,
+// into `out`. Returns 1 on success, -1 on a bad handle (an unheld channel
+// reports 0).
+//
+// # Safety
+// `client` is a live handle; `out` points to a writable `usize`.
+int32_t crdtsync_client_version_count(const CrdtClient *client, uint32_t channel, uintptr_t *out);
+
+// The version name at `index` in `channel`'s view into a fresh buffer at `out`.
+// Returns 1 if present, 0 if out of range or the channel isn't held, -1 on a bad
+// handle.
+//
+// # Safety
+// `client` is a live handle; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_client_version_name(const CrdtClient *client,
+                                     uint32_t channel,
+                                     uintptr_t index,
+                                     CrdtBuf *out);
+
+// The captured state of fetched version `name` on `channel` into a fresh buffer
+// at `out`. Returns 1 if present, 0 if not fetched or the channel isn't held, -1
+// on a bad handle.
+//
+// # Safety
+// `client` is a live handle; `name`/`name_len` follow [`as_slice`]; `out` points
+// to a writable `CrdtBuf`.
+int32_t crdtsync_client_version_state(const CrdtClient *client,
+                                      uint32_t channel,
+                                      const uint8_t *name,
+                                      uintptr_t name_len,
+                                      CrdtBuf *out);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

@@ -1041,3 +1041,201 @@ pub unsafe extern "C" fn crdtsync_client_awareness_len(
     }))
     .unwrap_or(-1)
 }
+
+// --- client named versions ---
+
+/// Frame a request to capture `channel`'s room as version `name`; returns the
+/// frame to send. Empty on a bad handle, input, or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle; `name`/`name_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_create_version(
+    client: *const CrdtClient,
+    channel: u32,
+    name: *const u8,
+    name_len: usize,
+) -> CrdtBuf {
+    version_frame(client, |s| {
+        as_slice(name, name_len).and_then(|n| s.create_version(Channel(channel), n))
+    })
+}
+
+/// Frame a request to rename version `from` to `to` on `channel`'s room. Empty on
+/// a bad handle, input, or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle; `from`/`from_len` and `to`/`to_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_rename_version(
+    client: *const CrdtClient,
+    channel: u32,
+    from: *const u8,
+    from_len: usize,
+    to: *const u8,
+    to_len: usize,
+) -> CrdtBuf {
+    version_frame(client, |s| {
+        match (as_slice(from, from_len), as_slice(to, to_len)) {
+            (Some(f), Some(t)) => s.rename_version(Channel(channel), f, t),
+            _ => None,
+        }
+    })
+}
+
+/// Frame a request to delete version `name` on `channel`'s room. Empty on a bad
+/// handle, input, or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle; `name`/`name_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_delete_version(
+    client: *const CrdtClient,
+    channel: u32,
+    name: *const u8,
+    name_len: usize,
+) -> CrdtBuf {
+    version_frame(client, |s| {
+        as_slice(name, name_len).and_then(|n| s.delete_version(Channel(channel), n))
+    })
+}
+
+/// Frame a request for the version names of `channel`'s room. Empty on a bad
+/// handle or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_list_versions(
+    client: *const CrdtClient,
+    channel: u32,
+) -> CrdtBuf {
+    version_frame(client, |s| s.list_versions(Channel(channel)))
+}
+
+/// Frame a request for the captured state of version `name` on `channel`'s room.
+/// Empty on a bad handle, input, or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle; `name`/`name_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_fetch_version(
+    client: *const CrdtClient,
+    channel: u32,
+    name: *const u8,
+    name_len: usize,
+) -> CrdtBuf {
+    version_frame(client, |s| {
+        as_slice(name, name_len).and_then(|n| s.fetch_version(Channel(channel), n))
+    })
+}
+
+/// Marshal a version request `frame` produces from the session into the wire
+/// frame to send, never letting a panic cross the C frame. Empty when `frame`
+/// yields nothing (a bad input or unheld channel).
+unsafe fn version_frame<F>(client: *const CrdtClient, frame: F) -> CrdtBuf
+where
+    F: FnOnce(&ClientSession) -> Option<Message>,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        match frame(&(*client).session) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// How many version names `channel`'s room currently holds in the client view,
+/// into `out`. Returns 1 on success, -1 on a bad handle (an unheld channel
+/// reports 0).
+///
+/// # Safety
+/// `client` is a live handle; `out` points to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_version_count(
+    client: *const CrdtClient,
+    channel: u32,
+    out: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        *out = (*client)
+            .session
+            .versions(Channel(channel))
+            .map_or(0, <[Vec<u8>]>::len);
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// The version name at `index` in `channel`'s view into a fresh buffer at `out`.
+/// Returns 1 if present, 0 if out of range or the channel isn't held, -1 on a bad
+/// handle.
+///
+/// # Safety
+/// `client` is a live handle; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_version_name(
+    client: *const CrdtClient,
+    channel: u32,
+    index: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        match (*client)
+            .session
+            .versions(Channel(channel))
+            .and_then(|names| names.get(index))
+        {
+            Some(name) => {
+                *out = CrdtBuf::from_vec(name.clone());
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// The captured state of fetched version `name` on `channel` into a fresh buffer
+/// at `out`. Returns 1 if present, 0 if not fetched or the channel isn't held, -1
+/// on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle; `name`/`name_len` follow [`as_slice`]; `out` points
+/// to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_version_state(
+    client: *const CrdtClient,
+    channel: u32,
+    name: *const u8,
+    name_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        let Some(n) = as_slice(name, name_len) else {
+            return 0;
+        };
+        match (*client).session.version_state(Channel(channel), n) {
+            Some(state) => {
+                *out = CrdtBuf::from_vec(state.to_vec());
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
