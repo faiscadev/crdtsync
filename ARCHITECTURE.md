@@ -245,7 +245,7 @@ Codepoints are universal (Unicode is append-only). What differs is grapheme clus
 
 ## What Core Does Not Ship
 
-NFC / NFD / NFKC / NFKD normalization (changes char_ids — app opt-in only if it accepts the cost). Locale-aware collation. Bidi / RTL display order. Locale-aware case folding. Word / sentence boundary detection beyond grapheme. Auto-repair of broken ZWJ sequences. Editor adapters handle their target editor's idiosyncrasies. Core stays Unicode-neutral beyond codepoint identity + grapheme helpers.
+NFC / NFD / NFKC / NFKD normalization (changes char_ids — app opt-in only if it accepts the cost). Locale-aware collation. Bidi / RTL display order. Locale-aware case folding. Word / sentence / grapheme boundary detection. Auto-repair of broken ZWJ sequences. Editor adapters handle their target editor's idiosyncrasies, grapheme segmentation included. Core stays Unicode-neutral: codepoint identity only, no Unicode-segmentation dependency (*as built* — see *Implementation Status & Divergences*).
 
 ---
 
@@ -970,6 +970,7 @@ This document is the **end-state** — the full scope + intended design; everyth
 - **Persistence is a per-room append-only file log** + optional `<room>.snap` snapshot — not SQLite. Crash-safety is hand-rolled (append flushes before return; compaction is temp → fsync → rename → dir fsync → truncate, with dedup-on-replay).
 - **One binary codec, shared by the wire and the log.** Deterministic little-endian, length-framed, total-decode (a `DecodeError`/`ProtocolError`, never a panic). Not CBOR/MessagePack. The 8-byte header (`"CRDT"` magic + version) reserves the version for future codec negotiation.
 - **Compaction is keyed on the server sequence** (`base_seq`), not a lamport timestamp. Cold-start (`catch_up`) returns **either** an op delta (at/above the room's floor) **or** a whole-replica snapshot regenerated live (below it) — never snapshot-plus-tail.
+- **Text is codepoint-only; grapheme segmentation is an SDK / editor-adapter concern.** The v0.1 roadmap listed "grapheme helpers"; the built core keeps them out — `Text` indexes by codepoint and ships no grapheme API, so no Unicode-segmentation table is pulled into the core (the same dependency-minimalism that keeps `getrandom` out). An editor adapter, which already handles its editor's idiosyncrasies, maps grapheme positions to codepoint indices. Convergence is codepoint-based and unaffected.
 
 ## Planned, not yet built (the prose above reads present-tense — it isn't yet)
 
