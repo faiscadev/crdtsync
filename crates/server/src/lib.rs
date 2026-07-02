@@ -7,7 +7,7 @@
 //! replays everything past it — the log a fresh replica replays back to the
 //! same state. Pure state; the transport wraps it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 
 use crdtsync_core::op::OpId;
@@ -69,6 +69,13 @@ pub enum Catchup {
     Snapshot { seq: u64, state: Vec<u8> },
 }
 
+/// A named version: a whole-replica snapshot captured at the server sequence it
+/// covered, retained under an app-chosen name until deleted.
+struct Version {
+    seq: u64,
+    state: Vec<u8>,
+}
+
 /// The set of rooms a single node serves, optionally over a durable log.
 pub struct Hub {
     server: ClientId,
@@ -78,6 +85,9 @@ pub struct Hub {
     /// Ephemeral presence per room: each owner client's latest entry per key,
     /// with the actor to surface it under. Never persisted or snapshotted.
     awareness: HashMap<RoomId, HashMap<(ClientId, Vec<u8>), (Vec<u8>, Vec<u8>)>>,
+    /// Named versions per room, keyed by name — sorted, for listing/pagination.
+    /// The in-memory versions index over the snapshot storage primitive.
+    versions: HashMap<RoomId, BTreeMap<Vec<u8>, Version>>,
 }
 
 impl Hub {
@@ -89,6 +99,7 @@ impl Hub {
             store: None,
             compaction_threshold: 0,
             awareness: HashMap::new(),
+            versions: HashMap::new(),
         }
     }
 
@@ -305,5 +316,71 @@ impl Hub {
     /// Read the merged state of a top-level slot in `room`.
     pub fn get(&self, room: &[u8], key: &[u8]) -> Option<Element> {
         self.rooms.get(room).and_then(|r| r.doc.get(key))
+    }
+
+    /// Capture the room's current whole-replica state as a named version, keyed
+    /// by `name`. Returns `false` — capturing nothing — if the room is unknown or
+    /// the name is already taken; a version is immutable, so a retake needs an
+    /// explicit delete or a fresh name.
+    pub fn create_version(&mut self, room: &[u8], name: &[u8]) -> bool {
+        let Some(r) = self.rooms.get(room) else {
+            return false;
+        };
+        let index = self.versions.entry(room.to_vec()).or_default();
+        if index.contains_key(name) {
+            return false;
+        }
+        index.insert(
+            name.to_vec(),
+            Version {
+                seq: r.head(),
+                state: r.doc.encode_state(),
+            },
+        );
+        true
+    }
+
+    /// The server sequence a named version covers, if it exists.
+    pub fn version_seq(&self, room: &[u8], name: &[u8]) -> Option<u64> {
+        self.versions.get(room)?.get(name).map(|v| v.seq)
+    }
+
+    /// The captured whole-replica state of a named version, for read / export /
+    /// diff. Restoring it as live state is restore-as-branch, a separate layer.
+    pub fn version_state(&self, room: &[u8], name: &[u8]) -> Option<&[u8]> {
+        self.versions
+            .get(room)?
+            .get(name)
+            .map(|v| v.state.as_slice())
+    }
+
+    /// The names of a room's versions, sorted, for listing and pagination.
+    pub fn version_names(&self, room: &[u8]) -> Vec<Vec<u8>> {
+        self.versions
+            .get(room)
+            .into_iter()
+            .flat_map(|index| index.keys().cloned())
+            .collect()
+    }
+
+    /// Rename a version. Returns `false` — changing nothing — if `from` is absent
+    /// or `to` is already taken.
+    pub fn rename_version(&mut self, room: &[u8], from: &[u8], to: &[u8]) -> bool {
+        let Some(index) = self.versions.get_mut(room) else {
+            return false;
+        };
+        if !index.contains_key(from) || index.contains_key(to) {
+            return false;
+        }
+        let version = index.remove(from).expect("presence checked above");
+        index.insert(to.to_vec(), version);
+        true
+    }
+
+    /// Delete a named version, returning whether one was removed.
+    pub fn delete_version(&mut self, room: &[u8], name: &[u8]) -> bool {
+        self.versions
+            .get_mut(room)
+            .is_some_and(|index| index.remove(name).is_some())
     }
 }
