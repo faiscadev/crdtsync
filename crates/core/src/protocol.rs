@@ -68,6 +68,12 @@ pub enum ErrorCode {
 pub enum Message {
     /// Opens a connection, naming the client.
     Hello { client: ClientId },
+    /// Presents an opaque credential for the server to verify. The core does not
+    /// parse it; a deployment-configured verifier interprets the bytes.
+    Auth { credential: Vec<u8> },
+    /// Reports a verified credential, carrying the server-derived actor id. The
+    /// client never asserts its own actor — it learns it here.
+    AuthOk { actor: Vec<u8> },
     /// Joins a room on `channel`, requesting every op past `last_seen_seq`.
     Subscribe {
         channel: Channel,
@@ -150,6 +156,14 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u8(&mut out, 5);
             put_u32(&mut out, channel.0);
         }
+        Message::Auth { credential } => {
+            put_u8(&mut out, 6);
+            put_bytes(&mut out, credential);
+        }
+        Message::AuthOk { actor } => {
+            put_u8(&mut out, 7);
+            put_bytes(&mut out, actor);
+        }
         Message::Error { code, message } => {
             put_u8(&mut out, 3);
             put_u16(&mut out, error_code_tag(*code));
@@ -202,6 +216,12 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
         }
         5 => Message::Unsubscribe {
             channel: Channel(cur.u32()?),
+        },
+        6 => Message::Auth {
+            credential: cur.bytes()?,
+        },
+        7 => Message::AuthOk {
+            actor: cur.bytes()?,
         },
         tag => {
             return Err(ProtocolError::BadTag {

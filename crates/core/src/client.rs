@@ -158,6 +158,8 @@ impl ClientSession {
                 Ok(())
             }
             Message::Error { code, message } => Err(ClientError::Server { code, message }),
+            Message::Auth { .. } => Err(ClientError::UnexpectedMessage("server sent auth")),
+            Message::AuthOk { .. } => Err(ClientError::UnexpectedMessage("server sent authok")),
             Message::Hello { .. } => Err(ClientError::UnexpectedMessage("server sent hello")),
             Message::Subscribe { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent subscribe"))
