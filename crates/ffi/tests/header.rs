@@ -57,6 +57,15 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_set_awareness",
         "crdtsync_client_awareness",
         "crdtsync_client_awareness_len",
+        // client named versions
+        "crdtsync_client_create_version",
+        "crdtsync_client_rename_version",
+        "crdtsync_client_delete_version",
+        "crdtsync_client_list_versions",
+        "crdtsync_client_fetch_version",
+        "crdtsync_client_version_count",
+        "crdtsync_client_version_name",
+        "crdtsync_client_version_state",
     ];
     for sym in required {
         assert!(
