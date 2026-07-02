@@ -114,6 +114,20 @@ async fn open_with_auth(url: &str, credential: &[u8]) -> Ws {
     ws
 }
 
+/// Open a connection setting the upgrade request header `name` to `value` — used
+/// to present a credential over the cookie and subprotocol carriers.
+async fn open_with_header(url: &str, name: &'static str, value: &str) -> Ws {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        HeaderName::from_static(name),
+        HeaderValue::from_str(value).unwrap(),
+    );
+    let (ws, _) = connect_async(request).await.unwrap();
+    ws
+}
+
 async fn send_bytes(ws: &mut Ws, bytes: Vec<u8>) {
     ws.send(WsMessage::Binary(bytes.into())).await.unwrap();
 }
@@ -384,4 +398,66 @@ async fn an_injected_verifier_refuses_a_bad_upgrade_credential() {
             ..
         }
     ));
+}
+
+// --- additional fast-path credential carriers ---
+
+/// Handshake a fast-path connection and assert the server established `actor`
+/// without an in-band Auth exchange.
+async fn assert_fast_path_actor(ws: &mut Ws, actor: &[u8]) {
+    send_bytes(ws, encode_header(PROTOCOL_VERSION).to_vec()).await;
+    assert_eq!(
+        recv(ws).await,
+        Message::AuthOk {
+            actor: actor.to_vec(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_credential_in_a_cookie_skips_the_auth_phase() {
+    let server = start_server().await;
+    let mut ws = open_with_header(&server.url, "cookie", "crdtsync_credential=cred").await;
+    assert_fast_path_actor(&mut ws, b"cred").await;
+}
+
+#[tokio::test]
+async fn a_credential_in_the_subprotocol_skips_the_auth_phase() {
+    let server = start_server().await;
+    // The client offers the app protocol plus the auth-carrying one.
+    let mut ws = open_with_header(
+        &server.url,
+        "sec-websocket-protocol",
+        "crdtsync, crdtsync.auth.cred",
+    )
+    .await;
+    assert_fast_path_actor(&mut ws, b"cred").await;
+}
+
+#[tokio::test]
+async fn a_credential_in_the_query_string_skips_the_auth_phase() {
+    let server = start_server().await;
+    let mut ws = open(&format!("{}/?credential=cred", server.url)).await;
+    assert_fast_path_actor(&mut ws, b"cred").await;
+}
+
+#[tokio::test]
+async fn the_authorization_header_wins_over_other_carriers() {
+    let server = start_server().await;
+    // Both a header and a cookie are present; the header takes precedence.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{
+        header::{AUTHORIZATION, COOKIE},
+        HeaderValue,
+    };
+    let mut request = server.url.as_str().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert(AUTHORIZATION, HeaderValue::from_static("from-header"));
+    request.headers_mut().insert(
+        COOKIE,
+        HeaderValue::from_static("crdtsync_credential=from-cookie"),
+    );
+    let (mut ws, _) = connect_async(request).await.unwrap();
+    assert_fast_path_actor(&mut ws, b"from-header").await;
 }
