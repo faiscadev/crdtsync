@@ -118,9 +118,9 @@ impl Hub {
         Ok(())
     }
 
-    /// Persist every future ingest to `store`. The log it already holds is
-    /// assumed to be `store`'s contents, as [`from_logs`](Hub::from_logs) leaves
-    /// it — this only redirects new writes to disk.
+    /// Persist every future ingest to `store`. The rooms it already holds are
+    /// assumed to be `store`'s contents, as [`from_rooms`](Hub::from_rooms)
+    /// leaves them — this only redirects new writes to disk.
     pub fn attach_store(&mut self, store: Store) {
         self.store = Some(store);
     }

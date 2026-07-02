@@ -98,6 +98,11 @@ impl Store {
             file.sync_all()?;
         }
         fs::rename(&tmp, self.snap_path(room))?;
+        // Persist the rename itself: until the directory is flushed the snapshot
+        // entry is not crash-durable, so a power loss could drop it while the
+        // log removal below survives. Flushing here keeps the snapshot present
+        // before the log it replaces can disappear.
+        self.sync_dir()?;
 
         // The snapshot is durable; the log prefix it covers can go. A compaction
         // folds up to the head, so the whole log is dropped and later appends
@@ -107,6 +112,11 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Flush the root directory so a rename or removal within it is durable.
+    fn sync_dir(&self) -> io::Result<()> {
+        File::open(&self.root)?.sync_all()
     }
 
     /// Every room's snapshot and log, keyed by room id. Room order is
