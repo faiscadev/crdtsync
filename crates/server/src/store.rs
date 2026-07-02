@@ -31,14 +31,16 @@ pub struct Snapshot {
     pub state: Vec<u8>,
 }
 
-/// What a store holds for one room: an optional compaction snapshot and the op
-/// records still in its log. The log may overlap the snapshot — a crash between
-/// writing the snapshot and truncating the log leaves the prefix behind — so
-/// the hub replays it through its dedup.
+/// What a store holds for one room: an optional compaction snapshot, the op
+/// records still in its log, and its named versions. The log may overlap the
+/// snapshot — a crash between writing the snapshot and truncating the log leaves
+/// the prefix behind — so the hub replays it through its dedup.
 #[derive(Default)]
 pub struct RoomLog {
     pub snapshot: Option<Snapshot>,
     pub ops: Vec<Op>,
+    /// The room's named versions as `(name, covered seq, state)`.
+    pub versions: Vec<(Vec<u8>, u64, Vec<u8>)>,
 }
 
 /// A directory of per-room logs and snapshots.
@@ -114,6 +116,44 @@ impl Store {
         }
     }
 
+    /// Rewrite `room`'s named versions to their own file, replacing whatever it
+    /// held. Each record is the name (length-prefixed), the covered sequence
+    /// (8-byte little-endian), then the state (length-prefixed). The file lands
+    /// atomically — temp, flushed, renamed, directory flushed — so a crash never
+    /// leaves a torn index; an empty set removes the file. A version is immutable
+    /// but the *index* is not, so the whole file is rewritten on every change.
+    pub fn write_versions(
+        &mut self,
+        room: &[u8],
+        versions: &[(&[u8], u64, &[u8])],
+    ) -> io::Result<()> {
+        if versions.is_empty() {
+            match fs::remove_file(self.versions_path(room)) {
+                Ok(()) => return self.sync_dir(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+        let mut buf = Vec::new();
+        for (name, seq, state) in versions {
+            put_bytes(&mut buf, name);
+            buf.extend_from_slice(&seq.to_le_bytes());
+            put_bytes(&mut buf, state);
+        }
+        let tmp = self.versions_tmp_path(room);
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            file.write_all(&buf)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, self.versions_path(room))?;
+        self.sync_dir()
+    }
+
     /// Flush the root directory so a rename or removal within it is durable.
     fn sync_dir(&self) -> io::Result<()> {
         File::open(&self.root)?.sync_all()
@@ -137,6 +177,7 @@ impl Store {
             match kind {
                 FileKind::Log => slot.ops = decode_records(&bytes)?,
                 FileKind::Snapshot => slot.snapshot = Some(parse_snapshot(&bytes)?),
+                FileKind::Versions => slot.versions = parse_versions(&bytes)?,
             }
         }
         Ok(rooms.into_iter().collect())
@@ -168,6 +209,25 @@ impl Store {
     fn snap_tmp_path(&self, room: &[u8]) -> PathBuf {
         self.root.join(format!("{}.snap.tmp", Self::hex_name(room)))
     }
+
+    /// The named-versions file backing `room`.
+    fn versions_path(&self, room: &[u8]) -> PathBuf {
+        self.root.join(format!("{}.versions", Self::hex_name(room)))
+    }
+
+    /// The in-progress versions temp for `room`, renamed onto `versions_path`
+    /// once durable.
+    fn versions_tmp_path(&self, room: &[u8]) -> PathBuf {
+        self.root
+            .join(format!("{}.versions.tmp", Self::hex_name(room)))
+    }
+}
+
+/// Append `bytes` to `buf` as a `u32` little-endian length prefix then the bytes.
+fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).expect("length exceeds u32");
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(bytes);
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -176,14 +236,16 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 enum FileKind {
     Log,
     Snapshot,
+    Versions,
 }
 
 /// Recover a room id and file kind from a path, or `None` if it is not one of
-/// ours (including an uncommitted `.snap.tmp`).
+/// ours (including an uncommitted `.snap.tmp` / `.versions.tmp`).
 fn classify(path: &Path) -> Option<(RoomId, FileKind)> {
     let kind = match path.extension()?.to_str()? {
         "log" => FileKind::Log,
         "snap" => FileKind::Snapshot,
+        "versions" => FileKind::Versions,
         _ => return None,
     };
     let stem = path.file_stem()?.to_str()?.as_bytes();
@@ -211,6 +273,56 @@ fn parse_snapshot(bytes: &[u8]) -> io::Result<Snapshot> {
         base_seq,
         state: bytes[8..].to_vec(),
     })
+}
+
+/// Parse a versions file: a sequence of `(name, seq, state)` records, each a
+/// length-prefixed name, an 8-byte little-endian sequence, and a length-prefixed
+/// state. The file is rewritten atomically, so it is never torn — any framing
+/// shortfall or trailing garbage is corruption, not a tolerable tail.
+fn parse_versions(bytes: &[u8]) -> io::Result<Vec<(Vec<u8>, u64, Vec<u8>)>> {
+    let mut versions = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let name = take_bytes(bytes, &mut at)?;
+        let seq = take_u64(bytes, &mut at)?;
+        let state = take_bytes(bytes, &mut at)?;
+        versions.push((name, seq, state));
+    }
+    Ok(versions)
+}
+
+/// Read a `u32`-length-prefixed byte string at `at`, advancing it.
+fn take_bytes(bytes: &[u8], at: &mut usize) -> io::Result<Vec<u8>> {
+    let len = take_u32(bytes, at)? as usize;
+    let start = *at;
+    let body = bytes
+        .get(start..)
+        .and_then(|rest| rest.get(..len))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "versions record is truncated")
+        })?;
+    *at = start + len;
+    Ok(body.to_vec())
+}
+
+/// Read a little-endian `u32` at `at`, advancing it.
+fn take_u32(bytes: &[u8], at: &mut usize) -> io::Result<u32> {
+    let end = *at + 4;
+    let field = bytes.get(*at..end).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "versions record is truncated")
+    })?;
+    *at = end;
+    Ok(u32::from_le_bytes(field.try_into().unwrap()))
+}
+
+/// Read a little-endian `u64` at `at`, advancing it.
+fn take_u64(bytes: &[u8], at: &mut usize) -> io::Result<u64> {
+    let end = *at + 8;
+    let field = bytes.get(*at..end).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "versions record is truncated")
+    })?;
+    *at = end;
+    Ok(u64::from_le_bytes(field.try_into().unwrap()))
 }
 
 fn unhex(c: u8) -> Option<u8> {

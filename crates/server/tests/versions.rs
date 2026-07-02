@@ -7,8 +7,9 @@
 //! a point-in-time snapshot, retained until the app deletes it.
 //!
 //! Restoring a version as live state is restore-as-branch, gated on the branch
-//! layer; durable persistence of the index and auto-version triggers are
-//! follow-ons. This suite covers the in-memory index over the merged replica.
+//! layer; auto-version triggers are a follow-on. These tests drive an in-memory
+//! hub (no store), so the version mutations never fail; durability across a
+//! store reopen has its own suite.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::{ClientId, Element, Scalar};
@@ -30,7 +31,7 @@ fn doc(first: u8) -> Document {
 
 const ROOM: &[u8] = b"room-a";
 
-/// Ingest a register-write into the room, returning the value written.
+/// Ingest a register-write into the room.
 fn write_age(h: &mut Hub, value: i64) {
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(value)));
     h.ingest(ROOM, ops).unwrap();
@@ -54,7 +55,7 @@ fn a_created_version_captures_the_current_state_and_seq() {
     write_age(&mut h, 30);
     let seq = h.seq(ROOM);
 
-    assert!(h.create_version(ROOM, b"v1"));
+    assert!(h.create_version(ROOM, b"v1").unwrap());
     assert_eq!(h.version_seq(ROOM, b"v1"), Some(seq));
     assert_eq!(age_in(h.version_state(ROOM, b"v1").unwrap()), 30);
 }
@@ -64,7 +65,7 @@ fn a_version_is_a_point_in_time_untouched_by_later_edits() {
     let mut h = hub();
     write_age(&mut h, 30);
     let at_v1 = h.seq(ROOM);
-    assert!(h.create_version(ROOM, b"v1"));
+    assert!(h.create_version(ROOM, b"v1").unwrap());
 
     // The room moves on; the version does not.
     write_age(&mut h, 40);
@@ -76,10 +77,13 @@ fn a_version_is_a_point_in_time_untouched_by_later_edits() {
 fn a_duplicate_name_does_not_overwrite() {
     let mut h = hub();
     write_age(&mut h, 30);
-    assert!(h.create_version(ROOM, b"v1"));
+    assert!(h.create_version(ROOM, b"v1").unwrap());
 
     write_age(&mut h, 40);
-    assert!(!h.create_version(ROOM, b"v1"), "a taken name is refused");
+    assert!(
+        !h.create_version(ROOM, b"v1").unwrap(),
+        "a taken name is refused"
+    );
     assert_eq!(
         age_in(h.version_state(ROOM, b"v1").unwrap()),
         30,
@@ -91,9 +95,9 @@ fn a_duplicate_name_does_not_overwrite() {
 fn versions_list_sorted_for_pagination() {
     let mut h = hub();
     write_age(&mut h, 1);
-    assert!(h.create_version(ROOM, b"v-c"));
-    assert!(h.create_version(ROOM, b"v-a"));
-    assert!(h.create_version(ROOM, b"v-b"));
+    assert!(h.create_version(ROOM, b"v-c").unwrap());
+    assert!(h.create_version(ROOM, b"v-a").unwrap());
+    assert!(h.create_version(ROOM, b"v-b").unwrap());
     assert_eq!(
         h.version_names(ROOM),
         vec![b"v-a".to_vec(), b"v-b".to_vec(), b"v-c".to_vec()]
@@ -104,9 +108,9 @@ fn versions_list_sorted_for_pagination() {
 fn rename_moves_a_version_and_preserves_its_state() {
     let mut h = hub();
     write_age(&mut h, 30);
-    assert!(h.create_version(ROOM, b"draft"));
+    assert!(h.create_version(ROOM, b"draft").unwrap());
 
-    assert!(h.rename_version(ROOM, b"draft", b"final"));
+    assert!(h.rename_version(ROOM, b"draft", b"final").unwrap());
     assert_eq!(h.version_seq(ROOM, b"draft"), None, "the old name is gone");
     assert_eq!(age_in(h.version_state(ROOM, b"final").unwrap()), 30);
 }
@@ -115,11 +119,14 @@ fn rename_moves_a_version_and_preserves_its_state() {
 fn rename_refuses_an_absent_source_or_a_taken_target() {
     let mut h = hub();
     write_age(&mut h, 30);
-    assert!(h.create_version(ROOM, b"a"));
-    assert!(h.create_version(ROOM, b"b"));
+    assert!(h.create_version(ROOM, b"a").unwrap());
+    assert!(h.create_version(ROOM, b"b").unwrap());
 
-    assert!(!h.rename_version(ROOM, b"missing", b"c"), "absent source");
-    assert!(!h.rename_version(ROOM, b"a", b"b"), "taken target");
+    assert!(
+        !h.rename_version(ROOM, b"missing", b"c").unwrap(),
+        "absent source"
+    );
+    assert!(!h.rename_version(ROOM, b"a", b"b").unwrap(), "taken target");
     assert_eq!(h.version_names(ROOM), vec![b"a".to_vec(), b"b".to_vec()]);
 }
 
@@ -127,18 +134,21 @@ fn rename_refuses_an_absent_source_or_a_taken_target() {
 fn delete_removes_a_version() {
     let mut h = hub();
     write_age(&mut h, 30);
-    assert!(h.create_version(ROOM, b"v1"));
+    assert!(h.create_version(ROOM, b"v1").unwrap());
 
-    assert!(h.delete_version(ROOM, b"v1"));
+    assert!(h.delete_version(ROOM, b"v1").unwrap());
     assert_eq!(h.version_seq(ROOM, b"v1"), None);
-    assert!(!h.delete_version(ROOM, b"v1"), "a second delete is a no-op");
+    assert!(
+        !h.delete_version(ROOM, b"v1").unwrap(),
+        "a second delete is a no-op"
+    );
 }
 
 #[test]
 fn an_unknown_room_has_no_versions() {
     let mut h = hub();
     assert!(
-        !h.create_version(b"ghost", b"v1"),
+        !h.create_version(b"ghost", b"v1").unwrap(),
         "a room with no state cannot be versioned"
     );
     assert_eq!(h.version_seq(b"ghost", b"v1"), None);
@@ -157,8 +167,8 @@ fn versions_are_isolated_per_room() {
     )
     .unwrap();
 
-    assert!(h.create_version(ROOM, b"v1"));
-    assert!(h.create_version(other, b"v1"));
+    assert!(h.create_version(ROOM, b"v1").unwrap());
+    assert!(h.create_version(other, b"v1").unwrap());
 
     assert_eq!(age_in(h.version_state(ROOM, b"v1").unwrap()), 30);
     assert_eq!(age_in(h.version_state(other, b"v1").unwrap()), 99);

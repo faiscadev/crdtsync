@@ -207,6 +207,12 @@ impl Hub {
         // Store-less replay: these ops are already durable, so ingest can't fail.
         self.ingest(&room, log.ops)
             .expect("a store-less replay never fails");
+        if !log.versions.is_empty() {
+            let index = self.versions.entry(room).or_default();
+            for (name, seq, state) in log.versions {
+                index.insert(name, Version { seq, state });
+            }
+        }
         Ok(())
     }
 
@@ -319,25 +325,32 @@ impl Hub {
     }
 
     /// Capture the room's current whole-replica state as a named version, keyed
-    /// by `name`. Returns `false` — capturing nothing — if the room is unknown or
-    /// the name is already taken; a version is immutable, so a retake needs an
-    /// explicit delete or a fresh name.
-    pub fn create_version(&mut self, room: &[u8], name: &[u8]) -> bool {
+    /// by `name`. Returns `Ok(false)` — capturing nothing — if the room is
+    /// unknown or the name is already taken; a version is immutable, so a retake
+    /// needs an explicit delete or a fresh name. With a store attached the index
+    /// is persisted before the version is committed, so a persist failure leaves
+    /// no version the disk has not accepted.
+    pub fn create_version(&mut self, room: &[u8], name: &[u8]) -> io::Result<bool> {
         let Some(r) = self.rooms.get(room) else {
-            return false;
+            return Ok(false);
+        };
+        let version = Version {
+            seq: r.head(),
+            state: r.doc.encode_state(),
         };
         let index = self.versions.entry(room.to_vec()).or_default();
         if index.contains_key(name) {
-            return false;
+            return Ok(false);
         }
-        index.insert(
-            name.to_vec(),
-            Version {
-                seq: r.head(),
-                state: r.doc.encode_state(),
-            },
-        );
-        true
+        index.insert(name.to_vec(), version);
+        if let Err(e) = self.persist_versions(room) {
+            self.versions
+                .get_mut(room)
+                .expect("index created above")
+                .remove(name);
+            return Err(e);
+        }
+        Ok(true)
     }
 
     /// The server sequence a named version covers, if it exists.
@@ -363,24 +376,59 @@ impl Hub {
             .collect()
     }
 
-    /// Rename a version. Returns `false` — changing nothing — if `from` is absent
-    /// or `to` is already taken.
-    pub fn rename_version(&mut self, room: &[u8], from: &[u8], to: &[u8]) -> bool {
+    /// Rename a version. Returns `Ok(false)` — changing nothing — if `from` is
+    /// absent or `to` is already taken. The index is persisted before the rename
+    /// commits when a store is attached.
+    pub fn rename_version(&mut self, room: &[u8], from: &[u8], to: &[u8]) -> io::Result<bool> {
         let Some(index) = self.versions.get_mut(room) else {
-            return false;
+            return Ok(false);
         };
         if !index.contains_key(from) || index.contains_key(to) {
-            return false;
+            return Ok(false);
         }
         let version = index.remove(from).expect("presence checked above");
         index.insert(to.to_vec(), version);
-        true
+        if let Err(e) = self.persist_versions(room) {
+            let index = self.versions.get_mut(room).expect("index present above");
+            let version = index.remove(to).expect("just inserted");
+            index.insert(from.to_vec(), version);
+            return Err(e);
+        }
+        Ok(true)
     }
 
-    /// Delete a named version, returning whether one was removed.
-    pub fn delete_version(&mut self, room: &[u8], name: &[u8]) -> bool {
-        self.versions
-            .get_mut(room)
-            .is_some_and(|index| index.remove(name).is_some())
+    /// Delete a named version, returning whether one was removed. The index is
+    /// persisted before the removal commits when a store is attached.
+    pub fn delete_version(&mut self, room: &[u8], name: &[u8]) -> io::Result<bool> {
+        let Some(index) = self.versions.get_mut(room) else {
+            return Ok(false);
+        };
+        let Some(removed) = index.remove(name) else {
+            return Ok(false);
+        };
+        if let Err(e) = self.persist_versions(room) {
+            self.versions
+                .get_mut(room)
+                .expect("index present above")
+                .insert(name.to_vec(), removed);
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Persist `room`'s version index to the store, if one is attached. The whole
+    /// index is rewritten atomically — a version is immutable, but the set of
+    /// versions is not.
+    fn persist_versions(&mut self, room: &[u8]) -> io::Result<()> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(());
+        };
+        let empty = BTreeMap::new();
+        let index = self.versions.get(room).unwrap_or(&empty);
+        let records: Vec<(&[u8], u64, &[u8])> = index
+            .iter()
+            .map(|(name, v)| (name.as_slice(), v.seq, v.state.as_slice()))
+            .collect();
+        store.write_versions(room, &records)
     }
 }
