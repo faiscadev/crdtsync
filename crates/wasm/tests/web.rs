@@ -198,6 +198,21 @@ fn a_client_handshake_and_awareness_marshal() {
 }
 
 #[wasm_bindgen_test]
+fn a_client_version_requests_marshal() {
+    let mut c = wasm_client(1);
+    let sub = c.subscribe(b"room-1");
+    let ch = sub.channel();
+    assert!(c.create_version(ch, b"v1").is_some());
+    assert!(c.rename_version(ch, b"v1", b"v2").is_some());
+    assert!(c.delete_version(ch, b"v1").is_some());
+    assert!(c.list_versions(ch).is_some());
+    assert!(c.fetch_version(ch, b"v1").is_some());
+    // Nothing reported until a server reply is folded in.
+    assert!(c.versions(ch).is_empty());
+    assert!(c.version_state(ch, b"v1").is_none());
+}
+
+#[wasm_bindgen_test]
 fn a_client_rejects_garbage_frames() {
     let mut c = wasm_client(1);
     assert!(!c.receive(&[0xff, 0xff, 0xff, 0xff]));

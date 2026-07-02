@@ -310,6 +310,69 @@ impl WasmClient {
     pub fn awareness_len(&self, channel: u32) -> usize {
         self.inner.awareness_len(Channel(channel))
     }
+
+    /// Frame a request to capture `channel`'s room as version `name`. `None` if
+    /// the channel isn't held.
+    #[wasm_bindgen(js_name = createVersion)]
+    pub fn create_version(&self, channel: u32, name: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .create_version(Channel(channel), name)
+            .map(|m| encode_message(&m))
+    }
+
+    /// Frame a request to rename version `from` to `to`. `None` if the channel
+    /// isn't held.
+    #[wasm_bindgen(js_name = renameVersion)]
+    pub fn rename_version(&self, channel: u32, from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .rename_version(Channel(channel), from, to)
+            .map(|m| encode_message(&m))
+    }
+
+    /// Frame a request to delete version `name`. `None` if the channel isn't held.
+    #[wasm_bindgen(js_name = deleteVersion)]
+    pub fn delete_version(&self, channel: u32, name: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .delete_version(Channel(channel), name)
+            .map(|m| encode_message(&m))
+    }
+
+    /// Frame a request for `channel`'s room's version names. `None` if the channel
+    /// isn't held.
+    #[wasm_bindgen(js_name = listVersions)]
+    pub fn list_versions(&self, channel: u32) -> Option<Vec<u8>> {
+        self.inner
+            .list_versions(Channel(channel))
+            .map(|m| encode_message(&m))
+    }
+
+    /// Frame a request for the captured state of version `name`. `None` if the
+    /// channel isn't held.
+    #[wasm_bindgen(js_name = fetchVersion)]
+    pub fn fetch_version(&self, channel: u32, name: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .fetch_version(Channel(channel), name)
+            .map(|m| encode_message(&m))
+    }
+
+    /// The version names last reported for `channel`'s room, in order. Empty if
+    /// the channel isn't held or none have been reported.
+    pub fn versions(&self, channel: u32) -> Vec<js_sys::Uint8Array> {
+        self.inner
+            .versions(Channel(channel))
+            .unwrap_or(&[])
+            .iter()
+            .map(|name| js_sys::Uint8Array::from(name.as_slice()))
+            .collect()
+    }
+
+    /// The captured state of a fetched version `name`, once it has arrived.
+    #[wasm_bindgen(js_name = versionState)]
+    pub fn version_state(&self, channel: u32, name: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .version_state(Channel(channel), name)
+            .map(<[u8]>::to_vec)
+    }
 }
 
 impl WasmClient {

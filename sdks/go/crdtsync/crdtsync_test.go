@@ -307,6 +307,32 @@ func TestClientHandshakeAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestClientVersionRequestsMarshal(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+
+	ch, _ := c.Subscribe(key("room-1"))
+	frames := [][]byte{
+		c.CreateVersion(ch, key("v1")),
+		c.RenameVersion(ch, key("v1"), key("v2")),
+		c.DeleteVersion(ch, key("v1")),
+		c.ListVersions(ch),
+		c.FetchVersion(ch, key("v1")),
+	}
+	for i, f := range frames {
+		if len(f) == 0 {
+			t.Fatalf("version request %d should yield a frame", i)
+		}
+	}
+	// Nothing reported until a server reply is folded in.
+	if names := c.Versions(ch); len(names) != 0 {
+		t.Fatalf("versions: got %d, want 0", len(names))
+	}
+	if _, ok := c.VersionState(ch, key("v1")); ok {
+		t.Fatal("no version state before a fetch reply")
+	}
+}
+
 func TestClientReceiveRejectsGarbage(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()

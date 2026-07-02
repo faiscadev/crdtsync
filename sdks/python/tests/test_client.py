@@ -49,6 +49,19 @@ def test_awareness_publish_and_lifecycle():
         assert a.resume(ch) == b""
 
 
+def test_version_requests_marshal():
+    with Client(cid(1)) as a:
+        ch, _ = a.subscribe(b"room-1")
+        assert len(a.create_version(ch, b"v1")) > 0
+        assert len(a.rename_version(ch, b"v1", b"v2")) > 0
+        assert len(a.delete_version(ch, b"v1")) > 0
+        assert len(a.list_versions(ch)) > 0
+        assert len(a.fetch_version(ch, b"v1")) > 0
+        # Nothing reported until a server reply is folded in.
+        assert a.versions(ch) == []
+        assert a.version_state(ch, b"v1") is None
+
+
 def test_receive_rejects_garbage():
     with Client(cid(1)) as a:
         assert a.receive(b"\xff\xff\xff\xff") == 0
