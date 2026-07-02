@@ -121,6 +121,7 @@ fn an_inbound_error_is_a_violation() {
         Message::Error {
             code: ErrorCode::Internal,
             message: String::new(),
+            details: Vec::new(),
         },
     );
     assert!(r.close);

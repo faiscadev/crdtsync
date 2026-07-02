@@ -443,6 +443,7 @@ async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
                 .send(Message::Error {
                     code: ErrorCode::AuthFailed,
                     message: "credential rejected".to_string(),
+                    details: Vec::new(),
                 })
                 .await;
             None

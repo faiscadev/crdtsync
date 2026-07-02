@@ -527,6 +527,7 @@ fn a_server_error_surfaces_to_the_caller() {
     let err = session.receive(Message::Error {
         code: ErrorCode::UnknownRoom,
         message: "no such room".to_string(),
+        details: Vec::new(),
     });
     match err {
         Err(ClientError::Server { code, message }) => {

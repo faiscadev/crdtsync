@@ -339,7 +339,7 @@ impl ClientSession {
                 room.awareness.retain(|(a, _), _| *a != actor);
                 Ok(())
             }
-            Message::Error { code, message } => Err(ClientError::Server { code, message }),
+            Message::Error { code, message, .. } => Err(ClientError::Server { code, message }),
             Message::Auth { .. } => Err(ClientError::UnexpectedMessage("server sent auth")),
             Message::AwarenessSet { .. } => Err(ClientError::UnexpectedMessage(
                 "server sent an awareness set",

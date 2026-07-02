@@ -43,7 +43,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **v0.2 wire / client** — client session / reconnect driver `core::client::ClientSession` (#59).
 
-**Forward-compat reservations** — blob-ref value slot `Scalar::BlobRef` reserved in the op envelope + codec (#60).
+**Forward-compat reservations** — blob-ref value slot `Scalar::BlobRef` reserved in the op envelope + codec (#60); error-envelope `details` byte string reserved in `Message::Error` + codec (#108) — round-tripped, empty, no producer yet, so the SDK error surface stays code + message.
 
 **Channel multiplexing** — one connection multiplexes many rooms via client-assigned `Channel`; server session holds channel→room, registry fans out per peer-channel (#61); SDK-side `ClientSession` holds N rooms, each with its own replica + last-seen seq, routing inbound frames by channel, reconnect via `resume(channel)` (#62). Arc complete.
 
