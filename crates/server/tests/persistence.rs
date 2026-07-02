@@ -345,6 +345,39 @@ fn a_snapshot_beside_a_full_log_reconstructs_correctly() {
     assert_eq!(hub.seq(ROOM), reference.seq(ROOM));
 }
 
+#[test]
+fn an_auto_compacted_room_persists_its_snapshot() {
+    let tmp = tempdir();
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        hub.set_compaction_threshold(2);
+        let mut a = doc(1);
+        hub.ingest(ROOM, a.transact(|tx| tx.register(b"a", Scalar::Int(1))))
+            .unwrap();
+        // The second op takes the retained log to the threshold, folding it into
+        // a durable snapshot.
+        hub.ingest(ROOM, a.transact(|tx| tx.register(b"b", Scalar::Int(2))))
+            .unwrap();
+    }
+    let rooms = Store::open(tmp.path()).unwrap().load().unwrap();
+    let (_, rl) = rooms.iter().find(|(room, _)| room == ROOM).unwrap();
+    assert!(
+        rl.snapshot.is_some(),
+        "auto-compaction persisted a snapshot"
+    );
+    assert!(rl.ops.is_empty(), "the log was truncated on disk");
+
+    let reloaded = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(int(reloaded.get(ROOM, b"a")), 1);
+    assert_eq!(int(reloaded.get(ROOM, b"b")), 2);
+    assert_eq!(reloaded.seq(ROOM), 2);
+}
+
 // --- a tempdir without pulling in a dev-dependency ---
 
 struct TempDir(std::path::PathBuf);
