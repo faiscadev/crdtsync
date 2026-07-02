@@ -14,11 +14,13 @@ use crdtsync_core::op::OpId;
 use crdtsync_core::{ClientId, Document, Element, Op};
 
 pub mod auth;
+pub mod clock;
 pub mod registry;
 pub mod runtime;
 pub mod session;
 pub mod store;
 pub use auth::{AllowAll, Verifier};
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use registry::{ConnId, Registry};
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{RoomLog, Snapshot, Store};
@@ -113,13 +115,36 @@ impl Hub {
             .collect()
     }
 
-    /// Drop every awareness entry owned by `client` across all rooms — called
-    /// when its connection ends, so a later subscriber is not replayed a
-    /// departed client's presence.
-    pub fn clear_client_awareness(&mut self, client: ClientId) {
-        for entries in self.awareness.values_mut() {
-            entries.retain(|(owner, _), _| *owner != client);
+    /// Whether `client` currently holds any awareness entry in any room — so a
+    /// disconnect only starts a grace timer for a client whose presence a later
+    /// sweep would actually clear.
+    pub fn has_client_awareness(&self, client: ClientId) -> bool {
+        self.awareness
+            .values()
+            .any(|entries| entries.keys().any(|(owner, _)| *owner == client))
+    }
+
+    /// Drop every awareness entry owned by `client` across all rooms, returning
+    /// the `(room, actor)` pairs cleared so the caller can tell each room's peers
+    /// the presence expired. A client holds one actor per room, so at most one
+    /// pair per room it had presence in.
+    pub fn clear_client_awareness(&mut self, client: ClientId) -> Vec<(RoomId, Vec<u8>)> {
+        let mut cleared = Vec::new();
+        for (room, entries) in self.awareness.iter_mut() {
+            let mut actor = None;
+            entries.retain(|(owner, _), (a, _)| {
+                if *owner == client {
+                    actor.get_or_insert_with(|| a.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if let Some(actor) = actor {
+                cleared.push((room.clone(), actor));
+            }
         }
+        cleared
     }
 
     /// Auto-compact a room once its retained log reaches `threshold` ops, folding

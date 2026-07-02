@@ -6,9 +6,11 @@
 //! touches the op log or a snapshot, and never echoes to the sender. Publishing
 //! before auth, or on an unbound channel, is a protocol violation.
 
+use std::sync::Arc;
+
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, ErrorCode, Message};
-use crdtsync_server::{ConnId, Registry};
+use crdtsync_server::{ConnId, ManualClock, Registry};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -214,8 +216,12 @@ fn replay_reflects_the_latest_value_per_key() {
 }
 
 #[test]
-fn a_departed_clients_presence_is_not_replayed() {
+fn a_departed_clients_presence_is_not_replayed_after_the_grace_window() {
     let mut r = registry();
+    let clock = Arc::new(ManualClock::new(0));
+    r.set_clock(clock.clone());
+    r.set_grace_millis(5000);
+
     let a = hello_auth(&mut r, 1);
     subscribe(&mut r, a, 1, ROOM_A);
     r.deliver(
@@ -227,6 +233,9 @@ fn a_departed_clients_presence_is_not_replayed() {
         },
     );
     r.disconnect(a);
+    // Past the grace window a sweep drops the departed client's presence.
+    clock.advance(5000);
+    r.sweep();
 
     let b = hello_auth(&mut r, 2);
     r.deliver(
@@ -239,7 +248,7 @@ fn a_departed_clients_presence_is_not_replayed() {
     );
     assert!(
         awareness_updates(r.take_outbox(b)).is_empty(),
-        "a gone client's presence is cleared"
+        "a gone client's presence is cleared once the grace window lapses"
     );
 }
 
