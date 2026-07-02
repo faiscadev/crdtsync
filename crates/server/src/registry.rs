@@ -11,6 +11,7 @@ use std::io;
 
 use crdtsync_core::{ClientId, Message};
 
+use crate::auth::{AllowAll, Verifier};
 use crate::{step, Hub, Session, Store};
 
 /// A live connection's handle, minted by [`Registry::connect`].
@@ -28,6 +29,7 @@ pub struct Registry {
     hub: Hub,
     conns: HashMap<ConnId, Conn>,
     next: u64,
+    verifier: Box<dyn Verifier>,
 }
 
 impl Registry {
@@ -36,13 +38,20 @@ impl Registry {
         Self::from_hub(Hub::new(server))
     }
 
-    /// A registry over an existing hub — durable or not.
+    /// A registry over an existing hub — durable or not. Defaults to the
+    /// dev-mode [`AllowAll`] verifier; set one with [`Registry::set_verifier`].
     pub(crate) fn from_hub(hub: Hub) -> Self {
         Self {
             hub,
             conns: HashMap::new(),
             next: 0,
+            verifier: Box::new(AllowAll),
         }
+    }
+
+    /// Use `verifier` to authenticate connections' credentials.
+    pub fn set_verifier(&mut self, verifier: Box<dyn Verifier>) {
+        self.verifier = verifier;
     }
 
     /// A registry backed by `store`: its hub replays the persisted log, and
@@ -80,7 +89,7 @@ impl Registry {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
-            let resp = step(&mut self.hub, &mut conn.session, msg);
+            let resp = step(&mut self.hub, &mut conn.session, &*self.verifier, msg);
             conn.outbox.extend(resp.replies);
             (resp.broadcast, resp.close, resp.broadcast_room)
         };

@@ -130,6 +130,12 @@ fn ingest_via(r: &mut Registry, client: u8, room: &[u8], ops: Vec<crdtsync_core:
     ));
     assert!(r.deliver(
         id,
+        Message::Auth {
+            credential: b"cred".to_vec()
+        }
+    ));
+    assert!(r.deliver(
+        id,
         Message::Subscribe {
             channel: Channel(0),
             room: room.to_vec(),
@@ -201,6 +207,12 @@ fn catch_up_uses_stable_sequences_across_a_restart() {
         let mut r = Registry::with_store(cid(SERVER), Store::open(tmp.path()).unwrap()).unwrap();
         let id = r.connect();
         r.deliver(id, Message::Hello { client: cid(1) });
+        r.deliver(
+            id,
+            Message::Auth {
+                credential: b"cred".to_vec(),
+            },
+        );
         r.deliver(
             id,
             Message::Subscribe {

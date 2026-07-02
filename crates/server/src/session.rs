@@ -12,13 +12,17 @@ use std::collections::HashMap;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
 
+use crate::auth::Verifier;
 use crate::{Catchup, Hub, RoomId};
 
-/// One client connection's protocol state. A connection multiplexes several
-/// room subscriptions, each on its own [`Channel`]; the client assigns the
-/// handle at Subscribe and every later frame names it.
+/// One client connection's protocol state. The handshake runs Hello → Auth →
+/// Subscribe: the client names itself, then presents a credential the server
+/// turns into an actor, then joins rooms. A connection multiplexes several room
+/// subscriptions, each on its own [`Channel`]; the client assigns the handle at
+/// Subscribe and every later frame names it.
 pub struct Session {
     client: Option<ClientId>,
+    actor: Option<Vec<u8>>,
     channels: HashMap<Channel, RoomId>,
 }
 
@@ -26,6 +30,7 @@ impl Session {
     pub fn new() -> Self {
         Self {
             client: None,
+            actor: None,
             channels: HashMap::new(),
         }
     }
@@ -33,6 +38,12 @@ impl Session {
     /// The client named at Hello, if the handshake is done.
     pub fn client(&self) -> Option<ClientId> {
         self.client
+    }
+
+    /// The server-derived actor for this connection, once a credential has been
+    /// verified at Auth.
+    pub fn actor(&self) -> Option<&[u8]> {
+        self.actor.as_deref()
     }
 
     /// The channels this connection has bound to `room`. A broadcast for the
@@ -66,7 +77,12 @@ pub struct Response {
 
 /// Drive one inbound message through the session, mutating the hub and
 /// returning what to send and whether to close.
-pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
+pub fn step(
+    hub: &mut Hub,
+    session: &mut Session,
+    verifier: &dyn Verifier,
+    msg: Message,
+) -> Response {
     match msg {
         Message::Hello { client } => {
             if session.client.is_some() {
@@ -77,13 +93,41 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
             session.client = Some(client);
             Response::default()
         }
+        Message::Auth { credential } => {
+            if session.client.is_none() {
+                return violation("auth before hello");
+            }
+            if session.actor.is_some() {
+                return violation("already authenticated");
+            }
+            // The server derives the actor from the credential; a client never
+            // asserts its own identity. A refused credential closes the
+            // connection. The credential bytes are never logged.
+            match verifier.verify(&credential) {
+                Some(actor) => {
+                    session.actor = Some(actor.clone());
+                    Response {
+                        replies: vec![Message::AuthOk { actor }],
+                        ..Response::default()
+                    }
+                }
+                None => Response {
+                    replies: vec![Message::Error {
+                        code: ErrorCode::AuthFailed,
+                        message: "credential rejected".to_string(),
+                    }],
+                    close: true,
+                    ..Response::default()
+                },
+            }
+        }
         Message::Subscribe {
             channel,
             room,
             last_seen_seq,
         } => {
-            if session.client.is_none() {
-                return violation("subscribe before hello");
+            if session.actor.is_none() {
+                return violation("subscribe before auth");
             }
             if session.channels.contains_key(&channel) {
                 return violation("channel already subscribed");
@@ -103,8 +147,8 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
             }
         }
         Message::Unsubscribe { channel } => {
-            if session.client.is_none() {
-                return violation("unsubscribe before hello");
+            if session.actor.is_none() {
+                return violation("unsubscribe before auth");
             }
             if session.channels.remove(&channel).is_none() {
                 return violation("unsubscribe of an unbound channel");
@@ -112,6 +156,9 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
             Response::default()
         }
         Message::Ops { channel, ops } => {
+            if session.actor.is_none() {
+                return violation("ops before auth");
+            }
             let Some(client) = session.client else {
                 return violation("ops before hello");
             };
@@ -146,7 +193,6 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
         }
         Message::Snapshot { .. } => violation("client sent a snapshot"),
         Message::Error { .. } => violation("client sent an error"),
-        Message::Auth { .. } => violation("auth phase is not enabled"),
         Message::AuthOk { .. } => violation("client sent an authok"),
     }
 }
