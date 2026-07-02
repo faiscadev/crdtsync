@@ -33,6 +33,25 @@ const OUTBOX_CAPACITY: usize = 1024;
 /// the writer in `send`.
 const WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How the server runs the ephemeral-awareness sweep: how long a disconnected
+/// client's presence lingers before it may be cleared, and how often the sweep
+/// checks. The defaults suit interactive use — a 5s grace absorbs brief
+/// reconnects, checked once a second.
+#[derive(Clone, Copy)]
+pub struct ServeConfig {
+    pub grace: std::time::Duration,
+    pub sweep_interval: std::time::Duration,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            grace: std::time::Duration::from_secs(5),
+            sweep_interval: std::time::Duration::from_secs(1),
+        }
+    }
+}
+
 /// A request to the registry actor from a connection task.
 enum Cmd {
     /// Open a connection, returning its id and registering its outbound sink
@@ -67,6 +86,17 @@ pub async fn serve(
     server: ClientId,
     store: Option<Store>,
 ) -> std::io::Result<()> {
+    serve_with(listener, server, store, ServeConfig::default()).await
+}
+
+/// Serve the wire protocol as [`serve`] does, with an explicit awareness
+/// [`ServeConfig`] instead of the defaults.
+pub async fn serve_with(
+    listener: TcpListener,
+    server: ClientId,
+    store: Option<Store>,
+    config: ServeConfig,
+) -> std::io::Result<()> {
     // Replay the persisted log here, before serving: a corrupt log fails
     // startup rather than panicking inside the detached actor thread and
     // leaving a live port with no registry behind it. The read is blocking, so
@@ -87,9 +117,10 @@ pub async fn serve(
     // The replicas are single-threaded; keep them on one dedicated thread.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .expect("build registry runtime");
-        rt.block_on(registry_actor(server, rooms, store, cmd_rx));
+        rt.block_on(registry_actor(server, rooms, store, config, cmd_rx));
     });
 
     loop {
@@ -119,6 +150,7 @@ async fn registry_actor(
     server: ClientId,
     rooms: Vec<(RoomId, RoomLog)>,
     store: Option<Store>,
+    config: ServeConfig,
     mut cmds: UnboundedReceiver<Cmd>,
 ) {
     // The rooms were validated during startup, so reconstruction can't fail.
@@ -127,32 +159,45 @@ async fn registry_actor(
         hub.attach_store(store);
     }
     let mut reg = Registry::from_hub(hub);
+    reg.set_grace_millis(config.grace.as_millis() as u64);
     let mut peers: HashMap<ConnId, Peer> = HashMap::new();
-    while let Some(cmd) = cmds.recv().await {
-        match cmd {
-            Cmd::Connect {
-                writer,
-                closer,
-                reply,
-            } => {
-                let id = reg.connect();
-                peers.insert(
-                    id,
-                    Peer {
+    // The sweep expires the presence of clients past their grace deadline; its
+    // first immediate tick is a harmless no-op with nothing yet stale.
+    let mut sweep = tokio::time::interval(config.sweep_interval);
+    loop {
+        tokio::select! {
+            cmd = cmds.recv() => {
+                let Some(cmd) = cmd else { break };
+                match cmd {
+                    Cmd::Connect {
                         writer,
-                        closer: Some(closer),
-                    },
-                );
-                let _ = reply.send(id);
+                        closer,
+                        reply,
+                    } => {
+                        let id = reg.connect();
+                        peers.insert(
+                            id,
+                            Peer {
+                                writer,
+                                closer: Some(closer),
+                            },
+                        );
+                        let _ = reply.send(id);
+                    }
+                    Cmd::Deliver { id, msg, reply } => {
+                        let keep = reg.deliver(id, msg);
+                        flush(&mut reg, &mut peers);
+                        let _ = reply.send(keep);
+                    }
+                    Cmd::Disconnect { id } => {
+                        reg.disconnect(id);
+                        peers.remove(&id);
+                    }
+                }
             }
-            Cmd::Deliver { id, msg, reply } => {
-                let keep = reg.deliver(id, msg);
+            _ = sweep.tick() => {
+                reg.sweep();
                 flush(&mut reg, &mut peers);
-                let _ = reply.send(keep);
-            }
-            Cmd::Disconnect { id } => {
-                reg.disconnect(id);
-                peers.remove(&id);
             }
         }
     }

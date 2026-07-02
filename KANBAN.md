@@ -51,7 +51,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Awareness (core)** — ephemeral presence: wire `AwarenessSet`/`AwarenessUpdate` (#66); server fan-out per peer-channel, actor-tagged, never logged/snapshotted (#67); client `set_awareness` + per-channel `(actor,key)` LWW view (#68); server-side ephemeral store → late-joiner replay on Subscribe + clear-on-disconnect (#69). Publish + fan-out + client view + late-joiner replay done.
 
-**Awareness reconnect grace** — `AwarenessClear` wire message (#70); server `Clock` seam (`SystemClock`/`ManualClock`) + grace window (default 5s) + `Registry::sweep` fanning `AwarenessClear` to room peers, reconnect within window cancels the clear (#71). TTL-per-entry, throttle/coalesce, and periodic-sweep runtime wiring deferred (see Next); auth-filter still queued.
+**Awareness reconnect grace** — `AwarenessClear` wire message (#70); server `Clock` seam (`SystemClock`/`ManualClock`) + grace window (default 5s) + `Registry::sweep` fanning `AwarenessClear` to room peers, reconnect within window cancels the clear (#71); periodic sweep wired into the tokio runtime via `serve_with`/`ServeConfig` so grace expiry fires in production (#72). Session-TTL (grace) complete end-to-end. Timed-TTL + throttle are schema-gated (see Queue); auth-filter still queued.
 
 ---
 
@@ -63,7 +63,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Awareness TTL + throttle + periodic sweep** — the remaining clock-dependent follow-ons now that the server `Clock` seam + reconnect grace landed (#71): per-entry TTL (session vs timed) + removal broadcast (reuse `AwarenessClear`), server-side throttle/coalesce, and wiring a periodic `Registry::sweep` into the tokio runtime so grace/TTL expiry fires without an external caller. Per-recipient auth filtering (blocked on the authz policy layer) and RelativePosition anchors (blocked — not built) stay queued. → *Awareness*. (v0.2, clock seam done)
+- **Auth fast path + anonymous mode** — credentials presented at the WS upgrade (HTTP header / subprotocol) validated during accept, skipping the in-band Auth phase (one round trip saved); anonymous-mode toggle deriving `actor = anon:<random>` from Host entropy. Transport glue on top of the landed Auth phase — the next unblocked v0.2 unit. → *Networking / Handshake*. (v0.2, ready)
 
 ---
 
@@ -73,7 +73,7 @@ Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized
 
 - **Element-ref value slot** — the other unbuilt payload value type (line 177). Under-specified shape, no v0.1 reservation promise, so deferred until its design settles — not urgent like blob-ref was. → *Internal Data Model*. (foundational, deferred)
 - **Channel multiplexing — remaining** — logical channels currently key on `room`; widen to `(room, branch, zone)` once branches/zones exist. The `Channel` handle already abstracts this (no wire change needed then). → *Networking / Connection*. (v0.2, blocked on branches/zones)
-- **Auth fast path + anonymous mode** — credentials presented at the WS upgrade (HTTP header / subprotocol) validated during accept, skipping the in-band Auth phase (one round trip saved); anonymous-mode toggle deriving `actor = anon:<random>` from Host entropy. Transport glue on top of the landed Auth phase. → *Networking / Handshake*. (v0.2)
+- **Awareness timed-TTL + throttle** — per-entry auto-expire-after-silence (timed TTL, distinct from the session TTL the grace sweep already handles) + removal broadcast (reuse `AwarenessClear`), and server-side throttle/coalesce of high-frequency entries (cursor/mouse). **Schema-gated:** ARCHITECTURE §Awareness declares an entry's TTL and throttle interval in the schema file (line 708), and the schema layer is unbuilt — so these trigger values have no home until it lands. The clock seam (#71) + periodic sweep (#72) are ready to enforce them. → *Awareness / Schema*. (v0.2, blocked on schema)
 - **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window ("keep last N"), time/migration compaction triggers. **Design depth (needs a careful pass before building):** snapshots are anchor-based (a tombstone anchors surviving nodes), so GC must be leaf-only (drop a below-watermark tombstone only when no surviving node parents off it), not a flat "discard older than watermark"; and the watermark is a server-seq while tombstones are lamport-`Stamp`-keyed with no client-ack protocol today — the correlation + ack semantics are unspecified. Gate any build on the convergence property harness (invariant: GC preserves materialized state). → *Snapshots / Tombstone GC*. (v0.2, needs design)
 - **Declarative policy + audit log** — authorization enforcement. → *Authorization*. (v0.2)
 - **Named versions + auto-version triggers**, **UndoManager**, **composition cookbook**, **admin dashboard**, **replay tooling**. → *Versioning*, *Undo/Redo*, *Admin UI*, *Debugging*. (v0.2)

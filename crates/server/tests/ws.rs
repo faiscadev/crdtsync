@@ -13,7 +13,8 @@ use crdtsync_core::{
     decode_message, encode_header, encode_message, ClientId, Document, ErrorCode, Message, Op,
     Scalar,
 };
-use crdtsync_server::runtime::serve;
+use crdtsync_server::runtime::{serve, serve_with, ServeConfig};
+use std::time::Duration;
 
 const CH: Channel = Channel(0);
 
@@ -59,6 +60,18 @@ async fn start_server() -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(serve(listener, cid(0xFF), None));
+    Server {
+        url: format!("ws://{addr}"),
+        task,
+    }
+}
+
+/// Start a server with an explicit awareness grace + sweep cadence, so a test
+/// can drive presence expiry without waiting the multi-second default.
+async fn start_server_with(config: ServeConfig) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(serve_with(listener, cid(0xFF), None, config));
     Server {
         url: format!("ws://{addr}"),
         task,
@@ -201,4 +214,53 @@ async fn a_foreign_version_is_refused() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn a_departed_clients_presence_clears_after_the_grace_window() {
+    // A short grace and fast sweep so the expiry fires within the test rather
+    // than after the multi-second production default.
+    let server = start_server_with(ServeConfig {
+        grace: Duration::from_millis(150),
+        sweep_interval: Duration::from_millis(20),
+    })
+    .await;
+    let url = &server.url;
+
+    let mut a = join(url, 1).await;
+    assert_eq!(recv(&mut a).await, ops_msg(Vec::new()));
+    send(
+        &mut a,
+        &Message::AwarenessSet {
+            channel: CH,
+            key: b"cursor".to_vec(),
+            value: vec![1],
+        },
+    )
+    .await;
+
+    // B joins and is replayed A's presence.
+    let mut b = join(url, 2).await;
+    assert_eq!(recv(&mut b).await, ops_msg(Vec::new()));
+    assert_eq!(
+        recv(&mut b).await,
+        Message::AwarenessUpdate {
+            channel: CH,
+            actor: b"cred".to_vec(),
+            key: b"cursor".to_vec(),
+            value: vec![1],
+        }
+    );
+
+    // A drops; past the grace window the periodic sweep clears its presence and
+    // tells B on B's own channel.
+    a.close(None).await.unwrap();
+    drop(a);
+    assert_eq!(
+        recv(&mut b).await,
+        Message::AwarenessClear {
+            channel: CH,
+            actor: b"cred".to_vec(),
+        }
+    );
 }
