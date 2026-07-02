@@ -15,9 +15,9 @@ import ctypes
 import os
 import platform
 import struct
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-__all__ = ["Document", "encode_path"]
+__all__ = ["Client", "Document", "encode_path"]
 
 Path = List[bytes]
 
@@ -80,6 +80,32 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_apply, [doc, cbytes, size], c.c_int32)
     sig(lib.crdtsync_doc_encode_state, [doc], buf)
     sig(lib.crdtsync_doc_decode_state, [cbytes, size], doc)
+
+    # wire client session
+    ch = c.c_uint32
+    sig(lib.crdtsync_client_new, [cbytes], doc)
+    sig(lib.crdtsync_client_free, [doc], None)
+    sig(lib.crdtsync_client_hello, [doc], buf)
+    sig(lib.crdtsync_client_auth, [doc, cbytes, size], buf)
+    sig(lib.crdtsync_client_actor, [doc, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_subscribe, [doc, cbytes, size, c.POINTER(ch)], buf)
+    sig(lib.crdtsync_client_resume, [doc, ch], buf)
+    sig(lib.crdtsync_client_unsubscribe, [doc, ch], buf)
+    sig(lib.crdtsync_client_receive, [doc, cbytes, size], c.c_int32)
+    sig(lib.crdtsync_client_last_seen_seq, [doc, ch, c.POINTER(c.c_uint64)], c.c_int32)
+    sig(lib.crdtsync_client_register_int, [doc, ch, cbytes, size, c.c_int64], buf)
+    sig(lib.crdtsync_client_inc, [doc, ch, cbytes, size, c.c_uint32], buf)
+    sig(lib.crdtsync_client_set_bytes, [doc, ch, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_delete, [doc, ch, cbytes, size], buf)
+    sig(lib.crdtsync_client_get_int, [doc, ch, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
+    sig(lib.crdtsync_client_get_bytes, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_set_awareness, [doc, ch, cbytes, size, cbytes, size], buf)
+    sig(
+        lib.crdtsync_client_awareness,
+        [doc, ch, cbytes, size, cbytes, size, c.POINTER(buf)],
+        c.c_int32,
+    )
+    sig(lib.crdtsync_client_awareness_len, [doc, ch, c.POINTER(size)], c.c_int32)
     return lib
 
 
@@ -270,3 +296,155 @@ class Document:
         out = _CrdtBuf()
         rc = fn(self._handle, p, len(p), ctypes.byref(out))
         return _take_buf(out) if rc == 1 else None
+
+
+class Client:
+    """A wire client session for one client id (16 bytes).
+
+    It holds a replica per subscribed room and turns local edits into wire
+    frames to send; :meth:`receive` folds a peer's frame back in. A room is
+    addressed by the ``channel`` returned from :meth:`subscribe`.
+    """
+
+    def __init__(self, client_id: bytes):
+        if len(client_id) != 16:
+            raise ValueError("client_id must be 16 bytes")
+        self._handle = _LIB.crdtsync_client_new(client_id)
+        if not self._handle:
+            raise RuntimeError("failed to open client")
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None):
+            _LIB.crdtsync_client_free(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> "Client":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+    # --- handshake ---
+
+    def hello(self) -> bytes:
+        """The opening Hello frame to send, naming this client."""
+        return _take_buf(_LIB.crdtsync_client_hello(self._handle))
+
+    def auth(self, credential: bytes) -> bytes:
+        """The Auth frame asking the server to verify ``credential``."""
+        return _take_buf(
+            _LIB.crdtsync_client_auth(self._handle, credential, len(credential))
+        )
+
+    def actor(self) -> Optional[bytes]:
+        """The server-derived actor, or ``None`` before AuthOk has arrived."""
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_actor(self._handle, ctypes.byref(out))
+        return _take_buf(out) if rc == 1 else None
+
+    # --- subscription lifecycle ---
+
+    def subscribe(self, room: bytes) -> Tuple[int, bytes]:
+        """Join ``room`` on a fresh channel; return ``(channel, subscribe_frame)``."""
+        channel = ctypes.c_uint32()
+        frame = _take_buf(
+            _LIB.crdtsync_client_subscribe(
+                self._handle, room, len(room), ctypes.byref(channel)
+            )
+        )
+        return channel.value, frame
+
+    def resume(self, channel: int) -> bytes:
+        """Re-issue Subscribe for a held channel from its caught-up position."""
+        _u32("channel", channel)
+        return _take_buf(_LIB.crdtsync_client_resume(self._handle, channel))
+
+    def unsubscribe(self, channel: int) -> bytes:
+        """Leave ``channel``'s room, dropping its replica; return the frame."""
+        _u32("channel", channel)
+        return _take_buf(_LIB.crdtsync_client_unsubscribe(self._handle, channel))
+
+    def receive(self, msg: bytes) -> int:
+        """Fold one received wire frame in. 1 applied, 0 refused, -1 bad handle."""
+        return _LIB.crdtsync_client_receive(self._handle, msg, len(msg))
+
+    def last_seen_seq(self, channel: int) -> Optional[int]:
+        """The highest server sequence ``channel`` has caught up to."""
+        _u32("channel", channel)
+        out = ctypes.c_uint64()
+        rc = _LIB.crdtsync_client_last_seen_seq(self._handle, channel, ctypes.byref(out))
+        return out.value if rc == 1 else None
+
+    # --- per-channel edits ---
+
+    def register_int(self, channel: int, path: Path, value: int) -> bytes:
+        _u32("channel", channel)
+        _i64("value", value)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_register_int(self._handle, channel, p, len(p), value)
+        )
+
+    def inc(self, channel: int, path: Path, amount: int) -> bytes:
+        _u32("channel", channel)
+        _u32("amount", amount)
+        p = encode_path(path)
+        return _take_buf(_LIB.crdtsync_client_inc(self._handle, channel, p, len(p), amount))
+
+    def set_bytes(self, channel: int, path: Path, value: bytes) -> bytes:
+        _u32("channel", channel)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_set_bytes(self._handle, channel, p, len(p), value, len(value))
+        )
+
+    def delete(self, channel: int, path: Path) -> bytes:
+        _u32("channel", channel)
+        p = encode_path(path)
+        return _take_buf(_LIB.crdtsync_client_delete(self._handle, channel, p, len(p)))
+
+    # --- per-channel reads ---
+
+    def get_int(self, channel: int, path: Path) -> Optional[int]:
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = ctypes.c_int64()
+        rc = _LIB.crdtsync_client_get_int(self._handle, channel, p, len(p), ctypes.byref(out))
+        return out.value if rc == 1 else None
+
+    def get_bytes(self, channel: int, path: Path) -> Optional[bytes]:
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_get_bytes(self._handle, channel, p, len(p), ctypes.byref(out))
+        return _take_buf(out) if rc == 1 else None
+
+    # --- awareness ---
+
+    def set_awareness(self, channel: int, key: bytes, value: bytes) -> bytes:
+        """Publish an ephemeral awareness entry ``key``; return the frame to send."""
+        _u32("channel", channel)
+        return _take_buf(
+            _LIB.crdtsync_client_set_awareness(
+                self._handle, channel, key, len(key), value, len(value)
+            )
+        )
+
+    def awareness(self, channel: int, actor: bytes, key: bytes) -> Optional[bytes]:
+        """A peer's awareness entry on ``channel`` by publishing ``actor`` and ``key``."""
+        _u32("channel", channel)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_awareness(
+            self._handle, channel, actor, len(actor), key, len(key), ctypes.byref(out)
+        )
+        return _take_buf(out) if rc == 1 else None
+
+    def awareness_len(self, channel: int) -> int:
+        """How many awareness entries ``channel`` currently holds."""
+        _u32("channel", channel)
+        out = ctypes.c_size_t()
+        rc = _LIB.crdtsync_client_awareness_len(self._handle, channel, ctypes.byref(out))
+        return out.value if rc == 1 else 0
