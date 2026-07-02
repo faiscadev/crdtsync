@@ -35,6 +35,20 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_doc_text_get",
         // sync
         "crdtsync_doc_apply",
+        // wire client session
+        "typedef struct CrdtClient CrdtClient;",
+        "crdtsync_client_new",
+        "crdtsync_client_free",
+        "crdtsync_client_hello",
+        "crdtsync_client_subscribe",
+        "crdtsync_client_receive",
+        "crdtsync_client_last_seen_seq",
+        "crdtsync_client_register_int",
+        "crdtsync_client_inc",
+        "crdtsync_client_set_bytes",
+        "crdtsync_client_delete",
+        "crdtsync_client_get_int",
+        "crdtsync_client_get_bytes",
     ];
     for sym in required {
         assert!(

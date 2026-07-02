@@ -248,6 +248,14 @@ impl ClientSession {
         self.rooms.get(&channel).map(|r| &r.doc)
     }
 
+    /// Mutable access to `channel`'s replica, for an embedder that edits through
+    /// the path façade rather than the [`edit`](ClientSession::edit) closure —
+    /// the ops it emits still travel to the server as a `Message::Ops` the caller
+    /// builds. `None` if the channel isn't held.
+    pub fn document_mut(&mut self, channel: Channel) -> Option<&mut Document> {
+        self.rooms.get_mut(&channel).map(|r| &mut r.doc)
+    }
+
     /// The highest server sequence `channel`'s room has caught up to.
     pub fn last_seen_seq(&self, channel: Channel) -> Option<u64> {
         self.rooms.get(&channel).map(|r| r.last_seen_seq)
