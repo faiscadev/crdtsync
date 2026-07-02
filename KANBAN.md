@@ -57,13 +57,13 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **Auth fast path + anonymous mode** — PR-A (this slice): `Session::authenticated` + `Registry::connect_authenticated` let a connection open already authenticated so its client skips the in-band Auth phase. PR-B (next): extract credentials at the WS upgrade (Authorization header / subprotocol), verify during accept, and an anonymous-mode toggle minting `actor = anon:<random>` from Host entropy. → *Networking / Handshake*.
 
 ---
 
 ## ⏭ Next
 
-- **Auth fast path + anonymous mode** — credentials presented at the WS upgrade (HTTP header / subprotocol) validated during accept, skipping the in-band Auth phase (one round trip saved); anonymous-mode toggle deriving `actor = anon:<random>` from Host entropy. Transport glue on top of the landed Auth phase — the next unblocked v0.2 unit. → *Networking / Handshake*. (v0.2, ready)
+- _(Auth fast path + anonymous mode is now in progress — see above.)_
 
 ---
 
