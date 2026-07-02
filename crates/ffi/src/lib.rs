@@ -18,6 +18,7 @@
 //! Every entry point catches panics so one never unwinds across the C frame, and
 //! rejects null or malformed input rather than dereferencing it.
 
+use crdtsync_core::diff::{diff, encode_changes};
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, encode_message, encode_ops, path, Channel, ClientId, ClientSession, Document,
@@ -463,6 +464,37 @@ pub unsafe extern "C" fn crdtsync_doc_decode_state(bytes: *const u8, len: usize)
         }
     }))
     .unwrap_or(std::ptr::null_mut())
+}
+
+/// Diff two snapshots (each a state buffer from [`crdtsync_doc_encode_state`],
+/// a named version, or an exported room) into the encoded change list — the
+/// structural changes turning the old state into the new. Decode it with the
+/// SDK's change-list reader. Empty on malformed input or a bad snapshot, never
+/// a panic across the frame.
+///
+/// # Safety
+/// `old`/`old_len` and `new`/`new_len` each follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_diff(
+    old: *const u8,
+    old_len: usize,
+    new: *const u8,
+    new_len: usize,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (Some(old_raw), Some(new_raw)) = (as_slice(old, old_len), as_slice(new, new_len))
+        else {
+            return CrdtBuf::empty();
+        };
+        let (Ok(old_doc), Ok(new_doc)) = (
+            Document::decode_state(old_raw),
+            Document::decode_state(new_raw),
+        ) else {
+            return CrdtBuf::empty();
+        };
+        CrdtBuf::from_vec(encode_changes(&diff(&old_doc, &new_doc)))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
 }
 
 /// Marshal a path-addressed edit: delegate the navigation to `run`, encode the

@@ -183,6 +183,47 @@ fn a_snapshot_round_trips_through_a_decode() {
 }
 
 #[test]
+fn diff_of_two_snapshots_reports_the_change() {
+    use crdtsync_core::diff::{decode_changes, Change};
+    unsafe {
+        let c = client(1);
+        let a = crdtsync_doc_new(c.as_ptr());
+        let reg = register_int(a, &path(&[b"age"]), 30);
+        let old = crdtsync_doc_encode_state(a);
+
+        let reg2 = register_int(a, &path(&[b"age"]), 31);
+        let new = crdtsync_doc_encode_state(a);
+
+        let buf = crdtsync_diff(old.ptr, old.len, new.ptr, new.len);
+        assert!(!buf.ptr.is_null() && buf.len > 0);
+        let bytes = std::slice::from_raw_parts(buf.ptr, buf.len);
+        let changes = decode_changes(bytes).expect("the encoded change list decodes");
+        assert!(matches!(changes.as_slice(), [Change::Value { .. }],));
+
+        crdtsync_buf_free(reg);
+        crdtsync_buf_free(reg2);
+        crdtsync_buf_free(old);
+        crdtsync_buf_free(new);
+        crdtsync_buf_free(buf);
+        crdtsync_doc_free(a);
+    }
+}
+
+#[test]
+fn diff_of_malformed_input_is_empty() {
+    unsafe {
+        let junk = [1u8, 2, 3];
+        let buf = crdtsync_diff(junk.as_ptr(), junk.len(), junk.as_ptr(), junk.len());
+        assert_eq!(buf.len, 0, "a bad snapshot yields an empty change list");
+        // A null pair is empty too, not a crash.
+        let buf2 = crdtsync_diff(ptr::null(), 0, ptr::null(), 0);
+        assert_eq!(buf2.len, 0);
+        crdtsync_buf_free(buf);
+        crdtsync_buf_free(buf2);
+    }
+}
+
+#[test]
 fn a_decoded_snapshot_still_dedups_and_converges() {
     unsafe {
         let (ca, cb) = (client(1), client(2));
