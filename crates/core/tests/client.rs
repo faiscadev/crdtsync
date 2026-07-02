@@ -94,6 +94,95 @@ fn authok_records_the_server_derived_actor() {
     assert_eq!(session.actor(), Some(&b"alice"[..]));
 }
 
+// --- awareness ---
+
+#[test]
+fn set_awareness_frames_a_publish_on_the_channel() {
+    let mut session = ClientSession::new(cid(1));
+    let (ch, _) = session.subscribe(ROOM_A);
+    match session.set_awareness(ch, b"cursor", &[1, 2, 3]) {
+        Some(Message::AwarenessSet {
+            channel,
+            key,
+            value,
+        }) => {
+            assert_eq!(channel, ch);
+            assert_eq!(key, b"cursor");
+            assert_eq!(value, vec![1, 2, 3]);
+        }
+        other => panic!("expected AwarenessSet, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_awareness_on_an_unknown_channel_is_none() {
+    let session = ClientSession::new(cid(1));
+    assert!(session.set_awareness(Channel(3), b"cursor", &[1]).is_none());
+}
+
+#[test]
+fn an_update_records_a_peers_entry() {
+    let mut session = ClientSession::new(cid(1));
+    let (ch, _) = session.subscribe(ROOM_A);
+    session
+        .receive(Message::AwarenessUpdate {
+            channel: ch,
+            actor: b"alice".to_vec(),
+            key: b"cursor".to_vec(),
+            value: vec![9],
+        })
+        .unwrap();
+    assert_eq!(session.awareness(ch, b"alice", b"cursor"), Some(&[9][..]));
+    assert_eq!(session.awareness_len(ch), 1);
+}
+
+#[test]
+fn an_update_is_last_writer_wins_per_actor_and_key() {
+    let mut session = ClientSession::new(cid(1));
+    let (ch, _) = session.subscribe(ROOM_A);
+    let upd = |value: Vec<u8>| Message::AwarenessUpdate {
+        channel: ch,
+        actor: b"alice".to_vec(),
+        key: b"cursor".to_vec(),
+        value,
+    };
+    session.receive(upd(vec![1])).unwrap();
+    session.receive(upd(vec![2])).unwrap();
+    assert_eq!(session.awareness(ch, b"alice", b"cursor"), Some(&[2][..]));
+    assert_eq!(session.awareness_len(ch), 1);
+}
+
+#[test]
+fn distinct_actors_coexist() {
+    let mut session = ClientSession::new(cid(1));
+    let (ch, _) = session.subscribe(ROOM_A);
+    for actor in [b"alice".to_vec(), b"bob".to_vec()] {
+        session
+            .receive(Message::AwarenessUpdate {
+                channel: ch,
+                actor,
+                key: b"cursor".to_vec(),
+                value: vec![1],
+            })
+            .unwrap();
+    }
+    assert_eq!(session.awareness_len(ch), 2);
+    assert_eq!(session.awareness(ch, b"bob", b"cursor"), Some(&[1][..]));
+}
+
+#[test]
+fn an_update_on_an_unknown_channel_is_rejected() {
+    let mut session = ClientSession::new(cid(1));
+    session.subscribe(ROOM_A);
+    let err = session.receive(Message::AwarenessUpdate {
+        channel: Channel(9),
+        actor: b"alice".to_vec(),
+        key: b"cursor".to_vec(),
+        value: vec![1],
+    });
+    assert!(matches!(err, Err(ClientError::UnknownChannel(_))));
+}
+
 #[test]
 fn subscribe_assigns_a_channel_and_requests_from_zero() {
     let mut session = ClientSession::new(cid(1));

@@ -49,6 +49,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Handshake auth** — three-phase Hello → Auth → Subscribe. Wire `Auth`/`AuthOk` messages (#63); server pluggable `Verifier` + session actor gate, dev-mode `AllowAll` default (#64); client `ClientSession::auth`/`actor` (#65). Server derives actor; client never asserts it. Fast path + anonymous-random deferred (see queue).
 
+**Awareness (core)** — ephemeral presence: wire `AwarenessSet`/`AwarenessUpdate` (#66); server fan-out per peer-channel, actor-tagged, never logged/snapshotted (#67); client `set_awareness` + per-channel `(actor,key)` LWW view (#68). Publish + fan-out + client view done; TTL/throttle/grace/late-joiner-replay/auth-filter deferred (see queue).
+
 ---
 
 ## 🚧 In progress
@@ -59,7 +61,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Awareness subsystem** — ephemeral presence (cursors / selections / typing): per-actor entries with TTL, publish throttle, per-recipient auth filtering (actor known post-auth), reconnect grace. Not CRDT-merged state — a separate ephemeral store + wire messages, no convergence risk. → *Awareness*. (v0.2)
+- **Awareness completion** — the deferred follow-ons on top of the landed core: server ephemeral store so a late joiner replays current entries on Subscribe; per-entry TTL (session vs timed, needs a Host clock + sweep) + removal broadcast; server-side throttle/coalesce; reconnect grace window (default 5s, keyed by client_id). Per-recipient auth filtering (blocked on the authz policy layer) and RelativePosition anchors (blocked — not built) stay queued. → *Awareness*. (v0.2)
 
 ---
 
