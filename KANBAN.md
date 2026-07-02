@@ -85,6 +85,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Named versions (language SDKs)** — Python/Go (over the C ABI) and wasm (over `ClientSession`) wrap the five issue methods + the view (`versions` list, `version_state` by name) (#92). **Arc complete** — named versions run end to end (index → durable → wire → server → client → SDKs). Restore-as-branch + auto-triggers stay blocked (branch layer / engine-event hooks).
 
+**Composition cookbook** — executable recipes (`crates/core/tests/cookbook.rs`) building Set, bounded counter, multi-value register, and a tagged document from the closed primitive set — no new engine support — with convergence assertions (#93). The "compose, don't add primitives" thesis, kept honest by tests.
+
 ---
 
 ## 🚧 In progress
@@ -111,7 +113,7 @@ Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized
 - **Awareness timed-TTL + throttle** — per-entry auto-expire-after-silence (timed TTL, distinct from the session TTL the grace sweep already handles) + removal broadcast (reuse `AwarenessClear`), and server-side throttle/coalesce of high-frequency entries (cursor/mouse). **Schema-gated:** ARCHITECTURE §Awareness declares an entry's TTL and throttle interval in the schema file (line 708), and the schema layer is unbuilt — so these trigger values have no home until it lands. The clock seam (#71) + periodic sweep (#72) are ready to enforce them. → *Awareness / Schema*. (v0.2, blocked on schema)
 - **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window ("keep last N"), time/migration compaction triggers. **Design depth (needs a careful pass before building):** snapshots are anchor-based (a tombstone anchors surviving nodes), so GC must be leaf-only (drop a below-watermark tombstone only when no surviving node parents off it), not a flat "discard older than watermark"; and the watermark is a server-seq while tombstones are lamport-`Stamp`-keyed with no client-ack protocol today — the correlation + ack semantics are unspecified. Gate any build on the convergence property harness (invariant: GC preserves materialized state). → *Snapshots / Tombstone GC*. (v0.2, needs design)
 - **Declarative policy + audit log** — authorization enforcement. → *Authorization*. (v0.2)
-- **Auto-version triggers** (engine-event/schedule-driven version creation — needs the event hooks), **UndoManager**, **composition cookbook**, **admin dashboard**, **replay tooling**. → *Versioning*, *Undo/Redo*, *Admin UI*, *Debugging*. (v0.2)
+- **Auto-version triggers** (engine-event/schedule-driven version creation — needs the event hooks), **UndoManager** (per-user SDK undo stack — inverse ops per kind + tombstone-revival semantics; large, next major unblocked unit), **admin dashboard**, **replay tooling**. → *Versioning*, *Undo/Redo*, *Admin UI*, *Debugging*. (v0.2) _(composition cookbook landed #93)_
 - **Blob refs (full)** — refs in ops, bytes in a content-addressable store. → *Binary Blobs*. (v0.5)
 - **XmlElement / marks / schema / invariant repair / zones**. → *CRDT Model*, *Marks*, *Schema*, *Invariant Repair*, *Authorization/zones*. (v0.5)
 - **Mixed-version migrations** — migration log entries, per-op `schema_version`, four detection gates. → *Schema Migration*. (v0.6)
