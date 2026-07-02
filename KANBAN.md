@@ -59,17 +59,21 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Awareness reconnect grace** — `AwarenessClear` wire message (#70); server `Clock` seam (`SystemClock`/`ManualClock`) + grace window (default 5s) + `Registry::sweep` fanning `AwarenessClear` to room peers, reconnect within window cancels the clear (#71); periodic sweep wired into the tokio runtime via `serve_with`/`ServeConfig` so grace expiry fires in production (#72). Session-TTL (grace) complete end-to-end. Timed-TTL + throttle are schema-gated (see Queue); auth-filter still queued.
 
+**Auth fast path + carriers** — connection opens pre-authenticated (`Session::authenticated`/`connect_authenticated`, #73); `Authorization`-header credential verified at the WS upgrade with an unsolicited `AuthOk` + anonymous mode (#74); real `Verifier` injectable via `serve_with_verifier` (#75); credential carriers extended to subprotocol/cookie/query with precedence (#76). mTLS deferred (no TLS layer).
+
+**SDK wiring — wire client** — the full `CrdtClient` C ABI (`ClientSession`: lifecycle, receive, per-channel edits/reads, auth, awareness, last-seen; core `document_mut`) (#77/#78), wrapped in the Python (#79), Go (#80), and wasm (#81) SDKs. Every SDK can now drive the sync protocol, not just the local `Document`.
+
 ---
 
 ## 🚧 In progress
 
-- **SDK wiring — wire client through the SDKs** — the C ABI now exposes the full `CrdtClient` (wire `ClientSession`): lifecycle (new/free/hello/subscribe→channel/unsubscribe/resume), receive, per-channel path edits (register_int/inc/set_bytes/delete) returning the `Ops` frame, per-channel reads, last-seen seq (#77); plus auth (`auth`/`actor`), awareness (`set_awareness` + peer view + len) (#78). Core gained `ClientSession::document_mut` so the FFI reuses the `path::` façade. Python (#79) and Go (#80) bindings wrap the full `CrdtClient` surface. Remaining: wasm binding. → *SDKs*.
+- _(nothing in flight)_
 
 ---
 
 ## ⏭ Next
 
-- **SDK wiring — wasm binding** — expose the wire client in the wasm SDK (`crates/wasm`, wasm-bindgen over the core directly — not the C ABI, so it wraps `ClientSession` in Rust). Python (#79) and Go (#80) landed. → *SDKs*. (v0.2, ready)
+- **Authorization — policy + enforcement** — the v0.2 authz layer: token claims → roles, schema-level `@auth` defaults + doc-level ACLs, per-recipient wire redaction (unauthorized bytes never leave the server), audit log. Large and design-heavy — needs a scoping pass against ARCHITECTURE §Authorization before slicing. Unblocks awareness per-recipient auth-filtering (currently queued). → *Authorization*. (v0.2, needs design)
 - **mTLS credential carrier** — a client certificate as the fast-path credential. Blocked: the server terminates plain TCP with no TLS layer to expose the cert; land TLS termination first. → *Networking / Handshake*. (v0.2, blocked on TLS)
 
 ---

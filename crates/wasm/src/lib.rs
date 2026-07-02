@@ -7,7 +7,11 @@
 //! in. Navigation lives in `crdtsync_core::path`; this layer only marshals
 //! JS values.
 
-use crdtsync_core::{decode_ops, encode_ops, path, ClientId, Document};
+use crdtsync_core::op::Op;
+use crdtsync_core::{
+    decode_message, decode_ops, encode_message, encode_ops, path, Channel, ClientId, ClientSession,
+    Document, Message,
+};
 use wasm_bindgen::prelude::*;
 
 /// A CRDT replica for one 16-byte client id.
@@ -143,6 +147,181 @@ impl WasmDocument {
         match decode_ops(ops) {
             Ok(ops) => ops.iter().filter(|op| self.inner.apply(op)).count() as i32,
             Err(_) => -1,
+        }
+    }
+}
+
+/// The channel a [`WasmClient::subscribe`] assigned, and the Subscribe frame to
+/// send for it.
+#[wasm_bindgen]
+pub struct WasmSubscription {
+    channel: u32,
+    frame: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl WasmSubscription {
+    /// The connection-local channel the room was assigned.
+    #[wasm_bindgen(getter)]
+    pub fn channel(&self) -> u32 {
+        self.channel
+    }
+
+    /// The Subscribe frame to send to the server.
+    #[wasm_bindgen(getter)]
+    pub fn frame(&self) -> Vec<u8> {
+        self.frame.clone()
+    }
+}
+
+/// A wire client session for one 16-byte client id. It holds a replica per
+/// subscribed room and turns local edits into wire frames to send; [`receive`]
+/// folds a peer's frame back in. A room is addressed by the channel
+/// [`subscribe`] returns.
+#[wasm_bindgen]
+pub struct WasmClient {
+    inner: ClientSession,
+}
+
+#[wasm_bindgen]
+impl WasmClient {
+    /// Open a wire client for the given 16-byte client id.
+    #[wasm_bindgen(constructor)]
+    pub fn new(client_id: &[u8]) -> Result<WasmClient, JsError> {
+        let bytes: [u8; 16] = client_id
+            .try_into()
+            .map_err(|_| JsError::new("client id must be 16 bytes"))?;
+        Ok(WasmClient {
+            inner: ClientSession::new(ClientId::from_bytes(bytes)),
+        })
+    }
+
+    /// The opening Hello frame to send, naming this client.
+    pub fn hello(&self) -> Vec<u8> {
+        encode_message(&self.inner.hello())
+    }
+
+    /// The Auth frame asking the server to verify `credential`.
+    pub fn auth(&self, credential: &[u8]) -> Vec<u8> {
+        encode_message(&self.inner.auth(credential))
+    }
+
+    /// The server-derived actor, present once AuthOk has been received.
+    pub fn actor(&self) -> Option<Vec<u8>> {
+        self.inner.actor().map(<[u8]>::to_vec)
+    }
+
+    /// Join `room` on a fresh channel; returns the channel and Subscribe frame.
+    pub fn subscribe(&mut self, room: &[u8]) -> WasmSubscription {
+        let (channel, msg) = self.inner.subscribe(room);
+        WasmSubscription {
+            channel: channel.0,
+            frame: encode_message(&msg),
+        }
+    }
+
+    /// Re-issue Subscribe for a held channel from its caught-up position; `None`
+    /// if the channel isn't held.
+    pub fn resume(&self, channel: u32) -> Option<Vec<u8>> {
+        self.inner
+            .resume(Channel(channel))
+            .map(|msg| encode_message(&msg))
+    }
+
+    /// Leave the room on `channel`, dropping its replica; `None` if not held.
+    pub fn unsubscribe(&mut self, channel: u32) -> Option<Vec<u8>> {
+        self.inner
+            .unsubscribe(Channel(channel))
+            .map(|msg| encode_message(&msg))
+    }
+
+    /// Fold one received wire frame in. `true` when applied, `false` when the
+    /// frame is undecodable or the session refuses it.
+    pub fn receive(&mut self, msg: &[u8]) -> bool {
+        match decode_message(msg) {
+            Ok(message) => self.inner.receive(message).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// The highest server sequence `channel` has caught up to.
+    #[wasm_bindgen(js_name = lastSeenSeq)]
+    pub fn last_seen_seq(&self, channel: u32) -> Option<u64> {
+        self.inner.last_seen_seq(Channel(channel))
+    }
+
+    /// Install-or-set an integer Register at a path in `channel`'s room. Returns
+    /// the Ops frame to send; empty if the channel isn't held.
+    #[wasm_bindgen(js_name = registerInt)]
+    pub fn register_int(&mut self, channel: u32, path: &[u8], value: i64) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::register_int(d, path, value))
+    }
+
+    /// Install-or-increment a Counter at a path in `channel`'s room.
+    pub fn inc(&mut self, channel: u32, path: &[u8], amount: u32) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::inc(d, path, amount))
+    }
+
+    /// Set a bytes scalar at a path in `channel`'s room.
+    #[wasm_bindgen(js_name = setBytes)]
+    pub fn set_bytes(&mut self, channel: u32, path: &[u8], value: &[u8]) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::set_bytes(d, path, value))
+    }
+
+    /// Tombstone the slot at a path in `channel`'s room.
+    pub fn delete(&mut self, channel: u32, path: &[u8]) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::delete(d, path))
+    }
+
+    /// Read an integer Register at a path in `channel`'s room.
+    #[wasm_bindgen(js_name = getInt)]
+    pub fn get_int(&self, channel: u32, path: &[u8]) -> Option<i64> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::get_int(d, path))
+    }
+
+    /// Read a bytes scalar at a path in `channel`'s room.
+    #[wasm_bindgen(js_name = getBytes)]
+    pub fn get_bytes(&self, channel: u32, path: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::get_bytes(d, path))
+    }
+
+    /// Publish an ephemeral awareness entry `key` on `channel`'s room; returns
+    /// the frame to send. `None` if the channel isn't held.
+    #[wasm_bindgen(js_name = setAwareness)]
+    pub fn set_awareness(&self, channel: u32, key: &[u8], value: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .set_awareness(Channel(channel), key, value)
+            .map(|msg| encode_message(&msg))
+    }
+
+    /// A peer's awareness entry on `channel` by publishing `actor` and `key`.
+    pub fn awareness(&self, channel: u32, actor: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .awareness(Channel(channel), actor, key)
+            .map(<[u8]>::to_vec)
+    }
+
+    /// How many awareness entries `channel` currently holds.
+    #[wasm_bindgen(js_name = awarenessLen)]
+    pub fn awareness_len(&self, channel: u32) -> usize {
+        self.inner.awareness_len(Channel(channel))
+    }
+}
+
+impl WasmClient {
+    /// Run a path edit against `channel`'s replica and wrap the ops in the Ops
+    /// frame to send; empty when the channel isn't held.
+    fn ops_frame(&mut self, channel: u32, run: impl FnOnce(&mut Document) -> Vec<Op>) -> Vec<u8> {
+        match self.inner.document_mut(Channel(channel)) {
+            Some(doc) => encode_message(&Message::Ops {
+                channel: Channel(channel),
+                ops: run(doc),
+            }),
+            None => Vec::new(),
         }
     }
 }
