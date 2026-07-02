@@ -16,7 +16,7 @@ use crate::doc::Document;
 use crate::element::{Element, ElementKind};
 use crate::list::List;
 use crate::map::Map;
-use crate::path::encode_path;
+use crate::path::{encode_path, parse_path};
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 use crate::text::Text;
@@ -284,6 +284,90 @@ fn runs(seq: &[(Stamp, char)], present: &HashSet<Stamp>) -> Vec<(usize, String)>
 fn path_of(prefix: &[Vec<u8>]) -> Vec<u8> {
     let keys: Vec<&[u8]> = prefix.iter().map(Vec::as_slice).collect();
     encode_path(&keys)
+}
+
+/// The engine's default text rendering of a change list — one human-readable
+/// line per change, for a debug dump, an audit view, or a CLI. An app that wants
+/// its own presentation reads the structured [`Change`]s directly; this is the
+/// sensible default. `+` adds, `-` removes, `~` changes a value; paths print
+/// slash-joined and sequence runs print their index and contents.
+pub fn render(changes: &[Change]) -> Vec<String> {
+    changes.iter().map(render_change).collect()
+}
+
+fn render_change(change: &Change) -> String {
+    match change {
+        Change::Added { path, kind } => format!("+ {} ({})", show_path(path), kind_name(*kind)),
+        Change::Removed { path, kind } => format!("- {} ({})", show_path(path), kind_name(*kind)),
+        Change::Value { path, old, new } => {
+            format!(
+                "~ {}: {} -> {}",
+                show_path(path),
+                show_scalar(old),
+                show_scalar(new)
+            )
+        }
+        Change::Counter { path, old, new } => format!("~ {}: {old} -> {new}", show_path(path)),
+        Change::ListInsert { path, index, items } => {
+            format!("+ {}[{index}]: {}", show_path(path), show_items(items))
+        }
+        Change::ListDelete { path, index, items } => {
+            format!("- {}[{index}]: {}", show_path(path), show_items(items))
+        }
+        Change::TextInsert { path, index, text } => {
+            format!("+ {}[{index}]: {text:?}", show_path(path))
+        }
+        Change::TextDelete { path, index, text } => {
+            format!("- {}[{index}]: {text:?}", show_path(path))
+        }
+    }
+}
+
+/// A path as `/key/key`, each key shown as UTF-8 (lossy for non-text keys).
+fn show_path(path: &[u8]) -> String {
+    match parse_path(path) {
+        Some(keys) => {
+            let mut out = String::new();
+            for key in keys {
+                out.push('/');
+                out.push_str(&String::from_utf8_lossy(&key));
+            }
+            out
+        }
+        None => String::from("<bad path>"),
+    }
+}
+
+fn show_scalar(s: &Scalar) -> String {
+    match s {
+        Scalar::Null => String::from("null"),
+        Scalar::Bool(b) => b.to_string(),
+        Scalar::Int(n) => n.to_string(),
+        Scalar::Bytes(b) => format!("<{} bytes>", b.len()),
+        Scalar::BlobRef(_) => String::from("<blobref>"),
+    }
+}
+
+fn show_items(items: &[SeqItem]) -> String {
+    items
+        .iter()
+        .map(|item| match item {
+            SeqItem::Scalar(s) => show_scalar(s),
+            SeqItem::Composite(kind) => format!("<{}>", kind_name(*kind)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn kind_name(kind: ElementKind) -> &'static str {
+    match kind {
+        ElementKind::Scalar => "scalar",
+        ElementKind::Register => "register",
+        ElementKind::Counter => "counter",
+        ElementKind::Map => "map",
+        ElementKind::List => "list",
+        ElementKind::Text => "text",
+    }
 }
 
 /// Serialize a change list to bytes, so a diff computed in the core crosses the
