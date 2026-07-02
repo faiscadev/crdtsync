@@ -242,6 +242,107 @@ func (d *Document) Apply(ops []byte) int {
 	return int(C.crdtsync_doc_apply(d.h, pp, pl))
 }
 
+// --- undo / redo ---
+
+// Undo is a per-user undo/redo manager over a Document. Each edit made through
+// it records its inverse; Undo and Redo emit ordinary ops that converge on peers
+// like any edit. The manager is separate from the document it drives, so every
+// call names the document.
+type Undo struct {
+	h *C.CrdtUndo
+}
+
+// NewUndo opens an undo manager.
+func NewUndo() (*Undo, error) {
+	h := C.crdtsync_undo_new()
+	if h == nil {
+		return nil, errors.New("failed to open undo manager")
+	}
+	return &Undo{h: h}, nil
+}
+
+// Close frees the manager. Safe to call more than once.
+func (u *Undo) Close() {
+	if u.h != nil {
+		C.crdtsync_undo_free(u.h)
+		u.h = nil
+	}
+}
+
+// RegisterInt sets an integer Register at path as one undo step.
+func (u *Undo) RegisterInt(doc *Document, path [][]byte, value int64) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_undo_register_int(u.h, doc.h, pp, pl, C.int64_t(value)))
+}
+
+// Inc increments a Counter at path as one undo step.
+func (u *Undo) Inc(doc *Document, path [][]byte, amount uint32) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_undo_inc(u.h, doc.h, pp, pl, C.uint32_t(amount)))
+}
+
+// Dec decrements a Counter at path as one undo step.
+func (u *Undo) Dec(doc *Document, path [][]byte, amount uint32) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_undo_dec(u.h, doc.h, pp, pl, C.uint32_t(amount)))
+}
+
+// Delete tombstones the Register slot at path as one undo step.
+func (u *Undo) Delete(doc *Document, path [][]byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_undo_delete(u.h, doc.h, pp, pl))
+}
+
+// ListInsert inserts a bytes item at live index in the List at path as one undo
+// step.
+func (u *Undo) ListInsert(doc *Document, path [][]byte, index uint, value []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	vp, vl := bytesArg(value)
+	return takeBuf(C.crdtsync_undo_list_insert(u.h, doc.h, pp, pl, C.uintptr_t(index), vp, vl))
+}
+
+// ListDelete tombstones the live item at index in the List at path as one undo
+// step.
+func (u *Undo) ListDelete(doc *Document, path [][]byte, index uint) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_undo_list_delete(u.h, doc.h, pp, pl, C.uintptr_t(index)))
+}
+
+// TextInsert inserts UTF-8 text at a codepoint index in the Text at path as one
+// undo step.
+func (u *Undo) TextInsert(doc *Document, path [][]byte, index uint, s string) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	sp, sl := bytesArg([]byte(s))
+	return takeBuf(C.crdtsync_undo_text_insert(u.h, doc.h, pp, pl, C.uintptr_t(index), sp, sl))
+}
+
+// TextDelete tombstones count codepoints from index in the Text at path as one
+// undo step.
+func (u *Undo) TextDelete(doc *Document, path [][]byte, index, count uint) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_undo_text_delete(u.h, doc.h, pp, pl, C.uintptr_t(index), C.uintptr_t(count)))
+}
+
+// Undo reverts the most recent intention; returns the ops (empty if none).
+func (u *Undo) Undo(doc *Document) []byte {
+	return takeBuf(C.crdtsync_undo_undo(u.h, doc.h))
+}
+
+// Redo replays the most recently undone intention; returns the ops (empty if none).
+func (u *Undo) Redo(doc *Document) []byte {
+	return takeBuf(C.crdtsync_undo_redo(u.h, doc.h))
+}
+
+// CanUndo reports whether there is a recorded intention to undo.
+func (u *Undo) CanUndo() bool {
+	return C.crdtsync_undo_can_undo(u.h) == 1
+}
+
+// CanRedo reports whether there is an undone intention to redo.
+func (u *Undo) CanRedo() bool {
+	return C.crdtsync_undo_can_redo(u.h) == 1
+}
+
 // --- wire client session ---
 
 // Client is a wire client session for one 16-byte client id. It holds a replica

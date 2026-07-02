@@ -358,3 +358,90 @@ func TestClientReceiveRejectsGarbage(t *testing.T) {
 		t.Fatalf("garbage receive: got %d, want 0", rc)
 	}
 }
+
+func newUndo(t *testing.T) *Undo {
+	t.Helper()
+	u, err := NewUndo()
+	if err != nil {
+		t.Fatalf("NewUndo: %v", err)
+	}
+	return u
+}
+
+func TestUndoAndRedoARegister(t *testing.T) {
+	d := newDoc(t, 1)
+	defer d.Close()
+	u := newUndo(t)
+	defer u.Close()
+
+	u.RegisterInt(d, path("title"), 1)
+	u.RegisterInt(d, path("title"), 2)
+	if v, _ := d.GetInt(path("title")); v != 2 {
+		t.Fatalf("want 2, got %d", v)
+	}
+	if !u.CanUndo() {
+		t.Fatal("expected can-undo")
+	}
+
+	u.Undo(d)
+	if v, _ := d.GetInt(path("title")); v != 1 {
+		t.Fatalf("after undo want 1, got %d", v)
+	}
+	u.Redo(d)
+	if v, _ := d.GetInt(path("title")); v != 2 {
+		t.Fatalf("after redo want 2, got %d", v)
+	}
+	if u.CanRedo() {
+		t.Fatal("redo stack should be empty")
+	}
+}
+
+func TestUndoOfAListInsert(t *testing.T) {
+	d := newDoc(t, 1)
+	defer d.Close()
+	u := newUndo(t)
+	defer u.Close()
+
+	u.ListInsert(d, path("items"), 0, []byte("a"))
+	if n, _ := d.ListLen(path("items")); n != 1 {
+		t.Fatalf("want len 1, got %d", n)
+	}
+	u.Undo(d)
+	if n, _ := d.ListLen(path("items")); n != 0 {
+		t.Fatalf("after undo want len 0, got %d", n)
+	}
+}
+
+func TestUndoOfATextEdit(t *testing.T) {
+	d := newDoc(t, 1)
+	defer d.Close()
+	u := newUndo(t)
+	defer u.Close()
+
+	u.TextInsert(d, path("body"), 0, "hi")
+	if s, _ := d.TextGet(path("body")); s != "hi" {
+		t.Fatalf("want hi, got %q", s)
+	}
+	u.Undo(d)
+	if s, _ := d.TextGet(path("body")); s != "" {
+		t.Fatalf("after undo want empty, got %q", s)
+	}
+}
+
+func TestUndoConvergesOnAPeer(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	b := newDoc(t, 2)
+	defer b.Close()
+	u := newUndo(t)
+	defer u.Close()
+
+	b.Apply(u.Inc(a, path("votes"), 5))
+	if v, _ := b.GetCounter(path("votes")); v != 5 {
+		t.Fatalf("peer want 5, got %d", v)
+	}
+	b.Apply(u.Undo(a))
+	if v, _ := b.GetCounter(path("votes")); v != 0 {
+		t.Fatalf("peer after undo want 0, got %d", v)
+	}
+}

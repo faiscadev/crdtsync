@@ -101,6 +101,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **UndoManager (FFI)** — a `CrdtUndo` handle over the C ABI: `crdtsync_undo_new`/`_free` plus register_int/inc/dec/delete/list_insert/list_delete/text_insert/text_delete (each returns the ops to broadcast) and undo/redo/can_undo/can_redo (#100). The manager is a handle distinct from the `CrdtDoc` it drives, named on every call. Bytes-in-Register has no existing reader, so it is not exposed. Python/Go/wasm wrappers next.
 
+**UndoManager (SDK wrappers)** — Python `Undo`, Go `Undo`, and wasm `WasmUndo` over the FFI/core surface: register_int/inc/dec/delete/list_insert/list_delete/text_insert/text_delete + undo/redo/can_undo/can_redo, each naming the document it drives (#101). Undo/redo now works end-to-end in every SDK; the subsystem is complete.
+
 ---
 
 ## 🚧 In progress
@@ -127,7 +129,7 @@ Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized
 - **Awareness timed-TTL + throttle** — per-entry auto-expire-after-silence (timed TTL, distinct from the session TTL the grace sweep already handles) + removal broadcast (reuse `AwarenessClear`), and server-side throttle/coalesce of high-frequency entries (cursor/mouse). **Schema-gated:** ARCHITECTURE §Awareness declares an entry's TTL and throttle interval in the schema file (line 708), and the schema layer is unbuilt — so these trigger values have no home until it lands. The clock seam (#71) + periodic sweep (#72) are ready to enforce them. → *Awareness / Schema*. (v0.2, blocked on schema)
 - **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window ("keep last N"), time/migration compaction triggers. **Design depth (needs a careful pass before building):** snapshots are anchor-based (a tombstone anchors surviving nodes), so GC must be leaf-only (drop a below-watermark tombstone only when no surviving node parents off it), not a flat "discard older than watermark"; and the watermark is a server-seq while tombstones are lamport-`Stamp`-keyed with no client-ack protocol today — the correlation + ack semantics are unspecified. Gate any build on the convergence property harness (invariant: GC preserves materialized state). → *Snapshots / Tombstone GC*. (v0.2, needs design)
 - **Declarative policy + audit log** — authorization enforcement. → *Authorization*. (v0.2)
-- **UndoManager — SDK wrappers** — core undo (#94/#95/#97/#98/#99) and the FFI handle (#100) are done. Remaining: Python/Go/wasm wrappers over `CrdtUndo` (register_int/inc/dec/delete/list_insert/list_delete/text_insert/text_delete + undo/redo/can_undo/can_redo), mirroring the FFI surface. → *Undo/Redo*. (v0.2)
+- **UndoManager — DONE (#94–#101)** — core undo across every value type (scalar/counter/list/text, root or nested), grouping, the FFI `CrdtUndo` handle, and Python/Go/wasm wrappers all merged. The whole subsystem is complete end-to-end. Remaining refinements are optional (bytes-in-Register has no reader to surface; a fluent group builder in the SDKs).
 - **Auto-version triggers** (engine-event/schedule-driven version creation — needs the event hooks), **admin dashboard**, **replay tooling**. → *Versioning*, *Admin UI*, *Debugging*. (v0.2) _(composition cookbook landed #93)_
 - **Blob refs (full)** — refs in ops, bytes in a content-addressable store. → *Binary Blobs*. (v0.5)
 - **XmlElement / marks / schema / invariant repair / zones**. → *CRDT Model*, *Marks*, *Schema*, *Invariant Repair*, *Authorization/zones*. (v0.5)
