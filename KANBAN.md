@@ -45,7 +45,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Forward-compat reservations** — blob-ref value slot `Scalar::BlobRef` reserved in the op envelope + codec (#60).
 
-**Channel multiplexing (server)** — one connection multiplexes many rooms via client-assigned `Channel`; `Subscribe`/`Ops`/`Snapshot` carry a channel, new `Unsubscribe`; server session holds channel→room, registry fans out per peer-channel (#61).
+**Channel multiplexing** — one connection multiplexes many rooms via client-assigned `Channel`; server session holds channel→room, registry fans out per peer-channel (#61); SDK-side `ClientSession` holds N rooms, each with its own replica + last-seen seq, routing inbound frames by channel, reconnect via `resume(channel)` (#62). Arc complete.
 
 ---
 
@@ -57,7 +57,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **ClientSession multi-room** — the SDK-side driver holds several rooms at once, each on its own `Channel`, routing inbound ops/snapshots by channel and tracking a per-room last-seen sequence. The client half of channel multiplexing (server half landed #61). No wire change — the `Channel`-bearing protocol is already in place.
+- **Handshake auth** — three-phase Hello/Auth/Subscribe, pluggable credential verifier, opaque credentials, server-derived `actor_id`. The `AuthFailed` code is already reserved but unused; `Hello` today carries an untrusted peer-asserted `client_id`. → *Networking / Handshake*, *Authentication*. (v0.2)
 
 ---
 
@@ -66,8 +66,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized slice `cs-next` has broken out so far; when it drains, `cs-next` cuts the next slice from ARCHITECTURE. Order = dependency → foundational/forward-compat → roadmap/value. Each item cites the ARCHITECTURE section it derives from.
 
 - **Element-ref value slot** — the other unbuilt payload value type (line 177). Under-specified shape, no v0.1 reservation promise, so deferred until its design settles — not urgent like blob-ref was. → *Internal Data Model*. (foundational, deferred)
-- **Handshake auth** — three-phase Hello/Auth/Subscribe, pluggable credential verifier, opaque credentials, server-derived `actor_id`. → *Networking / Handshake*, *Authentication*. (v0.2)
-- **Channel multiplexing** — logical channels per `(room, branch, zone)` over one WS (Next above is step one). → *Networking / Connection*. (v0.2)
+- **Channel multiplexing — remaining** — logical channels currently key on `room`; widen to `(room, branch, zone)` once branches/zones exist. The `Channel` handle already abstracts this (no wire change needed then). → *Networking / Connection*. (v0.2, blocked on branches/zones)
 - **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window, time/migration compaction triggers. Compaction retains all tombstones until this lands. → *Snapshots / Tombstone GC*. (v0.2)
 - **Awareness subsystem** — ephemeral presence (cursors/selections/typing), TTL + throttle + auth filtering + reconnect grace. → *Awareness*. (v0.2)
 - **Declarative policy + audit log** — authorization enforcement. → *Authorization*. (v0.2)

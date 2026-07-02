@@ -1,29 +1,20 @@
 //! Client session — the replica's side of the wire protocol.
 //!
 //! A [`ClientSession`] mirrors the server's session driver from the client's
-//! seat. It opens with Hello, joins a room with Subscribe carrying the last
-//! sequence it saw, folds the server's catch-up — an op delta or a whole-replica
-//! snapshot — into a local replica, and tracks how far it has caught up so a
-//! reconnect resumes from there instead of replaying from zero.
+//! seat. It opens with Hello, then holds several room subscriptions at once —
+//! each on its own [`Channel`], with its own local replica and caught-up
+//! position. Subscribe assigns the next channel and draws a catch-up (an op
+//! delta or a whole-replica snapshot); inbound frames route to a room by their
+//! channel; a reconnect resumes each room from where it left off.
 //!
-//! Sequence tracking is by count: the server's deltas and broadcasts are
-//! contiguous runs of ops at the head, each op holding one server sequence, so a
-//! batch of `n` ops advances the seen sequence by `n`. A redelivered op — the
-//! client's own write echoed back on reconnect, or a resend — still advances the
-//! sequence (it occupies a server slot) but does not re-apply, because the
-//! replica deduplicates.
+//! Sequence tracking is per room, by count: the server's deltas and broadcasts
+//! are contiguous runs of ops at the head, each op holding one server sequence,
+//! so a batch of `n` ops advances that room's seen sequence by `n`. A
+//! redelivered op still advances the sequence (it occupies a server slot) but
+//! does not re-apply, because the replica deduplicates.
 
 use crdtsync_core::client::{ClientError, ClientSession};
 use crdtsync_core::{Channel, ClientId, Document, Element, ErrorCode, Message, Op, Scalar};
-
-/// A server-to-client op delta. The channel is immaterial to a single-room
-/// `ClientSession`, which folds the ops regardless.
-fn ops_msg(ops: Vec<Op>) -> Message {
-    Message::Ops {
-        channel: Channel(0),
-        ops,
-    }
-}
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -31,15 +22,15 @@ fn cid(first: u8) -> ClientId {
     ClientId::from_bytes(b)
 }
 
-/// A stand-in for the server's authoritative replica, the source of the ops and
-/// snapshots a client catches up from.
+/// A stand-in for the server's authoritative replica of a room, the source of
+/// the ops and snapshots a client catches up from.
 fn srv() -> Document {
     Document::new(cid(0xFF))
 }
 
-/// Read a top-level Register's int, panicking on any other shape.
-fn int(e: Option<Element>) -> i64 {
-    match e {
+/// Read a top-level Register's int from a room's replica.
+fn int(doc: &Document, key: &[u8]) -> i64 {
+    match doc.get(key) {
         Some(Element::Register(r)) => match r.borrow().read() {
             Scalar::Int(n) => *n,
             other => panic!("expected Int, got {other:?}"),
@@ -48,12 +39,15 @@ fn int(e: Option<Element>) -> i64 {
     }
 }
 
-/// Read a top-level Counter's value.
-fn counter(e: Option<Element>) -> i64 {
-    match e {
+fn counter(doc: &Document, key: &[u8]) -> i64 {
+    match doc.get(key) {
         Some(Element::Counter(c)) => c.borrow().read(),
         _ => panic!("expected a Counter"),
     }
+}
+
+fn ops_msg(channel: Channel, ops: Vec<Op>) -> Message {
+    Message::Ops { channel, ops }
 }
 
 /// Unwrap the ops of a `Message::Ops`.
@@ -64,7 +58,8 @@ fn ops_of(m: Message) -> Vec<Op> {
     }
 }
 
-const ROOM: &[u8] = b"room-1";
+const ROOM_A: &[u8] = b"room-a";
+const ROOM_B: &[u8] = b"room-b";
 
 // --- handshake framing ---
 
@@ -78,47 +73,55 @@ fn hello_names_the_client() {
 }
 
 #[test]
-fn subscribe_binds_the_room_and_requests_from_zero() {
+fn subscribe_assigns_a_channel_and_requests_from_zero() {
     let mut session = ClientSession::new(cid(1));
-    match session.subscribe(ROOM) {
+    let (channel, msg) = session.subscribe(ROOM_A);
+    match msg {
         Message::Subscribe {
+            channel: c,
             room,
             last_seen_seq,
-            ..
         } => {
-            assert_eq!(room, ROOM);
-            // A fresh client has caught up to nothing.
+            assert_eq!(c, channel);
+            assert_eq!(room, ROOM_A);
             assert_eq!(last_seen_seq, 0);
         }
         other => panic!("expected Subscribe, got {other:?}"),
     }
-    assert_eq!(session.room(), Some(ROOM));
+    assert_eq!(session.room(channel), Some(ROOM_A));
+    assert_eq!(session.last_seen_seq(channel), Some(0));
 }
 
-// --- catch-up ---
+#[test]
+fn two_rooms_get_distinct_channels() {
+    let mut session = ClientSession::new(cid(1));
+    let (a, _) = session.subscribe(ROOM_A);
+    let (b, _) = session.subscribe(ROOM_B);
+    assert_ne!(a, b);
+    assert_eq!(session.room(a), Some(ROOM_A));
+    assert_eq!(session.room(b), Some(ROOM_B));
+}
+
+// --- catch-up, per room ---
 
 #[test]
-fn an_ops_catch_up_converges_the_replica_and_tracks_the_sequence() {
-    // The server folds two ops into its replica; the client subscribes from zero
-    // and is handed them as a delta.
+fn an_ops_catch_up_converges_the_rooms_replica_and_tracks_the_sequence() {
     let mut srv = srv();
     let mut delta = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
     delta.extend(srv.transact(|tx| tx.register(b"b", Scalar::Int(2))));
 
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM);
-    session.receive(ops_msg(delta)).unwrap();
+    let (ch, _) = session.subscribe(ROOM_A);
+    session.receive(ops_msg(ch, delta)).unwrap();
 
-    assert_eq!(int(session.document().get(b"a")), 1);
-    assert_eq!(int(session.document().get(b"b")), 2);
-    // Two ops caught up: the seen sequence is the server's head.
-    assert_eq!(session.last_seen_seq(), 2);
+    let doc = session.document(ch).unwrap();
+    assert_eq!(int(doc, b"a"), 1);
+    assert_eq!(int(doc, b"b"), 2);
+    assert_eq!(session.last_seen_seq(ch), Some(2));
 }
 
 #[test]
 fn a_snapshot_catch_up_rebuilds_the_replica_and_adopts_the_sequence() {
-    // A client below the compaction floor is served the whole replica as a
-    // snapshot tagged with the sequence it lands at, not a delta.
     let mut srv = srv();
     srv.transact(|tx| {
         tx.register(b"a", Scalar::Int(1));
@@ -126,19 +129,19 @@ fn a_snapshot_catch_up_rebuilds_the_replica_and_adopts_the_sequence() {
     });
 
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM);
+    let (ch, _) = session.subscribe(ROOM_A);
     session
         .receive(Message::Snapshot {
-            channel: Channel(0),
+            channel: ch,
             seq: 9,
             state: srv.encode_state(),
         })
         .unwrap();
 
-    assert_eq!(int(session.document().get(b"a")), 1);
-    assert_eq!(counter(session.document().get(b"n")), 5);
-    // The snapshot's tagged sequence is adopted wholesale.
-    assert_eq!(session.last_seen_seq(), 9);
+    let doc = session.document(ch).unwrap();
+    assert_eq!(int(doc, b"a"), 1);
+    assert_eq!(counter(doc, b"n"), 5);
+    assert_eq!(session.last_seen_seq(ch), Some(9));
 }
 
 #[test]
@@ -147,35 +150,66 @@ fn live_ops_advance_the_replica_and_the_sequence() {
     let first = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM);
-    session.receive(ops_msg(first)).unwrap();
-    assert_eq!(session.last_seen_seq(), 1);
+    let (ch, _) = session.subscribe(ROOM_A);
+    session.receive(ops_msg(ch, first)).unwrap();
+    assert_eq!(session.last_seen_seq(ch), Some(1));
 
-    // A later broadcast lands on top and carries the sequence forward.
     let later = srv.transact(|tx| tx.register(b"b", Scalar::Int(2)));
-    session.receive(ops_msg(later)).unwrap();
-    assert_eq!(int(session.document().get(b"b")), 2);
-    assert_eq!(session.last_seen_seq(), 2);
+    session.receive(ops_msg(ch, later)).unwrap();
+    assert_eq!(int(session.document(ch).unwrap(), b"b"), 2);
+    assert_eq!(session.last_seen_seq(ch), Some(2));
 }
 
-// --- reconnect ---
+// --- rooms are isolated ---
 
 #[test]
-fn reconnect_subscribes_from_the_last_seen_sequence() {
+fn ops_on_one_channel_do_not_touch_another_rooms_replica() {
+    let mut srv_a = srv();
+    let a_ops = srv_a.transact(|tx| tx.register(b"a", Scalar::Int(1)));
+
+    let mut session = ClientSession::new(cid(2));
+    let (ca, _) = session.subscribe(ROOM_A);
+    let (cb, _) = session.subscribe(ROOM_B);
+    session.receive(ops_msg(ca, a_ops)).unwrap();
+
+    // Room A caught up; room B is untouched.
+    assert_eq!(int(session.document(ca).unwrap(), b"a"), 1);
+    assert!(session.document(cb).unwrap().get(b"a").is_none());
+    assert_eq!(session.last_seen_seq(cb), Some(0));
+}
+
+// --- reconnect, per room ---
+
+#[test]
+fn resume_resubscribes_a_room_from_its_last_seen_sequence() {
     let mut srv = srv();
     let mut delta = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
     delta.extend(srv.transact(|tx| tx.register(b"b", Scalar::Int(2))));
 
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM);
-    session.receive(ops_msg(delta)).unwrap();
+    let (ch, _) = session.subscribe(ROOM_A);
+    session.receive(ops_msg(ch, delta)).unwrap();
 
-    // Reconnecting, the client asks only for what it missed past its position —
-    // the server can answer with a small delta instead of the whole log.
-    match session.subscribe(ROOM) {
-        Message::Subscribe { last_seen_seq, .. } => assert_eq!(last_seen_seq, 2),
-        other => panic!("expected Subscribe, got {other:?}"),
+    // Reconnecting, the client asks only for what it missed past its position,
+    // on the same channel and room.
+    match session.resume(ch) {
+        Some(Message::Subscribe {
+            channel,
+            room,
+            last_seen_seq,
+        }) => {
+            assert_eq!(channel, ch);
+            assert_eq!(room, ROOM_A);
+            assert_eq!(last_seen_seq, 2);
+        }
+        other => panic!("expected a Subscribe, got {other:?}"),
     }
+}
+
+#[test]
+fn resume_of_an_unknown_channel_is_none() {
+    let session = ClientSession::new(cid(1));
+    assert!(session.resume(Channel(7)).is_none());
 }
 
 #[test]
@@ -184,40 +218,46 @@ fn a_redelivered_op_is_idempotent_but_still_advances_the_sequence() {
     let op = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM);
-    session.receive(ops_msg(op.clone())).unwrap();
-    assert_eq!(session.last_seen_seq(), 1);
+    let (ch, _) = session.subscribe(ROOM_A);
+    session.receive(ops_msg(ch, op.clone())).unwrap();
+    assert_eq!(session.last_seen_seq(ch), Some(1));
 
-    // The same op redelivered (a resend, or the client's own write echoed on a
-    // reconnect) does not re-apply, but it still holds a server sequence.
-    session.receive(ops_msg(op)).unwrap();
-    assert_eq!(int(session.document().get(b"a")), 1);
-    assert_eq!(session.last_seen_seq(), 2);
+    session.receive(ops_msg(ch, op)).unwrap();
+    assert_eq!(int(session.document(ch).unwrap(), b"a"), 1);
+    assert_eq!(session.last_seen_seq(ch), Some(2));
 }
 
-// --- local edits ---
+// --- local edits, per room ---
 
 #[test]
-fn a_local_edit_yields_ops_to_send_without_advancing_the_seen_sequence() {
+fn a_local_edit_yields_ops_on_its_channel_without_advancing_the_sequence() {
     let mut session = ClientSession::new(cid(1));
-    session.subscribe(ROOM);
+    let (ch, _) = session.subscribe(ROOM_A);
 
-    // A local edit applies to the replica and returns the ops to broadcast; the
-    // seen sequence is the server's, so an unacknowledged local write leaves it
-    // untouched.
-    let outbound = session.edit(|tx| tx.register(b"a", Scalar::Int(7)));
-    assert_eq!(int(session.document().get(b"a")), 7);
-    assert_eq!(session.last_seen_seq(), 0);
+    let outbound = session
+        .edit(ch, |tx| tx.register(b"a", Scalar::Int(7)))
+        .unwrap();
+    assert_eq!(int(session.document(ch).unwrap(), b"a"), 7);
+    assert_eq!(session.last_seen_seq(ch), Some(0));
+    match &outbound {
+        Message::Ops { channel, .. } => assert_eq!(*channel, ch),
+        other => panic!("expected Ops, got {other:?}"),
+    }
     assert_eq!(ops_of(outbound).len(), 1);
+}
+
+#[test]
+fn an_edit_on_an_unknown_channel_is_none() {
+    let mut session = ClientSession::new(cid(1));
+    assert!(session
+        .edit(Channel(3), |tx| tx.register(b"a", Scalar::Int(1)))
+        .is_none());
 }
 
 // --- snapshot over prior state ---
 
 #[test]
 fn a_snapshot_replaces_prior_local_state_with_the_server_state() {
-    // The client has one write; the server's snapshot reflects a different, fuller
-    // replica. Adopting the snapshot yields the server's state, not a merge onto
-    // stale local slots.
     let mut srv = srv();
     srv.transact(|tx| {
         tx.register(b"a", Scalar::Int(1));
@@ -226,47 +266,91 @@ fn a_snapshot_replaces_prior_local_state_with_the_server_state() {
 
     let mut peer = Document::new(cid(3));
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM);
+    let (ch, _) = session.subscribe(ROOM_A);
     session
         .receive(ops_msg(
+            ch,
             peer.transact(|tx| tx.register(b"a", Scalar::Int(99))),
         ))
         .unwrap();
 
     session
         .receive(Message::Snapshot {
-            channel: Channel(0),
+            channel: ch,
             seq: 2,
             state: srv.encode_state(),
         })
         .unwrap();
-    assert_eq!(int(session.document().get(b"a")), 1);
-    assert_eq!(int(session.document().get(b"b")), 2);
-    assert_eq!(session.last_seen_seq(), 2);
+    let doc = session.document(ch).unwrap();
+    assert_eq!(int(doc, b"a"), 1);
+    assert_eq!(int(doc, b"b"), 2);
+    assert_eq!(session.last_seen_seq(ch), Some(2));
 }
 
 #[test]
 fn edits_after_a_snapshot_still_carry_the_clients_own_id() {
-    // A snapshot is authored by the server's replica, so adopting it must not
-    // reseat the client's identity: a later local write is still this client's.
     let mut srv = srv();
     srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM);
+    let (ch, _) = session.subscribe(ROOM_A);
     session
         .receive(Message::Snapshot {
-            channel: Channel(0),
+            channel: ch,
             seq: 1,
             state: srv.encode_state(),
         })
         .unwrap();
 
-    let outbound = session.edit(|tx| tx.register(b"b", Scalar::Int(2)));
+    let outbound = session
+        .edit(ch, |tx| tx.register(b"b", Scalar::Int(2)))
+        .unwrap();
     assert!(ops_of(outbound).iter().all(|op| op.id.client == cid(2)));
 }
 
+// --- unsubscribe ---
+
+#[test]
+fn unsubscribe_drops_the_room_and_frees_the_channel() {
+    let mut session = ClientSession::new(cid(1));
+    let (ch, _) = session.subscribe(ROOM_A);
+    match session.unsubscribe(ch) {
+        Some(Message::Unsubscribe { channel }) => assert_eq!(channel, ch),
+        other => panic!("expected Unsubscribe, got {other:?}"),
+    }
+    assert_eq!(session.room(ch), None);
+    assert_eq!(session.last_seen_seq(ch), None);
+}
+
+#[test]
+fn unsubscribe_of_an_unknown_channel_is_none() {
+    let mut session = ClientSession::new(cid(1));
+    assert!(session.unsubscribe(Channel(4)).is_none());
+}
+
 // --- malformed / illegal server frames ---
+
+#[test]
+fn ops_on_an_unknown_channel_are_rejected() {
+    let mut srv = srv();
+    let op = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
+    let mut session = ClientSession::new(cid(2));
+    session.subscribe(ROOM_A);
+    let err = session.receive(ops_msg(Channel(9), op));
+    assert!(matches!(err, Err(ClientError::UnknownChannel(_))));
+}
+
+#[test]
+fn a_snapshot_on_an_unknown_channel_is_rejected() {
+    let mut session = ClientSession::new(cid(2));
+    session.subscribe(ROOM_A);
+    let err = session.receive(Message::Snapshot {
+        channel: Channel(9),
+        seq: 1,
+        state: srv().encode_state(),
+    });
+    assert!(matches!(err, Err(ClientError::UnknownChannel(_))));
+}
 
 #[test]
 fn a_garbage_snapshot_is_rejected_and_leaves_the_replica_intact() {
@@ -274,18 +358,18 @@ fn a_garbage_snapshot_is_rejected_and_leaves_the_replica_intact() {
     let op = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM);
-    session.receive(ops_msg(op)).unwrap();
+    let (ch, _) = session.subscribe(ROOM_A);
+    session.receive(ops_msg(ch, op)).unwrap();
 
     let err = session.receive(Message::Snapshot {
-        channel: Channel(0),
+        channel: ch,
         seq: 5,
         state: vec![0xFF, 0xFF, 0xFF, 0xFF],
     });
     assert!(matches!(err, Err(ClientError::BadSnapshot)));
     // The rejected snapshot changed nothing.
-    assert_eq!(int(session.document().get(b"a")), 1);
-    assert_eq!(session.last_seen_seq(), 1);
+    assert_eq!(int(session.document(ch).unwrap(), b"a"), 1);
+    assert_eq!(session.last_seen_seq(ch), Some(1));
 }
 
 #[test]
@@ -307,8 +391,6 @@ fn a_server_error_surfaces_to_the_caller() {
 #[test]
 fn a_client_only_message_from_the_server_is_a_violation() {
     let mut session = ClientSession::new(cid(1));
-    // Hello and Subscribe travel client to server; seeing one inbound is a
-    // protocol violation, not something to fold in.
     assert!(matches!(
         session.receive(Message::Hello { client: cid(2) }),
         Err(ClientError::UnexpectedMessage(_))
@@ -316,8 +398,14 @@ fn a_client_only_message_from_the_server_is_a_violation() {
     assert!(matches!(
         session.receive(Message::Subscribe {
             channel: Channel(0),
-            room: ROOM.to_vec(),
+            room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+        }),
+        Err(ClientError::UnexpectedMessage(_))
+    ));
+    assert!(matches!(
+        session.receive(Message::Unsubscribe {
+            channel: Channel(0),
         }),
         Err(ClientError::UnexpectedMessage(_))
     ));
