@@ -56,6 +56,7 @@ fn one_room_log(room: &[u8], ops: Vec<Op>) -> Vec<(RoomId, RoomLog)> {
         RoomLog {
             snapshot: None,
             ops,
+            versions: Vec::new(),
         },
     )]
 }
@@ -101,6 +102,7 @@ fn from_rooms_replays_independent_rooms() {
             RoomLog {
                 snapshot: None,
                 ops: a,
+                versions: Vec::new(),
             },
         ),
         (
@@ -108,6 +110,7 @@ fn from_rooms_replays_independent_rooms() {
             RoomLog {
                 snapshot: None,
                 ops: b,
+                versions: Vec::new(),
             },
         ),
     ];
