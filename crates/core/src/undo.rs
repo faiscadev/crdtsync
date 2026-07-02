@@ -16,12 +16,14 @@
 //!
 //! Edits are addressed by path (see [`crate::path`]), so a slot inside a nested
 //! Map undoes as readily as a root one. This helper covers scalar slots — a
-//! Register and a Counter. List and text edits — whose inverses need element
-//! revival — are layered on in later work.
+//! Register and a Counter — and List items: undo of an insert deletes the node
+//! it minted, and undo of a delete revives the removed value as a fresh insert
+//! (the op log has no un-tombstone). Text edits are layered on in later work.
 
 use crate::doc::Document;
-use crate::op::Op;
+use crate::op::{Op, OpKind};
 use crate::path;
+use crate::stamp::Stamp;
 use crate::Scalar;
 
 /// The inverse of one recorded edit — what to replay to undo it. Applying an
@@ -37,6 +39,25 @@ enum Change {
     /// Apply this counter delta at `path` — one direction to cancel the recorded
     /// one.
     Counter { path: Vec<u8>, inc: u32, dec: u32 },
+    /// Tombstone the list node `id` at `path` — the inverse of an insert.
+    ListDeleteNode { path: Vec<u8>, id: Stamp },
+    /// Re-insert `value` at live `index` in the list at `path` — the inverse of
+    /// a delete. Revival is a fresh insert (the op log has no un-tombstone), so
+    /// the value returns with a new id.
+    ListInsertValue {
+        path: Vec<u8>,
+        index: usize,
+        value: Vec<u8>,
+    },
+}
+
+/// The id of the node a `ListInsert` op minted — its stamp — for the last insert
+/// in `ops`, so an inverse can later delete exactly that node.
+fn inserted_list_id(ops: &[Op]) -> Option<Stamp> {
+    ops.iter().rev().find_map(|op| match op.kind {
+        OpKind::ListInsert { .. } => Some(op.stamp),
+        _ => None,
+    })
 }
 
 /// One undo step: the inverses of a group of edits, in the order they were made.
@@ -103,6 +124,37 @@ impl Batch<'_> {
         });
         self
     }
+
+    /// Insert `value` at live `index` in the List at `path`.
+    pub fn list_insert(&mut self, path: &[u8], index: usize, value: &[u8]) -> &mut Self {
+        let ops = path::list_insert(self.doc, path, index, value);
+        if let Some(id) = inserted_list_id(&ops) {
+            self.inverses.push(Change::ListDeleteNode {
+                path: path.to_vec(),
+                id,
+            });
+        }
+        self.ops.extend(ops);
+        self
+    }
+
+    /// Tombstone the live item at `index` in the List at `path`, capturing its
+    /// value so an undo can revive it.
+    pub fn list_delete(&mut self, path: &[u8], index: usize) -> &mut Self {
+        let Some(value) = path::list_get(self.doc, path, index) else {
+            return self;
+        };
+        let ops = path::list_delete(self.doc, path, index);
+        if !ops.is_empty() {
+            self.inverses.push(Change::ListInsertValue {
+                path: path.to_vec(),
+                index,
+                value,
+            });
+        }
+        self.ops.extend(ops);
+        self
+    }
 }
 
 impl UndoManager {
@@ -166,6 +218,27 @@ impl UndoManager {
     pub fn delete(&mut self, doc: &mut Document, path: &[u8]) -> Vec<Op> {
         self.group(doc, |b| {
             b.delete(path);
+        })
+    }
+
+    /// Insert `value` at live `index` in the List at `path` as its own undo step.
+    pub fn list_insert(
+        &mut self,
+        doc: &mut Document,
+        path: &[u8],
+        index: usize,
+        value: &[u8],
+    ) -> Vec<Op> {
+        self.group(doc, |b| {
+            b.list_insert(path, index, value);
+        })
+    }
+
+    /// Tombstone the live item at `index` in the List at `path` as its own undo
+    /// step.
+    pub fn list_delete(&mut self, doc: &mut Document, path: &[u8], index: usize) -> Vec<Op> {
+        self.group(doc, |b| {
+            b.list_delete(path, index);
         })
     }
 
@@ -237,6 +310,24 @@ fn apply_change(doc: &mut Document, change: Change) -> (Vec<Op>, Change) {
                     dec: inc,
                 },
             )
+        }
+        Change::ListDeleteNode { path, id } => {
+            // Capture where the node sits so the mirror can revive it in place.
+            let index = path::list_live_index(doc, &path, id);
+            let value = index.and_then(|i| path::list_get(doc, &path, i));
+            let ops = path::list_delete_id(doc, &path, id);
+            match (index, value) {
+                (Some(index), Some(value)) => (ops, Change::ListInsertValue { path, index, value }),
+                // Nothing live to delete: the inverse is inert.
+                _ => (ops, Change::ListDeleteNode { path, id }),
+            }
+        }
+        Change::ListInsertValue { path, index, value } => {
+            let ops = path::list_insert(doc, &path, index, &value);
+            match inserted_list_id(&ops) {
+                Some(id) => (ops, Change::ListDeleteNode { path, id }),
+                None => (ops, Change::ListInsertValue { path, index, value }),
+            }
         }
     }
 }

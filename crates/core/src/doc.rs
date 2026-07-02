@@ -1032,6 +1032,16 @@ impl ListCursor<'_> {
             self.doc.emit(self.list_id, OpKind::ListDelete { id });
         }
     }
+
+    /// Tombstone the node with `id` directly, when the caller already knows the
+    /// stable id rather than a shifting index.
+    pub fn delete_id(&mut self, id: Stamp) {
+        let present =
+            matches!(self.doc.lists.get(&self.list_id), Some(list) if list.borrow().contains(id));
+        if present {
+            self.doc.emit(self.list_id, OpKind::ListDelete { id });
+        }
+    }
 }
 
 /// A cursor over one Text in the tree.
