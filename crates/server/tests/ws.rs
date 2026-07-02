@@ -13,7 +13,8 @@ use crdtsync_core::{
     decode_message, encode_header, encode_message, ClientId, Document, ErrorCode, Message, Op,
     Scalar,
 };
-use crdtsync_server::runtime::{serve, serve_with, ServeConfig};
+use crdtsync_server::runtime::{serve, serve_with, serve_with_verifier, ServeConfig};
+use crdtsync_server::Verifier;
 use std::time::Duration;
 
 const CH: Channel = Channel(0);
@@ -81,6 +82,23 @@ async fn start_server_with(config: ServeConfig) -> Server {
 async fn open(url: &str) -> Ws {
     let (ws, _) = connect_async(url).await.unwrap();
     ws
+}
+
+/// Start a server whose credentials are checked by `verifier`.
+async fn start_server_with_verifier(verifier: Box<dyn Verifier + Send>) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(serve_with_verifier(
+        listener,
+        cid(0xFF),
+        None,
+        ServeConfig::default(),
+        verifier,
+    ));
+    Server {
+        url: format!("ws://{addr}"),
+        task,
+    }
 }
 
 /// Open a connection presenting `credential` in the `Authorization` header — the
@@ -330,4 +348,40 @@ async fn anonymous_mode_mints_an_actor_without_a_credential() {
         }
         other => panic!("expected an AuthOk, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn an_injected_verifier_maps_a_good_upgrade_credential_to_its_actor() {
+    let verifier: Box<dyn Verifier + Send> =
+        Box::new(|cred: &[u8]| (cred == b"good").then(|| b"alice".to_vec()));
+    let server = start_server_with_verifier(verifier).await;
+    let url = &server.url;
+
+    let mut ws = open_with_auth(url, b"good").await;
+    send_bytes(&mut ws, encode_header(PROTOCOL_VERSION).to_vec()).await;
+    // The actor is what the verifier derived, not the raw credential.
+    assert_eq!(
+        recv(&mut ws).await,
+        Message::AuthOk {
+            actor: b"alice".to_vec(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn an_injected_verifier_refuses_a_bad_upgrade_credential() {
+    let verifier: Box<dyn Verifier + Send> =
+        Box::new(|cred: &[u8]| (cred == b"good").then(|| b"alice".to_vec()));
+    let server = start_server_with_verifier(verifier).await;
+    let url = &server.url;
+
+    // A refused credential closes the connection with AuthFailed before the loop.
+    let mut ws = open_with_auth(url, b"nope").await;
+    assert!(matches!(
+        recv(&mut ws).await,
+        Message::Error {
+            code: ErrorCode::AuthFailed,
+            ..
+        }
+    ));
 }

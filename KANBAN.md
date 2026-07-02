@@ -49,7 +49,9 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Handshake auth** — three-phase Hello → Auth → Subscribe. Wire `Auth`/`AuthOk` messages (#63); server pluggable `Verifier` + session actor gate, dev-mode `AllowAll` default (#64); client `ClientSession::auth`/`actor` (#65). Server derives actor; client never asserts it.
 
-**Auth fast path + anonymous mode** — `Session::authenticated` + `Registry::connect_authenticated` open a connection already authenticated (#73); runtime verifies an `Authorization`-header credential during the WS upgrade and sends an unsolicited `AuthOk`, skipping the in-band Auth phase; `ServeConfig::anonymous` mints `actor = anon:<random>` from transport-layer entropy (#74). Header carrier done; other carriers (cookie/subprotocol/mTLS/query) + non-`AllowAll` verifier injection into `serve` are follow-ons (see Queue).
+**Auth fast path + anonymous mode** — `Session::authenticated` + `Registry::connect_authenticated` open a connection already authenticated (#73); runtime verifies an `Authorization`-header credential during the WS upgrade and sends an unsolicited `AuthOk`, skipping the in-band Auth phase; `ServeConfig::anonymous` mints `actor = anon:<random>` from transport-layer entropy (#74). Header carrier done.
+
+**Verifier injection** — `serve_with_verifier` plugs a real `Box<dyn Verifier + Send>` (JWT/OIDC/API key) into the runtime; `serve`/`serve_with` default to dev `AllowAll` (#75). Real end-to-end map + reject now exercisable. Other credential carriers (cookie/subprotocol/mTLS/query) stay queued.
 
 **Awareness (core)** — ephemeral presence: wire `AwarenessSet`/`AwarenessUpdate` (#66); server fan-out per peer-channel, actor-tagged, never logged/snapshotted (#67); client `set_awareness` + per-channel `(actor,key)` LWW view (#68); server-side ephemeral store → late-joiner replay on Subscribe + clear-on-disconnect (#69). Publish + fan-out + client view + late-joiner replay done.
 
@@ -65,7 +67,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Auth carriers + verifier injection** — extend the fast path beyond the `Authorization` header to the other ARCHITECTURE credential carriers (cookie, WS subprotocol, mTLS, query param — the last logs-leak-prone) and let a deployment inject a non-`AllowAll` `Verifier` into `serve` (today `serve` hardcodes the dev verifier). Small transport glue on the landed fast path. → *Networking / Handshake*. (v0.2, ready)
+- **Additional auth carriers** — extend the fast-path credential extraction beyond the `Authorization` header to the other ARCHITECTURE carriers: cookie, WS subprotocol, mTLS client cert, query param (the last logs-leak-prone, gate behind a flag). Small transport glue on the landed header path + verifier injection; needs a precedence rule when several are present. → *Networking / Handshake*. (v0.2, ready)
 
 ---
 
