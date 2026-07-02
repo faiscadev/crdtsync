@@ -31,6 +31,7 @@ pub mod doc;
 pub mod op;
 pub mod path;
 pub mod protocol;
+pub mod undo;
 
 pub use client::{ClientError, ClientSession};
 pub use clientid::ClientId;
@@ -51,3 +52,4 @@ pub use register::Register;
 pub use scalar::{BlobRef, Scalar};
 pub use stamp::Stamp;
 pub use text::Text;
+pub use undo::UndoManager;
