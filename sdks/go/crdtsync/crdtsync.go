@@ -235,3 +235,158 @@ func (d *Document) Apply(ops []byte) int {
 	pp, pl := bytesArg(ops)
 	return int(C.crdtsync_doc_apply(d.h, pp, pl))
 }
+
+// --- wire client session ---
+
+// Client is a wire client session for one 16-byte client id. It holds a replica
+// per subscribed room and turns local edits into wire frames to send; Receive
+// folds a peer's frame back in. A room is addressed by the channel Subscribe
+// returns.
+type Client struct {
+	h *C.CrdtClient
+}
+
+// NewClient opens a wire client for the given 16-byte client id.
+func NewClient(clientID []byte) (*Client, error) {
+	if len(clientID) != 16 {
+		return nil, errors.New("client id must be 16 bytes")
+	}
+	h := C.crdtsync_client_new((*C.uint8_t)(unsafe.Pointer(&clientID[0])))
+	if h == nil {
+		return nil, errors.New("failed to open client")
+	}
+	return &Client{h: h}, nil
+}
+
+// Close frees the client. Safe to call more than once.
+func (c *Client) Close() {
+	if c.h != nil {
+		C.crdtsync_client_free(c.h)
+		c.h = nil
+	}
+}
+
+// Hello is the opening frame to send, naming this client.
+func (c *Client) Hello() []byte {
+	return takeBuf(C.crdtsync_client_hello(c.h))
+}
+
+// Auth is the frame asking the server to verify credential and derive the actor.
+func (c *Client) Auth(credential []byte) []byte {
+	cp, cl := bytesArg(credential)
+	return takeBuf(C.crdtsync_client_auth(c.h, cp, cl))
+}
+
+// Actor is the server-derived actor, present once AuthOk has been received.
+func (c *Client) Actor() ([]byte, bool) {
+	var out C.CrdtBuf
+	rc := C.crdtsync_client_actor(c.h, &out)
+	if rc != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// Subscribe joins room on a fresh channel; returns the channel and the frame.
+func (c *Client) Subscribe(room []byte) (uint32, []byte) {
+	rp, rl := bytesArg(room)
+	var channel C.uint32_t
+	frame := takeBuf(C.crdtsync_client_subscribe(c.h, rp, rl, &channel))
+	return uint32(channel), frame
+}
+
+// Resume re-issues Subscribe for a held channel from its caught-up position.
+func (c *Client) Resume(channel uint32) []byte {
+	return takeBuf(C.crdtsync_client_resume(c.h, C.uint32_t(channel)))
+}
+
+// Unsubscribe leaves the room on channel, dropping its replica.
+func (c *Client) Unsubscribe(channel uint32) []byte {
+	return takeBuf(C.crdtsync_client_unsubscribe(c.h, C.uint32_t(channel)))
+}
+
+// Receive folds one received wire frame in. 1 applied, 0 refused, -1 bad handle.
+func (c *Client) Receive(msg []byte) int {
+	mp, ml := bytesArg(msg)
+	return int(C.crdtsync_client_receive(c.h, mp, ml))
+}
+
+// LastSeenSeq is the highest server sequence channel has caught up to.
+func (c *Client) LastSeenSeq(channel uint32) (uint64, bool) {
+	var out C.uint64_t
+	rc := C.crdtsync_client_last_seen_seq(c.h, C.uint32_t(channel), &out)
+	return uint64(out), rc == 1
+}
+
+// RegisterInt installs-or-sets an integer Register in channel's room.
+func (c *Client) RegisterInt(channel uint32, path [][]byte, value int64) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_client_register_int(c.h, C.uint32_t(channel), pp, pl, C.int64_t(value)))
+}
+
+// Inc installs-or-increments a Counter in channel's room.
+func (c *Client) Inc(channel uint32, path [][]byte, amount uint32) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_client_inc(c.h, C.uint32_t(channel), pp, pl, C.uint32_t(amount)))
+}
+
+// SetBytes sets a bytes scalar in channel's room.
+func (c *Client) SetBytes(channel uint32, path [][]byte, value []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	vp, vl := bytesArg(value)
+	return takeBuf(C.crdtsync_client_set_bytes(c.h, C.uint32_t(channel), pp, pl, vp, vl))
+}
+
+// Delete tombstones the slot at path in channel's room.
+func (c *Client) Delete(channel uint32, path [][]byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_client_delete(c.h, C.uint32_t(channel), pp, pl))
+}
+
+// GetInt reads an integer Register at path in channel's room.
+func (c *Client) GetInt(channel uint32, path [][]byte) (int64, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.int64_t
+	rc := C.crdtsync_client_get_int(c.h, C.uint32_t(channel), pp, pl, &out)
+	return int64(out), rc == 1
+}
+
+// GetBytes reads a bytes scalar at path in channel's room.
+func (c *Client) GetBytes(channel uint32, path [][]byte) ([]byte, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	rc := C.crdtsync_client_get_bytes(c.h, C.uint32_t(channel), pp, pl, &out)
+	if rc != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// SetAwareness publishes an ephemeral awareness entry key in channel's room.
+func (c *Client) SetAwareness(channel uint32, key, value []byte) []byte {
+	kp, kl := bytesArg(key)
+	vp, vl := bytesArg(value)
+	return takeBuf(C.crdtsync_client_set_awareness(c.h, C.uint32_t(channel), kp, kl, vp, vl))
+}
+
+// Awareness reads a peer's awareness entry on channel by publishing actor and key.
+func (c *Client) Awareness(channel uint32, actor, key []byte) ([]byte, bool) {
+	ap, al := bytesArg(actor)
+	kp, kl := bytesArg(key)
+	var out C.CrdtBuf
+	rc := C.crdtsync_client_awareness(c.h, C.uint32_t(channel), ap, al, kp, kl, &out)
+	if rc != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// AwarenessLen reports how many awareness entries channel currently holds.
+func (c *Client) AwarenessLen(channel uint32) uint {
+	var out C.uintptr_t
+	rc := C.crdtsync_client_awareness_len(c.h, C.uint32_t(channel), &out)
+	if rc != 1 {
+		return 0
+	}
+	return uint(out)
+}

@@ -225,3 +225,92 @@ func TestEncodeStateIsCanonical(t *testing.T) {
 		t.Fatal("re-encode of a decoded snapshot is not canonical")
 	}
 }
+
+// newClient opens a wire client, failing the test on error.
+func newClient(t *testing.T, first byte) *Client {
+	t.Helper()
+	c, err := NewClient(cid(first))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return c
+}
+
+func TestClientEditTravelsToAPeer(t *testing.T) {
+	a := newClient(t, 1)
+	defer a.Close()
+	b := newClient(t, 2)
+	defer b.Close()
+
+	// Both fresh sessions assign channel 0 to their first subscription.
+	ca, _ := a.Subscribe(key("room-1"))
+	cb, _ := b.Subscribe(key("room-1"))
+	if ca != 0 || cb != 0 {
+		t.Fatalf("first channel: got %d and %d, want 0 and 0", ca, cb)
+	}
+
+	ops := a.RegisterInt(ca, path("age"), 30)
+	if v, ok := a.GetInt(ca, path("age")); !ok || v != 30 {
+		t.Fatalf("local read: got (%d,%v), want (30,true)", v, ok)
+	}
+	if rc := b.Receive(ops); rc != 1 {
+		t.Fatalf("receive: got %d, want 1", rc)
+	}
+	if v, ok := b.GetInt(cb, path("age")); !ok || v != 30 {
+		t.Fatalf("peer read: got (%d,%v), want (30,true)", v, ok)
+	}
+	if seq, ok := b.LastSeenSeq(cb); !ok || seq != 1 {
+		t.Fatalf("last seen: got (%d,%v), want (1,true)", seq, ok)
+	}
+}
+
+func TestClientBytesRoundTrip(t *testing.T) {
+	a := newClient(t, 1)
+	defer a.Close()
+	b := newClient(t, 2)
+	defer b.Close()
+	ca, _ := a.Subscribe(key("room-1"))
+	cb, _ := b.Subscribe(key("room-1"))
+
+	b.Receive(a.SetBytes(ca, path("blob"), []byte{0, 1, 0xff}))
+	if got, ok := b.GetBytes(cb, path("blob")); !ok || !bytes.Equal(got, []byte{0, 1, 0xff}) {
+		t.Fatalf("bytes: got (%v,%v)", got, ok)
+	}
+}
+
+func TestClientHandshakeAndLifecycle(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+
+	if len(c.Hello()) == 0 || len(c.Auth(key("token"))) == 0 {
+		t.Fatal("handshake frames should be non-empty")
+	}
+	if _, ok := c.Actor(); ok {
+		t.Fatal("actor should be absent before AuthOk")
+	}
+
+	ch, _ := c.Subscribe(key("room-1"))
+	if len(c.SetAwareness(ch, key("cursor"), key("x"))) == 0 {
+		t.Fatal("set_awareness should yield a frame")
+	}
+	if n := c.AwarenessLen(ch); n != 0 {
+		t.Fatalf("awareness len: got %d, want 0", n)
+	}
+	if len(c.Unsubscribe(ch)) == 0 {
+		t.Fatal("unsubscribe should yield a frame")
+	}
+	if _, ok := c.LastSeenSeq(ch); ok {
+		t.Fatal("channel should be gone after unsubscribe")
+	}
+	if len(c.Resume(ch)) != 0 {
+		t.Fatal("resume of an unheld channel should be empty")
+	}
+}
+
+func TestClientReceiveRejectsGarbage(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+	if rc := c.Receive([]byte{0xff, 0xff, 0xff, 0xff}); rc != 0 {
+		t.Fatalf("garbage receive: got %d, want 0", rc)
+	}
+}

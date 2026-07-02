@@ -63,13 +63,13 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- **SDK wiring — wire client through the SDKs** — the C ABI now exposes the full `CrdtClient` (wire `ClientSession`): lifecycle (new/free/hello/subscribe→channel/unsubscribe/resume), receive, per-channel path edits (register_int/inc/set_bytes/delete) returning the `Ops` frame, per-channel reads, last-seen seq (#77); plus auth (`auth`/`actor`), awareness (`set_awareness` + peer view + len) (#78). Core gained `ClientSession::document_mut` so the FFI reuses the `path::` façade. Python binding wraps the full `CrdtClient` surface (#79). Remaining: wasm / Go bindings. → *SDKs*.
+- **SDK wiring — wire client through the SDKs** — the C ABI now exposes the full `CrdtClient` (wire `ClientSession`): lifecycle (new/free/hello/subscribe→channel/unsubscribe/resume), receive, per-channel path edits (register_int/inc/set_bytes/delete) returning the `Ops` frame, per-channel reads, last-seen seq (#77); plus auth (`auth`/`actor`), awareness (`set_awareness` + peer view + len) (#78). Core gained `ClientSession::document_mut` so the FFI reuses the `path::` façade. Python (#79) and Go (#80) bindings wrap the full `CrdtClient` surface. Remaining: wasm binding. → *SDKs*.
 
 ---
 
 ## ⏭ Next
 
-- **SDK wiring — Go + wasm bindings** — wrap the full `CrdtClient` C ABI (#77/#78) in the Go (cgo) and wasm (wasm-bindgen over core) SDKs. Python landed (#79). Per-binding slices. → *SDKs*. (v0.2, ready)
+- **SDK wiring — wasm binding** — expose the wire client in the wasm SDK (`crates/wasm`, wasm-bindgen over the core directly — not the C ABI, so it wraps `ClientSession` in Rust). Python (#79) and Go (#80) landed. → *SDKs*. (v0.2, ready)
 - **mTLS credential carrier** — a client certificate as the fast-path credential. Blocked: the server terminates plain TCP with no TLS layer to expose the cert; land TLS termination first. → *Networking / Handshake*. (v0.2, blocked on TLS)
 
 ---
