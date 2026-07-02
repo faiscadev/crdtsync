@@ -498,3 +498,95 @@ func TestClientAtomicTransactionTravelsToAPeer(t *testing.T) {
 		t.Fatalf("peer y want 2, got %d", v)
 	}
 }
+
+func TestDiffValueChange(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	a.RegisterInt(path("age"), 30)
+	old := a.EncodeState()
+	a.RegisterInt(path("age"), 31)
+	changes, err := Diff(old, a.EncodeState())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
+	}
+	c := changes[0]
+	if c.Op != "value" || !bytes.Equal(c.Path, EncodePath(path("age"))) {
+		t.Fatalf("unexpected change %+v", c)
+	}
+	if c.Old == nil || c.Old.T != "int" || c.Old.Int != 30 {
+		t.Fatalf("bad old %+v", c.Old)
+	}
+	if c.New == nil || c.New.T != "int" || c.New.Int != 31 {
+		t.Fatalf("bad new %+v", c.New)
+	}
+}
+
+func TestDiffCounterAndAdd(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	a.Inc(path("hits"), 3)
+	old := a.EncodeState()
+	a.Inc(path("hits"), 2)
+	a.RegisterInt(path("age"), 9)
+	changes, err := Diff(old, a.EncodeState())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	byOp := map[string]Change{}
+	for _, c := range changes {
+		byOp[c.Op] = c
+	}
+	if c := byOp["counter"]; c.OldInt != 3 || c.NewInt != 5 {
+		t.Fatalf("bad counter %+v", c)
+	}
+	if c := byOp["add"]; c.Kind != "register" || !bytes.Equal(c.Path, EncodePath(path("age"))) {
+		t.Fatalf("bad add %+v", c)
+	}
+}
+
+func TestDiffTextAndListRuns(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	a.TextInsert(path("body"), 0, "hi")
+	a.ListInsert(path("xs"), 0, key("x"))
+	old := a.EncodeState()
+	a.TextInsert(path("body"), 2, "!")
+	a.ListInsert(path("xs"), 1, key("y"))
+	changes, err := Diff(old, a.EncodeState())
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	byOp := map[string]Change{}
+	for _, c := range changes {
+		byOp[c.Op] = c
+	}
+	if c := byOp["textInsert"]; c.Text != "!" || c.Index != 2 {
+		t.Fatalf("bad text %+v", c)
+	}
+	if c := byOp["listInsert"]; c.Index != 1 || len(c.Items) != 1 || c.Items[0].Scalar == nil {
+		t.Fatalf("bad list %+v", c)
+	}
+}
+
+func TestDiffIdenticalIsEmpty(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	a.RegisterInt(path("age"), 30)
+	state := a.EncodeState()
+	changes, err := Diff(state, state)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want no changes, got %d", len(changes))
+	}
+}
+
+func TestDiffMalformedErrors(t *testing.T) {
+	if _, err := Diff([]byte{0xff, 0xff, 0xff, 0xff}, []byte{0xff, 0xff, 0xff, 0xff}); err == nil {
+		t.Fatal("want an error for a malformed snapshot")
+	}
+}
