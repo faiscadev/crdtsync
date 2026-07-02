@@ -140,6 +140,57 @@ fn undo_of_a_delete_restores_the_value() {
 }
 
 #[test]
+fn a_group_undoes_as_one_step() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    // Two fields set as a single gesture.
+    u.group(&mut d, |b| {
+        b.register(b"first", Scalar::Int(1));
+        b.register(b"last", Scalar::Int(2));
+    });
+    assert_eq!(reg(&d, b"first"), Some(Scalar::Int(1)));
+    assert_eq!(reg(&d, b"last"), Some(Scalar::Int(2)));
+
+    // One undo reverts the whole group.
+    u.undo(&mut d);
+    assert_eq!(reg(&d, b"first"), None);
+    assert_eq!(reg(&d, b"last"), None);
+    assert!(!u.can_undo(), "the group was a single step");
+
+    // One redo restores the whole group.
+    u.redo(&mut d);
+    assert_eq!(reg(&d, b"first"), Some(Scalar::Int(1)));
+    assert_eq!(reg(&d, b"last"), Some(Scalar::Int(2)));
+}
+
+#[test]
+fn a_group_mixes_register_and_counter() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    u.register(&mut d, b"title", Scalar::Int(1));
+    // A gesture that changes a field and bumps a counter together.
+    u.group(&mut d, |b| {
+        b.register(b"title", Scalar::Int(2));
+        b.inc(b"votes", 3);
+    });
+    assert_eq!(reg(&d, b"title"), Some(Scalar::Int(2)));
+    assert_eq!(counter(&d, b"votes"), 3);
+
+    u.undo(&mut d);
+    assert_eq!(reg(&d, b"title"), Some(Scalar::Int(1)), "field restored");
+    assert_eq!(counter(&d, b"votes"), 0, "counter bump undone");
+}
+
+#[test]
+fn an_empty_group_records_no_step() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let ops = u.group(&mut d, |_| {});
+    assert!(ops.is_empty());
+    assert!(!u.can_undo(), "an empty group is not an undo step");
+}
+
+#[test]
 fn empty_stacks_return_none() {
     let mut d = doc(1);
     let mut u = UndoManager::new();

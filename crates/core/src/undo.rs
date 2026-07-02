@@ -10,6 +10,10 @@
 //! it reverts a user's own intentions and never anyone else's — global undo is
 //! deliberately unsupported.
 //!
+//! An undo step is one *intention* — a group of edits a user made as a single
+//! gesture, reverted together. A single-edit method records a one-edit intention;
+//! [`group`](UndoManager::group) records several edits as one.
+//!
 //! This helper covers root-level scalar slots: an integer/bytes/bool Register and
 //! a Counter. Nested paths, lists, and text — whose inverses need element
 //! revival — are layered on in later work.
@@ -29,13 +33,71 @@ enum Change {
     Counter { key: Vec<u8>, inc: u32, dec: u32 },
 }
 
-/// A user's undo/redo stacks over one [`Document`]. Each recorded edit pushes its
-/// inverse; a fresh edit clears the redo stack, as an intervening edit makes the
-/// redone future ambiguous.
+/// One undo step: the inverses of a group of edits, in the order they were made.
+type Intention = Vec<Change>;
+
+/// A user's undo/redo stacks over one [`Document`]. Each recorded intention
+/// pushes onto the undo stack; a fresh edit clears the redo stack, as an
+/// intervening edit makes the redone future ambiguous.
 #[derive(Default)]
 pub struct UndoManager {
-    undo: Vec<Change>,
-    redo: Vec<Change>,
+    undo: Vec<Intention>,
+    redo: Vec<Intention>,
+}
+
+/// The edits of one [`group`](UndoManager::group), applied as they are called
+/// while their inverses and emitted ops accumulate into a single intention.
+pub struct Batch<'a> {
+    doc: &'a mut Document,
+    inverses: Intention,
+    ops: Vec<Op>,
+}
+
+impl Batch<'_> {
+    /// Install-or-set a root Register at `key`.
+    pub fn register(&mut self, key: &[u8], value: Scalar) -> &mut Self {
+        let prior = read_register(self.doc, key);
+        self.ops
+            .extend(self.doc.transact(|tx| tx.register(key, value)));
+        self.inverses.push(Change::Slot {
+            key: key.to_vec(),
+            value: prior,
+        });
+        self
+    }
+
+    /// Install-or-increment a root Counter at `key`.
+    pub fn inc(&mut self, key: &[u8], amount: u32) -> &mut Self {
+        self.ops.extend(self.doc.transact(|tx| tx.inc(key, amount)));
+        self.inverses.push(Change::Counter {
+            key: key.to_vec(),
+            inc: 0,
+            dec: amount,
+        });
+        self
+    }
+
+    /// Install-or-decrement a root Counter at `key`.
+    pub fn dec(&mut self, key: &[u8], amount: u32) -> &mut Self {
+        self.ops.extend(self.doc.transact(|tx| tx.dec(key, amount)));
+        self.inverses.push(Change::Counter {
+            key: key.to_vec(),
+            inc: amount,
+            dec: 0,
+        });
+        self
+    }
+
+    /// Tombstone a root Register slot at `key`.
+    pub fn delete(&mut self, key: &[u8]) -> &mut Self {
+        let prior = read_register(self.doc, key);
+        self.ops.extend(self.doc.transact(|tx| tx.delete(key)));
+        self.inverses.push(Change::Slot {
+            key: key.to_vec(),
+            value: prior,
+        });
+        self
+    }
 }
 
 impl UndoManager {
@@ -44,93 +106,100 @@ impl UndoManager {
         Self::default()
     }
 
-    /// Whether there is a recorded edit to undo.
+    /// Whether there is a recorded intention to undo.
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
 
-    /// Whether there is an undone edit to redo.
+    /// Whether there is an undone intention to redo.
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
 
-    /// Install-or-set a root integer/bytes/bool Register at `key`, recording the
-    /// prior value so the edit can be undone. Returns the ops to broadcast.
+    /// Record several edits as one undo step, returning every op they emit. Undo
+    /// reverts them together; an empty group records nothing.
+    pub fn group<F>(&mut self, doc: &mut Document, edits: F) -> Vec<Op>
+    where
+        F: FnOnce(&mut Batch),
+    {
+        let mut batch = Batch {
+            doc,
+            inverses: Vec::new(),
+            ops: Vec::new(),
+        };
+        edits(&mut batch);
+        let Batch { inverses, ops, .. } = batch;
+        if !inverses.is_empty() {
+            self.undo.push(inverses);
+            self.redo.clear();
+        }
+        ops
+    }
+
+    /// Install-or-set a root Register at `key` as its own undo step.
     pub fn register(&mut self, doc: &mut Document, key: &[u8], value: Scalar) -> Vec<Op> {
-        let prior = read_register(doc, key);
-        let ops = doc.transact(|tx| tx.register(key, value));
-        self.record(Change::Slot {
-            key: key.to_vec(),
-            value: prior,
-        });
-        ops
+        self.group(doc, |b| {
+            b.register(key, value);
+        })
     }
 
-    /// Install-or-increment a root Counter at `key`. The inverse is a matching
-    /// decrement, so no prior value is needed. Returns the ops to broadcast.
+    /// Install-or-increment a root Counter at `key` as its own undo step.
     pub fn inc(&mut self, doc: &mut Document, key: &[u8], amount: u32) -> Vec<Op> {
-        let ops = doc.transact(|tx| tx.inc(key, amount));
-        self.record(Change::Counter {
-            key: key.to_vec(),
-            inc: 0,
-            dec: amount,
-        });
-        ops
+        self.group(doc, |b| {
+            b.inc(key, amount);
+        })
     }
 
-    /// Install-or-decrement a root Counter at `key`; the inverse is a matching
-    /// increment. Returns the ops to broadcast.
+    /// Install-or-decrement a root Counter at `key` as its own undo step.
     pub fn dec(&mut self, doc: &mut Document, key: &[u8], amount: u32) -> Vec<Op> {
-        let ops = doc.transact(|tx| tx.dec(key, amount));
-        self.record(Change::Counter {
-            key: key.to_vec(),
-            inc: amount,
-            dec: 0,
-        });
-        ops
+        self.group(doc, |b| {
+            b.dec(key, amount);
+        })
     }
 
-    /// Tombstone a root Register slot at `key`, recording its prior value so undo
-    /// restores it. Returns the ops to broadcast.
+    /// Tombstone a root Register slot at `key` as its own undo step.
     pub fn delete(&mut self, doc: &mut Document, key: &[u8]) -> Vec<Op> {
-        let prior = read_register(doc, key);
-        let ops = doc.transact(|tx| tx.delete(key));
-        self.record(Change::Slot {
-            key: key.to_vec(),
-            value: prior,
-        });
-        ops
+        self.group(doc, |b| {
+            b.delete(key);
+        })
     }
 
-    /// Revert the most recent tracked edit, returning the ops to broadcast, or
-    /// `None` if there is nothing to undo. The undone edit becomes redoable.
+    /// Revert the most recent intention, returning the ops to broadcast, or
+    /// `None` if there is nothing to undo. The undone intention becomes redoable.
     pub fn undo(&mut self, doc: &mut Document) -> Option<Vec<Op>> {
-        let change = self.undo.pop()?;
-        let (ops, inverse) = apply(doc, change);
+        let intention = self.undo.pop()?;
+        let (ops, inverse) = apply(doc, intention);
         self.redo.push(inverse);
         Some(ops)
     }
 
-    /// Replay the most recently undone edit, returning the ops to broadcast, or
-    /// `None` if there is nothing to redo. The redone edit becomes undoable again.
+    /// Replay the most recently undone intention, returning the ops to broadcast,
+    /// or `None` if there is nothing to redo. It becomes undoable again.
     pub fn redo(&mut self, doc: &mut Document) -> Option<Vec<Op>> {
-        let change = self.redo.pop()?;
-        let (ops, inverse) = apply(doc, change);
+        let intention = self.redo.pop()?;
+        let (ops, inverse) = apply(doc, intention);
         self.undo.push(inverse);
         Some(ops)
     }
-
-    /// Push a new edit's inverse and drop the redo future it invalidates.
-    fn record(&mut self, change: Change) {
-        self.undo.push(change);
-        self.redo.clear();
-    }
 }
 
-/// Apply one inverse change to `doc`, returning the ops it produced and the
-/// change that would undo *this* application (its own inverse), so undo and redo
-/// alternate over the same slot.
-fn apply(doc: &mut Document, change: Change) -> (Vec<Op>, Change) {
+/// Apply an intention's inverses to `doc` — in reverse of the order they were
+/// made, so the last edit is undone first — and return the ops they produced and
+/// the mirror intention that would undo *this* application, so undo and redo
+/// alternate over the same slots.
+fn apply(doc: &mut Document, intention: Intention) -> (Vec<Op>, Intention) {
+    let mut ops = Vec::new();
+    let mut inverse = Vec::new();
+    for change in intention.into_iter().rev() {
+        let (o, inv) = apply_change(doc, change);
+        ops.extend(o);
+        inverse.push(inv);
+    }
+    (ops, inverse)
+}
+
+/// Apply one inverse change, returning its ops and its own inverse.
+fn apply_change(doc: &mut Document, change: Change) -> (Vec<Op>, Change) {
     match change {
         Change::Slot { key, value } => {
             let current = read_register(doc, &key);
