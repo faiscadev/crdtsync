@@ -678,3 +678,44 @@ fn a_null_undo_handle_is_inert() {
         crdtsync_undo_free(ptr::null_mut());
     }
 }
+
+// --- atomic transactions ---
+
+#[test]
+fn a_doc_atomic_transaction_commits_all_or_nothing() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let x = path(&[b"x"]);
+        let y = path(&[b"y"]);
+
+        crdtsync_doc_begin_atomic(a);
+        // Edits accumulate while recording; each returns an empty buffer.
+        let e1 = register_int(a, &x, 1);
+        let e2 = register_int(a, &y, 2);
+        assert_eq!(e1.len, 0);
+        assert_eq!(e2.len, 0);
+        let group = crdtsync_doc_commit_atomic(a);
+        assert!(group.len > 0);
+
+        // Split the group so the peer sees a partial delivery first.
+        let ops = crdtsync_core::decode_ops(std::slice::from_raw_parts(group.ptr, group.len))
+            .expect("decode");
+        assert_eq!(ops.len(), 2);
+        let first = crdtsync_core::encode_ops(&ops[..1]);
+        let rest = crdtsync_core::encode_ops(&ops[1..]);
+
+        crdtsync_doc_apply(b, first.as_ptr(), first.len());
+        assert_eq!(get_int(b, &x).0, 0, "partial tx is invisible");
+        crdtsync_doc_apply(b, rest.as_ptr(), rest.len());
+        assert_eq!(get_int(b, &x), (1, 1));
+        assert_eq!(get_int(b, &y), (1, 2));
+
+        crdtsync_buf_free(e1);
+        crdtsync_buf_free(e2);
+        crdtsync_buf_free(group);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}

@@ -154,6 +154,18 @@ impl WasmDocument {
             Err(_) => -1,
         }
     }
+
+    /// Begin recording an atomic transaction; edits accumulate until commit.
+    #[wasm_bindgen(js_name = beginAtomic)]
+    pub fn begin_atomic(&mut self) {
+        self.inner.begin_atomic();
+    }
+
+    /// Commit the atomic transaction, returning the group's ops to broadcast.
+    #[wasm_bindgen(js_name = commitAtomic)]
+    pub fn commit_atomic(&mut self) -> Vec<u8> {
+        encode_ops(&self.inner.commit_atomic())
+    }
 }
 
 /// A per-user undo/redo manager over a [`WasmDocument`]. Each edit made through

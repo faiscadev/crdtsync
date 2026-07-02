@@ -242,6 +242,18 @@ func (d *Document) Apply(ops []byte) int {
 	return int(C.crdtsync_doc_apply(d.h, pp, pl))
 }
 
+// BeginAtomic starts recording an atomic transaction; edits accumulate until
+// CommitAtomic.
+func (d *Document) BeginAtomic() {
+	C.crdtsync_doc_begin_atomic(d.h)
+}
+
+// CommitAtomic commits the atomic transaction, returning the group's ops to
+// broadcast.
+func (d *Document) CommitAtomic() []byte {
+	return takeBuf(C.crdtsync_doc_commit_atomic(d.h))
+}
+
 // --- undo / redo ---
 
 // Undo is a per-user undo/redo manager over a Document. Each edit made through

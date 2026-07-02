@@ -64,6 +64,10 @@ pub struct Document {
     /// The next atomic-transaction id to mint; namespaced by this replica's
     /// client, so `(client, tx)` is globally unique.
     next_tx: u64,
+    /// When recording an atomic transaction (between `begin_atomic` and
+    /// `commit_atomic`), the ops emitted so far accumulate here instead of being
+    /// returned per edit, so several edits commit as one group.
+    atomic: Option<Vec<Op>>,
     seen: HashSet<OpId>,
     /// Ops whose target isn't reachable yet, held until a create makes it so.
     buffer: Vec<Op>,
@@ -103,6 +107,7 @@ impl Document {
             lamport: 0,
             seq: 0,
             next_tx: 0,
+            atomic: None,
             seen: HashSet::new(),
             buffer: Vec::new(),
             buffered: HashSet::new(),
@@ -342,6 +347,7 @@ impl Document {
             // under its own client with fresh op ids, so restarting at 0 cannot
             // collide with anything still buffered.
             next_tx: 0,
+            atomic: None,
             seen,
             buffer,
             buffered,
@@ -373,19 +379,43 @@ impl Document {
         // A local create can restore a container that buffered remote ops were
         // waiting on; replay them now, not only on the next remote apply.
         self.drain_buffer();
-        std::mem::take(&mut self.pending)
+        let ops = std::mem::take(&mut self.pending);
+        // While recording an atomic transaction, edits accumulate into the group
+        // rather than returning per call; the group ships on `commit_atomic`.
+        match self.atomic.as_mut() {
+            Some(acc) => {
+                acc.extend(ops);
+                Vec::new()
+            }
+            None => ops,
+        }
     }
 
-    /// Like [`transact`](Self::transact), but tag the emitted ops as one atomic
-    /// transaction. A receiver holds the members until the whole group arrives,
-    /// then applies them together, so no peer observes a partial transaction. The
-    /// author applies its own edits immediately, as with any local edit. An empty
-    /// transaction tags nothing.
-    pub fn atomic_transact<F>(&mut self, f: F) -> Vec<Op>
-    where
-        F: FnOnce(&mut MapCursor),
-    {
-        let ops = self.transact(f);
+    /// Begin recording an atomic transaction: until [`commit_atomic`], every edit
+    /// accumulates into one group and returns no ops of its own. Idempotent while
+    /// already recording (the open group continues). Pair with `commit_atomic`.
+    pub fn begin_atomic(&mut self) {
+        if self.atomic.is_none() {
+            self.atomic = Some(Vec::new());
+        }
+    }
+
+    /// Close the atomic transaction opened by [`begin_atomic`] and return its ops,
+    /// tagged as one group for all-or-nothing delivery. Returns empty (and tags
+    /// nothing) if no edits were recorded or no transaction was open.
+    pub fn commit_atomic(&mut self) -> Vec<Op> {
+        let ops = self.atomic.take().unwrap_or_default();
+        self.tag_atomic(ops)
+    }
+
+    /// Whether an atomic transaction is currently open.
+    pub fn is_atomic(&self) -> bool {
+        self.atomic.is_some()
+    }
+
+    /// Tag a group's ops as one atomic transaction. An empty group is left
+    /// untagged.
+    fn tag_atomic(&mut self, ops: Vec<Op>) -> Vec<Op> {
         let Ok(count) = u32::try_from(ops.len()) else {
             return ops;
         };
@@ -400,6 +430,20 @@ impl Document {
                 op
             })
             .collect()
+    }
+
+    /// Like [`transact`](Self::transact), but tag the emitted ops as one atomic
+    /// transaction. A receiver holds the members until the whole group arrives,
+    /// then applies them together, so no peer observes a partial transaction. The
+    /// author applies its own edits immediately, as with any local edit. An empty
+    /// transaction tags nothing.
+    pub fn atomic_transact<F>(&mut self, f: F) -> Vec<Op>
+    where
+        F: FnOnce(&mut MapCursor),
+    {
+        self.begin_atomic();
+        let _ = self.transact(f);
+        self.commit_atomic()
     }
 
     /// Fold a foreign op into local state. An op whose target isn't reachable
