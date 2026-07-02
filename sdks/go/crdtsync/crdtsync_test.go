@@ -159,3 +159,69 @@ func TestEncodePathShape(t *testing.T) {
 		t.Fatalf("encode path: got %v", got)
 	}
 }
+
+func TestSnapshotRoundTrips(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	a.RegisterInt(path("age"), 30)
+	a.Inc(path("hits"), 5)
+
+	back, err := DecodeState(a.EncodeState())
+	if err != nil {
+		t.Fatalf("DecodeState: %v", err)
+	}
+	defer back.Close()
+	if v, ok := back.GetInt(path("age")); !ok || v != 30 {
+		t.Fatalf("age: got %d ok=%v", v, ok)
+	}
+	if v, ok := back.GetCounter(path("hits")); !ok || v != 5 {
+		t.Fatalf("hits: got %d ok=%v", v, ok)
+	}
+}
+
+func TestDecodedDocumentDedupsAndConverges(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	reg := a.RegisterInt(path("age"), 30)
+
+	back, err := DecodeState(a.EncodeState())
+	if err != nil {
+		t.Fatalf("DecodeState: %v", err)
+	}
+	defer back.Close()
+
+	// A replay of the covered op is a no-op; a later peer op still lands.
+	if n := back.Apply(reg); n != 0 {
+		t.Fatalf("replay applied %d ops, want 0", n)
+	}
+	b := newDoc(t, 2)
+	defer b.Close()
+	b.Apply(reg)
+	hit := b.Inc(path("hits"), 4)
+	if n := back.Apply(hit); n != 1 {
+		t.Fatalf("later op applied %d ops, want 1", n)
+	}
+	if v, ok := back.GetCounter(path("hits")); !ok || v != 4 {
+		t.Fatalf("hits: got %d ok=%v", v, ok)
+	}
+}
+
+func TestDecodeGarbageStateErrors(t *testing.T) {
+	if _, err := DecodeState([]byte{0xFF, 0xFF, 0xFF, 0xFF}); err == nil {
+		t.Fatal("DecodeState on garbage: want error, got nil")
+	}
+}
+
+func TestEncodeStateIsCanonical(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	a.RegisterInt(path("age"), 30)
+	back, err := DecodeState(a.EncodeState())
+	if err != nil {
+		t.Fatalf("DecodeState: %v", err)
+	}
+	defer back.Close()
+	if !bytes.Equal(a.EncodeState(), back.EncodeState()) {
+		t.Fatal("re-encode of a decoded snapshot is not canonical")
+	}
+}

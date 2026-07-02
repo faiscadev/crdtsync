@@ -59,6 +59,39 @@ fn a_counter_accumulates_across_replicas() {
 }
 
 #[wasm_bindgen_test]
+fn a_snapshot_round_trips_through_a_decode() {
+    let mut a = doc(1);
+    let p = path(&["age"]);
+    a.register_int(&p, 30);
+    a.inc(&path(&["hits"]), 5);
+
+    let snap = a.encode_state();
+    let back = WasmDocument::decode_state(&snap).ok().unwrap();
+    assert_eq!(back.get_int(&p), Some(30));
+    assert_eq!(back.get_counter(&path(&["hits"])), Some(5));
+}
+
+#[wasm_bindgen_test]
+fn a_decoded_document_dedups_and_converges() {
+    let mut a = doc(1);
+    let reg = a.register_int(&path(&["age"]), 30);
+
+    let mut back = WasmDocument::decode_state(&a.encode_state()).ok().unwrap();
+    // A replay of a covered op is a no-op; a later peer op still lands.
+    assert_eq!(back.apply(&reg), 0);
+    let mut b = doc(2);
+    b.apply(&reg);
+    let hit = b.inc(&path(&["hits"]), 4);
+    assert_eq!(back.apply(&hit), 1);
+    assert_eq!(back.get_counter(&path(&["hits"])), Some(4));
+}
+
+#[wasm_bindgen_test]
+fn decoding_garbage_state_is_an_error() {
+    assert!(WasmDocument::decode_state(&[0xFF; 8]).is_err());
+}
+
+#[wasm_bindgen_test]
 fn a_nested_path_converges() {
     let mut a = doc(1);
     let mut b = doc(2);

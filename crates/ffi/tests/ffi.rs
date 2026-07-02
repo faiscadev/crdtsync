@@ -129,6 +129,91 @@ fn a_counter_accumulates_across_replicas() {
     }
 }
 
+// --- state snapshot ---
+
+#[test]
+fn a_snapshot_round_trips_through_a_decode() {
+    unsafe {
+        let c = client(1);
+        let a = crdtsync_doc_new(c.as_ptr());
+        let reg = register_int(a, &path(&[b"age"]), 30);
+        let hit = inc(a, &path(&[b"hits"]), 5);
+
+        let snap = crdtsync_doc_encode_state(a);
+        assert!(!snap.ptr.is_null() && snap.len > 0);
+
+        // A fresh handle decoded from the snapshot reads the same state.
+        let b = crdtsync_doc_decode_state(snap.ptr, snap.len);
+        assert!(!b.is_null());
+        assert_eq!(get_int(b, &path(&[b"age"])), (1, 30));
+        assert_eq!(get_counter(b, &path(&[b"hits"])), (1, 5));
+
+        crdtsync_buf_free(reg);
+        crdtsync_buf_free(hit);
+        crdtsync_buf_free(snap);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn a_decoded_snapshot_still_dedups_and_converges() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let reg = register_int(a, &path(&[b"age"]), 30);
+
+        // Reload `a` from a snapshot, then a peer's later edit still lands and a
+        // replay of the covered op is a no-op.
+        let snap = crdtsync_doc_encode_state(a);
+        let reloaded = crdtsync_doc_decode_state(snap.ptr, snap.len);
+
+        assert_eq!(
+            crdtsync_doc_apply(reloaded, reg.ptr, reg.len),
+            0,
+            "replay is deduped"
+        );
+
+        let b = crdtsync_doc_new(cb.as_ptr());
+        exchange(b, &reg);
+        let hit = inc(b, &path(&[b"hits"]), 4);
+        assert_eq!(
+            crdtsync_doc_apply(reloaded, hit.ptr, hit.len),
+            1,
+            "later op applies"
+        );
+        assert_eq!(get_counter(reloaded, &path(&[b"hits"])), (1, 4));
+
+        crdtsync_buf_free(reg);
+        crdtsync_buf_free(hit);
+        crdtsync_buf_free(snap);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+        crdtsync_doc_free(reloaded);
+    }
+}
+
+#[test]
+fn decoding_garbage_state_is_null_not_a_crash() {
+    unsafe {
+        // A malformed snapshot must be rejected as a null handle, never a panic
+        // across the boundary.
+        let garbage = [0xFFu8; 8];
+        assert!(crdtsync_doc_decode_state(garbage.as_ptr(), garbage.len()).is_null());
+        // A null/empty input is likewise a null handle, not UB.
+        assert!(crdtsync_doc_decode_state(ptr::null(), 0).is_null());
+    }
+}
+
+#[test]
+fn encoding_a_null_handle_is_an_empty_buffer() {
+    unsafe {
+        let snap = crdtsync_doc_encode_state(ptr::null());
+        assert_eq!(snap.len, 0);
+        crdtsync_buf_free(snap);
+    }
+}
+
 // --- nested paths ---
 
 #[test]
