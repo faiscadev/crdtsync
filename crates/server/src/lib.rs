@@ -314,6 +314,48 @@ impl Hub {
         Ok(())
     }
 
+    /// The room's whole-replica state as a portable snapshot — the bytes to move
+    /// it to another node, back it up, or capture a debug repro. `None` for an
+    /// unknown room. Import it elsewhere with [`import_room`](Hub::import_room).
+    pub fn export_room(&self, room: &[u8]) -> Option<Vec<u8>> {
+        self.rooms.get(room).map(|r| r.doc.encode_state())
+    }
+
+    /// Rebuild a room from a portable snapshot produced by
+    /// [`export_room`](Hub::export_room). The merged state, element/client
+    /// identities, and dedup set come back, so a client resending its ops is
+    /// deduped exactly as against the origin. Returns `Ok(false)` — installing
+    /// nothing — if `room` already exists: import is create-only, so moving onto
+    /// live state needs an explicit delete first. Malformed bytes are an
+    /// `InvalidData` error. With a store attached the snapshot is persisted
+    /// before the room commits, so the import survives a restart.
+    pub fn import_room(&mut self, room: &[u8], state: &[u8]) -> io::Result<bool> {
+        if self.rooms.contains_key(room) {
+            return Ok(false);
+        }
+        let doc = Document::decode_state(state)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
+        let seen: HashSet<OpId> = doc.seen().collect();
+        // The whole imported history is folded into the snapshot, so its floor
+        // sits at the op count — a fresh subscriber lands below it and is served
+        // the state rather than an empty delta. Sequences renumber from here;
+        // they are server-local, so a move never collides with the origin's.
+        let base_seq = seen.len() as u64;
+        if let Some(store) = self.store.as_mut() {
+            store.compact(room, base_seq, state)?;
+        }
+        self.rooms.insert(
+            room.to_vec(),
+            Room {
+                doc,
+                log: Vec::new(),
+                seen,
+                base_seq,
+            },
+        );
+        Ok(true)
+    }
+
     /// The room's current high-water server sequence (0 if unseen or empty).
     pub fn seq(&self, room: &[u8]) -> u64 {
         self.rooms.get(room).map_or(0, Room::head)
