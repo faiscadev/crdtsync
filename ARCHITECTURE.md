@@ -606,7 +606,7 @@ Anonymous mode: server emits `actor_id = "anon:<random>"` if deployment policy p
 
 ## Error Envelope
 
-Standardized error response with closed enum code + human message + opaque details. Closed enum keeps wire compact, cross-language error handling uniform. New codes ship through engine releases. *As built:* code + message (the `details` field is not yet implemented).
+Standardized error response with closed enum code + human message + opaque details. Closed enum keeps wire compact, cross-language error handling uniform. New codes ship through engine releases. *As built:* code + message + an opaque `details` byte string, all three on the wire; `details` is reserved (round-tripped, empty) — no producer populates it yet, so the SDK error surface still exposes only code + message.
 
 ## Not Locked
 

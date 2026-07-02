@@ -139,6 +139,7 @@ pub fn step(
                     replies: vec![Message::Error {
                         code: ErrorCode::AuthFailed,
                         message: "credential rejected".to_string(),
+                        details: Vec::new(),
                     }],
                     close: true,
                     ..Response::default()
@@ -229,6 +230,7 @@ pub fn step(
                     replies: vec![Message::Error {
                         code: ErrorCode::Internal,
                         message: "failed to persist ops".to_string(),
+                        details: Vec::new(),
                     }],
                     close: true,
                     ..Response::default()
@@ -384,6 +386,7 @@ pub fn negotiate(version: u32) -> Result<(), Message> {
         Err(Message::Error {
             code: ErrorCode::UnsupportedVersion,
             message: "unsupported protocol version".to_string(),
+            details: Vec::new(),
         })
     }
 }
@@ -393,6 +396,7 @@ fn violation(reason: &str) -> Response {
         replies: vec![Message::Error {
             code: ErrorCode::ProtocolViolation,
             message: reason.to_string(),
+            details: Vec::new(),
         }],
         close: true,
         ..Response::default()
@@ -406,6 +410,7 @@ fn internal(reason: &str) -> Response {
         replies: vec![Message::Error {
             code: ErrorCode::Internal,
             message: reason.to_string(),
+            details: Vec::new(),
         }],
         close: true,
         ..Response::default()
@@ -420,6 +425,7 @@ fn forbidden(reason: &str) -> Response {
         replies: vec![Message::Error {
             code: ErrorCode::Forbidden,
             message: reason.to_string(),
+            details: Vec::new(),
         }],
         ..Response::default()
     }

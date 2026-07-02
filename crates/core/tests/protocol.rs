@@ -192,6 +192,18 @@ fn error_round_trips() {
     round_trips(Message::Error {
         code: ErrorCode::UnsupportedVersion,
         message: "upgrade required".to_string(),
+        details: Vec::new(),
+    });
+}
+
+#[test]
+fn error_round_trips_opaque_details() {
+    // The details field carries machine-readable specifics the core never
+    // parses — opaque bytes, round-tripped verbatim.
+    round_trips(Message::Error {
+        code: ErrorCode::Forbidden,
+        message: "not permitted".to_string(),
+        details: vec![0x00, 0x7F, 0xFF, 0x01],
     });
 }
 
@@ -203,12 +215,41 @@ fn every_error_code_round_trips() {
         ErrorCode::AuthFailed,
         ErrorCode::UnknownRoom,
         ErrorCode::Internal,
+        ErrorCode::Forbidden,
     ] {
         round_trips(Message::Error {
             code,
             message: String::new(),
+            details: Vec::new(),
         });
     }
+}
+
+#[test]
+fn a_truncated_error_is_an_error_not_a_panic() {
+    let bytes = encode_message(&Message::Error {
+        code: ErrorCode::Internal,
+        message: "boom".to_string(),
+        details: vec![1, 2, 3],
+    });
+    for cut in 0..bytes.len() {
+        assert_eq!(
+            decode_message(&bytes[..cut]),
+            Err(ProtocolError::UnexpectedEof),
+            "truncating to {cut} bytes must error",
+        );
+    }
+}
+
+#[test]
+fn trailing_bytes_after_an_error_are_rejected() {
+    let mut bytes = encode_message(&Message::Error {
+        code: ErrorCode::Internal,
+        message: "boom".to_string(),
+        details: Vec::new(),
+    });
+    bytes.push(0);
+    assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
 }
 
 // --- messages reject malformed input ---
@@ -251,6 +292,7 @@ fn an_unknown_error_code_is_an_error() {
     let mut bytes = encode_message(&Message::Error {
         code: ErrorCode::Internal,
         message: String::new(),
+        details: Vec::new(),
     });
     // The code is the two bytes right after the message tag.
     bytes[1] = 0xEE;
@@ -269,10 +311,11 @@ fn a_non_utf8_error_message_is_an_error() {
     let mut bytes = encode_message(&Message::Error {
         code: ErrorCode::Internal,
         message: "x".to_string(),
+        details: Vec::new(),
     });
-    // Replace the single message byte with an invalid UTF-8 lead byte.
-    let last = bytes.len() - 1;
-    bytes[last] = 0xFF;
+    // Replace the single message byte with an invalid UTF-8 lead byte: it sits
+    // after the tag, the 2-byte code, and the 4-byte length prefix.
+    bytes[7] = 0xFF;
     assert_eq!(decode_message(&bytes), Err(ProtocolError::BadUtf8));
 }
 

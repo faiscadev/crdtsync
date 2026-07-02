@@ -140,8 +140,15 @@ pub enum Message {
         seq: u64,
         state: Vec<u8>,
     },
-    /// A failure the server reports to the client.
-    Error { code: ErrorCode, message: String },
+    /// A failure the server reports to the client: a closed-enum `code`, a
+    /// human-readable `message`, and opaque `details` the core never parses —
+    /// machine-readable specifics a client interprets by code. `details` is
+    /// empty until a producer populates it.
+    Error {
+        code: ErrorCode,
+        message: String,
+        details: Vec<u8>,
+    },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -287,10 +294,15 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u64(&mut out, *seq);
             put_bytes(&mut out, state);
         }
-        Message::Error { code, message } => {
+        Message::Error {
+            code,
+            message,
+            details,
+        } => {
             put_u8(&mut out, 3);
             put_u16(&mut out, error_code_tag(*code));
             put_bytes(&mut out, message.as_bytes());
+            put_bytes(&mut out, details);
         }
     }
     out
@@ -325,7 +337,12 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
         3 => {
             let code = error_code(cur.u16()?)?;
             let message = cur.string()?;
-            Message::Error { code, message }
+            let details = cur.bytes()?;
+            Message::Error {
+                code,
+                message,
+                details,
+            }
         }
         4 => {
             let channel = Channel(cur.u32()?);
