@@ -27,6 +27,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::auth::{AllowAll, Verifier};
 use crate::{negotiate, ConnId, Registry, RoomId, RoomLog, Store};
 
 /// How many outbound messages may queue for one connection before it is judged
@@ -127,13 +128,27 @@ pub async fn serve(
     serve_with(listener, server, store, ServeConfig::default()).await
 }
 
-/// Serve the wire protocol as [`serve`] does, with an explicit awareness
-/// [`ServeConfig`] instead of the defaults.
+/// Serve the wire protocol as [`serve`] does, with an explicit [`ServeConfig`]
+/// instead of the defaults. Credentials are checked by the dev-mode
+/// [`AllowAll`]; use [`serve_with_verifier`] to supply a real one.
 pub async fn serve_with(
     listener: TcpListener,
     server: ClientId,
     store: Option<Store>,
     config: ServeConfig,
+) -> std::io::Result<()> {
+    serve_with_verifier(listener, server, store, config, Box::new(AllowAll)).await
+}
+
+/// Serve the wire protocol as [`serve_with`] does, authenticating credentials
+/// with `verifier` — the deployment's identity seam (JWT, OIDC, API key). It
+/// derives the actor for both the in-band Auth phase and the upgrade fast path.
+pub async fn serve_with_verifier(
+    listener: TcpListener,
+    server: ClientId,
+    store: Option<Store>,
+    config: ServeConfig,
+    verifier: Box<dyn Verifier + Send>,
 ) -> std::io::Result<()> {
     // Replay the persisted log here, before serving: a corrupt log fails
     // startup rather than panicking inside the detached actor thread and
@@ -158,7 +173,9 @@ pub async fn serve_with(
             .enable_time()
             .build()
             .expect("build registry runtime");
-        rt.block_on(registry_actor(server, rooms, store, config, cmd_rx));
+        rt.block_on(registry_actor(
+            server, rooms, store, config, verifier, cmd_rx,
+        ));
     });
 
     loop {
@@ -189,6 +206,7 @@ async fn registry_actor(
     rooms: Vec<(RoomId, RoomLog)>,
     store: Option<Store>,
     config: ServeConfig,
+    verifier: Box<dyn Verifier + Send>,
     mut cmds: UnboundedReceiver<Cmd>,
 ) {
     // The rooms were validated during startup, so reconstruction can't fail.
@@ -197,6 +215,7 @@ async fn registry_actor(
         hub.attach_store(store);
     }
     let mut reg = Registry::from_hub(hub);
+    reg.set_verifier(verifier);
     reg.set_grace_millis(config.grace.as_millis() as u64);
     let mut peers: HashMap<ConnId, Peer> = HashMap::new();
     // The sweep expires the presence of clients past their grace deadline; its
