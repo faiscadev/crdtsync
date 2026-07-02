@@ -199,16 +199,90 @@ fn an_unchanged_list_is_not_reported() {
 }
 
 #[test]
-fn a_changed_text_reports_the_sequence_differs() {
+fn a_text_insert_reports_a_run_at_its_new_index() {
     let mut d = doc();
     d.transact(|tx| tx.text(b"body").insert(0, "hi"));
     let old = snapshot(&d);
-    d.transact(|tx| tx.text(b"body").insert(2, "!"));
+    d.transact(|tx| tx.text(b"body").insert(2, "!!"));
     assert_eq!(
         diff(&old, &d),
-        vec![Change::Sequence {
+        vec![Change::TextInsert {
             path: p(&[b"body"]),
-            kind: ElementKind::Text,
+            index: 2,
+            text: "!!".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn a_text_delete_reports_a_run_at_its_old_index() {
+    let mut d = doc();
+    d.transact(|tx| tx.text(b"body").insert(0, "hello"));
+    let old = snapshot(&d);
+    d.transact(|tx| tx.text(b"body").delete(1, 3)); // "hello" -> "ho"
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::TextDelete {
+            path: p(&[b"body"]),
+            index: 1,
+            text: "ell".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn a_text_replacement_reports_the_delete_then_the_insert() {
+    let mut d = doc();
+    d.transact(|tx| tx.text(b"body").insert(0, "cat"));
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        tx.text(b"body").delete(1, 1); // "cat" -> "ct"
+        tx.text(b"body").insert(1, "o"); // "ct" -> "cot"
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![
+            Change::TextDelete {
+                path: p(&[b"body"]),
+                index: 1,
+                text: "a".to_string(),
+            },
+            Change::TextInsert {
+                path: p(&[b"body"]),
+                index: 1,
+                text: "o".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn an_unchanged_text_is_not_reported() {
+    let mut d = doc();
+    d.transact(|tx| tx.text(b"body").insert(0, "hi"));
+    let old = snapshot(&d);
+    d.transact(|tx| tx.register(b"other", Scalar::Int(1)));
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::Added {
+            path: p(&[b"other"]),
+            kind: ElementKind::Register,
+        }]
+    );
+}
+
+#[test]
+fn a_text_diff_counts_in_codepoints_not_bytes() {
+    let mut d = doc();
+    d.transact(|tx| tx.text(b"body").insert(0, "café"));
+    let old = snapshot(&d);
+    d.transact(|tx| tx.text(b"body").insert(4, "☕")); // append after 4 codepoints
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::TextInsert {
+            path: p(&[b"body"]),
+            index: 4,
+            text: "☕".to_string(),
         }]
     );
 }
