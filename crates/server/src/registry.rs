@@ -69,6 +69,13 @@ impl Registry {
         self.verifier = verifier;
     }
 
+    /// Verify a credential presented at the transport upgrade, returning the
+    /// server-derived actor, or `None` if refused. The fast path uses this to
+    /// establish auth during accept, so the connection skips the in-band Auth.
+    pub fn verify_credential(&self, credential: &[u8]) -> Option<Vec<u8>> {
+        self.verifier.verify(credential)
+    }
+
     /// Read wall time from `clock` for the reconnect-grace window — a shared
     /// [`ManualClock`](crate::clock::ManualClock) drives it deterministically in
     /// tests.

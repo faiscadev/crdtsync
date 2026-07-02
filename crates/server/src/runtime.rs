@@ -14,12 +14,17 @@
 //! socket closed.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use crdtsync_core::{decode_header, decode_message, encode_message, ClientId, Document, Message};
+use crdtsync_core::{
+    decode_header, decode_message, encode_message, ClientId, Document, ErrorCode, Message,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{channel, unbounded_channel, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{negotiate, ConnId, Registry, RoomId, RoomLog, Store};
@@ -33,14 +38,18 @@ const OUTBOX_CAPACITY: usize = 1024;
 /// the writer in `send`.
 const WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How the server runs the ephemeral-awareness sweep: how long a disconnected
-/// client's presence lingers before it may be cleared, and how often the sweep
-/// checks. The defaults suit interactive use — a 5s grace absorbs brief
-/// reconnects, checked once a second.
+/// Runtime policy: how the ephemeral-awareness sweep runs (how long a
+/// disconnected client's presence lingers, and how often the sweep checks), and
+/// whether a connection with no credential is admitted anonymously. The defaults
+/// suit interactive use — a 5s grace absorbs brief reconnects, checked once a
+/// second — and refuse anonymous connections.
 #[derive(Clone, Copy)]
 pub struct ServeConfig {
     pub grace: std::time::Duration,
     pub sweep_interval: std::time::Duration,
+    /// Admit a credential-less connection by minting `actor = anon:<random>`,
+    /// if the deployment permits it. Off by default.
+    pub anonymous: bool,
 }
 
 impl Default for ServeConfig {
@@ -48,18 +57,35 @@ impl Default for ServeConfig {
         Self {
             grace: std::time::Duration::from_secs(5),
             sweep_interval: std::time::Duration::from_secs(1),
+            anonymous: false,
         }
     }
 }
 
+/// Mint an anonymous actor id, `anon:` followed by 128 random bits in hex, from
+/// system entropy — kept at the transport layer, out of the pure-logic core.
+fn anon_actor() -> Vec<u8> {
+    use std::fmt::Write;
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).expect("system entropy is available");
+    let mut actor = String::from("anon:");
+    for byte in bytes {
+        let _ = write!(actor, "{byte:02x}");
+    }
+    actor.into_bytes()
+}
+
 /// A request to the registry actor from a connection task.
 enum Cmd {
-    /// Open a connection, returning its id and registering its outbound sink
-    /// and a one-shot the actor fires to close a dropped connection.
+    /// Open a connection, registering its outbound sink and a one-shot the actor
+    /// fires to close a dropped connection. Any credential presented at the
+    /// upgrade travels with it; the actor verifies it and replies with the
+    /// [`ConnOutcome`].
     Connect {
         writer: Sender<Message>,
         closer: oneshot::Sender<()>,
-        reply: oneshot::Sender<ConnId>,
+        credential: Option<Vec<u8>>,
+        reply: oneshot::Sender<ConnOutcome>,
     },
     /// Route one inbound message, replying whether the connection stays open.
     Deliver {
@@ -69,6 +95,18 @@ enum Cmd {
     },
     /// Close a connection.
     Disconnect { id: ConnId },
+}
+
+/// What the actor makes of a connect request after weighing any upgrade
+/// credential against the verifier and the anonymous-mode policy.
+enum ConnOutcome {
+    /// The connection is open. `authok` carries the server-derived actor when
+    /// the upgrade established one (fast path or anonymous), which the client is
+    /// told before the message loop; `None` means the client must authenticate
+    /// in band.
+    Open { id: ConnId, authok: Option<Vec<u8>> },
+    /// A credential was presented at the upgrade but the verifier refused it.
+    Refused,
 }
 
 /// The actor's view of a live connection: where to send its outbound messages,
@@ -172,17 +210,43 @@ async fn registry_actor(
                     Cmd::Connect {
                         writer,
                         closer,
+                        credential,
                         reply,
                     } => {
-                        let id = reg.connect();
-                        peers.insert(
-                            id,
-                            Peer {
-                                writer,
-                                closer: Some(closer),
+                        // A credential presented at the upgrade is verified now,
+                        // so a good one skips the in-band Auth phase; a bad one is
+                        // refused. With no credential the connection is anonymous
+                        // if policy allows, else it must authenticate in band.
+                        let outcome = match credential {
+                            Some(cred) => match reg.verify_credential(&cred) {
+                                Some(actor) => ConnOutcome::Open {
+                                    id: reg.connect_authenticated(actor.clone()),
+                                    authok: Some(actor),
+                                },
+                                None => ConnOutcome::Refused,
                             },
-                        );
-                        let _ = reply.send(id);
+                            None if config.anonymous => {
+                                let actor = anon_actor();
+                                ConnOutcome::Open {
+                                    id: reg.connect_authenticated(actor.clone()),
+                                    authok: Some(actor),
+                                }
+                            }
+                            None => ConnOutcome::Open {
+                                id: reg.connect(),
+                                authok: None,
+                            },
+                        };
+                        if let ConnOutcome::Open { id, .. } = &outcome {
+                            peers.insert(
+                                *id,
+                                Peer {
+                                    writer,
+                                    closer: Some(closer),
+                                },
+                            );
+                        }
+                        let _ = reply.send(outcome);
                     }
                     Cmd::Deliver { id, msg, reply } => {
                         let keep = reg.deliver(id, msg);
@@ -228,25 +292,39 @@ fn flush(reg: &mut Registry, peers: &mut HashMap<ConnId, Peer>) {
 
 /// Drive one connection: handshake, then the message loop, then teardown.
 async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
-    let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+    // Read any credential off the upgrade request — the fast-path carrier is the
+    // `Authorization` header. The callback runs during the accept, so it stashes
+    // the bytes for the connect that follows.
+    let carried = Arc::new(Mutex::new(None));
+    let sink = carried.clone();
+    let callback = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+        if let Some(value) = req.headers().get(AUTHORIZATION) {
+            *sink.lock().unwrap() = Some(value.as_bytes().to_vec());
+        }
+        Ok(resp)
+    };
+    let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, callback).await else {
         return;
     };
+    let credential = carried.lock().unwrap().take();
+
     let (mut write, mut read) = ws.split();
 
     let (out, mut out_rx) = channel::<Message>(OUTBOX_CAPACITY);
     let (close_tx, mut close_rx) = oneshot::channel();
-    let (id_tx, id_rx) = oneshot::channel();
+    let (reply_tx, reply_rx) = oneshot::channel();
     if cmds
         .send(Cmd::Connect {
             writer: out.clone(),
             closer: close_tx,
-            reply: id_tx,
+            credential,
+            reply: reply_tx,
         })
         .is_err()
     {
         return;
     }
-    let Ok(id) = id_rx.await else {
+    let Ok(outcome) = reply_rx.await else {
         return;
     };
 
@@ -264,20 +342,45 @@ async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
         }
     });
 
-    // The first frame is the connection header: negotiate the version before
-    // any message, queueing a refusal the client can read before the close.
-    match next_binary(&mut read).await {
-        Some(bytes) => match decode_header(&bytes).map(negotiate) {
-            Ok(Ok(())) => run_messages(id, &mut read, &cmds, &mut close_rx).await,
-            Ok(Err(refusal)) => {
-                let _ = out.send(refusal).await;
+    let id = match outcome {
+        // A credential was presented at the upgrade and refused: report it and
+        // close without ever entering the message loop.
+        ConnOutcome::Refused => {
+            let _ = out
+                .send(Message::Error {
+                    code: ErrorCode::AuthFailed,
+                    message: "credential rejected".to_string(),
+                })
+                .await;
+            None
+        }
+        ConnOutcome::Open { id, authok } => {
+            // The first frame is the connection header: negotiate the version
+            // before any message, queueing a refusal the client can read before
+            // the close. Once negotiated, a fast-path or anonymous connection is
+            // told its server-derived actor without having sent an Auth.
+            match next_binary(&mut read).await {
+                Some(bytes) => match decode_header(&bytes).map(negotiate) {
+                    Ok(Ok(())) => {
+                        if let Some(actor) = authok {
+                            let _ = out.send(Message::AuthOk { actor }).await;
+                        }
+                        run_messages(id, &mut read, &cmds, &mut close_rx).await;
+                    }
+                    Ok(Err(refusal)) => {
+                        let _ = out.send(refusal).await;
+                    }
+                    Err(_) => {}
+                },
+                None => {}
             }
-            Err(_) => {}
-        },
-        None => {}
-    }
+            Some(id)
+        }
+    };
 
-    let _ = cmds.send(Cmd::Disconnect { id });
+    if let Some(id) = id {
+        let _ = cmds.send(Cmd::Disconnect { id });
+    }
     drop(out);
     // Let the writer flush what's queued, but don't let a peer that stopped
     // reading wedge it in `send` and keep the socket half-open.
