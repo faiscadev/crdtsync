@@ -14,23 +14,29 @@
 //! gesture, reverted together. A single-edit method records a one-edit intention;
 //! [`group`](UndoManager::group) records several edits as one.
 //!
-//! This helper covers root-level scalar slots: an integer/bytes/bool Register and
-//! a Counter. Nested paths, lists, and text — whose inverses need element
+//! Edits are addressed by path (see [`crate::path`]), so a slot inside a nested
+//! Map undoes as readily as a root one. This helper covers scalar slots — a
+//! Register and a Counter. List and text edits — whose inverses need element
 //! revival — are layered on in later work.
 
 use crate::doc::Document;
 use crate::op::Op;
-use crate::{Element, Scalar};
+use crate::path;
+use crate::Scalar;
 
 /// The inverse of one recorded edit — what to replay to undo it. Applying an
 /// inverse yields the change that would in turn undo *it*, which is what makes
 /// undo and redo symmetric.
 enum Change {
-    /// Restore a root Register slot to `value`, or delete it if the slot held
-    /// nothing before the edit.
-    Slot { key: Vec<u8>, value: Option<Scalar> },
-    /// Apply this counter delta — one direction to cancel the recorded one.
-    Counter { key: Vec<u8>, inc: u32, dec: u32 },
+    /// Restore the Register slot at `path` to `value`, or delete it if the slot
+    /// held nothing before the edit.
+    Slot {
+        path: Vec<u8>,
+        value: Option<Scalar>,
+    },
+    /// Apply this counter delta at `path` — one direction to cancel the recorded
+    /// one.
+    Counter { path: Vec<u8>, inc: u32, dec: u32 },
 }
 
 /// One undo step: the inverses of a group of edits, in the order they were made.
@@ -54,46 +60,45 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
-    /// Install-or-set a root Register at `key`.
-    pub fn register(&mut self, key: &[u8], value: Scalar) -> &mut Self {
-        let prior = read_register(self.doc, key);
-        self.ops
-            .extend(self.doc.transact(|tx| tx.register(key, value)));
+    /// Install-or-set the Register at `path`.
+    pub fn register(&mut self, path: &[u8], value: Scalar) -> &mut Self {
+        let prior = path::get_register(self.doc, path);
+        self.ops.extend(path::register(self.doc, path, value));
         self.inverses.push(Change::Slot {
-            key: key.to_vec(),
+            path: path.to_vec(),
             value: prior,
         });
         self
     }
 
-    /// Install-or-increment a root Counter at `key`.
-    pub fn inc(&mut self, key: &[u8], amount: u32) -> &mut Self {
-        self.ops.extend(self.doc.transact(|tx| tx.inc(key, amount)));
+    /// Install-or-increment the Counter at `path`.
+    pub fn inc(&mut self, path: &[u8], amount: u32) -> &mut Self {
+        self.ops.extend(path::inc(self.doc, path, amount));
         self.inverses.push(Change::Counter {
-            key: key.to_vec(),
+            path: path.to_vec(),
             inc: 0,
             dec: amount,
         });
         self
     }
 
-    /// Install-or-decrement a root Counter at `key`.
-    pub fn dec(&mut self, key: &[u8], amount: u32) -> &mut Self {
-        self.ops.extend(self.doc.transact(|tx| tx.dec(key, amount)));
+    /// Install-or-decrement the Counter at `path`.
+    pub fn dec(&mut self, path: &[u8], amount: u32) -> &mut Self {
+        self.ops.extend(path::dec(self.doc, path, amount));
         self.inverses.push(Change::Counter {
-            key: key.to_vec(),
+            path: path.to_vec(),
             inc: amount,
             dec: 0,
         });
         self
     }
 
-    /// Tombstone a root Register slot at `key`.
-    pub fn delete(&mut self, key: &[u8]) -> &mut Self {
-        let prior = read_register(self.doc, key);
-        self.ops.extend(self.doc.transact(|tx| tx.delete(key)));
+    /// Tombstone the Register slot at `path`.
+    pub fn delete(&mut self, path: &[u8]) -> &mut Self {
+        let prior = path::get_register(self.doc, path);
+        self.ops.extend(path::delete(self.doc, path));
         self.inverses.push(Change::Slot {
-            key: key.to_vec(),
+            path: path.to_vec(),
             value: prior,
         });
         self
@@ -136,31 +141,31 @@ impl UndoManager {
         ops
     }
 
-    /// Install-or-set a root Register at `key` as its own undo step.
-    pub fn register(&mut self, doc: &mut Document, key: &[u8], value: Scalar) -> Vec<Op> {
+    /// Install-or-set the Register at `path` as its own undo step.
+    pub fn register(&mut self, doc: &mut Document, path: &[u8], value: Scalar) -> Vec<Op> {
         self.group(doc, |b| {
-            b.register(key, value);
+            b.register(path, value);
         })
     }
 
-    /// Install-or-increment a root Counter at `key` as its own undo step.
-    pub fn inc(&mut self, doc: &mut Document, key: &[u8], amount: u32) -> Vec<Op> {
+    /// Install-or-increment the Counter at `path` as its own undo step.
+    pub fn inc(&mut self, doc: &mut Document, path: &[u8], amount: u32) -> Vec<Op> {
         self.group(doc, |b| {
-            b.inc(key, amount);
+            b.inc(path, amount);
         })
     }
 
-    /// Install-or-decrement a root Counter at `key` as its own undo step.
-    pub fn dec(&mut self, doc: &mut Document, key: &[u8], amount: u32) -> Vec<Op> {
+    /// Install-or-decrement the Counter at `path` as its own undo step.
+    pub fn dec(&mut self, doc: &mut Document, path: &[u8], amount: u32) -> Vec<Op> {
         self.group(doc, |b| {
-            b.dec(key, amount);
+            b.dec(path, amount);
         })
     }
 
-    /// Tombstone a root Register slot at `key` as its own undo step.
-    pub fn delete(&mut self, doc: &mut Document, key: &[u8]) -> Vec<Op> {
+    /// Tombstone the Register slot at `path` as its own undo step.
+    pub fn delete(&mut self, doc: &mut Document, path: &[u8]) -> Vec<Op> {
         self.group(doc, |b| {
-            b.delete(key);
+            b.delete(path);
         })
     }
 
@@ -201,50 +206,37 @@ fn apply(doc: &mut Document, intention: Intention) -> (Vec<Op>, Intention) {
 /// Apply one inverse change, returning its ops and its own inverse.
 fn apply_change(doc: &mut Document, change: Change) -> (Vec<Op>, Change) {
     match change {
-        Change::Slot { key, value } => {
-            let current = read_register(doc, &key);
-            let ops = match &value {
-                Some(scalar) => {
-                    let scalar = scalar.clone();
-                    doc.transact(|tx| tx.register(&key, scalar))
-                }
-                None => doc.transact(|tx| tx.delete(&key)),
+        Change::Slot { path, value } => {
+            let current = path::get_register(doc, &path);
+            let ops = match value {
+                Some(scalar) => path::register(doc, &path, scalar),
+                None => path::delete(doc, &path),
             };
             (
                 ops,
                 Change::Slot {
-                    key,
+                    path,
                     value: current,
                 },
             )
         }
-        Change::Counter { key, inc, dec } => {
-            let ops = doc.transact(|tx| {
-                if inc > 0 {
-                    tx.inc(&key, inc);
-                }
-                if dec > 0 {
-                    tx.dec(&key, dec);
-                }
-            });
+        Change::Counter { path, inc, dec } => {
+            let ops = if inc > 0 {
+                path::inc(doc, &path, inc)
+            } else if dec > 0 {
+                path::dec(doc, &path, dec)
+            } else {
+                Vec::new()
+            };
             // Undoing an (inc, dec) application is the mirrored (dec, inc).
             (
                 ops,
                 Change::Counter {
-                    key,
+                    path,
                     inc: dec,
                     dec: inc,
                 },
             )
         }
-    }
-}
-
-/// The current value of a root Register slot, or `None` if the slot is empty or
-/// holds a non-Register element.
-fn read_register(doc: &Document, key: &[u8]) -> Option<Scalar> {
-    match doc.get(key) {
-        Some(Element::Register(reg)) => Some(reg.borrow().read().clone()),
-        _ => None,
     }
 }

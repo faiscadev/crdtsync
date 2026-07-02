@@ -43,6 +43,11 @@ pub fn parse_path(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(keys)
 }
 
+/// Install-or-set a Register holding any scalar at a path.
+pub fn register(doc: &mut Document, path: &[u8], value: Scalar) -> Vec<Op> {
+    emit(doc, path, move |cur, key| cur.register(key, value))
+}
+
 /// Install-or-set an integer Register at a path.
 pub fn register_int(doc: &mut Document, path: &[u8], value: i64) -> Vec<Op> {
     emit(doc, path, |cur, key| cur.register(key, Scalar::Int(value)))
@@ -120,6 +125,14 @@ pub fn get_int(doc: &Document, path: &[u8]) -> Option<i64> {
             Scalar::Int(n) => Some(*n),
             _ => None,
         },
+        _ => None,
+    })
+}
+
+/// Read a Register's scalar at a path, whatever its type.
+pub fn get_register(doc: &Document, path: &[u8]) -> Option<Scalar> {
+    slot(doc, path).and_then(|e| match e {
+        Element::Register(r) => Some(r.borrow().read().clone()),
         _ => None,
     })
 }
