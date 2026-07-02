@@ -73,6 +73,28 @@ fn hello_names_the_client() {
 }
 
 #[test]
+fn auth_presents_the_credential_verbatim() {
+    let session = ClientSession::new(cid(1));
+    match session.auth(b"my-token") {
+        Message::Auth { credential } => assert_eq!(credential, b"my-token"),
+        other => panic!("expected Auth, got {other:?}"),
+    }
+    // The actor is unknown until the server replies AuthOk.
+    assert_eq!(session.actor(), None);
+}
+
+#[test]
+fn authok_records_the_server_derived_actor() {
+    let mut session = ClientSession::new(cid(1));
+    session
+        .receive(Message::AuthOk {
+            actor: b"alice".to_vec(),
+        })
+        .unwrap();
+    assert_eq!(session.actor(), Some(&b"alice"[..]));
+}
+
+#[test]
 fn subscribe_assigns_a_channel_and_requests_from_zero() {
     let mut session = ClientSession::new(cid(1));
     let (channel, msg) = session.subscribe(ROOM_A);

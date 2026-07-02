@@ -47,6 +47,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Channel multiplexing** — one connection multiplexes many rooms via client-assigned `Channel`; server session holds channel→room, registry fans out per peer-channel (#61); SDK-side `ClientSession` holds N rooms, each with its own replica + last-seen seq, routing inbound frames by channel, reconnect via `resume(channel)` (#62). Arc complete.
 
+**Handshake auth** — three-phase Hello → Auth → Subscribe. Wire `Auth`/`AuthOk` messages (#63); server pluggable `Verifier` + session actor gate, dev-mode `AllowAll` default (#64); client `ClientSession::auth`/`actor` (#65). Server derives actor; client never asserts it. Fast path + anonymous-random deferred (see queue).
+
 ---
 
 ## 🚧 In progress
@@ -57,7 +59,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Handshake auth** — three-phase Hello/Auth/Subscribe, pluggable credential verifier, opaque credentials, server-derived `actor_id`. The `AuthFailed` code is already reserved but unused; `Hello` today carries an untrusted peer-asserted `client_id`. → *Networking / Handshake*, *Authentication*. (v0.2)
+- **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window ("keep last N"), time/migration compaction triggers. Compaction retains all tombstones until this lands, so snapshot state grows unbounded. → *Snapshots / Tombstone GC*. (v0.2)
 
 ---
 
@@ -67,7 +69,7 @@ Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized
 
 - **Element-ref value slot** — the other unbuilt payload value type (line 177). Under-specified shape, no v0.1 reservation promise, so deferred until its design settles — not urgent like blob-ref was. → *Internal Data Model*. (foundational, deferred)
 - **Channel multiplexing — remaining** — logical channels currently key on `room`; widen to `(room, branch, zone)` once branches/zones exist. The `Channel` handle already abstracts this (no wire change needed then). → *Networking / Connection*. (v0.2, blocked on branches/zones)
-- **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window, time/migration compaction triggers. Compaction retains all tombstones until this lands. → *Snapshots / Tombstone GC*. (v0.2)
+- **Auth fast path + anonymous mode** — credentials presented at the WS upgrade (HTTP header / subprotocol) validated during accept, skipping the in-band Auth phase (one round trip saved); anonymous-mode toggle deriving `actor = anon:<random>` from Host entropy. Transport glue on top of the landed Auth phase. → *Networking / Handshake*. (v0.2)
 - **Awareness subsystem** — ephemeral presence (cursors/selections/typing), TTL + throttle + auth filtering + reconnect grace. → *Awareness*. (v0.2)
 - **Declarative policy + audit log** — authorization enforcement. → *Authorization*. (v0.2)
 - **Named versions + auto-version triggers**, **UndoManager**, **composition cookbook**, **admin dashboard**, **replay tooling**. → *Versioning*, *Undo/Redo*, *Admin UI*, *Debugging*. (v0.2)
