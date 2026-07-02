@@ -13,6 +13,7 @@ use std::io;
 use crdtsync_core::op::OpId;
 use crdtsync_core::{ClientId, Document, Element, Op};
 
+pub mod acl;
 pub mod auth;
 pub mod authz;
 pub mod clock;
