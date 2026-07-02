@@ -97,6 +97,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **UndoManager (list revival)** — undo of a list insert deletes the node it minted (addressed by stable id, not a drifting index); undo of a list delete revives the removed value as a fresh insert at its place — the op log has no un-tombstone (#98). Backed by `List::live_index`, `ListCursor::delete_id`, `path::list_delete_id`/`list_live_index`. Text revival is the last undo slice.
 
+**UndoManager (text revival)** — undo of a text insert deletes the run's char_ids; undo of a text delete revives the captured substring as a fresh run at its place (#99). Backed by `Text::live_index`, `TextCursor::delete_ids`, `path::text_delete_ids`/`text_run_ids`/`text_live_index`. Core undo now spans every value type (scalar / counter / list / text, root or nested); only the SDK surface remains.
+
 ---
 
 ## 🚧 In progress
@@ -123,7 +125,7 @@ Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized
 - **Awareness timed-TTL + throttle** — per-entry auto-expire-after-silence (timed TTL, distinct from the session TTL the grace sweep already handles) + removal broadcast (reuse `AwarenessClear`), and server-side throttle/coalesce of high-frequency entries (cursor/mouse). **Schema-gated:** ARCHITECTURE §Awareness declares an entry's TTL and throttle interval in the schema file (line 708), and the schema layer is unbuilt — so these trigger values have no home until it lands. The clock seam (#71) + periodic sweep (#72) are ready to enforce them. → *Awareness / Schema*. (v0.2, blocked on schema)
 - **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window ("keep last N"), time/migration compaction triggers. **Design depth (needs a careful pass before building):** snapshots are anchor-based (a tombstone anchors surviving nodes), so GC must be leaf-only (drop a below-watermark tombstone only when no surviving node parents off it), not a flat "discard older than watermark"; and the watermark is a server-seq while tombstones are lamport-`Stamp`-keyed with no client-ack protocol today — the correlation + ack semantics are unspecified. Gate any build on the convergence property harness (invariant: GC preserves materialized state). → *Snapshots / Tombstone GC*. (v0.2, needs design)
 - **Declarative policy + audit log** — authorization enforcement. → *Authorization*. (v0.2)
-- **UndoManager — remaining** — scalar undo (#94), grouping (#95), nested paths (#97), list revival (#98) landed. Next slices: text revival (undo of a text insert = delete the run; undo of a text delete = re-insert the captured substring), then the SDK surface. → *Undo/Redo*. (v0.2)
+- **UndoManager — SDK surface** — core undo is complete: scalar (#94), grouping (#95), nested paths (#97), list revival (#98), text revival (#99) cover every value type at root or nested. Remaining: expose `UndoManager` through FFI + Python/Go/wasm (a per-client handle wrapping a `Document`, with undo/redo/group + can_undo/can_redo). → *Undo/Redo*. (v0.2)
 - **Auto-version triggers** (engine-event/schedule-driven version creation — needs the event hooks), **admin dashboard**, **replay tooling**. → *Versioning*, *Admin UI*, *Debugging*. (v0.2) _(composition cookbook landed #93)_
 - **Blob refs (full)** — refs in ops, bytes in a content-addressable store. → *Binary Blobs*. (v0.5)
 - **XmlElement / marks / schema / invariant repair / zones**. → *CRDT Model*, *Marks*, *Schema*, *Invariant Repair*, *Authorization/zones*. (v0.5)

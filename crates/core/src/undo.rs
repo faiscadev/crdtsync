@@ -16,9 +16,9 @@
 //!
 //! Edits are addressed by path (see [`crate::path`]), so a slot inside a nested
 //! Map undoes as readily as a root one. This helper covers scalar slots — a
-//! Register and a Counter — and List items: undo of an insert deletes the node
-//! it minted, and undo of a delete revives the removed value as a fresh insert
-//! (the op log has no un-tombstone). Text edits are layered on in later work.
+//! Register and a Counter — and the sequence types, List and Text: undo of an
+//! insert deletes the node(s) it minted, and undo of a delete revives the
+//! removed value as a fresh insert (the op log has no un-tombstone).
 
 use crate::doc::Document;
 use crate::op::{Op, OpKind};
@@ -49,6 +49,22 @@ enum Change {
         index: usize,
         value: Vec<u8>,
     },
+    /// Tombstone the text codepoints `ids` at `path` — the inverse of an insert.
+    TextDeleteRun { path: Vec<u8>, ids: Vec<Stamp> },
+    /// Re-insert `s` at codepoint `index` in the text at `path` — the inverse of
+    /// a delete. As with a list, revival is a fresh insert with new char_ids.
+    TextInsertRun {
+        path: Vec<u8>,
+        index: usize,
+        s: String,
+    },
+}
+
+/// The live substring of `count` codepoints from `index` in the text at `path`,
+/// so a delete can capture what it removed for a later revival.
+fn text_substring(doc: &Document, path: &[u8], index: usize, count: usize) -> Option<String> {
+    let full = path::text_get(doc, path)?;
+    Some(full.chars().skip(index).take(count).collect())
 }
 
 /// The id of the node a `ListInsert` op minted — its stamp — for the last insert
@@ -155,6 +171,43 @@ impl Batch<'_> {
         self.ops.extend(ops);
         self
     }
+
+    /// Insert `s` at codepoint `index` in the Text at `path`.
+    pub fn text_insert(&mut self, path: &[u8], index: usize, s: &str) -> &mut Self {
+        let ops = path::text_insert(self.doc, path, index, s);
+        let count = s.chars().count();
+        if !ops.is_empty() && count > 0 {
+            let ids = path::text_run_ids(self.doc, path, index, count);
+            if !ids.is_empty() {
+                self.inverses.push(Change::TextDeleteRun {
+                    path: path.to_vec(),
+                    ids,
+                });
+            }
+        }
+        self.ops.extend(ops);
+        self
+    }
+
+    /// Tombstone `count` codepoints from `index` in the Text at `path`, capturing
+    /// them so an undo can revive the substring.
+    pub fn text_delete(&mut self, path: &[u8], index: usize, count: usize) -> &mut Self {
+        let ids = path::text_run_ids(self.doc, path, index, count);
+        if ids.is_empty() {
+            return self;
+        }
+        let s = text_substring(self.doc, path, index, ids.len()).unwrap_or_default();
+        let ops = path::text_delete(self.doc, path, index, count);
+        if !ops.is_empty() {
+            self.inverses.push(Change::TextInsertRun {
+                path: path.to_vec(),
+                index,
+                s,
+            });
+        }
+        self.ops.extend(ops);
+        self
+    }
 }
 
 impl UndoManager {
@@ -239,6 +292,33 @@ impl UndoManager {
     pub fn list_delete(&mut self, doc: &mut Document, path: &[u8], index: usize) -> Vec<Op> {
         self.group(doc, |b| {
             b.list_delete(path, index);
+        })
+    }
+
+    /// Insert `s` at codepoint `index` in the Text at `path` as its own undo step.
+    pub fn text_insert(
+        &mut self,
+        doc: &mut Document,
+        path: &[u8],
+        index: usize,
+        s: &str,
+    ) -> Vec<Op> {
+        self.group(doc, |b| {
+            b.text_insert(path, index, s);
+        })
+    }
+
+    /// Tombstone `count` codepoints from `index` in the Text at `path` as its own
+    /// undo step.
+    pub fn text_delete(
+        &mut self,
+        doc: &mut Document,
+        path: &[u8],
+        index: usize,
+        count: usize,
+    ) -> Vec<Op> {
+        self.group(doc, |b| {
+            b.text_delete(path, index, count);
         })
     }
 
@@ -327,6 +407,31 @@ fn apply_change(doc: &mut Document, change: Change) -> (Vec<Op>, Change) {
             match inserted_list_id(&ops) {
                 Some(id) => (ops, Change::ListDeleteNode { path, id }),
                 None => (ops, Change::ListInsertValue { path, index, value }),
+            }
+        }
+        Change::TextDeleteRun { path, ids } => {
+            // Capture the run's live extent so the mirror can revive it in place.
+            let mut live: Vec<usize> = ids
+                .iter()
+                .filter_map(|id| path::text_live_index(doc, &path, *id))
+                .collect();
+            live.sort_unstable();
+            let index = live.first().copied();
+            let s = index.and_then(|i| text_substring(doc, &path, i, live.len()));
+            let ops = path::text_delete_ids(doc, &path, &ids);
+            match (index, s) {
+                (Some(index), Some(s)) => (ops, Change::TextInsertRun { path, index, s }),
+                // Nothing live to delete: the inverse is inert.
+                _ => (ops, Change::TextDeleteRun { path, ids }),
+            }
+        }
+        Change::TextInsertRun { path, index, s } => {
+            let ops = path::text_insert(doc, &path, index, &s);
+            let ids = path::text_run_ids(doc, &path, index, s.chars().count());
+            if ids.is_empty() {
+                (ops, Change::TextInsertRun { path, index, s })
+            } else {
+                (ops, Change::TextDeleteRun { path, ids })
             }
         }
     }

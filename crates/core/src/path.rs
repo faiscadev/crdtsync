@@ -140,6 +140,40 @@ pub fn text_delete(doc: &mut Document, path: &[u8], index: usize, count: usize) 
     })
 }
 
+/// Tombstone the codepoints with these char_ids in the Text at a path,
+/// addressing them by stable id rather than a shifting index. Inert if the text
+/// or every id is absent.
+pub fn text_delete_ids(doc: &mut Document, path: &[u8], ids: &[Stamp]) -> Vec<Op> {
+    if !slot_ok(
+        doc,
+        path,
+        |e| matches!(e, Element::Text(t) if ids.iter().any(|id| t.borrow().contains(*id))),
+    ) {
+        return Vec::new();
+    }
+    let ids = ids.to_vec();
+    emit(doc, path, move |cur, key| cur.text(key).delete_ids(&ids))
+}
+
+/// The char_ids of up to `count` live codepoints from `index` in the Text at a
+/// path — the run just inserted there, so an inverse can delete exactly it.
+pub fn text_run_ids(doc: &Document, path: &[u8], index: usize, count: usize) -> Vec<Stamp> {
+    slot(doc, path)
+        .and_then(|e| match e {
+            Element::Text(t) => Some(t.borrow().node_ids(index, count)),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The live codepoint index of char_id `id` in the Text at a path, if live.
+pub fn text_live_index(doc: &Document, path: &[u8], id: Stamp) -> Option<usize> {
+    slot(doc, path).and_then(|e| match e {
+        Element::Text(t) => t.borrow().live_index(id),
+        _ => None,
+    })
+}
+
 /// Read an integer Register at a path.
 pub fn get_int(doc: &Document, path: &[u8]) -> Option<i64> {
     slot(doc, path).and_then(|e| match e {
