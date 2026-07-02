@@ -240,3 +240,37 @@ fn concurrent_edits_from_two_clients_all_land() {
     assert_eq!(int(h.get(ROOM, b"b")), 2);
     assert_eq!(h.seq(ROOM), 2);
 }
+
+// --- atomic transactions ---
+
+#[test]
+fn ingest_preserves_and_fans_out_a_whole_atomic_transaction() {
+    let mut h = hub();
+    let mut d = doc(1);
+    let batch = d.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.register(b"y", Scalar::Int(2));
+    });
+    assert_eq!(batch.len(), 2);
+
+    // The hub logs and applies the whole group; the returned batch still carries
+    // the transaction tags, so it fans out to peers as one atomic group.
+    let applied = ingest(&mut h, ROOM, batch);
+    assert_eq!(applied.len(), 2);
+    assert!(applied.iter().all(|op| op.tx.is_some()));
+    let id0 = applied[0].tx.clone().unwrap().id;
+    assert!(applied.iter().all(|op| op.tx.as_ref().unwrap().id == id0));
+    assert_eq!(int(h.get(ROOM, b"x")), 1);
+    assert_eq!(int(h.get(ROOM, b"y")), 2);
+
+    // A fresh subscriber catching up from zero receives every member, so it can
+    // commit the transaction atomically.
+    let delta = ops(h.catch_up(ROOM, 0));
+    assert_eq!(delta.len(), 2);
+    let mut peer = doc(2);
+    for op in &delta {
+        peer.apply(op);
+    }
+    assert_eq!(int(peer.get(b"x")), 1);
+    assert_eq!(int(peer.get(b"y")), 2);
+}

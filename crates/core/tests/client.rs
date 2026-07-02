@@ -559,3 +559,50 @@ fn a_client_only_message_from_the_server_is_a_violation() {
         Err(ClientError::UnexpectedMessage(_))
     ));
 }
+
+// --- atomic transactions over the wire ---
+
+#[test]
+fn atomic_edit_tags_its_ops_as_one_transaction() {
+    let mut session = ClientSession::new(cid(1));
+    let (ch, _) = session.subscribe(ROOM_A);
+    let ops = ops_of(
+        session
+            .atomic_edit(ch, |tx| {
+                tx.register(b"first", Scalar::Int(1));
+                tx.register(b"last", Scalar::Int(2));
+            })
+            .expect("held channel"),
+    );
+    assert_eq!(ops.len(), 2);
+    let tx0 = ops[0].tx.clone().expect("tagged");
+    assert_eq!(ops[1].tx.clone().expect("tagged").id, tx0.id);
+    assert!(ops.iter().all(|o| o.tx.as_ref().unwrap().count == 2));
+}
+
+#[test]
+fn a_peer_folds_in_an_atomic_edit_all_or_nothing() {
+    let mut a = ClientSession::new(cid(1));
+    let mut b = ClientSession::new(cid(2));
+    let (ca, _) = a.subscribe(ROOM_A);
+    let (cb, _) = b.subscribe(ROOM_A);
+
+    let ops = ops_of(
+        a.atomic_edit(ca, |tx| {
+            tx.register(b"x", Scalar::Int(1));
+            tx.register(b"y", Scalar::Int(2));
+        })
+        .expect("held channel"),
+    );
+
+    // Deliver only the first member: the peer shows none of the transaction.
+    b.receive(ops_msg(cb, vec![ops[0].clone()])).unwrap();
+    let doc = b.document(cb).expect("room");
+    assert!(doc.get(b"x").is_none() && doc.get(b"y").is_none());
+
+    // The remaining member commits the whole transaction.
+    b.receive(ops_msg(cb, vec![ops[1].clone()])).unwrap();
+    let doc = b.document(cb).expect("room");
+    assert_eq!(int(doc, b"x"), 1);
+    assert_eq!(int(doc, b"y"), 2);
+}
