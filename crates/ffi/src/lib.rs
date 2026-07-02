@@ -383,6 +383,40 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
     .unwrap_or(-1)
 }
 
+/// Serialize the whole replica to a canonical snapshot. Empty on a bad handle.
+///
+/// # Safety
+/// `doc` must be a handle returned by a constructor and not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_encode_state(doc: *const CrdtDoc) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return CrdtBuf::empty();
+        }
+        CrdtBuf::from_vec((*doc).doc.encode_state())
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Open a document from a snapshot produced by [`crdtsync_doc_encode_state`].
+/// Null on a malformed snapshot or bad input, never a panic across the frame.
+///
+/// # Safety
+/// `bytes`/`len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_decode_state(bytes: *const u8, len: usize) -> *mut CrdtDoc {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(raw) = as_slice(bytes, len) else {
+            return std::ptr::null_mut();
+        };
+        match Document::decode_state(raw) {
+            Ok(doc) => Box::into_raw(Box::new(CrdtDoc { doc })),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
 /// Marshal a path-addressed edit: delegate the navigation to `run`, encode the
 /// emitted ops, and never let a panic cross the C frame.
 unsafe fn edit<F>(doc: *mut CrdtDoc, path: *const u8, path_len: usize, run: F) -> CrdtBuf

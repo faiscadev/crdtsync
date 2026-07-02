@@ -194,6 +194,19 @@ int32_t crdtsync_doc_text_get(const CrdtDoc *doc,
 // `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`].
 int32_t crdtsync_doc_apply(CrdtDoc *doc, const uint8_t *bytes, uintptr_t len);
 
+// Serialize the whole replica to a canonical snapshot. Empty on a bad handle.
+//
+// # Safety
+// `doc` must be a handle returned by a constructor and not yet freed.
+CrdtBuf crdtsync_doc_encode_state(const CrdtDoc *doc);
+
+// Open a document from a snapshot produced by [`crdtsync_doc_encode_state`].
+// Null on a malformed snapshot or bad input, never a panic across the frame.
+//
+// # Safety
+// `bytes`/`len` follow [`as_slice`].
+CrdtDoc *crdtsync_doc_decode_state(const uint8_t *bytes, uintptr_t len);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

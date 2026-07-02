@@ -29,6 +29,20 @@ impl WasmDocument {
         })
     }
 
+    /// Serialize the whole replica to a canonical snapshot.
+    #[wasm_bindgen(js_name = encodeState)]
+    pub fn encode_state(&self) -> Vec<u8> {
+        self.inner.encode_state()
+    }
+
+    /// Open a document from a snapshot produced by [`WasmDocument::encode_state`].
+    #[wasm_bindgen(js_name = decodeState)]
+    pub fn decode_state(state: &[u8]) -> Result<WasmDocument, JsError> {
+        Document::decode_state(state)
+            .map(|inner| WasmDocument { inner })
+            .map_err(|e| JsError::new(&format!("{e:?}")))
+    }
+
     /// Encode a path from its keys.
     #[wasm_bindgen(js_name = encodePath)]
     pub fn encode_path(keys: Vec<js_sys::Uint8Array>) -> Vec<u8> {
