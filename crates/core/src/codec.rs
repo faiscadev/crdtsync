@@ -10,7 +10,7 @@ use crate::clientid::ClientId;
 use crate::elementid::ElementId;
 use crate::list::{Anchor, Side};
 use crate::op::{Op, OpId, OpKind, TxId};
-use crate::scalar::Scalar;
+use crate::scalar::{BlobRef, Scalar};
 use crate::stamp::Stamp;
 
 /// Why a byte string could not be decoded into an op.
@@ -118,6 +118,19 @@ pub(crate) fn put_scalar(out: &mut Vec<u8>, s: &Scalar) {
         Scalar::Bytes(b) => {
             put_u8(out, 3);
             put_bytes(out, b);
+        }
+        Scalar::BlobRef(r) => {
+            put_u8(out, 4);
+            out.extend_from_slice(&r.id);
+            put_bytes(out, r.mime.as_bytes());
+            put_u64(out, r.size);
+            match &r.inline {
+                None => put_u8(out, 0),
+                Some(bytes) => {
+                    put_u8(out, 1);
+                    put_bytes(out, bytes);
+                }
+            }
         }
     }
 }
@@ -325,6 +338,27 @@ impl<'a> Cursor<'a> {
             },
             2 => Ok(Scalar::Int(self.i64()?)),
             3 => Ok(Scalar::Bytes(self.bytes()?)),
+            4 => {
+                let id = self.array16()?;
+                let mime = self.string()?;
+                let size = self.u64()?;
+                let inline = match self.u8()? {
+                    0 => None,
+                    1 => Some(self.bytes()?),
+                    tag => {
+                        return Err(DecodeError::BadTag {
+                            what: "blob inline",
+                            tag,
+                        })
+                    }
+                };
+                Ok(Scalar::BlobRef(BlobRef {
+                    id,
+                    mime,
+                    size,
+                    inline,
+                }))
+            }
             tag => Err(DecodeError::BadTag {
                 what: "scalar",
                 tag,

@@ -8,6 +8,10 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 ---
 
+## 2026-07-02 · #60 · blob-ref reserved as a `Scalar` variant, not a separate `Value` enum
+**Changed:** the blob-ref value slot is `Scalar::BlobRef(BlobRef)` (value-codec tag 4), sitting alongside the other leaf values, rather than a distinct `Value = Scalar | BlobRef | ElementRef` payload type. `BlobRef { id: [u8;16], mime, size, inline: Option<Vec<u8>> }`. Slot-only: the blob store, dedup, presigned fetch, and GC still land v0.5. The element-ref value type is left unreserved (no v0.1 promise, shape under-specified).
+**Why:** a blob ref merges as an LWW replace on assignment — exactly a leaf value's semantics — so it is the true analog of the `tx` slot reservation: one codec tag, near-zero churn, no refactor of `RegisterSet`/`MapSet`/`ListInsert`. ARCHITECTURE's scalar/blob-ref/element-ref taxonomy distinguishes *merge semantics*, which `Scalar` already models; it is not a mandate for a distinct Rust enum. Trade-off: `Scalar` is documented "no id" in the CRDT-identity sense — `BlobRef`'s handle is opaque payload data (like `Bytes`), carries no CRDT identity, and does not merge or displace, so it still reads as a value, not an entity.
+
 ## 2026-07-02 · rewrite · core language is Rust, not C
 **Changed:** the core and server are implemented in Rust — a downward `Rc<RefCell<T>>` value graph, `#![forbid(unsafe_code)]`, Miri-gated — not C. Export surface is unchanged: a stable C ABI (cbindgen) for native SDKs + wasm (wasm-bindgen) for the browser. Host seam is `entropy()` + `now()` only; `std`, not `no_std`.
 **Why:** the C core's manual refcount/arena lifetime management was error-prone ("memory management was hell"); Rust removes the use-after-free / double-free / aliasing hazard class at compile time while keeping the same portability. Decided at the cheapest moment — only the primitives existed.

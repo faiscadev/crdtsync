@@ -43,6 +43,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **v0.2 wire / client** — client session / reconnect driver `core::client::ClientSession` (#59).
 
+**Forward-compat reservations** — blob-ref value slot `Scalar::BlobRef` reserved in the op envelope + codec (#60).
+
 ---
 
 ## 🚧 In progress
@@ -61,7 +63,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized slice `cs-next` has broken out so far; when it drains, `cs-next` cuts the next slice from ARCHITECTURE. Order = dependency → foundational/forward-compat → roadmap/value. Each item cites the ARCHITECTURE section it derives from.
 
-- **Blob-ref envelope slot** — reserve the blob-ref slot in the op envelope now; the `tx` slot was reserved but blob was missed (inconsistent, likely oversight). Small; jumps ahead of features. → *Binary Blobs*, *Internal Data Model*. (foundational)
+- **Element-ref value slot** — the other unbuilt payload value type (line 177). Under-specified shape, no v0.1 reservation promise, so deferred until its design settles — not urgent like blob-ref was. → *Internal Data Model*. (foundational, deferred)
 - **Handshake auth** — three-phase Hello/Auth/Subscribe, pluggable credential verifier, opaque credentials, server-derived `actor_id`. → *Networking / Handshake*, *Authentication*. (v0.2)
 - **Channel multiplexing** — logical channels per `(room, branch, zone)` over one WS (Next above is step one). → *Networking / Connection*. (v0.2)
 - **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window, time/migration compaction triggers. Compaction retains all tombstones until this lands. → *Snapshots / Tombstone GC*. (v0.2)
