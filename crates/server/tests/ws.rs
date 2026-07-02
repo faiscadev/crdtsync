@@ -100,6 +100,20 @@ async fn join(url: &str, client: u8) -> Ws {
         },
     )
     .await;
+    // The dev-mode verifier accepts any credential and echoes it as the actor.
+    send(
+        &mut ws,
+        &Message::Auth {
+            credential: b"cred".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv(&mut ws).await,
+        Message::AuthOk {
+            actor: b"cred".to_vec(),
+        }
+    );
     send(
         &mut ws,
         &Message::Subscribe {

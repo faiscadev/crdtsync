@@ -13,10 +13,12 @@ use std::io;
 use crdtsync_core::op::OpId;
 use crdtsync_core::{ClientId, Document, Element, Op};
 
+pub mod auth;
 pub mod registry;
 pub mod runtime;
 pub mod session;
 pub mod store;
+pub use auth::{AllowAll, Verifier};
 pub use registry::{ConnId, Registry};
 pub use session::{negotiate, step, Response, Session};
 pub use store::{RoomLog, Snapshot, Store};

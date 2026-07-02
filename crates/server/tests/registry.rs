@@ -41,15 +41,28 @@ fn sub(room: &[u8]) -> Message {
     }
 }
 
-/// Bring a connection up to a subscribed room, discarding the catch-up reply.
-fn join(r: &mut Registry, client: u8, room: &[u8]) -> ConnId {
-    let id = r.connect();
+/// Say Hello and authenticate (the dev verifier accepts any credential),
+/// discarding the AuthOk reply.
+fn auth(r: &mut Registry, id: ConnId, client: u8) {
     assert!(r.deliver(
         id,
         Message::Hello {
             client: cid(client)
         }
     ));
+    assert!(r.deliver(
+        id,
+        Message::Auth {
+            credential: b"cred".to_vec()
+        }
+    ));
+    r.take_outbox(id);
+}
+
+/// Bring a connection up to a subscribed room, discarding the catch-up reply.
+fn join(r: &mut Registry, client: u8, room: &[u8]) -> ConnId {
+    let id = r.connect();
+    auth(r, id, client);
     assert!(r.deliver(id, sub(room)));
     r.take_outbox(id);
     id
@@ -77,7 +90,7 @@ fn connections_get_distinct_ids() {
 fn subscribe_queues_the_catch_up_reply() {
     let mut r = registry();
     let a = r.connect();
-    r.deliver(a, Message::Hello { client: cid(1) });
+    auth(&mut r, a, 1);
     r.deliver(a, sub(ROOM));
     assert_eq!(r.take_outbox(a), vec![ops_msg(Vec::new())]);
 }
@@ -125,7 +138,7 @@ fn a_late_joiner_catches_up_on_prior_ops() {
 
     // A connection that subscribes afterward draws the room's history.
     let b = r.connect();
-    r.deliver(b, Message::Hello { client: cid(2) });
+    auth(&mut r, b, 2);
     r.deliver(b, sub(ROOM));
     assert_eq!(r.take_outbox(b), vec![ops_msg(ops)]);
 }
