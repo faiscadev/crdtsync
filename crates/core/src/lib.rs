@@ -27,6 +27,7 @@ pub mod text;
 
 pub mod client;
 pub mod codec;
+pub mod diff;
 pub mod doc;
 pub mod op;
 pub mod path;

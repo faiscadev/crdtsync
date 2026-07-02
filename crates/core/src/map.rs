@@ -220,6 +220,19 @@ impl Map {
         self.slots.values().filter(|e| !e.tombstone).count()
     }
 
+    /// The live slot keys, sorted, for deterministic traversal — the order a
+    /// structural diff or an ordered walk reports slots in.
+    pub fn keys(&self) -> Vec<Vec<u8>> {
+        let mut keys: Vec<Vec<u8>> = self
+            .slots
+            .iter()
+            .filter(|(_, e)| !e.tombstone)
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// Slot handle for a live key, else `None`.
     pub fn get(&self, key: &[u8]) -> Option<Element> {
         self.slots
