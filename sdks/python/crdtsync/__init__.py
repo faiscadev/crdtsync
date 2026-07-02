@@ -17,7 +17,7 @@ import platform
 import struct
 from typing import List, Optional, Tuple
 
-__all__ = ["Client", "Document", "Undo", "encode_path"]
+__all__ = ["Client", "Document", "Undo", "diff", "encode_path"]
 
 Path = List[bytes]
 
@@ -83,6 +83,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_decode_state, [cbytes, size], doc)
     sig(lib.crdtsync_doc_begin_atomic, [doc], None)
     sig(lib.crdtsync_doc_commit_atomic, [doc], buf)
+    sig(lib.crdtsync_diff, [cbytes, size, cbytes, size], buf)
 
     # undo / redo
     undo = c.c_void_p
@@ -183,6 +184,123 @@ def _take_buf(buf: _CrdtBuf) -> bytes:
     data = ctypes.string_at(buf.ptr, buf.len)
     _LIB.crdtsync_buf_free(buf)
     return data
+
+
+_KINDS = ("scalar", "register", "counter", "map", "list", "text")
+
+
+class _Reader:
+    """Reads the change-list byte format the core emits (little-endian)."""
+
+    def __init__(self, data: bytes):
+        self._d = data
+        self._i = 0
+
+    def _take(self, n: int) -> bytes:
+        end = self._i + n
+        if end > len(self._d):
+            raise ValueError("truncated change list")
+        chunk = self._d[self._i : end]
+        self._i = end
+        return chunk
+
+    def u8(self) -> int:
+        return self._take(1)[0]
+
+    def u32(self) -> int:
+        return int.from_bytes(self._take(4), "little")
+
+    def u64(self) -> int:
+        return int.from_bytes(self._take(8), "little")
+
+    def i64(self) -> int:
+        return int.from_bytes(self._take(8), "little", signed=True)
+
+    def blob(self) -> bytes:
+        return self._take(self.u32())
+
+    def kind(self) -> str:
+        tag = self.u8()
+        if tag >= len(_KINDS):
+            raise ValueError(f"bad element kind {tag}")
+        return _KINDS[tag]
+
+    def scalar(self) -> dict:
+        """A scalar as a tagged ``{"t", "v"}`` dict, mirroring the wasm shape."""
+        start = self._i
+        tag = self.u8()
+        if tag == 0:
+            return {"t": "null"}
+        if tag == 1:
+            return {"t": "bool", "v": self.u8() != 0}
+        if tag == 2:
+            return {"t": "int", "v": self.i64()}
+        if tag == 3:
+            return {"t": "bytes", "v": self.blob()}
+        if tag == 4:
+            self._take(16)  # id
+            self.blob()  # mime
+            self.u64()  # size
+            if self.u8() == 1:
+                self.blob()  # inline bytes
+            return {"t": "blobref", "v": self._d[start : self._i]}
+        raise ValueError(f"bad scalar tag {tag}")
+
+    def items(self) -> list:
+        out = []
+        for _ in range(self.u32()):
+            tag = self.u8()
+            if tag == 0:
+                out.append({"scalar": self.scalar()})
+            elif tag == 1:
+                out.append({"kind": self.kind()})
+            else:
+                raise ValueError(f"bad diff item tag {tag}")
+        return out
+
+
+def _decode_changes(data: bytes) -> list:
+    r = _Reader(data)
+    out = []
+    for _ in range(r.u32()):
+        tag = r.u8()
+        if tag == 0:
+            out.append({"op": "add", "path": r.blob(), "kind": r.kind()})
+        elif tag == 1:
+            out.append({"op": "remove", "path": r.blob(), "kind": r.kind()})
+        elif tag == 2:
+            out.append({"op": "value", "path": r.blob(), "old": r.scalar(), "new": r.scalar()})
+        elif tag == 3:
+            out.append({"op": "counter", "path": r.blob(), "old": r.i64(), "new": r.i64()})
+        elif tag == 4:
+            out.append({"op": "listInsert", "path": r.blob(), "index": r.u64(), "items": r.items()})
+        elif tag == 5:
+            out.append({"op": "listDelete", "path": r.blob(), "index": r.u64(), "items": r.items()})
+        elif tag == 6:
+            out.append(
+                {"op": "textInsert", "path": r.blob(), "index": r.u64(), "text": r.blob().decode("utf-8")}
+            )
+        elif tag == 7:
+            out.append(
+                {"op": "textDelete", "path": r.blob(), "index": r.u64(), "text": r.blob().decode("utf-8")}
+            )
+        else:
+            raise ValueError(f"bad change tag {tag}")
+    return out
+
+
+def diff(old_state: bytes, new_state: bytes) -> list:
+    """Diff two snapshots — each a state buffer from ``Document.encode_state``, a
+    named version, or an exported room — into a list of structural change dicts
+    turning the old state into the new. Each change has an ``op`` tag, a ``path``
+    (bytes), and its variant's fields; a scalar is a tagged ``{"t", "v"}`` dict.
+    Raises ``ValueError`` on a malformed snapshot."""
+    data = _take_buf(
+        _LIB.crdtsync_diff(old_state, len(old_state), new_state, len(new_state))
+    )
+    if not data:
+        raise ValueError("malformed snapshot")
+    return _decode_changes(data)
 
 
 class Document:
