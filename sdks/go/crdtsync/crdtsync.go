@@ -584,3 +584,193 @@ func (c *Client) VersionState(channel uint32, name []byte) ([]byte, bool) {
 	}
 	return takeBuf(out), true
 }
+
+// --- schema-aware diff ---
+
+// Scalar is a diff's tagged scalar value: T names the kind and the matching
+// field holds it. Bytes also carries a BlobRef's opaque encoded bytes.
+type Scalar struct {
+	T     string // "null" | "bool" | "int" | "bytes" | "blobref"
+	Bool  bool
+	Int   int64
+	Bytes []byte
+}
+
+// Item is a List item in a diff: either an inline scalar or a composite's kind.
+type Item struct {
+	Scalar *Scalar
+	Kind   string
+}
+
+// Change is one structural change between two snapshots. Op names the variant;
+// which fields it populates follows Op — "add"/"remove": Kind; "value": Old/New;
+// "counter": OldInt/NewInt; "listInsert"/"listDelete": Index/Items;
+// "textInsert"/"textDelete": Index/Text.
+type Change struct {
+	Op     string
+	Path   []byte
+	Kind   string
+	Old    *Scalar
+	New    *Scalar
+	OldInt int64
+	NewInt int64
+	Index  uint
+	Items  []Item
+	Text   string
+}
+
+var kindNames = [...]string{"scalar", "register", "counter", "map", "list", "text"}
+
+// changeReader reads the change-list byte format the core emits (little-endian).
+type changeReader struct {
+	d   []byte
+	i   int
+	err error
+}
+
+func (r *changeReader) take(n int) []byte {
+	if r.err != nil {
+		return nil
+	}
+	if r.i+n > len(r.d) {
+		r.err = errors.New("truncated change list")
+		return nil
+	}
+	b := r.d[r.i : r.i+n]
+	r.i += n
+	return b
+}
+
+func (r *changeReader) u8() byte {
+	b := r.take(1)
+	if b == nil {
+		return 0
+	}
+	return b[0]
+}
+
+func (r *changeReader) u32() uint32 {
+	b := r.take(4)
+	if b == nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(b)
+}
+
+func (r *changeReader) u64() uint64 {
+	b := r.take(8)
+	if b == nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(b)
+}
+
+func (r *changeReader) blob() []byte {
+	return append([]byte(nil), r.take(int(r.u32()))...)
+}
+
+func (r *changeReader) kind() string {
+	t := r.u8()
+	if int(t) >= len(kindNames) {
+		if r.err == nil {
+			r.err = errors.New("bad element kind")
+		}
+		return ""
+	}
+	return kindNames[t]
+}
+
+func (r *changeReader) scalar() *Scalar {
+	start := r.i
+	switch r.u8() {
+	case 0:
+		return &Scalar{T: "null"}
+	case 1:
+		return &Scalar{T: "bool", Bool: r.u8() != 0}
+	case 2:
+		return &Scalar{T: "int", Int: int64(r.u64())}
+	case 3:
+		return &Scalar{T: "bytes", Bytes: r.blob()}
+	case 4:
+		r.take(16) // id
+		r.blob()   // mime
+		r.u64()    // size
+		if r.u8() == 1 {
+			r.blob() // inline
+		}
+		return &Scalar{T: "blobref", Bytes: append([]byte(nil), r.d[start:r.i]...)}
+	default:
+		if r.err == nil {
+			r.err = errors.New("bad scalar tag")
+		}
+		return &Scalar{}
+	}
+}
+
+func (r *changeReader) items() []Item {
+	n := int(r.u32())
+	items := make([]Item, 0, n)
+	for k := 0; k < n && r.err == nil; k++ {
+		switch r.u8() {
+		case 0:
+			items = append(items, Item{Scalar: r.scalar()})
+		case 1:
+			items = append(items, Item{Kind: r.kind()})
+		default:
+			if r.err == nil {
+				r.err = errors.New("bad diff item tag")
+			}
+		}
+	}
+	return items
+}
+
+func decodeChanges(data []byte) ([]Change, error) {
+	r := &changeReader{d: data}
+	count := int(r.u32())
+	out := make([]Change, 0, count)
+	for k := 0; k < count && r.err == nil; k++ {
+		var ch Change
+		switch r.u8() {
+		case 0:
+			ch = Change{Op: "add", Path: r.blob(), Kind: r.kind()}
+		case 1:
+			ch = Change{Op: "remove", Path: r.blob(), Kind: r.kind()}
+		case 2:
+			ch = Change{Op: "value", Path: r.blob(), Old: r.scalar(), New: r.scalar()}
+		case 3:
+			ch = Change{Op: "counter", Path: r.blob(), OldInt: int64(r.u64()), NewInt: int64(r.u64())}
+		case 4:
+			ch = Change{Op: "listInsert", Path: r.blob(), Index: uint(r.u64()), Items: r.items()}
+		case 5:
+			ch = Change{Op: "listDelete", Path: r.blob(), Index: uint(r.u64()), Items: r.items()}
+		case 6:
+			ch = Change{Op: "textInsert", Path: r.blob(), Index: uint(r.u64()), Text: string(r.blob())}
+		case 7:
+			ch = Change{Op: "textDelete", Path: r.blob(), Index: uint(r.u64()), Text: string(r.blob())}
+		default:
+			r.err = errors.New("bad change tag")
+		}
+		if r.err == nil {
+			out = append(out, ch)
+		}
+	}
+	if r.err != nil {
+		return nil, r.err
+	}
+	return out, nil
+}
+
+// Diff computes the structural changes turning oldState into newState — each a
+// snapshot from EncodeState, a named version, or an exported room. Each Change
+// carries an Op tag, a Path, and its variant's fields. Returns an error on a
+// malformed snapshot.
+func Diff(oldState, newState []byte) ([]Change, error) {
+	op, ol := bytesArg(oldState)
+	np, nl := bytesArg(newState)
+	data := takeBuf(C.crdtsync_diff(op, ol, np, nl))
+	if len(data) == 0 {
+		return nil, errors.New("malformed snapshot")
+	}
+	return decodeChanges(data)
+}
