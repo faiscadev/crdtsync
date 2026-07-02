@@ -34,3 +34,18 @@ impl ElementId {
         self.0.into_bytes()
     }
 }
+
+impl ElementKind {
+    /// The kind for a tag byte (`kind as u8`), or `None` if it names no kind.
+    pub(crate) fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Scalar),
+            1 => Some(Self::Register),
+            2 => Some(Self::Counter),
+            3 => Some(Self::Map),
+            4 => Some(Self::List),
+            5 => Some(Self::Text),
+            _ => None,
+        }
+    }
+}
