@@ -146,6 +146,8 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
         }
         Message::Snapshot { .. } => violation("client sent a snapshot"),
         Message::Error { .. } => violation("client sent an error"),
+        Message::Auth { .. } => violation("auth phase is not enabled"),
+        Message::AuthOk { .. } => violation("client sent an authok"),
     }
 }
 
