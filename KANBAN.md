@@ -93,6 +93,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Counter `dec` end-to-end** — a Counter decrement surfaced through the whole binding stack: `path::dec` → FFI `crdtsync_doc_dec`/`crdtsync_client_dec` → Python/Go/wasm `dec`, mirroring `inc` (#96). Closes an SDK gap (the PN-counter's negative direction had no path/FFI/SDK entry point) and readies nested-counter undo.
 
+**UndoManager (nested paths)** — undo is now path-addressed: every `UndoManager`/`Batch` method takes an encoded path, so a scalar slot inside a nested Map undoes exactly as a root one; a group can revert root + nested edits as one intention (#97). Backed by `path::register` (generic scalar) + `path::get_register`. List/text revival is the remaining undo slice.
+
 ---
 
 ## 🚧 In progress
@@ -119,7 +121,7 @@ Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized
 - **Awareness timed-TTL + throttle** — per-entry auto-expire-after-silence (timed TTL, distinct from the session TTL the grace sweep already handles) + removal broadcast (reuse `AwarenessClear`), and server-side throttle/coalesce of high-frequency entries (cursor/mouse). **Schema-gated:** ARCHITECTURE §Awareness declares an entry's TTL and throttle interval in the schema file (line 708), and the schema layer is unbuilt — so these trigger values have no home until it lands. The clock seam (#71) + periodic sweep (#72) are ready to enforce them. → *Awareness / Schema*. (v0.2, blocked on schema)
 - **Tombstone GC / watermark** — `min(last_seen_seq)` watermark, retention window ("keep last N"), time/migration compaction triggers. **Design depth (needs a careful pass before building):** snapshots are anchor-based (a tombstone anchors surviving nodes), so GC must be leaf-only (drop a below-watermark tombstone only when no surviving node parents off it), not a flat "discard older than watermark"; and the watermark is a server-seq while tombstones are lamport-`Stamp`-keyed with no client-ack protocol today — the correlation + ack semantics are unspecified. Gate any build on the convergence property harness (invariant: GC preserves materialized state). → *Snapshots / Tombstone GC*. (v0.2, needs design)
 - **Declarative policy + audit log** — authorization enforcement. → *Authorization*. (v0.2)
-- **UndoManager — remaining** — scalar undo (#94) + grouping (#95) landed. Next slices: nested paths (undo an edit inside a nested Map), then list/text revival (undo of an insert = delete; undo of a delete must re-insert the value — element-revival semantics), then the SDK surface. → *Undo/Redo*. (v0.2)
+- **UndoManager — remaining** — scalar undo (#94), grouping (#95), nested paths (#97) landed. Next slices: list/text revival (undo of an insert = delete; undo of a delete must re-insert the value — element-revival semantics), then the SDK surface. → *Undo/Redo*. (v0.2)
 - **Auto-version triggers** (engine-event/schedule-driven version creation — needs the event hooks), **admin dashboard**, **replay tooling**. → *Versioning*, *Admin UI*, *Debugging*. (v0.2) _(composition cookbook landed #93)_
 - **Blob refs (full)** — refs in ops, bytes in a content-addressable store. → *Binary Blobs*. (v0.5)
 - **XmlElement / marks / schema / invariant repair / zones**. → *CRDT Model*, *Marks*, *Schema*, *Invariant Repair*, *Authorization/zones*. (v0.5)
