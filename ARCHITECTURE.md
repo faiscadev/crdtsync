@@ -130,6 +130,8 @@ Closed set of primitives. No generic CRDT abstractions.
 
 Document root is a Map of named top-level Elements.
 
+*Built today (v0.2):* Map, List, Text, Register, Counter (plus the Scalar leaf). XmlElement, XmlFragment, and RangedElement are v0.5 — described here as the data model, not yet implemented.
+
 ## Rationale
 
 Map / List / Text / Register / Counter cover structured collaborative apps (Kanban, settings, code editors, dashboards, forms). XmlElement covers document-style trees (ProseMirror, HTML, SVG, OOXML-shaped data) with first-class attributes that can themselves hold CRDTs. RangedElement is the generic ranged annotation: marks (bold / italic / link), comments, suggestions, highlights, mentions, domain overlays — all the same primitive, recursive payload.
@@ -170,9 +172,9 @@ SDK ships a documented cookbook of "build this custom-feeling type from these pr
 
 # Internal Data Model
 
-Every operation is immutable and append-only. Ops carry identity, authorship (`client_id` + `actor_id`), scope (`room` / `branch` / `zone`), versioning (`schema_version`), causality (`lamport`), wall time (informational, not used for causality), kind, target, payload.
+Every operation is immutable and append-only. This describes the **wire/stored envelope**: identity, authorship (`client_id` + `actor_id`), scope (`room` / `branch` / `zone`), versioning (`schema_version`), causality (`lamport`), wall time (informational, not used for causality), kind, target, payload. The **core op** the CRDT engine actually merges is the inner subset — `{id, stamp, target, kind, tx}`; authorship, scope, schema version, and wall time are envelope concerns layered around the core op, not core op fields (see *Implementation Status & Divergences*).
 
-Value types in op payloads: scalars, blob refs, element refs.
+Value types in op payloads: scalars, blob refs, element refs. (The blob-ref slot is part of the model but is not yet reserved in the built op envelope — see *Implementation Status & Divergences*.)
 
 ---
 
@@ -271,9 +273,9 @@ Peritext-style range CRDT (Litt, van Hardenberg, Kleppmann — Ink & Switch 2022
 
 # Map Slot Safety
 
-`Map.set(key, value)` uses LWW. For scalar values, fine. For child CRDTs, convergence comes from **deterministic element_id derivation**, not API guardrails. Two clients concurrently creating "the same child" derive the same element_id from (parent_id, key) and converge by construction.
+`Map.set(key, value)` uses LWW. For scalar values, fine. For child CRDTs, convergence comes from **deterministic element_id derivation**, not API guardrails. Two clients concurrently creating "the same child" derive the same element_id from `(parent_id, key, kind)` and converge by construction. Derivation guarantees *convergence*; *propagation* is separate — creating a child emits a create-op so a peer learns the container exists before any op targets it (see *Implementation Status & Divergences*).
 
-If a Set displaces an existing Element ref (e.g., set scalar onto a slot previously holding Text), the displaced element_id may become unreachable. Core surfaces an orphan event. Orphaning is never silent.
+If a Set displaces an existing Element ref (e.g., set scalar onto a slot previously holding Text), the displaced element is **retained in a persistent per-id registry, not discarded** — a later Set that re-wins the slot reinstates the same element, and a displaced counter keeps accumulating. This is a convergence requirement, not a nicety: two replicas that saw the same ops must agree even across displace-then-recreate, so orphan-and-forget would diverge and is not an option. Core still surfaces an orphan event for the app; the state itself is kept. Orphaning is never silent.
 
 Standalone CRDT construction (a la `new Text()` in Yjs) is intentionally not supported in v0.1: elements must be created at their final location so the deterministic id has a parent. Removes the "type not yet integrated" footgun.
 
@@ -450,13 +452,13 @@ Stack lives in SDK on client, persists in local storage. Offline editing produce
 
 # Persistence
 
-Zero external infrastructure. Embedded storage engine. SQLite + append-only operation log is the starting recommendation (mature, reliable, inspectable, backup-friendly, transactional). Tables shape: rooms, snapshots, operations, clients, cluster membership.
+Zero external infrastructure. As built, the store is a **per-room append-only file log** (`<room>.log`, one length-framed op per record) plus an optional `<room>.snap` compaction snapshot — no SQLite, no relational tables. Durability is hand-rolled: an append flushes before it returns; compaction lands atomically (temp → fsync → rename → directory fsync) before the log is truncated, and a crash-left overlap is deduped on replay. *Revisit:* the op hot-path is well served by the file log, but the admin UI / op-log viewer / audit-query / retention features described below want queryability, and durability is now bespoke (a directory-fsync crash bug already shipped and was fixed) — reconsider an embedded DB (SQLite/redb) for the metadata/index side if those consumers land (see *Implementation Status & Divergences*).
 
 ---
 
 # Snapshots
 
-Serialized materialized Document state at a specific lamport timestamp. Makes replay fast, drives tombstone GC, marks migration checkpoints, backs the user-facing versioning layer.
+Serialized materialized Document state. As built, a snapshot is keyed by the **server sequence** it covers (`base_seq`), not a lamport timestamp, and is generated on demand from the live merged replica. It makes replay fast and is the compaction artifact; it will also drive tombstone GC, migration checkpoints, and the versioning layer (those consumers are not built yet).
 
 ## Frequency Triggers
 
@@ -468,11 +470,11 @@ Latest per branch always retained. Migration-boundary snapshots retained forever
 
 ## Tombstone GC
 
-Snapshots are when GC actually happens. Until a snapshot crosses the watermark, tombstones must be retained — offline clients could need them.
+Snapshots are when GC actually happens. Until a snapshot crosses the watermark, tombstones must be retained — offline clients could need them. **Not yet built:** current compaction retains all tombstones — there is no `min(last_seen_seq)` watermark GC (see *Implementation Status & Divergences*).
 
 ## Cold Start
 
-When a client connects to a room it has not seen, server sends latest snapshot + ops since snapshot lamport. No full-history replay on client.
+When a client connects to a room it has not seen, catch-up returns **either** the ops since its last-seen sequence (at/above the room's compaction floor) **or**, if it fell below the floor, a whole-replica snapshot regenerated live — never snapshot-plus-tail. No full-history replay on the client. *Revisit:* regenerating a whole-replica snapshot per below-floor cold-start is O(state) CPU; cache it per floor if snapshots grow large or cold-starts get frequent (see *Implementation Status & Divergences*).
 
 ## Export / Import
 
@@ -584,11 +586,13 @@ WebSocket. WSS over TLS in production.
 
 **One WebSocket per `(server, actor session)`. Logical channels multiplexed per `(room, branch, zone)` subscription.** Subscribe / unsubscribe via in-band control messages, runtime-mutable.
 
+*As built (v0.2):* a connection binds a single room; a second Subscribe switches it. Multiplexing many rooms/channels over one connection is planned, not yet built (see *Implementation Status & Divergences*).
+
 Five docs in five tabs = five connections (per-tab `client_id`). Five docs in one tab = one connection with five channels.
 
 ## Handshake
 
-Three phases. Wire structure fixed; credential carrier deployment-pluggable.
+Three phases (planned). *As built (v0.2):* two phases — Hello → Subscribe. There is no Auth phase, no `actor_id`, and no token validation yet (the `AuthFailed` error code is reserved but unused); `Hello` carries an untrusted, peer-asserted `client_id`. The Auth phase below is a v0.2 target (see *Implementation Status & Divergences*). Wire structure fixed; credential carrier deployment-pluggable.
 
 1. **Hello** — version + codec negotiation. Format-stable header in the first 8 bytes (4-byte magic + 4-byte protocol version) so new codecs ship in later releases without breaking older clients.
 2. **Auth** — only if credentials weren't present at upgrade. Pluggable carriers: cookie, WS subprotocol, `Authorization` header, in-band, mTLS, API key, query param (supported but logs leak). Credentials opaque bytes interpreted by deployment-configured verifier. Clients never assert `actor_id` — server derives it from verified credential.
@@ -602,11 +606,11 @@ Anonymous mode: server emits `actor_id = "anon:<random>"` if deployment policy p
 
 ## Error Envelope
 
-Standardized error response with closed enum code + human message + opaque details. Closed enum keeps wire compact, cross-language error handling uniform. New codes ship through engine releases.
+Standardized error response with closed enum code + human message + opaque details. Closed enum keeps wire compact, cross-language error handling uniform. New codes ship through engine releases. *As built:* code + message (the `details` field is not yet implemented).
 
 ## Not Locked
 
-Binary codec choice (CBOR / MessagePack / Cap'n Proto / custom) deferred to implementation, negotiated via Hello. Compression, framing details, TLS profile, heartbeat interval, op size limits — all infrastructure / runtime config.
+Binary codec choice (CBOR / MessagePack / Cap'n Proto / custom) deferred to implementation, negotiated via Hello. *As built:* one custom deterministic little-endian codec (not CBOR/MessagePack), shared by the wire and the durable log; the 8-byte header reserves a version field for the negotiation, but only one codec exists today. Compression, framing details, TLS profile, heartbeat interval, op size limits — all infrastructure / runtime config.
 
 ---
 
@@ -930,7 +934,7 @@ CRDT correctness (convergence, tombstones, id derivation, displacement semantics
 
 Decisions that shape the wire format, op model, or schema language. Bind early — adding them after v0.1 ships requires breaking changes.
 
-**Status: all foundational decisions are decided.** Implementation choices (wire codec, compression, framing details, TLS profile, keepalive intervals, op size limits) are deferred to implementation time and can be revisited without breaking the model.
+**Status: all foundational decisions are decided.** Implementation choices (wire codec, compression, framing details, TLS profile, keepalive intervals, op size limits) are deferred to implementation time and can be revisited without breaking the model. ("Decided" means the *design* is settled, not that it is built — several rows are still planned; see *Implementation Status & Divergences* for what has shipped. Note the blob-ref envelope slot is decided but **not yet reserved** in the built op.)
 
 | Status | Decision | Why foundational |
 |--------|----------|------------------|
@@ -948,6 +952,38 @@ Decisions that shape the wire format, op model, or schema language. Bind early �
 ## Additive (No Foundational Pressure)
 
 Can land cleanly later without breaking the v0.1 model: editor adapter contract, storage layout refresh, search / indexing, quotas / rate limits, debugging tools, E2E encryption, branch merging, webhooks / external integrations.
+
+---
+
+# Implementation Status & Divergences
+
+This document is the **plan of record** — the design intent. The **live build board is [KANBAN.md](KANBAN.md)**. As the Rust core, server, and SDKs were built (v0.1 → v0.2, 2026-07), several concrete choices diverged from the prose above. This section is the reconciliation: where they disagree, the note here (and the code) is authoritative.
+
+## Deliberate divergences — code is authoritative
+
+- **Core language is Rust**, not C — a downward `Rc<RefCell<T>>` value graph, `#![forbid(unsafe_code)]`, Miri-gated. Portability is unchanged: a stable C ABI (cbindgen) for native SDKs + wasm (wasm-bindgen) for the browser. Native hosts embed the C ABI directly; only JS gets wasm (no wasm runtime embedded in a native host). Host seam is `entropy()` + `now()` only; `std`, not `no_std`.
+- **Two op layers.** The *core op* carries only what merge needs — `{id, stamp, target, kind, tx}`. Authorship (`actor_id`), scope (`room`/`branch`/`zone`), `schema_version`, and wall time are **wire/server-envelope** concerns wrapping the core op, not core op fields.
+- **element_id derives from `(parent_id, key, kind)`** — the kind is in the tuple, so a type-flip on a slot yields a different id, which drives the displacement path correctly.
+- **Displacement retains, it does not forget.** A displaced container/counter is kept in a persistent per-id registry and *reinstated* if its slot is re-won; a displaced counter keeps accumulating. This is a **convergence requirement** — orphan-and-forget (as the older Map Slot Safety prose implied) diverges across replicas. The orphan event still fires for the app; the state is retained.
+- **Creation emits an op.** Get-or-create emits an op on the create path (silent on get). Derivation gives *convergence* for concurrent same-slot creates; the op gives *propagation* (a peer learns the container exists before a child op targets it). Both are needed — "convergence by derivation, not API" holds for convergence only.
+- **The op-log is the source of truth; a snapshot is a compaction artifact,** not a separate cold-start channel. Every state change is an op; replaying the log reproduces the state.
+- **Persistence is a per-room append-only file log** + optional `<room>.snap` snapshot — not SQLite. Crash-safety is hand-rolled (append flushes before return; compaction is temp → fsync → rename → dir fsync → truncate, with dedup-on-replay).
+- **One binary codec, shared by the wire and the log.** Deterministic little-endian, length-framed, total-decode (a `DecodeError`/`ProtocolError`, never a panic). Not CBOR/MessagePack. The 8-byte header (`"CRDT"` magic + version) reserves the version for future codec negotiation.
+- **Compaction is keyed on the server sequence** (`base_seq`), not a lamport timestamp. Cold-start (`catch_up`) returns **either** an op delta (at/above the room's floor) **or** a whole-replica snapshot regenerated live (below it) — never snapshot-plus-tail.
+
+## Planned, not yet built (the prose above reads present-tense — it isn't yet)
+
+- **Auth** — the handshake is Hello → Subscribe today; no Auth phase, no token validation, no `actor_id` (the `AuthFailed` code is reserved, unused). `Hello` carries an untrusted, peer-asserted `client_id`. Three-phase auth + `actor_id` is a v0.2 item.
+- **Connection multiplexing** — a connection binds one room; a second Subscribe switches it. One-connection-many-channels is not built.
+- **Tombstone GC / watermark** — compaction retains all tombstones; no `min(last_seen_seq)` watermark, no retention window ("keep last 3"), only an op-count trigger (no time/migration triggers). Snapshot state grows with tombstones until GC lands.
+- **Blob-ref envelope slot** — the `tx` slot is reserved as promised; the **blob-ref slot is not**. It should be reserved (the doc's own "reserve early, cheap now / painful later" rationale) or the reservation consciously dropped. Tracked in KANBAN.
+- **Op-batching RLE** — the codec frames one op per record; cross-op run-length encoding is a later additive op kind.
+- **Also absent:** Error `details` field, `RelativePosition`/anchor SDK type, client_id generation/persistence in the SDKs (they take a caller-supplied 16-byte id), codec negotiation, and the XmlElement / XmlFragment / RangedElement primitives (v0.5).
+
+## Revisit items (accepted now, flagged for a later look)
+
+- **File-log vs. an embedded DB for the query/metadata side.** The append-only file log is right for the op hot-path, but the admin UI / op-log viewer / audit-query / retention features want queryability, and durability is now hand-rolled (a directory-fsync crash bug already shipped and was fixed). Reconsider SQLite/redb for the *metadata/index* side if those consumers land — a checkpoint, not a reversal.
+- **Cold-start snapshot CPU.** A below-floor subscriber triggers a whole-replica `encode_state` regenerated live on every cold-start — O(state) CPU per connection. Fine at current scale; cache the encoded snapshot per compaction floor if snapshots grow large or cold-starts get frequent.
 
 ---
 
