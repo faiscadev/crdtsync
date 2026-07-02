@@ -7,8 +7,15 @@
 //! Error and signals close; the caller drains the outbox, then disconnects.
 //! Pure, synchronous routing; the async transport pumps bytes through it.
 
+use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, ErrorCode, Message, Scalar};
 use crdtsync_server::{ConnId, Registry};
+
+const CH: Channel = Channel(0);
+
+fn ops_msg(ops: Vec<crdtsync_core::Op>) -> Message {
+    Message::Ops { channel: CH, ops }
+}
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -28,6 +35,7 @@ const ROOM: &[u8] = b"room-1";
 
 fn sub(room: &[u8]) -> Message {
     Message::Subscribe {
+        channel: CH,
         room: room.to_vec(),
         last_seen_seq: 0,
     }
@@ -71,7 +79,7 @@ fn subscribe_queues_the_catch_up_reply() {
     let a = r.connect();
     r.deliver(a, Message::Hello { client: cid(1) });
     r.deliver(a, sub(ROOM));
-    assert_eq!(r.take_outbox(a), vec![Message::Ops(Vec::new())]);
+    assert_eq!(r.take_outbox(a), vec![ops_msg(Vec::new())]);
 }
 
 #[test]
@@ -90,9 +98,9 @@ fn ops_broadcast_to_other_members_but_not_the_sender() {
     let b = join(&mut r, 2, ROOM);
 
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    r.deliver(a, Message::Ops(ops.clone()));
+    r.deliver(a, ops_msg(ops.clone()));
 
-    assert_eq!(r.take_outbox(b), vec![Message::Ops(ops)]);
+    assert_eq!(r.take_outbox(b), vec![ops_msg(ops)]);
     assert!(r.take_outbox(a).is_empty(), "the sender gets no echo");
 }
 
@@ -103,7 +111,7 @@ fn a_broadcast_skips_other_rooms() {
     let other = join(&mut r, 2, b"room-2");
 
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    r.deliver(a, Message::Ops(ops));
+    r.deliver(a, ops_msg(ops));
 
     assert!(r.take_outbox(other).is_empty());
 }
@@ -113,13 +121,13 @@ fn a_late_joiner_catches_up_on_prior_ops() {
     let mut r = registry();
     let a = join(&mut r, 1, ROOM);
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    r.deliver(a, Message::Ops(ops.clone()));
+    r.deliver(a, ops_msg(ops.clone()));
 
     // A connection that subscribes afterward draws the room's history.
     let b = r.connect();
     r.deliver(b, Message::Hello { client: cid(2) });
     r.deliver(b, sub(ROOM));
-    assert_eq!(r.take_outbox(b), vec![Message::Ops(ops)]);
+    assert_eq!(r.take_outbox(b), vec![ops_msg(ops)]);
 }
 
 #[test]
@@ -129,10 +137,10 @@ fn a_resent_batch_broadcasts_nothing() {
     let b = join(&mut r, 2, ROOM);
 
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    r.deliver(a, Message::Ops(ops.clone()));
+    r.deliver(a, ops_msg(ops.clone()));
     r.take_outbox(b);
     // The hub dedups the resend, so nothing new fans out.
-    r.deliver(a, Message::Ops(ops));
+    r.deliver(a, ops_msg(ops));
     assert!(r.take_outbox(b).is_empty());
 }
 
@@ -144,7 +152,7 @@ fn a_disconnected_member_stops_receiving() {
     r.disconnect(b);
 
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    r.deliver(a, Message::Ops(ops));
+    r.deliver(a, ops_msg(ops));
     assert!(r.take_outbox(b).is_empty());
 }
 
@@ -156,7 +164,7 @@ fn a_violation_queues_an_error_and_signals_close() {
     let c = r.connect();
     // Ops before Hello is a protocol violation.
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    let keep_open = r.deliver(c, Message::Ops(ops));
+    let keep_open = r.deliver(c, ops_msg(ops));
     assert!(!keep_open);
     let out = r.take_outbox(c);
     assert!(is_violation(&out[0]), "the error is queued for sending");

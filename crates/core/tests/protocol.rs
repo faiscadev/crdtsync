@@ -8,7 +8,7 @@
 
 use crdtsync_core::op::{Op, OpId, OpKind};
 use crdtsync_core::protocol::{
-    decode_header, decode_message, encode_header, encode_message, ErrorCode, Message,
+    decode_header, decode_message, encode_header, encode_message, Channel, ErrorCode, Message,
     ProtocolError, MAGIC, PROTOCOL_VERSION,
 };
 use crdtsync_core::Scalar;
@@ -97,6 +97,7 @@ fn hello_round_trips() {
 #[test]
 fn subscribe_round_trips() {
     round_trips(Message::Subscribe {
+        channel: Channel(1),
         room: b"room-42".to_vec(),
         last_seen_seq: 1_000_000,
     });
@@ -105,6 +106,7 @@ fn subscribe_round_trips() {
 #[test]
 fn subscribe_with_an_empty_room_round_trips() {
     round_trips(Message::Subscribe {
+        channel: Channel(0),
         room: Vec::new(),
         last_seen_seq: 0,
     });
@@ -113,18 +115,31 @@ fn subscribe_with_an_empty_room_round_trips() {
 #[test]
 fn ops_round_trips_a_batch() {
     let ops = sample_ops();
-    let bytes = encode_message(&Message::Ops(ops.clone()));
-    assert_eq!(decode_message(&bytes), Ok(Message::Ops(ops)));
+    let bytes = encode_message(&Message::Ops {
+        channel: Channel(0),
+        ops: ops.clone(),
+    });
+    assert_eq!(
+        decode_message(&bytes),
+        Ok(Message::Ops {
+            channel: Channel(0),
+            ops,
+        })
+    );
 }
 
 #[test]
 fn ops_round_trips_an_empty_batch() {
-    round_trips(Message::Ops(Vec::new()));
+    round_trips(Message::Ops {
+        channel: Channel(0),
+        ops: Vec::new(),
+    });
 }
 
 #[test]
 fn snapshot_round_trips() {
     round_trips(Message::Snapshot {
+        channel: Channel(0),
         seq: 4_200_000,
         state: vec![1, 2, 3, 0, 255, 128],
     });
@@ -133,6 +148,7 @@ fn snapshot_round_trips() {
 #[test]
 fn snapshot_round_trips_an_empty_state() {
     round_trips(Message::Snapshot {
+        channel: Channel(0),
         seq: 0,
         state: Vec::new(),
     });
@@ -141,6 +157,7 @@ fn snapshot_round_trips_an_empty_state() {
 #[test]
 fn snapshot_round_trips_a_large_state() {
     round_trips(Message::Snapshot {
+        channel: Channel(0),
         seq: 1,
         state: (0..4096).map(|i| i as u8).collect(),
     });
@@ -149,6 +166,7 @@ fn snapshot_round_trips_a_large_state() {
 #[test]
 fn a_truncated_snapshot_is_an_error() {
     let bytes = encode_message(&Message::Snapshot {
+        channel: Channel(0),
         seq: 9,
         state: vec![7, 7, 7],
     });
@@ -161,6 +179,7 @@ fn a_truncated_snapshot_is_an_error() {
 #[test]
 fn trailing_bytes_after_a_snapshot_are_an_error() {
     let mut bytes = encode_message(&Message::Snapshot {
+        channel: Channel(0),
         seq: 9,
         state: vec![7],
     });
@@ -259,7 +278,10 @@ fn a_non_utf8_error_message_is_an_error() {
 
 #[test]
 fn a_corrupt_op_batch_is_an_error() {
-    let bytes = encode_message(&Message::Ops(sample_ops()));
+    let bytes = encode_message(&Message::Ops {
+        channel: Channel(0),
+        ops: sample_ops(),
+    });
     // Truncate inside the batch payload; the framed codec must reject it.
     assert!(matches!(
         decode_message(&bytes[..bytes.len() - 1]),

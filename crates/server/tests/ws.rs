@@ -8,12 +8,18 @@
 //! Excluded under Miri, which cannot run tokio's real I/O.
 #![cfg(not(miri))]
 
-use crdtsync_core::protocol::PROTOCOL_VERSION;
+use crdtsync_core::protocol::{Channel, PROTOCOL_VERSION};
 use crdtsync_core::{
     decode_message, encode_header, encode_message, ClientId, Document, ErrorCode, Message, Op,
     Scalar,
 };
 use crdtsync_server::runtime::serve;
+
+const CH: Channel = Channel(0);
+
+fn ops_msg(ops: Vec<Op>) -> Message {
+    Message::Ops { channel: CH, ops }
+}
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -97,6 +103,7 @@ async fn join(url: &str, client: u8) -> Ws {
     send(
         &mut ws,
         &Message::Subscribe {
+            channel: CH,
             room: ROOM.to_vec(),
             last_seen_seq: 0,
         },
@@ -115,7 +122,7 @@ async fn subscribe_returns_a_catch_up_batch() {
     let url = &server.url;
     let mut a = join(url, 1).await;
     // A fresh room's catch-up is empty.
-    assert_eq!(recv(&mut a).await, Message::Ops(Vec::new()));
+    assert_eq!(recv(&mut a).await, ops_msg(Vec::new()));
 }
 
 #[tokio::test]
@@ -124,13 +131,13 @@ async fn an_op_broadcasts_to_another_subscriber() {
     let url = &server.url;
     let mut a = join(url, 1).await;
     let mut b = join(url, 2).await;
-    assert_eq!(recv(&mut a).await, Message::Ops(Vec::new()));
-    assert_eq!(recv(&mut b).await, Message::Ops(Vec::new()));
+    assert_eq!(recv(&mut a).await, ops_msg(Vec::new()));
+    assert_eq!(recv(&mut b).await, ops_msg(Vec::new()));
 
     let ops = sample_ops();
-    send(&mut a, &Message::Ops(ops.clone())).await;
+    send(&mut a, &ops_msg(ops.clone())).await;
 
-    assert_eq!(recv(&mut b).await, Message::Ops(ops));
+    assert_eq!(recv(&mut b).await, ops_msg(ops));
 }
 
 #[tokio::test]
@@ -138,26 +145,33 @@ async fn a_late_joiner_catches_up() {
     let server = start_server().await;
     let url = &server.url;
     let mut a = join(url, 1).await;
-    assert_eq!(recv(&mut a).await, Message::Ops(Vec::new()));
+    assert_eq!(recv(&mut a).await, ops_msg(Vec::new()));
 
     let ops = sample_ops();
-    send(&mut a, &Message::Ops(ops.clone())).await;
+    send(&mut a, &ops_msg(ops.clone())).await;
 
-    // Barrier: a re-subscribes and reads its own op back, proving the server
-    // ingested it before the late joiner subscribes.
+    // Barrier: a subscribes the room again on a second channel and reads its own
+    // op back, proving the server ingested it before the late joiner subscribes.
     send(
         &mut a,
         &Message::Subscribe {
+            channel: Channel(1),
             room: ROOM.to_vec(),
             last_seen_seq: 0,
         },
     )
     .await;
-    assert_eq!(recv(&mut a).await, Message::Ops(ops.clone()));
+    assert_eq!(
+        recv(&mut a).await,
+        Message::Ops {
+            channel: Channel(1),
+            ops: ops.clone(),
+        }
+    );
 
     // A connection that subscribes afterward draws the room's history.
     let mut b = join(url, 2).await;
-    assert_eq!(recv(&mut b).await, Message::Ops(ops));
+    assert_eq!(recv(&mut b).await, ops_msg(ops));
 }
 
 #[tokio::test]

@@ -586,7 +586,7 @@ WebSocket. WSS over TLS in production.
 
 **One WebSocket per `(server, actor session)`. Logical channels multiplexed per `(room, branch, zone)` subscription.** Subscribe / unsubscribe via in-band control messages, runtime-mutable.
 
-*As built (v0.2):* a connection binds a single room; a second Subscribe switches it. Multiplexing many rooms/channels over one connection is planned, not yet built (see *Implementation Status & Divergences*).
+*As built (v0.2):* the server multiplexes many rooms over one connection — each Subscribe opens a client-assigned `Channel`, ops/snapshots/unsubscribes name their channel, and fan-out tags each peer on the channel it opened for the room. The SDK-side `ClientSession` still drives a single room (pinned to one channel); its multi-room extension is planned (see *Implementation Status & Divergences*).
 
 Five docs in five tabs = five connections (per-tab `client_id`). Five docs in one tab = one connection with five channels.
 
@@ -974,7 +974,7 @@ This document is the **end-state** — the full scope + intended design; everyth
 ## Planned, not yet built (the prose above reads present-tense — it isn't yet)
 
 - **Auth** — the handshake is Hello → Subscribe today; no Auth phase, no token validation, no `actor_id` (the `AuthFailed` code is reserved, unused). `Hello` carries an untrusted, peer-asserted `client_id`. Three-phase auth + `actor_id` is a v0.2 item.
-- **Connection multiplexing** — a connection binds one room; a second Subscribe switches it. One-connection-many-channels is not built.
+- **Connection multiplexing** — the server multiplexes many rooms over one connection via client-assigned channels; the SDK-side `ClientSession` still holds a single room on one channel. Multi-room `ClientSession` is the remaining piece.
 - **Tombstone GC / watermark** — compaction retains all tombstones; no `min(last_seen_seq)` watermark, no retention window ("keep last 3"), only an op-count trigger (no time/migration triggers). Snapshot state grows with tombstones until GC lands.
 - **Element-ref envelope slot** — the `tx` and blob-ref slots are reserved (`Scalar::BlobRef`); the **element-ref value slot is not**. Its shape is under-specified and it carries no v0.1 reservation promise, so it is deferred until its design settles. Tracked in KANBAN.
 - **Op-batching RLE** — the codec frames one op per record; cross-op run-length encoding is a later additive op kind.

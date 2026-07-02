@@ -7,24 +7,26 @@
 //! to close. Anything out of order is a protocol violation. Pure logic; the
 //! async transport drives it.
 
+use std::collections::HashMap;
+
 use crdtsync_core::protocol::PROTOCOL_VERSION;
-use crdtsync_core::{ClientId, ErrorCode, Message, Op};
+use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
 
 use crate::{Catchup, Hub, RoomId};
 
-/// One client connection's protocol state. A connection binds a single active
-/// room; Subscribe switches it. Multiplexing many rooms over one connection is
-/// a later concern.
+/// One client connection's protocol state. A connection multiplexes several
+/// room subscriptions, each on its own [`Channel`]; the client assigns the
+/// handle at Subscribe and every later frame names it.
 pub struct Session {
     client: Option<ClientId>,
-    room: Option<RoomId>,
+    channels: HashMap<Channel, RoomId>,
 }
 
 impl Session {
     pub fn new() -> Self {
         Self {
             client: None,
-            room: None,
+            channels: HashMap::new(),
         }
     }
 
@@ -33,9 +35,15 @@ impl Session {
         self.client
     }
 
-    /// The room bound by the latest Subscribe, if any.
-    pub fn room(&self) -> Option<&[u8]> {
-        self.room.as_deref()
+    /// The channels this connection has bound to `room`. A broadcast for the
+    /// room is delivered on each — one connection may hold the same room on
+    /// more than one channel.
+    pub fn channels_for_room(&self, room: &[u8]) -> Vec<Channel> {
+        self.channels
+            .iter()
+            .filter(|(_, r)| r.as_slice() == room)
+            .map(|(c, _)| *c)
+            .collect()
     }
 }
 
@@ -46,11 +54,13 @@ impl Default for Session {
 }
 
 /// What a [`step`] yields: replies to this client, ops to broadcast to the
-/// room's other subscribers, and whether the connection should close.
+/// other subscribers of `broadcast_room`, and whether the connection should
+/// close. `broadcast_room` is `None` when there is nothing to fan out.
 #[derive(Default)]
 pub struct Response {
     pub replies: Vec<Message>,
     pub broadcast: Vec<Op>,
+    pub broadcast_room: Option<RoomId>,
     pub close: bool,
 }
 
@@ -68,28 +78,45 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
             Response::default()
         }
         Message::Subscribe {
+            channel,
             room,
             last_seen_seq,
         } => {
             if session.client.is_none() {
                 return violation("subscribe before hello");
             }
+            if session.channels.contains_key(&channel) {
+                return violation("channel already subscribed");
+            }
             let reply = match hub.catch_up(&room, last_seen_seq) {
-                Catchup::Ops(ops) => Message::Ops(ops),
-                Catchup::Snapshot { seq, state } => Message::Snapshot { seq, state },
+                Catchup::Ops(ops) => Message::Ops { channel, ops },
+                Catchup::Snapshot { seq, state } => Message::Snapshot {
+                    channel,
+                    seq,
+                    state,
+                },
             };
-            session.room = Some(room);
+            session.channels.insert(channel, room);
             Response {
                 replies: vec![reply],
                 ..Response::default()
             }
         }
-        Message::Ops(ops) => {
+        Message::Unsubscribe { channel } => {
+            if session.client.is_none() {
+                return violation("unsubscribe before hello");
+            }
+            if session.channels.remove(&channel).is_none() {
+                return violation("unsubscribe of an unbound channel");
+            }
+            Response::default()
+        }
+        Message::Ops { channel, ops } => {
             let Some(client) = session.client else {
                 return violation("ops before hello");
             };
-            let Some(room) = session.room.as_deref() else {
-                return violation("ops before subscribe");
+            let Some(room) = session.channels.get(&channel).cloned() else {
+                return violation("ops on an unbound channel");
             };
             // Every op must carry the client declared at Hello, so a
             // connection's ops stay self-consistent. Authenticating that the
@@ -101,9 +128,10 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
             // The deduped ops fan out to the room's other subscribers; nothing
             // echoes back to the sender. A hub that cannot durably record the
             // ops rejects the write rather than advertising an unpersisted one.
-            match hub.ingest(room, ops) {
+            match hub.ingest(&room, ops) {
                 Ok(applied) => Response {
                     broadcast: applied,
+                    broadcast_room: Some(room),
                     ..Response::default()
                 },
                 Err(_) => Response {
@@ -111,8 +139,8 @@ pub fn step(hub: &mut Hub, session: &mut Session, msg: Message) -> Response {
                         code: ErrorCode::Internal,
                         message: "failed to persist ops".to_string(),
                     }],
-                    broadcast: Vec::new(),
                     close: true,
+                    ..Response::default()
                 },
             }
         }
@@ -139,7 +167,7 @@ fn violation(reason: &str) -> Response {
             code: ErrorCode::ProtocolViolation,
             message: reason.to_string(),
         }],
-        broadcast: Vec::new(),
         close: true,
+        ..Response::default()
     }
 }
