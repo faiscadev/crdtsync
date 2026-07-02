@@ -5,8 +5,8 @@
 //! [`diff`] walks the two trees in lockstep and reports each slot that was
 //! added, removed, or changed, addressed by its path. Scalar / register /
 //! counter values report their old and new value; a nested map is walked so a
-//! deep edit surfaces at its own path. Sequences (List / Text) report only
-//! *that* they changed — element- and char-level detail is a follow-on. The
+//! deep edit surfaces at its own path. Sequences diff to runs by stable id — a
+//! List to item inserts/deletes, a Text to codepoint inserts/deletes. The
 //! change list is ordered by path, so diffing the same pair is deterministic.
 
 use std::collections::{BTreeSet, HashSet};
@@ -35,9 +35,18 @@ pub enum Change {
     },
     /// A Counter whose value changed.
     Counter { path: Vec<u8>, old: i64, new: i64 },
-    /// A List whose contents changed. Element-level detail is a follow-on; this
-    /// reports that the list at `path` differs.
-    Sequence { path: Vec<u8>, kind: ElementKind },
+    /// A run of items inserted into a List, at its index in the new list.
+    ListInsert {
+        path: Vec<u8>,
+        index: usize,
+        items: Vec<SeqItem>,
+    },
+    /// A run of items deleted from a List, at its index in the old list.
+    ListDelete {
+        path: Vec<u8>,
+        index: usize,
+        items: Vec<SeqItem>,
+    },
     /// A run of codepoints inserted into a Text, at its index in the new text.
     TextInsert {
         path: Vec<u8>,
@@ -50,6 +59,14 @@ pub enum Change {
         index: usize,
         text: String,
     },
+}
+
+/// A List item in a diff: an inline scalar value, or the kind of a composite
+/// (a composite's own contents diff at its own path once it is reachable).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SeqItem {
+    Scalar(Scalar),
+    Composite(ElementKind),
 }
 
 /// The structural changes turning `old` into `new`, ordered by path.
@@ -115,12 +132,7 @@ fn diff_elem(a: &Element, b: &Element, prefix: &mut Vec<Vec<u8>>, out: &mut Vec<
             }
         }
         (Element::List(a), Element::List(b)) => {
-            if list_state(&a.borrow()) != list_state(&b.borrow()) {
-                out.push(Change::Sequence {
-                    path: path_of(prefix),
-                    kind: ElementKind::List,
-                });
-            }
+            diff_list(&a.borrow(), &b.borrow(), prefix, out);
         }
         (Element::Text(a), Element::Text(b)) => {
             diff_text(&a.borrow(), &b.borrow(), prefix, out);
@@ -148,11 +160,68 @@ fn scalar_of(e: &Element) -> Scalar {
     }
 }
 
-/// A sequence's canonical bytes — equal contents encode identically, so a byte
-/// comparison detects a change without an element-level walk.
-fn list_state(l: &List) -> Vec<u8> {
-    let mut out = Vec::new();
-    l.encode_state_into(&mut out);
+/// Element-level diff of two List snapshots by node id. A node identified by
+/// its stable id (a `Stamp`) that is live in one snapshot and not the other is
+/// an exact insert or delete; consecutive same-op items coalesce into a run,
+/// deletes (at their index in the old list) before inserts (at their index in
+/// the new list). A node still live in both is unchanged in position; a change
+/// to a composite item's own contents surfaces at that item's path.
+fn diff_list(old: &List, new: &List, prefix: &[Vec<u8>], out: &mut Vec<Change>) {
+    let old_seq = list_seq(old);
+    let new_seq = list_seq(new);
+    let old_ids: HashSet<Stamp> = old_seq.iter().map(|(id, _)| *id).collect();
+    let new_ids: HashSet<Stamp> = new_seq.iter().map(|(id, _)| *id).collect();
+
+    for (index, items) in list_runs(&old_seq, &new_ids) {
+        out.push(Change::ListDelete {
+            path: path_of(prefix),
+            index,
+            items,
+        });
+    }
+    for (index, items) in list_runs(&new_seq, &old_ids) {
+        out.push(Change::ListInsert {
+            path: path_of(prefix),
+            index,
+            items,
+        });
+    }
+}
+
+/// A List's live items in order, each with its stable node id.
+fn list_seq(l: &List) -> Vec<(Stamp, SeqItem)> {
+    (0..l.len())
+        .filter_map(|i| Some((l.node_at(i)?, seq_item(&l.get(i)?))))
+        .collect()
+}
+
+/// A List item as it appears in a diff: an inline scalar (or a register's
+/// scalar), else the composite's kind.
+fn seq_item(e: &Element) -> SeqItem {
+    match e {
+        Element::Scalar(s) => SeqItem::Scalar(s.clone()),
+        Element::Register(r) => SeqItem::Scalar(r.borrow().read().clone()),
+        other => SeqItem::Composite(other.kind()),
+    }
+}
+
+/// Coalesce the items of `seq` whose id is absent from `present` into runs, each
+/// tagged with the run's start index within `seq`.
+fn list_runs(seq: &[(Stamp, SeqItem)], present: &HashSet<Stamp>) -> Vec<(usize, Vec<SeqItem>)> {
+    let mut out: Vec<(usize, Vec<SeqItem>)> = Vec::new();
+    let mut run: Option<(usize, Vec<SeqItem>)> = None;
+    for (index, (id, item)) in seq.iter().enumerate() {
+        if present.contains(id) {
+            if let Some(r) = run.take() {
+                out.push(r);
+            }
+        } else {
+            run.get_or_insert((index, Vec::new())).1.push(item.clone());
+        }
+    }
+    if let Some(r) = run.take() {
+        out.push(r);
+    }
     out
 }
 
