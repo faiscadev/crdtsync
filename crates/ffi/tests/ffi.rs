@@ -583,3 +583,98 @@ fn a_null_data_pointer_is_rejected_not_dereferenced() {
         crdtsync_doc_free(doc);
     }
 }
+
+// --- undo / redo ---
+
+#[test]
+fn undo_and_redo_a_register_across_the_boundary() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let undo = crdtsync_undo_new();
+        let p = path(&[b"title"]);
+
+        let o1 = crdtsync_undo_register_int(undo, doc, p.as_ptr(), p.len(), 1);
+        let o2 = crdtsync_undo_register_int(undo, doc, p.as_ptr(), p.len(), 2);
+        assert_eq!(get_int(doc, &p), (1, 2));
+        assert_eq!(crdtsync_undo_can_undo(undo), 1);
+
+        let u1 = crdtsync_undo_undo(undo, doc);
+        assert_eq!(get_int(doc, &p), (1, 1), "undo steps back one value");
+        let r1 = crdtsync_undo_redo(undo, doc);
+        assert_eq!(get_int(doc, &p), (1, 2), "redo restores it");
+        assert_eq!(crdtsync_undo_can_redo(undo), 0);
+
+        crdtsync_buf_free(o1);
+        crdtsync_buf_free(o2);
+        crdtsync_buf_free(u1);
+        crdtsync_buf_free(r1);
+        crdtsync_undo_free(undo);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn an_undo_converges_on_a_peer() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let undo = crdtsync_undo_new();
+        let p = path(&[b"votes"]);
+
+        let up = crdtsync_undo_inc(undo, a, p.as_ptr(), p.len(), 5);
+        exchange(b, &up);
+        assert_eq!(get_counter(b, &p).1, 5);
+
+        // The undo's ops travel like any edit and the peer converges.
+        let un = crdtsync_undo_undo(undo, a);
+        exchange(b, &un);
+        assert_eq!(get_counter(a, &p).1, 0);
+        assert_eq!(get_counter(b, &p).1, 0, "the peer sees the undo");
+
+        crdtsync_buf_free(up);
+        crdtsync_buf_free(un);
+        crdtsync_undo_free(undo);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn undo_removes_a_list_insert() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let undo = crdtsync_undo_new();
+        let p = path(&[b"items"]);
+        let v = b"a";
+
+        let ins = crdtsync_undo_list_insert(undo, doc, p.as_ptr(), p.len(), 0, v.as_ptr(), v.len());
+        let mut len: usize = 0;
+        assert_eq!(crdtsync_doc_list_len(doc, p.as_ptr(), p.len(), &mut len), 1);
+        assert_eq!(len, 1);
+
+        let un = crdtsync_undo_undo(undo, doc);
+        assert_eq!(crdtsync_doc_list_len(doc, p.as_ptr(), p.len(), &mut len), 1);
+        assert_eq!(len, 0, "the inserted item is removed");
+
+        crdtsync_buf_free(ins);
+        crdtsync_buf_free(un);
+        crdtsync_undo_free(undo);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn a_null_undo_handle_is_inert() {
+    unsafe {
+        assert_eq!(crdtsync_undo_can_undo(ptr::null()), -1);
+        assert_eq!(crdtsync_undo_can_redo(ptr::null()), -1);
+        let doc = crdtsync_doc_new(client(1).as_ptr());
+        let buf = crdtsync_undo_undo(ptr::null_mut(), doc);
+        crdtsync_buf_free(buf);
+        crdtsync_doc_free(doc);
+        crdtsync_undo_free(ptr::null_mut());
+    }
+}

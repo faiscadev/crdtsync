@@ -21,7 +21,7 @@
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, encode_message, encode_ops, path, Channel, ClientId, ClientSession, Document,
-    Message,
+    Message, Scalar, UndoManager,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
@@ -536,6 +536,279 @@ where
             }
             None => 0,
         }
+    }))
+    .unwrap_or(-1)
+}
+
+// --- undo / redo ---
+//
+// A per-user undo manager over one document. Edits recorded through it capture
+// their inverse; `undo`/`redo` emit ordinary ops that converge on peers like any
+// edit. The manager is a handle distinct from the document it drives, so every
+// call names both. Edits return the ops to broadcast, encoded like a doc edit.
+
+/// Opaque undo-manager handle.
+pub struct CrdtUndo {
+    undo: UndoManager,
+}
+
+/// Open an undo manager. It drives whichever document is passed to each call.
+///
+/// # Safety
+/// The returned handle is freed with [`crdtsync_undo_free`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_new() -> *mut CrdtUndo {
+    catch_unwind(AssertUnwindSafe(|| {
+        Box::into_raw(Box::new(CrdtUndo {
+            undo: UndoManager::new(),
+        }))
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// # Safety
+/// `undo` must be a handle from `crdtsync_undo_new`, not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_free(undo: *mut CrdtUndo) {
+    if undo.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(undo))));
+}
+
+/// Record a path-addressed edit through the manager, applying it to `doc` and
+/// returning the ops to broadcast.
+unsafe fn undo_edit<F>(
+    undo: *mut CrdtUndo,
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    run: F,
+) -> CrdtBuf
+where
+    F: FnOnce(&mut UndoManager, &mut Document, &[u8]) -> Vec<Op>,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if undo.is_null() || doc.is_null() {
+            return CrdtBuf::empty();
+        }
+        let Some(p) = as_slice(path, path_len) else {
+            return CrdtBuf::empty();
+        };
+        let ops = run(&mut (*undo).undo, &mut (*doc).doc, p);
+        CrdtBuf::from_vec(encode_ops(&ops))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Set an integer Register at a path as one undo step. Returns the ops.
+///
+/// # Safety
+/// `undo`/`doc` are live handles; `path`/`path_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_register_int(
+    undo: *mut CrdtUndo,
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    value: i64,
+) -> CrdtBuf {
+    undo_edit(undo, doc, path, path_len, |u, d, p| {
+        u.register(d, p, Scalar::Int(value))
+    })
+}
+
+/// Increment a Counter at a path as one undo step. Returns the ops.
+///
+/// # Safety
+/// As [`crdtsync_undo_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_inc(
+    undo: *mut CrdtUndo,
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    amount: u32,
+) -> CrdtBuf {
+    undo_edit(undo, doc, path, path_len, |u, d, p| u.inc(d, p, amount))
+}
+
+/// Decrement a Counter at a path as one undo step. Returns the ops.
+///
+/// # Safety
+/// As [`crdtsync_undo_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_dec(
+    undo: *mut CrdtUndo,
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    amount: u32,
+) -> CrdtBuf {
+    undo_edit(undo, doc, path, path_len, |u, d, p| u.dec(d, p, amount))
+}
+
+/// Tombstone the Register slot at a path as one undo step. Returns the ops.
+///
+/// # Safety
+/// As [`crdtsync_undo_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_delete(
+    undo: *mut CrdtUndo,
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+) -> CrdtBuf {
+    undo_edit(undo, doc, path, path_len, |u, d, p| u.delete(d, p))
+}
+
+/// Insert a bytes item at a live index in the List at a path as one undo step.
+///
+/// # Safety
+/// `undo`/`doc` are live handles; `path`/`path_len` and `value`/`value_len` each
+/// follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_list_insert(
+    undo: *mut CrdtUndo,
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    value: *const u8,
+    value_len: usize,
+) -> CrdtBuf {
+    let Some(val) = as_slice(value, value_len) else {
+        return CrdtBuf::empty();
+    };
+    undo_edit(undo, doc, path, path_len, |u, d, p| {
+        u.list_insert(d, p, index, val)
+    })
+}
+
+/// Tombstone the live item at an index in the List at a path as one undo step.
+///
+/// # Safety
+/// As [`crdtsync_undo_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_list_delete(
+    undo: *mut CrdtUndo,
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+) -> CrdtBuf {
+    undo_edit(undo, doc, path, path_len, |u, d, p| {
+        u.list_delete(d, p, index)
+    })
+}
+
+/// Insert UTF-8 text at a codepoint index in the Text at a path as one undo step.
+///
+/// # Safety
+/// `undo`/`doc` are live handles; `path`/`path_len` and `s`/`s_len` each follow
+/// [`as_slice`]. `s` must be valid UTF-8; invalid bytes yield an empty result.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_text_insert(
+    undo: *mut CrdtUndo,
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    s: *const u8,
+    s_len: usize,
+) -> CrdtBuf {
+    let Some(bytes) = as_slice(s, s_len) else {
+        return CrdtBuf::empty();
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return CrdtBuf::empty();
+    };
+    undo_edit(undo, doc, path, path_len, |u, d, p| {
+        u.text_insert(d, p, index, text)
+    })
+}
+
+/// Tombstone `count` codepoints from an index in the Text at a path as one undo
+/// step. Returns the ops.
+///
+/// # Safety
+/// As [`crdtsync_undo_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_text_delete(
+    undo: *mut CrdtUndo,
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    count: usize,
+) -> CrdtBuf {
+    undo_edit(undo, doc, path, path_len, |u, d, p| {
+        u.text_delete(d, p, index, count)
+    })
+}
+
+/// Revert the most recent intention, applying it to `doc` and returning the ops
+/// to broadcast — empty when there is nothing to undo.
+///
+/// # Safety
+/// `undo`/`doc` are live handles.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_undo(undo: *mut CrdtUndo, doc: *mut CrdtDoc) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if undo.is_null() || doc.is_null() {
+            return CrdtBuf::empty();
+        }
+        let ops = (*undo).undo.undo(&mut (*doc).doc).unwrap_or_default();
+        CrdtBuf::from_vec(encode_ops(&ops))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Replay the most recently undone intention. Returns the ops — empty when there
+/// is nothing to redo.
+///
+/// # Safety
+/// `undo`/`doc` are live handles.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_redo(undo: *mut CrdtUndo, doc: *mut CrdtDoc) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if undo.is_null() || doc.is_null() {
+            return CrdtBuf::empty();
+        }
+        let ops = (*undo).undo.redo(&mut (*doc).doc).unwrap_or_default();
+        CrdtBuf::from_vec(encode_ops(&ops))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Whether there is a recorded intention to undo (1), none (0), or a bad handle
+/// (-1).
+///
+/// # Safety
+/// `undo` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_can_undo(undo: *const CrdtUndo) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if undo.is_null() {
+            return -1;
+        }
+        i32::from((*undo).undo.can_undo())
+    }))
+    .unwrap_or(-1)
+}
+
+/// Whether there is an undone intention to redo (1), none (0), or a bad handle
+/// (-1).
+///
+/// # Safety
+/// `undo` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_undo_can_redo(undo: *const CrdtUndo) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if undo.is_null() {
+            return -1;
+        }
+        i32::from((*undo).undo.can_redo())
     }))
     .unwrap_or(-1)
 }

@@ -36,6 +36,22 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_doc_text_get",
         // sync
         "crdtsync_doc_apply",
+        // undo / redo
+        "typedef struct CrdtUndo CrdtUndo;",
+        "crdtsync_undo_new",
+        "crdtsync_undo_free",
+        "crdtsync_undo_register_int",
+        "crdtsync_undo_inc",
+        "crdtsync_undo_dec",
+        "crdtsync_undo_delete",
+        "crdtsync_undo_list_insert",
+        "crdtsync_undo_list_delete",
+        "crdtsync_undo_text_insert",
+        "crdtsync_undo_text_delete",
+        "crdtsync_undo_undo",
+        "crdtsync_undo_redo",
+        "crdtsync_undo_can_undo",
+        "crdtsync_undo_can_redo",
         // wire client session
         "typedef struct CrdtClient CrdtClient;",
         "crdtsync_client_new",
