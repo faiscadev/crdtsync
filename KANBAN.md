@@ -63,13 +63,13 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **SDK wiring — wire client through the SDKs** — the C ABI now exposes a `CrdtClient` (wire `ClientSession`): new/free, hello, subscribe→channel, receive, per-channel path edits (register_int/inc/set_bytes/delete) that return the `Ops` frame, per-channel reads, last-seen seq; core gained `ClientSession::document_mut` so the FFI reuses the `path::` façade (#77). Next slices: auth (`auth`/`actor`) + awareness (`set_awareness` + peer view) + `unsubscribe`/`resume` on the C ABI, then the wasm / Python / Go bindings over the new symbols. → *SDKs*.
 
 ---
 
 ## ⏭ Next
 
-- **SDK wiring — auth + awareness + multi-room** — the core `ClientSession` gained auth (`auth`/`actor`), awareness (`set_awareness` + peer view), and N-room multiplexing, but the FFI / wasm / Python / Go SDKs still expose only the older single-room, no-auth surface. Thread the new capabilities through the C ABI and each binding. Dependency-ready (logic built); large, so per-SDK slices. → *SDKs*. (v0.2, ready)
+- **SDK wiring — remaining** — on the C ABI: client-side auth (`auth`/`actor`) + awareness (`set_awareness` + peer view) + `unsubscribe`/`resume`. Then the wasm / Python / Go bindings over the full `CrdtClient` surface. The FFI spine landed (#77, In progress). → *SDKs*. (v0.2, ready)
 - **mTLS credential carrier** — a client certificate as the fast-path credential. Blocked: the server terminates plain TCP with no TLS layer to expose the cert; land TLS termination first. → *Networking / Handshake*. (v0.2, blocked on TLS)
 
 ---

@@ -10,6 +10,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+// Opaque wire-client handle.
+typedef struct CrdtClient CrdtClient;
+
 // Opaque document handle.
 typedef struct CrdtDoc CrdtDoc;
 
@@ -206,6 +209,115 @@ CrdtBuf crdtsync_doc_encode_state(const CrdtDoc *doc);
 // # Safety
 // `bytes`/`len` follow [`as_slice`].
 CrdtDoc *crdtsync_doc_decode_state(const uint8_t *bytes, uintptr_t len);
+
+// Open a wire client for the 16-byte client id at `client`. Null on bad input.
+//
+// # Safety
+// `client` must point to 16 readable bytes.
+CrdtClient *crdtsync_client_new(const uint8_t *client);
+
+// # Safety
+// `client` must be a handle from `crdtsync_client_new`, not yet freed.
+void crdtsync_client_free(CrdtClient *client);
+
+// The opening Hello frame to send, naming this client. Empty on a bad handle.
+//
+// # Safety
+// `client` is a live handle.
+CrdtBuf crdtsync_client_hello(const CrdtClient *client);
+
+// Join `room` on a fresh channel, writing the assigned channel to `out_channel`
+// and returning the Subscribe frame to send. Empty on a bad handle or input.
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len` follow [`as_slice`];
+// `out_channel` points to a writable `u32`.
+CrdtBuf crdtsync_client_subscribe(CrdtClient *client,
+                                  const uint8_t *room,
+                                  uintptr_t room_len,
+                                  uint32_t *out_channel);
+
+// Fold one received wire frame into the addressed room. Returns 1 when applied,
+// 0 when the frame is undecodable or the session refuses it, -1 on a bad handle.
+//
+// # Safety
+// `client` is a live handle; `msg`/`msg_len` follow [`as_slice`].
+int32_t crdtsync_client_receive(CrdtClient *client, const uint8_t *msg, uintptr_t msg_len);
+
+// The highest server sequence `channel`'s room has caught up to, into `out`.
+// Returns 1 on success, 0 if the channel isn't held, -1 on a bad handle.
+//
+// # Safety
+// `client` is a live handle; `out` points to a writable `u64`.
+int32_t crdtsync_client_last_seen_seq(const CrdtClient *client, uint32_t channel, uint64_t *out);
+
+// Install-or-set an integer Register at a path in `channel`'s room. Returns the
+// Ops frame to send; empty on a bad handle, path, or unheld channel.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_register_int(CrdtClient *client,
+                                     uint32_t channel,
+                                     const uint8_t *path,
+                                     uintptr_t path_len,
+                                     int64_t value);
+
+// Install-or-increment a Counter at a path in `channel`'s room. Returns the Ops
+// frame to send.
+//
+// # Safety
+// As [`crdtsync_client_register_int`].
+CrdtBuf crdtsync_client_inc(CrdtClient *client,
+                            uint32_t channel,
+                            const uint8_t *path,
+                            uintptr_t path_len,
+                            uint32_t amount);
+
+// Set a bytes scalar at a path in `channel`'s room. Returns the Ops frame.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` and `value`/`value_len` each
+// follow [`as_slice`].
+CrdtBuf crdtsync_client_set_bytes(CrdtClient *client,
+                                  uint32_t channel,
+                                  const uint8_t *path,
+                                  uintptr_t path_len,
+                                  const uint8_t *value,
+                                  uintptr_t value_len);
+
+// Tombstone the slot at a path in `channel`'s room. Returns the Ops frame.
+//
+// # Safety
+// As [`crdtsync_client_register_int`].
+CrdtBuf crdtsync_client_delete(CrdtClient *client,
+                               uint32_t channel,
+                               const uint8_t *path,
+                               uintptr_t path_len);
+
+// Read an integer Register at a path in `channel`'s room into `out`. Returns 1
+// on success, 0 if absent or the channel isn't held, -1 on a bad handle.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` follow [`as_slice`]; `out`
+// points to a writable `i64`.
+int32_t crdtsync_client_get_int(const CrdtClient *client,
+                                uint32_t channel,
+                                const uint8_t *path,
+                                uintptr_t path_len,
+                                int64_t *out);
+
+// Read a bytes scalar at a path in `channel`'s room into a fresh buffer at
+// `out` the caller frees. Returns 1 on success, 0 if absent or the channel
+// isn't held, -1 on a bad handle.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` follow [`as_slice`]; `out`
+// points to a writable `CrdtBuf`.
+int32_t crdtsync_client_get_bytes(const CrdtClient *client,
+                                  uint32_t channel,
+                                  const uint8_t *path,
+                                  uintptr_t path_len,
+                                  CrdtBuf *out);
 
 #ifdef __cplusplus
 }  // extern "C"

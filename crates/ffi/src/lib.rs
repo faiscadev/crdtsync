@@ -19,7 +19,10 @@
 //! rejects null or malformed input rather than dereferencing it.
 
 use crdtsync_core::op::Op;
-use crdtsync_core::{encode_ops, path, ClientId, Document};
+use crdtsync_core::{
+    decode_message, encode_message, encode_ops, path, Channel, ClientId, ClientSession, Document,
+    Message,
+};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 
@@ -517,6 +520,338 @@ where
                 *out = CrdtBuf::from_vec(b);
                 1
             }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+// --- wire client session ---
+//
+// The sync client on top of the CRDT core: it holds a replica per subscribed
+// room and turns local edits into wire messages to send, and folds received
+// wire messages back in. Messages cross the boundary as encoded byte buffers
+// (the same frames the server speaks); a room is addressed by the `u32` channel
+// the client assigns at subscribe.
+
+/// Opaque wire-client handle.
+pub struct CrdtClient {
+    session: ClientSession,
+}
+
+/// Open a wire client for the 16-byte client id at `client`. Null on bad input.
+///
+/// # Safety
+/// `client` must point to 16 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_new(client: *const u8) -> *mut CrdtClient {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return std::ptr::null_mut();
+        }
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(slice::from_raw_parts(client, 16));
+        Box::into_raw(Box::new(CrdtClient {
+            session: ClientSession::new(ClientId::from_bytes(bytes)),
+        }))
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// # Safety
+/// `client` must be a handle from `crdtsync_client_new`, not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_free(client: *mut CrdtClient) {
+    if client.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(client))));
+}
+
+/// The opening Hello frame to send, naming this client. Empty on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_hello(client: *const CrdtClient) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        CrdtBuf::from_vec(encode_message(&(*client).session.hello()))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Join `room` on a fresh channel, writing the assigned channel to `out_channel`
+/// and returning the Subscribe frame to send. Empty on a bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len` follow [`as_slice`];
+/// `out_channel` points to a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_subscribe(
+    client: *mut CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    out_channel: *mut u32,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out_channel.is_null() {
+            return CrdtBuf::empty();
+        }
+        let Some(r) = as_slice(room, room_len) else {
+            return CrdtBuf::empty();
+        };
+        let (channel, msg) = (*client).session.subscribe(r);
+        *out_channel = channel.0;
+        CrdtBuf::from_vec(encode_message(&msg))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Fold one received wire frame into the addressed room. Returns 1 when applied,
+/// 0 when the frame is undecodable or the session refuses it, -1 on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle; `msg`/`msg_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_receive(
+    client: *mut CrdtClient,
+    msg: *const u8,
+    msg_len: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return -1;
+        }
+        let Some(bytes) = as_slice(msg, msg_len) else {
+            return -1;
+        };
+        let Ok(message) = decode_message(bytes) else {
+            return 0;
+        };
+        match (*client).session.receive(message) {
+            Ok(()) => 1,
+            Err(_) => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// The highest server sequence `channel`'s room has caught up to, into `out`.
+/// Returns 1 on success, 0 if the channel isn't held, -1 on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle; `out` points to a writable `u64`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_last_seen_seq(
+    client: *const CrdtClient,
+    channel: u32,
+    out: *mut u64,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        match (*client).session.last_seen_seq(Channel(channel)) {
+            Some(seq) => {
+                *out = seq;
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Install-or-set an integer Register at a path in `channel`'s room. Returns the
+/// Ops frame to send; empty on a bad handle, path, or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_register_int(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    value: i64,
+) -> CrdtBuf {
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::register_int(d, p, value)
+    })
+}
+
+/// Install-or-increment a Counter at a path in `channel`'s room. Returns the Ops
+/// frame to send.
+///
+/// # Safety
+/// As [`crdtsync_client_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_inc(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    amount: u32,
+) -> CrdtBuf {
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::inc(d, p, amount)
+    })
+}
+
+/// Set a bytes scalar at a path in `channel`'s room. Returns the Ops frame.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` and `value`/`value_len` each
+/// follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_set_bytes(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    value: *const u8,
+    value_len: usize,
+) -> CrdtBuf {
+    let Some(val) = as_slice(value, value_len) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::set_bytes(d, p, val)
+    })
+}
+
+/// Tombstone the slot at a path in `channel`'s room. Returns the Ops frame.
+///
+/// # Safety
+/// As [`crdtsync_client_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_delete(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+) -> CrdtBuf {
+    client_edit(client, channel, path, path_len, |d, p| path::delete(d, p))
+}
+
+/// Read an integer Register at a path in `channel`'s room into `out`. Returns 1
+/// on success, 0 if absent or the channel isn't held, -1 on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` follow [`as_slice`]; `out`
+/// points to a writable `i64`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_get_int(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut i64,
+) -> i32 {
+    client_read(
+        client,
+        channel,
+        path,
+        path_len,
+        out,
+        |d, p, o| match path::get_int(d, p) {
+            Some(n) => {
+                *o = n;
+                1
+            }
+            None => 0,
+        },
+    )
+}
+
+/// Read a bytes scalar at a path in `channel`'s room into a fresh buffer at
+/// `out` the caller frees. Returns 1 on success, 0 if absent or the channel
+/// isn't held, -1 on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` follow [`as_slice`]; `out`
+/// points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_get_bytes(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    client_read(
+        client,
+        channel,
+        path,
+        path_len,
+        out,
+        |d, p, o| match path::get_bytes(d, p) {
+            Some(b) => {
+                *o = CrdtBuf::from_vec(b);
+                1
+            }
+            None => 0,
+        },
+    )
+}
+
+/// Marshal a path-addressed edit on `channel`'s room: run the navigation against
+/// the room's replica, wrap the emitted ops in the Ops frame to send, and never
+/// let a panic cross the C frame. Empty when the channel isn't held.
+unsafe fn client_edit<F>(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    run: F,
+) -> CrdtBuf
+where
+    F: FnOnce(&mut Document, &[u8]) -> Vec<Op>,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        let Some(p) = as_slice(path, path_len) else {
+            return CrdtBuf::empty();
+        };
+        let Some(doc) = (*client).session.document_mut(Channel(channel)) else {
+            return CrdtBuf::empty();
+        };
+        let ops = run(doc, p);
+        CrdtBuf::from_vec(encode_message(&Message::Ops {
+            channel: Channel(channel),
+            ops,
+        }))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Read a slot on `channel`'s room through `run`, which writes into `out` and
+/// returns the status code. -1 on a bad handle or output pointer.
+unsafe fn client_read<T, F>(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut T,
+    run: F,
+) -> i32
+where
+    F: FnOnce(&Document, &[u8], *mut T) -> i32,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        let Some(p) = as_slice(path, path_len) else {
+            return 0;
+        };
+        match (*client).session.document(Channel(channel)) {
+            Some(doc) => run(doc, p, out),
             None => 0,
         }
     }))
