@@ -66,6 +66,7 @@ pub struct Hub {
     server: ClientId,
     rooms: HashMap<RoomId, Room>,
     store: Option<Store>,
+    compaction_threshold: u64,
 }
 
 impl Hub {
@@ -75,7 +76,16 @@ impl Hub {
             server,
             rooms: HashMap::new(),
             store: None,
+            compaction_threshold: 0,
         }
+    }
+
+    /// Auto-compact a room once its retained log reaches `threshold` ops, folding
+    /// the log into a snapshot in the same ingest that crosses it. The snapshot
+    /// is persisted when a store is attached. `0` disables the policy, leaving
+    /// compaction entirely to explicit [`compact`](Hub::compact) calls.
+    pub fn set_compaction_threshold(&mut self, threshold: u64) {
+        self.compaction_threshold = threshold;
     }
 
     /// A hub rebuilt from each room's persisted snapshot and log. A room with a
@@ -132,6 +142,7 @@ impl Hub {
     /// batch to broadcast to the room's subscribers.
     pub fn ingest(&mut self, room: &[u8], ops: Vec<Op>) -> io::Result<Vec<Op>> {
         let server = self.server;
+        let key = room;
         // The ops not already logged, deduped within the batch too — the set
         // that would grow the log.
         let fresh: Vec<Op> = {
@@ -154,6 +165,13 @@ impl Hub {
             room.seen.insert(op.id);
             room.doc.apply(op);
             room.log.push(op.clone());
+        }
+        // A retained log that has grown to the threshold folds into a snapshot
+        // now, resetting the window; the applied batch is returned unchanged.
+        if self.compaction_threshold > 0
+            && self.rooms.get(key).map_or(0, |r| r.log.len() as u64) >= self.compaction_threshold
+        {
+            self.compact(key)?;
         }
         Ok(fresh)
     }

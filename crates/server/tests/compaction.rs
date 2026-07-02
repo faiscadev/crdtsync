@@ -201,6 +201,77 @@ fn an_uncompacted_room_still_serves_ops_from_zero() {
     assert_eq!(ops(h.catch_up(ROOM, 0)).len(), 2);
 }
 
+// --- automatic compaction policy ---
+
+/// Ingest `count` single-op counter increments.
+fn ingest_incs(h: &mut Hub, count: usize) {
+    let mut a = doc(1);
+    for _ in 0..count {
+        ingest(h, ROOM, a.transact(|tx| tx.inc(b"n", 1)));
+    }
+}
+
+#[test]
+fn without_a_threshold_a_room_is_never_compacted() {
+    let mut h = hub();
+    ingest_incs(&mut h, 6);
+    // No policy: a from-zero subscriber still replays the whole log as ops.
+    assert_eq!(ops(h.catch_up(ROOM, 0)).len(), 6);
+}
+
+#[test]
+fn crossing_the_threshold_auto_compacts() {
+    let mut h = hub();
+    h.set_compaction_threshold(3);
+    ingest_incs(&mut h, 3);
+    // The retained log hit the threshold and folded into a snapshot: a from-zero
+    // subscriber gets a snapshot, and the head sequence is preserved.
+    let (snap_seq, restored) = snapshot(h.catch_up(ROOM, 0));
+    assert_eq!(snap_seq, 3);
+    assert_eq!(h.seq(ROOM), 3);
+    assert_eq!(counter(restored.get(b"n")), 3);
+}
+
+#[test]
+fn auto_compaction_resets_its_window() {
+    let mut h = hub();
+    h.set_compaction_threshold(3);
+    ingest_incs(&mut h, 3); // compacts at the third op
+
+    // The window resets after compaction: one more op does not re-compact, so a
+    // subscriber at the floor gets it as a delta rather than a fresh snapshot.
+    let mut a = doc(2);
+    let later = ingest(&mut h, ROOM, a.transact(|tx| tx.inc(b"n", 1)));
+    assert_eq!(ops(h.catch_up(ROOM, 3)), later);
+    assert_eq!(h.seq(ROOM), 4);
+}
+
+#[test]
+fn a_batch_that_overshoots_the_threshold_still_compacts() {
+    let mut h = hub();
+    h.set_compaction_threshold(2);
+    let mut a = doc(1);
+    let mut batch = a.transact(|tx| tx.inc(b"n", 1));
+    batch.extend(a.transact(|tx| tx.inc(b"n", 1)));
+    batch.extend(a.transact(|tx| tx.inc(b"n", 1)));
+    ingest(&mut h, ROOM, batch); // 3 ops in one batch, threshold 2
+    let (snap_seq, _) = snapshot(h.catch_up(ROOM, 0));
+    assert_eq!(snap_seq, 3);
+}
+
+#[test]
+fn auto_compaction_preserves_dedup() {
+    let mut h = hub();
+    h.set_compaction_threshold(1);
+    let mut a = doc(1);
+    let op = a.transact(|tx| tx.register(b"k", Scalar::Int(9)));
+    ingest(&mut h, ROOM, op.clone()); // threshold 1: compacts at once
+                                      // The compacted op is still deduped on a resend.
+    assert!(ingest(&mut h, ROOM, op).is_empty());
+    assert_eq!(h.seq(ROOM), 1);
+    assert_eq!(int(h.get(ROOM, b"k")), 9);
+}
+
 // --- nested state through the snapshot ---
 
 #[test]
