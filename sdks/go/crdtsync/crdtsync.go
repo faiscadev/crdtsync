@@ -43,12 +43,27 @@ func New(clientID []byte) (*Document, error) {
 	return &Document{h: h}, nil
 }
 
+// DecodeState opens a document from a snapshot produced by EncodeState.
+func DecodeState(state []byte) (*Document, error) {
+	sp, sl := bytesArg(state)
+	h := C.crdtsync_doc_decode_state(sp, sl)
+	if h == nil {
+		return nil, errors.New("failed to decode document snapshot")
+	}
+	return &Document{h: h}, nil
+}
+
 // Close frees the document. Safe to call more than once.
 func (d *Document) Close() {
 	if d.h != nil {
 		C.crdtsync_doc_free(d.h)
 		d.h = nil
 	}
+}
+
+// EncodeState serializes the whole replica to a canonical snapshot.
+func (d *Document) EncodeState() []byte {
+	return takeBuf(C.crdtsync_doc_encode_state(d.h))
 }
 
 // EncodePath encodes a path as the ABI expects: each key a little-endian u32

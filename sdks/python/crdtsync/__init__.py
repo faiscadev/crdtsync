@@ -78,6 +78,8 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_text_len, [doc, cbytes, size, c.POINTER(size)], c.c_int32)
     sig(lib.crdtsync_doc_text_get, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_doc_apply, [doc, cbytes, size], c.c_int32)
+    sig(lib.crdtsync_doc_encode_state, [doc], buf)
+    sig(lib.crdtsync_doc_decode_state, [cbytes, size], doc)
     return lib
 
 
@@ -235,6 +237,19 @@ class Document:
     def apply(self, ops: bytes) -> int:
         """Fold a peer's encoded ops in. Returns the number applied, -1 on error."""
         return _LIB.crdtsync_doc_apply(self._handle, ops, len(ops))
+
+    def encode_state(self) -> bytes:
+        """Serialize the whole replica to a canonical snapshot."""
+        return _take_buf(_LIB.crdtsync_doc_encode_state(self._handle))
+
+    @classmethod
+    def decode_state(cls, state: bytes) -> "Document":
+        """Open a document from a snapshot produced by :meth:`encode_state`."""
+        obj = cls.__new__(cls)
+        obj._handle = _LIB.crdtsync_doc_decode_state(state, len(state))
+        if not obj._handle:
+            raise ValueError("failed to decode document snapshot")
+        return obj
 
     # --- helpers ---
 
