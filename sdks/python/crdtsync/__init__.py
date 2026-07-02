@@ -106,6 +106,14 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         c.c_int32,
     )
     sig(lib.crdtsync_client_awareness_len, [doc, ch, c.POINTER(size)], c.c_int32)
+    sig(lib.crdtsync_client_create_version, [doc, ch, cbytes, size], buf)
+    sig(lib.crdtsync_client_rename_version, [doc, ch, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_delete_version, [doc, ch, cbytes, size], buf)
+    sig(lib.crdtsync_client_list_versions, [doc, ch], buf)
+    sig(lib.crdtsync_client_fetch_version, [doc, ch, cbytes, size], buf)
+    sig(lib.crdtsync_client_version_count, [doc, ch, c.POINTER(size)], c.c_int32)
+    sig(lib.crdtsync_client_version_name, [doc, ch, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_version_state, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
     return lib
 
 
@@ -448,3 +456,64 @@ class Client:
         out = ctypes.c_size_t()
         rc = _LIB.crdtsync_client_awareness_len(self._handle, channel, ctypes.byref(out))
         return out.value if rc == 1 else 0
+
+    # --- named versions ---
+
+    def create_version(self, channel: int, name: bytes) -> bytes:
+        """Frame a request to capture ``channel``'s room as version ``name``."""
+        _u32("channel", channel)
+        return _take_buf(
+            _LIB.crdtsync_client_create_version(self._handle, channel, name, len(name))
+        )
+
+    def rename_version(self, channel: int, frm: bytes, to: bytes) -> bytes:
+        """Frame a request to rename version ``frm`` to ``to``."""
+        _u32("channel", channel)
+        return _take_buf(
+            _LIB.crdtsync_client_rename_version(
+                self._handle, channel, frm, len(frm), to, len(to)
+            )
+        )
+
+    def delete_version(self, channel: int, name: bytes) -> bytes:
+        """Frame a request to delete version ``name``."""
+        _u32("channel", channel)
+        return _take_buf(
+            _LIB.crdtsync_client_delete_version(self._handle, channel, name, len(name))
+        )
+
+    def list_versions(self, channel: int) -> bytes:
+        """Frame a request for ``channel``'s room's version names."""
+        _u32("channel", channel)
+        return _take_buf(_LIB.crdtsync_client_list_versions(self._handle, channel))
+
+    def fetch_version(self, channel: int, name: bytes) -> bytes:
+        """Frame a request for the captured state of version ``name``."""
+        _u32("channel", channel)
+        return _take_buf(
+            _LIB.crdtsync_client_fetch_version(self._handle, channel, name, len(name))
+        )
+
+    def versions(self, channel: int) -> List[bytes]:
+        """The version names last reported for ``channel``'s room, in order."""
+        _u32("channel", channel)
+        count = ctypes.c_size_t()
+        rc = _LIB.crdtsync_client_version_count(self._handle, channel, ctypes.byref(count))
+        if rc != 1:
+            return []
+        out = []
+        for i in range(count.value):
+            buf = _CrdtBuf()
+            got = _LIB.crdtsync_client_version_name(self._handle, channel, i, ctypes.byref(buf))
+            if got == 1:
+                out.append(_take_buf(buf))
+        return out
+
+    def version_state(self, channel: int, name: bytes) -> Optional[bytes]:
+        """The captured state of a fetched version ``name``, once it has arrived."""
+        _u32("channel", channel)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_version_state(
+            self._handle, channel, name, len(name), ctypes.byref(out)
+        )
+        return _take_buf(out) if rc == 1 else None

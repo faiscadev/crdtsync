@@ -390,3 +390,60 @@ func (c *Client) AwarenessLen(channel uint32) uint {
 	}
 	return uint(out)
 }
+
+// CreateVersion frames a request to capture channel's room as version name.
+func (c *Client) CreateVersion(channel uint32, name []byte) []byte {
+	np, nl := bytesArg(name)
+	return takeBuf(C.crdtsync_client_create_version(c.h, C.uint32_t(channel), np, nl))
+}
+
+// RenameVersion frames a request to rename version from to to.
+func (c *Client) RenameVersion(channel uint32, from, to []byte) []byte {
+	fp, fl := bytesArg(from)
+	tp, tl := bytesArg(to)
+	return takeBuf(C.crdtsync_client_rename_version(c.h, C.uint32_t(channel), fp, fl, tp, tl))
+}
+
+// DeleteVersion frames a request to delete version name.
+func (c *Client) DeleteVersion(channel uint32, name []byte) []byte {
+	np, nl := bytesArg(name)
+	return takeBuf(C.crdtsync_client_delete_version(c.h, C.uint32_t(channel), np, nl))
+}
+
+// ListVersions frames a request for channel's room's version names.
+func (c *Client) ListVersions(channel uint32) []byte {
+	return takeBuf(C.crdtsync_client_list_versions(c.h, C.uint32_t(channel)))
+}
+
+// FetchVersion frames a request for the captured state of version name.
+func (c *Client) FetchVersion(channel uint32, name []byte) []byte {
+	np, nl := bytesArg(name)
+	return takeBuf(C.crdtsync_client_fetch_version(c.h, C.uint32_t(channel), np, nl))
+}
+
+// Versions returns the version names last reported for channel's room, in order.
+func (c *Client) Versions(channel uint32) [][]byte {
+	var count C.uintptr_t
+	if C.crdtsync_client_version_count(c.h, C.uint32_t(channel), &count) != 1 {
+		return nil
+	}
+	names := make([][]byte, 0, int(count))
+	for i := 0; i < int(count); i++ {
+		var out C.CrdtBuf
+		if C.crdtsync_client_version_name(c.h, C.uint32_t(channel), C.uintptr_t(i), &out) == 1 {
+			names = append(names, takeBuf(out))
+		}
+	}
+	return names
+}
+
+// VersionState returns the captured state of a fetched version name, if present.
+func (c *Client) VersionState(channel uint32, name []byte) ([]byte, bool) {
+	np, nl := bytesArg(name)
+	var out C.CrdtBuf
+	rc := C.crdtsync_client_version_state(c.h, C.uint32_t(channel), np, nl, &out)
+	if rc != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
