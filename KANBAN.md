@@ -47,6 +47,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Op acknowledgement (client outbox)** — `ClientSession` retains authored ops per channel; `edit`/`atomic_edit`/`commit_atomic` enqueue, `receive(Accepted{through})` prunes `id.seq <= through`, `resend(channel)` re-emits the unacked tail after reconnect, `outbox_len(channel)` is the queue depth (#122). `client_outbox.rs`. Unit 2 — the **offline-queue** half at the client seat; peer ops fanned in never touch the outbox, so `Accepted` alone drains it.
 
+**Op acknowledgement (server ack)** — session `step` replies `Accepted{channel, through=max OpId.seq of the submitted batch}` to the author after a durable `Hub::ingest` (over the whole batch, so a resent-but-known op is still acked; empty batch acks nothing) (#PR). **Offline queue now works end-to-end** — client outbox ↔ server ack, proven by a `ClientSession`↔`step` drain test. Unit 3 of the op-ack gate; `Ack`-recording-into-the-watermark deferred to Unit 4 (with its GC consumer + Clock/horizon).
+
 **Forward-compat reservations** — blob-ref value slot `Scalar::BlobRef` reserved in the op envelope + codec (#60); error-envelope `details` byte string reserved in `Message::Error` + codec (#108) — round-tripped, empty, no producer yet, so the SDK error surface stays code + message.
 
 **Channel multiplexing** — one connection multiplexes many rooms via client-assigned `Channel`; server session holds channel→room, registry fans out per peer-channel (#61); SDK-side `ClientSession` holds N rooms, each with its own replica + last-seen seq, routing inbound frames by channel, reconnect via `resume(channel)` (#62). Arc complete.
@@ -139,7 +141,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight — Op-ack Unit 3 next)_
+- _(nothing in flight — Op-ack Unit 4 next: tombstone GC + Ack-watermark recording)_
 
 ---
 
@@ -148,8 +150,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 - **Op acknowledgement — the gate that unlocks offline-queue + tombstone-GC** (§Op Acknowledgement, opened 2026-07-02, DECISIONS). One ack concept, two directions, sliced dependency-order:
   - **Unit 1 — wire frames — DONE (#121)**: `Message::Accepted`/`Ack` (tags 18/19) + codec + `protocol_ack.rs`; exhaustive-match placeholder arms in client `receive` / server `step` that Units 2–3 replace.
   - **Unit 2 — client outbox / offline queue — DONE (#122)**: `ClientSession` retains authored ops per channel; `edit`/`atomic_edit`/`commit_atomic` enqueue; `receive(Accepted{through})` prunes `id.seq <= through`; `resend(channel)` re-emits the unpruned tail; `outbox_len(channel)` exposes the queue depth. `client_outbox.rs`. Delivers the **offline-queue** half at the client seat (the server ack that drives it is Unit 3).
-  - **Unit 3 — server ack** (needs Unit 1): session `step` replies `Accepted{channel, through=max OpId.seq of the sender's committed ops}` to the author after `Hub::ingest`; records inbound `Ack{channel, seq}` as the sender's last-acked server seq in a per-client registry (Clock-stamped, #71 seam, for horizon eviction). Sender-directed reply, distinct from the fan-out path. Spec first.
-  - **Unit 4 — tombstone GC + retention horizon** (needs Unit 3; folds in the queued *Tombstone GC* design-depth item): compaction drops leaf tombstones below `min(last-acked seq)` over clients within the retention horizon; a client past the horizon is evicted from the watermark, re-synced by Snapshot if it returns below the floor. Leaf-only (anchor-aware) drop, gated on the convergence harness. Delivers the **tombstone-GC** half.
+  - **Unit 3 — server ack — DONE (#PR)**: session `step` replies `Accepted{channel, through=max OpId.seq of the submitted batch}` to the author after a durable `Hub::ingest` (computed over the whole batch, not just fresh ops, so a resent-but-known op is still acked and pruned; an empty batch acks nothing). Sender-directed reply, distinct from fan-out. **Offline queue now works end-to-end** (client outbox ↔ server ack), proven by a client↔`step` drain test. Scope note: `Ack{seq}`-recording-into-the-watermark was folded into Unit 4 (its consumer + the Clock/horizon live there), so `step` still accepts-and-ignores `Ack` for now.
+  - **Unit 4 — tombstone GC + Ack watermark + retention horizon** (needs Unit 3; folds in the queued *Tombstone GC* design-depth item): record inbound `Ack{channel, seq}` as each client's last-acked server seq (Clock-stamped, #71 seam); compaction drops leaf tombstones below `min(last-acked seq)` over clients within the retention horizon; a client past the horizon is evicted from the watermark, re-synced by Snapshot if it returns below the floor. Leaf-only (anchor-aware) drop, gated on the convergence harness. Delivers the **tombstone-GC** half.
   - **Unit 5+ — SDK surface** (follow-on): `resend` + outbox introspection over FFI + Python/Go/wasm.
   → *Op Acknowledgement / Tombstone GC*. (v0.2)
 - **Atomic transactions — DONE (#102–#106)** — core (`Tx{id,count}` envelope, buffer-until-whole, seq-order commit), drive path (`ClientSession::atomic_edit`; server unchanged), the SDK surface at both the doc seat (`begin_atomic`/`commit_atomic` over FFI + Python/Go/wasm) and the client seat (per-channel begin/commit), and atomic-tx undo (`UndoManager::atomic_group`, #106). All-or-nothing view boundary, convergence preserved, verified end to end. Remaining scope constraints (one branch/zone/schema version, member cap) need the branch/zone/schema layers. → *Transactions*. (v0.2)

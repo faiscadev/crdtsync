@@ -111,10 +111,18 @@ fn ops_broadcast_to_other_members_but_not_the_sender() {
     let b = join(&mut r, 2, ROOM);
 
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
+    let through = ops.iter().map(|o| o.id.seq).max().unwrap();
     r.deliver(a, ops_msg(ops.clone()));
 
     assert_eq!(r.take_outbox(b), vec![ops_msg(ops)]);
-    assert!(r.take_outbox(a).is_empty(), "the sender gets no echo");
+    // The sender gets no op echo — only the acknowledgement of its own batch.
+    assert_eq!(
+        r.take_outbox(a),
+        vec![Message::Accepted {
+            channel: CH,
+            through
+        }]
+    );
 }
 
 #[test]

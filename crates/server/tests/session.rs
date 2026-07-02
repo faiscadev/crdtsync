@@ -314,9 +314,18 @@ fn ops_after_subscribe_ingest_and_broadcast() {
             ops: ops.clone(),
         },
     );
+    let through = ops.iter().map(|o| o.id.seq).max().unwrap();
     assert_eq!(r.broadcast, ops);
     assert_eq!(r.broadcast_room.as_deref(), Some(ROOM));
-    assert!(r.replies.is_empty() && !r.close);
+    // The author is acknowledged through its batch's highest op sequence.
+    assert_eq!(
+        r.replies,
+        vec![Message::Accepted {
+            channel: CH,
+            through
+        }]
+    );
+    assert!(!r.close);
     assert_eq!(h.seq(ROOM), 1);
 }
 
@@ -346,9 +355,88 @@ fn a_resent_op_batch_broadcasts_nothing() {
             ops: ops.clone(),
         },
     );
+    let through = ops.iter().map(|o| o.id.seq).max().unwrap();
     let r = st(&mut h, &mut s, Message::Ops { channel: CH, ops });
     assert!(r.broadcast.is_empty());
+    // A resent batch broadcasts nothing but is still acknowledged, so the
+    // author can prune an op the hub already holds.
+    assert_eq!(
+        r.replies,
+        vec![Message::Accepted {
+            channel: CH,
+            through
+        }]
+    );
     assert_eq!(h.seq(ROOM), 1);
+}
+
+#[test]
+fn the_ack_frontier_is_the_batchs_highest_op_seq() {
+    let mut h = hub();
+    let mut s = Session::new();
+    handshake(&mut h, &mut s, 1);
+    st(&mut h, &mut s, sub(ROOM, 0));
+    // A multi-op batch is acknowledged through its last member's sequence.
+    let ops = doc(1).transact(|tx| {
+        tx.register(b"a", Scalar::Int(1));
+        tx.register(b"b", Scalar::Int(2));
+    });
+    let through = ops.iter().map(|o| o.id.seq).max().unwrap();
+    let r = st(&mut h, &mut s, Message::Ops { channel: CH, ops });
+    assert_eq!(
+        r.replies,
+        vec![Message::Accepted {
+            channel: CH,
+            through
+        }]
+    );
+}
+
+#[test]
+fn an_empty_op_batch_is_not_acknowledged() {
+    let mut h = hub();
+    let mut s = Session::new();
+    handshake(&mut h, &mut s, 1);
+    st(&mut h, &mut s, sub(ROOM, 0));
+    // Nothing was authored, so there is no frontier to acknowledge.
+    let r = st(
+        &mut h,
+        &mut s,
+        Message::Ops {
+            channel: CH,
+            ops: vec![],
+        },
+    );
+    assert!(r.replies.is_empty());
+    assert!(r.broadcast.is_empty() && !r.close);
+}
+
+#[test]
+fn the_author_outbox_drains_against_the_server_ack() {
+    // The offline queue end to end: a client authors ops into its outbox, the
+    // server ingests and acknowledges, and the acknowledgement drains the outbox.
+    use crdtsync_core::client::ClientSession;
+    let mut h = hub();
+    let mut s = Session::new();
+    handshake(&mut h, &mut s, 1);
+    st(&mut h, &mut s, sub(ROOM, 0));
+
+    let mut client = ClientSession::new(cid(1));
+    let (ch, _) = client.subscribe(ROOM);
+    let outbound = client
+        .edit(ch, |c| c.register(b"age", Scalar::Int(30)))
+        .unwrap();
+    assert_eq!(client.outbox_len(ch), 1);
+
+    let r = st(&mut h, &mut s, outbound);
+    let ack = r
+        .replies
+        .into_iter()
+        .find(|m| matches!(m, Message::Accepted { .. }))
+        .expect("the server acknowledges the author");
+
+    client.receive(ack).unwrap();
+    assert_eq!(client.outbox_len(ch), 0);
 }
 
 #[test]
