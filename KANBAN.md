@@ -67,6 +67,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Per-recipient read redaction** — the registry re-checks `Read` on every fan-out (ops + awareness), so a peer whose read is revoked mid-session stops receiving the room without resubscribing; enforces the "filter every op send" invariant against a dynamic policy (#83). Room-level today; the per-send hook is where element/zone redaction slots in. Doc-level ACL-CRDT + finer-grain snapshot redaction + audit log remain (see Next/Queue).
 
+**ACL decision flow** — `acl::Acl`, a concrete tuple-walking `Authorizer` (the first real policy on the seam): allow/deny rules over `Subject` (`Actor`/`Authenticated`/`Anonymous`/`Anyone`) × action (`Option<Action>`) × `ResourceMatch` (`AnyRoom`/`Room`), evaluated explicit-deny-wins → allow → default-deny; order-independent; plugs in via `set_authorizer` (#84). Role/group subjects (need a claims model) and schema `@auth` role grants (need the schema layer) deferred. Doc-level ACL-as-CRDT feeds this same evaluator later.
+
 ---
 
 ## 🚧 In progress
@@ -77,7 +79,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Authorization — policy layers on the seam** — build atop the `Authorizer` seam (#82) and the per-recipient read hook (#83): the decision flow (ACL tuple walk, explicit-deny-wins, default-deny), doc-level ACL as CRDT-merged state, and finer-grain wire redaction (element/zone, and the cold-start snapshot — room-level per-send redaction landed in #83). Schema-level `@auth` defaults and zones are gated on the unbuilt schema + zone layers. Large — slice per layer. → *Authorization*. (v0.2, needs design)
+- **Authorization — remaining policy layers** — atop the seam (#82), read redaction (#83), and the ACL decision flow (#84): doc-level ACL as CRDT-merged state (tuples live in the document, merge, and feed the #84 evaluator — needs the ACL-CRDT design + per-recipient ACL-tuple redaction, since ACL state is itself privacy-sensitive), role/group subjects (need a claims model threaded from the verifier to the enforcement point), and finer-grain wire redaction (element/zone + cold-start snapshot — room-level per-send landed in #83). Schema-level `@auth` defaults and zones are gated on the unbuilt schema + zone layers. Large — slice per layer. → *Authorization*. (v0.2, needs design)
 - **Audit log** — the op log is already the authoritative record (actor + lamport + timestamp); add the query surface + a separate access log for read-only actions (connect, snapshot export, branch read) that generate no ops. → *Authorization / Audit*. (v0.2)
 - **mTLS credential carrier** — a client certificate as the fast-path credential. Blocked: the server terminates plain TCP with no TLS layer to expose the cert; land TLS termination first. → *Networking / Handshake*. (v0.2, blocked on TLS)
 
