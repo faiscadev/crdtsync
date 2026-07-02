@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crdtsync_core::{ClientId, Message};
 
 use crate::auth::{AllowAll, Verifier};
-use crate::authz::{Authorizer, PermitAll};
+use crate::authz::{Action, Authorizer, PermitAll, Resource};
 use crate::clock::{Clock, SystemClock};
 use crate::{step, Hub, Session, Store};
 
@@ -208,8 +208,15 @@ impl Registry {
         // multiplexing several rooms can route what it receives.
         if !broadcast.is_empty() {
             if let Some(room) = room {
+                let authorizer = &*self.authorizer;
                 for (peer, conn) in self.conns.iter_mut() {
                     if *peer == id {
+                        continue;
+                    }
+                    // Per-recipient redaction: a peer whose read was revoked
+                    // mid-session stops receiving the room's ops at once, without
+                    // waiting for it to resubscribe.
+                    if !peer_may_read(authorizer, &conn.session, &room) {
                         continue;
                     }
                     for channel in conn.session.channels_for_room(&room) {
@@ -224,8 +231,14 @@ impl Registry {
         // Awareness is ephemeral: fan the entry out to the room's other
         // subscribers on each peer's channel; nothing is stored or echoed back.
         if let Some(a) = awareness {
+            let authorizer = &*self.authorizer;
             for (peer, conn) in self.conns.iter_mut() {
                 if *peer == id {
+                    continue;
+                }
+                // Seeing a peer's presence is a read of the room, so the same
+                // per-recipient check gates the awareness fan-out.
+                if !peer_may_read(authorizer, &conn.session, &a.room) {
                     continue;
                 }
                 for channel in conn.session.channels_for_room(&a.room) {
@@ -252,5 +265,15 @@ impl Registry {
     /// The shared hub, for reading merged room state.
     pub fn hub(&self) -> &Hub {
         &self.hub
+    }
+}
+
+/// Whether a peer connection may currently read `room` — the per-recipient gate
+/// on every fan-out. An unauthenticated connection holds no room subscription,
+/// so it never qualifies.
+fn peer_may_read(authorizer: &dyn Authorizer, session: &Session, room: &[u8]) -> bool {
+    match session.actor() {
+        Some(actor) => authorizer.authorize(actor, Action::Read, &Resource::Room(room)),
+        None => false,
     }
 }

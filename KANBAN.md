@@ -65,6 +65,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Authorization seam** — pluggable `authz::Authorizer` (`Action` × `Resource::Room`), default-deny contract, dev `PermitAll`; enforced at Subscribe (read) / Ops (write) / AwarenessSet (publish); non-closing `ErrorCode::Forbidden`; injectable via `set_authorizer` (#82). Room-level enforcement points that exist today; two-tier policy + redaction + zones + audit remain (see Next/Queue).
 
+**Per-recipient read redaction** — the registry re-checks `Read` on every fan-out (ops + awareness), so a peer whose read is revoked mid-session stops receiving the room without resubscribing; enforces the "filter every op send" invariant against a dynamic policy (#83). Room-level today; the per-send hook is where element/zone redaction slots in. Doc-level ACL-CRDT + finer-grain snapshot redaction + audit log remain (see Next/Queue).
+
 ---
 
 ## 🚧 In progress
@@ -75,7 +77,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Authorization — policy layers on the seam** — build atop the `Authorizer` seam (#82): the decision flow (ACL tuple walk, explicit-deny-wins, default-deny), doc-level ACL as CRDT-merged state, per-recipient wire redaction (unauthorized bytes never leave the server — filter every op send + cold-start snapshot), and the audit/access log. Schema-level `@auth` defaults and zones are gated on the unbuilt schema + zone layers. Per-recipient redaction unblocks awareness auth-filtering. Large — slice per layer. → *Authorization*. (v0.2, needs design)
+- **Authorization — policy layers on the seam** — build atop the `Authorizer` seam (#82) and the per-recipient read hook (#83): the decision flow (ACL tuple walk, explicit-deny-wins, default-deny), doc-level ACL as CRDT-merged state, and finer-grain wire redaction (element/zone, and the cold-start snapshot — room-level per-send redaction landed in #83). Schema-level `@auth` defaults and zones are gated on the unbuilt schema + zone layers. Large — slice per layer. → *Authorization*. (v0.2, needs design)
 - **Audit log** — the op log is already the authoritative record (actor + lamport + timestamp); add the query surface + a separate access log for read-only actions (connect, snapshot export, branch read) that generate no ops. → *Authorization / Audit*. (v0.2)
 - **mTLS credential carrier** — a client certificate as the fast-path credential. Blocked: the server terminates plain TCP with no TLS layer to expose the cert; land TLS termination first. → *Networking / Handshake*. (v0.2, blocked on TLS)
 
