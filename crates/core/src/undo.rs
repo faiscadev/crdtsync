@@ -77,7 +77,13 @@ fn inserted_list_id(ops: &[Op]) -> Option<Stamp> {
 }
 
 /// One undo step: the inverses of a group of edits, in the order they were made.
-type Intention = Vec<Change>;
+/// `atomic` records that the edits were made as an atomic transaction, so their
+/// undo (and redo) replays as one atomic transaction too — a peer never sees a
+/// partially-undone group.
+struct Intention {
+    changes: Vec<Change>,
+    atomic: bool,
+}
 
 /// A user's undo/redo stacks over one [`Document`]. Each recorded intention
 /// pushes onto the undo stack; a fresh edit clears the redo stack, as an
@@ -92,7 +98,7 @@ pub struct UndoManager {
 /// while their inverses and emitted ops accumulate into a single intention.
 pub struct Batch<'a> {
     doc: &'a mut Document,
-    inverses: Intention,
+    inverses: Vec<Change>,
     ops: Vec<Op>,
 }
 
@@ -239,11 +245,39 @@ impl UndoManager {
         };
         edits(&mut batch);
         let Batch { inverses, ops, .. } = batch;
-        if !inverses.is_empty() {
-            self.undo.push(inverses);
+        self.record(inverses, false);
+        ops
+    }
+
+    /// Like [`group`](Self::group), but the edits form one atomic transaction:
+    /// their ops ship as a group a peer folds in all-or-nothing, and a later undo
+    /// (or redo) of the intention replays as one atomic transaction too. An empty
+    /// group records nothing.
+    pub fn atomic_group<F>(&mut self, doc: &mut Document, edits: F) -> Vec<Op>
+    where
+        F: FnOnce(&mut Batch),
+    {
+        doc.begin_atomic();
+        let mut batch = Batch {
+            doc,
+            inverses: Vec::new(),
+            ops: Vec::new(),
+        };
+        edits(&mut batch);
+        // While recording, each edit's ops accumulate in the doc rather than in
+        // the batch; the tagged group comes from the commit.
+        let Batch { doc, inverses, .. } = batch;
+        let ops = doc.commit_atomic();
+        self.record(inverses, true);
+        ops
+    }
+
+    /// Push a recorded intention (unless empty), clearing the redoable future.
+    fn record(&mut self, changes: Vec<Change>, atomic: bool) {
+        if !changes.is_empty() {
+            self.undo.push(Intention { changes, atomic });
             self.redo.clear();
         }
-        ops
     }
 
     /// Install-or-set the Register at `path` as its own undo step.
@@ -341,14 +375,43 @@ impl UndoManager {
     }
 }
 
-/// Apply an intention's inverses to `doc` — in reverse of the order they were
-/// made, so the last edit is undone first — and return the ops they produced and
-/// the mirror intention that would undo *this* application, so undo and redo
-/// alternate over the same slots.
+/// Apply an intention, returning the ops to broadcast and the mirror intention
+/// that would undo *this* application. An atomic intention replays inside one
+/// atomic transaction, so its ops reach a peer all-or-nothing and the mirror is
+/// itself atomic.
 fn apply(doc: &mut Document, intention: Intention) -> (Vec<Op>, Intention) {
+    let Intention { changes, atomic } = intention;
+    if atomic {
+        doc.begin_atomic();
+        let (_, inverse) = apply_changes(doc, changes);
+        let ops = doc.commit_atomic();
+        (
+            ops,
+            Intention {
+                changes: inverse,
+                atomic,
+            },
+        )
+    } else {
+        let (ops, inverse) = apply_changes(doc, changes);
+        (
+            ops,
+            Intention {
+                changes: inverse,
+                atomic,
+            },
+        )
+    }
+}
+
+/// Apply a group's inverse changes to `doc` — in reverse of the order they were
+/// made, so the last edit is undone first — and return the ops they produced and
+/// the mirror changes that would undo *this* application, so undo and redo
+/// alternate over the same slots.
+fn apply_changes(doc: &mut Document, changes: Vec<Change>) -> (Vec<Op>, Vec<Change>) {
     let mut ops = Vec::new();
     let mut inverse = Vec::new();
-    for change in intention.into_iter().rev() {
+    for change in changes.into_iter().rev() {
         let (o, inv) = apply_change(doc, change);
         ops.extend(o);
         inverse.push(inv);

@@ -506,3 +506,84 @@ fn a_text_undo_converges_on_a_peer() {
         "the peer sees the run removed"
     );
 }
+
+// --- atomic transaction groups ---
+
+#[test]
+fn an_atomic_group_tags_its_ops_as_one_transaction() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let ops = u.atomic_group(&mut d, |b| {
+        b.register(&p(&[b"first"]), Scalar::Int(1));
+        b.register(&p(&[b"last"]), Scalar::Int(2));
+    });
+    assert_eq!(ops.len(), 2);
+    let id = ops[0].tx.clone().expect("tagged").id;
+    assert!(ops.iter().all(|o| o.tx.as_ref().map(|t| t.id) == Some(id)));
+    assert!(ops.iter().all(|o| o.tx.as_ref().unwrap().count == 2));
+}
+
+#[test]
+fn undo_and_redo_of_an_atomic_group_stay_atomic() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    u.atomic_group(&mut d, |b| {
+        b.register(&p(&[b"x"]), Scalar::Int(1));
+        b.register(&p(&[b"y"]), Scalar::Int(2));
+    });
+
+    // The undo replays as one atomic transaction (its ops share a tx).
+    let undo_ops = u.undo(&mut d).expect("something to undo");
+    assert_eq!(undo_ops.len(), 2);
+    let uid = undo_ops[0].tx.clone().expect("undo is atomic").id;
+    assert!(undo_ops
+        .iter()
+        .all(|o| o.tx.as_ref().map(|t| t.id) == Some(uid)));
+
+    // As does the redo.
+    let redo_ops = u.redo(&mut d).expect("something to redo");
+    assert!(redo_ops.iter().all(|o| o.tx.is_some()));
+    assert_eq!(reg(&d, &p(&[b"x"])), Some(Scalar::Int(1)));
+}
+
+#[test]
+fn undo_of_an_atomic_group_commits_all_or_nothing_on_a_peer() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let mut u = UndoManager::new();
+    let setup = u.atomic_group(&mut a, |bx| {
+        bx.register(&p(&[b"x"]), Scalar::Int(1));
+        bx.register(&p(&[b"y"]), Scalar::Int(2));
+    });
+    for op in &setup {
+        b.apply(op);
+    }
+    assert_eq!(reg(&b, &p(&[b"x"])), Some(Scalar::Int(1)));
+
+    // The undo group reaches the peer split; it stays until whole.
+    let undo_ops = u.undo(&mut a).expect("undo");
+    assert!(!b.apply(&undo_ops[0]));
+    assert_eq!(
+        reg(&b, &p(&[b"x"])),
+        Some(Scalar::Int(1)),
+        "partial undo hidden"
+    );
+    assert!(b.apply(&undo_ops[1]));
+    assert_eq!(reg(&b, &p(&[b"x"])), None);
+    assert_eq!(reg(&b, &p(&[b"y"])), None);
+}
+
+#[test]
+fn a_plain_group_undo_is_not_atomic() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    u.group(&mut d, |b| {
+        b.register(&p(&[b"x"]), Scalar::Int(1));
+        b.register(&p(&[b"y"]), Scalar::Int(2));
+    });
+    let undo_ops = u.undo(&mut d).expect("undo");
+    assert!(
+        undo_ops.iter().all(|o| o.tx.is_none()),
+        "plain undo carries no tx"
+    );
+}
