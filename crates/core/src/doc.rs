@@ -194,6 +194,15 @@ impl Document {
         }
     }
 
+    /// Rebuild a replica from a snapshot but author future ops under `client`
+    /// rather than the identity the snapshot was encoded with. A replica that
+    /// adopts a peer's snapshot keeps its own identity for the ops it writes.
+    pub fn decode_state_as(client: ClientId, bytes: &[u8]) -> Result<Document, DecodeError> {
+        let mut doc = Document::decode_state(bytes)?;
+        doc.client = client;
+        Ok(doc)
+    }
+
     fn read_state(cur: &mut Cursor) -> Result<Document, DecodeError> {
         let version = cur.u8()?;
         if version != STATE_VERSION {

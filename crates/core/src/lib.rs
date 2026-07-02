@@ -25,12 +25,14 @@ pub mod map;
 pub mod register;
 pub mod text;
 
+pub mod client;
 pub mod codec;
 pub mod doc;
 pub mod op;
 pub mod path;
 pub mod protocol;
 
+pub use client::{ClientError, ClientSession};
 pub use clientid::ClientId;
 pub use codec::{decode_op, decode_ops, encode_op, encode_ops, DecodeError};
 pub use counter::Counter;
