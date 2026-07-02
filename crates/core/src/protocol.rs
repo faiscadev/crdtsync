@@ -94,6 +94,14 @@ pub enum Message {
         seq: u64,
         state: Vec<u8>,
     },
+    /// Acknowledges an author's durably-logged ops on `channel`: `through` is the
+    /// highest per-client op sequence (`OpId.seq`) the server has committed for
+    /// this client, so the author drains its outbox up to it. Sent to the author
+    /// only — never fanned out to the room.
+    Accepted { channel: Channel, through: u64 },
+    /// Reports the server sequence the client has applied on `channel`, so the
+    /// server can advance this client's tombstone-GC watermark.
+    Ack { channel: Channel, seq: u64 },
     /// Publishes this client's ephemeral awareness entry `key` on `channel`'s
     /// room, replacing any prior value. Not durable — never logged or snapshotted.
     AwarenessSet {
@@ -218,6 +226,16 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
         Message::AuthOk { actor } => {
             put_u8(&mut out, 7);
             put_bytes(&mut out, actor);
+        }
+        Message::Accepted { channel, through } => {
+            put_u8(&mut out, 18);
+            put_u32(&mut out, channel.0);
+            put_u64(&mut out, *through);
+        }
+        Message::Ack { channel, seq } => {
+            put_u8(&mut out, 19);
+            put_u32(&mut out, channel.0);
+            put_u64(&mut out, *seq);
         }
         Message::AwarenessSet {
             channel,
@@ -434,6 +452,16 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 seq,
                 state,
             }
+        }
+        18 => {
+            let channel = Channel(cur.u32()?);
+            let through = cur.u64()?;
+            Message::Accepted { channel, through }
+        }
+        19 => {
+            let channel = Channel(cur.u32()?);
+            let seq = cur.u64()?;
+            Message::Ack { channel, seq }
         }
         tag => {
             return Err(ProtocolError::BadTag {
