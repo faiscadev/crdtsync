@@ -76,9 +76,15 @@ impl Registry {
         id
     }
 
-    /// Close a connection, dropping its session and any queued messages.
+    /// Close a connection, dropping its session and any queued messages. Its
+    /// ephemeral awareness is cleared so a later subscriber is not replayed a
+    /// departed client's presence.
     pub fn disconnect(&mut self, id: ConnId) {
-        self.conns.remove(&id);
+        if let Some(conn) = self.conns.remove(&id) {
+            if let Some(client) = conn.session.client() {
+                self.hub.clear_client_awareness(client);
+            }
+        }
     }
 
     /// Drive one inbound message through the connection's session, queueing its
