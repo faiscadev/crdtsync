@@ -43,7 +43,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **v0.2 wire / client** — client session / reconnect driver `core::client::ClientSession` (#59).
 
-**Op acknowledgement (wire frames)** — `Message::Accepted { channel, through }` (tag 18, server→client, highest per-client `OpId.seq` durably committed — drains the author's outbox) and `Message::Ack { channel, seq }` (tag 19, client→server, the applied server sequence — feeds the GC watermark) + codec + `protocol_ack.rs` round-trip/total-decode (#PR). Unit 1 of the op-ack gate; placeholder match arms (client refuses `Accepted` until the Unit 2 outbox; server accepts-and-ignores `Ack` until Unit 3 records it) that later units replace.
+**Op acknowledgement (wire frames)** — `Message::Accepted { channel, through }` (tag 18, server→client, highest per-client `OpId.seq` durably committed — drains the author's outbox) and `Message::Ack { channel, seq }` (tag 19, client→server, the applied server sequence — feeds the GC watermark) + codec + `protocol_ack.rs` round-trip/total-decode (#121). Unit 1 of the op-ack gate; placeholder match arms (client refuses `Accepted` until the Unit 2 outbox; server accepts-and-ignores `Ack` until Unit 3 records it) that later units replace.
 
 **Forward-compat reservations** — blob-ref value slot `Scalar::BlobRef` reserved in the op envelope + codec (#60); error-envelope `details` byte string reserved in `Message::Error` + codec (#108) — round-tripped, empty, no producer yet, so the SDK error surface stays code + message.
 
@@ -144,7 +144,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 ## ⏭ Next
 
 - **Op acknowledgement — the gate that unlocks offline-queue + tombstone-GC** (§Op Acknowledgement, opened 2026-07-02, DECISIONS). One ack concept, two directions, sliced dependency-order:
-  - **Unit 1 — wire frames — DONE (#PR)**: `Message::Accepted`/`Ack` (tags 18/19) + codec + `protocol_ack.rs`; exhaustive-match placeholder arms in client `receive` / server `step` that Units 2–3 replace.
+  - **Unit 1 — wire frames — DONE (#121)**: `Message::Accepted`/`Ack` (tags 18/19) + codec + `protocol_ack.rs`; exhaustive-match placeholder arms in client `receive` / server `step` that Units 2–3 replace.
   - **Unit 2 — client outbox / offline queue** (needs Unit 1): `ClientSession` retains authored ops per channel; `edit`/`atomic_edit`/`commit_atomic` append; `receive(Accepted{through})` prunes `id.seq <= through`; `resend(channel) -> Option<Message>` re-emits the unpruned tail after reconnect. Spec first (`client_outbox.rs`). Delivers the **offline-queue** half.
   - **Unit 3 — server ack** (needs Unit 1): session `step` replies `Accepted{channel, through=max OpId.seq of the sender's committed ops}` to the author after `Hub::ingest`; records inbound `Ack{channel, seq}` as the sender's last-acked server seq in a per-client registry (Clock-stamped, #71 seam, for horizon eviction). Sender-directed reply, distinct from the fan-out path. Spec first.
   - **Unit 4 — tombstone GC + retention horizon** (needs Unit 3; folds in the queued *Tombstone GC* design-depth item): compaction drops leaf tombstones below `min(last-acked seq)` over clients within the retention horizon; a client past the horizon is evicted from the watermark, re-synced by Snapshot if it returns below the floor. Leaf-only (anchor-aware) drop, gated on the convergence harness. Delivers the **tombstone-GC** half.
