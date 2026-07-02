@@ -63,6 +63,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **SDK wiring — wire client** — the full `CrdtClient` C ABI (`ClientSession`: lifecycle, receive, per-channel edits/reads, auth, awareness, last-seen; core `document_mut`) (#77/#78), wrapped in the Python (#79), Go (#80), and wasm (#81) SDKs. Every SDK can now drive the sync protocol, not just the local `Document`.
 
+**Authorization seam** — pluggable `authz::Authorizer` (`Action` × `Resource::Room`), default-deny contract, dev `PermitAll`; enforced at Subscribe (read) / Ops (write) / AwarenessSet (publish); non-closing `ErrorCode::Forbidden`; injectable via `set_authorizer` (#82). Room-level enforcement points that exist today; two-tier policy + redaction + zones + audit remain (see Next/Queue).
+
 ---
 
 ## 🚧 In progress
@@ -73,7 +75,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Authorization — policy + enforcement** — the v0.2 authz layer: token claims → roles, schema-level `@auth` defaults + doc-level ACLs, per-recipient wire redaction (unauthorized bytes never leave the server), audit log. Large and design-heavy — needs a scoping pass against ARCHITECTURE §Authorization before slicing. Unblocks awareness per-recipient auth-filtering (currently queued). → *Authorization*. (v0.2, needs design)
+- **Authorization — policy layers on the seam** — build atop the `Authorizer` seam (#82): the decision flow (ACL tuple walk, explicit-deny-wins, default-deny), doc-level ACL as CRDT-merged state, per-recipient wire redaction (unauthorized bytes never leave the server — filter every op send + cold-start snapshot), and the audit/access log. Schema-level `@auth` defaults and zones are gated on the unbuilt schema + zone layers. Per-recipient redaction unblocks awareness auth-filtering. Large — slice per layer. → *Authorization*. (v0.2, needs design)
+- **Audit log** — the op log is already the authoritative record (actor + lamport + timestamp); add the query surface + a separate access log for read-only actions (connect, snapshot export, branch read) that generate no ops. → *Authorization / Audit*. (v0.2)
 - **mTLS credential carrier** — a client certificate as the fast-path credential. Blocked: the server terminates plain TCP with no TLS layer to expose the cert; land TLS termination first. → *Networking / Handshake*. (v0.2, blocked on TLS)
 
 ---

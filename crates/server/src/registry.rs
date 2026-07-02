@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crdtsync_core::{ClientId, Message};
 
 use crate::auth::{AllowAll, Verifier};
+use crate::authz::{Authorizer, PermitAll};
 use crate::clock::{Clock, SystemClock};
 use crate::{step, Hub, Session, Store};
 
@@ -36,6 +37,7 @@ pub struct Registry {
     conns: HashMap<ConnId, Conn>,
     next: u64,
     verifier: Box<dyn Verifier>,
+    authorizer: Box<dyn Authorizer>,
     clock: Arc<dyn Clock>,
     grace_millis: u64,
     /// Departed clients whose presence is retained until the wall-clock deadline,
@@ -58,6 +60,7 @@ impl Registry {
             conns: HashMap::new(),
             next: 0,
             verifier: Box::new(AllowAll),
+            authorizer: Box::new(PermitAll),
             clock: Arc::new(SystemClock),
             grace_millis: DEFAULT_GRACE_MILLIS,
             stale: HashMap::new(),
@@ -67,6 +70,11 @@ impl Registry {
     /// Use `verifier` to authenticate connections' credentials.
     pub fn set_verifier(&mut self, verifier: Box<dyn Verifier>) {
         self.verifier = verifier;
+    }
+
+    /// Use `authorizer` to decide what each authenticated actor may do.
+    pub fn set_authorizer(&mut self, authorizer: Box<dyn Authorizer>) {
+        self.authorizer = authorizer;
     }
 
     /// Verify a credential presented at the transport upgrade, returning the
@@ -179,7 +187,13 @@ impl Registry {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
-            let resp = step(&mut self.hub, &mut conn.session, &*self.verifier, msg);
+            let resp = step(
+                &mut self.hub,
+                &mut conn.session,
+                &*self.verifier,
+                &*self.authorizer,
+                msg,
+            );
             conn.outbox.extend(resp.replies);
             (
                 resp.broadcast,

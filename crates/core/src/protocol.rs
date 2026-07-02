@@ -61,6 +61,8 @@ pub enum ErrorCode {
     AuthFailed,
     UnknownRoom,
     Internal,
+    /// The authenticated actor is not permitted the requested action.
+    Forbidden,
 }
 
 /// One framed message on the wire.
@@ -315,6 +317,7 @@ fn error_code_tag(code: ErrorCode) -> u16 {
         ErrorCode::AuthFailed => 2,
         ErrorCode::UnknownRoom => 3,
         ErrorCode::Internal => 4,
+        ErrorCode::Forbidden => 5,
     }
 }
 
@@ -325,6 +328,7 @@ fn error_code(tag: u16) -> Result<ErrorCode, ProtocolError> {
         2 => Ok(ErrorCode::AuthFailed),
         3 => Ok(ErrorCode::UnknownRoom),
         4 => Ok(ErrorCode::Internal),
+        5 => Ok(ErrorCode::Forbidden),
         tag => Err(ProtocolError::BadTag {
             what: "error code",
             tag: tag as u8,
