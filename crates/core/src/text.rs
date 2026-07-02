@@ -134,6 +134,12 @@ impl Text {
         self.inner.contains(id)
     }
 
+    /// The live codepoint index of char_id `id`, if it is present and not
+    /// tombstoned.
+    pub fn live_index(&self, id: Stamp) -> Option<usize> {
+        self.inner.live_index(id)
+    }
+
     /// Tombstone the codepoints with these char_ids. Idempotent.
     pub fn delete_ids(&mut self, ids: &[Stamp]) {
         for id in ids {

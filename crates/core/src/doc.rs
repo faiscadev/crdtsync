@@ -1077,4 +1077,17 @@ impl TextCursor<'_> {
             self.doc.emit(self.text_id, OpKind::TextDelete { ids });
         }
     }
+
+    /// Tombstone the codepoints with these char_ids directly, when the caller
+    /// already knows the stable ids rather than a shifting index.
+    pub fn delete_ids(&mut self, ids: &[Stamp]) {
+        let present = matches!(
+            self.doc.texts.get(&self.text_id),
+            Some(text) if ids.iter().any(|id| text.borrow().contains(*id))
+        );
+        if present {
+            self.doc
+                .emit(self.text_id, OpKind::TextDelete { ids: ids.to_vec() });
+        }
+    }
 }

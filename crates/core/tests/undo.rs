@@ -404,3 +404,105 @@ fn a_list_undo_converges_on_a_peer() {
         "the peer sees the item removed"
     );
 }
+
+#[test]
+fn undo_of_a_text_insert_removes_the_run() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let body = p(&[b"body"]);
+    u.text_insert(&mut d, &body, 0, "hi");
+    assert_eq!(path::text_get(&d, &body).as_deref(), Some("hi"));
+
+    u.undo(&mut d);
+    assert_eq!(
+        path::text_get(&d, &body).as_deref(),
+        Some(""),
+        "insert undone"
+    );
+    u.redo(&mut d);
+    assert_eq!(
+        path::text_get(&d, &body).as_deref(),
+        Some("hi"),
+        "redo re-inserts the run"
+    );
+}
+
+#[test]
+fn undo_of_a_text_delete_revives_the_substring() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let body = p(&[b"body"]);
+    u.text_insert(&mut d, &body, 0, "hello");
+    u.text_delete(&mut d, &body, 1, 3); // remove "ell"
+    assert_eq!(path::text_get(&d, &body).as_deref(), Some("ho"));
+
+    u.undo(&mut d);
+    assert_eq!(
+        path::text_get(&d, &body).as_deref(),
+        Some("hello"),
+        "the deleted substring returns to its place"
+    );
+    u.redo(&mut d);
+    assert_eq!(
+        path::text_get(&d, &body).as_deref(),
+        Some("ho"),
+        "redo removes it again"
+    );
+}
+
+#[test]
+fn undo_of_a_nested_text_insert_removes_the_run() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let note = p(&[b"doc", b"note"]);
+    u.text_insert(&mut d, &note, 0, "draft");
+    assert_eq!(path::text_get(&d, &note).as_deref(), Some("draft"));
+
+    u.undo(&mut d);
+    assert_eq!(
+        path::text_get(&d, &note).as_deref(),
+        Some(""),
+        "nested insert undone"
+    );
+}
+
+#[test]
+fn a_group_of_text_edits_undoes_as_one() {
+    let mut d = doc(1);
+    let mut u = UndoManager::new();
+    let body = p(&[b"body"]);
+    u.text_insert(&mut d, &body, 0, "hello");
+    // One gesture that deletes a span and appends — reverted together.
+    u.group(&mut d, |b| {
+        b.text_delete(&body, 0, 1);
+        b.text_insert(&body, 4, "!");
+    });
+    assert_eq!(path::text_get(&d, &body).as_deref(), Some("ello!"));
+
+    u.undo(&mut d);
+    assert_eq!(
+        path::text_get(&d, &body).as_deref(),
+        Some("hello"),
+        "the whole group is one step"
+    );
+    assert!(u.can_undo(), "the initial insert is still undoable");
+}
+
+#[test]
+fn a_text_undo_converges_on_a_peer() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let mut u = UndoManager::new();
+    let body = p(&[b"body"]);
+
+    apply_all(&mut b, &u.text_insert(&mut a, &body, 0, "hi"));
+    assert_eq!(path::text_get(&b, &body).as_deref(), Some("hi"));
+
+    let undo_ops = u.undo(&mut a).expect("something to undo");
+    apply_all(&mut b, &undo_ops);
+    assert_eq!(
+        path::text_get(&b, &body).as_deref(),
+        Some(""),
+        "the peer sees the run removed"
+    );
+}
