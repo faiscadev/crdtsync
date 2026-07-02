@@ -232,3 +232,13 @@ fn a_fast_path_actor_still_fans_out_awareness() {
         }]
     );
 }
+
+#[test]
+fn verify_credential_reflects_the_verifier() {
+    let mut r = registry();
+    r.set_verifier(Box::new(|cred: &[u8]| {
+        (cred == b"good").then(|| b"alice".to_vec())
+    }));
+    assert_eq!(r.verify_credential(b"good"), Some(b"alice".to_vec()));
+    assert_eq!(r.verify_credential(b"bad"), None);
+}

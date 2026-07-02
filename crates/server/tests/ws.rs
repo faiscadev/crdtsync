@@ -83,6 +83,19 @@ async fn open(url: &str) -> Ws {
     ws
 }
 
+/// Open a connection presenting `credential` in the `Authorization` header — the
+/// upgrade fast path the server verifies during accept.
+async fn open_with_auth(url: &str, credential: &[u8]) -> Ws {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert(AUTHORIZATION, HeaderValue::from_bytes(credential).unwrap());
+    let (ws, _) = connect_async(request).await.unwrap();
+    ws
+}
+
 async fn send_bytes(ws: &mut Ws, bytes: Vec<u8>) {
     ws.send(WsMessage::Binary(bytes.into())).await.unwrap();
 }
@@ -223,6 +236,7 @@ async fn a_departed_clients_presence_clears_after_the_grace_window() {
     let server = start_server_with(ServeConfig {
         grace: Duration::from_millis(150),
         sweep_interval: Duration::from_millis(20),
+        ..ServeConfig::default()
     })
     .await;
     let url = &server.url;
@@ -263,4 +277,57 @@ async fn a_departed_clients_presence_clears_after_the_grace_window() {
             actor: b"cred".to_vec(),
         }
     );
+}
+
+#[tokio::test]
+async fn a_credential_at_the_upgrade_skips_the_auth_phase() {
+    // The dev verifier accepts any credential and echoes it as the actor.
+    let server = start_server().await;
+    let url = &server.url;
+    let mut ws = open_with_auth(url, b"cred").await;
+    send_bytes(&mut ws, encode_header(PROTOCOL_VERSION).to_vec()).await;
+
+    // The server establishes the actor at the upgrade and tells us, no Auth sent.
+    assert_eq!(
+        recv(&mut ws).await,
+        Message::AuthOk {
+            actor: b"cred".to_vec(),
+        }
+    );
+
+    // Straight from Hello to Subscribe.
+    send(&mut ws, &Message::Hello { client: cid(1) }).await;
+    send(
+        &mut ws,
+        &Message::Subscribe {
+            channel: CH,
+            room: ROOM.to_vec(),
+            last_seen_seq: 0,
+        },
+    )
+    .await;
+    assert_eq!(recv(&mut ws).await, ops_msg(Vec::new()));
+}
+
+#[tokio::test]
+async fn anonymous_mode_mints_an_actor_without_a_credential() {
+    let server = start_server_with(ServeConfig {
+        anonymous: true,
+        ..ServeConfig::default()
+    })
+    .await;
+    let url = &server.url;
+    // No Authorization header, but anonymous mode is on.
+    let mut ws = open(url).await;
+    send_bytes(&mut ws, encode_header(PROTOCOL_VERSION).to_vec()).await;
+
+    match recv(&mut ws).await {
+        Message::AuthOk { actor } => {
+            assert!(
+                actor.starts_with(b"anon:"),
+                "expected anon actor, got {actor:?}"
+            );
+        }
+        other => panic!("expected an AuthOk, got {other:?}"),
+    }
 }

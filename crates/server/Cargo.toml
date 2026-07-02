@@ -9,6 +9,9 @@ crdtsync-core = { path = "../core" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Anonymous-mode actor ids are minted from system entropy at the transport
+# layer, kept out of the Miri-gated pure-logic core.
+getrandom = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
