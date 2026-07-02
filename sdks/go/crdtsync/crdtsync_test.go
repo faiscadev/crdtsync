@@ -471,3 +471,30 @@ func TestAtomicTransactionGroupsEditsAndConverges(t *testing.T) {
 		t.Fatalf("peer y want 2, got %d", v)
 	}
 }
+
+func TestClientAtomicTransactionTravelsToAPeer(t *testing.T) {
+	a := newClient(t, 1)
+	defer a.Close()
+	b := newClient(t, 2)
+	defer b.Close()
+
+	ca, _ := a.Subscribe(key("room-1"))
+	cb, _ := b.Subscribe(key("room-1"))
+
+	a.BeginAtomic(ca)
+	// Edits accumulate while recording; only the commit frame is sent.
+	a.RegisterInt(ca, path("x"), 1)
+	a.RegisterInt(ca, path("y"), 2)
+	frame := a.CommitAtomic(ca)
+	if len(frame) == 0 {
+		t.Fatal("commit returned no frame")
+	}
+
+	b.Receive(frame)
+	if v, _ := b.GetInt(cb, path("x")); v != 1 {
+		t.Fatalf("peer x want 1, got %d", v)
+	}
+	if v, _ := b.GetInt(cb, path("y")); v != 2 {
+		t.Fatalf("peer y want 2, got %d", v)
+	}
+}

@@ -68,6 +68,8 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_dec",
         "crdtsync_client_set_bytes",
         "crdtsync_client_delete",
+        "crdtsync_client_begin_atomic",
+        "crdtsync_client_commit_atomic",
         "crdtsync_client_get_int",
         "crdtsync_client_get_bytes",
         // client auth + lifecycle + awareness

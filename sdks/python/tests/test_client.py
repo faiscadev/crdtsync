@@ -75,3 +75,21 @@ def test_channel_bounds_are_checked():
             a.register_int(-1, [b"k"], 1)
         with pytest.raises(ValueError):
             a.get_int(2**32, [b"k"])
+
+
+def test_atomic_transaction_over_the_client():
+    with Client(cid(1)) as a, Client(cid(2)) as b:
+        ca, _ = a.subscribe(b"room-1")
+        cb, _ = b.subscribe(b"room-1")
+
+        a.begin_atomic(ca)
+        # Edits accumulate while recording; only the commit frame is sent.
+        a.register_int(ca, [b"x"], 1)
+        a.register_int(ca, [b"y"], 2)
+        frame = a.commit_atomic(ca)
+        assert len(frame) > 0
+        assert a.get_int(ca, [b"x"]) == 1
+
+        b.receive(frame)
+        assert b.get_int(cb, [b"x"]) == 1
+        assert b.get_int(cb, [b"y"]) == 2

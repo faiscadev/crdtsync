@@ -149,6 +149,27 @@ impl ClientSession {
         })
     }
 
+    /// Begin recording an atomic transaction on `channel`'s room: subsequent
+    /// [`edit`](Self::edit)s accumulate into one group until
+    /// [`commit_atomic`](Self::commit_atomic). For callers that build a group
+    /// across several calls rather than in one closure. `None` if the channel
+    /// isn't held.
+    pub fn begin_atomic(&mut self, channel: Channel) -> Option<()> {
+        self.rooms.get_mut(&channel)?.doc.begin_atomic();
+        Some(())
+    }
+
+    /// Commit the atomic transaction opened by [`begin_atomic`](Self::begin_atomic)
+    /// on `channel`, returning the group's ops as one `Message::Ops` to send.
+    /// `None` if the channel isn't held.
+    pub fn commit_atomic(&mut self, channel: Channel) -> Option<Message> {
+        let room = self.rooms.get_mut(&channel)?;
+        Some(Message::Ops {
+            channel,
+            ops: room.doc.commit_atomic(),
+        })
+    }
+
     /// Publish an ephemeral awareness entry on `channel`'s room, returning the
     /// frame to send. `None` if the channel isn't held. The entry is transient —
     /// it is not stored locally or reflected back.

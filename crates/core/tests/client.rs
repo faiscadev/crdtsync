@@ -606,3 +606,33 @@ fn a_peer_folds_in_an_atomic_edit_all_or_nothing() {
     assert_eq!(int(doc, b"x"), 1);
     assert_eq!(int(doc, b"y"), 2);
 }
+
+#[test]
+fn begin_and_commit_atomic_group_edits_on_a_channel() {
+    let mut a = ClientSession::new(cid(1));
+    let mut b = ClientSession::new(cid(2));
+    let (ca, _) = a.subscribe(ROOM_A);
+    let (cb, _) = b.subscribe(ROOM_A);
+
+    a.begin_atomic(ca).expect("held channel");
+    // Edits accumulate while recording; each emits an empty op batch.
+    assert!(ops_of(a.edit(ca, |c| c.register(b"x", Scalar::Int(1))).unwrap()).is_empty());
+    assert!(ops_of(a.edit(ca, |c| c.register(b"y", Scalar::Int(2))).unwrap()).is_empty());
+    let ops = ops_of(a.commit_atomic(ca).expect("held channel"));
+    assert_eq!(ops.len(), 2);
+
+    // Split delivery: the peer stays empty until the whole group lands.
+    b.receive(ops_msg(cb, vec![ops[0].clone()])).unwrap();
+    assert!(b.document(cb).unwrap().get(b"x").is_none());
+    b.receive(ops_msg(cb, vec![ops[1].clone()])).unwrap();
+    let doc = b.document(cb).expect("room");
+    assert_eq!(int(doc, b"x"), 1);
+    assert_eq!(int(doc, b"y"), 2);
+}
+
+#[test]
+fn atomic_channel_methods_reject_an_unheld_channel() {
+    let mut s = ClientSession::new(cid(1));
+    assert!(s.begin_atomic(Channel(9)).is_none());
+    assert!(s.commit_atomic(Channel(9)).is_none());
+}
