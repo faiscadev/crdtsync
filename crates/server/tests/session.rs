@@ -34,9 +34,9 @@ fn doc(first: u8) -> Document {
 const ROOM: &[u8] = b"room-1";
 const CH: Channel = Channel(0);
 
-/// Drive one message with the dev-mode verifier.
+/// Drive one message with the dev-mode verifier and permit-all authorizer.
 fn st(hub: &mut Hub, s: &mut Session, msg: Message) -> crdtsync_server::Response {
-    step(hub, s, &V, msg)
+    step(hub, s, &V, &crdtsync_server::PermitAll, msg)
 }
 
 fn sub(room: &[u8], last_seen_seq: u64) -> Message {

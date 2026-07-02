@@ -10,7 +10,13 @@
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, ErrorCode, Message};
 use crdtsync_server::auth::{AllowAll, Verifier};
-use crdtsync_server::{step, Hub, Session};
+use crdtsync_server::{step, Hub, PermitAll, Response, Session};
+
+/// Drive a message through `step` under the dev-mode permit-all authorizer; these
+/// tests exercise the auth phase, not authorization.
+fn drive(hub: &mut Hub, s: &mut Session, v: &dyn Verifier, msg: Message) -> Response {
+    step(hub, s, v, &PermitAll, msg)
+}
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -28,7 +34,7 @@ fn only_good() -> impl Verifier {
 }
 
 fn hello(hub: &mut Hub, s: &mut Session, v: &dyn Verifier, client: u8) {
-    let r = step(
+    let r = drive(
         hub,
         s,
         v,
@@ -71,7 +77,7 @@ fn a_verified_credential_establishes_the_actor_and_replies_authok() {
     let mut s = Session::new();
     hello(&mut h, &mut s, &v, 1);
 
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,
@@ -95,7 +101,7 @@ fn after_auth_subscribe_is_allowed() {
     let mut h = hub();
     let mut s = Session::new();
     hello(&mut h, &mut s, &v, 1);
-    step(
+    drive(
         &mut h,
         &mut s,
         &v,
@@ -103,7 +109,7 @@ fn after_auth_subscribe_is_allowed() {
             credential: b"good".to_vec(),
         },
     );
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,
@@ -131,7 +137,7 @@ fn a_rejected_credential_is_auth_failed_and_closes() {
     let mut h = hub();
     let mut s = Session::new();
     hello(&mut h, &mut s, &v, 1);
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,
@@ -151,7 +157,7 @@ fn auth_before_hello_is_a_violation() {
     let v = only_good();
     let mut h = hub();
     let mut s = Session::new();
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,
@@ -169,7 +175,7 @@ fn a_second_auth_is_a_violation() {
     let mut h = hub();
     let mut s = Session::new();
     hello(&mut h, &mut s, &v, 1);
-    step(
+    drive(
         &mut h,
         &mut s,
         &v,
@@ -177,7 +183,7 @@ fn a_second_auth_is_a_violation() {
             credential: b"good".to_vec(),
         },
     );
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,
@@ -195,7 +201,7 @@ fn subscribe_before_auth_is_a_violation() {
     let mut h = hub();
     let mut s = Session::new();
     hello(&mut h, &mut s, &v, 1);
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,
@@ -215,7 +221,7 @@ fn ops_before_auth_is_a_violation() {
     let mut h = hub();
     let mut s = Session::new();
     hello(&mut h, &mut s, &v, 1);
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,
@@ -245,7 +251,7 @@ fn a_fast_path_session_subscribes_without_an_auth_phase() {
     // authenticated and the client goes straight from Hello to Subscribe.
     let mut s = Session::authenticated(b"alice".to_vec());
     hello(&mut h, &mut s, &v, 1);
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,
@@ -272,7 +278,7 @@ fn an_in_band_auth_on_a_fast_path_session_is_a_violation() {
     let mut s = Session::authenticated(b"alice".to_vec());
     hello(&mut h, &mut s, &v, 1);
     // The actor is already established, so a redundant Auth is out of order.
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,
@@ -293,7 +299,7 @@ fn allow_all_accepts_any_credential_and_adopts_it_as_the_actor() {
     let mut h = hub();
     let mut s = Session::new();
     hello(&mut h, &mut s, &v, 1);
-    let r = step(
+    let r = drive(
         &mut h,
         &mut s,
         &v,

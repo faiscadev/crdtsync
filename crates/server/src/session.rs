@@ -13,6 +13,7 @@ use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
 
 use crate::auth::Verifier;
+use crate::authz::{Action, Authorizer, Resource};
 use crate::{Catchup, Hub, RoomId};
 
 /// One client connection's protocol state. The handshake runs Hello → Auth →
@@ -103,6 +104,7 @@ pub fn step(
     hub: &mut Hub,
     session: &mut Session,
     verifier: &dyn Verifier,
+    authorizer: &dyn Authorizer,
     msg: Message,
 ) -> Response {
     match msg {
@@ -148,11 +150,16 @@ pub fn step(
             room,
             last_seen_seq,
         } => {
-            if session.actor.is_none() {
+            let Some(actor) = session.actor.as_deref() else {
                 return violation("subscribe before auth");
-            }
+            };
             if session.channels.contains_key(&channel) {
                 return violation("channel already subscribed");
+            }
+            // A subscription reads the room; the server never serves a room the
+            // actor may not read.
+            if !authorizer.authorize(actor, Action::Read, &Resource::Room(&room)) {
+                return forbidden("read denied");
             }
             let reply = match hub.catch_up(&room, last_seen_seq) {
                 Catchup::Ops(ops) => Message::Ops { channel, ops },
@@ -205,6 +212,10 @@ pub fn step(
             if ops.iter().any(|op| op.id.client != client) {
                 return violation("op client mismatch");
             }
+            let actor = session.actor.as_deref().expect("actor set, checked above");
+            if !authorizer.authorize(actor, Action::Write, &Resource::Room(&room)) {
+                return forbidden("write denied");
+            }
             // The deduped ops fan out to the room's other subscribers; nothing
             // echoes back to the sender. A hub that cannot durably record the
             // ops rejects the write rather than advertising an unpersisted one.
@@ -241,6 +252,9 @@ pub fn step(
             let Some(room) = session.channels.get(&channel).cloned() else {
                 return violation("awareness on an unbound channel");
             };
+            if !authorizer.authorize(&actor, Action::PublishAwareness, &Resource::Room(&room)) {
+                return forbidden("awareness publish denied");
+            }
             // Ephemeral: retained for late-joiner replay and fanned to the room's
             // peers, but never logged or snapshotted.
             hub.set_awareness(&room, client, actor.clone(), key.clone(), value.clone());
@@ -279,6 +293,19 @@ fn violation(reason: &str) -> Response {
             message: reason.to_string(),
         }],
         close: true,
+        ..Response::default()
+    }
+}
+
+/// A denied-but-well-formed request: the actor lacks permission. Unlike a
+/// protocol violation the connection stays open — the client may still act
+/// within what it is allowed.
+fn forbidden(reason: &str) -> Response {
+    Response {
+        replies: vec![Message::Error {
+            code: ErrorCode::Forbidden,
+            message: reason.to_string(),
+        }],
         ..Response::default()
     }
 }
