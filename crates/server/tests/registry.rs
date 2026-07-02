@@ -190,3 +190,45 @@ fn delivering_to_an_unknown_connection_signals_close() {
     r.disconnect(c);
     assert!(!r.deliver(c, Message::Hello { client: cid(1) }));
 }
+
+// --- the upgrade fast path ---
+
+#[test]
+fn a_fast_path_connection_subscribes_without_the_auth_phase() {
+    let mut r = registry();
+    // The credential was verified at the transport upgrade, so the connection
+    // opens already authenticated and goes straight from Hello to Subscribe.
+    let id = r.connect_authenticated(b"alice".to_vec());
+    assert!(r.deliver(id, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(id, sub(ROOM)));
+    assert_eq!(r.take_outbox(id), vec![ops_msg(Vec::new())]);
+}
+
+#[test]
+fn a_fast_path_actor_still_fans_out_awareness() {
+    let mut r = registry();
+    let a = r.connect_authenticated(b"alice".to_vec());
+    assert!(r.deliver(a, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(a, sub(ROOM)));
+    r.take_outbox(a);
+    let b = join(&mut r, 2, ROOM);
+
+    assert!(r.deliver(
+        a,
+        Message::AwarenessSet {
+            channel: CH,
+            key: b"cursor".to_vec(),
+            value: vec![9],
+        }
+    ));
+    // The peer sees the entry tagged with the fast-path actor.
+    assert_eq!(
+        r.take_outbox(b),
+        vec![Message::AwarenessUpdate {
+            channel: CH,
+            actor: b"alice".to_vec(),
+            key: b"cursor".to_vec(),
+            value: vec![9],
+        }]
+    );
+}

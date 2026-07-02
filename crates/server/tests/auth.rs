@@ -228,6 +228,63 @@ fn ops_before_auth_is_a_violation() {
     assert!(is_violation(&r.replies[0]));
 }
 
+// --- the upgrade fast path (auth established before the message loop) ---
+
+#[test]
+fn a_fast_path_session_starts_with_the_actor_already_set() {
+    let s = Session::authenticated(b"alice".to_vec());
+    assert_eq!(s.actor(), Some(&b"alice"[..]));
+    assert_eq!(s.client(), None, "hello still names the client");
+}
+
+#[test]
+fn a_fast_path_session_subscribes_without_an_auth_phase() {
+    let v = only_good();
+    let mut h = hub();
+    // The credential was verified at the transport upgrade; the session begins
+    // authenticated and the client goes straight from Hello to Subscribe.
+    let mut s = Session::authenticated(b"alice".to_vec());
+    hello(&mut h, &mut s, &v, 1);
+    let r = step(
+        &mut h,
+        &mut s,
+        &v,
+        Message::Subscribe {
+            channel: Channel(0),
+            room: b"room-1".to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert_eq!(
+        r.replies,
+        vec![Message::Ops {
+            channel: Channel(0),
+            ops: Vec::new(),
+        }]
+    );
+    assert!(!r.close);
+}
+
+#[test]
+fn an_in_band_auth_on_a_fast_path_session_is_a_violation() {
+    let v = only_good();
+    let mut h = hub();
+    let mut s = Session::authenticated(b"alice".to_vec());
+    hello(&mut h, &mut s, &v, 1);
+    // The actor is already established, so a redundant Auth is out of order.
+    let r = step(
+        &mut h,
+        &mut s,
+        &v,
+        Message::Auth {
+            credential: b"good".to_vec(),
+        },
+    );
+    assert!(r.close);
+    assert!(is_violation(&r.replies[0]));
+    assert_eq!(s.actor(), Some(&b"alice"[..]), "the actor is unchanged");
+}
+
 // --- the dev-mode default ---
 
 #[test]

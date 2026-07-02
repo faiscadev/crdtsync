@@ -89,14 +89,26 @@ impl Registry {
         Ok(Self::from_hub(hub))
     }
 
-    /// Open a connection, returning its handle.
+    /// Open a connection whose client authenticates in band, returning its
+    /// handle.
     pub fn connect(&mut self) -> ConnId {
+        self.insert_conn(Session::new())
+    }
+
+    /// Open a connection already authenticated as `actor` — the upgrade fast path
+    /// (credential verified at accept) or anonymous mode. Its client skips the
+    /// in-band Auth phase.
+    pub fn connect_authenticated(&mut self, actor: Vec<u8>) -> ConnId {
+        self.insert_conn(Session::authenticated(actor))
+    }
+
+    fn insert_conn(&mut self, session: Session) -> ConnId {
         let id = ConnId(self.next);
         self.next += 1;
         self.conns.insert(
             id,
             Conn {
-                session: Session::new(),
+                session,
                 outbox: Vec::new(),
             },
         );

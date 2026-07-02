@@ -35,6 +35,18 @@ impl Session {
         }
     }
 
+    /// A session already authenticated as `actor` — the upgrade fast path, where
+    /// the credential was verified during the transport accept (or anonymous
+    /// mode minted the actor), so the in-band Auth phase is skipped. Hello still
+    /// names the client; an in-band Auth afterward is out of order.
+    pub fn authenticated(actor: Vec<u8>) -> Self {
+        Self {
+            client: None,
+            actor: Some(actor),
+            channels: HashMap::new(),
+        }
+    }
+
     /// The client named at Hello, if the handshake is done.
     pub fn client(&self) -> Option<ClientId> {
         self.client
