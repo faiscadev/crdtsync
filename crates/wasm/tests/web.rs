@@ -157,3 +157,48 @@ fn encode_path_frames_keys() {
     let got = WasmDocument::encode_path(vec![k1, k2]);
     assert_eq!(got, vec![2, 0, 0, 0, b'a', b'b', 1, 0, 0, 0, b'c']);
 }
+
+use crdtsync_wasm::WasmClient;
+
+fn wasm_client(first: u8) -> WasmClient {
+    WasmClient::new(&cid(first)).ok().unwrap()
+}
+
+#[wasm_bindgen_test]
+fn a_client_edit_travels_to_a_peer() {
+    let mut a = wasm_client(1);
+    let mut b = wasm_client(2);
+    // Both fresh sessions assign channel 0 to their first subscription.
+    let sa = a.subscribe(b"room-1");
+    let sb = b.subscribe(b"room-1");
+    assert_eq!(sa.channel(), 0);
+    assert_eq!(sb.channel(), 0);
+
+    let p = path(&["age"]);
+    let ops = a.register_int(sa.channel(), &p, 30);
+    assert_eq!(a.get_int(sa.channel(), &p), Some(30));
+    assert!(b.receive(&ops));
+    assert_eq!(b.get_int(sb.channel(), &p), Some(30));
+    assert_eq!(b.last_seen_seq(sb.channel()), Some(1));
+}
+
+#[wasm_bindgen_test]
+fn a_client_handshake_and_awareness_marshal() {
+    let mut c = wasm_client(1);
+    assert!(!c.hello().is_empty());
+    assert!(!c.auth(b"token").is_empty());
+    assert_eq!(c.actor(), None);
+
+    let sub = c.subscribe(b"room-1");
+    assert!(c.set_awareness(sub.channel(), b"cursor", b"x").is_some());
+    assert_eq!(c.awareness_len(sub.channel()), 0);
+    assert!(c.unsubscribe(sub.channel()).is_some());
+    assert_eq!(c.last_seen_seq(sub.channel()), None);
+    assert!(c.resume(sub.channel()).is_none());
+}
+
+#[wasm_bindgen_test]
+fn a_client_rejects_garbage_frames() {
+    let mut c = wasm_client(1);
+    assert!(!c.receive(&[0xff, 0xff, 0xff, 0xff]));
+}
