@@ -24,7 +24,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{channel, unbounded_channel, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, COOKIE, SEC_WEBSOCKET_PROTOCOL};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::auth::{AllowAll, Verifier};
@@ -309,16 +310,89 @@ fn flush(reg: &mut Registry, peers: &mut HashMap<ConnId, Peer>) {
     }
 }
 
+/// The cookie holding a credential, when the carrier is a cookie.
+const AUTH_COOKIE: &str = "crdtsync_credential";
+/// The WebSocket subprotocol prefix carrying a credential — the value follows.
+const AUTH_SUBPROTOCOL_PREFIX: &str = "crdtsync.auth.";
+/// The plain application subprotocol a client offers alongside the auth one; the
+/// server echoes it so the client's subprotocol negotiation succeeds.
+const APP_SUBPROTOCOL: &str = "crdtsync";
+/// The query-string key holding a credential, when the carrier is the URL.
+const AUTH_QUERY_KEY: &str = "credential";
+
+/// Pull a credential off the upgrade request, trying carriers in precedence
+/// order: `Authorization` header, WebSocket subprotocol, cookie, then query
+/// param. A browser cannot set the `Authorization` header on a WebSocket, so the
+/// subprotocol and query carriers are the ones a browser client can reach; the
+/// query carrier is convenient but logs-leak-prone (URLs land in access logs).
+fn extract_credential(req: &Request) -> Option<Vec<u8>> {
+    if let Some(value) = req.headers().get(AUTHORIZATION) {
+        return Some(value.as_bytes().to_vec());
+    }
+    if let Some(cred) = subprotocol_credential(req) {
+        return Some(cred);
+    }
+    if let Some(cred) = cookie_credential(req) {
+        return Some(cred);
+    }
+    query_credential(req)
+}
+
+/// Each comma-separated subprotocol the client offered.
+fn offered_subprotocols(req: &Request) -> impl Iterator<Item = &str> {
+    req.headers()
+        .get_all(SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|list| list.split(','))
+        .map(str::trim)
+}
+
+/// The credential carried in a `crdtsync.auth.<value>` subprotocol offer.
+fn subprotocol_credential(req: &Request) -> Option<Vec<u8>> {
+    offered_subprotocols(req)
+        .find_map(|p| p.strip_prefix(AUTH_SUBPROTOCOL_PREFIX))
+        .map(|cred| cred.as_bytes().to_vec())
+}
+
+/// The credential in the `crdtsync_credential=<value>` cookie.
+fn cookie_credential(req: &Request) -> Option<Vec<u8>> {
+    let prefix = format!("{AUTH_COOKIE}=");
+    req.headers()
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|list| list.split(';'))
+        .map(str::trim)
+        .find_map(|kv| kv.strip_prefix(&prefix))
+        .map(|cred| cred.as_bytes().to_vec())
+}
+
+/// The credential in the `?credential=<value>` query param.
+fn query_credential(req: &Request) -> Option<Vec<u8>> {
+    let prefix = format!("{AUTH_QUERY_KEY}=");
+    req.uri()
+        .query()?
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(&prefix))
+        .map(|cred| cred.as_bytes().to_vec())
+}
+
 /// Drive one connection: handshake, then the message loop, then teardown.
 async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
-    // Read any credential off the upgrade request — the fast-path carrier is the
-    // `Authorization` header. The callback runs during the accept, so it stashes
-    // the bytes for the connect that follows.
+    // Read any credential off the upgrade request across the supported carriers.
+    // The callback runs during the accept, so it stashes the bytes for the
+    // connect that follows, and echoes the app subprotocol when the client
+    // offered it so its subprotocol negotiation succeeds.
     let carried = Arc::new(Mutex::new(None));
     let sink = carried.clone();
-    let callback = move |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-        if let Some(value) = req.headers().get(AUTHORIZATION) {
-            *sink.lock().unwrap() = Some(value.as_bytes().to_vec());
+    let callback = move |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> {
+        *sink.lock().unwrap() = extract_credential(req);
+        if offered_subprotocols(req).any(|p| p == APP_SUBPROTOCOL) {
+            resp.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static(APP_SUBPROTOCOL),
+            );
         }
         Ok(resp)
     };

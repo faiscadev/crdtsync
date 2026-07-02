@@ -51,7 +51,9 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 **Auth fast path + anonymous mode** — `Session::authenticated` + `Registry::connect_authenticated` open a connection already authenticated (#73); runtime verifies an `Authorization`-header credential during the WS upgrade and sends an unsolicited `AuthOk`, skipping the in-band Auth phase; `ServeConfig::anonymous` mints `actor = anon:<random>` from transport-layer entropy (#74). Header carrier done.
 
-**Verifier injection** — `serve_with_verifier` plugs a real `Box<dyn Verifier + Send>` (JWT/OIDC/API key) into the runtime; `serve`/`serve_with` default to dev `AllowAll` (#75). Real end-to-end map + reject now exercisable. Other credential carriers (cookie/subprotocol/mTLS/query) stay queued.
+**Verifier injection** — `serve_with_verifier` plugs a real `Box<dyn Verifier + Send>` (JWT/OIDC/API key) into the runtime; `serve`/`serve_with` default to dev `AllowAll` (#75). Real end-to-end map + reject now exercisable.
+
+**Auth carriers** — fast-path credential read from four carriers in precedence order: `Authorization` header → `crdtsync.auth.<v>` subprotocol (echoed so browser negotiation succeeds) → `crdtsync_credential` cookie → `?credential=` query param (#76). Browser-reachable carriers (subprotocol/query/cookie) covered. mTLS deferred — no TLS layer yet (see Queue).
 
 **Awareness (core)** — ephemeral presence: wire `AwarenessSet`/`AwarenessUpdate` (#66); server fan-out per peer-channel, actor-tagged, never logged/snapshotted (#67); client `set_awareness` + per-channel `(actor,key)` LWW view (#68); server-side ephemeral store → late-joiner replay on Subscribe + clear-on-disconnect (#69). Publish + fan-out + client view + late-joiner replay done.
 
@@ -67,7 +69,8 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
-- **Additional auth carriers** — extend the fast-path credential extraction beyond the `Authorization` header to the other ARCHITECTURE carriers: cookie, WS subprotocol, mTLS client cert, query param (the last logs-leak-prone, gate behind a flag). Small transport glue on the landed header path + verifier injection; needs a precedence rule when several are present. → *Networking / Handshake*. (v0.2, ready)
+- **SDK wiring — auth + awareness + multi-room** — the core `ClientSession` gained auth (`auth`/`actor`), awareness (`set_awareness` + peer view), and N-room multiplexing, but the FFI / wasm / Python / Go SDKs still expose only the older single-room, no-auth surface. Thread the new capabilities through the C ABI and each binding. Dependency-ready (logic built); large, so per-SDK slices. → *SDKs*. (v0.2, ready)
+- **mTLS credential carrier** — a client certificate as the fast-path credential. Blocked: the server terminates plain TCP with no TLS layer to expose the cert; land TLS termination first. → *Networking / Handshake*. (v0.2, blocked on TLS)
 
 ---
 
