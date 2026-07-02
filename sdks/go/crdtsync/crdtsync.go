@@ -424,6 +424,24 @@ func (c *Client) Unsubscribe(channel uint32) []byte {
 	return takeBuf(C.crdtsync_client_unsubscribe(c.h, C.uint32_t(channel)))
 }
 
+// Resend re-emits the authored ops on channel the server has not yet
+// acknowledged, as one Ops frame to replay after a reconnect. Empty when
+// nothing is outstanding.
+func (c *Client) Resend(channel uint32) []byte {
+	return takeBuf(C.crdtsync_client_resend(c.h, C.uint32_t(channel)))
+}
+
+// OutboxLen reports how many authored ops on channel await acknowledgement —
+// the offline queue depth.
+func (c *Client) OutboxLen(channel uint32) uint {
+	var out C.uintptr_t
+	rc := C.crdtsync_client_outbox_len(c.h, C.uint32_t(channel), &out)
+	if rc != 1 {
+		return 0
+	}
+	return uint(out)
+}
+
 // Receive folds one received wire frame in. 1 applied, 0 refused, -1 bad handle.
 func (c *Client) Receive(msg []byte) int {
 	mp, ml := bytesArg(msg)

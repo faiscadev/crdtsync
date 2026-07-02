@@ -149,10 +149,8 @@ impl ClientSession {
     where
         F: FnOnce(&mut MapCursor),
     {
-        let room = self.rooms.get_mut(&channel)?;
-        let ops = room.doc.transact(f);
-        room.outbox.extend(ops.iter().cloned());
-        Some(Message::Ops { channel, ops })
+        let ops = self.rooms.get_mut(&channel)?.doc.transact(f);
+        self.enqueue_ops(channel, ops)
     }
 
     /// Like [`edit`](Self::edit), but the emitted ops form one atomic
@@ -164,10 +162,8 @@ impl ClientSession {
     where
         F: FnOnce(&mut MapCursor),
     {
-        let room = self.rooms.get_mut(&channel)?;
-        let ops = room.doc.atomic_transact(f);
-        room.outbox.extend(ops.iter().cloned());
-        Some(Message::Ops { channel, ops })
+        let ops = self.rooms.get_mut(&channel)?.doc.atomic_transact(f);
+        self.enqueue_ops(channel, ops)
     }
 
     /// Begin recording an atomic transaction on `channel`'s room: subsequent
@@ -184,8 +180,19 @@ impl ClientSession {
     /// on `channel`, returning the group's ops as one `Message::Ops` to send.
     /// `None` if the channel isn't held.
     pub fn commit_atomic(&mut self, channel: Channel) -> Option<Message> {
+        let ops = self.rooms.get_mut(&channel)?.doc.commit_atomic();
+        self.enqueue_ops(channel, ops)
+    }
+
+    /// Record ops authored through [`document_mut`](Self::document_mut) into
+    /// `channel`'s outbox and frame them as the `Message::Ops` to send, so an
+    /// edit made through the path façade is acknowledged and resent exactly like
+    /// one made through [`edit`](Self::edit). During an atomic transaction the
+    /// façade's per-call ops are empty (they accumulate in the replica until
+    /// commit), so nothing is enqueued until the group ships. `None` if the
+    /// channel isn't held.
+    pub fn enqueue_ops(&mut self, channel: Channel, ops: Vec<Op>) -> Option<Message> {
         let room = self.rooms.get_mut(&channel)?;
-        let ops = room.doc.commit_atomic();
         room.outbox.extend(ops.iter().cloned());
         Some(Message::Ops { channel, ops })
     }

@@ -526,6 +526,22 @@ int32_t crdtsync_client_actor(const CrdtClient *client, CrdtBuf *out);
 // `client` is a live handle.
 CrdtBuf crdtsync_client_resume(const CrdtClient *client, uint32_t channel);
 
+// Re-emit the authored ops on `channel` the server has not yet acknowledged,
+// as one Ops frame to replay after a reconnect. Empty on a bad handle, an
+// unheld channel, or nothing outstanding.
+//
+// # Safety
+// `client` is a live handle.
+CrdtBuf crdtsync_client_resend(const CrdtClient *client, uint32_t channel);
+
+// How many authored ops on `channel` await acknowledgement — the offline queue
+// depth — into `out`. Returns 1 on success, -1 on a bad handle (an unheld
+// channel reports 0).
+//
+// # Safety
+// `client` is a live handle; `out` points to a writable `usize`.
+int32_t crdtsync_client_outbox_len(const CrdtClient *client, uint32_t channel, uintptr_t *out);
+
 // Leave the room on `channel`, dropping its replica; returns the Unsubscribe
 // frame to send. Empty on a bad handle or unheld channel.
 //

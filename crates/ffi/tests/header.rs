@@ -78,6 +78,8 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_auth",
         "crdtsync_client_actor",
         "crdtsync_client_resume",
+        "crdtsync_client_resend",
+        "crdtsync_client_outbox_len",
         "crdtsync_client_unsubscribe",
         "crdtsync_client_set_awareness",
         "crdtsync_client_awareness",

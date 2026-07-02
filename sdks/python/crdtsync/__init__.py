@@ -111,6 +111,8 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_actor, [doc, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_subscribe, [doc, cbytes, size, c.POINTER(ch)], buf)
     sig(lib.crdtsync_client_resume, [doc, ch], buf)
+    sig(lib.crdtsync_client_resend, [doc, ch], buf)
+    sig(lib.crdtsync_client_outbox_len, [doc, ch, c.POINTER(size)], c.c_int32)
     sig(lib.crdtsync_client_unsubscribe, [doc, ch], buf)
     sig(lib.crdtsync_client_receive, [doc, cbytes, size], c.c_int32)
     sig(lib.crdtsync_client_last_seen_seq, [doc, ch, c.POINTER(c.c_uint64)], c.c_int32)
@@ -623,6 +625,19 @@ class Client:
         """Re-issue Subscribe for a held channel from its caught-up position."""
         _u32("channel", channel)
         return _take_buf(_LIB.crdtsync_client_resume(self._handle, channel))
+
+    def resend(self, channel: int) -> bytes:
+        """Re-emit the unacknowledged authored ops on ``channel`` as one Ops
+        frame to replay after a reconnect; empty when nothing is outstanding."""
+        _u32("channel", channel)
+        return _take_buf(_LIB.crdtsync_client_resend(self._handle, channel))
+
+    def outbox_len(self, channel: int) -> int:
+        """How many authored ops on ``channel`` await acknowledgement."""
+        _u32("channel", channel)
+        out = ctypes.c_size_t()
+        rc = _LIB.crdtsync_client_outbox_len(self._handle, channel, ctypes.byref(out))
+        return out.value if rc == 1 else 0
 
     def unsubscribe(self, channel: int) -> bytes:
         """Leave ``channel``'s room, dropping its replica; return the frame."""

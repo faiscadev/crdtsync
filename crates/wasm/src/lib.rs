@@ -376,6 +376,20 @@ impl WasmClient {
             .map(|msg| encode_message(&msg))
     }
 
+    /// Re-emit the unacknowledged authored ops on `channel` as one Ops frame to
+    /// replay after a reconnect; `None` when nothing is outstanding.
+    pub fn resend(&self, channel: u32) -> Option<Vec<u8>> {
+        self.inner
+            .resend(Channel(channel))
+            .map(|msg| encode_message(&msg))
+    }
+
+    /// How many authored ops on `channel` await acknowledgement.
+    #[wasm_bindgen(js_name = outboxLen)]
+    pub fn outbox_len(&self, channel: u32) -> usize {
+        self.inner.outbox_len(Channel(channel))
+    }
+
     /// Leave the room on `channel`, dropping its replica; `None` if not held.
     pub fn unsubscribe(&mut self, channel: u32) -> Option<Vec<u8>> {
         self.inner
@@ -548,11 +562,14 @@ impl WasmClient {
     /// Run a path edit against `channel`'s replica and wrap the ops in the Ops
     /// frame to send; empty when the channel isn't held.
     fn ops_frame(&mut self, channel: u32, run: impl FnOnce(&mut Document) -> Vec<Op>) -> Vec<u8> {
-        match self.inner.document_mut(Channel(channel)) {
-            Some(doc) => encode_message(&Message::Ops {
-                channel: Channel(channel),
-                ops: run(doc),
-            }),
+        let Some(doc) = self.inner.document_mut(Channel(channel)) else {
+            return Vec::new();
+        };
+        let ops = run(doc);
+        // Route through the session so the ops enter the outbox and are resent /
+        // acknowledged like a closure edit, not just framed and forgotten.
+        match self.inner.enqueue_ops(Channel(channel), ops) {
+            Some(msg) => encode_message(&msg),
             None => Vec::new(),
         }
     }

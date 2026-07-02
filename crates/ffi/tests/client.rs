@@ -290,6 +290,48 @@ fn unsubscribe_drops_the_channel() {
 }
 
 #[test]
+fn the_outbox_drains_against_an_ack_over_the_wire_client() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        let (ch, sub) = subscribe(c, b"room-1");
+        crdtsync_buf_free(sub);
+        let p = path(&[b"age"]);
+
+        let e1 = register_int(c, ch, &p, 30);
+        crdtsync_buf_free(e1);
+        let e2 = register_int(c, ch, &p, 31);
+        crdtsync_buf_free(e2);
+
+        let mut n: usize = 0;
+        assert_eq!(crdtsync_client_outbox_len(c, ch, &mut n), 1);
+        assert_eq!(n, 2);
+
+        // The unacknowledged tail replays as one Ops frame.
+        let tail = crdtsync_client_resend(c, ch);
+        assert!(tail.len > 0);
+        crdtsync_buf_free(tail);
+
+        // An Accepted through u64::MAX drains the outbox.
+        let accepted = encode_message(&Message::Accepted {
+            channel: Channel(ch),
+            through: u64::MAX,
+        });
+        assert_eq!(
+            crdtsync_client_receive(c, accepted.as_ptr(), accepted.len()),
+            1
+        );
+
+        assert_eq!(crdtsync_client_outbox_len(c, ch, &mut n), 1);
+        assert_eq!(n, 0);
+        let empty = crdtsync_client_resend(c, ch);
+        assert_eq!(empty.len, 0);
+        crdtsync_buf_free(empty);
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
 fn an_atomic_transaction_travels_over_the_wire_client() {
     unsafe {
         let a = crdtsync_client_new(client_id(1).as_ptr());
