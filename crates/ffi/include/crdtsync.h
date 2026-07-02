@@ -234,6 +234,19 @@ CrdtBuf crdtsync_doc_encode_state(const CrdtDoc *doc);
 // `bytes`/`len` follow [`as_slice`].
 CrdtDoc *crdtsync_doc_decode_state(const uint8_t *bytes, uintptr_t len);
 
+// Diff two snapshots (each a state buffer from [`crdtsync_doc_encode_state`],
+// a named version, or an exported room) into the encoded change list — the
+// structural changes turning the old state into the new. Decode it with the
+// SDK's change-list reader. Empty on malformed input or a bad snapshot, never
+// a panic across the frame.
+//
+// # Safety
+// `old`/`old_len` and `new`/`new_len` each follow [`as_slice`].
+CrdtBuf crdtsync_diff(const uint8_t *old,
+                      uintptr_t old_len,
+                      const uint8_t *new_,
+                      uintptr_t new_len);
+
 // Open an undo manager. It drives whichever document is passed to each call.
 //
 // # Safety
