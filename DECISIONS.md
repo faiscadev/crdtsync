@@ -6,6 +6,10 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
+## 2026-07-02 · #70, #71 · awareness reconnect grace via an injected server `Clock` + explicit sweep, not clear-on-disconnect
+**Changed:** a disconnect no longer clears the client's ephemeral presence at once. The server gains a `Clock` seam (`clock::{Clock, SystemClock, ManualClock}`, wall-millis) — the analog of the core's `Host::now`, which the server runtime lacked. On disconnect a client with live presence is marked *stale* with a `now + grace` deadline (default 5s); a reconnect (Hello) within the window cancels it; `Registry::sweep` clears every past-deadline client and fans a new `Message::AwarenessClear { channel, actor }` (wire tag 10, server→client) to each affected room's remaining subscribers on their own channel. Replaces #69's synchronous `Hub::clear_client_awareness` on disconnect; that method now *returns* the cleared `(room, actor)` pairs so the sweep can address the fan-out.
+**Why:** ARCHITECTURE §Awareness prescribes a reconnect grace window so a brief drop (tab reload, flaky network) doesn't flicker a user's cursor out and back for every peer. That needs wall time on the server, which only the core had — hence the `Clock` seam, injectable so tests drive presence expiry deterministically with a `ManualClock` instead of sleeping. Sweep is explicit (caller-driven) rather than a background timer so the registry stays pure/synchronous; wiring a periodic tokio sweep into the runtime is a separate follow-on. Clearing is gated on the client actually holding presence, so the common no-awareness disconnect never reads the clock (keeps the Miri-gated registry tests off the unsupported system-time call under isolation). TTL-per-entry and throttle/coalesce remain queued on the same seam.
+
 ---
 
 ## 2026-07-02 · #66 · awareness — ephemeral LWW-per-client presence on the connection, off the op log
