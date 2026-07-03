@@ -92,7 +92,9 @@ impl SchemaError {
 impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let what = match self.kind {
-            SchemaErrorKind::Json(k) => return write!(f, "invalid schema JSON: {k:?}"),
+            SchemaErrorKind::Json(k) => {
+                return write!(f, "invalid schema JSON ({k:?}) at {}", self.at)
+            }
             SchemaErrorKind::NotAnObject => "expected an object",
             SchemaErrorKind::MissingField => "missing required field",
             SchemaErrorKind::WrongType => "field has the wrong type",
@@ -139,8 +141,9 @@ impl Schema {
     /// Parse a schema from its JSON source. Total — any input yields a `Schema`
     /// or a [`SchemaError`], never a panic.
     pub fn parse(src: &str) -> Result<Schema, SchemaError> {
-        let json = Json::parse(src)
-            .map_err(|e: JsonError| SchemaError::new(SchemaErrorKind::Json(e.kind), "document"))?;
+        let json = Json::parse(src).map_err(|e: JsonError| {
+            SchemaError::new(SchemaErrorKind::Json(e.kind), format!("byte {}", e.at))
+        })?;
         Schema::from_json(&json)
     }
 

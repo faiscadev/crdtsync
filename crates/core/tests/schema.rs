@@ -393,6 +393,16 @@ fn a_bound_must_be_an_integer() {
 }
 
 #[test]
+fn a_json_error_keeps_its_byte_offset() {
+    // The leading-zero `01` is a bad number partway into the document; the
+    // schema error must carry that location, not flatten it to "document".
+    let e = Schema::parse(r#"{ "schema": 01 }"#).unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::Json(JsonErrorKind::BadNumber));
+    assert_eq!(e.at, "byte 12", "offset preserved");
+    assert!(format!("{e}").contains("byte 12"), "shown: {e}");
+}
+
+#[test]
 fn schema_error_displays_and_is_an_error() {
     let e = Schema::parse("[]").unwrap_err();
     let shown = format!("{e}");
