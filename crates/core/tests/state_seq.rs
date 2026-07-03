@@ -184,6 +184,61 @@ fn a_bogus_run_length_is_rejected_not_expanded() {
     );
 }
 
+#[test]
+fn an_empty_run_is_rejected() {
+    // The encoder never emits a zero-length run; accepting one would admit
+    // non-canonical encodings (padding that decodes to the same state). Craft
+    // an honest single-tombstone record and zero its length field.
+    let empty = List::new(eid(1, 1)).encode_state();
+    let header = empty.len();
+
+    let mut l = List::new(eid(1, 1));
+    l.insert(0, int(7), stmp(1, 1));
+    l.delete(0);
+    let mut bytes = l.encode_state();
+    let stamp_len = 24;
+    let anchor_len = bytes.len() - (header + stamp_len + 4);
+    let len_off = bytes.len() - anchor_len - 4;
+    bytes[len_off..len_off + 4].copy_from_slice(&0u32.to_le_bytes());
+    assert!(
+        List::decode_state(&bytes).is_err(),
+        "a zero-length run must be rejected as malformed"
+    );
+}
+
+#[test]
+fn many_capped_runs_exceed_the_global_decode_budget() {
+    // The per-record cap bounds one run but not their sum: a small stream of
+    // many records, each at the per-record cap, could still claim an enormous
+    // node count. Assemble such a stream directly and confirm decode rejects it
+    // on the declared total — quickly, without materialising the nodes.
+    let empty = List::new(eid(1, 1)).encode_state();
+    let header = empty.len(); // id + live_count(0) + run_count(0)
+
+    let mut l = List::new(eid(1, 1));
+    l.insert(0, int(7), stmp(1, 1));
+    l.delete(0);
+    let one_run = l.encode_state();
+    // One record = everything past the header (stamp, length, anchor), with its
+    // length field set to the per-record cap (1 << 20).
+    let mut record = one_run[header..].to_vec();
+    let stamp_len = 24;
+    let len_off = stamp_len; // length sits right after the start stamp
+    record[len_off..len_off + 4].copy_from_slice(&(1u32 << 20).to_le_bytes());
+
+    // 17 records at 1<<20 each sum to 17<<20, past the 1<<24 global budget.
+    let runs = 17u32;
+    let mut bytes = one_run[..header].to_vec();
+    bytes[header - 4..].copy_from_slice(&runs.to_le_bytes()); // run_count
+    for _ in 0..runs {
+        bytes.extend_from_slice(&record);
+    }
+    assert!(
+        List::decode_state(&bytes).is_err(),
+        "the summed run lengths exceed the decode budget and must be rejected"
+    );
+}
+
 // --- Text ---
 
 #[test]

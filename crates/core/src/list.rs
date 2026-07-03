@@ -20,6 +20,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// crafted record — bounding the decompression a single record can drive.
 const MAX_TOMBSTONE_RUN: u32 = 1 << 20;
 
+/// The most tombstones a whole decoded sequence may reconstruct across every
+/// run. The per-record cap alone bounds one record but not their sum, so a
+/// small stream of many records could still claim an unbounded node count; this
+/// ceiling bounds the total. A document compacts long before reaching it.
+const MAX_TOMBSTONE_TOTAL: u64 = 1 << 24;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Side {
     Left,
@@ -208,20 +214,38 @@ impl List {
             }
         }
 
+        // Read every run record and validate its declared size before
+        // reconstructing any node, so a crafted stream is rejected on its
+        // declared lengths rather than by materialising the bomb it describes.
+        // Each record consumes real bytes, so the record count is itself bounded
+        // by the input length.
         let run_count = cur.u32()?;
+        let mut runs = Vec::new();
+        let mut total_tombstones: u64 = 0;
         for _ in 0..run_count {
             let start = cur.stamp()?;
             let length = cur.u32()?;
             let anchor = cur.anchor()?;
             // A run reconstructs `length` nodes from a fixed record, so an
             // unbounded length is a decompression bomb; the encoder splits past
-            // this cap, so a larger record is malformed.
-            if length > MAX_TOMBSTONE_RUN {
+            // the per-record cap and never emits an empty run, so a length
+            // outside `1..=MAX_TOMBSTONE_RUN` is malformed.
+            if length == 0 || length > MAX_TOMBSTONE_RUN {
                 return Err(DecodeError::BadTag {
                     what: "list: tombstone run length",
                     tag: 0,
                 });
             }
+            total_tombstones += length as u64;
+            if total_tombstones > MAX_TOMBSTONE_TOTAL {
+                return Err(DecodeError::BadTag {
+                    what: "list: tombstone total exceeds decode budget",
+                    tag: 0,
+                });
+            }
+            runs.push((start, length, anchor));
+        }
+        for (start, length, anchor) in runs {
             let mut parent = anchor.parent;
             let mut side = anchor.side;
             for i in 0..length {
