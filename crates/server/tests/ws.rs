@@ -13,8 +13,11 @@ use crdtsync_core::{
     decode_message, encode_header, encode_message, ClientId, Document, ErrorCode, Message, Op,
     Scalar,
 };
-use crdtsync_server::runtime::{serve, serve_with, serve_with_verifier, ServeConfig};
-use crdtsync_server::Verifier;
+use crdtsync_server::acl::Acl;
+use crdtsync_server::runtime::{
+    serve, serve_with, serve_with_authorizer, serve_with_verifier, ServeConfig,
+};
+use crdtsync_server::{AllowAll, Authorizer, Verifier};
 use std::time::Duration;
 
 const CH: Channel = Channel(0);
@@ -182,6 +185,114 @@ async fn join(url: &str, client: u8) -> Ws {
     )
     .await;
     ws
+}
+
+/// Start a server that enforces `authorizer` at every read/write/awareness point.
+/// The dev-mode verifier still echoes the presented credential as the actor, so a
+/// test picks the actor a policy sees by choosing the credential it authenticates
+/// with.
+async fn start_server_with_authorizer(authorizer: Box<dyn Authorizer + Send>) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(serve_with_authorizer(
+        listener,
+        cid(0xFF),
+        None,
+        ServeConfig::default(),
+        Box::new(AllowAll),
+        authorizer,
+    ));
+    Server {
+        url: format!("ws://{addr}"),
+        task,
+    }
+}
+
+/// Handshake and authenticate as the actor named by `credential`, returning the
+/// connection without subscribing so a test can drive the subscribe itself.
+async fn auth_as(url: &str, client: u8, credential: &[u8]) -> Ws {
+    let mut ws = open(url).await;
+    send_bytes(&mut ws, encode_header(PROTOCOL_VERSION).to_vec()).await;
+    send(
+        &mut ws,
+        &Message::Hello {
+            client: cid(client),
+        },
+    )
+    .await;
+    send(
+        &mut ws,
+        &Message::Auth {
+            credential: credential.to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv(&mut ws).await,
+        Message::AuthOk {
+            actor: credential.to_vec(),
+        }
+    );
+    ws
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// A policy loaded from a declarative file is enforced by the running server: the
+/// granted actor subscribes to the permitted room, and everyone else is refused
+/// over the real transport — the deploy-seam half of declarative enforcement.
+#[tokio::test]
+async fn a_declared_policy_gates_subscribe_over_the_transport() {
+    // Only "reader" may read the room; every other actor is default-denied.
+    let room = std::str::from_utf8(ROOM).unwrap();
+    let policy = format!("allow actor:{} read room:{room}", hex(b"reader"));
+    let acl = Acl::from_policy(&policy).unwrap();
+    let server = start_server_with_authorizer(Box::new(acl)).await;
+    let url = &server.url;
+
+    let mut granted = auth_as(url, 1, b"reader").await;
+    send(
+        &mut granted,
+        &Message::Subscribe {
+            channel: CH,
+            room: ROOM.to_vec(),
+            last_seen_seq: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv(&mut granted).await,
+        ops_msg(Vec::new()),
+        "the permitted actor subscribes"
+    );
+
+    let mut denied = auth_as(url, 2, b"intruder").await;
+    send(
+        &mut denied,
+        &Message::Subscribe {
+            channel: CH,
+            room: ROOM.to_vec(),
+            last_seen_seq: 0,
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            recv(&mut denied).await,
+            Message::Error {
+                code: ErrorCode::Forbidden,
+                ..
+            }
+        ),
+        "an actor outside the policy is forbidden"
+    );
 }
 
 fn sample_ops() -> Vec<Op> {
