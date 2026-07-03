@@ -5,11 +5,20 @@
 //! log there and replay it on restart; unset, the replicas are in-memory. Set
 //! `CRDTSYNC_POLICY_FILE` to enforce a declarative authorization policy; unset,
 //! every authenticated actor is permitted.
+//!
+//! The stock binary authenticates with the dev-mode `AllowAll` verifier, which
+//! takes the presented credential verbatim as the actor id. So a policy's
+//! subject-class rules (`authenticated` / `anonymous` / `anyone`) hold, but its
+//! `actor:<id>` rules are only advisory here — any client can name itself that
+//! actor by sending that credential. A production deployment embeds the library
+//! and injects a real `Verifier` (`serve_with_verifier` / `serve_with_authorizer`)
+//! that derives the actor from a validated credential; only then are `actor:`
+//! rules enforceable.
 
 use std::env::VarError;
 
 use crdtsync_core::ClientId;
-use crdtsync_server::acl::Acl;
+use crdtsync_server::acl::{Acl, PolicyFileError};
 use crdtsync_server::runtime::{serve, serve_with_authorizer, ServeConfig};
 use crdtsync_server::{AllowAll, Store};
 use tokio::net::TcpListener;
@@ -44,10 +53,15 @@ async fn main() -> std::io::Result<()> {
         None => None,
     };
     let policy = match path_var("CRDTSYNC_POLICY_FILE")? {
-        Some(path) => Some(
-            Acl::from_policy_file(path)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?,
-        ),
+        // Keep the underlying failure intact: an unreadable file surfaces its own
+        // io error (kind and source), a malformed one is invalid data carrying the
+        // parse error (which names the offending line) as its source.
+        Some(path) => Some(Acl::from_policy_file(path).map_err(|e| match e {
+            PolicyFileError::Io(io) => io,
+            PolicyFileError::Parse(parse) => {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, parse)
+            }
+        })?),
         None => None,
     };
     let listener = TcpListener::bind(&addr).await?;
@@ -55,8 +69,10 @@ async fn main() -> std::io::Result<()> {
     // The server never mints ops; its replicas only merge, so a fixed id is fine.
     let server = ClientId::from_bytes([0; 16]);
     match policy {
-        // A declared policy is enforced; without one, the runtime's default
-        // permits every authenticated actor (dev mode).
+        // A declared policy gates every authenticated actor; without one, the
+        // runtime's default permits them all (dev mode). The actor each rule sees
+        // comes from the dev-mode verifier above — see the module note on why
+        // `actor:` rules need a real verifier to be enforceable.
         Some(acl) => {
             serve_with_authorizer(
                 listener,

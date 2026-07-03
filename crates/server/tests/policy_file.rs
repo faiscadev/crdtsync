@@ -3,6 +3,9 @@
 //! `Acl::from_policy_file` reads a policy file and parses it into an `Acl`. The
 //! two failure modes are distinct: the file being unreadable (`Io`) and its
 //! contents being malformed (`Parse`, carrying the offending line).
+//!
+//! Excluded under Miri, which cannot touch the real filesystem.
+#![cfg(not(miri))]
 
 use crdtsync_server::acl::{Acl, PolicyFileError};
 use crdtsync_server::{Action, Authorizer, Resource};
