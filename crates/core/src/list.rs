@@ -458,7 +458,8 @@ impl List {
 
     /// The number of live items strictly before `id` in sequence order, and
     /// whether `id` itself is live — or `None` if `id` is not in the sequence.
-    /// One pass over the order, so resolution is O(n), not O(n²).
+    /// One traversal of the order (no repeated `live_index` scans, which made the
+    /// earlier resolution quadratic in traversals).
     fn live_rank(&self, id: Stamp) -> Option<(usize, bool)> {
         let mut before = 0;
         for s in self.tree_order() {
