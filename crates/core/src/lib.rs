@@ -13,6 +13,7 @@
 
 pub mod anchor;
 pub mod host;
+pub mod json;
 
 pub mod clientid;
 pub mod elementid;
@@ -44,6 +45,7 @@ pub use doc::{Document, OrphanEvent};
 pub use element::{Element, ElementKind};
 pub use elementid::ElementId;
 pub use host::Host;
+pub use json::Json;
 pub use list::{Anchor, List, Side};
 pub use map::Map;
 pub use op::{Op, OpId, OpKind, Tx, TxId};
