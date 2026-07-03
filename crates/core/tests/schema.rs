@@ -403,6 +403,29 @@ fn a_json_error_keeps_its_byte_offset() {
 }
 
 #[test]
+fn a_nested_field_error_names_its_type() {
+    let e = Schema::parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map", "children": { "x": "X" } },
+                       "X": { "kind": "register", "min": "low" } } }"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::WrongType);
+    assert_eq!(e.at, "X.min", "the error names the offending type");
+}
+
+#[test]
+fn a_bad_child_value_names_the_type_and_slot() {
+    let e = Schema::parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map", "children": { "x": 3 } } } }"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::WrongType);
+    assert_eq!(e.at, "R.children.x", "the error names the type and slot");
+}
+
+#[test]
 fn schema_error_displays_and_is_an_error() {
     let e = Schema::parse("[]").unwrap_err();
     let shown = format!("{e}");

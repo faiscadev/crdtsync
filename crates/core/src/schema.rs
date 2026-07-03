@@ -152,9 +152,9 @@ impl Schema {
         json.as_object()
             .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, "document"))?;
 
-        let name = required_str(json, "schema")?.to_string();
-        let version = required_int(json, "version")?;
-        let root = required_str(json, "root")?.to_string();
+        let name = required_str(json, "schema", "")?.to_string();
+        let version = required_int(json, "version", "")?;
+        let root = required_str(json, "root", "")?.to_string();
 
         let types_json = json
             .get("types")
@@ -221,28 +221,38 @@ impl Schema {
     }
 }
 
+/// A readable error location: a field key joined onto its enclosing context
+/// (a type name, or a `Type.children` path), or a bare key at the top level.
+fn at(ctx: &str, key: &str) -> String {
+    if ctx.is_empty() {
+        key.to_string()
+    } else {
+        format!("{ctx}.{key}")
+    }
+}
+
 fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, SchemaError> {
     json.as_object()
         .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, type_name.to_string()))?;
-    let kind = required_str(json, "kind")?;
+    let kind = required_str(json, "kind", type_name)?;
     match kind {
         "map" => Ok(TypeDef::Map {
-            children: parse_children(json)?,
+            children: parse_children(json, type_name)?,
         }),
         "list" => {
-            let items = required_str(json, "items")?.to_string();
-            let (min, max) = counts(json)?;
+            let items = required_str(json, "items", type_name)?.to_string();
+            let (min, max) = counts(json, type_name)?;
             Ok(TypeDef::List { items, min, max })
         }
         "text" => Ok(TypeDef::Text {
-            max: count_field(json, "max")?,
+            max: count_field(json, "max", type_name)?,
         }),
         "register" => {
-            let (min, max) = bounds(json)?;
+            let (min, max) = bounds(json, type_name)?;
             Ok(TypeDef::Register { min, max })
         }
         "counter" => {
-            let (min, max) = bounds(json)?;
+            let (min, max) = bounds(json, type_name)?;
             Ok(TypeDef::Counter { min, max })
         }
         _ => Err(SchemaError::new(
@@ -252,84 +262,91 @@ fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, SchemaError> 
     }
 }
 
-fn parse_children(json: &Json) -> Result<Vec<(String, String)>, SchemaError> {
+fn parse_children(json: &Json, ctx: &str) -> Result<Vec<(String, String)>, SchemaError> {
     let Some(children) = json.get("children") else {
         return Ok(Vec::new());
     };
+    let ctx = at(ctx, "children");
     let obj = children
         .as_object()
-        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, "children"))?;
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, ctx.clone()))?;
     let mut out = Vec::with_capacity(obj.len());
     for (slot, ty) in obj {
         let type_name = ty
             .as_str()
-            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, slot.clone()))?;
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, slot)))?;
         out.push((slot.clone(), type_name.to_string()));
     }
     Ok(out)
 }
 
 /// The `min`/`max` of a register or counter — full-range `i64` bounds.
-fn bounds(json: &Json) -> Result<(Option<i64>, Option<i64>), SchemaError> {
-    let min = int_field(json, "min")?;
-    let max = int_field(json, "max")?;
+fn bounds(json: &Json, ctx: &str) -> Result<(Option<i64>, Option<i64>), SchemaError> {
+    let min = int_field(json, "min", ctx)?;
+    let max = int_field(json, "max", ctx)?;
     if let (Some(a), Some(b)) = (min, max) {
         if a > b {
-            return Err(SchemaError::new(SchemaErrorKind::BadRange, "min > max"));
+            return Err(SchemaError::new(
+                SchemaErrorKind::BadRange,
+                at(ctx, "min > max"),
+            ));
         }
     }
     Ok((min, max))
 }
 
 /// The `min`/`max` of a list — non-negative element counts.
-fn counts(json: &Json) -> Result<(Option<u64>, Option<u64>), SchemaError> {
-    let min = count_field(json, "min")?;
-    let max = count_field(json, "max")?;
+fn counts(json: &Json, ctx: &str) -> Result<(Option<u64>, Option<u64>), SchemaError> {
+    let min = count_field(json, "min", ctx)?;
+    let max = count_field(json, "max", ctx)?;
     if let (Some(a), Some(b)) = (min, max) {
         if a > b {
-            return Err(SchemaError::new(SchemaErrorKind::BadRange, "min > max"));
+            return Err(SchemaError::new(
+                SchemaErrorKind::BadRange,
+                at(ctx, "min > max"),
+            ));
         }
     }
     Ok((min, max))
 }
 
-fn int_field(json: &Json, key: &str) -> Result<Option<i64>, SchemaError> {
+fn int_field(json: &Json, key: &str, ctx: &str) -> Result<Option<i64>, SchemaError> {
     match json.get(key) {
         None => Ok(None),
         Some(v) => Ok(Some(v.as_i64().ok_or_else(|| {
-            SchemaError::new(SchemaErrorKind::WrongType, key.to_string())
+            SchemaError::new(SchemaErrorKind::WrongType, at(ctx, key))
         })?)),
     }
 }
 
-fn count_field(json: &Json, key: &str) -> Result<Option<u64>, SchemaError> {
-    match int_field(json, key)? {
+fn count_field(json: &Json, key: &str, ctx: &str) -> Result<Option<u64>, SchemaError> {
+    match int_field(json, key, ctx)? {
         None => Ok(None),
-        Some(n) if n < 0 => Err(SchemaError::new(SchemaErrorKind::BadRange, key.to_string())),
+        Some(n) if n < 0 => Err(SchemaError::new(SchemaErrorKind::BadRange, at(ctx, key))),
         Some(n) => Ok(Some(n as u64)),
     }
 }
 
-fn required_str<'a>(json: &'a Json, key: &str) -> Result<&'a str, SchemaError> {
+fn required_str<'a>(json: &'a Json, key: &str, ctx: &str) -> Result<&'a str, SchemaError> {
     match json.get(key) {
         None => Err(SchemaError::new(
             SchemaErrorKind::MissingField,
-            key.to_string(),
+            at(ctx, key),
         )),
         Some(v) => v
             .as_str()
-            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, key.to_string())),
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(ctx, key))),
     }
 }
 
-fn required_int(json: &Json, key: &str) -> Result<i64, SchemaError> {
+fn required_int(json: &Json, key: &str, ctx: &str) -> Result<i64, SchemaError> {
     match json.get(key) {
         None => Err(SchemaError::new(
             SchemaErrorKind::MissingField,
-            key.to_string(),
+            at(ctx, key),
         )),
         Some(v) => v
             .as_i64()
-            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, key.to_string())),
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(ctx, key))),
     }
 }
