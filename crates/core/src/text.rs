@@ -104,7 +104,7 @@ impl Text {
         let mut anchor = anchor;
         for (k, c) in s.chars().enumerate() {
             let char_id = Stamp {
-                lamport: base.lamport + k as u64,
+                lamport: base.lamport.saturating_add(k as u64),
                 client: base.client,
             };
             self.inner

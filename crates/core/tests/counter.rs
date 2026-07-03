@@ -256,3 +256,19 @@ fn clone_of_displaced_is_not_displaced() {
     src.displace();
     assert!(!src.deep_clone().is_displaced());
 }
+
+#[test]
+fn a_cumulative_amount_past_u32_max_saturates_not_panics() {
+    // `amount` is wire-derived and two distinct same-author ops both apply, so
+    // their per-client tally sums. A sum past u32::MAX must not panic (checked
+    // builds) or wrap (release) — it saturates at the tally ceiling.
+    let mut c = fresh();
+    c.inc(cid(1), 3_000_000_000);
+    c.inc(cid(1), 3_000_000_000);
+    assert_eq!(c.read(), u32::MAX as i64);
+
+    let mut d = fresh();
+    d.dec(cid(1), 3_000_000_000);
+    d.dec(cid(1), 3_000_000_000);
+    assert_eq!(d.read(), -(u32::MAX as i64));
+}
