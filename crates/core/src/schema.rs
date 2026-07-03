@@ -28,6 +28,20 @@ pub struct Schema {
     version: i64,
     root: String,
     types: Vec<(String, TypeDef)>,
+    awareness: Vec<(String, AwarenessEntry)>,
+}
+
+/// The declared timing of one kind of ephemeral awareness entry (a cursor, a
+/// selection, a presence marker). Both bounds are milliseconds and optional.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AwarenessEntry {
+    /// Auto-expire an entry this many milliseconds after its last update
+    /// (timed presence). `None` means the entry lives until its owner clears
+    /// it or disconnects.
+    pub ttl: Option<u64>,
+    /// Coalesce inbound updates arriving within this many milliseconds,
+    /// keeping only the latest. `None` means no server-side throttle.
+    pub throttle: Option<u64>,
 }
 
 /// One named type: a built primitive with its declared constraints.
@@ -139,6 +153,19 @@ impl Schema {
             .map(|(_, def)| def)
     }
 
+    /// The declared awareness entry kinds, in declaration order.
+    pub fn awareness(&self) -> &[(String, AwarenessEntry)] {
+        &self.awareness
+    }
+
+    /// The awareness timing declared for `kind`, if any.
+    pub fn awareness_entry(&self, kind: &str) -> Option<&AwarenessEntry> {
+        self.awareness
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, e)| e)
+    }
+
     /// Parse a schema from its JSON source. Total — any input yields a `Schema`
     /// or a [`SchemaError`], never a panic.
     pub fn parse(src: &str) -> Result<Schema, SchemaError> {
@@ -169,11 +196,17 @@ impl Schema {
             types.push((type_name.clone(), parse_type_def(def, type_name)?));
         }
 
+        let awareness = match json.get("awareness") {
+            None => Vec::new(),
+            Some(a) => parse_awareness(a)?,
+        };
+
         let schema = Schema {
             name,
             version,
             root,
             types,
+            awareness,
         };
         schema.validate_references()?;
         Ok(schema)
@@ -264,6 +297,23 @@ fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, SchemaError> 
             at(type_name, "kind"),
         )),
     }
+}
+
+fn parse_awareness(json: &Json) -> Result<Vec<(String, AwarenessEntry)>, SchemaError> {
+    let obj = json
+        .as_object()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, "awareness"))?;
+    let mut out = Vec::with_capacity(obj.len());
+    for (kind, entry) in obj {
+        let ctx = at("awareness", kind);
+        entry
+            .as_object()
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, ctx.clone()))?;
+        let ttl = count_field(entry, "ttl", &ctx)?;
+        let throttle = count_field(entry, "throttle", &ctx)?;
+        out.push((kind.clone(), AwarenessEntry { ttl, throttle }));
+    }
+    Ok(out)
 }
 
 fn parse_children(json: &Json, ctx: &str) -> Result<Vec<(String, String)>, SchemaError> {
