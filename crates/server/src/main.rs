@@ -7,13 +7,15 @@
 //! every authenticated actor is permitted.
 //!
 //! The stock binary authenticates with the dev-mode `AllowAll` verifier, which
-//! takes the presented credential verbatim as the actor id. So a policy's
-//! subject-class rules (`authenticated` / `anonymous` / `anyone`) hold, but its
-//! `actor:<id>` rules are only advisory here — any client can name itself that
-//! actor by sending that credential. A production deployment embeds the library
-//! and injects a real `Verifier` (`serve_with_verifier` / `serve_with_authorizer`)
-//! that derives the actor from a validated credential; only then are `actor:`
-//! rules enforceable.
+//! takes the presented credential verbatim as the actor id. The client therefore
+//! controls its entire actor id — including whether it carries the `anon:` prefix
+//! that separates anonymous from authenticated. So under this binary no policy
+//! subject is a security boundary except `anyone` (which matches everyone
+//! regardless): `actor:<id>`, `authenticated`, and `anonymous` rules are all
+//! spoofable by choosing a matching credential. A production deployment embeds
+//! the library and injects a real `Verifier` (`serve_with_verifier` /
+//! `serve_with_authorizer`) that derives the actor from a validated credential;
+//! only then is any subject rule enforceable.
 
 use std::env::VarError;
 
@@ -71,8 +73,9 @@ async fn main() -> std::io::Result<()> {
     match policy {
         // A declared policy gates every authenticated actor; without one, the
         // runtime's default permits them all (dev mode). The actor each rule sees
-        // comes from the dev-mode verifier above — see the module note on why
-        // `actor:` rules need a real verifier to be enforceable.
+        // comes from the dev-mode verifier above, which the client controls
+        // entirely — so every subject but `anyone` is spoofable until a real
+        // verifier is injected (see the module note).
         Some(acl) => {
             serve_with_authorizer(
                 listener,
