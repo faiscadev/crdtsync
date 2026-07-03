@@ -274,3 +274,47 @@ fn ingest_preserves_and_fans_out_a_whole_atomic_transaction() {
     assert_eq!(int(peer.get(b"x")), 1);
     assert_eq!(int(peer.get(b"y")), 2);
 }
+
+#[test]
+fn awareness_keys_per_client_are_bounded() {
+    // A client cannot grow a room's awareness map without bound: past the
+    // per-client key cap a new key is dropped, so an AwarenessSet flood can't
+    // drive the server to OOM.
+    let mut h = hub();
+    let client = cid(1);
+    for k in 0..500u32 {
+        h.set_awareness(
+            b"room",
+            client,
+            b"actor".to_vec(),
+            k.to_le_bytes().to_vec(),
+            vec![0],
+        );
+    }
+    // Exactly the cap is retained — the first 64 distinct keys, no more.
+    assert_eq!(h.awareness_entries(b"room").len(), 64);
+
+    // An update to an already-held key still applies past the cap.
+    h.set_awareness(
+        b"room",
+        client,
+        b"actor".to_vec(),
+        0u32.to_le_bytes().to_vec(),
+        vec![9],
+    );
+    let updated = h
+        .awareness_entries(b"room")
+        .into_iter()
+        .find(|(_, key, _)| key == &0u32.to_le_bytes().to_vec())
+        .map(|(_, _, value)| value);
+    assert_eq!(
+        updated,
+        Some(vec![9]),
+        "an update to an existing key must apply after the cap"
+    );
+    assert_eq!(
+        h.awareness_entries(b"room").len(),
+        64,
+        "an update must not grow the map"
+    );
+}

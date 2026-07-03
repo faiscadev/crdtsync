@@ -276,8 +276,11 @@ pub fn step(
                 return forbidden("awareness publish denied");
             }
             // Ephemeral: retained for late-joiner replay and fanned to the room's
-            // peers, but never logged or snapshotted.
-            hub.set_awareness(&room, client, actor.clone(), key.clone(), value.clone());
+            // peers, but never logged or snapshotted. A key dropped at the
+            // per-client cap is neither stored nor broadcast.
+            if !hub.set_awareness(&room, client, actor.clone(), key.clone(), value.clone()) {
+                return Response::default();
+            }
             Response {
                 awareness: Some(AwarenessBroadcast {
                     room,

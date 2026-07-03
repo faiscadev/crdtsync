@@ -136,10 +136,26 @@ impl Registry {
     /// and only a later [`sweep`](Registry::sweep) past the deadline drops it.
     pub fn disconnect(&mut self, id: ConnId) {
         if let Some(conn) = self.conns.remove(&id) {
+            // Only an authenticated connection can have published awareness, so
+            // only one may influence its grace retention — an unauthenticated
+            // Hello-only socket cannot schedule or refresh a sweep for a client
+            // id it merely asserted.
+            if conn.session.actor().is_none() {
+                return;
+            }
             if let Some(client) = conn.session.client() {
-                // Only a client with live presence needs a grace timer; without
-                // it there is nothing for a sweep to clear.
-                if self.hub.has_client_awareness(client) {
+                // Another live connection under the same client still owns that
+                // presence, so a sweep must not clear it — this covers a
+                // reconnect race (the new connection registered before the old
+                // one's close) and a second connection asserting the same id.
+                let still_held = self
+                    .conns
+                    .values()
+                    .any(|c| c.session.client() == Some(client) && c.session.actor().is_some());
+                // Only a client with live presence and no other live connection
+                // needs a grace timer; otherwise there is nothing a sweep should
+                // clear.
+                if !still_held && self.hub.has_client_awareness(client) {
                     let deadline = self.clock.now_millis().saturating_add(self.grace_millis);
                     self.stale.insert(client, deadline);
                 }
@@ -178,12 +194,7 @@ impl Registry {
     /// replies and fanning any broadcast out to the room's other connections.
     /// Returns whether the connection should stay open.
     pub fn deliver(&mut self, id: ConnId, msg: Message) -> bool {
-        // A client reappearing within its grace window cancels the pending clear,
-        // so its presence survives the reconnect gap.
-        if let Message::Hello { client } = &msg {
-            self.stale.remove(client);
-        }
-        let (broadcast, close, room, awareness) = {
+        let (broadcast, close, room, awareness, authed_client) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
@@ -195,13 +206,28 @@ impl Registry {
                 msg,
             );
             conn.outbox.extend(resp.replies);
+            // Only an authenticated session may touch a client's grace timer, so
+            // a bare Hello-only socket can neither cancel a pending sweep nor
+            // keep a foreign client id's presence alive.
+            let authed_client = conn
+                .session
+                .actor()
+                .is_some()
+                .then(|| conn.session.client())
+                .flatten();
             (
                 resp.broadcast,
                 resp.close,
                 resp.broadcast_room,
                 resp.awareness,
+                authed_client,
             )
         };
+        // A client reappearing within its grace window cancels the pending
+        // clear once it re-authenticates, so its presence survives the gap.
+        if let Some(client) = authed_client {
+            self.stale.remove(&client);
+        }
         // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),
         // so fanning it out never advertises an unpersisted write. Each peer is
         // sent the ops on the channel it opened for the room, so a peer

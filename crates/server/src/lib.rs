@@ -76,6 +76,11 @@ struct Version {
     state: Vec<u8>,
 }
 
+/// The most distinct awareness keys one client may hold in a room. Presence is
+/// a handful of entries (cursor, selection, name, viewport, …); the cap bounds
+/// the room's awareness map against a client that floods distinct keys.
+const MAX_AWARENESS_KEYS_PER_CLIENT: usize = 64;
+
 /// The set of rooms a single node serves, optionally over a durable log.
 pub struct Hub {
     server: ClientId,
@@ -84,7 +89,9 @@ pub struct Hub {
     compaction_threshold: u64,
     /// Ephemeral presence per room: each owner client's latest entry per key,
     /// with the actor to surface it under. Never persisted or snapshotted.
-    awareness: HashMap<RoomId, HashMap<(ClientId, Vec<u8>), (Vec<u8>, Vec<u8>)>>,
+    /// Per room, each client's presence keyed by awareness key → (actor, value).
+    /// Nesting by client keeps the per-client key cap an O(1) check.
+    awareness: HashMap<RoomId, HashMap<ClientId, HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>>>,
     /// Named versions per room, keyed by name — sorted, for listing/pagination.
     /// The in-memory versions index over the snapshot storage primitive.
     versions: HashMap<RoomId, BTreeMap<Vec<u8>, Version>>,
@@ -104,7 +111,11 @@ impl Hub {
     }
 
     /// Record `client`'s ephemeral awareness entry `key` in `room`, last-writer-
-    /// wins, so a later subscriber can be replayed the current presence.
+    /// wins, so a later subscriber can be replayed the current presence. A new
+    /// key past the per-client cap is dropped, so a client cannot grow the room's
+    /// awareness map without bound; an update to an existing key always applies.
+    /// Returns whether the entry was stored — a dropped key is not broadcast
+    /// either, so the cap bounds fan-out as well as memory.
     pub fn set_awareness(
         &mut self,
         room: &[u8],
@@ -112,11 +123,18 @@ impl Hub {
         actor: Vec<u8>,
         key: Vec<u8>,
         value: Vec<u8>,
-    ) {
-        self.awareness
+    ) -> bool {
+        let keys = self
+            .awareness
             .entry(room.to_vec())
             .or_default()
-            .insert((client, key), (actor, value));
+            .entry(client)
+            .or_default();
+        if !keys.contains_key(&key) && keys.len() >= MAX_AWARENESS_KEYS_PER_CLIENT {
+            return false;
+        }
+        keys.insert(key, (actor, value));
+        true
     }
 
     /// The current awareness entries in `room` as `(actor, key, value)`, for
@@ -126,7 +144,10 @@ impl Hub {
             .get(room)
             .into_iter()
             .flatten()
-            .map(|((_, key), (actor, value))| (actor.clone(), key.clone(), value.clone()))
+            .flat_map(|(_, keys)| {
+                keys.iter()
+                    .map(|(key, (actor, value))| (actor.clone(), key.clone(), value.clone()))
+            })
             .collect()
     }
 
@@ -136,7 +157,7 @@ impl Hub {
     pub fn has_client_awareness(&self, client: ClientId) -> bool {
         self.awareness
             .values()
-            .any(|entries| entries.keys().any(|(owner, _)| *owner == client))
+            .any(|by_client| by_client.get(&client).is_some_and(|keys| !keys.is_empty()))
     }
 
     /// Drop every awareness entry owned by `client` across all rooms, returning
@@ -145,18 +166,11 @@ impl Hub {
     /// pair per room it had presence in.
     pub fn clear_client_awareness(&mut self, client: ClientId) -> Vec<(RoomId, Vec<u8>)> {
         let mut cleared = Vec::new();
-        for (room, entries) in self.awareness.iter_mut() {
-            let mut actor = None;
-            entries.retain(|(owner, _), (a, _)| {
-                if *owner == client {
-                    actor.get_or_insert_with(|| a.clone());
-                    false
-                } else {
-                    true
+        for (room, by_client) in self.awareness.iter_mut() {
+            if let Some(keys) = by_client.remove(&client) {
+                if let Some((actor, _)) = keys.into_values().next() {
+                    cleared.push((room.clone(), actor));
                 }
-            });
-            if let Some(actor) = actor {
-                cleared.push((room.clone(), actor));
             }
         }
         cleared

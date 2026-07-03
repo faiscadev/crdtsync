@@ -239,3 +239,151 @@ fn a_sweep_with_nothing_stale_is_a_no_op() {
     );
     assert_eq!(awareness_updates(r.take_outbox(b)).len(), 1);
 }
+
+#[test]
+fn a_second_connection_asserting_a_live_client_cannot_steal_its_presence() {
+    let (mut r, clock) = registry();
+    // The victim holds presence in the room over a live connection.
+    let victim = hello_auth(&mut r, 1);
+    subscribe(&mut r, victim, 1, ROOM_A);
+    set_awareness(&mut r, victim, 1, b"cursor", vec![5]);
+
+    // A second connection asserts the victim's client id, then drops. Its
+    // departure must not schedule a sweep of a presence another live connection
+    // still holds.
+    let intruder = r.connect();
+    assert!(r.deliver(intruder, Message::Hello { client: cid(1) }));
+    r.disconnect(intruder);
+
+    clock.advance(GRACE);
+    r.sweep();
+
+    // The victim is still connected, so a joiner is still replayed its presence.
+    let joiner = hello_auth(&mut r, 2);
+    r.deliver(
+        joiner,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(
+        !awareness_updates(r.take_outbox(joiner)).is_empty(),
+        "a live client's presence was swept by another connection's disconnect"
+    );
+}
+
+#[test]
+fn an_authenticated_second_connection_cannot_steal_a_live_clients_presence() {
+    let (mut r, clock) = registry();
+    let victim = hello_auth(&mut r, 1);
+    subscribe(&mut r, victim, 1, ROOM_A);
+    set_awareness(&mut r, victim, 1, b"cursor", vec![5]);
+
+    // A different, authenticated connection asserting the victim's client id
+    // still cannot schedule a sweep while the victim's connection is live.
+    let intruder = hello_auth(&mut r, 1);
+    r.disconnect(intruder);
+
+    clock.advance(GRACE);
+    r.sweep();
+
+    let joiner = hello_auth(&mut r, 2);
+    r.deliver(
+        joiner,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(
+        !awareness_updates(r.take_outbox(joiner)).is_empty(),
+        "a live client's presence was swept by another authenticated connection"
+    );
+}
+
+#[test]
+fn an_awareness_key_dropped_at_the_cap_is_not_broadcast() {
+    let (mut r, _clock) = registry();
+    let a = hello_auth(&mut r, 1);
+    subscribe(&mut r, a, 1, ROOM_A);
+    let b = hello_auth(&mut r, 2);
+    subscribe(&mut r, b, 1, ROOM_A);
+    r.take_outbox(b);
+
+    // A flood of distinct keys past the cap: only stored keys are broadcast, so
+    // the peer sees the cap, not the flood.
+    for k in 0..100u32 {
+        set_awareness(&mut r, a, 1, &k.to_le_bytes(), vec![0]);
+    }
+    assert_eq!(
+        awareness_updates(r.take_outbox(b)).len(),
+        64,
+        "a key dropped at the cap must not be broadcast to peers"
+    );
+}
+
+#[test]
+fn an_unauthenticated_socket_does_not_keep_a_departed_clients_presence() {
+    let (mut r, clock) = registry();
+    let victim = hello_auth(&mut r, 1);
+    subscribe(&mut r, victim, 1, ROOM_A);
+    set_awareness(&mut r, victim, 1, b"cursor", vec![5]);
+
+    // An unauthenticated socket asserting the victim's id does not count as
+    // holding the presence, so the victim's real departure still schedules a
+    // sweep and the presence expires.
+    let ghost = r.connect();
+    assert!(r.deliver(ghost, Message::Hello { client: cid(1) }));
+    r.disconnect(victim);
+
+    clock.advance(GRACE);
+    r.sweep();
+
+    let joiner = hello_auth(&mut r, 2);
+    r.deliver(
+        joiner,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(
+        awareness_updates(r.take_outbox(joiner)).is_empty(),
+        "an unauthenticated socket kept a departed client's presence alive"
+    );
+}
+
+#[test]
+fn an_unauthenticated_hello_does_not_cancel_a_pending_sweep() {
+    let (mut r, clock) = registry();
+    let victim = hello_auth(&mut r, 1);
+    subscribe(&mut r, victim, 1, ROOM_A);
+    set_awareness(&mut r, victim, 1, b"cursor", vec![5]);
+    r.disconnect(victim); // schedules the grace timer
+
+    // A bare Hello asserting the id must not cancel the pending sweep — only an
+    // authenticated reconnect does.
+    let ghost = r.connect();
+    assert!(r.deliver(ghost, Message::Hello { client: cid(1) }));
+
+    clock.advance(GRACE);
+    r.sweep();
+
+    let joiner = hello_auth(&mut r, 2);
+    r.deliver(
+        joiner,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(
+        awareness_updates(r.take_outbox(joiner)).is_empty(),
+        "an unauthenticated Hello cancelled a pending presence sweep"
+    );
+}
