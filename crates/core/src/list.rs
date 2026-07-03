@@ -91,8 +91,11 @@ impl List {
     /// takes consecutive stamps chained parent-to-child. So a maximal run of
     /// tombstones with consecutive stamps forming that chain collapses to one
     /// range record (start, length, the run head's anchor); its dead values are
-    /// dropped. A deleted region costs O(runs), not O(deleted items). Both
-    /// sections are stamp-ordered so equal states encode identically.
+    /// dropped. A deleted region costs O(runs), not O(deleted items). The live
+    /// section is stamp-ordered and the tombstone runs are emitted in run-head
+    /// stamp order, each split run's chunks in ascending offset — a
+    /// deterministic function of the node set (not a global stamp sort across
+    /// runs), so equal states encode identically.
     pub(crate) fn encode_state_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.id.as_bytes());
 
