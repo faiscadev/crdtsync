@@ -137,9 +137,18 @@ impl Registry {
     pub fn disconnect(&mut self, id: ConnId) {
         if let Some(conn) = self.conns.remove(&id) {
             if let Some(client) = conn.session.client() {
-                // Only a client with live presence needs a grace timer; without
-                // it there is nothing for a sweep to clear.
-                if self.hub.has_client_awareness(client) {
+                // Another live connection under the same client still owns that
+                // presence, so a sweep must not clear it — this covers a
+                // reconnect race (the new connection registered before the old
+                // one's close) and a second connection asserting the same id.
+                let still_held = self
+                    .conns
+                    .values()
+                    .any(|c| c.session.client() == Some(client));
+                // Only a client with live presence and no other live connection
+                // needs a grace timer; otherwise there is nothing a sweep should
+                // clear.
+                if !still_held && self.hub.has_client_awareness(client) {
                     let deadline = self.clock.now_millis().saturating_add(self.grace_millis);
                     self.stale.insert(client, deadline);
                 }

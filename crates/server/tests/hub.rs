@@ -274,3 +274,26 @@ fn ingest_preserves_and_fans_out_a_whole_atomic_transaction() {
     assert_eq!(int(peer.get(b"x")), 1);
     assert_eq!(int(peer.get(b"y")), 2);
 }
+
+#[test]
+fn awareness_keys_per_client_are_bounded() {
+    // A client cannot grow a room's awareness map without bound: past the
+    // per-client key cap a new key is dropped, so an AwarenessSet flood can't
+    // drive the server to OOM.
+    let mut h = hub();
+    let client = cid(1);
+    for k in 0..500u32 {
+        h.set_awareness(
+            b"room",
+            client,
+            b"actor".to_vec(),
+            k.to_le_bytes().to_vec(),
+            vec![0],
+        );
+    }
+    let retained = h.awareness_entries(b"room").len();
+    assert!(
+        retained <= 64,
+        "awareness map unbounded: {retained} entries"
+    );
+}

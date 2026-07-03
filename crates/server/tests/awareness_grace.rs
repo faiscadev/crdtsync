@@ -239,3 +239,37 @@ fn a_sweep_with_nothing_stale_is_a_no_op() {
     );
     assert_eq!(awareness_updates(r.take_outbox(b)).len(), 1);
 }
+
+#[test]
+fn a_second_connection_asserting_a_live_client_cannot_steal_its_presence() {
+    let (mut r, clock) = registry();
+    // The victim holds presence in the room over a live connection.
+    let victim = hello_auth(&mut r, 1);
+    subscribe(&mut r, victim, 1, ROOM_A);
+    set_awareness(&mut r, victim, 1, b"cursor", vec![5]);
+
+    // A second connection asserts the victim's client id, then drops. Its
+    // departure must not schedule a sweep of a presence another live connection
+    // still holds.
+    let intruder = r.connect();
+    assert!(r.deliver(intruder, Message::Hello { client: cid(1) }));
+    r.disconnect(intruder);
+
+    clock.advance(GRACE);
+    r.sweep();
+
+    // The victim is still connected, so a joiner is still replayed its presence.
+    let joiner = hello_auth(&mut r, 2);
+    r.deliver(
+        joiner,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(
+        !awareness_updates(r.take_outbox(joiner)).is_empty(),
+        "a live client's presence was swept by another connection's disconnect"
+    );
+}

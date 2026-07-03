@@ -76,6 +76,11 @@ struct Version {
     state: Vec<u8>,
 }
 
+/// The most distinct awareness keys one client may hold in a room. Presence is
+/// a handful of entries (cursor, selection, name, viewport, …); the cap bounds
+/// the room's awareness map against a client that floods distinct keys.
+const MAX_AWARENESS_KEYS_PER_CLIENT: usize = 64;
+
 /// The set of rooms a single node serves, optionally over a durable log.
 pub struct Hub {
     server: ClientId,
@@ -104,7 +109,9 @@ impl Hub {
     }
 
     /// Record `client`'s ephemeral awareness entry `key` in `room`, last-writer-
-    /// wins, so a later subscriber can be replayed the current presence.
+    /// wins, so a later subscriber can be replayed the current presence. A new
+    /// key past the per-client cap is dropped, so a client cannot grow the room's
+    /// awareness map without bound; an update to an existing key always applies.
     pub fn set_awareness(
         &mut self,
         room: &[u8],
@@ -113,10 +120,14 @@ impl Hub {
         key: Vec<u8>,
         value: Vec<u8>,
     ) {
-        self.awareness
-            .entry(room.to_vec())
-            .or_default()
-            .insert((client, key), (actor, value));
+        let entries = self.awareness.entry(room.to_vec()).or_default();
+        if !entries.contains_key(&(client, key.clone())) {
+            let held = entries.keys().filter(|(owner, _)| *owner == client).count();
+            if held >= MAX_AWARENESS_KEYS_PER_CLIENT {
+                return;
+            }
+        }
+        entries.insert((client, key), (actor, value));
     }
 
     /// The current awareness entries in `room` as `(actor, key, value)`, for
