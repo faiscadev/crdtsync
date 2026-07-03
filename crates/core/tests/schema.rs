@@ -9,7 +9,7 @@
 //! so no accepted schema can describe a state the engine cannot later repair.
 
 use crdtsync_core::json::JsonErrorKind;
-use crdtsync_core::schema::{Schema, SchemaErrorKind, TypeDef};
+use crdtsync_core::schema::{AwarenessEntry, Schema, SchemaErrorKind, TypeDef};
 
 fn parse(s: &str) -> Schema {
     Schema::parse(s).unwrap_or_else(|e| panic!("parse of schema failed: {e:?}\n{s}"))
@@ -169,6 +169,95 @@ fn a_register_bound_may_be_negative() {
             min: Some(-10),
             max: Some(10)
         })
+    );
+}
+
+// --- awareness ---
+
+#[test]
+fn a_schema_without_awareness_has_no_entries() {
+    let s = parse(FULL);
+    assert!(s.awareness().is_empty());
+    assert_eq!(s.awareness_entry("cursor"), None);
+}
+
+#[test]
+fn parses_awareness_entries_with_ttl_and_throttle() {
+    let s = parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "awareness": {
+                "cursor": { "ttl": 30000, "throttle": 50 },
+                "selection": { "ttl": 30000 },
+                "presence": {}
+            } }"#,
+    );
+    assert_eq!(
+        s.awareness_entry("cursor"),
+        Some(&AwarenessEntry {
+            ttl: Some(30000),
+            throttle: Some(50),
+        })
+    );
+    assert_eq!(
+        s.awareness_entry("selection"),
+        Some(&AwarenessEntry {
+            ttl: Some(30000),
+            throttle: None,
+        })
+    );
+    assert_eq!(
+        s.awareness_entry("presence"),
+        Some(&AwarenessEntry {
+            ttl: None,
+            throttle: None,
+        })
+    );
+    assert_eq!(s.awareness_entry("missing"), None);
+}
+
+#[test]
+fn awareness_kinds_keep_declaration_order() {
+    let s = parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "awareness": { "cursor": {}, "selection": {}, "presence": {} } }"#,
+    );
+    let kinds: Vec<&str> = s.awareness().iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(kinds, ["cursor", "selection", "presence"]);
+}
+
+#[test]
+fn awareness_must_be_an_object() {
+    assert_eq!(
+        err(r#"{ "schema": "s", "version": 1, "root": "R",
+                 "types": { "R": { "kind": "map" } }, "awareness": [] }"#),
+        SchemaErrorKind::NotAnObject
+    );
+}
+
+#[test]
+fn an_awareness_entry_must_be_an_object() {
+    assert_eq!(
+        err(r#"{ "schema": "s", "version": 1, "root": "R",
+                 "types": { "R": { "kind": "map" } }, "awareness": { "cursor": 5 } }"#),
+        SchemaErrorKind::NotAnObject
+    );
+}
+
+#[test]
+fn an_awareness_timer_must_be_a_non_negative_integer() {
+    assert_eq!(
+        err(r#"{ "schema": "s", "version": 1, "root": "R",
+                 "types": { "R": { "kind": "map" } },
+                 "awareness": { "cursor": { "ttl": "soon" } } }"#),
+        SchemaErrorKind::WrongType
+    );
+    assert_eq!(
+        err(r#"{ "schema": "s", "version": 1, "root": "R",
+                 "types": { "R": { "kind": "map" } },
+                 "awareness": { "cursor": { "throttle": -1 } } }"#),
+        SchemaErrorKind::BadRange
     );
 }
 
