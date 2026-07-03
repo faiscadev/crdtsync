@@ -273,3 +273,54 @@ fn a_second_connection_asserting_a_live_client_cannot_steal_its_presence() {
         "a live client's presence was swept by another connection's disconnect"
     );
 }
+
+#[test]
+fn an_authenticated_second_connection_cannot_steal_a_live_clients_presence() {
+    let (mut r, clock) = registry();
+    let victim = hello_auth(&mut r, 1);
+    subscribe(&mut r, victim, 1, ROOM_A);
+    set_awareness(&mut r, victim, 1, b"cursor", vec![5]);
+
+    // A different, authenticated connection asserting the victim's client id
+    // still cannot schedule a sweep while the victim's connection is live.
+    let intruder = hello_auth(&mut r, 1);
+    r.disconnect(intruder);
+
+    clock.advance(GRACE);
+    r.sweep();
+
+    let joiner = hello_auth(&mut r, 2);
+    r.deliver(
+        joiner,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(
+        !awareness_updates(r.take_outbox(joiner)).is_empty(),
+        "a live client's presence was swept by another authenticated connection"
+    );
+}
+
+#[test]
+fn an_awareness_key_dropped_at_the_cap_is_not_broadcast() {
+    let (mut r, _clock) = registry();
+    let a = hello_auth(&mut r, 1);
+    subscribe(&mut r, a, 1, ROOM_A);
+    let b = hello_auth(&mut r, 2);
+    subscribe(&mut r, b, 1, ROOM_A);
+    r.take_outbox(b);
+
+    // A flood of distinct keys past the cap: only stored keys are broadcast, so
+    // the peer sees the cap, not the flood.
+    for k in 0..100u32 {
+        set_awareness(&mut r, a, 1, &k.to_le_bytes(), vec![0]);
+    }
+    assert_eq!(
+        awareness_updates(r.take_outbox(b)).len(),
+        64,
+        "a key dropped at the cap must not be broadcast to peers"
+    );
+}

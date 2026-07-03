@@ -114,6 +114,8 @@ impl Hub {
     /// wins, so a later subscriber can be replayed the current presence. A new
     /// key past the per-client cap is dropped, so a client cannot grow the room's
     /// awareness map without bound; an update to an existing key always applies.
+    /// Returns whether the entry was stored — a dropped key is not broadcast
+    /// either, so the cap bounds fan-out as well as memory.
     pub fn set_awareness(
         &mut self,
         room: &[u8],
@@ -121,7 +123,7 @@ impl Hub {
         actor: Vec<u8>,
         key: Vec<u8>,
         value: Vec<u8>,
-    ) {
+    ) -> bool {
         let keys = self
             .awareness
             .entry(room.to_vec())
@@ -129,9 +131,10 @@ impl Hub {
             .entry(client)
             .or_default();
         if !keys.contains_key(&key) && keys.len() >= MAX_AWARENESS_KEYS_PER_CLIENT {
-            return;
+            return false;
         }
         keys.insert(key, (actor, value));
+        true
     }
 
     /// The current awareness entries in `room` as `(actor, key, value)`, for

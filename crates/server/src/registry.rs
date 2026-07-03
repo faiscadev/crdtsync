@@ -136,6 +136,13 @@ impl Registry {
     /// and only a later [`sweep`](Registry::sweep) past the deadline drops it.
     pub fn disconnect(&mut self, id: ConnId) {
         if let Some(conn) = self.conns.remove(&id) {
+            // Only an authenticated connection can have published awareness, so
+            // only one may influence its grace retention — an unauthenticated
+            // Hello-only socket cannot schedule or refresh a sweep for a client
+            // id it merely asserted.
+            if conn.session.actor().is_none() {
+                return;
+            }
             if let Some(client) = conn.session.client() {
                 // Another live connection under the same client still owns that
                 // presence, so a sweep must not clear it — this covers a
