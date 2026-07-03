@@ -605,7 +605,7 @@ impl Document {
                 OpKind::TextInsert { s, .. } => {
                     for k in 0..s.chars().count() as u64 {
                         inserted.insert(Stamp {
-                            lamport: op.stamp.lamport + k,
+                            lamport: op.stamp.lamport.saturating_add(k),
                             client: op.stamp.client,
                         });
                     }

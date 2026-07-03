@@ -292,3 +292,20 @@ fn node_ids_clamps_past_the_end() {
     ins(&mut t, 0, "ab", 1, 1);
     assert_eq!(t.node_ids(1, 10).len(), 1); // only "b" remains
 }
+
+#[test]
+fn an_insert_run_based_at_the_lamport_ceiling_does_not_overflow() {
+    // `base` is an op's wire-derived stamp, so an adversarial op can set it to
+    // the lamport ceiling. Deriving consecutive char_ids must saturate rather
+    // than panic (checked builds) or wrap to a colliding low stamp (release).
+    let mut t = text();
+    let anchor = Anchor {
+        parent: None,
+        side: crdtsync_core::Side::Right,
+    };
+    let base = Stamp {
+        lamport: u64::MAX,
+        client: crdtsync_core::ClientId::from_bytes([7u8; 16]),
+    };
+    t.insert_run(base, "ab", anchor); // must not panic
+}

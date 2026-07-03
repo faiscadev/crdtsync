@@ -97,7 +97,7 @@ impl Counter {
     pub fn inc(&mut self, client: ClientId, amount: u32) {
         self.entries
             .entry(client)
-            .and_modify(|tally| tally.inc += amount)
+            .and_modify(|tally| tally.inc = tally.inc.saturating_add(amount))
             .or_insert(Tally {
                 inc: amount,
                 dec: 0,
@@ -107,7 +107,7 @@ impl Counter {
     pub fn dec(&mut self, client: ClientId, amount: u32) {
         self.entries
             .entry(client)
-            .and_modify(|tally| tally.dec += amount)
+            .and_modify(|tally| tally.dec = tally.dec.saturating_add(amount))
             .or_insert(Tally {
                 inc: 0,
                 dec: amount,

@@ -235,3 +235,36 @@ fn ops_from_a_plain_transact_carry_no_tx() {
     });
     assert!(ops.iter().all(|o: &Op| o.tx.is_none()));
 }
+
+#[test]
+fn a_tx_textinsert_at_the_lamport_ceiling_does_not_overflow() {
+    // A complete one-member atomic tx runs the readiness check, whose TextInsert
+    // arm derives a char_id stamp per codepoint from the op's wire-derived
+    // lamport. At the ceiling that derivation must saturate — not overflow-panic
+    // (checked builds) or wrap (release) — through the public apply() boundary.
+    let mut d = doc(1);
+    let attacker = cid(9);
+    let op = Op {
+        id: crdtsync_core::OpId {
+            client: attacker,
+            seq: 0,
+        },
+        stamp: crdtsync_core::Stamp {
+            lamport: u64::MAX,
+            client: attacker,
+        },
+        target: d.root_id(),
+        kind: crdtsync_core::OpKind::TextInsert {
+            s: "ab".to_string(),
+            anchor: crdtsync_core::Anchor {
+                parent: None,
+                side: crdtsync_core::Side::Right,
+            },
+        },
+        tx: Some(Tx {
+            id: crdtsync_core::TxId(0),
+            count: 1,
+        }),
+    };
+    d.apply(&op); // must not panic
+}
