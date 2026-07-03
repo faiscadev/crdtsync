@@ -3,13 +3,14 @@
 //! When a reconnecting client falls below the room's compaction floor the server
 //! replies with a whole-replica [`Message::Snapshot`]. Adopting it must replace
 //! the room's state **without rewinding the client's own op-sequence counter**:
-//! a server snapshot authors nothing, so it carries `seq = 0`, and if adoption
+//! a server snapshot authors nothing, so its encoded replica op-seq counter is
+//! 0 (distinct from the `Message::Snapshot { seq }` server sequence), and if adoption
 //! reset the adopting client to it the client would re-mint `OpId`s it already
 //! made durable — the server dedups those away, so the edits would apply locally
 //! but never reach a peer (silent divergence).
 
 use crdtsync_core::client::ClientSession;
-use crdtsync_core::{Channel, ClientId, Document, Message, Op, Scalar};
+use crdtsync_core::{ClientId, Document, Message, Op, Scalar};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
