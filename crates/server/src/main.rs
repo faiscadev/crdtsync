@@ -4,25 +4,26 @@
 //! protocol over WebSocket. Set `CRDTSYNC_DATA_DIR` to persist each room's op
 //! log there and replay it on restart; unset, the replicas are in-memory. Set
 //! `CRDTSYNC_POLICY_FILE` to enforce a declarative authorization policy; unset,
-//! every authenticated actor is permitted.
+//! every authenticated actor is permitted. Set `CRDTSYNC_CREDENTIALS_FILE` to
+//! authenticate actors against a static secret-token table; unset, the dev-mode
+//! verifier admits any credential.
 //!
-//! The stock binary authenticates with the dev-mode `AllowAll` verifier, which
-//! takes the presented credential verbatim as the actor id. The client therefore
-//! controls its entire actor id — including whether it carries the `anon:` prefix
-//! that separates anonymous from authenticated. So under this binary no policy
-//! subject is a security boundary except `anyone` (which matches everyone
-//! regardless): `actor:<id>`, `authenticated`, and `anonymous` rules are all
-//! spoofable by choosing a matching credential. A production deployment embeds
-//! the library and injects a real `Verifier` (`serve_with_verifier` /
-//! `serve_with_authorizer`) that derives the actor from a validated credential;
-//! only then is any subject rule enforceable.
+//! A policy's `actor:` and subject-class (`authenticated` / `anonymous`) rules
+//! are only real boundaries when the actor is server-derived. With a credentials
+//! file the actor comes from the validated token, so those rules are enforced.
+//! Without one, the dev-mode verifier takes the credential verbatim as the actor
+//! — the client controls its whole actor id, including the `anon:` prefix that
+//! separates anonymous from authenticated — so every subject but `anyone` is
+//! spoofable. A richer verifier (signed tokens, OIDC) is injected by embedding
+//! the library and calling `serve_with_verifier` / `serve_with_authorizer`.
 
 use std::env::VarError;
 
 use crdtsync_core::ClientId;
 use crdtsync_server::acl::{Acl, PolicyFileError};
-use crdtsync_server::runtime::{serve, serve_with_authorizer, ServeConfig};
-use crdtsync_server::{AllowAll, Store};
+use crdtsync_server::auth::CredentialsFileError;
+use crdtsync_server::runtime::{serve_with_authorizer, ServeConfig};
+use crdtsync_server::{AllowAll, Authorizer, PermitAll, StaticTokens, Store, Verifier};
 use tokio::net::TcpListener;
 
 /// Read an environment variable that names a filesystem path, mapping absence to
@@ -35,6 +36,46 @@ fn path_var(name: &'static str) -> std::io::Result<Option<String>> {
             std::io::ErrorKind::InvalidInput,
             format!("{name} is not valid unicode"),
         )),
+    }
+}
+
+/// The verifier for the run: a static credential table if `CRDTSYNC_CREDENTIALS_FILE`
+/// is set, else the dev-mode `AllowAll`. A malformed table surfaces the full
+/// [`CredentialsFileError`] (its "credentials file" context, with the underlying
+/// error as the source), keeping the original [`io::ErrorKind`](std::io::ErrorKind)
+/// so a missing file still reads as `NotFound`.
+fn verifier() -> std::io::Result<Box<dyn Verifier + Send>> {
+    match path_var("CRDTSYNC_CREDENTIALS_FILE")? {
+        Some(path) => {
+            let table = StaticTokens::from_credentials_file(path).map_err(|e| {
+                let kind = match &e {
+                    CredentialsFileError::Io(io) => io.kind(),
+                    CredentialsFileError::Parse(_) => std::io::ErrorKind::InvalidData,
+                };
+                std::io::Error::new(kind, e)
+            })?;
+            Ok(Box::new(table))
+        }
+        None => Ok(Box::new(AllowAll)),
+    }
+}
+
+/// The authorizer for the run: a declared policy if `CRDTSYNC_POLICY_FILE` is set,
+/// else the permissive `PermitAll`. A malformed policy surfaces the full
+/// [`PolicyFileError`] the way [`verifier`] surfaces its own.
+fn authorizer() -> std::io::Result<Box<dyn Authorizer + Send>> {
+    match path_var("CRDTSYNC_POLICY_FILE")? {
+        Some(path) => {
+            let acl = Acl::from_policy_file(path).map_err(|e| {
+                let kind = match &e {
+                    PolicyFileError::Io(io) => io.kind(),
+                    PolicyFileError::Parse(_) => std::io::ErrorKind::InvalidData,
+                };
+                std::io::Error::new(kind, e)
+            })?;
+            Ok(Box::new(acl))
+        }
+        None => Ok(Box::new(PermitAll)),
     }
 }
 
@@ -54,39 +95,20 @@ async fn main() -> std::io::Result<()> {
         Some(dir) => Some(Store::open(dir)?),
         None => None,
     };
-    let policy = match path_var("CRDTSYNC_POLICY_FILE")? {
-        // Keep the underlying failure intact: an unreadable file surfaces its own
-        // io error (kind and source), a malformed one is invalid data carrying the
-        // parse error (which names the offending line) as its source.
-        Some(path) => Some(Acl::from_policy_file(path).map_err(|e| match e {
-            PolicyFileError::Io(io) => io,
-            PolicyFileError::Parse(parse) => {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, parse)
-            }
-        })?),
-        None => None,
-    };
+    let verifier = verifier()?;
+    let authorizer = authorizer()?;
     let listener = TcpListener::bind(&addr).await?;
     eprintln!("crdtsync serving on ws://{addr}");
     // The server never mints ops; its replicas only merge, so a fixed id is fine.
-    let server = ClientId::from_bytes([0; 16]);
-    match policy {
-        // A declared policy gates every authenticated actor; without one, the
-        // runtime's default permits them all (dev mode). The actor each rule sees
-        // comes from the dev-mode verifier above, which the client controls
-        // entirely — so every subject but `anyone` is spoofable until a real
-        // verifier is injected (see the module note).
-        Some(acl) => {
-            serve_with_authorizer(
-                listener,
-                server,
-                store,
-                ServeConfig::default(),
-                Box::new(AllowAll),
-                Box::new(acl),
-            )
-            .await
-        }
-        None => serve(listener, server, store).await,
-    }
+    // Both seams default to their permissive dev-mode value when unconfigured, so
+    // one serve path covers every combination.
+    serve_with_authorizer(
+        listener,
+        ClientId::from_bytes([0; 16]),
+        store,
+        ServeConfig::default(),
+        verifier,
+        authorizer,
+    )
+    .await
 }

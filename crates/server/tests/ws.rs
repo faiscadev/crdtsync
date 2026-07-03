@@ -17,7 +17,7 @@ use crdtsync_server::acl::Acl;
 use crdtsync_server::runtime::{
     serve, serve_with, serve_with_authorizer, serve_with_verifier, ServeConfig,
 };
-use crdtsync_server::{AllowAll, Authorizer, Verifier};
+use crdtsync_server::{AllowAll, Authorizer, StaticTokens, Verifier};
 use std::time::Duration;
 
 const CH: Channel = Channel(0);
@@ -208,9 +208,103 @@ async fn start_server_with_authorizer(authorizer: Box<dyn Authorizer + Send>) ->
     }
 }
 
-/// Handshake and authenticate as the actor named by `credential`, returning the
-/// connection without subscribing so a test can drive the subscribe itself.
-async fn auth_as(url: &str, client: u8, credential: &[u8]) -> Ws {
+/// Start a server with both a real `verifier` (which derives the actor from the
+/// credential) and an `authorizer`, so a test can prove that a policy's `actor:`
+/// rules become enforceable once the actor is server-derived rather than
+/// client-chosen.
+async fn start_server_with_verifier_and_authorizer(
+    verifier: Box<dyn Verifier + Send>,
+    authorizer: Box<dyn Authorizer + Send>,
+) -> Server {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(serve_with_authorizer(
+        listener,
+        cid(0xFF),
+        None,
+        ServeConfig::default(),
+        verifier,
+        authorizer,
+    ));
+    Server {
+        url: format!("ws://{addr}"),
+        task,
+    }
+}
+
+/// Read the next frame, returning `None` if the connection closed instead — used
+/// on the rejection path, where the server sends an error and then closes.
+async fn recv_or_close(ws: &mut Ws) -> Option<Message> {
+    loop {
+        match ws.next().await {
+            Some(Ok(WsMessage::Binary(b))) => return Some(decode_message(&b).unwrap()),
+            Some(Ok(WsMessage::Close(_))) | None => return None,
+            Some(Ok(_)) => continue,
+            Some(Err(_)) => return None,
+        }
+    }
+}
+
+/// A real verifier makes a policy's `actor:` rules enforceable end to end: the
+/// server derives the actor from the credential, so a client cannot name itself
+/// an allowed actor, and an unknown credential never gets past the handshake.
+#[tokio::test]
+async fn a_real_verifier_makes_actor_policy_enforceable() {
+    // secret-alice authenticates as "alice"; the policy lets alice read the room.
+    let mut tokens = StaticTokens::new();
+    tokens.insert(b"secret-alice".to_vec(), b"alice".to_vec());
+    let policy = format!(
+        "allow actor:{} read room:{}",
+        hex(b"alice"),
+        std::str::from_utf8(ROOM).unwrap()
+    );
+    let acl = crdtsync_server::acl::Acl::from_policy(&policy).unwrap();
+    let server = start_server_with_verifier_and_authorizer(Box::new(tokens), Box::new(acl)).await;
+    let url = &server.url;
+
+    // The holder of the secret authenticates as alice and reads the room.
+    let mut alice = auth_expecting(url, 1, b"secret-alice", b"alice").await;
+    send(
+        &mut alice,
+        &Message::Subscribe {
+            channel: CH,
+            room: ROOM.to_vec(),
+            last_seen_seq: 0,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv(&mut alice).await,
+        ops_msg(Vec::new()),
+        "the verified actor is permitted by the policy"
+    );
+
+    // An unknown credential never authenticates — it cannot spoof alice.
+    let mut imposter = open(url).await;
+    send_bytes(&mut imposter, encode_header(PROTOCOL_VERSION).to_vec()).await;
+    send(&mut imposter, &Message::Hello { client: cid(2) }).await;
+    send(
+        &mut imposter,
+        &Message::Auth {
+            credential: b"secret-alice-guess".to_vec(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            recv_or_close(&mut imposter).await,
+            Some(Message::Error {
+                code: ErrorCode::AuthFailed,
+                ..
+            }) | None
+        ),
+        "an unknown credential is refused at the handshake"
+    );
+}
+
+/// Handshake and authenticate with `credential`, asserting the server derives
+/// `actor` for it, then return the connection for the test to drive.
+async fn auth_expecting(url: &str, client: u8, credential: &[u8], actor: &[u8]) -> Ws {
     let mut ws = open(url).await;
     send_bytes(&mut ws, encode_header(PROTOCOL_VERSION).to_vec()).await;
     send(
@@ -230,10 +324,17 @@ async fn auth_as(url: &str, client: u8, credential: &[u8]) -> Ws {
     assert_eq!(
         recv(&mut ws).await,
         Message::AuthOk {
-            actor: credential.to_vec(),
+            actor: actor.to_vec(),
         }
     );
     ws
+}
+
+/// Handshake and authenticate as the actor named by `credential`, returning the
+/// connection without subscribing so a test can drive the subscribe itself. Uses
+/// the dev-mode verifier's actor == credential rule.
+async fn auth_as(url: &str, client: u8, credential: &[u8]) -> Ws {
+    auth_expecting(url, client, credential, credential).await
 }
 
 fn hex(bytes: &[u8]) -> String {
