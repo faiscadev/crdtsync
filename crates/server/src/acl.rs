@@ -227,6 +227,55 @@ impl Acl {
         }
         Ok(acl)
     }
+
+    /// Load a policy from a file at `path` — read it, then [`from_policy`](Acl::from_policy)
+    /// its contents. A deployment points the server at a policy file and the
+    /// running server enforces it. The file being unreadable and its contents
+    /// being malformed are distinct [`PolicyFileError`] arms.
+    pub fn from_policy_file(path: impl AsRef<std::path::Path>) -> Result<Self, PolicyFileError> {
+        let text = std::fs::read_to_string(path)?;
+        Ok(Self::from_policy(&text)?)
+    }
+}
+
+/// Why loading a policy file failed: the file could not be read, or its contents
+/// did not parse.
+#[derive(Debug)]
+pub enum PolicyFileError {
+    /// The file could not be read.
+    Io(std::io::Error),
+    /// The file was read but a line did not parse.
+    Parse(PolicyError),
+}
+
+impl std::fmt::Display for PolicyFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PolicyFileError::Io(e) => write!(f, "reading policy file: {e}"),
+            PolicyFileError::Parse(e) => write!(f, "parsing policy file: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PolicyFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PolicyFileError::Io(e) => Some(e),
+            PolicyFileError::Parse(e) => Some(e),
+        }
+    }
+}
+
+impl From<std::io::Error> for PolicyFileError {
+    fn from(e: std::io::Error) -> Self {
+        PolicyFileError::Io(e)
+    }
+}
+
+impl From<PolicyError> for PolicyFileError {
+    fn from(e: PolicyError) -> Self {
+        PolicyFileError::Parse(e)
+    }
 }
 
 fn parse_effect(tok: &str) -> Option<Effect> {
