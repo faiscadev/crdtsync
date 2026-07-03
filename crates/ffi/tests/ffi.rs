@@ -801,6 +801,25 @@ fn a_relative_position_tracks_edits_across_the_boundary() {
 }
 
 #[test]
+fn a_text_relative_position_round_trips() {
+    unsafe {
+        let ca = client(1);
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let t = path(&[b"doc", b"title"]);
+
+        let o = crdtsync_doc_text_insert(a, t.as_ptr(), t.len(), 0, b"hello".as_ptr(), 5);
+        crdtsync_buf_free(o);
+        let pos = capture(a, &t, 5, 0);
+        assert_eq!(resolve(a, &t, &pos), (1, 5));
+        let o = crdtsync_doc_text_insert(a, t.as_ptr(), t.len(), 0, b">>".as_ptr(), 2);
+        crdtsync_buf_free(o);
+        assert_eq!(resolve(a, &t, &pos), (1, 7), "anchor slid with the insert");
+
+        crdtsync_doc_free(a);
+    }
+}
+
+#[test]
 fn a_position_on_a_bad_or_non_sequence_path_is_reported() {
     unsafe {
         let ca = client(1);

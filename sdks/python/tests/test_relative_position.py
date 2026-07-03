@@ -26,6 +26,7 @@ def test_a_text_position_round_trips():
         path = [b"doc", b"title"]
         a.text_insert(path, 0, "hello")
         pos = a.relative_position(path, 5, Side.LEFT)
+        assert pos is not None
         assert a.resolve_position(path, pos) == 5
         a.text_insert(path, 0, ">>")
         assert a.resolve_position(path, pos) == 7
@@ -37,5 +38,6 @@ def test_a_non_sequence_or_malformed_position_is_none():
         assert a.relative_position([b"age"], 0) is None
         a.list_insert([b"list"], 0, b"x")
         pos = a.relative_position([b"list"], 0)
+        assert pos is not None
         assert a.resolve_position([b"age"], pos) is None
         assert a.resolve_position([b"list"], b"\xff\xff") is None

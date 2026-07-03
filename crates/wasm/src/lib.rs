@@ -165,8 +165,8 @@ impl WasmDocument {
 
     /// Capture a stable position in the List or Text at a path — the encoded
     /// `RelativePosition` bytes, resolved later with `resolvePosition`. `side` is
-    /// 0 (left of `index`) or 1 (right). Undefined for a non-sequence slot or an
-    /// unknown side.
+    /// 0 (left of `index`) or 1 (right). Returns `undefined` for a non-sequence
+    /// slot or an unknown `side`.
     #[wasm_bindgen(js_name = relativePosition)]
     pub fn relative_position(&self, path: &[u8], index: usize, side: u32) -> Option<Vec<u8>> {
         let side = match side {
@@ -178,8 +178,8 @@ impl WasmDocument {
     }
 
     /// Resolve a captured position (bytes from `relativePosition`) back to a live
-    /// index in the List or Text at a path. Undefined for a non-sequence slot or
-    /// malformed position bytes.
+    /// index in the List or Text at a path. Returns `undefined` for a non-sequence
+    /// slot or malformed position bytes.
     #[wasm_bindgen(js_name = resolvePosition)]
     pub fn resolve_position(&self, path: &[u8], pos: &[u8]) -> Option<usize> {
         let position = RelativePosition::decode(pos).ok()?;

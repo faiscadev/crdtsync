@@ -650,6 +650,25 @@ func TestRelativePositionTracksEditsAndRoundTrips(t *testing.T) {
 	}
 }
 
+func TestTextRelativePositionRoundTrips(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+
+	p := path("doc", "title")
+	a.TextInsert(p, 0, "hello")
+	pos := a.RelativePosition(p, 5, Left)
+	if pos == nil {
+		t.Fatal("capture returned nil")
+	}
+	if i, ok := a.ResolvePosition(p, pos); !ok || i != 5 {
+		t.Fatalf("resolve: got %d ok=%v", i, ok)
+	}
+	a.TextInsert(p, 0, ">>")
+	if i, ok := a.ResolvePosition(p, pos); !ok || i != 7 {
+		t.Fatalf("resolve after insert: got %d ok=%v", i, ok)
+	}
+}
+
 func TestRelativePositionOnNonSequenceIsAbsent(t *testing.T) {
 	a := newDoc(t, 1)
 	defer a.Close()

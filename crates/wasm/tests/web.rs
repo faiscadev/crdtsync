@@ -164,6 +164,17 @@ fn a_relative_position_tracks_edits_and_round_trips() {
 }
 
 #[wasm_bindgen_test]
+fn a_text_relative_position_round_trips() {
+    let mut a = doc(1);
+    let t = path(&["doc", "title"]);
+    a.text_insert(&t, 0, "hello");
+    let pos = a.relative_position(&t, 5, 0).expect("captured");
+    assert_eq!(a.resolve_position(&t, &pos), Some(5));
+    a.text_insert(&t, 0, ">>");
+    assert_eq!(a.resolve_position(&t, &pos), Some(7));
+}
+
+#[wasm_bindgen_test]
 fn apply_rejects_garbage() {
     let mut a = doc(1);
     assert_eq!(a.apply(&[0xff; 8]), -1);
