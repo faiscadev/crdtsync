@@ -394,7 +394,19 @@ impl Parser<'_> {
         if self.peek() == Some(b'-') {
             self.at += 1;
         }
-        self.digits()?;
+        // Integer part: `0` alone, or a non-zero digit then any digits. A leading
+        // zero (`01`, `00`) is not a JSON number.
+        match self.peek() {
+            Some(b'0') => self.at += 1,
+            Some(b'1'..=b'9') => self.digits()?,
+            _ => return Err(self.err(JsonErrorKind::BadNumber)),
+        }
+        if matches!(self.peek(), Some(b'0'..=b'9')) {
+            return Err(JsonError {
+                at: start,
+                kind: JsonErrorKind::BadNumber,
+            });
+        }
         if self.peek() == Some(b'.') {
             is_float = true;
             self.at += 1;

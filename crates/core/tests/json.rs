@@ -231,6 +231,19 @@ fn a_bare_minus_is_a_bad_number() {
 }
 
 #[test]
+fn a_leading_zero_integer_is_a_bad_number() {
+    // JSON's integer grammar is `0 | [1-9][0-9]*` — no leading zeros.
+    assert_eq!(err("01"), JsonErrorKind::BadNumber);
+    assert_eq!(err("00"), JsonErrorKind::BadNumber);
+    assert_eq!(err("-01"), JsonErrorKind::BadNumber);
+    assert_eq!(err("007"), JsonErrorKind::BadNumber);
+    // A single zero, and a zero fraction/exponent, stay valid.
+    assert_eq!(parse("0"), Json::Int(0));
+    assert_eq!(parse("0.5"), Json::Float(0.5));
+    assert_eq!(parse("0e1"), Json::Float(0.0));
+}
+
+#[test]
 fn nesting_past_the_depth_cap_is_rejected_not_a_stack_overflow() {
     let deep_arrays = "[".repeat(1000) + &"]".repeat(1000);
     assert_eq!(
