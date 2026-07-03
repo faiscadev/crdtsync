@@ -10,7 +10,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::anchor::RelativePosition;
 use crate::doc::{Document, MapCursor};
+use crate::list::Side;
 use crate::map::Map;
 use crate::op::Op;
 use crate::stamp::Stamp;
@@ -240,6 +242,32 @@ pub fn text_len(doc: &Document, path: &[u8]) -> Option<usize> {
 pub fn text_get(doc: &Document, path: &[u8]) -> Option<String> {
     slot(doc, path).and_then(|e| match e {
         Element::Text(t) => Some(t.borrow().as_string()),
+        _ => None,
+    })
+}
+
+/// Capture a stable position in the List or Text at a path — an anchor that
+/// tracks the same gap between items as they shift under concurrent edits.
+/// A path that is not a sequence yields nothing.
+pub fn relative_position(
+    doc: &Document,
+    path: &[u8],
+    index: usize,
+    side: Side,
+) -> Option<RelativePosition> {
+    slot(doc, path).and_then(|e| match e {
+        Element::List(l) => Some(l.borrow().relative_position(index, side)),
+        Element::Text(t) => Some(t.borrow().relative_position(index, side)),
+        _ => None,
+    })
+}
+
+/// Resolve a captured position back to a live index in the List or Text at a
+/// path. A path that is not a sequence yields nothing.
+pub fn resolve_position(doc: &Document, path: &[u8], pos: &RelativePosition) -> Option<usize> {
+    slot(doc, path).and_then(|e| match e {
+        Element::List(l) => Some(l.borrow().resolve_position(pos)),
+        Element::Text(t) => Some(t.borrow().resolve_position(pos)),
         _ => None,
     })
 }

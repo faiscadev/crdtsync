@@ -197,6 +197,34 @@ int32_t crdtsync_doc_text_get(const CrdtDoc *doc,
                               uintptr_t path_len,
                               CrdtBuf *out);
 
+// Capture a stable position in the List or Text at a path — the encoded
+// [`RelativePosition`] bytes, resolved later with
+// [`crdtsync_doc_resolve_position`]. `side` is 0 (left of `index`) or 1 (right).
+// Empty on a bad handle/path, a non-sequence slot, or an unknown `side`.
+//
+// # Safety
+// `doc` is a live handle or null; `path`/`path_len` follow [`as_slice`].
+CrdtBuf crdtsync_doc_relative_position(const CrdtDoc *doc,
+                                       const uint8_t *path,
+                                       uintptr_t path_len,
+                                       uintptr_t index,
+                                       uint32_t side);
+
+// Resolve a captured position (bytes from [`crdtsync_doc_relative_position`])
+// back to a live index in the List or Text at a path, written to `out`. Returns
+// 1 when resolved, 0 on a bad path / non-sequence slot / malformed position
+// bytes, -1 on a bad handle or panic.
+//
+// # Safety
+// `doc` is a live handle or null; `path`/`path_len` and `pos`/`pos_len` follow
+// [`as_slice`]; `out` is a writable `usize`.
+int32_t crdtsync_doc_resolve_position(const CrdtDoc *doc,
+                                      const uint8_t *path,
+                                      uintptr_t path_len,
+                                      const uint8_t *pos,
+                                      uintptr_t pos_len,
+                                      uintptr_t *out);
+
 // Fold an encoded op log (as returned by an edit) from a peer into the
 // document. Returns the number of ops applied now (a duplicate or one buffered
 // pending its target counts as not-applied), or -1 on a bad handle or

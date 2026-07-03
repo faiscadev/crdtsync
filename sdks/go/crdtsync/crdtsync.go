@@ -234,6 +234,40 @@ func (d *Document) TextGet(path [][]byte) (string, bool) {
 	return string(takeBuf(out)), true
 }
 
+// --- relative positions (anchors) ---
+
+// Side selects which edge of an index a captured position anchors to.
+type Side uint32
+
+const (
+	// Left anchors to the left of the index.
+	Left Side = 0
+	// Right anchors to the right of the index.
+	Right Side = 1
+)
+
+// RelativePosition captures a stable position in the List or Text at path — the
+// encoded bytes to resolve later with ResolvePosition. Nil for a non-sequence
+// slot.
+func (d *Document) RelativePosition(path [][]byte, index uint, side Side) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	b := takeBuf(C.crdtsync_doc_relative_position(d.h, pp, pl, C.uintptr_t(index), C.uint32_t(side)))
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
+// ResolvePosition resolves a captured position back to a live index in the List
+// or Text at path. The bool is false for a non-sequence slot or malformed bytes.
+func (d *Document) ResolvePosition(path [][]byte, pos []byte) (uint, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	qp, ql := bytesArg(pos)
+	var out C.uintptr_t
+	rc := C.crdtsync_doc_resolve_position(d.h, pp, pl, qp, ql, &out)
+	return uint(out), rc == 1
+}
+
 // --- sync ---
 
 // Apply folds a peer's encoded ops in. Returns the number applied, -1 on error.
