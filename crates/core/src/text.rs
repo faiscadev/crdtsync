@@ -34,12 +34,14 @@ impl Text {
         self.inner.encode_state_into(out);
     }
 
-    /// Read a text from `cur`, advancing it. Every node must be a valid Unicode
-    /// codepoint, so a malformed snapshot is rejected here rather than panicking
-    /// when the text is later read.
+    /// Read a text from `cur`, advancing it. Every live node must be a valid
+    /// Unicode codepoint, so a malformed snapshot is rejected here rather than
+    /// panicking when the text is later read. Tombstones carry no value (they
+    /// are compressed away in the encoding and never rendered), so only the live
+    /// codepoints are checked.
     pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<Text, DecodeError> {
         let inner = List::decode_state_from(cur)?;
-        for value in inner.node_values() {
+        for value in inner.live_values() {
             match value {
                 Element::Scalar(Scalar::Int(cp)) if char::from_u32(*cp as u32).is_some() => {}
                 _ => {
@@ -118,9 +120,7 @@ impl Text {
 
     /// The char_ids of up to `count` live codepoints starting at `index`.
     pub fn node_ids(&self, index: usize, count: usize) -> Vec<Stamp> {
-        (index..index.saturating_add(count))
-            .map_while(|i| self.inner.node_at(i))
-            .collect()
+        self.inner.node_ids(index, count)
     }
 
     /// Tombstone `count` live codepoints starting at `index`.

@@ -7,12 +7,27 @@
 //! must survive to anchor inserts placed against it. The same algorithm backs
 //! Text.
 
-use crate::codec::{len_u32, put_anchor, put_stamp, put_u32, put_u8, Cursor, DecodeError};
+use crate::codec::{len_u32, put_anchor, put_stamp, put_u32, Cursor, DecodeError};
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
+use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// The most tombstones one encoded run record may reconstruct. A run longer
+/// than this is split into chained records on encode, so this only rejects a
+/// crafted record — bounding the decompression a single record can drive.
+const MAX_TOMBSTONE_RUN: u32 = 1 << 20;
+
+/// The most tombstones a whole decoded sequence may reconstruct across every
+/// run. The per-record cap alone bounds one record but not their sum, so a
+/// small stream of many records could still claim a huge node count on untrusted
+/// input; this ceiling bounds total decode memory (a few hundred MB of nodes at
+/// the limit). Run-length compression is inherently high-ratio, so a bytes-based
+/// ratio cannot separate a bomb from a legitimately dense snapshot — an absolute
+/// node ceiling is the meaningful guard. A document compacts far below this.
+const MAX_TOMBSTONE_TOTAL: u64 = 1 << 22;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Side {
@@ -68,15 +83,26 @@ impl List {
         self.id
     }
 
-    /// Append this list's state — id and every node, live or tombstoned — to
-    /// `out`. Nodes are ordered by their stamp so equal states encode
-    /// identically. A tombstoned node is kept: it anchors later inserts.
+    /// Append this list's state to `out` in two sections: the live nodes in
+    /// full, then the tombstones run-length compressed.
+    ///
+    /// A tombstone must survive to anchor later inserts, but its value is never
+    /// read again and deleted content is contiguous — a run inserted together
+    /// takes consecutive stamps chained parent-to-child. So a maximal run of
+    /// tombstones with consecutive stamps forming that chain collapses to one
+    /// range record (start, length, the run head's anchor); its dead values are
+    /// dropped. A deleted region costs O(runs), not O(deleted items). The live
+    /// section is stamp-ordered and the tombstone runs are emitted in run-head
+    /// stamp order, each split run's chunks in ascending offset — a
+    /// deterministic function of the node set (not a global stamp sort across
+    /// runs), so equal states encode identically.
     pub(crate) fn encode_state_into(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.id.as_bytes());
-        let mut nodes: Vec<&Node> = self.nodes.values().collect();
-        nodes.sort_by_key(|n| n.id);
-        put_u32(out, len_u32(nodes.len()));
-        for node in nodes {
+
+        let mut live: Vec<&Node> = self.nodes.values().filter(|n| !n.tombstone).collect();
+        live.sort_by_key(|n| n.id);
+        put_u32(out, len_u32(live.len()));
+        for node in live {
             put_stamp(out, &node.id);
             match &node.value {
                 // List inserts and Text codepoints always store scalars.
@@ -90,37 +116,119 @@ impl List {
                     side: node.side,
                 },
             );
-            put_u8(out, node.tombstone as u8);
         }
+
+        // Tombstones sorted by stamp; a run extends while the next stamp
+        // (same client, +1 lamport) is a tombstone chained to its predecessor.
+        let dead: BTreeMap<Stamp, &Node> = self
+            .nodes
+            .values()
+            .filter(|n| n.tombstone)
+            .map(|n| (n.id, n))
+            .collect();
+        let mut runs: Vec<(Stamp, u64, Anchor)> = Vec::new();
+        for (&start, node) in &dead {
+            // Start a run only at its head — a tombstone whose predecessor is
+            // not a tombstone chained into it. Every other tombstone is reached
+            // by walking forward from some head, so each is emitted exactly once
+            // without a separate visited set.
+            if let Some(prev_lamport) = start.lamport.checked_sub(1) {
+                let prev = Stamp {
+                    lamport: prev_lamport,
+                    client: start.client,
+                };
+                if dead.contains_key(&prev) && node.parent == Some(prev) && node.side == Side::Right
+                {
+                    continue;
+                }
+            }
+            let mut len = 1u64;
+            let mut cur_id = start;
+            while let Some(next_id) = cur_id.lamport.checked_add(1).map(|lamport| Stamp {
+                lamport,
+                client: cur_id.client,
+            }) {
+                match dead.get(&next_id) {
+                    Some(n) if n.parent == Some(cur_id) && n.side == Side::Right => {
+                        len += 1;
+                        cur_id = next_id;
+                    }
+                    _ => break,
+                }
+            }
+            runs.push((
+                start,
+                len,
+                Anchor {
+                    parent: node.parent,
+                    side: node.side,
+                },
+            ));
+        }
+
+        // Split any run past the cap into chained chunks so the decoder's bound
+        // never rejects state this encoder produced.
+        let mut chunk_count = 0u64;
+        let mut chunks: Vec<u8> = Vec::new();
+        for (start, len, anchor) in &runs {
+            let mut off = 0u64;
+            while off < *len {
+                let chunk_len = (*len - off).min(MAX_TOMBSTONE_RUN as u64);
+                // Every derived lamport equals a materialised node's, so it fits
+                // u64; checked arithmetic keeps encode symmetric with the
+                // decoder's `checked_add` rather than wrapping in release.
+                let lamport = start
+                    .lamport
+                    .checked_add(off)
+                    .expect("run chunk stamp within a materialised node's lamport");
+                let chunk_start = Stamp {
+                    lamport,
+                    client: start.client,
+                };
+                let chunk_anchor = if off == 0 {
+                    *anchor
+                } else {
+                    Anchor {
+                        parent: Some(Stamp {
+                            lamport: lamport - 1,
+                            client: start.client,
+                        }),
+                        side: Side::Right,
+                    }
+                };
+                put_stamp(&mut chunks, &chunk_start);
+                put_u32(&mut chunks, chunk_len as u32);
+                put_anchor(&mut chunks, &chunk_anchor);
+                chunk_count += 1;
+                off += chunk_len;
+            }
+        }
+        put_u32(
+            out,
+            u32::try_from(chunk_count).expect("codec: tombstone run count exceeds u32"),
+        );
+        out.extend_from_slice(&chunks);
     }
 
-    /// Read a list from `cur`, advancing it.
+    /// Read a list from `cur`, advancing it. Mirrors [`encode_state_into`]: the
+    /// live section in full, then the tombstone runs expanded back to nodes.
     pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<List, DecodeError> {
         let id = cur.element_id()?;
-        let count = cur.u32()?;
-        // Cap the pre-allocation: the count is untrusted, so a valid stream
-        // grows the map incrementally rather than reserving on a bad length.
-        let mut nodes = HashMap::with_capacity(count.min(1024) as usize);
-        for _ in 0..count {
+        // Grow the map as records are read rather than trusting a count to size
+        // the reservation, so a bogus length fails on the missing bytes.
+        let mut nodes: HashMap<Stamp, Node> = HashMap::new();
+
+        let live_count = cur.u32()?;
+        for _ in 0..live_count {
             let node_id = cur.stamp()?;
             let value = Element::Scalar(cur.scalar()?);
             let anchor = cur.anchor()?;
-            let tombstone = match cur.u8()? {
-                0 => false,
-                1 => true,
-                tag => {
-                    return Err(DecodeError::BadTag {
-                        what: "list node tombstone",
-                        tag,
-                    })
-                }
-            };
             let node = Node {
                 id: node_id,
                 value,
                 parent: anchor.parent,
                 side: anchor.side,
-                tombstone,
+                tombstone: false,
             };
             if nodes.insert(node_id, node).is_some() {
                 return Err(DecodeError::BadTag {
@@ -129,17 +237,77 @@ impl List {
                 });
             }
         }
+
+        // Read every run record and validate its declared size before
+        // reconstructing any node, so a crafted stream is rejected on its
+        // declared lengths rather than by materialising the bomb it describes.
+        // Each record consumes real bytes, so the record count is itself bounded
+        // by the input length.
+        let run_count = cur.u32()?;
+        let mut runs = Vec::new();
+        let mut total_tombstones: u64 = 0;
+        for _ in 0..run_count {
+            let start = cur.stamp()?;
+            let length = cur.u32()?;
+            let anchor = cur.anchor()?;
+            // A run reconstructs `length` nodes from a fixed record, so an
+            // unbounded length is a decompression bomb; the encoder splits past
+            // the per-record cap and never emits an empty run, so a length
+            // outside `1..=MAX_TOMBSTONE_RUN` is malformed.
+            if length == 0 || length > MAX_TOMBSTONE_RUN {
+                return Err(DecodeError::BadTag {
+                    what: "list: tombstone run length",
+                    tag: 0,
+                });
+            }
+            total_tombstones += length as u64;
+            if total_tombstones > MAX_TOMBSTONE_TOTAL {
+                return Err(DecodeError::BadTag {
+                    what: "list: tombstone total exceeds decode budget",
+                    tag: 0,
+                });
+            }
+            runs.push((start, length, anchor));
+        }
+        for (start, length, anchor) in runs {
+            let mut parent = anchor.parent;
+            let mut side = anchor.side;
+            for i in 0..length {
+                let lamport = start
+                    .lamport
+                    .checked_add(i as u64)
+                    .ok_or(DecodeError::BadTag {
+                        what: "list: tombstone run overflows lamport",
+                        tag: 0,
+                    })?;
+                let node_id = Stamp {
+                    lamport,
+                    client: start.client,
+                };
+                // A tombstone's value is never read; a placeholder stands in.
+                let node = Node {
+                    id: node_id,
+                    value: Element::Scalar(Scalar::Null),
+                    parent,
+                    side,
+                    tombstone: true,
+                };
+                if nodes.insert(node_id, node).is_some() {
+                    return Err(DecodeError::BadTag {
+                        what: "list: duplicate node id",
+                        tag: 0,
+                    });
+                }
+                parent = Some(node_id);
+                side = Side::Right;
+            }
+        }
+
         Ok(List {
             id,
             nodes,
             displaced: Cell::new(false),
         })
-    }
-
-    /// The value of every node, live or tombstoned — so a wrapper like Text can
-    /// validate a decoded snapshot.
-    pub(crate) fn node_values(&self) -> impl Iterator<Item = &Element> + '_ {
-        self.nodes.values().map(|node| &node.value)
     }
 
     /// Serialize this list's state to self-contained bytes.
@@ -183,6 +351,17 @@ impl List {
             .collect()
     }
 
+    /// The live values, borrowed and in no particular order — for membership or
+    /// validation passes (codepoint checking on decode) that need every live
+    /// value but not sequence order, skipping both `values`' clone and the tree
+    /// traversal `live_order` would do.
+    pub(crate) fn live_values(&self) -> impl Iterator<Item = &Element> {
+        self.nodes
+            .values()
+            .filter(|n| !n.tombstone)
+            .map(|n| &n.value)
+    }
+
     /// Insert `value` at live `index`, identified by `stamp`. A stamp already
     /// seen is a replay and leaves the node untouched.
     pub fn insert(&mut self, index: usize, value: Element, stamp: Stamp) {
@@ -224,6 +403,17 @@ impl List {
     /// The id of the live node at `index`, if any.
     pub fn node_at(&self, index: usize) -> Option<Stamp> {
         self.live_order().get(index).copied()
+    }
+
+    /// The ids of up to `count` live items starting at `index`, in one pass over
+    /// the live order — deleting a range is linear, not one full traversal per
+    /// item.
+    pub fn node_ids(&self, index: usize, count: usize) -> Vec<Stamp> {
+        self.live_order()
+            .into_iter()
+            .skip(index)
+            .take(count)
+            .collect()
     }
 
     /// The live position of node `id`, if it is present and not tombstoned.

@@ -34,8 +34,9 @@ use std::rc::Rc;
 const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version, bumped when the encoding changes so an old
-/// reader rejects a newer stream rather than misreading it.
-const STATE_VERSION: u8 = 1;
+/// reader rejects a newer stream rather than misreading it. v2 compresses
+/// sequence tombstones into run records and drops their dead values.
+const STATE_VERSION: u8 = 2;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
