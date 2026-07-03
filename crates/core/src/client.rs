@@ -330,9 +330,11 @@ impl ClientSession {
                     .rooms
                     .get_mut(&channel)
                     .ok_or(ClientError::UnknownChannel(channel))?;
-                // Adopt the server's state but keep our own identity for the ops
-                // we author next. A decode failure leaves the room untouched.
-                let doc = Document::decode_state_as(self.client, &state)
+                // Adopt the server's state but keep our own identity and op-seq
+                // high-water mark for the ops we author next, so a re-mint can't
+                // collide with an op already made durable. A decode failure
+                // leaves the room untouched.
+                let doc = Document::decode_state_as(self.client, room.doc.next_seq(), &state)
                     .map_err(|_| ClientError::BadSnapshot)?;
                 room.doc = doc;
                 room.last_seen_seq = seq;
