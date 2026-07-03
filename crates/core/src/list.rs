@@ -13,7 +13,7 @@ use crate::elementid::{ElementId, ElementKind};
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 /// The most tombstones one encoded run record may reconstruct. A run longer
 /// than this is split into chained records on encode, so this only rejects a
@@ -121,12 +121,21 @@ impl List {
             .map(|n| (n.id, n))
             .collect();
         let mut runs: Vec<(Stamp, u64, Anchor)> = Vec::new();
-        let mut consumed: HashSet<Stamp> = HashSet::new();
         for (&start, node) in &dead {
-            if consumed.contains(&start) {
-                continue;
+            // Start a run only at its head — a tombstone whose predecessor is
+            // not a tombstone chained into it. Every other tombstone is reached
+            // by walking forward from some head, so each is emitted exactly once
+            // without a separate visited set.
+            if let Some(prev_lamport) = start.lamport.checked_sub(1) {
+                let prev = Stamp {
+                    lamport: prev_lamport,
+                    client: start.client,
+                };
+                if dead.contains_key(&prev) && node.parent == Some(prev) && node.side == Side::Right
+                {
+                    continue;
+                }
             }
-            consumed.insert(start);
             let mut len = 1u64;
             let mut cur_id = start;
             while let Some(next_id) = cur_id.lamport.checked_add(1).map(|lamport| Stamp {
@@ -135,7 +144,6 @@ impl List {
             }) {
                 match dead.get(&next_id) {
                     Some(n) if n.parent == Some(cur_id) && n.side == Side::Right => {
-                        consumed.insert(next_id);
                         len += 1;
                         cur_id = next_id;
                     }
@@ -327,13 +335,15 @@ impl List {
             .collect()
     }
 
-    /// The live items in sequence order, borrowed — for passes that only
-    /// inspect values (codepoint validation on decode) and would otherwise
-    /// pay `values`' clone of every element into a temporary vector.
+    /// The live values, borrowed and in no particular order — for membership or
+    /// validation passes (codepoint checking on decode) that need every live
+    /// value but not sequence order, skipping both `values`' clone and the tree
+    /// traversal `live_order` would do.
     pub(crate) fn live_values(&self) -> impl Iterator<Item = &Element> {
-        self.live_order()
-            .into_iter()
-            .map(move |s| &self.nodes[&s].value)
+        self.nodes
+            .values()
+            .filter(|n| !n.tombstone)
+            .map(|n| &n.value)
     }
 
     /// Insert `value` at live `index`, identified by `stamp`. A stamp already
