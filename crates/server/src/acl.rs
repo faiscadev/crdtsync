@@ -91,7 +91,7 @@ impl Rule {
 
 /// A policy built from ACL tuples. Rules are order-independent — deny-wins makes
 /// the result the same however they were added.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct Acl {
     rules: Vec<Rule>,
 }
@@ -139,6 +139,159 @@ impl Acl {
     ) -> Self {
         self.push(subject, action, resource, Effect::Deny);
         self
+    }
+}
+
+/// Which field of a policy line failed to parse. Each variant that names a token
+/// carries it, so an error message can point at what was wrong.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PolicyErrorKind {
+    /// A rule line held this many whitespace-separated fields, not the four a
+    /// rule requires.
+    Arity(usize),
+    /// The effect field was neither `allow` nor `deny`.
+    Effect(String),
+    /// The subject field named no known subject.
+    Subject(String),
+    /// An `actor:` subject carried a value that is not valid hex — an odd length
+    /// or a non-hex digit.
+    ActorHex(String),
+    /// The action field named no known action.
+    Action(String),
+    /// The resource field named no known resource.
+    Resource(String),
+}
+
+impl std::fmt::Display for PolicyErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PolicyErrorKind::Arity(n) => write!(f, "expected 4 fields, found {n}"),
+            PolicyErrorKind::Effect(t) => write!(f, "unknown effect \"{t}\" (want allow or deny)"),
+            PolicyErrorKind::Subject(t) => write!(f, "unknown subject \"{t}\""),
+            PolicyErrorKind::ActorHex(t) => write!(f, "invalid actor hex \"{t}\""),
+            PolicyErrorKind::Action(t) => write!(f, "unknown action \"{t}\""),
+            PolicyErrorKind::Resource(t) => write!(f, "unknown resource \"{t}\""),
+        }
+    }
+}
+
+/// A failure to parse a policy, pinned to the 1-based physical line it occurred
+/// on so a deployment can find the bad rule in its file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PolicyError {
+    pub line: usize,
+    pub kind: PolicyErrorKind,
+}
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "line {}: {}", self.line, self.kind)
+    }
+}
+
+impl std::error::Error for PolicyError {}
+
+impl Acl {
+    /// Parse a declarative text policy into an [`Acl`]. One rule per line,
+    /// `<effect> <subject> <action> <resource>` with whitespace-separated fields;
+    /// blank lines and `#` comment lines are ignored. The result authorizes
+    /// identically to the same rules pushed via [`allow`](Acl::allow) /
+    /// [`deny`](Acl::deny). Parsing is total — a malformed line yields a
+    /// [`PolicyError`] naming its physical line, never a panic.
+    ///
+    /// - effect: `allow` | `deny`
+    /// - subject: `actor:<hex>` | `authenticated` | `anonymous` | `anyone` | `*`
+    /// - action: `read` | `write` | `publish_awareness` | `*`
+    /// - resource: `room:<name>` | `*`
+    pub fn from_policy(text: &str) -> Result<Self, PolicyError> {
+        let mut acl = Acl::new();
+        for (i, raw) in text.lines().enumerate() {
+            let line = i + 1;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<&str> = trimmed.split_whitespace().collect();
+            let at = |kind| PolicyError { line, kind };
+            if fields.len() != 4 {
+                return Err(at(PolicyErrorKind::Arity(fields.len())));
+            }
+            let effect = parse_effect(fields[0])
+                .ok_or_else(|| at(PolicyErrorKind::Effect(fields[0].into())))?;
+            let subject = parse_subject(fields[1]).map_err(at)?;
+            let action = parse_action(fields[2])
+                .ok_or_else(|| at(PolicyErrorKind::Action(fields[2].into())))?;
+            let resource = parse_resource(fields[3])
+                .ok_or_else(|| at(PolicyErrorKind::Resource(fields[3].into())))?;
+            acl.push(subject, action, resource, effect);
+        }
+        Ok(acl)
+    }
+}
+
+fn parse_effect(tok: &str) -> Option<Effect> {
+    match tok {
+        "allow" => Some(Effect::Allow),
+        "deny" => Some(Effect::Deny),
+        _ => None,
+    }
+}
+
+fn parse_subject(tok: &str) -> Result<Subject, PolicyErrorKind> {
+    match tok {
+        "authenticated" => Ok(Subject::Authenticated),
+        "anonymous" => Ok(Subject::Anonymous),
+        "anyone" | "*" => Ok(Subject::Anyone),
+        _ => match tok.strip_prefix("actor:") {
+            Some(hex) => decode_hex(hex)
+                .map(Subject::Actor)
+                .ok_or_else(|| PolicyErrorKind::ActorHex(hex.into())),
+            None => Err(PolicyErrorKind::Subject(tok.into())),
+        },
+    }
+}
+
+/// The outer `Option` is "known token?"; the inner is the action itself, `None`
+/// for the `*` wildcard that matches every action.
+fn parse_action(tok: &str) -> Option<Option<Action>> {
+    match tok {
+        "read" => Some(Some(Action::Read)),
+        "write" => Some(Some(Action::Write)),
+        "publish_awareness" => Some(Some(Action::PublishAwareness)),
+        "*" => Some(None),
+        _ => None,
+    }
+}
+
+fn parse_resource(tok: &str) -> Option<ResourceMatch> {
+    if tok == "*" {
+        Some(ResourceMatch::AnyRoom)
+    } else {
+        tok.strip_prefix("room:")
+            .map(|name| ResourceMatch::Room(name.as_bytes().to_vec()))
+    }
+}
+
+/// Decode an even-length string of hex digits (either case) to its bytes; any odd
+/// length or non-hex digit is a rejection.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let digits = s.as_bytes();
+    if digits.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.chunks_exact(2) {
+        out.push((unhex(pair[0])? << 4) | unhex(pair[1])?);
+    }
+    Some(out)
+}
+
+fn unhex(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
