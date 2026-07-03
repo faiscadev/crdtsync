@@ -7,6 +7,7 @@
 //! beyond codepoint identity (normalization and grapheme segmentation are SDK
 //! concerns).
 
+use crate::anchor::RelativePosition;
 use crate::codec::{Cursor, DecodeError};
 use crate::element::Element;
 use crate::elementid::ElementId;
@@ -138,6 +139,16 @@ impl Text {
     /// tombstoned.
     pub fn live_index(&self, id: Stamp) -> Option<usize> {
         self.inner.live_index(id)
+    }
+
+    /// Capture a stable codepoint position at `index` with the given gravity.
+    pub fn relative_position(&self, index: usize, side: Side) -> RelativePosition {
+        self.inner.relative_position(index, side)
+    }
+
+    /// The current live codepoint index of a captured [`RelativePosition`].
+    pub fn resolve_position(&self, pos: &RelativePosition) -> usize {
+        self.inner.resolve_position(pos)
     }
 
     /// Tombstone the codepoints with these char_ids. Idempotent.
