@@ -7,6 +7,7 @@
 //! must survive to anchor inserts placed against it. The same algorithm backs
 //! Text.
 
+use crate::anchor::RelativePosition;
 use crate::codec::{len_u32, put_anchor, put_stamp, put_u32, Cursor, DecodeError};
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
@@ -419,6 +420,71 @@ impl List {
     /// The live position of node `id`, if it is present and not tombstoned.
     pub fn live_index(&self, id: Stamp) -> Option<usize> {
         self.live_order().iter().position(|s| *s == id)
+    }
+
+    /// Capture a stable position at live `index` with the given gravity. `Left`
+    /// binds to the right edge of the item before the gap (the start of the
+    /// sequence at index 0); `Right` binds to the left edge of the item at the
+    /// gap (the end of the sequence at `len`). The binding is by item id, so the
+    /// position survives concurrent edits.
+    pub fn relative_position(&self, index: usize, side: Side) -> RelativePosition {
+        match side {
+            Side::Left => match index.checked_sub(1).and_then(|i| self.node_at(i)) {
+                Some(id) => RelativePosition::After(id),
+                None => RelativePosition::Start,
+            },
+            Side::Right => match self.node_at(index) {
+                Some(id) => RelativePosition::Before(id),
+                None => RelativePosition::End,
+            },
+        }
+    }
+
+    /// The current live index of a captured [`RelativePosition`]. A live binding
+    /// resolves to its item's edge; a deleted one walks the retained tombstones
+    /// to the nearest live neighbour on the gravity side; the boundaries resolve
+    /// to `0` and `len`.
+    pub fn resolve_position(&self, pos: &RelativePosition) -> usize {
+        match pos {
+            RelativePosition::Start => 0,
+            RelativePosition::End => self.len(),
+            RelativePosition::Before(id) => self.resolve_before(*id),
+            RelativePosition::After(id) => self.resolve_after(*id),
+        }
+    }
+
+    /// The left edge of `id`: its live index, or — if it is deleted — the index
+    /// of the nearest live item to its right, clamping to `len` past the end.
+    fn resolve_before(&self, id: Stamp) -> usize {
+        if let Some(i) = self.live_index(id) {
+            return i;
+        }
+        let order = self.tree_order();
+        if let Some(at) = order.iter().position(|s| *s == id) {
+            for s in &order[at + 1..] {
+                if !self.nodes[s].tombstone {
+                    return self.live_index(*s).unwrap();
+                }
+            }
+        }
+        self.len()
+    }
+
+    /// The right edge of `id`: one past its live index, or — if it is deleted —
+    /// one past the nearest live item to its left, clamping to `0` past the start.
+    fn resolve_after(&self, id: Stamp) -> usize {
+        if let Some(i) = self.live_index(id) {
+            return i + 1;
+        }
+        let order = self.tree_order();
+        if let Some(at) = order.iter().position(|s| *s == id) {
+            for s in order[..at].iter().rev() {
+                if !self.nodes[s].tombstone {
+                    return self.live_index(*s).unwrap() + 1;
+                }
+            }
+        }
+        0
     }
 
     /// Tombstone the live item at `index`.

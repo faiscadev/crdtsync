@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)] // scaffold: fields/methods are unimplemented stubs
 
+pub mod anchor;
 pub mod host;
 
 pub mod clientid;
@@ -34,6 +35,7 @@ pub mod path;
 pub mod protocol;
 pub mod undo;
 
+pub use anchor::RelativePosition;
 pub use client::{ClientError, ClientSession};
 pub use clientid::ClientId;
 pub use codec::{decode_op, decode_ops, encode_op, encode_ops, DecodeError};
