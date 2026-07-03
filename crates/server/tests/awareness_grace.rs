@@ -324,3 +324,66 @@ fn an_awareness_key_dropped_at_the_cap_is_not_broadcast() {
         "a key dropped at the cap must not be broadcast to peers"
     );
 }
+
+#[test]
+fn an_unauthenticated_socket_does_not_keep_a_departed_clients_presence() {
+    let (mut r, clock) = registry();
+    let victim = hello_auth(&mut r, 1);
+    subscribe(&mut r, victim, 1, ROOM_A);
+    set_awareness(&mut r, victim, 1, b"cursor", vec![5]);
+
+    // An unauthenticated socket asserting the victim's id does not count as
+    // holding the presence, so the victim's real departure still schedules a
+    // sweep and the presence expires.
+    let ghost = r.connect();
+    assert!(r.deliver(ghost, Message::Hello { client: cid(1) }));
+    r.disconnect(victim);
+
+    clock.advance(GRACE);
+    r.sweep();
+
+    let joiner = hello_auth(&mut r, 2);
+    r.deliver(
+        joiner,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(
+        awareness_updates(r.take_outbox(joiner)).is_empty(),
+        "an unauthenticated socket kept a departed client's presence alive"
+    );
+}
+
+#[test]
+fn an_unauthenticated_hello_does_not_cancel_a_pending_sweep() {
+    let (mut r, clock) = registry();
+    let victim = hello_auth(&mut r, 1);
+    subscribe(&mut r, victim, 1, ROOM_A);
+    set_awareness(&mut r, victim, 1, b"cursor", vec![5]);
+    r.disconnect(victim); // schedules the grace timer
+
+    // A bare Hello asserting the id must not cancel the pending sweep — only an
+    // authenticated reconnect does.
+    let ghost = r.connect();
+    assert!(r.deliver(ghost, Message::Hello { client: cid(1) }));
+
+    clock.advance(GRACE);
+    r.sweep();
+
+    let joiner = hello_auth(&mut r, 2);
+    r.deliver(
+        joiner,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(
+        awareness_updates(r.take_outbox(joiner)).is_empty(),
+        "an unauthenticated Hello cancelled a pending presence sweep"
+    );
+}
