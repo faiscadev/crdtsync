@@ -40,36 +40,41 @@ fn path_var(name: &'static str) -> std::io::Result<Option<String>> {
 }
 
 /// The verifier for the run: a static credential table if `CRDTSYNC_CREDENTIALS_FILE`
-/// is set, else the dev-mode `AllowAll`. A malformed table keeps its underlying
-/// failure — the file's own io error, or invalid data carrying the parse error
-/// (which names the offending line) as its source.
+/// is set, else the dev-mode `AllowAll`. A malformed table surfaces the full
+/// [`CredentialsFileError`] (its "credentials file" context, with the underlying
+/// error as the source), keeping the original [`io::ErrorKind`](std::io::ErrorKind)
+/// so a missing file still reads as `NotFound`.
 fn verifier() -> std::io::Result<Box<dyn Verifier + Send>> {
     match path_var("CRDTSYNC_CREDENTIALS_FILE")? {
-        Some(path) => Ok(Box::new(
-            StaticTokens::from_credentials_file(path).map_err(|e| match e {
-                CredentialsFileError::Io(io) => io,
-                CredentialsFileError::Parse(parse) => {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, parse)
-                }
-            })?,
-        )),
+        Some(path) => {
+            let table = StaticTokens::from_credentials_file(path).map_err(|e| {
+                let kind = match &e {
+                    CredentialsFileError::Io(io) => io.kind(),
+                    CredentialsFileError::Parse(_) => std::io::ErrorKind::InvalidData,
+                };
+                std::io::Error::new(kind, e)
+            })?;
+            Ok(Box::new(table))
+        }
         None => Ok(Box::new(AllowAll)),
     }
 }
 
 /// The authorizer for the run: a declared policy if `CRDTSYNC_POLICY_FILE` is set,
-/// else the permissive `PermitAll`. A malformed policy keeps its underlying
-/// failure, as [`verifier`] does.
+/// else the permissive `PermitAll`. A malformed policy surfaces the full
+/// [`PolicyFileError`] the way [`verifier`] surfaces its own.
 fn authorizer() -> std::io::Result<Box<dyn Authorizer + Send>> {
     match path_var("CRDTSYNC_POLICY_FILE")? {
-        Some(path) => Ok(Box::new(Acl::from_policy_file(path).map_err(
-            |e| match e {
-                PolicyFileError::Io(io) => io,
-                PolicyFileError::Parse(parse) => {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, parse)
-                }
-            },
-        )?)),
+        Some(path) => {
+            let acl = Acl::from_policy_file(path).map_err(|e| {
+                let kind = match &e {
+                    PolicyFileError::Io(io) => io.kind(),
+                    PolicyFileError::Parse(_) => std::io::ErrorKind::InvalidData,
+                };
+                std::io::Error::new(kind, e)
+            })?;
+            Ok(Box::new(acl))
+        }
         None => Ok(Box::new(PermitAll)),
     }
 }

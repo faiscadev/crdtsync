@@ -51,9 +51,19 @@ impl Verifier for AllowAll {
 /// actor is server-side, so a policy's `actor:` and subject-class rules become
 /// real boundaries — a client cannot pick its own actor as it can under
 /// [`AllowAll`].
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default)]
 pub struct StaticTokens {
     tokens: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+/// Redacted — the table's keys are secrets, so a debug print names only how many
+/// entries there are, never a credential or an actor.
+impl std::fmt::Debug for StaticTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticTokens")
+            .field("entries", &self.tokens.len())
+            .finish()
+    }
 }
 
 impl StaticTokens {
@@ -94,7 +104,7 @@ impl StaticTokens {
             if table.tokens.contains_key(&credential) {
                 return Err(CredentialsError {
                     line,
-                    kind: CredentialsErrorKind::DuplicateCredential(fields[0].into()),
+                    kind: CredentialsErrorKind::DuplicateCredential,
                 });
             }
             table
@@ -122,15 +132,16 @@ impl Verifier for StaticTokens {
     }
 }
 
-/// Why a credentials line failed to parse. `Arity` carries the field count found;
-/// `DuplicateCredential` carries the repeated credential.
+/// Why a credentials line failed to parse. `Arity` carries the field count found.
+/// The credential itself is a secret, so it is never carried in the error — the
+/// line number localizes the offending entry.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CredentialsErrorKind {
     /// A line held this many whitespace-separated fields, not the two an entry
     /// requires.
     Arity(usize),
     /// A credential was mapped on more than one line — an ambiguous config.
-    DuplicateCredential(String),
+    DuplicateCredential,
 }
 
 impl std::fmt::Display for CredentialsErrorKind {
@@ -139,8 +150,9 @@ impl std::fmt::Display for CredentialsErrorKind {
             CredentialsErrorKind::Arity(n) => {
                 write!(f, "expected 2 fields (credential actor), found {n}")
             }
-            CredentialsErrorKind::DuplicateCredential(c) => {
-                write!(f, "credential \"{c}\" is mapped more than once")
+            // The credential is a secret — name the fault, not the token.
+            CredentialsErrorKind::DuplicateCredential => {
+                write!(f, "a credential is mapped more than once")
             }
         }
     }
@@ -258,8 +270,23 @@ mod tests {
         assert_eq!(err.line, 2, "the second mapping is the conflict");
         assert!(matches!(
             err.kind,
-            CredentialsErrorKind::DuplicateCredential(_)
+            CredentialsErrorKind::DuplicateCredential
         ));
+        assert!(
+            !err.to_string().contains("secret"),
+            "the error must not leak the credential: {err}"
+        );
+    }
+
+    #[test]
+    fn debug_does_not_leak_the_credentials() {
+        let table = StaticTokens::from_credentials("secret-alice alice").unwrap();
+        let shown = format!("{table:?}");
+        assert!(
+            !shown.contains("secret-alice"),
+            "credential leaked: {shown}"
+        );
+        assert!(!shown.contains("alice"), "actor leaked: {shown}");
     }
 
     #[test]
