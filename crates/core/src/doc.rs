@@ -203,12 +203,26 @@ impl Document {
         }
     }
 
+    /// The next per-client op sequence this replica will mint — its op-seq
+    /// high-water mark.
+    pub fn next_seq(&self) -> u64 {
+        self.seq
+    }
+
     /// Rebuild a replica from a snapshot but author future ops under `client`
-    /// rather than the identity the snapshot was encoded with. A replica that
-    /// adopts a peer's snapshot keeps its own identity for the ops it writes.
-    pub fn decode_state_as(client: ClientId, bytes: &[u8]) -> Result<Document, DecodeError> {
+    /// with an op counter no lower than `next_seq`, rather than the identity and
+    /// counter the snapshot was encoded with. A replica adopting a snapshot
+    /// keeps its own identity and its own op-seq high-water mark, so it never
+    /// re-mints an `OpId` it already made durable (which a peer would dedup away,
+    /// diverging silently).
+    pub fn decode_state_as(
+        client: ClientId,
+        next_seq: u64,
+        bytes: &[u8],
+    ) -> Result<Document, DecodeError> {
         let mut doc = Document::decode_state(bytes)?;
         doc.client = client;
+        doc.seq = doc.seq.max(next_seq);
         Ok(doc)
     }
 
