@@ -120,9 +120,7 @@ impl Text {
 
     /// The char_ids of up to `count` live codepoints starting at `index`.
     pub fn node_ids(&self, index: usize, count: usize) -> Vec<Stamp> {
-        (index..index.saturating_add(count))
-            .map_while(|i| self.inner.node_at(i))
-            .collect()
+        self.inner.node_ids(index, count)
     }
 
     /// Tombstone `count` live codepoints starting at `index`.

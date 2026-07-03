@@ -405,6 +405,17 @@ impl List {
         self.live_order().get(index).copied()
     }
 
+    /// The ids of up to `count` live items starting at `index`, in one pass over
+    /// the live order — deleting a range is linear, not one full traversal per
+    /// item.
+    pub fn node_ids(&self, index: usize, count: usize) -> Vec<Stamp> {
+        self.live_order()
+            .into_iter()
+            .skip(index)
+            .take(count)
+            .collect()
+    }
+
     /// The live position of node `id`, if it is present and not tombstoned.
     pub fn live_index(&self, id: Stamp) -> Option<usize> {
         self.live_order().iter().position(|s| *s == id)
