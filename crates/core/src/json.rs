@@ -6,6 +6,8 @@
 //! into a [`Json`] value or a [`JsonError`]; it never panics, and it bounds
 //! nesting depth so a hostile document cannot overflow the stack.
 
+use std::collections::HashSet;
+
 /// A parsed JSON value. Integers keep full `i64` range distinct from floats,
 /// since a schema's versions and bounds are integers; objects keep declaration
 /// order.
@@ -224,6 +226,9 @@ impl Parser<'_> {
         }
         self.at += 1; // consume '{'
         let mut pairs: Vec<(String, Json)> = Vec::new();
+        // Track keys in a set so duplicate detection stays O(1) per key — a
+        // linear scan would be O(n²) on a large hostile object.
+        let mut seen: HashSet<String> = HashSet::new();
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.at += 1;
@@ -239,7 +244,7 @@ impl Parser<'_> {
             }
             let key_at = self.at;
             let key = self.string()?;
-            if pairs.iter().any(|(k, _)| *k == key) {
+            if !seen.insert(key.clone()) {
                 return Err(JsonError {
                     at: key_at,
                     kind: JsonErrorKind::DuplicateKey,

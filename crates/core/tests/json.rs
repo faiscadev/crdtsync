@@ -71,14 +71,26 @@ fn parses_plain_and_escaped_strings() {
 
 #[test]
 fn parses_a_bmp_unicode_escape() {
-    assert_eq!(parse(r#""é""#), Json::Str("é".into()));
-    assert_eq!(parse(r#""A""#), Json::Str("A".into()));
+    // The \uXXXX escape path — the source really carries backslash-u here.
+    assert_eq!(parse("\"\\u0041\""), Json::Str("A".into()));
+    assert_eq!(parse("\"\\u00e9\""), Json::Str("é".into()));
+    assert_eq!(
+        parse("\"\\u00E9\""),
+        Json::Str("é".into()),
+        "hex is case-insensitive"
+    );
+    assert_eq!(parse("\"a\\u0042c\""), Json::Str("aBc".into()));
 }
 
 #[test]
 fn combines_a_surrogate_pair_into_one_astral_scalar() {
-    // U+1F600 GRINNING FACE = 😀
-    assert_eq!(parse(r#""😀""#), Json::Str("😀".into()));
+    // U+1F600 GRINNING FACE = 😀, written as its UTF-16 surrogate pair 😀.
+    assert_eq!(parse("\"\\uD83D\\uDE00\""), Json::Str("😀".into()));
+    assert_eq!(
+        parse("\"\\ud83d\\ude00\""),
+        Json::Str("😀".into()),
+        "lowercase too"
+    );
 }
 
 #[test]
