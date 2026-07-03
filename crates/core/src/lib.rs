@@ -14,6 +14,7 @@
 pub mod anchor;
 pub mod host;
 pub mod json;
+pub mod schema;
 
 pub mod clientid;
 pub mod elementid;
@@ -55,6 +56,7 @@ pub use protocol::{
 };
 pub use register::Register;
 pub use scalar::{BlobRef, Scalar};
+pub use schema::{Schema, SchemaError, SchemaErrorKind, TypeDef};
 pub use stamp::Stamp;
 pub use text::Text;
 pub use undo::UndoManager;
