@@ -317,23 +317,62 @@ Wire format supports run-length encoding for consecutive same-client inserts fro
 
 # Schema
 
-Document carries an optional declarative schema. Schema-less docs work; apps that ship versioned releases over time should declare a schema.
+Document carries an optional declarative schema. **Schema is opt-in** — schema-less documents are first-class: they converge, persist, fan out, snapshot, sync offline, and enforce room-level ACLs with zero ceremony. A schema is adopted only to unlock the schema-gated feature tier (producer validation, invariant repair, migration, fine-grained `@auth`, type-aware SDK API, awareness TTL / throttle, marks / attrs / structural constraints). Nothing requires one; adding a schema is a later, incremental choice, so adoption is never a prerequisite for using the engine.
 
 ## Why Declare
 
-Producer-side op validation catches bugs at the write site. Type-aware SDK API. Enables deterministic invariant repair under concurrent merges. Enables schema migration with full history preservation. Cross-language: schema is JSON, every SDK enforces identically.
+Producer-side op validation catches bugs at the write site. Type-aware SDK API. Enables deterministic invariant repair under concurrent merges. Enables schema migration with full history preservation. Cross-language: schema is JSON, and the core is the sole validator — every SDK forwards the schema bytes to core rather than reimplementing validation, so "every SDK enforces identically" holds by construction (one implementation).
+
+## Schema Is Code, Not Document State
+
+A schema is an app-developer artifact: authored as a JSON file, versioned, checked into the app repo, CI-gated. It is **never** carried inside the document — the document records only the `schema_version` each op was created under (an envelope field). Schema-as-document-state is rejected: it would make the schema concurrently mergeable (destroying migration determinism), defeat the CI drift / verification gates and the boot-time hash-lock, and create a bootstrap cycle (reading the doc would require the schema the doc contains).
+
+## Distribution
+
+Schema reaches the two parties that use it through separate channels:
+
+- **Client** — a build-time **bundle** (required for the code-generated type-aware API and for cold-offline validation before first server contact) and / or a **handshake advertisement** (an enforcing server sends its active schema + version; the client caches it across restarts). Bundling is therefore optional: a *typed* client bundles (its accessors are generated code), a *dynamic* client fetches at handshake and adopts whatever version the server serves.
+- **Server** — **registration**, not deploy-time config. The app owner's CI pushes `{app_id, version, schema, generated_migrations}` to the server over an admin API on release. The server stays a generic engine (it hardcodes no app's types) while serving any tenant — a multi-tenant SaaS server is a per-`app_id` schema **registry**. A connecting client names its `app_id` + `schema_version`; the server resolves that to the schema it holds.
+
+## Two Server Tiers
+
+CRDT merge needs no schema — the core op `{id, stamp, target, kind, tx}` converges on its own — so a server hosts an app at one of two tiers. **The tier is decided per `app_id`** (by whether that app registered a schema), not globally and not per document: one binary serves enforcing apps and relay apps side by side.
+
+- **Relay** (app not registered) — stores, dedups, fans out, persists, snapshots; enforces only connection / room-level ACLs. No ingress validation, server-side repair, or in-flight migration. Clients still validate and repair locally against their own schema (deterministic repair converges regardless). This is the zero-config default, and it hosts apps that never registered.
+- **Enforcing** (registered schema) — adds producer-ingress validation (defense in depth), authoritative invariant repair, in-flight version translation, and schema-level `@auth`.
+
+## Trust Boundary
+
+A client-supplied schema **body is never trusted for enforcement**. The enforcing server enforces only its **registered** schema; a connecting client asserts a version *number*, used solely as a lookup key into the server's registered set (an unknown version is rejected, not fabricated). The registered schema is admin-provisioned — **registration is a meta-authed surface** (the app owner's CI credential, distinct from any sync connection) and hash-locked, so a client cannot slip a different body under a known version. A client's own schema is **advisory**: it drives the client's optimistic local validation / repair / typing, and the server re-validates every op against the trusted registered schema — client-side is advisory, the server is final authority. (Repair is `f(state, schema, lamport)`, so it converges across replicas *only* when they share the schema; the registered server is the arbiter that corrects a replica which repaired under a divergent schema.)
 
 ## Enforcement Points
 
-Producer SDK rejects op that violates schema before sending (invalid ops never enter the log). Server ingress validates inbound (defense in depth). Apply boundary at every replica validates merged state (triggers Invariant Repair on violation).
+Producer SDK rejects an op that violates the schema before sending (invalid ops never enter the log). An enforcing server validates inbound (defense in depth). The apply boundary at every schema-bearing replica validates merged state (triggers Invariant Repair on violation).
 
 ## What Predefined vs Not
 
-Core predefines: validation engine, mark kinds, attr type primitives, repair rules. App declares: type names, mark names, attr keys, allowed children, defaults, exclusivity, anchor expansion per mark, default block type for repair.
+Core predefines: the validation engine, mark merge-kinds, attr type primitives, repair rules. App declares: type names, mark names, attr keys, allowed children, defaults, exclusivity, anchor expansion per mark, default block type for repair, awareness entry shapes / TTL / throttle, schema-level `@auth` grants.
+
+## Schema File
+
+JSON. Top-level keys: `schema` (name), `version`, `root` (top-level Map slot → type), `types` (named definitions, each a `kind` = one of the eight primitives with its constraints), `marks` (name → merge flavor + anchor expansion + value shape), `awareness` (entry kind → TTL + throttle + value shape), `auth` (roles + schema-level grants with `${actor_id}` / `${author_id}` templating). Every schema dimension maps to exactly one repair rule with a declaration home, so parse-time validation guarantees no schema admits an unrepairable runtime state:
+
+| Repair rule | Declared by |
+|-------------|-------------|
+| Orphan inline → wrap in default block | `repair.orphanInline` on an xml type |
+| Disallowed child → drop | `children` allowlist |
+| Exclusive collision → keep lamport-oldest | `children.<T>.max` |
+| Out-of-range scalar → clamp | `min` / `max` on scalar / counter / attr |
+| Disallowed / mistyped attr → drop | `attrs` allowlist + `type` |
+| Mark on disallowed type → drop | type `marks` allowlist |
 
 ## Versioning
 
-Every schema declares a version. Every Document records the schema_version it was created under. Versioning mandatory once a schema is declared.
+Every schema declares a version; every Document records the `schema_version` it was created under. Versioning is mandatory once a schema is declared. Cross-version coexistence is handled by Schema Migration (below), not by version equality — a client declares the *range* of versions it speaks, and the server translates in flight per recipient.
+
+## Lifecycle Hooks
+
+Schema-driven events the engine detects and surfaces as SDK callbacks — the engine observes, the app decides UX (never an override, never a hard crash): `onRepaired` (invariant repair ran on a merge — offer undo / "we resolved a concurrent edit"), `onOpsRejected` (server rejected the client's ops — auth revoked while offline, or schema-invalid — app shows / discards / exports them), `onUpdateRequired` (the client's version range cannot bridge the document's version across a breaking gap — app prompts an update / falls back to read-only).
 
 ---
 
@@ -385,7 +424,34 @@ Migrations can't do I/O, wall-clock, random, network. Determinism is the entire 
 
 ## Mixed-Version Sync
 
-Server checks client schema_version on handshake. Gap covered entirely by bidirectional migrations → server translates ops in flight transparently, old client keeps working. Gap includes any forward-only migration → server rejects with `please-update-app`. Forward-only is the breakpoint.
+The **server is the compatibility layer; a client speaks a single version.** A typed client is generated for one version (its build version); a dynamic client adopts whatever the server serves. On handshake the client declares the version it wants ops delivered at — normally a single point (a "range of one"); a multi-version-codegen client, rare, may accept a small range. The server never makes a client understand more than its one version — it translates every op to that client's version.
+
+Translation rides the existing per-recipient fan-out seam (the same one that redacts, §Wire-Level Redaction). Mechanism:
+
+- The op log is **heterogeneous and immutable** — each op is stored tagged with its creation `schema_version` and never rewritten (audit / time-travel intact). Translation is a fan-out-time transform, not a log mutation.
+- Each migration edge carries a **bidirectional op-rewrite** — the built-in step kinds each define how to rewrite one op forward (up) and, for a back-compatible edge, inverse (down). A **breaking** edge has no inverse; that is what makes it breaking.
+- On fan-out, for each (op, recipient) the server composes the edge-rewrites along the chain from the op's creation version to the recipient's version and sends the rewritten op. Cheap structural surgery, no state materialization.
+- The **handshake range-check is the guard**: a recipient that cannot be reached from the document's version across a back-compatible path (i.e. a breaking gap with no inverse) is **refused at handshake with `onUpdateRequired`**, before it is ever a subscriber — so a down-translation at fan-out only ever traverses invertible edges. Forward-only is the sole breakpoint; a back-compatible gap never rejects.
+- **Ingest** validates an inbound op against its *own* creation version and stores it at that version — no inbound translation.
+- **Cold start** is the same migrations at coarser granularity: a peer joining below the compaction floor gets a snapshot of state materialized and migrated to that peer's version, then encoded.
+
+## Compatibility Classes
+
+Each migration edge is classified — by the CI drift / verification gates — as **back-compatible** (bidirectional: a down-migration exists — add type / add optional field / add mark / widen range, where down = drop the addition) or **breaking** (forward-only: the down-migration is lossy or impossible — remove a required field / narrow a type / bare rename). Back-compatible edges let mixed-version fleets coexist on one document; breaking edges strand any client that cannot reach the new version.
+
+## Rolling Upgrades (Expand / Contract)
+
+A zero-downtime schema change decomposes a breaking change into a back-compatible **expand**, a data **migrate**, and a **contract**, so the connected fleet is never split across a forward-only edge:
+
+1. **Expand** — introduce version N+1 as a back-compatible superset; deploy clients that speak `{N, N+1}`. Mixed N / N+1 clients coexist (the server translates both directions).
+2. **Migrate** — flip writes to the new construct, backfill; old-only clients stay served by down-migration to N.
+3. **Contract** — deploy clients that speak `{N+1}` only; a later edge may now drop N, since no live client speaks it.
+
+This discipline is **opt-in**, giving three ceremony tiers the app chooses per change, all on the same machinery — the only difference is whether an edge is made back-compatible:
+
+- **No schema** — no migration concept; documents just converge.
+- **Lazy-breaking** — make breaking edges freely; stranded clients receive `onUpdateRequired` and the app prompts an update. Minimal ceremony, a brief forced-update window.
+- **Zero-downtime** — the expand / migrate / contract dance with version ranges; no user ever hits a wall.
 
 ## Four Detection Gates
 
