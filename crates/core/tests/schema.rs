@@ -348,7 +348,12 @@ fn min_greater_than_max_is_a_bad_range() {
                  "types": {{ "R": {{ "kind": "map", "children": {{ "x": "X" }} }},
                              "X": {{ "kind": "{kind}", "min": 5, "max": 4 }} }} }}"#
         );
-        assert_eq!(err(&src), SchemaErrorKind::BadRange, "{kind}");
+        let e = Schema::parse(&src).expect_err("bad range");
+        assert_eq!(e.kind, SchemaErrorKind::BadRange, "{kind}");
+        assert_eq!(
+            e.at, "X.min_gt_max",
+            "dot-separated, operator-free location"
+        );
     }
     assert_eq!(
         err(r#"{ "schema": "s", "version": 1, "root": "R",

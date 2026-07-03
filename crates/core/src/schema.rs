@@ -288,7 +288,7 @@ fn bounds(json: &Json, ctx: &str) -> Result<(Option<i64>, Option<i64>), SchemaEr
         if a > b {
             return Err(SchemaError::new(
                 SchemaErrorKind::BadRange,
-                at(ctx, "min > max"),
+                at(ctx, "min_gt_max"),
             ));
         }
     }
@@ -303,7 +303,7 @@ fn counts(json: &Json, ctx: &str) -> Result<(Option<u64>, Option<u64>), SchemaEr
         if a > b {
             return Err(SchemaError::new(
                 SchemaErrorKind::BadRange,
-                at(ctx, "min > max"),
+                at(ctx, "min_gt_max"),
             ));
         }
     }
