@@ -247,8 +247,8 @@ const (
 )
 
 // RelativePosition captures a stable position in the List or Text at path — the
-// encoded bytes to resolve later with ResolvePosition. Nil for a non-sequence
-// slot.
+// encoded bytes to resolve later with ResolvePosition. Nil for a bad handle or
+// path, a non-sequence slot, or an unknown side.
 func (d *Document) RelativePosition(path [][]byte, index uint, side Side) []byte {
 	pp, pl := bytesArg(EncodePath(path))
 	b := takeBuf(C.crdtsync_doc_relative_position(d.h, pp, pl, C.uintptr_t(index), C.uint32_t(side)))
@@ -259,7 +259,8 @@ func (d *Document) RelativePosition(path [][]byte, index uint, side Side) []byte
 }
 
 // ResolvePosition resolves a captured position back to a live index in the List
-// or Text at path. The bool is false for a non-sequence slot or malformed bytes.
+// or Text at path. The bool is false for a bad handle or path, a non-sequence
+// slot, or malformed position bytes.
 func (d *Document) ResolvePosition(path [][]byte, pos []byte) (uint, bool) {
 	pp, pl := bytesArg(EncodePath(path))
 	qp, ql := bytesArg(pos)

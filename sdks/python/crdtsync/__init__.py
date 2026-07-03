@@ -437,6 +437,7 @@ class Document:
         bytes to resolve later with :meth:`resolve_position`. ``None`` for a
         non-sequence slot."""
         _usize("index", index)
+        _u32("side", int(side))
         p = encode_path(path)
         data = _take_buf(
             _LIB.crdtsync_doc_relative_position(self._handle, p, len(p), index, int(side))
