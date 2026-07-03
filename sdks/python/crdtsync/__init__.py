@@ -434,8 +434,9 @@ class Document:
         self, path: Path, index: int, side: Side = Side.LEFT
     ) -> Optional[bytes]:
         """Capture a stable position in the List or Text at ``path`` — encoded
-        bytes to resolve later with :meth:`resolve_position`. ``None`` for a
-        non-sequence slot."""
+        bytes to resolve later with :meth:`resolve_position`. ``None`` for a bad
+        or non-sequence path, or an unknown ``side`` (any value other than
+        ``LEFT``/``RIGHT``)."""
         _usize("index", index)
         _u32("side", int(side))
         p = encode_path(path)

@@ -41,3 +41,5 @@ def test_a_non_sequence_or_malformed_position_is_none():
         assert pos is not None
         assert a.resolve_position([b"age"], pos) is None
         assert a.resolve_position([b"list"], b"\xff\xff") is None
+        # An in-range but unknown side (not LEFT/RIGHT) is absent, not a wrap.
+        assert a.relative_position([b"list"], 0, 5) is None
