@@ -89,7 +89,9 @@ pub struct Hub {
     compaction_threshold: u64,
     /// Ephemeral presence per room: each owner client's latest entry per key,
     /// with the actor to surface it under. Never persisted or snapshotted.
-    awareness: HashMap<RoomId, HashMap<(ClientId, Vec<u8>), (Vec<u8>, Vec<u8>)>>,
+    /// Per room, each client's presence keyed by awareness key → (actor, value).
+    /// Nesting by client keeps the per-client key cap an O(1) check.
+    awareness: HashMap<RoomId, HashMap<ClientId, HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>>>,
     /// Named versions per room, keyed by name — sorted, for listing/pagination.
     /// The in-memory versions index over the snapshot storage primitive.
     versions: HashMap<RoomId, BTreeMap<Vec<u8>, Version>>,
@@ -120,14 +122,16 @@ impl Hub {
         key: Vec<u8>,
         value: Vec<u8>,
     ) {
-        let entries = self.awareness.entry(room.to_vec()).or_default();
-        if !entries.contains_key(&(client, key.clone())) {
-            let held = entries.keys().filter(|(owner, _)| *owner == client).count();
-            if held >= MAX_AWARENESS_KEYS_PER_CLIENT {
-                return;
-            }
+        let keys = self
+            .awareness
+            .entry(room.to_vec())
+            .or_default()
+            .entry(client)
+            .or_default();
+        if !keys.contains_key(&key) && keys.len() >= MAX_AWARENESS_KEYS_PER_CLIENT {
+            return;
         }
-        entries.insert((client, key), (actor, value));
+        keys.insert(key, (actor, value));
     }
 
     /// The current awareness entries in `room` as `(actor, key, value)`, for
@@ -137,7 +141,10 @@ impl Hub {
             .get(room)
             .into_iter()
             .flatten()
-            .map(|((_, key), (actor, value))| (actor.clone(), key.clone(), value.clone()))
+            .flat_map(|(_, keys)| {
+                keys.iter()
+                    .map(|(key, (actor, value))| (actor.clone(), key.clone(), value.clone()))
+            })
             .collect()
     }
 
@@ -147,7 +154,7 @@ impl Hub {
     pub fn has_client_awareness(&self, client: ClientId) -> bool {
         self.awareness
             .values()
-            .any(|entries| entries.keys().any(|(owner, _)| *owner == client))
+            .any(|by_client| by_client.get(&client).is_some_and(|keys| !keys.is_empty()))
     }
 
     /// Drop every awareness entry owned by `client` across all rooms, returning
@@ -156,18 +163,11 @@ impl Hub {
     /// pair per room it had presence in.
     pub fn clear_client_awareness(&mut self, client: ClientId) -> Vec<(RoomId, Vec<u8>)> {
         let mut cleared = Vec::new();
-        for (room, entries) in self.awareness.iter_mut() {
-            let mut actor = None;
-            entries.retain(|(owner, _), (a, _)| {
-                if *owner == client {
-                    actor.get_or_insert_with(|| a.clone());
-                    false
-                } else {
-                    true
+        for (room, by_client) in self.awareness.iter_mut() {
+            if let Some(keys) = by_client.remove(&client) {
+                if let Some((actor, _)) = keys.into_values().next() {
+                    cleared.push((room.clone(), actor));
                 }
-            });
-            if let Some(actor) = actor {
-                cleared.push((room.clone(), actor));
             }
         }
         cleared
