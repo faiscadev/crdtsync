@@ -85,6 +85,10 @@ pub enum SchemaErrorKind {
     RootNotMap,
     /// A numeric bound was ill-formed: `min` above `max`, or a negative count.
     BadRange,
+    /// A top-level key the schema language does not define (likely a typo) —
+    /// rejected rather than silently ignored, so a schema is code that fails
+    /// loud.
+    UnknownField,
 }
 
 /// A schema failure: a [`SchemaErrorKind`] plus the field or type name it
@@ -117,6 +121,7 @@ impl std::fmt::Display for SchemaError {
             SchemaErrorKind::UnknownTypeRef => "reference to an undeclared type",
             SchemaErrorKind::RootNotMap => "root type is not a map",
             SchemaErrorKind::BadRange => "ill-formed numeric bound",
+            SchemaErrorKind::UnknownField => "unknown top-level key",
         };
         write!(f, "{what}: {}", self.at)
     }
@@ -175,10 +180,31 @@ impl Schema {
         Schema::from_json(&json)
     }
 
+    /// The top-level keys the schema language defines. Any other key is a typo
+    /// and is rejected. `marks`/`auth` are declared by the language but not yet
+    /// modelled here; they are accepted structurally so a spec-valid schema
+    /// parses, and modelled by their own units.
+    const TOP_LEVEL_KEYS: [&'static str; 7] = [
+        "schema",
+        "version",
+        "root",
+        "types",
+        "marks",
+        "awareness",
+        "auth",
+    ];
+
     /// Build a schema from an already-parsed JSON value.
     pub fn from_json(json: &Json) -> Result<Schema, SchemaError> {
-        json.as_object()
+        let obj = json
+            .as_object()
             .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, "document"))?;
+
+        for (key, _) in obj {
+            if !Schema::TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                return Err(SchemaError::new(SchemaErrorKind::UnknownField, key.clone()));
+            }
+        }
 
         let name = required_str(json, "schema", "")?.to_string();
         let version = required_int(json, "version", "")?;
