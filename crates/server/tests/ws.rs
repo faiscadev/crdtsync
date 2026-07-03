@@ -250,8 +250,9 @@ fn hex(bytes: &[u8]) -> String {
 /// over the real transport — the deploy-seam half of declarative enforcement.
 #[tokio::test]
 async fn a_declared_policy_gates_subscribe_over_the_transport() {
-    // Only "reader" may read "room-1"; every other actor is default-denied.
-    let policy = format!("allow actor:{} read room:room-1", hex(b"reader"));
+    // Only "reader" may read the room; every other actor is default-denied.
+    let room = std::str::from_utf8(ROOM).unwrap();
+    let policy = format!("allow actor:{} read room:{room}", hex(b"reader"));
     let acl = Acl::from_policy(&policy).unwrap();
     let server = start_server_with_authorizer(Box::new(acl)).await;
     let url = &server.url;
