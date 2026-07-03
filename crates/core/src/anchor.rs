@@ -4,8 +4,10 @@
 //! integer offset drifts the moment another replica inserts or deletes ahead of
 //! it. A [`RelativePosition`] instead binds to the stable id of a nearby item (or
 //! a sequence boundary), so it resolves to the right live index however the
-//! sequence has since changed. It is captured with [`List::relative_position`]
-//! (or the Text equivalent) and read back with [`List::resolve_position`].
+//! sequence has since changed. It is captured with
+//! [`List::relative_position`](crate::list::List::relative_position) (or the Text
+//! equivalent) and read back with
+//! [`List::resolve_position`](crate::list::List::resolve_position).
 //!
 //! The gravity is in the binding: [`Before`](RelativePosition::Before) sits on an
 //! item's left edge and [`After`](RelativePosition::After) on its right, so a

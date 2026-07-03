@@ -428,6 +428,9 @@ impl List {
     /// gap (the end of the sequence at `len`). The binding is by item id, so the
     /// position survives concurrent edits.
     pub fn relative_position(&self, index: usize, side: Side) -> RelativePosition {
+        // A stale index past the end pins to the end boundary the same way on
+        // both sides, so an out-of-bounds caller never lands at the wrong edge.
+        let index = index.min(self.len());
         match side {
             Side::Left => match index.checked_sub(1).and_then(|i| self.node_at(i)) {
                 Some(id) => RelativePosition::After(id),
@@ -453,38 +456,39 @@ impl List {
         }
     }
 
-    /// The left edge of `id`: its live index, or — if it is deleted — the index
-    /// of the nearest live item to its right, clamping to `len` past the end.
-    fn resolve_before(&self, id: Stamp) -> usize {
-        if let Some(i) = self.live_index(id) {
-            return i;
-        }
-        let order = self.tree_order();
-        if let Some(at) = order.iter().position(|s| *s == id) {
-            for s in &order[at + 1..] {
-                if !self.nodes[s].tombstone {
-                    return self.live_index(*s).unwrap();
-                }
+    /// The number of live items strictly before `id` in sequence order, and
+    /// whether `id` itself is live — or `None` if `id` is not in the sequence.
+    /// One pass over the order, so resolution is O(n), not O(n²).
+    fn live_rank(&self, id: Stamp) -> Option<(usize, bool)> {
+        let mut before = 0;
+        for s in self.tree_order() {
+            if s == id {
+                return Some((before, !self.nodes[&s].tombstone));
+            }
+            if !self.nodes[&s].tombstone {
+                before += 1;
             }
         }
-        self.len()
+        None
+    }
+
+    /// The left edge of `id`: its live index, or — if it is deleted — the index
+    /// of the nearest live item to its right, clamping to `len` past the end.
+    /// Both equal the count of live items before `id`.
+    fn resolve_before(&self, id: Stamp) -> usize {
+        match self.live_rank(id) {
+            Some((before, _)) => before,
+            None => self.len(),
+        }
     }
 
     /// The right edge of `id`: one past its live index, or — if it is deleted —
     /// one past the nearest live item to its left, clamping to `0` past the start.
     fn resolve_after(&self, id: Stamp) -> usize {
-        if let Some(i) = self.live_index(id) {
-            return i + 1;
+        match self.live_rank(id) {
+            Some((before, live)) => before + usize::from(live),
+            None => 0,
         }
-        let order = self.tree_order();
-        if let Some(at) = order.iter().position(|s| *s == id) {
-            for s in order[..at].iter().rev() {
-                if !self.nodes[s].tombstone {
-                    return self.live_index(*s).unwrap() + 1;
-                }
-            }
-        }
-        0
     }
 
     /// Tombstone the live item at `index`.

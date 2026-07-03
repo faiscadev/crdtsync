@@ -202,6 +202,15 @@ fn start_and_end_track_the_boundaries_across_edits() {
     assert_eq!(l.resolve_position(&end), 4);
 }
 
+#[test]
+fn an_out_of_bounds_index_pins_to_the_end_on_either_side() {
+    let l = list_of("AB"); // len 2
+    for side in [Side::Left, Side::Right] {
+        let pos = l.relative_position(99, side);
+        assert_eq!(l.resolve_position(&pos), 2, "a stale index clamps to len");
+    }
+}
+
 // --- convergence: the same position resolves identically on converged replicas ---
 
 #[test]
