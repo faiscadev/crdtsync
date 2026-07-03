@@ -168,8 +168,15 @@ impl List {
             let mut off = 0u64;
             while off < *len {
                 let chunk_len = (*len - off).min(MAX_TOMBSTONE_RUN as u64);
+                // Every derived lamport equals a materialised node's, so it fits
+                // u64; checked arithmetic keeps encode symmetric with the
+                // decoder's `checked_add` rather than wrapping in release.
+                let lamport = start
+                    .lamport
+                    .checked_add(off)
+                    .expect("run chunk stamp within a materialised node's lamport");
                 let chunk_start = Stamp {
-                    lamport: start.lamport + off,
+                    lamport,
                     client: start.client,
                 };
                 let chunk_anchor = if off == 0 {
@@ -177,7 +184,7 @@ impl List {
                 } else {
                     Anchor {
                         parent: Some(Stamp {
-                            lamport: start.lamport + off - 1,
+                            lamport: lamport - 1,
                             client: start.client,
                         }),
                         side: Side::Right,
@@ -190,7 +197,10 @@ impl List {
                 off += chunk_len;
             }
         }
-        put_u32(out, len_u32(chunk_count as usize));
+        put_u32(
+            out,
+            u32::try_from(chunk_count).expect("codec: tombstone run count exceeds u32"),
+        );
         out.extend_from_slice(&chunks);
     }
 
