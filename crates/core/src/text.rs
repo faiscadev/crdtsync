@@ -41,7 +41,7 @@ impl Text {
     /// codepoints are checked.
     pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<Text, DecodeError> {
         let inner = List::decode_state_from(cur)?;
-        for value in &inner.values() {
+        for value in inner.live_values() {
             match value {
                 Element::Scalar(Scalar::Int(cp)) if char::from_u32(*cp as u32).is_some() => {}
                 _ => {

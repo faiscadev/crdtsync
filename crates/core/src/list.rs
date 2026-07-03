@@ -303,6 +303,15 @@ impl List {
             .collect()
     }
 
+    /// The live items in sequence order, borrowed — for passes that only
+    /// inspect values (codepoint validation on decode) and would otherwise
+    /// pay `values`' clone of every element into a temporary vector.
+    pub(crate) fn live_values(&self) -> impl Iterator<Item = &Element> {
+        self.live_order()
+            .into_iter()
+            .map(move |s| &self.nodes[&s].value)
+    }
+
     /// Insert `value` at live `index`, identified by `stamp`. A stamp already
     /// seen is a replay and leaves the node untouched.
     pub fn insert(&mut self, index: usize, value: Element, stamp: Stamp) {
