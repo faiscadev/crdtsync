@@ -145,6 +145,36 @@ fn a_text_converges_and_deletes() {
 }
 
 #[wasm_bindgen_test]
+fn a_relative_position_tracks_edits_and_round_trips() {
+    let mut a = doc(1);
+    let p = path(&["board", "cards"]);
+    a.list_insert(&p, 0, b"a");
+    a.list_insert(&p, 1, b"b");
+    a.list_insert(&p, 2, b"c");
+    // Anchor left of index 2, then insert ahead of it.
+    let pos = a.relative_position(&p, 2, 0).expect("captured");
+    assert_eq!(a.resolve_position(&p, &pos), Some(2));
+    a.list_insert(&p, 0, b"z");
+    assert_eq!(a.resolve_position(&p, &pos), Some(3));
+    // A non-sequence slot, an unknown side, and malformed bytes are all absent.
+    a.register_int(&path(&["age"]), 30);
+    assert_eq!(a.relative_position(&path(&["age"]), 0, 0), None);
+    assert_eq!(a.relative_position(&p, 0, 9), None);
+    assert_eq!(a.resolve_position(&p, &[0xff, 0xff]), None);
+}
+
+#[wasm_bindgen_test]
+fn a_text_relative_position_round_trips() {
+    let mut a = doc(1);
+    let t = path(&["doc", "title"]);
+    a.text_insert(&t, 0, "hello");
+    let pos = a.relative_position(&t, 5, 0).expect("captured");
+    assert_eq!(a.resolve_position(&t, &pos), Some(5));
+    a.text_insert(&t, 0, ">>");
+    assert_eq!(a.resolve_position(&t, &pos), Some(7));
+}
+
+#[wasm_bindgen_test]
 fn apply_rejects_garbage() {
     let mut a = doc(1);
     assert_eq!(a.apply(&[0xff; 8]), -1);

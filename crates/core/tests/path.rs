@@ -123,6 +123,52 @@ fn text_inserts_and_deletes_by_codepoint() {
     assert_eq!(path::text_get(&d, &path), Some("ho".to_string()));
 }
 
+// --- relative positions (anchors) ---
+
+#[test]
+fn a_list_position_tracks_an_insert_before_it() {
+    use crdtsync_core::list::Side;
+    let mut d = doc(1);
+    let path = p(&["board", "cards"]);
+    path::list_insert(&mut d, &path, 0, b"a");
+    path::list_insert(&mut d, &path, 1, b"b");
+    // Anchor to the left of "b" (index 1).
+    let pos = path::relative_position(&d, &path, 1, Side::Left).expect("captured");
+    assert_eq!(path::resolve_position(&d, &path, &pos), Some(1));
+    // Insert ahead of the anchor; it slides to keep the same gap.
+    path::list_insert(&mut d, &path, 0, b"z");
+    assert_eq!(path::resolve_position(&d, &path, &pos), Some(2));
+}
+
+#[test]
+fn a_text_position_round_trips() {
+    use crdtsync_core::list::Side;
+    let mut d = doc(1);
+    let path = p(&["doc", "title"]);
+    path::text_insert(&mut d, &path, 0, "hello");
+    let pos = path::relative_position(&d, &path, 5, Side::Left).expect("captured");
+    assert_eq!(path::resolve_position(&d, &path, &pos), Some(5));
+    path::text_insert(&mut d, &path, 0, ">>");
+    assert_eq!(path::resolve_position(&d, &path, &pos), Some(7));
+}
+
+#[test]
+fn a_position_on_a_non_sequence_path_is_absent() {
+    use crdtsync_core::list::Side;
+    let mut d = doc(1);
+    path::register_int(&mut d, &p(&["age"]), 30);
+    assert_eq!(
+        path::relative_position(&d, &p(&["age"]), 0, Side::Left),
+        None
+    );
+    assert_eq!(
+        path::relative_position(&d, &p(&["ghost"]), 0, Side::Left),
+        None
+    );
+    let end = crdtsync_core::RelativePosition::End;
+    assert_eq!(path::resolve_position(&d, &p(&["age"]), &end), None);
+}
+
 // --- convergence + inert paths ---
 
 #[test]

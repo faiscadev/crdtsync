@@ -34,6 +34,9 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_doc_text_delete",
         "crdtsync_doc_text_len",
         "crdtsync_doc_text_get",
+        // relative positions (anchors)
+        "crdtsync_doc_relative_position",
+        "crdtsync_doc_resolve_position",
         // sync
         "crdtsync_doc_apply",
         // diff

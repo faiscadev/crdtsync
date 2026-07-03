@@ -10,9 +10,10 @@
 use crdtsync_core::diff::{diff as core_diff, Change, SeqItem};
 use crdtsync_core::element::ElementKind;
 use crdtsync_core::op::Op;
+use crdtsync_core::list::Side;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_ops, path, Channel, ClientId, ClientSession,
-    Document, Message, Scalar, UndoManager,
+    Document, Message, RelativePosition, Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
 
@@ -160,6 +161,29 @@ impl WasmDocument {
     #[wasm_bindgen(js_name = textGet)]
     pub fn text_get(&self, path: &[u8]) -> Option<String> {
         path::text_get(&self.inner, path)
+    }
+
+    /// Capture a stable position in the List or Text at a path — the encoded
+    /// `RelativePosition` bytes, resolved later with `resolvePosition`. `side` is
+    /// 0 (left of `index`) or 1 (right). Returns `undefined` for a non-sequence
+    /// slot or an unknown `side`.
+    #[wasm_bindgen(js_name = relativePosition)]
+    pub fn relative_position(&self, path: &[u8], index: usize, side: u32) -> Option<Vec<u8>> {
+        let side = match side {
+            0 => Side::Left,
+            1 => Side::Right,
+            _ => return None,
+        };
+        path::relative_position(&self.inner, path, index, side).map(|p| p.encode())
+    }
+
+    /// Resolve a captured position (bytes from `relativePosition`) back to a live
+    /// index in the List or Text at a path. Returns `undefined` for a non-sequence
+    /// slot or malformed position bytes.
+    #[wasm_bindgen(js_name = resolvePosition)]
+    pub fn resolve_position(&self, path: &[u8], pos: &[u8]) -> Option<usize> {
+        let position = RelativePosition::decode(pos).ok()?;
+        path::resolve_position(&self.inner, path, &position)
     }
 
     /// Fold a peer's encoded ops in. Returns the number applied, -1 on error.

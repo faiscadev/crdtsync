@@ -760,3 +760,104 @@ fn a_doc_atomic_transaction_commits_all_or_nothing() {
         crdtsync_doc_free(b);
     }
 }
+
+// --- relative positions (anchors) ---
+
+unsafe fn capture(doc: *const CrdtDoc, p: &[u8], index: usize, side: u32) -> Vec<u8> {
+    let buf = crdtsync_doc_relative_position(doc, p.as_ptr(), p.len(), index, side);
+    assert!(buf.len > 0, "capture missed");
+    let v = std::slice::from_raw_parts(buf.ptr, buf.len).to_vec();
+    crdtsync_buf_free(buf);
+    v
+}
+
+unsafe fn resolve(doc: *const CrdtDoc, p: &[u8], pos: &[u8]) -> (i32, usize) {
+    let mut out: usize = 0;
+    let rc =
+        crdtsync_doc_resolve_position(doc, p.as_ptr(), p.len(), pos.as_ptr(), pos.len(), &mut out);
+    (rc, out)
+}
+
+#[test]
+fn a_relative_position_tracks_edits_across_the_boundary() {
+    unsafe {
+        let ca = client(1);
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let p = path(&[b"board", b"cards"]);
+
+        for (i, v) in [b"a", b"b", b"c"].iter().enumerate() {
+            let o = crdtsync_doc_list_insert(a, p.as_ptr(), p.len(), i, v.as_ptr(), 1);
+            crdtsync_buf_free(o);
+        }
+        // Anchor left of index 2 ("c"), then insert ahead of it.
+        let pos = capture(a, &p, 2, 0);
+        assert_eq!(resolve(a, &p, &pos), (1, 2));
+        let o = crdtsync_doc_list_insert(a, p.as_ptr(), p.len(), 0, b"z".as_ptr(), 1);
+        crdtsync_buf_free(o);
+        assert_eq!(resolve(a, &p, &pos), (1, 3), "anchor slid with the insert");
+
+        crdtsync_doc_free(a);
+    }
+}
+
+#[test]
+fn a_text_relative_position_round_trips() {
+    unsafe {
+        let ca = client(1);
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let t = path(&[b"doc", b"title"]);
+
+        let o = crdtsync_doc_text_insert(a, t.as_ptr(), t.len(), 0, b"hello".as_ptr(), 5);
+        crdtsync_buf_free(o);
+        let pos = capture(a, &t, 5, 0);
+        assert_eq!(resolve(a, &t, &pos), (1, 5));
+        let o = crdtsync_doc_text_insert(a, t.as_ptr(), t.len(), 0, b">>".as_ptr(), 2);
+        crdtsync_buf_free(o);
+        assert_eq!(resolve(a, &t, &pos), (1, 7), "anchor slid with the insert");
+
+        crdtsync_doc_free(a);
+    }
+}
+
+#[test]
+fn a_position_on_a_bad_or_non_sequence_path_is_reported() {
+    unsafe {
+        let ca = client(1);
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let age = path(&[b"age"]);
+        let r = register_int(a, &age, 30);
+        crdtsync_buf_free(r);
+
+        // Capture on a register slot yields an empty buffer.
+        let buf = crdtsync_doc_relative_position(a, age.as_ptr(), age.len(), 0, 0);
+        assert_eq!(buf.len, 0, "no anchor on a non-sequence");
+        crdtsync_buf_free(buf);
+        // An unknown side is rejected too.
+        let buf = crdtsync_doc_relative_position(a, age.as_ptr(), age.len(), 0, 9);
+        assert_eq!(buf.len, 0, "unknown side rejected");
+        crdtsync_buf_free(buf);
+
+        // Resolving on a non-sequence path returns 0; malformed bytes return 0.
+        let good = path(&[b"list"]);
+        let o = crdtsync_doc_list_insert(a, good.as_ptr(), good.len(), 0, b"x".as_ptr(), 1);
+        crdtsync_buf_free(o);
+        let pos = capture(a, &good, 0, 0);
+        assert_eq!(resolve(a, &age, &pos).0, 0, "non-sequence path");
+        assert_eq!(resolve(a, &good, &[0xff, 0xff]).0, 0, "malformed position");
+
+        // A null handle is -1.
+        assert_eq!(
+            crdtsync_doc_resolve_position(
+                ptr::null(),
+                good.as_ptr(),
+                good.len(),
+                pos.as_ptr(),
+                pos.len(),
+                &mut 0usize
+            ),
+            -1
+        );
+
+        crdtsync_doc_free(a);
+    }
+}

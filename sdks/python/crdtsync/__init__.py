@@ -12,14 +12,22 @@ The native library is loaded at import time from ``target/{release,debug}`` (or
 from __future__ import annotations
 
 import ctypes
+import enum
 import os
 import platform
 import struct
 from typing import List, Optional, Tuple
 
-__all__ = ["Client", "Document", "Undo", "diff", "encode_path"]
+__all__ = ["Client", "Document", "Side", "Undo", "diff", "encode_path"]
 
 Path = List[bytes]
+
+
+class Side(enum.IntEnum):
+    """Which edge of an index a captured position anchors to."""
+
+    LEFT = 0
+    RIGHT = 1
 
 
 class _CrdtBuf(ctypes.Structure):
@@ -78,6 +86,12 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_text_delete, [doc, cbytes, size, size, size], buf)
     sig(lib.crdtsync_doc_text_len, [doc, cbytes, size, c.POINTER(size)], c.c_int32)
     sig(lib.crdtsync_doc_text_get, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_doc_relative_position, [doc, cbytes, size, size, c.c_uint32], buf)
+    sig(
+        lib.crdtsync_doc_resolve_position,
+        [doc, cbytes, size, cbytes, size, c.POINTER(size)],
+        c.c_int32,
+    )
     sig(lib.crdtsync_doc_apply, [doc, cbytes, size], c.c_int32)
     sig(lib.crdtsync_doc_encode_state, [doc], buf)
     sig(lib.crdtsync_doc_decode_state, [cbytes, size], doc)
@@ -413,6 +427,33 @@ class Document:
     def text_get(self, path: Path) -> Optional[str]:
         raw = self._read_buf(_LIB.crdtsync_doc_text_get, path)
         return None if raw is None else raw.decode("utf-8")
+
+    # --- relative positions (anchors) ---
+
+    def relative_position(
+        self, path: Path, index: int, side: Side = Side.LEFT
+    ) -> Optional[bytes]:
+        """Capture a stable position in the List or Text at ``path`` — encoded
+        bytes to resolve later with :meth:`resolve_position`. ``None`` for a bad
+        or non-sequence path, or an unknown ``side`` (any value other than
+        ``LEFT``/``RIGHT``)."""
+        _usize("index", index)
+        _u32("side", int(side))
+        p = encode_path(path)
+        data = _take_buf(
+            _LIB.crdtsync_doc_relative_position(self._handle, p, len(p), index, int(side))
+        )
+        return data if data else None
+
+    def resolve_position(self, path: Path, pos: bytes) -> Optional[int]:
+        """Resolve a captured position back to a live index in the List or Text
+        at ``path``. ``None`` for a non-sequence slot or malformed bytes."""
+        p = encode_path(path)
+        out = ctypes.c_size_t()
+        rc = _LIB.crdtsync_doc_resolve_position(
+            self._handle, p, len(p), pos, len(pos), ctypes.byref(out)
+        )
+        return out.value if rc == 1 else None
 
     # --- sync ---
 

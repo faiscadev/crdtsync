@@ -19,10 +19,11 @@
 //! rejects null or malformed input rather than dereferencing it.
 
 use crdtsync_core::diff::{diff, encode_changes};
+use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, encode_message, encode_ops, path, Channel, ClientId, ClientSession, Document,
-    Message, Scalar, UndoManager,
+    Message, RelativePosition, Scalar, UndoManager,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
@@ -370,6 +371,83 @@ pub unsafe extern "C" fn crdtsync_doc_text_get(
     read_buf(doc, path, path_len, out, |d, p| {
         path::text_get(d, p).map(String::into_bytes)
     })
+}
+
+/// Map the C `side` argument to a [`Side`]: 0 is left of the index, 1 is right.
+fn side_from_u32(side: u32) -> Option<Side> {
+    match side {
+        0 => Some(Side::Left),
+        1 => Some(Side::Right),
+        _ => None,
+    }
+}
+
+/// Capture a stable position in the List or Text at a path — the encoded
+/// [`RelativePosition`] bytes, resolved later with
+/// [`crdtsync_doc_resolve_position`]. `side` is 0 (left of `index`) or 1 (right).
+/// Empty on a bad handle/path, a non-sequence slot, or an unknown `side`.
+///
+/// # Safety
+/// `doc` is a live handle or null; `path`/`path_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_relative_position(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    side: u32,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return CrdtBuf::empty();
+        }
+        let (Some(p), Some(side)) = (as_slice(path, path_len), side_from_u32(side)) else {
+            return CrdtBuf::empty();
+        };
+        match path::relative_position(&(*doc).doc, p, index, side) {
+            Some(pos) => CrdtBuf::from_vec(pos.encode()),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Resolve a captured position (bytes from [`crdtsync_doc_relative_position`])
+/// back to a live index in the List or Text at a path, written to `out`. Returns
+/// 1 when resolved, 0 on a bad path / non-sequence slot / malformed position
+/// bytes, -1 on a bad handle or panic.
+///
+/// # Safety
+/// `doc` is a live handle or null; `path`/`path_len` and `pos`/`pos_len` follow
+/// [`as_slice`]; `out` is a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_resolve_position(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    pos: *const u8,
+    pos_len: usize,
+    out: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() || out.is_null() {
+            return -1;
+        }
+        let (Some(p), Some(pos_raw)) = (as_slice(path, path_len), as_slice(pos, pos_len)) else {
+            return 0;
+        };
+        let Ok(position) = RelativePosition::decode(pos_raw) else {
+            return 0;
+        };
+        match path::resolve_position(&(*doc).doc, p, &position) {
+            Some(n) => {
+                *out = n;
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 /// Fold an encoded op log (as returned by an edit) from a peer into the

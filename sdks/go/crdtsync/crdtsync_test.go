@@ -626,3 +626,63 @@ func TestDiffMalformedErrors(t *testing.T) {
 		t.Fatal("want an error for a malformed snapshot")
 	}
 }
+
+func TestRelativePositionTracksEditsAndRoundTrips(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+
+	p := path("board", "cards")
+	a.ListInsert(p, 0, key("a"))
+	a.ListInsert(p, 1, key("b"))
+	a.ListInsert(p, 2, key("c"))
+
+	// Anchor left of index 2 ("c"), then insert ahead of it.
+	pos := a.RelativePosition(p, 2, Left)
+	if pos == nil {
+		t.Fatal("capture returned nil")
+	}
+	if i, ok := a.ResolvePosition(p, pos); !ok || i != 2 {
+		t.Fatalf("resolve: got %d ok=%v", i, ok)
+	}
+	a.ListInsert(p, 0, key("z"))
+	if i, ok := a.ResolvePosition(p, pos); !ok || i != 3 {
+		t.Fatalf("resolve after insert: got %d ok=%v", i, ok)
+	}
+}
+
+func TestTextRelativePositionRoundTrips(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+
+	p := path("doc", "title")
+	a.TextInsert(p, 0, "hello")
+	pos := a.RelativePosition(p, 5, Left)
+	if pos == nil {
+		t.Fatal("capture returned nil")
+	}
+	if i, ok := a.ResolvePosition(p, pos); !ok || i != 5 {
+		t.Fatalf("resolve: got %d ok=%v", i, ok)
+	}
+	a.TextInsert(p, 0, ">>")
+	if i, ok := a.ResolvePosition(p, pos); !ok || i != 7 {
+		t.Fatalf("resolve after insert: got %d ok=%v", i, ok)
+	}
+}
+
+func TestRelativePositionOnNonSequenceIsAbsent(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+
+	a.RegisterInt(path("age"), 30)
+	if pos := a.RelativePosition(path("age"), 0, Left); pos != nil {
+		t.Fatal("no anchor on a non-sequence")
+	}
+	a.ListInsert(path("list"), 0, key("x"))
+	pos := a.RelativePosition(path("list"), 0, Left)
+	if _, ok := a.ResolvePosition(path("age"), pos); ok {
+		t.Fatal("resolve on a non-sequence must fail")
+	}
+	if _, ok := a.ResolvePosition(path("list"), []byte{0xff, 0xff}); ok {
+		t.Fatal("resolve of malformed bytes must fail")
+	}
+}
