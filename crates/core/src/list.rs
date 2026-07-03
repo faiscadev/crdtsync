@@ -422,7 +422,8 @@ impl List {
         self.live_order().iter().position(|s| *s == id)
     }
 
-    /// Capture a stable position at live `index` with the given gravity. `Left`
+    /// Capture a stable position at `index` (clamped to the sequence length, so a
+    /// stale index is accepted) with the given gravity. `Left`
     /// binds to the right edge of the item before the gap (the start of the
     /// sequence at index 0); `Right` binds to the left edge of the item at the
     /// gap (the end of the sequence at `len`). The binding is by item id, so the
