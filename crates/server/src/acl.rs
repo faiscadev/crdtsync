@@ -153,7 +153,8 @@ pub enum PolicyErrorKind {
     Effect(String),
     /// The subject field named no known subject.
     Subject(String),
-    /// An `actor:` subject carried a value that is not even-length hex.
+    /// An `actor:` subject carried a value that is not valid hex — an odd length
+    /// or a non-hex digit.
     ActorHex(String),
     /// The action field named no known action.
     Action(String),

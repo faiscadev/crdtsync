@@ -140,9 +140,9 @@ fn resource_tokens_map_to_a_named_room_and_the_wildcard() {
 }
 
 #[test]
-fn actor_hex_decodes_to_the_matching_actor_bytes() {
-    // A room name may itself contain a colon; only the first `room:` prefix is
-    // stripped, the remainder is the raw name.
+fn a_room_name_may_contain_a_colon() {
+    // Only the first `room:` prefix is stripped; the remainder is the raw name,
+    // colons and all.
     let acl = Acl::from_policy("allow anyone read room:ns:room-a").unwrap();
     assert!(read(&acl, b"a", b"ns:room-a"));
     assert!(!read(&acl, b"a", b"room-a"));
