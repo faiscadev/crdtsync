@@ -22,7 +22,7 @@ pub mod registry;
 pub mod runtime;
 pub mod session;
 pub mod store;
-pub use auth::{AllowAll, Verifier};
+pub use auth::{AllowAll, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use registry::{ConnId, Registry};
