@@ -93,6 +93,97 @@ fn an_empty_list_round_trips() {
     assert_eq!(back.id(), l.id());
 }
 
+// --- tombstone compression ---
+
+#[test]
+fn a_deleted_run_compresses_far_below_its_length() {
+    // A run inserted together then deleted collapses to one range record, so the
+    // encoding is bounded by the run count, not the number of deleted items.
+    let mut t = Text::new(eid(2, 2));
+    t.insert(0, &"x".repeat(1000), stmp(1, 1));
+    t.delete(0, 1000); // tombstone the whole run
+
+    let bytes = t.encode_state();
+    // A per-node encoding would be ~1000 * (stamp + value + anchor) bytes; the
+    // compressed one is a single small run record plus the id header.
+    assert!(
+        bytes.len() < 200,
+        "1000 deleted codepoints encoded to {} bytes",
+        bytes.len()
+    );
+    // And it still reads back as empty live text.
+    let back = Text::decode_state(&bytes).unwrap();
+    assert_eq!(back.as_string(), "");
+    assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
+}
+
+#[test]
+fn compressed_tombstones_still_anchor_a_concurrent_insert() {
+    // The whole point of keeping tombstones is positioning. After a run is
+    // deleted and the replica is reloaded from its compressed snapshot, a
+    // concurrent insert that anchored inside the deleted run must still land in
+    // the same place on both replicas.
+    let mut a = Text::new(eid(2, 2));
+    a.insert(0, "abcde", stmp(1, 1));
+    let mut b = a.deep_clone();
+
+    // b deletes the middle; a concurrently inserts after 'c' (char_id 3,1).
+    b.delete(1, 3); // remove "bcd" -> "ae"
+    let anchor = a.place(3); // after 'c'
+    a.insert_run(stmp(10, 2), "Z", anchor);
+
+    // Reload b from its compressed snapshot, then converge.
+    let mut b = Text::decode_state(&b.encode_state()).unwrap();
+    b.merge(&a);
+    a.merge(&b);
+    assert_eq!(a.as_string(), b.as_string(), "must converge after a reload");
+}
+
+#[test]
+fn scattered_tombstones_and_live_nodes_round_trip() {
+    // Interleaved live and deleted nodes: deletes that do not form one chain
+    // stay as separate (length-1) runs, and live values survive untouched.
+    let mut l = List::new(eid(1, 1));
+    for i in 0..6 {
+        l.insert(i, int(i as i64), stmp(i as u64 + 1, 1));
+    }
+    l.delete(1); // tombstone value 1
+    l.delete(2); // tombstone value 3 (indices shift as live set shrinks)
+
+    let bytes = l.encode_state();
+    let back = List::decode_state(&bytes).unwrap();
+    assert_eq!(ints(&back), ints(&l));
+    assert_eq!(back.encode_state(), bytes);
+}
+
+#[test]
+fn a_bogus_run_length_is_rejected_not_expanded() {
+    // A crafted record claiming an enormous run must error at the cap, not try
+    // to reconstruct billions of nodes. Build an honest single-tombstone list
+    // (0 live nodes, 1 run of length 1), then overwrite the run-length field
+    // with a huge value. Layout: id, u32 live_count(=0), u32 run_count(=1),
+    // stamp start, u32 length, anchor. The length is the u32 sitting `4 +
+    // anchor_len` before the end — compute anchor_len from a zero-tombstone
+    // list, whose encoding is `id, u32 live_count(=0), u32 run_count(=0)`.
+    let empty = List::new(eid(1, 1)).encode_state();
+    let header = empty.len(); // id + live_count(0) + run_count(0)
+
+    let mut l = List::new(eid(1, 1));
+    l.insert(0, int(7), stmp(1, 1));
+    l.delete(0);
+    let mut bytes = l.encode_state();
+    // Everything after `header - 4` (re-counting run_count as 1) is: stamp,
+    // length, anchor. anchor_len = total - (header + stamp_len + 4).
+    let stamp_len = 24; // 8-byte lamport + 16-byte client id
+    let anchor_len = bytes.len() - (header + stamp_len + 4);
+    let len_off = bytes.len() - anchor_len - 4;
+    bytes[len_off..len_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(
+        List::decode_state(&bytes).is_err(),
+        "an oversized run length must be rejected, not expanded"
+    );
+}
+
 // --- Text ---
 
 #[test]

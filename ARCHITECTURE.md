@@ -307,7 +307,7 @@ Used by Register values, Map scalar set, XmlElement attr values, mark values of 
 
 ## Tombstone GC
 
-CRDT text/list deletions leave tombstones (required to position concurrent inserts). Watermark = min(last-acked seq) across clients within the retention horizon (§Op Acknowledgement) — each client reports progress with an `Ack` frame. At snapshot boundary: discard tombstones older than watermark. Offline clients within the horizon block GC for ops they haven't acked; a client absent past the horizon is dropped and re-synced by Snapshot if it returns below the floor.
+CRDT text/list deletions leave tombstones (required to position concurrent inserts). **Tombstones are never removed** — removing a node another replica still references would force either orphan-reparenting (a replicated GC op with forwarding, since peers keep tombstones the server drops) or edit-rejection (silent-ish data loss on cold regions). Both are complex or lossy, and removal buys nothing convergence can't get more cheaply. Instead tombstones are **compressed**: a contiguous deleted run — consecutive char/list ids that form one insert's parent-chain, all tombstoned — encodes as a single range record, and a tombstone's dead value (never read again) is dropped. A deleted region costs O(runs), not O(deleted items); real editing deletes contiguous spans (words, lines, paragraphs), so runs are few. Convergence is untouched — same logical state, fewer bytes — so it needs no watermark, no client acknowledgement, and no distributed decision. This is what mature CRDTs (Yjs's deleted-item structs, Automerge's columnar RLE) actually ship.
 
 ## Op Batching
 
@@ -470,7 +470,7 @@ Latest per branch always retained. Migration-boundary snapshots retained forever
 
 ## Tombstone GC
 
-Snapshots are when GC actually happens. Until a snapshot crosses the watermark, tombstones must be retained — offline clients within the retention horizon could need them. The watermark is the `min` of the per-client last-acked sequences (§Op Acknowledgement). **Not yet built:** current compaction retains all tombstones — there is no watermark GC (see *Implementation Status & Divergences*).
+Tombstones are compressed, never removed (see §Tombstone GC above). Compression happens at **state-encoding time** — every artifact that carries the merged state (a snapshot, a below-floor cold-start catch-up, the durable `.snap` file) run-length-encodes contiguous deleted runs into range records and drops dead values. This bounds exactly the things that compound as a room ages: snapshot size, wire catch-up, disk, replay cost. It is a pure codec optimization — no watermark, no acknowledgement, no removal — so no client can be forced to re-sync by it. **Not yet built:** current compaction encodes every tombstone node in full (see *Implementation Status & Divergences*).
 
 ## Cold Start
 
@@ -622,22 +622,14 @@ Reconnect: client stored last_seen_seq, server replays missing ops.
 
 ## Op Acknowledgement
 
-Two acknowledgement frames, one per direction, both meaning "my durable commit frontier on this channel is X":
+Acknowledgement frames carry a per-channel commit frontier so each side learns the other's progress — the sender is never echoed its own ops, so the op stream alone can't tell it.
 
 - **`Accepted { channel, through }`** (server → client). After the server durably logs an authored batch from client C, it replies with the highest **per-client op sequence (`OpId.seq`) of C's own ops** it has committed. Keyed by the author's op seq, not the server sequence: the op identity `(client_id, seq)` is what dedup already keys on and is stable across reconnect, so a resent op re-acks to the same `through`. Server-sequence correlation would shift when ops are resent and break the outbox match.
-- **`Ack { channel, seq }`** (client → server). "I have applied `channel`'s log through server sequence `seq`." The server records it per client; `min` across clients within the retention horizon is the tombstone-GC floor.
-
-The sender is never echoed its own ops, so these frames — not the op stream — are how each side learns the other's progress.
+- **`Ack { channel, seq }`** (client → server). "I have applied `channel`'s log through server sequence `seq`." **Reserved, no consumer.** It was intended to feed a `min(last-acked seq)` tombstone-GC watermark; that whole approach was dropped in favour of tombstone *compression* (§Tombstone GC), which needs no distributed progress tracking. The frame stays defined on the wire (accepted-and-ignored by the server) as a forward-compat reservation; nothing produces it today.
 
 ### Offline op queue
 
 `ClientSession` retains its authored ops per channel in an outbox. `edit` appends; an inbound `Accepted { through }` prunes every outbox op with `id.seq <= through`; a reconnect re-emits the unpruned tail — ops authored while disconnected, or in flight when the connection dropped. `Accepted` is the only signal that a local write reached durable storage, so without it the outbox could never drain. Ops the server rejects (permission revoked while offline, §Offline Edits + Permission Revocation) come back as Error, not Accepted, and stay in the outbox for the app to resolve.
-
-### Retention horizon
-
-The GC floor is `min(last-acked seq)` over clients that have acked within a configurable **retention horizon**. A client absent longer than the horizon is dropped from the watermark and its tombstones become collectable; if it later reconnects below the compaction floor it is brought current with a whole-replica Snapshot (the same below-floor path as cold start), never a delta past a collected tombstone. This bounds tombstone growth against a client that disconnects forever, at the cost of a snapshot re-sync for a client absent past the horizon.
-
-**Invariant (load-bearing):** GC never removes a tombstone at or above the compaction floor, and a client reconnecting below the floor always receives a Snapshot, never a delta. This keeps GC convergent — a stale replica adopts server truth via snapshot instead of replaying past a missing tombstone. The horizon governs *when* a client stops holding the floor back; the floor-coupling governs *correctness*.
 
 ---
 
@@ -993,7 +985,7 @@ This document is the **end-state** — the full scope + intended design; everyth
 
 ## Planned, not yet built (the prose above reads present-tense — it isn't yet)
 
-- **Tombstone GC / watermark** — compaction retains all tombstones; no `min(last-acked seq)` watermark, no retention window ("keep last 3"), only an op-count trigger (no time/migration triggers). The enabling `Ack`/`Accepted` op-acknowledgement frames and the `ClientSession` outbox are also not built yet (§Op Acknowledgement is design-of-record). Snapshot state grows with tombstones until GC lands.
+- **Tombstone compression** — the state codec encodes every tombstone node in full (stamp + value + anchor); contiguous deleted runs are not yet collapsed to range records and dead values are not yet dropped, so snapshot/wire state grows linearly with deleted items until compression lands (§Tombstone GC is design-of-record). The `Accepted` frame + `ClientSession` outbox (the offline queue) **are** built; the `Ack` frame is a reserved no-consumer wire slot (its GC-watermark purpose was dropped for compression).
 - **Element-ref envelope slot** — the `tx` and blob-ref slots are reserved (`Scalar::BlobRef`); the **element-ref value slot is not**. Its shape is under-specified and it carries no v0.1 reservation promise, so it is deferred until its design settles. Tracked in KANBAN.
 - **Op-batching RLE** — the codec frames one op per record; cross-op run-length encoding is a later additive op kind.
 - **Also absent:** `RelativePosition`/anchor SDK type, client_id generation/persistence in the SDKs (they take a caller-supplied 16-byte id), codec negotiation, and the XmlElement / XmlFragment / RangedElement primitives (v0.5). (The Error `details` field is now reserved on the wire — round-tripped, empty, no producer — see §Error Envelope.)
