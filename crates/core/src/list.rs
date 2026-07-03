@@ -22,9 +22,12 @@ const MAX_TOMBSTONE_RUN: u32 = 1 << 20;
 
 /// The most tombstones a whole decoded sequence may reconstruct across every
 /// run. The per-record cap alone bounds one record but not their sum, so a
-/// small stream of many records could still claim an unbounded node count; this
-/// ceiling bounds the total. A document compacts long before reaching it.
-const MAX_TOMBSTONE_TOTAL: u64 = 1 << 24;
+/// small stream of many records could still claim a huge node count on untrusted
+/// input; this ceiling bounds total decode memory (a few hundred MB of nodes at
+/// the limit). Run-length compression is inherently high-ratio, so a bytes-based
+/// ratio cannot separate a bomb from a legitimately dense snapshot — an absolute
+/// node ceiling is the meaningful guard. A document compacts far below this.
+const MAX_TOMBSTONE_TOTAL: u64 = 1 << 22;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Side {

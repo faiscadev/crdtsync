@@ -226,7 +226,8 @@ fn many_capped_runs_exceed_the_global_decode_budget() {
     let len_off = stamp_len; // length sits right after the start stamp
     record[len_off..len_off + 4].copy_from_slice(&(1u32 << 20).to_le_bytes());
 
-    // 17 records at 1<<20 each sum to 17<<20, past the 1<<24 global budget.
+    // Many records at the per-record cap (1<<20 each) sum far past the global
+    // budget, so decode must reject on the declared total.
     let runs = 17u32;
     let mut bytes = one_run[..header].to_vec();
     bytes[header - 4..].copy_from_slice(&runs.to_le_bytes()); // run_count
