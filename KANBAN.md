@@ -155,7 +155,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **RelativePosition / anchors (core)** — cut from ARCHITECTURE §Anchors ("planned, not yet built: RelativePosition/anchor SDK type"). A stable cursor/selection position in a List or Text sequence that survives concurrent inserts and deletes without drifting — id-bound, not integer-offset. Foundational: cursors/selections/marks/comments/RangedElement + awareness cursors all depend on it. Dependency-ready (list/text green; `node_at`/`live_index`/`contains` + retained tombstones give the resolution machinery). Core-only this unit; the SDK `RelativePosition` surface (FFI/wasm/Python/Go) is a follow-on. Spec: `crates/core/tests/anchor.rs`. Picked by `cs-next`, handed to `/cs-implement`.
 
 ---
 
