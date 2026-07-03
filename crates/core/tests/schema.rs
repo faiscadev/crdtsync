@@ -281,12 +281,12 @@ fn a_type_def_must_be_an_object() {
 
 #[test]
 fn a_type_needs_a_known_kind() {
-    assert_eq!(
-        err(
-            r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "widget" } } }"#
-        ),
-        SchemaErrorKind::UnknownKind
-    );
+    let e = Schema::parse(
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "widget" } } }"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::UnknownKind);
+    assert_eq!(e.at, "R.kind", "the error names the kind field");
     assert_eq!(
         err(r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": {} } }"#),
         SchemaErrorKind::MissingField

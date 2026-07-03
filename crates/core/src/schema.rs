@@ -19,6 +19,7 @@
 //! tree, not over JSON.
 
 use crate::json::{Json, JsonError, JsonErrorKind};
+use std::collections::HashSet;
 
 /// A parsed, validated schema.
 #[derive(Clone, Debug, PartialEq)]
@@ -179,8 +180,21 @@ impl Schema {
     }
 
     /// Every type a schema names must be declared, and `root` must be a map —
-    /// the closure guarantee that makes runtime repair total.
+    /// the closure guarantee that makes runtime repair total. The declared set
+    /// is hashed once so membership stays O(1) per reference (a schema may carry
+    /// many types) while `self.types` keeps its declaration order.
     fn validate_references(&self) -> Result<(), SchemaError> {
+        let declared: HashSet<&str> = self.types.iter().map(|(n, _)| n.as_str()).collect();
+        let require = |name: &str| -> Result<(), SchemaError> {
+            if declared.contains(name) {
+                Ok(())
+            } else {
+                Err(SchemaError::new(
+                    SchemaErrorKind::UnknownTypeRef,
+                    name.to_string(),
+                ))
+            }
+        };
         match self.type_def(&self.root) {
             None => {
                 return Err(SchemaError::new(
@@ -200,22 +214,12 @@ impl Schema {
             match def {
                 TypeDef::Map { children } => {
                     for (_, ty) in children {
-                        self.require_declared(ty)?;
+                        require(ty)?;
                     }
                 }
-                TypeDef::List { items, .. } => self.require_declared(items)?,
+                TypeDef::List { items, .. } => require(items)?,
                 TypeDef::Text { .. } | TypeDef::Register { .. } | TypeDef::Counter { .. } => {}
             }
-        }
-        Ok(())
-    }
-
-    fn require_declared(&self, name: &str) -> Result<(), SchemaError> {
-        if self.type_def(name).is_none() {
-            return Err(SchemaError::new(
-                SchemaErrorKind::UnknownTypeRef,
-                name.to_string(),
-            ));
         }
         Ok(())
     }
@@ -257,7 +261,7 @@ fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, SchemaError> 
         }
         _ => Err(SchemaError::new(
             SchemaErrorKind::UnknownKind,
-            type_name.to_string(),
+            at(type_name, "kind"),
         )),
     }
 }
