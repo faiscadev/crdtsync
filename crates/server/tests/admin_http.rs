@@ -122,6 +122,9 @@ fn register(app_id: &str, version: u32, credential: Option<&str>, body: &str) ->
     req.into_bytes()
 }
 
+// Socket tests do real network syscalls Miri cannot execute; skip them there.
+// The pure `dispatch` tests above still run under Miri.
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn the_admin_plane_serves_registration_over_a_socket() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -170,6 +173,7 @@ async fn the_admin_plane_serves_registration_over_a_socket() {
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_malformed_request_over_the_socket_is_400() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
