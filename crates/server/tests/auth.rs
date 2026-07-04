@@ -11,11 +11,19 @@ use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, ErrorCode, Message};
 use crdtsync_server::auth::{AllowAll, Identity, Verifier};
 use crdtsync_server::{step, Hub, PermitAll, Response, SchemaRegistry, Session};
+use std::sync::Mutex;
 
 /// Drive a message through `step` under the dev-mode permit-all authorizer; these
 /// tests exercise the auth phase, not authorization.
 fn drive(hub: &mut Hub, s: &mut Session, v: &dyn Verifier, msg: Message) -> Response {
-    step(hub, s, v, &PermitAll, &SchemaRegistry::new(), msg)
+    step(
+        hub,
+        s,
+        v,
+        &PermitAll,
+        &Mutex::new(SchemaRegistry::new()),
+        msg,
+    )
 }
 
 fn cid(first: u8) -> ClientId {

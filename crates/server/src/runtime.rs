@@ -46,13 +46,18 @@ const WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// whether a connection with no credential is admitted anonymously. The defaults
 /// suit interactive use — a 5s grace absorbs brief reconnects, checked once a
 /// second — and refuse anonymous connections.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ServeConfig {
     pub grace: std::time::Duration,
     pub sweep_interval: std::time::Duration,
     /// Admit a credential-less connection by minting `actor = anon:<random>`,
     /// if the deployment permits it. Off by default.
     pub anonymous: bool,
+    /// The schema registry the handshake resolves each client's `{app_id,
+    /// version}` against. Share the same handle with the registration admin plane
+    /// so a registration becomes visible to the data plane; the default is an
+    /// empty registry, so every connection resolves to a relay.
+    pub schema: Arc<Mutex<crate::SchemaRegistry>>,
 }
 
 impl Default for ServeConfig {
@@ -61,6 +66,7 @@ impl Default for ServeConfig {
             grace: std::time::Duration::from_secs(5),
             sweep_interval: std::time::Duration::from_secs(1),
             anonymous: false,
+            schema: Arc::default(),
         }
     }
 }
@@ -245,6 +251,7 @@ async fn registry_actor(
     let mut reg = Registry::from_hub(hub);
     reg.set_verifier(verifier);
     reg.set_authorizer(authorizer);
+    reg.set_schema_registry(config.schema.clone());
     reg.set_grace_millis(config.grace.as_millis() as u64);
     let mut peers: HashMap<ConnId, Peer> = HashMap::new();
     // The sweep expires the presence of clients past their grace deadline; its

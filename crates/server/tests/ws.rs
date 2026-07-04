@@ -17,7 +17,8 @@ use crdtsync_server::acl::Acl;
 use crdtsync_server::runtime::{
     serve, serve_with, serve_with_authorizer, serve_with_verifier, ServeConfig,
 };
-use crdtsync_server::{AllowAll, Authorizer, Identity, StaticTokens, Verifier};
+use crdtsync_server::{AllowAll, Authorizer, Identity, SchemaRegistry, StaticTokens, Verifier};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const CH: Channel = Channel(0);
@@ -701,4 +702,136 @@ async fn the_authorization_header_wins_over_other_carriers() {
     );
     let (mut ws, _) = connect_async(request).await.unwrap();
     assert_fast_path_actor(&mut ws, b"from-header").await;
+}
+
+/// A schema shared into the serve config reaches the handshake gate: a client
+/// declaring a registered app's unknown version is refused and the socket closes,
+/// while a client declaring a known version proceeds to authenticate. This is the
+/// data-plane half of registration — the admin plane writes the same shared
+/// registry (see the admin transport tests).
+#[tokio::test]
+async fn a_registered_apps_unknown_version_is_refused_at_the_handshake() {
+    let mut schema = SchemaRegistry::new();
+    schema.register(b"app-x", 1, br#"{"v":1}"#, b"").unwrap();
+    let server = start_server_with(ServeConfig {
+        schema: Arc::new(Mutex::new(schema)),
+        ..ServeConfig::default()
+    })
+    .await;
+
+    // An unknown version: the server sends UnsupportedVersion and closes.
+    let mut ws = open(&server.url).await;
+    send_bytes(&mut ws, encode_header(PROTOCOL_VERSION).to_vec()).await;
+    send(
+        &mut ws,
+        &Message::Hello {
+            client: cid(1),
+            app_id: b"app-x".to_vec(),
+            schema_version: 9,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_or_close(&mut ws).await,
+        Some(Message::Error {
+            code: ErrorCode::UnsupportedVersion,
+            ..
+        })
+    ));
+    assert!(recv_or_close(&mut ws).await.is_none(), "the socket closes");
+
+    // A known version proceeds through the handshake to AuthOk.
+    let mut ws = open(&server.url).await;
+    send_bytes(&mut ws, encode_header(PROTOCOL_VERSION).to_vec()).await;
+    send(
+        &mut ws,
+        &Message::Hello {
+            client: cid(2),
+            app_id: b"app-x".to_vec(),
+            schema_version: 1,
+        },
+    )
+    .await;
+    send(
+        &mut ws,
+        &Message::Auth {
+            credential: b"cred".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv(&mut ws).await,
+        Message::AuthOk {
+            actor: b"cred".to_vec(),
+        }
+    );
+}
+
+/// The end-to-end cross-plane contract `main.rs` wires: one shared registry
+/// handed to both the data plane and the admin plane, so a schema registered over
+/// the admin socket is at once visible to a data-plane handshake. Registering
+/// `app-x` v1 over the admin plane turns `app-x` from unregistered (relay, any
+/// version accepted) into enforcing — so a client then declaring an unknown
+/// version is refused. Were the registry not shared, `app-x` would still be
+/// unregistered on the data plane and the unknown version would be relayed.
+#[tokio::test]
+async fn a_registration_over_the_admin_plane_reaches_the_data_plane_handshake() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let schema = Arc::new(Mutex::new(SchemaRegistry::new()));
+    let data = start_server_with(ServeConfig {
+        schema: schema.clone(),
+        ..ServeConfig::default()
+    })
+    .await;
+
+    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = admin_listener.local_addr().unwrap();
+    tokio::spawn(crdtsync_server::serve_admin(
+        admin_listener,
+        Box::new(AllowAll),
+        Box::new(crdtsync_server::PermitAll),
+        schema.clone(),
+    ));
+
+    // Before registration, app-x is unregistered — a handshake would relay any
+    // version. Register v1 over the admin socket.
+    let body = b"{\"v\":1}";
+    // `Connection: close` so the server closes the socket after the response and
+    // `read_to_end` reaches EOF rather than blocking on a kept-alive connection.
+    let request = format!(
+        "POST /apps/app-x/schemas/1 HTTP/1.1\r\nHost: admin\r\nAuthorization: admin\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut sock = tokio::net::TcpStream::connect(admin_addr).await.unwrap();
+    sock.write_all(request.as_bytes()).await.unwrap();
+    sock.write_all(body).await.unwrap();
+    let mut response = Vec::new();
+    sock.read_to_end(&mut response).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+        "admin registration accepted: {}",
+        String::from_utf8_lossy(&response)
+    );
+
+    // The data plane now sees app-x as registered: an unknown version is refused.
+    let mut ws = open(&data.url).await;
+    send_bytes(&mut ws, encode_header(PROTOCOL_VERSION).to_vec()).await;
+    send(
+        &mut ws,
+        &Message::Hello {
+            client: cid(1),
+            app_id: b"app-x".to_vec(),
+            schema_version: 9,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_or_close(&mut ws).await,
+        Some(Message::Error {
+            code: ErrorCode::UnsupportedVersion,
+            ..
+        })
+    ));
+    assert!(recv_or_close(&mut ws).await.is_none(), "the socket closes");
 }

@@ -210,16 +210,17 @@ impl Registry {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
-            let schema = self.schema.lock().expect("schema registry lock poisoned");
+            // Pass the shared registry unlocked: `step` locks it only for the
+            // Hello resolve, so a slow verifier in the Auth branch never holds it
+            // and cannot stall the admin plane's writes.
             let resp = step(
                 &mut self.hub,
                 &mut conn.session,
                 &*self.verifier,
                 &*self.authorizer,
-                &schema,
+                &self.schema,
                 msg,
             );
-            drop(schema);
             conn.outbox.extend(resp.replies);
             // Only an authenticated session may touch a client's grace timer, so
             // a bare Hello-only socket can neither cancel a pending sweep nor

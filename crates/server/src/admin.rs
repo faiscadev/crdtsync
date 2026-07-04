@@ -7,7 +7,8 @@
 //! the request's [`Resource::App`] — the app-admin meta-auth, distinct from any
 //! room action. Only a permitted identity reaches the [`SchemaRegistry`].
 //!
-//! [`register_schema`] is a pure decision over an already-decoded request. The
+//! [`register_schema`] decides over an already-decoded request, running the trust
+//! seams lock-free and locking the shared registry only for the write. The
 //! HTTP transport is axum over the tokio runtime the server already runs — the
 //! admin plane is an untrusted network boundary, so its HTTP/1.1 parsing is
 //! hyper's (battle-tested against request smuggling and framing edge cases)
@@ -68,7 +69,7 @@ pub fn register_schema(
     req: &RegisterRequest,
     verifier: &dyn Verifier,
     authorizer: &dyn Authorizer,
-    registry: &mut SchemaRegistry,
+    registry: &Mutex<SchemaRegistry>,
 ) -> RegisterOutcome {
     let Some(credential) = req.credential else {
         return RegisterOutcome::Unauthenticated;
@@ -80,6 +81,15 @@ pub fn register_schema(
     if !authorizer.authorize(identity.actor(), Action::RegisterSchema, &resource) {
         return RegisterOutcome::Forbidden;
     }
+    // Authentication and authorization ran lock-free above; the registry — shared
+    // with the data plane, whose handshake reads it — is locked only for the
+    // write, so a slow verifier cannot stall data-plane message processing. Recover
+    // a poisoned lock rather than propagate the panic across the plane boundary:
+    // the registry validates a version before it mutates, so a panic in either
+    // plane leaves its map intact.
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match registry.register(req.app_id, req.version, req.schema, req.migration) {
         Ok(registered) => RegisterOutcome::Accepted(registered),
         Err(error) => RegisterOutcome::Rejected(error),
@@ -94,28 +104,30 @@ const MAX_BODY: usize = 1 << 20;
 /// client cannot wedge the plane.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The registry behind a lock, plus the trust seams every request consults.
-/// Registration is rare, so a plain mutex around the whole registry is enough —
-/// no per-app locking. The handler holds it only across the pure `register`, with
-/// no `await` inside the guard.
+/// The registry plus the trust seams every request consults. The registry is the
+/// same `Arc<Mutex<SchemaRegistry>>` the data plane resolves handshakes against,
+/// so a registration is at once visible there. Registration is rare, so a plain
+/// mutex around the whole registry is enough — no per-app locking; the write is
+/// taken only for the pure `register`, after the trust seams run lock-free.
 struct AdminState {
     verifier: Box<dyn Verifier + Send + Sync>,
     authorizer: Box<dyn Authorizer + Send + Sync>,
-    registry: Mutex<SchemaRegistry>,
+    registry: Arc<Mutex<SchemaRegistry>>,
 }
 
 /// The admin control-plane router: the single registration route, a body cap
-/// (over-large → `413`), and a per-request timeout (stalled → `408`). Exposed so
-/// it can be driven in-process by tests without a socket.
+/// (over-large → `413`), and a per-request timeout (stalled → `408`). `registry`
+/// is shared with the data plane. Exposed so it can be driven in-process by tests
+/// without a socket.
 pub fn admin_router(
     verifier: Box<dyn Verifier + Send + Sync>,
     authorizer: Box<dyn Authorizer + Send + Sync>,
-    registry: SchemaRegistry,
+    registry: Arc<Mutex<SchemaRegistry>>,
 ) -> Router {
     let state = Arc::new(AdminState {
         verifier,
         authorizer,
-        registry: Mutex::new(registry),
+        registry,
     });
     Router::new()
         .route("/apps/{app_id}/schemas/{version}", post(register))
@@ -136,7 +148,7 @@ pub async fn serve_admin(
     listener: TcpListener,
     verifier: Box<dyn Verifier + Send + Sync>,
     authorizer: Box<dyn Authorizer + Send + Sync>,
-    registry: SchemaRegistry,
+    registry: Arc<Mutex<SchemaRegistry>>,
 ) -> std::io::Result<()> {
     let router = admin_router(verifier, authorizer, registry);
     axum::serve(listener, router).await
@@ -159,15 +171,14 @@ async fn register(
         migration: b"",
         credential: headers.get("authorization").map(|v| v.as_bytes()),
     };
-    let outcome = {
-        let mut registry = state.registry.lock().expect("admin registry lock poisoned");
-        register_schema(
-            &req,
-            state.verifier.as_ref(),
-            state.authorizer.as_ref(),
-            &mut registry,
-        )
-    };
+    // `register_schema` runs the trust seams lock-free and locks the shared
+    // registry only for the write — no lock is held across an axum await here.
+    let outcome = register_schema(
+        &req,
+        state.verifier.as_ref(),
+        state.authorizer.as_ref(),
+        &state.registry,
+    );
     match outcome {
         RegisterOutcome::Accepted(_) => (StatusCode::OK, "registered"),
         RegisterOutcome::Unauthenticated => {
