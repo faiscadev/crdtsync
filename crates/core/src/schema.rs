@@ -85,7 +85,8 @@ pub enum SchemaErrorKind {
     RootNotMap,
     /// A numeric bound was ill-formed: `min` above `max`, or a negative count.
     BadRange,
-    /// A top-level key the schema language does not define (likely a typo) —
+    /// A key the schema language does not define at its position (a top-level
+    /// key, a type-def field, or an awareness-entry field) — likely a typo,
     /// rejected rather than silently ignored, so a schema is code that fails
     /// loud.
     UnknownField,
@@ -121,7 +122,7 @@ impl std::fmt::Display for SchemaError {
             SchemaErrorKind::UnknownTypeRef => "reference to an undeclared type",
             SchemaErrorKind::RootNotMap => "root type is not a map",
             SchemaErrorKind::BadRange => "ill-formed numeric bound",
-            SchemaErrorKind::UnknownField => "unknown top-level key",
+            SchemaErrorKind::UnknownField => "unknown key",
         };
         write!(f, "{what}: {}", self.at)
     }
@@ -294,27 +295,55 @@ fn at(ctx: &str, key: &str) -> String {
     }
 }
 
+/// Reject any key of `obj` outside `allowed`, so a typo'd field fails loud
+/// rather than being silently dropped.
+fn reject_unknown_fields(
+    obj: &[(String, Json)],
+    allowed: &[&str],
+    ctx: &str,
+) -> Result<(), SchemaError> {
+    for (key, _) in obj {
+        if !allowed.contains(&key.as_str()) {
+            return Err(SchemaError::new(
+                SchemaErrorKind::UnknownField,
+                at(ctx, key),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, SchemaError> {
-    json.as_object()
+    let obj = json
+        .as_object()
         .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, type_name.to_string()))?;
     let kind = required_str(json, "kind", type_name)?;
     match kind {
-        "map" => Ok(TypeDef::Map {
-            children: parse_children(json, type_name)?,
-        }),
+        "map" => {
+            reject_unknown_fields(obj, &["kind", "children"], type_name)?;
+            Ok(TypeDef::Map {
+                children: parse_children(json, type_name)?,
+            })
+        }
         "list" => {
+            reject_unknown_fields(obj, &["kind", "items", "min", "max"], type_name)?;
             let items = required_str(json, "items", type_name)?.to_string();
             let (min, max) = counts(json, type_name)?;
             Ok(TypeDef::List { items, min, max })
         }
-        "text" => Ok(TypeDef::Text {
-            max: count_field(json, "max", type_name)?,
-        }),
+        "text" => {
+            reject_unknown_fields(obj, &["kind", "max"], type_name)?;
+            Ok(TypeDef::Text {
+                max: count_field(json, "max", type_name)?,
+            })
+        }
         "register" => {
+            reject_unknown_fields(obj, &["kind", "min", "max"], type_name)?;
             let (min, max) = bounds(json, type_name)?;
             Ok(TypeDef::Register { min, max })
         }
         "counter" => {
+            reject_unknown_fields(obj, &["kind", "min", "max"], type_name)?;
             let (min, max) = bounds(json, type_name)?;
             Ok(TypeDef::Counter { min, max })
         }
@@ -332,9 +361,10 @@ fn parse_awareness(json: &Json) -> Result<Vec<(String, AwarenessEntry)>, SchemaE
     let mut out = Vec::with_capacity(obj.len());
     for (kind, entry) in obj {
         let ctx = at("awareness", kind);
-        entry
+        let entry_obj = entry
             .as_object()
             .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, ctx.clone()))?;
+        reject_unknown_fields(entry_obj, &["ttl", "throttle"], &ctx)?;
         let ttl = count_field(entry, "ttl", &ctx)?;
         let throttle = count_field(entry, "throttle", &ctx)?;
         out.push((kind.clone(), AwarenessEntry { ttl, throttle }));
