@@ -13,7 +13,7 @@
 use crdtsync_core::protocol::{Channel, PROTOCOL_VERSION};
 use crdtsync_core::{ClientId, Document, ErrorCode, Message, Scalar};
 use crdtsync_server::auth::AllowAll;
-use crdtsync_server::{negotiate, step, Hub, Session};
+use crdtsync_server::{negotiate, step, Hub, SchemaRegistry, Session};
 
 const V: AllowAll = AllowAll;
 
@@ -36,7 +36,14 @@ const CH: Channel = Channel(0);
 
 /// Drive one message with the dev-mode verifier and permit-all authorizer.
 fn st(hub: &mut Hub, s: &mut Session, msg: Message) -> crdtsync_server::Response {
-    step(hub, s, &V, &crdtsync_server::PermitAll, msg)
+    step(
+        hub,
+        s,
+        &V,
+        &crdtsync_server::PermitAll,
+        &SchemaRegistry::new(),
+        msg,
+    )
 }
 
 fn sub(room: &[u8], last_seen_seq: u64) -> Message {

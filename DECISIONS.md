@@ -8,6 +8,14 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
+## 2026-07-04 · Unit 5c-ii-b-1/#160 · the schema registry is injected into the connection Registry, not threaded through its constructor
+**Changed:** no ARCHITECTURE change — an implementation decision for wiring resolution into the handshake.
+- **`Registry` holds an `Arc<Mutex<SchemaRegistry>>` that defaults to empty and is overridden by a `set_schema_registry` setter**, in the mould of `set_verifier`/`set_authorizer` — rather than adding the registry to `Registry::new`. `Registry::new(server)` has ~29 call sites (mostly tests); an empty default means every existing connection resolves to `Relay` (no app registered) so behaviour and those call sites are untouched, and only the data plane that actually shares a registry opts in.
+- **`step` takes `&SchemaRegistry` and resolves at `Hello`.** The resolution is part of processing the Hello message (where the client is validated and recorded), so it belongs in `step`, not split into the transport. `deliver` locks the shared registry and passes it in. A `Reject` returns an `UnsupportedVersion` error with `close`, so the connection is refused before it can subscribe; `Relay`/`Enforcing` proceed, and the `Session` records `app_id` + the resolved `schema_version` (`None` = relay) for later enforcement units to read.
+- **Sliced b-1 (logic) from b-2 (cross-plane sharing).** b-1 is unit-testable end to end through `Registry::deliver` with an injected registry — no sockets, no serve chain. b-2 threads one shared `Arc<Mutex<SchemaRegistry>>` through the serve chain and the admin plane so a real registration becomes visible to the handshake.
+
+**Why:** the setter-with-empty-default keeps a security-relevant change from rippling into dozens of unrelated test call sites, and makes the relay default explicit (no registry ⇒ relay). Putting resolution in `step` keeps the Hello logic in one place. Isolating b-1 lets the gate be proven against an in-memory registry before the cross-plane plumbing (b-2) shares the real one. Unblocks 5c-ii-b-2.
+
 ## 2026-07-04 · Unit 5c-ii-a/#159 · the handshake tier decision is a pure method on the registry
 **Changed:** no ARCHITECTURE change — an implementation + slicing decision.
 - **The accept/reject/tier policy lives on `SchemaRegistry` as a pure `resolve_handshake`**, separate from the data-plane wiring that will call it (5c-ii-b). The decision is a pure function of registry state, so it is isolated as a spec'd, Miri-clean method — a bug here would mis-tier a connection or let an unknown version through, so it is worth verifying before any plumbing.
