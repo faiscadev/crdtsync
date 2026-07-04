@@ -36,25 +36,79 @@ pub struct Repair {
     pub kind: RepairKind,
 }
 
+/// A location's repaired *reading*, independent of where it currently sits — what
+/// the `onRepaired` observer diffs across settles to decide a location's repair
+/// status changed. A truncation is identified by its surviving node *stamps*, not
+/// their sequence indices: an unrelated edit that shifts those indices while the
+/// same items survive is not a reading change (the consumer already observes the
+/// sequence edit through normal reads), whereas a different surviving item, or a
+/// re-clamp to the other bound, is.
+///
+/// The `path` completes the identity, and it is stable: a repairable element is a
+/// composite (register/counter for a clamp, list/text for a truncation), and a
+/// composite is only ever a map-slot value — a sequence node holds a scalar, so
+/// no composite is a list item — so a repair's path is all `Step::Key` and never
+/// carries a shifting `Step::Index`.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum RepairId {
+    Clamp {
+        path: Vec<Step>,
+        value: i64,
+    },
+    Keep {
+        path: Vec<Step>,
+        survivors: Vec<Stamp>,
+    },
+}
+
 /// How every non-conformant element in `doc` reads repaired against `schema`, in
 /// the same deterministic tree order as [`validate`]. An empty result is a
 /// document that reads conformant as-is.
 pub fn repairs(doc: &Document, schema: &Schema) -> Vec<Repair> {
+    keyed_repairs(doc, schema)
+        .into_iter()
+        .map(|(repair, _)| repair)
+        .collect()
+}
+
+/// Each repair paired with its reading-stable [`RepairId`]. A read consumes the
+/// [`Repair`] (index projection); the observer diffs on the id. One walk builds
+/// both.
+pub(crate) fn keyed_repairs(doc: &Document, schema: &Schema) -> Vec<(Repair, RepairId)> {
     validate(doc, schema)
         .into_iter()
         .filter_map(|v| {
-            let kind = match v.kind {
-                ViolationKind::BelowMin { min, .. } => RepairKind::Clamped { value: min },
-                ViolationKind::AboveMax { max, .. } => RepairKind::Clamped { value: max },
+            let path = v.path;
+            let (kind, id) = match v.kind {
+                ViolationKind::BelowMin { min, .. } => (
+                    RepairKind::Clamped { value: min },
+                    RepairId::Clamp {
+                        path: path.clone(),
+                        value: min,
+                    },
+                ),
+                ViolationKind::AboveMax { max, .. } => (
+                    RepairKind::Clamped { value: max },
+                    RepairId::Clamp {
+                        path: path.clone(),
+                        value: max,
+                    },
+                ),
                 ViolationKind::TooLong { max, .. } => {
-                    let ids = sequence_node_ids(element_at(doc, &v.path)?)?;
-                    RepairKind::Truncated {
-                        keep: survivors(&ids, max),
-                    }
+                    let ids = sequence_node_ids(element_at(doc, &path)?)?;
+                    let keep = survivors(&ids, max);
+                    let survivors = keep.iter().map(|&i| ids[i]).collect();
+                    (
+                        RepairKind::Truncated { keep },
+                        RepairId::Keep {
+                            path: path.clone(),
+                            survivors,
+                        },
+                    )
                 }
                 ViolationKind::KindMismatch { .. } | ViolationKind::UnknownSlot => return None,
             };
-            Some(Repair { path: v.path, kind })
+            Some((Repair { path, kind }, id))
         })
         .collect()
 }

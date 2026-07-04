@@ -22,9 +22,12 @@ use crate::elementid::{ElementId, ElementKind};
 use crate::list::List;
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
+use crate::repair::{keyed_repairs, Repair, RepairId};
 use crate::scalar::Scalar;
+use crate::schema::Schema;
 use crate::stamp::Stamp;
 use crate::text::Text;
+use crate::validate::Step;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -76,6 +79,13 @@ pub struct Document {
     orphans: Vec<OrphanEvent>,
     /// Ops emitted by the transact currently in progress.
     pending: Vec<Op>,
+    /// An opt-in schema the document is checked against. `None` disables all
+    /// repair observation — the document reports no `onRepaired` repairs.
+    schema: Option<Schema>,
+    /// The repair readings surfaced as of the last `take_repairs`, so a standing
+    /// repair is told apart from a newly-needed or newly-changed one. Kept
+    /// meaningful only while a schema is bound.
+    repair_baseline: Vec<RepairId>,
 }
 
 impl Drop for Document {
@@ -114,6 +124,8 @@ impl Document {
             buffered: HashSet::new(),
             orphans: Vec::new(),
             pending: Vec::new(),
+            schema: None,
+            repair_baseline: Vec::new(),
         }
     }
 
@@ -145,6 +157,47 @@ impl Document {
     /// Drain the orphan events accumulated since the last call.
     pub fn take_orphans(&mut self) -> Vec<OrphanEvent> {
         std::mem::take(&mut self.orphans)
+    }
+
+    /// Bind a schema for `onRepaired` observation. The current state is taken as
+    /// the baseline — an existing violation is not reported — so a later
+    /// [`take_repairs`](Self::take_repairs) surfaces only a repair the state has
+    /// come to need since. Rebinding reseeds the baseline against the new schema.
+    /// Bind at a settle point, not inside an open atomic transaction, so the
+    /// baseline is a committed state rather than a transient sub-state.
+    pub fn set_schema(&mut self, schema: Schema) {
+        self.repair_baseline = repair_ids(keyed_repairs(self, &schema));
+        self.schema = Some(schema);
+    }
+
+    /// The located paths whose repair reading has newly changed against the bound
+    /// schema since the last call — the `onRepaired` observation. A path surfaces
+    /// when the location comes to need a repair, or a standing one's reading
+    /// changes (a re-clamp to the other bound, a different surviving item after a
+    /// truncation); the repaired value itself is produced by a read
+    /// ([`repairs`](crate::repair::repairs)), so a consumer always reads the fresh
+    /// reading and never caches a stale one.
+    ///
+    /// Observation is of settled state only, computed on demand: a violation that
+    /// appears and resolves between two calls is never reported, and while a local
+    /// atomic transaction is open the result is empty — its transient sub-states
+    /// are not observed, only the state committed at `commit_atomic`. Empty with
+    /// no schema bound.
+    pub fn take_repairs(&mut self) -> Vec<Vec<Step>> {
+        let Some(schema) = &self.schema else {
+            return Vec::new();
+        };
+        if self.atomic.is_some() {
+            return Vec::new();
+        }
+        let current = keyed_repairs(self, schema);
+        let fresh = current
+            .iter()
+            .filter(|(_, id)| !self.repair_baseline.contains(id))
+            .map(|(repair, _)| repair.path.clone())
+            .collect();
+        self.repair_baseline = repair_ids(current);
+        fresh
     }
 
     /// Serialize the whole replica to a self-contained, canonical snapshot:
@@ -368,6 +421,8 @@ impl Document {
             buffered,
             orphans: Vec::new(),
             pending: Vec::new(),
+            schema: None,
+            repair_baseline: Vec::new(),
         };
         // The buffer holds only ops still waiting on their target; a well-formed
         // snapshot already satisfies that, so this is a no-op there. Draining
@@ -960,6 +1015,11 @@ fn span(kind: &OpKind) -> u64 {
         OpKind::TextInsert { s, .. } => s.chars().count().max(1) as u64,
         _ => 1,
     }
+}
+
+/// The reading-stable ids of a keyed-repair set — the `onRepaired` baseline.
+fn repair_ids(keyed: Vec<(Repair, RepairId)>) -> Vec<RepairId> {
+    keyed.into_iter().map(|(_, id)| id).collect()
 }
 
 /// A composite that was live before a mutation and is displaced after it is an
