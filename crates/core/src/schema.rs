@@ -29,6 +29,89 @@ pub struct Schema {
     root: String,
     types: Vec<(String, TypeDef)>,
     awareness: Vec<(String, AwarenessEntry)>,
+    auth: Auth,
+}
+
+/// The schema-level `@auth`: the static, role-based access defaults that ship
+/// with the app code. It holds *only* a role vocabulary and role/subject-keyed
+/// grants; per-instance ownership and per-actor grants are dynamic doc-level ACL
+/// state, never declared here.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Auth {
+    roles: Vec<String>,
+    grants: Vec<Grant>,
+}
+
+impl Auth {
+    /// The static role vocabulary, in declaration order.
+    pub fn roles(&self) -> &[String] {
+        &self.roles
+    }
+
+    /// The static grants, in declaration order.
+    pub fn grants(&self) -> &[Grant] {
+        &self.grants
+    }
+}
+
+/// One static grant: an `effect` on an `action`, for a `subject`, over a `path`
+/// (which inherits downward at check time). The concrete JSON is
+/// `{ "allow"|"deny": "<action>", "to": "<subject>", "on": "<path>" }` — the
+/// effect and the action are fused into the `allow`/`deny` key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grant {
+    pub effect: Effect,
+    pub action: Action,
+    pub subject: Subject,
+    pub path: String,
+}
+
+/// Whether a grant opens or closes access. An explicit deny wins at check time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effect {
+    Allow,
+    Deny,
+}
+
+/// A schema-grantable capability. Ownership (`own`) and the meta-auth actions
+/// are deliberately absent: they are dynamic doc-level ACL state, never a static
+/// schema default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Read,
+    Write,
+    PublishAwareness,
+}
+
+/// Who a grant applies to: a declared role, a subject class, or an ownership
+/// template resolved against the acting identity at check time. A bare actor id
+/// is not a schema subject — per-actor grants are dynamic doc-level ACL state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Subject {
+    /// A role declared in `auth.roles`.
+    Role(String),
+    /// A subject class (`authenticated` / `anonymous` / `anyone`).
+    Class(SubjectClass),
+    /// An ownership template (`${actor_id}` etc.) bound at check time.
+    Template(TemplateVar),
+}
+
+/// A well-known subject class every deployment understands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubjectClass {
+    Authenticated,
+    Anonymous,
+    Anyone,
+}
+
+/// A `${…}` template variable a grant subject or path resolves against the
+/// acting identity / resource at check time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateVar {
+    ActorId,
+    AuthorId,
+    RoomId,
+    BranchId,
 }
 
 /// The declared timing of one kind of ephemeral awareness entry (a cursor, a
@@ -90,6 +173,19 @@ pub enum SchemaErrorKind {
     /// rejected rather than silently ignored, so a schema is code that fails
     /// loud.
     UnknownField,
+    /// A grant did not carry exactly one of `allow` / `deny`.
+    BadGrant,
+    /// A grant named an action that is not a schema-grantable capability
+    /// (`own` and the meta-auth actions are dynamic doc-level ACL state).
+    UnknownAction,
+    /// A grant subject was a malformed or unknown `${…}` template.
+    BadSubject,
+    /// A grant `to` named a role that is not declared in `auth.roles`.
+    UnknownRoleRef,
+    /// A grant `on` was not a well-formed absolute path.
+    BadPath,
+    /// `auth.roles` declared the same role twice.
+    DuplicateRole,
 }
 
 /// A schema failure: a [`SchemaErrorKind`] plus the field or type name it
@@ -123,6 +219,12 @@ impl std::fmt::Display for SchemaError {
             SchemaErrorKind::RootNotMap => "root type is not a map",
             SchemaErrorKind::BadRange => "ill-formed numeric bound",
             SchemaErrorKind::UnknownField => "unknown key",
+            SchemaErrorKind::BadGrant => "grant needs exactly one of allow/deny",
+            SchemaErrorKind::UnknownAction => "unknown or non-schema-grantable action",
+            SchemaErrorKind::BadSubject => "malformed grant subject template",
+            SchemaErrorKind::UnknownRoleRef => "grant references an undeclared role",
+            SchemaErrorKind::BadPath => "grant path is not a well-formed absolute path",
+            SchemaErrorKind::DuplicateRole => "duplicate role",
         };
         write!(f, "{what}: {}", self.at)
     }
@@ -172,6 +274,11 @@ impl Schema {
             .map(|(_, e)| e)
     }
 
+    /// The static role-based access defaults (`@auth`).
+    pub fn auth(&self) -> &Auth {
+        &self.auth
+    }
+
     /// Parse a schema from its JSON source. Total — any input yields a `Schema`
     /// or a [`SchemaError`], never a panic.
     pub fn parse(src: &str) -> Result<Schema, SchemaError> {
@@ -182,9 +289,9 @@ impl Schema {
     }
 
     /// The top-level keys the schema language defines. Any other key is a typo
-    /// and is rejected. `marks`/`auth` are declared by the language but not yet
-    /// modelled here; they are accepted structurally so a spec-valid schema
-    /// parses, and modelled by their own units.
+    /// and is rejected. `marks` is declared by the language but not yet modelled
+    /// here; it is accepted structurally so a spec-valid schema parses, and
+    /// modelled by its own unit.
     const TOP_LEVEL_KEYS: [&'static str; 7] = [
         "schema",
         "version",
@@ -228,12 +335,18 @@ impl Schema {
             Some(a) => parse_awareness(a)?,
         };
 
+        let auth = match json.get("auth") {
+            None => Auth::default(),
+            Some(a) => parse_auth(a)?,
+        };
+
         let schema = Schema {
             name,
             version,
             root,
             types,
             awareness,
+            auth,
         };
         schema.validate_references()?;
         Ok(schema)
@@ -370,6 +483,143 @@ fn parse_awareness(json: &Json) -> Result<Vec<(String, AwarenessEntry)>, SchemaE
         out.push((kind.clone(), AwarenessEntry { ttl, throttle }));
     }
     Ok(out)
+}
+
+/// Parse the `@auth` block: a role vocabulary and static grants. `roles` is
+/// validated for duplicates; each grant's `to` role reference is closure-checked
+/// against that vocabulary, so an accepted `@auth` names no role it did not
+/// declare.
+fn parse_auth(json: &Json) -> Result<Auth, SchemaError> {
+    let obj = json
+        .as_object()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, "auth"))?;
+    reject_unknown_fields(obj, &["roles", "grants"], "auth")?;
+
+    let roles = parse_roles(json)?;
+    let declared: HashSet<&str> = roles.iter().map(String::as_str).collect();
+
+    let grants = match json.get("grants") {
+        None => Vec::new(),
+        Some(g) => {
+            let arr = g
+                .as_array()
+                .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, "auth.grants"))?;
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, grant) in arr.iter().enumerate() {
+                out.push(parse_grant(grant, i, &declared)?);
+            }
+            out
+        }
+    };
+
+    Ok(Auth { roles, grants })
+}
+
+fn parse_roles(json: &Json) -> Result<Vec<String>, SchemaError> {
+    let Some(roles) = json.get("roles") else {
+        return Ok(Vec::new());
+    };
+    let arr = roles
+        .as_array()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, "auth.roles"))?;
+    let mut out: Vec<String> = Vec::with_capacity(arr.len());
+    for role in arr {
+        let name = role
+            .as_str()
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, "auth.roles"))?;
+        if out.iter().any(|r| r == name) {
+            return Err(SchemaError::new(
+                SchemaErrorKind::DuplicateRole,
+                at("auth.roles", name),
+            ));
+        }
+        out.push(name.to_string());
+    }
+    Ok(out)
+}
+
+fn parse_grant(json: &Json, index: usize, roles: &HashSet<&str>) -> Result<Grant, SchemaError> {
+    let ctx = format!("auth.grants[{index}]");
+    let obj = json
+        .as_object()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, ctx.clone()))?;
+    reject_unknown_fields(obj, &["allow", "deny", "to", "on"], &ctx)?;
+
+    // The effect and the action are fused: exactly one of `allow` / `deny`
+    // carries the action as its value.
+    let (effect, action_val) = match (json.get("allow"), json.get("deny")) {
+        (Some(a), None) => (Effect::Allow, a),
+        (None, Some(d)) => (Effect::Deny, d),
+        _ => return Err(SchemaError::new(SchemaErrorKind::BadGrant, ctx)),
+    };
+    let action_name = action_val
+        .as_str()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, "action")))?;
+    let action = parse_action(action_name, &ctx)?;
+
+    let subject = parse_subject(required_str(json, "to", &ctx)?, roles, &ctx)?;
+    let path = required_str(json, "on", &ctx)?.to_string();
+    validate_path(&path, &ctx)?;
+
+    Ok(Grant {
+        effect,
+        action,
+        subject,
+        path,
+    })
+}
+
+fn parse_action(name: &str, ctx: &str) -> Result<Action, SchemaError> {
+    match name {
+        "read" => Ok(Action::Read),
+        "write" => Ok(Action::Write),
+        "publish_awareness" => Ok(Action::PublishAwareness),
+        _ => Err(SchemaError::new(
+            SchemaErrorKind::UnknownAction,
+            at(ctx, name),
+        )),
+    }
+}
+
+fn parse_subject(raw: &str, roles: &HashSet<&str>, ctx: &str) -> Result<Subject, SchemaError> {
+    if let Some(rest) = raw.strip_prefix("${") {
+        let var = rest
+            .strip_suffix('}')
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::BadSubject, at(ctx, raw)))?;
+        return match var {
+            "actor_id" => Ok(Subject::Template(TemplateVar::ActorId)),
+            "author_id" => Ok(Subject::Template(TemplateVar::AuthorId)),
+            "room_id" => Ok(Subject::Template(TemplateVar::RoomId)),
+            "branch_id" => Ok(Subject::Template(TemplateVar::BranchId)),
+            _ => Err(SchemaError::new(SchemaErrorKind::BadSubject, at(ctx, raw))),
+        };
+    }
+    match raw {
+        "authenticated" => Ok(Subject::Class(SubjectClass::Authenticated)),
+        "anonymous" => Ok(Subject::Class(SubjectClass::Anonymous)),
+        "anyone" => Ok(Subject::Class(SubjectClass::Anyone)),
+        name if roles.contains(name) => Ok(Subject::Role(name.to_string())),
+        name => Err(SchemaError::new(
+            SchemaErrorKind::UnknownRoleRef,
+            at(ctx, name),
+        )),
+    }
+}
+
+/// A grant path is absolute (`/` or `/seg/seg…`) with no empty segment. Path
+/// inheritance is by segment at check time, so a malformed path is rejected here
+/// rather than mis-matching later.
+fn validate_path(path: &str, ctx: &str) -> Result<(), SchemaError> {
+    if path == "/" {
+        return Ok(());
+    }
+    let Some(rest) = path.strip_prefix('/') else {
+        return Err(SchemaError::new(SchemaErrorKind::BadPath, at(ctx, "on")));
+    };
+    if rest.split('/').any(str::is_empty) {
+        return Err(SchemaError::new(SchemaErrorKind::BadPath, at(ctx, "on")));
+    }
+    Ok(())
 }
 
 fn parse_children(json: &Json, ctx: &str) -> Result<Vec<(String, String)>, SchemaError> {

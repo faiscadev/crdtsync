@@ -9,7 +9,10 @@
 //! so no accepted schema can describe a state the engine cannot later repair.
 
 use crdtsync_core::json::JsonErrorKind;
-use crdtsync_core::schema::{AwarenessEntry, Schema, SchemaErrorKind, TypeDef};
+use crdtsync_core::schema::{
+    Action, AwarenessEntry, Effect, Schema, SchemaErrorKind, Subject, SubjectClass, TemplateVar,
+    TypeDef,
+};
 
 fn parse(s: &str) -> Schema {
     Schema::parse(s).unwrap_or_else(|e| panic!("parse of schema failed: {e:?}\n{s}"))
@@ -309,14 +312,15 @@ fn an_unknown_field_inside_an_awareness_entry_is_rejected() {
 
 #[test]
 fn the_language_defined_top_level_keys_are_accepted() {
-    // `marks` and `auth` are declared by the language (not yet modelled here),
-    // so a schema using them still parses.
+    // `marks` is declared by the language (not yet modelled here), so a schema
+    // using it still parses; `awareness` and `auth` are modelled and must be
+    // well-formed.
     let s = parse(
         r#"{ "schema": "s", "version": 1, "root": "R",
             "types": { "R": { "kind": "map" } },
             "marks": { "bold": {} },
             "awareness": { "cursor": {} },
-            "auth": { "roles": {} } }"#,
+            "auth": { "roles": ["editor"] } }"#,
     );
     assert_eq!(s.name(), "s");
     assert_eq!(s.awareness_entry("cursor").map(|_| ()), Some(()));
@@ -606,4 +610,305 @@ fn hostile_inputs_never_panic() {
         // The contract is only that it returns — Ok or Err, never a panic.
         let _ = Schema::parse(s);
     }
+}
+
+// --- @auth: static role-based defaults (roles vocabulary + grants) ---
+
+// A schema carrying a full `@auth` block: a role vocabulary and grants covering
+// every subject flavour (declared role, ownership template, subject class), both
+// effects, and every schema-grantable action.
+const AUTHED: &str = r#"
+{
+    "schema": "notes",
+    "version": 1,
+    "root": "Doc",
+    "types": { "Doc": { "kind": "map" } },
+    "auth": {
+        "roles": ["viewer", "editor"],
+        "grants": [
+            { "allow": "read",  "to": "viewer", "on": "/" },
+            { "allow": "write", "to": "editor", "on": "/body" },
+            { "deny":  "write", "to": "viewer", "on": "/body" },
+            { "allow": "write", "to": "${author_id}", "on": "/comments" },
+            { "allow": "read",  "to": "authenticated", "on": "/" },
+            { "allow": "publish_awareness", "to": "anyone", "on": "/cursors" }
+        ]
+    }
+}
+"#;
+
+#[test]
+fn auth_roles_parse_in_declaration_order() {
+    let s = parse(AUTHED);
+    assert_eq!(s.auth().roles(), ["viewer", "editor"]);
+}
+
+#[test]
+fn auth_grants_parse_effect_action_subject_path() {
+    let s = parse(AUTHED);
+    let g = s.auth().grants();
+    assert_eq!(g.len(), 6);
+
+    assert_eq!(g[0].effect, Effect::Allow);
+    assert_eq!(g[0].action, Action::Read);
+    assert_eq!(g[0].subject, Subject::Role("viewer".to_string()));
+    assert_eq!(g[0].path, "/");
+
+    assert_eq!(g[1].effect, Effect::Allow);
+    assert_eq!(g[1].action, Action::Write);
+    assert_eq!(g[1].subject, Subject::Role("editor".to_string()));
+    assert_eq!(g[1].path, "/body");
+
+    // deny keeps its effect distinct from an allow of the same action/path.
+    assert_eq!(g[2].effect, Effect::Deny);
+    assert_eq!(g[2].action, Action::Write);
+    assert_eq!(g[2].subject, Subject::Role("viewer".to_string()));
+}
+
+#[test]
+fn auth_subject_flavours() {
+    let s = parse(AUTHED);
+    let g = s.auth().grants();
+    assert_eq!(g[3].subject, Subject::Template(TemplateVar::AuthorId));
+    assert_eq!(g[4].subject, Subject::Class(SubjectClass::Authenticated));
+    assert_eq!(g[5].subject, Subject::Class(SubjectClass::Anyone));
+    assert_eq!(g[5].action, Action::PublishAwareness);
+}
+
+#[test]
+fn every_template_var_parses() {
+    for (tok, want) in [
+        ("${actor_id}", TemplateVar::ActorId),
+        ("${author_id}", TemplateVar::AuthorId),
+        ("${room_id}", TemplateVar::RoomId),
+        ("${branch_id}", TemplateVar::BranchId),
+    ] {
+        let src = format!(
+            r#"{{ "schema": "s", "version": 1, "root": "R",
+                 "types": {{ "R": {{ "kind": "map" }} }},
+                 "auth": {{ "grants": [ {{ "allow": "read", "to": "{tok}", "on": "/" }} ] }} }}"#
+        );
+        let s = parse(&src);
+        assert_eq!(s.auth().grants()[0].subject, Subject::Template(want));
+    }
+}
+
+#[test]
+fn every_subject_class_parses() {
+    for (tok, want) in [
+        ("authenticated", SubjectClass::Authenticated),
+        ("anonymous", SubjectClass::Anonymous),
+        ("anyone", SubjectClass::Anyone),
+    ] {
+        let src = format!(
+            r#"{{ "schema": "s", "version": 1, "root": "R",
+                 "types": {{ "R": {{ "kind": "map" }} }},
+                 "auth": {{ "grants": [ {{ "allow": "read", "to": "{tok}", "on": "/" }} ] }} }}"#
+        );
+        let s = parse(&src);
+        assert_eq!(s.auth().grants()[0].subject, Subject::Class(want));
+    }
+}
+
+#[test]
+fn absent_auth_is_empty() {
+    let s = parse(FULL);
+    assert!(s.auth().roles().is_empty());
+    assert!(s.auth().grants().is_empty());
+}
+
+#[test]
+fn auth_may_declare_roles_without_grants() {
+    let s = parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "auth": { "roles": ["viewer"] } }"#,
+    );
+    assert_eq!(s.auth().roles(), ["viewer"]);
+    assert!(s.auth().grants().is_empty());
+}
+
+#[test]
+fn auth_may_grant_only_classes_without_roles() {
+    let s = parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "auth": { "grants": [ { "allow": "read", "to": "anyone", "on": "/" } ] } }"#,
+    );
+    assert!(s.auth().roles().is_empty());
+    assert_eq!(s.auth().grants().len(), 1);
+}
+
+// --- @auth errors: closure, arity, vocabulary, path ---
+
+fn auth_err(grants_and_roles: &str) -> SchemaErrorKind {
+    let src = format!(
+        r#"{{ "schema": "s", "version": 1, "root": "R",
+             "types": {{ "R": {{ "kind": "map" }} }},
+             "auth": {} }}"#,
+        grants_and_roles
+    );
+    err(&src)
+}
+
+#[test]
+fn grant_to_an_undeclared_role_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": "ghost", "on": "/" } ] }"#),
+        SchemaErrorKind::UnknownRoleRef
+    );
+}
+
+#[test]
+fn ownership_action_is_not_schema_grantable() {
+    // `own` is dynamic doc-level ACL state, never a static schema default.
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "own", "to": "anyone", "on": "/" } ] }"#),
+        SchemaErrorKind::UnknownAction
+    );
+}
+
+#[test]
+fn an_unknown_action_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "frobnicate", "to": "anyone", "on": "/" } ] }"#),
+        SchemaErrorKind::UnknownAction
+    );
+}
+
+#[test]
+fn a_grant_with_both_effects_is_rejected() {
+    assert_eq!(
+        auth_err(
+            r#"{ "grants": [ { "allow": "read", "deny": "read", "to": "anyone", "on": "/" } ] }"#
+        ),
+        SchemaErrorKind::BadGrant
+    );
+}
+
+#[test]
+fn a_grant_with_no_effect_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "to": "anyone", "on": "/" } ] }"#),
+        SchemaErrorKind::BadGrant
+    );
+}
+
+#[test]
+fn a_grant_missing_its_subject_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "on": "/" } ] }"#),
+        SchemaErrorKind::MissingField
+    );
+}
+
+#[test]
+fn a_grant_missing_its_path_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": "anyone" } ] }"#),
+        SchemaErrorKind::MissingField
+    );
+}
+
+#[test]
+fn an_unknown_grant_field_is_rejected() {
+    assert_eq!(
+        auth_err(
+            r#"{ "grants": [ { "allow": "read", "to": "anyone", "on": "/", "when": "now" } ] }"#
+        ),
+        SchemaErrorKind::UnknownField
+    );
+}
+
+#[test]
+fn an_unknown_template_var_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": "${session_id}", "on": "/" } ] }"#),
+        SchemaErrorKind::BadSubject
+    );
+}
+
+#[test]
+fn a_malformed_template_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": "${unclosed", "on": "/" } ] }"#),
+        SchemaErrorKind::BadSubject
+    );
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": "${}", "on": "/" } ] }"#),
+        SchemaErrorKind::BadSubject
+    );
+}
+
+#[test]
+fn a_path_without_a_leading_slash_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": "anyone", "on": "body" } ] }"#),
+        SchemaErrorKind::BadPath
+    );
+}
+
+#[test]
+fn a_path_with_an_empty_segment_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": "anyone", "on": "/a//b" } ] }"#),
+        SchemaErrorKind::BadPath
+    );
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": "anyone", "on": "/body/" } ] }"#),
+        SchemaErrorKind::BadPath
+    );
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": "anyone", "on": "" } ] }"#),
+        SchemaErrorKind::BadPath
+    );
+}
+
+#[test]
+fn a_duplicate_role_is_rejected() {
+    assert_eq!(
+        auth_err(r#"{ "roles": ["editor", "editor"] }"#),
+        SchemaErrorKind::DuplicateRole
+    );
+}
+
+#[test]
+fn malformed_auth_shapes_are_rejected() {
+    assert_eq!(auth_err("[]"), SchemaErrorKind::NotAnObject);
+    assert_eq!(
+        auth_err(r#"{ "roles": "editor" }"#),
+        SchemaErrorKind::WrongType
+    );
+    assert_eq!(auth_err(r#"{ "roles": [1] }"#), SchemaErrorKind::WrongType);
+    assert_eq!(auth_err(r#"{ "grants": {} }"#), SchemaErrorKind::WrongType);
+    assert_eq!(
+        auth_err(r#"{ "grants": [ "nope" ] }"#),
+        SchemaErrorKind::NotAnObject
+    );
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": 5, "to": "anyone", "on": "/" } ] }"#),
+        SchemaErrorKind::WrongType
+    );
+    assert_eq!(
+        auth_err(r#"{ "grants": [ { "allow": "read", "to": 5, "on": "/" } ] }"#),
+        SchemaErrorKind::WrongType
+    );
+    assert_eq!(auth_err(r#"{ "wat": 1 }"#), SchemaErrorKind::UnknownField);
+}
+
+#[test]
+fn auth_error_locations_name_the_offending_grant() {
+    let e = Schema::parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "auth": { "grants": [ { "allow": "read", "to": "anyone", "on": "/" },
+                                  { "allow": "read", "to": "ghost", "on": "/" } ] } }"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::UnknownRoleRef);
+    assert!(
+        e.at.contains("grants"),
+        "location names the grants block: {}",
+        e.at
+    );
 }
