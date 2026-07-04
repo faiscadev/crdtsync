@@ -88,7 +88,7 @@ async fn open(url: &str) -> Ws {
 }
 
 /// Start a server whose credentials are checked by `verifier`.
-async fn start_server_with_verifier(verifier: Box<dyn Verifier + Send>) -> Server {
+async fn start_server_with_verifier(verifier: Box<dyn Verifier + Send + Sync>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(serve_with_verifier(
@@ -191,7 +191,7 @@ async fn join(url: &str, client: u8) -> Ws {
 /// The dev-mode verifier still echoes the presented credential as the actor, so a
 /// test picks the actor a policy sees by choosing the credential it authenticates
 /// with.
-async fn start_server_with_authorizer(authorizer: Box<dyn Authorizer + Send>) -> Server {
+async fn start_server_with_authorizer(authorizer: Box<dyn Authorizer + Send + Sync>) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(serve_with_authorizer(
@@ -213,8 +213,8 @@ async fn start_server_with_authorizer(authorizer: Box<dyn Authorizer + Send>) ->
 /// rules become enforceable once the actor is server-derived rather than
 /// client-chosen.
 async fn start_server_with_verifier_and_authorizer(
-    verifier: Box<dyn Verifier + Send>,
-    authorizer: Box<dyn Authorizer + Send>,
+    verifier: Box<dyn Verifier + Send + Sync>,
+    authorizer: Box<dyn Authorizer + Send + Sync>,
 ) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -587,7 +587,7 @@ async fn anonymous_mode_mints_an_actor_without_a_credential() {
 
 #[tokio::test]
 async fn an_injected_verifier_maps_a_good_upgrade_credential_to_its_actor() {
-    let verifier: Box<dyn Verifier + Send> =
+    let verifier: Box<dyn Verifier + Send + Sync> =
         Box::new(|cred: &[u8]| (cred == b"good").then(|| Identity::new(b"alice".to_vec())));
     let server = start_server_with_verifier(verifier).await;
     let url = &server.url;
@@ -605,7 +605,7 @@ async fn an_injected_verifier_maps_a_good_upgrade_credential_to_its_actor() {
 
 #[tokio::test]
 async fn an_injected_verifier_refuses_a_bad_upgrade_credential() {
-    let verifier: Box<dyn Verifier + Send> =
+    let verifier: Box<dyn Verifier + Send + Sync> =
         Box::new(|cred: &[u8]| (cred == b"good").then(|| Identity::new(b"alice".to_vec())));
     let server = start_server_with_verifier(verifier).await;
     let url = &server.url;

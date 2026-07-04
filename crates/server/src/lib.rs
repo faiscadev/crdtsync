@@ -25,7 +25,7 @@ pub mod runtime;
 pub mod schema_registry;
 pub mod session;
 pub mod store;
-pub use admin::{register_schema, RegisterOutcome, RegisterRequest};
+pub use admin::{register_schema, serve_admin, AdminResponse, RegisterOutcome, RegisterRequest};
 pub use auth::{AllowAll, Identity, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};
 pub use clock::{Clock, ManualClock, SystemClock};
