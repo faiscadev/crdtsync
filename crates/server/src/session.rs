@@ -102,6 +102,12 @@ impl Session {
             .map(|(c, _)| *c)
             .collect()
     }
+
+    /// The rooms this connection currently subscribes, one entry per channel —
+    /// the same room recurs if held on several channels, so the caller dedups.
+    pub fn subscribed_rooms(&self) -> impl Iterator<Item = &RoomId> {
+        self.channels.values()
+    }
 }
 
 impl Default for Session {
