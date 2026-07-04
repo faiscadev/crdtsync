@@ -17,7 +17,7 @@ use crdtsync_server::acl::Acl;
 use crdtsync_server::runtime::{
     serve, serve_with, serve_with_authorizer, serve_with_verifier, ServeConfig,
 };
-use crdtsync_server::{AllowAll, Authorizer, StaticTokens, Verifier};
+use crdtsync_server::{AllowAll, Authorizer, Identity, StaticTokens, Verifier};
 use std::time::Duration;
 
 const CH: Channel = Channel(0);
@@ -588,7 +588,7 @@ async fn anonymous_mode_mints_an_actor_without_a_credential() {
 #[tokio::test]
 async fn an_injected_verifier_maps_a_good_upgrade_credential_to_its_actor() {
     let verifier: Box<dyn Verifier + Send> =
-        Box::new(|cred: &[u8]| (cred == b"good").then(|| b"alice".to_vec()));
+        Box::new(|cred: &[u8]| (cred == b"good").then(|| Identity::new(b"alice".to_vec())));
     let server = start_server_with_verifier(verifier).await;
     let url = &server.url;
 
@@ -606,7 +606,7 @@ async fn an_injected_verifier_maps_a_good_upgrade_credential_to_its_actor() {
 #[tokio::test]
 async fn an_injected_verifier_refuses_a_bad_upgrade_credential() {
     let verifier: Box<dyn Verifier + Send> =
-        Box::new(|cred: &[u8]| (cred == b"good").then(|| b"alice".to_vec()));
+        Box::new(|cred: &[u8]| (cred == b"good").then(|| Identity::new(b"alice".to_vec())));
     let server = start_server_with_verifier(verifier).await;
     let url = &server.url;
 

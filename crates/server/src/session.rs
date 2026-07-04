@@ -12,18 +12,19 @@ use std::collections::HashMap;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
 
-use crate::auth::Verifier;
+use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Resource};
 use crate::{Catchup, Hub, RoomId};
 
 /// One client connection's protocol state. The handshake runs Hello → Auth →
 /// Subscribe: the client names itself, then presents a credential the server
-/// turns into an actor, then joins rooms. A connection multiplexes several room
-/// subscriptions, each on its own [`Channel`]; the client assigns the handle at
-/// Subscribe and every later frame names it.
+/// turns into an [`Identity`] (actor plus roles and groups), then joins rooms. A
+/// connection multiplexes several room subscriptions, each on its own
+/// [`Channel`]; the client assigns the handle at Subscribe and every later frame
+/// names it.
 pub struct Session {
     client: Option<ClientId>,
-    actor: Option<Vec<u8>>,
+    identity: Option<Identity>,
     channels: HashMap<Channel, RoomId>,
 }
 
@@ -31,19 +32,19 @@ impl Session {
     pub fn new() -> Self {
         Self {
             client: None,
-            actor: None,
+            identity: None,
             channels: HashMap::new(),
         }
     }
 
-    /// A session already authenticated as `actor` — the upgrade fast path, where
-    /// the credential was verified during the transport accept (or anonymous
-    /// mode minted the actor), so the in-band Auth phase is skipped. Hello still
-    /// names the client; an in-band Auth afterward is out of order.
-    pub fn authenticated(actor: Vec<u8>) -> Self {
+    /// A session already authenticated as `identity` — the upgrade fast path,
+    /// where the credential was verified during the transport accept (or
+    /// anonymous mode minted the actor), so the in-band Auth phase is skipped.
+    /// Hello still names the client; an in-band Auth afterward is out of order.
+    pub fn authenticated(identity: Identity) -> Self {
         Self {
             client: None,
-            actor: Some(actor),
+            identity: Some(identity),
             channels: HashMap::new(),
         }
     }
@@ -53,10 +54,18 @@ impl Session {
         self.client
     }
 
-    /// The server-derived actor for this connection, once a credential has been
-    /// verified at Auth.
+    /// The server-derived actor for this connection, once it is authenticated —
+    /// by the in-band Auth phase, the transport-upgrade fast path, or anonymous
+    /// mode minting an actor.
     pub fn actor(&self) -> Option<&[u8]> {
-        self.actor.as_deref()
+        self.identity.as_ref().map(|i| i.actor())
+    }
+
+    /// The full identity (actor plus asserted roles and groups) for this
+    /// connection, once it is authenticated — by in-band Auth, the fast path, or
+    /// anonymous minting.
+    pub fn identity(&self) -> Option<&Identity> {
+        self.identity.as_ref()
     }
 
     /// The channels this connection has bound to `room`. A broadcast for the
@@ -121,15 +130,16 @@ pub fn step(
             if session.client.is_none() {
                 return violation("auth before hello");
             }
-            if session.actor.is_some() {
+            if session.identity.is_some() {
                 return violation("already authenticated");
             }
-            // The server derives the actor from the credential; a client never
+            // The server derives the identity from the credential; a client never
             // asserts its own identity. A refused credential closes the
             // connection. The credential bytes are never logged.
             match verifier.verify(&credential) {
-                Some(actor) => {
-                    session.actor = Some(actor.clone());
+                Some(identity) => {
+                    let actor = identity.actor().to_vec();
+                    session.identity = Some(identity);
                     Response {
                         replies: vec![Message::AuthOk { actor }],
                         ..Response::default()
@@ -151,7 +161,7 @@ pub fn step(
             room,
             last_seen_seq,
         } => {
-            let Some(actor) = session.actor.as_deref() else {
+            let Some(actor) = session.actor() else {
                 return violation("subscribe before auth");
             };
             if session.channels.contains_key(&channel) {
@@ -188,7 +198,7 @@ pub fn step(
             }
         }
         Message::Unsubscribe { channel } => {
-            if session.actor.is_none() {
+            if session.actor().is_none() {
                 return violation("unsubscribe before auth");
             }
             if session.channels.remove(&channel).is_none() {
@@ -197,7 +207,7 @@ pub fn step(
             Response::default()
         }
         Message::Ops { channel, ops } => {
-            if session.actor.is_none() {
+            if session.actor().is_none() {
                 return violation("ops before auth");
             }
             let Some(client) = session.client else {
@@ -213,7 +223,7 @@ pub fn step(
             if ops.iter().any(|op| op.id.client != client) {
                 return violation("op client mismatch");
             }
-            let actor = session.actor.as_deref().expect("actor set, checked above");
+            let actor = session.actor().expect("actor set, checked above");
             if !authorizer.authorize(actor, Action::Write, &Resource::Room(&room)) {
                 return forbidden("write denied");
             }
@@ -263,7 +273,7 @@ pub fn step(
             key,
             value,
         } => {
-            let Some(actor) = session.actor.clone() else {
+            let Some(actor) = session.actor().map(<[u8]>::to_vec) else {
                 return violation("awareness before auth");
             };
             let Some(client) = session.client else {
@@ -368,7 +378,7 @@ fn version_room(
     authorizer: &dyn Authorizer,
     action: Action,
 ) -> Option<RoomId> {
-    let actor = session.actor.as_deref()?;
+    let actor = session.actor()?;
     let room = session.channels.get(&channel)?.clone();
     authorizer
         .authorize(actor, action, &Resource::Room(&room))
@@ -379,7 +389,7 @@ fn version_room(
 /// if the connection is unauthenticated or the channel is unbound, otherwise a
 /// non-closing forbidden.
 fn version_denied(session: &Session, channel: Channel) -> Response {
-    if session.actor.is_none() {
+    if session.actor().is_none() {
         violation("version request before auth")
     } else if !session.channels.contains_key(&channel) {
         violation("version request on an unbound channel")

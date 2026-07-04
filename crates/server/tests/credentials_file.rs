@@ -8,7 +8,7 @@
 #![cfg(not(miri))]
 
 use crdtsync_server::auth::{CredentialsFileError, StaticTokens};
-use crdtsync_server::Verifier;
+use crdtsync_server::{Identity, Verifier};
 use std::path::PathBuf;
 
 fn temp_path(tag: &str) -> PathBuf {
@@ -38,8 +38,14 @@ fn a_valid_file_loads_and_authenticates() {
          secret-bob   bob\n",
     );
     let table = StaticTokens::from_credentials_file(&file.0).expect("valid file loads");
-    assert_eq!(table.verify(b"secret-alice"), Some(b"alice".to_vec()));
-    assert_eq!(table.verify(b"secret-bob"), Some(b"bob".to_vec()));
+    assert_eq!(
+        table.verify(b"secret-alice"),
+        Some(Identity::new(b"alice".to_vec()))
+    );
+    assert_eq!(
+        table.verify(b"secret-bob"),
+        Some(Identity::new(b"bob".to_vec()))
+    );
     assert_eq!(
         table.verify(b"unknown"),
         None,
@@ -59,7 +65,7 @@ fn a_malformed_file_is_a_parse_error_carrying_the_line() {
     let file = TempCreds::write(
         "malformed",
         "secret-alice alice\n\
-         this-line-has-too-many fields here\n",
+         cred actor roles groups extra\n",
     );
     let err = StaticTokens::from_credentials_file(&file.0).expect_err("a malformed file fails");
     match err {

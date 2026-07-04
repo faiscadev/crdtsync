@@ -9,7 +9,7 @@
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, ErrorCode, Message};
-use crdtsync_server::auth::{AllowAll, Verifier};
+use crdtsync_server::auth::{AllowAll, Identity, Verifier};
 use crdtsync_server::{step, Hub, PermitAll, Response, Session};
 
 /// Drive a message through `step` under the dev-mode permit-all authorizer; these
@@ -30,7 +30,7 @@ fn hub() -> Hub {
 
 /// A verifier that accepts exactly one credential, mapping it to a fixed actor.
 fn only_good() -> impl Verifier {
-    |cred: &[u8]| (cred == b"good").then(|| b"alice".to_vec())
+    |cred: &[u8]| (cred == b"good").then(|| Identity::new(b"alice".to_vec()))
 }
 
 fn hello(hub: &mut Hub, s: &mut Session, v: &dyn Verifier, client: u8) {
@@ -238,9 +238,25 @@ fn ops_before_auth_is_a_violation() {
 
 #[test]
 fn a_fast_path_session_starts_with_the_actor_already_set() {
-    let s = Session::authenticated(b"alice".to_vec());
+    let s = Session::authenticated(Identity::new(b"alice".to_vec()));
     assert_eq!(s.actor(), Some(&b"alice"[..]));
     assert_eq!(s.client(), None, "hello still names the client");
+}
+
+#[test]
+fn a_session_captures_the_full_identity_claims() {
+    // The session holds the roles/groups the credential asserted, so the policy
+    // evaluator can read membership from it (consumed by the role-grant tier).
+    let id = Identity::with_claims(
+        b"alice".to_vec(),
+        vec!["editor".into()],
+        vec!["design".into()],
+    );
+    let s = Session::authenticated(id);
+    let held = s.identity().expect("authenticated");
+    assert_eq!(held.actor(), b"alice");
+    assert_eq!(held.roles(), ["editor"]);
+    assert_eq!(held.groups(), ["design"]);
 }
 
 #[test]
@@ -249,7 +265,7 @@ fn a_fast_path_session_subscribes_without_an_auth_phase() {
     let mut h = hub();
     // The credential was verified at the transport upgrade; the session begins
     // authenticated and the client goes straight from Hello to Subscribe.
-    let mut s = Session::authenticated(b"alice".to_vec());
+    let mut s = Session::authenticated(Identity::new(b"alice".to_vec()));
     hello(&mut h, &mut s, &v, 1);
     let r = drive(
         &mut h,
@@ -275,7 +291,7 @@ fn a_fast_path_session_subscribes_without_an_auth_phase() {
 fn an_in_band_auth_on_a_fast_path_session_is_a_violation() {
     let v = only_good();
     let mut h = hub();
-    let mut s = Session::authenticated(b"alice".to_vec());
+    let mut s = Session::authenticated(Identity::new(b"alice".to_vec()));
     hello(&mut h, &mut s, &v, 1);
     // The actor is already established, so a redundant Auth is out of order.
     let r = drive(

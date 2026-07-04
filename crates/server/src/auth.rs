@@ -15,34 +15,93 @@
 
 use std::collections::HashMap;
 
-/// Turns a presented credential into a server-trusted actor id, or rejects it.
+/// The identity a credential resolves to: the actor id the server trusts for the
+/// connection, plus the roles and groups the credential asserts. Membership is
+/// read from the credential — the engine never decides it — and authorization
+/// matches a subject against this identity (an actor id against `actor`, a group
+/// against `groups`, a role against `roles`).
+///
+/// Roles and groups are captured here at the handshake; the policy evaluator
+/// begins consuming them with the role-grant tier.
+///
+/// There is deliberately no `Default`: an identity always names an actor, so a
+/// caller constructs it via [`Identity::new`] or [`Identity::with_claims`] —
+/// this rules out an *accidental* empty-actor identity (a stray
+/// `Identity::default()` marking a session authenticated). The actor bytes are
+/// whatever the verifier derives; a verifier that yields an empty actor (e.g.
+/// dev-mode [`AllowAll`] on an empty credential) is the verifier's concern.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Identity {
+    actor: Vec<u8>,
+    roles: Vec<String>,
+    groups: Vec<String>,
+}
+
+impl Identity {
+    /// An identity that asserts only an actor id — no roles, no groups.
+    pub fn new(actor: impl Into<Vec<u8>>) -> Self {
+        Identity {
+            actor: actor.into(),
+            roles: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
+
+    /// An identity asserting `actor` with the given role and group membership.
+    pub fn with_claims(actor: impl Into<Vec<u8>>, roles: Vec<String>, groups: Vec<String>) -> Self {
+        Identity {
+            actor: actor.into(),
+            roles,
+            groups,
+        }
+    }
+
+    /// The server-trusted actor id.
+    pub fn actor(&self) -> &[u8] {
+        &self.actor
+    }
+
+    /// The roles the credential asserts, in declaration order.
+    pub fn roles(&self) -> &[String] {
+        &self.roles
+    }
+
+    /// The groups the credential asserts, in declaration order.
+    pub fn groups(&self) -> &[String] {
+        &self.groups
+    }
+}
+
+/// Turns a presented credential into a server-trusted [`Identity`], or rejects
+/// it.
 pub trait Verifier {
-    /// The actor id for `credential`, or `None` to refuse the connection. The
+    /// The identity for `credential`, or `None` to refuse the connection. The
     /// bytes are opaque; an implementation interprets them (a signed token, an
-    /// API key) and derives the actor itself — it must not echo attacker-chosen
-    /// bytes back as identity in production.
-    fn verify(&self, credential: &[u8]) -> Option<Vec<u8>>;
+    /// API key) and derives the actor and its claims itself — it must not echo
+    /// attacker-chosen bytes back as identity in production.
+    fn verify(&self, credential: &[u8]) -> Option<Identity>;
 }
 
 /// A verifier from a plain closure, so a deployment (or a test) can supply the
 /// mapping inline.
 impl<F> Verifier for F
 where
-    F: Fn(&[u8]) -> Option<Vec<u8>>,
+    F: Fn(&[u8]) -> Option<Identity>,
 {
-    fn verify(&self, credential: &[u8]) -> Option<Vec<u8>> {
+    fn verify(&self, credential: &[u8]) -> Option<Identity> {
         self(credential)
     }
 }
 
 /// Dev-mode verifier: accepts any credential and adopts it verbatim as the
-/// actor id. It performs no real validation and lets the client pick its own
-/// actor — for local development and tests only, never production.
+/// actor id (no roles or groups). It performs no real validation and lets the
+/// client pick its own actor — for local development and tests only, never
+/// production.
 pub struct AllowAll;
 
 impl Verifier for AllowAll {
-    fn verify(&self, credential: &[u8]) -> Option<Vec<u8>> {
-        Some(credential.to_vec())
+    fn verify(&self, credential: &[u8]) -> Option<Identity> {
+        Some(Identity::new(credential.to_vec()))
     }
 }
 
@@ -53,7 +112,7 @@ impl Verifier for AllowAll {
 /// [`AllowAll`].
 #[derive(Clone, Default)]
 pub struct StaticTokens {
-    tokens: HashMap<Vec<u8>, Vec<u8>>,
+    tokens: HashMap<Vec<u8>, Identity>,
 }
 
 /// Redacted — the table's keys are secrets, so a debug print names only how many
@@ -72,19 +131,29 @@ impl StaticTokens {
         Self::default()
     }
 
-    /// Map a secret `credential` to the `actor` it authenticates as, replacing any
-    /// existing mapping for that credential.
+    /// Map a secret `credential` to the `actor` it authenticates as (with no
+    /// roles or groups), replacing any existing mapping for that credential.
     pub fn insert(&mut self, credential: impl Into<Vec<u8>>, actor: impl Into<Vec<u8>>) {
-        self.tokens.insert(credential.into(), actor.into());
+        self.tokens.insert(credential.into(), Identity::new(actor));
+    }
+
+    /// Map a secret `credential` to a full [`Identity`] (actor plus roles and
+    /// groups), replacing any existing mapping for that credential.
+    pub fn insert_identity(&mut self, credential: impl Into<Vec<u8>>, identity: Identity) {
+        self.tokens.insert(credential.into(), identity);
     }
 
     /// Parse a credentials table from text. One entry per line,
-    /// `<credential> <actor>` (whitespace-separated literal tokens); blank lines
-    /// and `#` comment lines are ignored. Both tokens are taken as raw UTF-8
-    /// bytes — the `actor` bytes are what a policy references as `actor:<hex>`.
-    /// Parsing is total: a line that is not exactly two fields, or that repeats a
-    /// credential, yields a [`CredentialsError`] naming its physical line, never a
-    /// panic.
+    /// `<credential> <actor> [roles] [groups]` (whitespace-separated tokens);
+    /// blank lines and `#` comment lines are ignored. `roles` and `groups` are
+    /// comma-separated name lists (`editor,viewer`); a lone `-` is an empty
+    /// list, used to give groups while asserting no roles. The credential and
+    /// actor are raw UTF-8 bytes — the `actor` bytes are what a policy
+    /// references as `actor:<hex>`.
+    ///
+    /// Parsing is total: a line outside two-to-four fields, one repeating a
+    /// credential, or one with an empty role/group name yields a
+    /// [`CredentialsError`] naming its physical line, never a panic.
     pub fn from_credentials(text: &str) -> Result<Self, CredentialsError> {
         let mut table = StaticTokens::new();
         for (i, raw) in text.lines().enumerate() {
@@ -94,7 +163,7 @@ impl StaticTokens {
                 continue;
             }
             let fields: Vec<&str> = trimmed.split_whitespace().collect();
-            if fields.len() != 2 {
+            if fields.len() < 2 || fields.len() > 4 {
                 return Err(CredentialsError {
                     line,
                     kind: CredentialsErrorKind::Arity(fields.len()),
@@ -107,9 +176,10 @@ impl StaticTokens {
                     kind: CredentialsErrorKind::DuplicateCredential,
                 });
             }
-            table
-                .tokens
-                .insert(credential, fields[1].as_bytes().to_vec());
+            let roles = parse_name_list(fields.get(2).copied(), line)?;
+            let groups = parse_name_list(fields.get(3).copied(), line)?;
+            let identity = Identity::with_claims(fields[1].as_bytes().to_vec(), roles, groups);
+            table.tokens.insert(credential, identity);
         }
         Ok(table)
     }
@@ -127,9 +197,29 @@ impl StaticTokens {
 }
 
 impl Verifier for StaticTokens {
-    fn verify(&self, credential: &[u8]) -> Option<Vec<u8>> {
+    fn verify(&self, credential: &[u8]) -> Option<Identity> {
         self.tokens.get(credential).cloned()
     }
+}
+
+/// Parse a comma-separated role/group field into names. An absent field or a
+/// lone `-` is an empty list; an empty name (a stray comma) is rejected.
+fn parse_name_list(field: Option<&str>, line: usize) -> Result<Vec<String>, CredentialsError> {
+    let names = match field {
+        None | Some("-") => return Ok(Vec::new()),
+        Some(f) => f,
+    };
+    let mut out = Vec::new();
+    for name in names.split(',') {
+        if name.is_empty() {
+            return Err(CredentialsError {
+                line,
+                kind: CredentialsErrorKind::EmptyName,
+            });
+        }
+        out.push(name.to_string());
+    }
+    Ok(out)
 }
 
 /// Why a credentials line failed to parse. `Arity` carries the field count found.
@@ -137,22 +227,31 @@ impl Verifier for StaticTokens {
 /// line number localizes the offending entry.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CredentialsErrorKind {
-    /// A line held this many whitespace-separated fields, not the two an entry
-    /// requires.
+    /// A line held this many whitespace-separated fields, outside the two-to-four
+    /// an entry allows (`credential actor [roles] [groups]`).
     Arity(usize),
     /// A credential was mapped on more than one line — an ambiguous config.
     DuplicateCredential,
+    /// A role or group list held an empty name (a stray or leading/trailing
+    /// comma).
+    EmptyName,
 }
 
 impl std::fmt::Display for CredentialsErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CredentialsErrorKind::Arity(n) => {
-                write!(f, "expected 2 fields (credential actor), found {n}")
+                write!(
+                    f,
+                    "expected 2 to 4 fields (credential actor [roles] [groups]), found {n}"
+                )
             }
             // The credential is a secret — name the fault, not the token.
             CredentialsErrorKind::DuplicateCredential => {
                 write!(f, "a credential is mapped more than once")
+            }
+            CredentialsErrorKind::EmptyName => {
+                write!(f, "a role or group list has an empty name")
             }
         }
     }
@@ -226,8 +325,14 @@ mod tests {
              secret-bob   bob\n",
         )
         .unwrap();
-        assert_eq!(table.verify(b"secret-alice"), Some(b"alice".to_vec()));
-        assert_eq!(table.verify(b"secret-bob"), Some(b"bob".to_vec()));
+        assert_eq!(
+            table.verify(b"secret-alice"),
+            Some(Identity::new(b"alice".to_vec()))
+        );
+        assert_eq!(
+            table.verify(b"secret-bob"),
+            Some(Identity::new(b"bob".to_vec()))
+        );
     }
 
     #[test]
@@ -248,16 +353,63 @@ mod tests {
         let table =
             StaticTokens::from_credentials("\n   # a note\n   secret-alice    alice   \n\n")
                 .unwrap();
-        assert_eq!(table.verify(b"secret-alice"), Some(b"alice".to_vec()));
+        assert_eq!(
+            table.verify(b"secret-alice"),
+            Some(Identity::new(b"alice".to_vec()))
+        );
     }
 
     #[test]
-    fn a_line_without_two_fields_is_an_arity_error() {
+    fn a_two_field_row_carries_no_roles_or_groups() {
+        let table = StaticTokens::from_credentials("secret-alice alice").unwrap();
+        let id = table.verify(b"secret-alice").unwrap();
+        assert_eq!(id.actor(), b"alice");
+        assert!(id.roles().is_empty());
+        assert!(id.groups().is_empty());
+    }
+
+    #[test]
+    fn roles_and_groups_parse_from_the_row() {
+        let table =
+            StaticTokens::from_credentials("secret-alice alice editor,viewer eng,design").unwrap();
+        let id = table.verify(b"secret-alice").unwrap();
+        assert_eq!(id.actor(), b"alice");
+        assert_eq!(id.roles(), ["editor", "viewer"]);
+        assert_eq!(id.groups(), ["eng", "design"]);
+    }
+
+    #[test]
+    fn a_three_field_row_carries_roles_and_no_groups() {
+        let table = StaticTokens::from_credentials("secret-alice alice editor,viewer").unwrap();
+        let id = table.verify(b"secret-alice").unwrap();
+        assert_eq!(id.actor(), b"alice");
+        assert_eq!(id.roles(), ["editor", "viewer"]);
+        assert!(id.groups().is_empty());
+    }
+
+    #[test]
+    fn a_dash_is_an_empty_list() {
+        // A `-` in the roles slot lets a row assert groups but no roles.
+        let table = StaticTokens::from_credentials("secret-alice alice - eng").unwrap();
+        let id = table.verify(b"secret-alice").unwrap();
+        assert!(id.roles().is_empty());
+        assert_eq!(id.groups(), ["eng"]);
+    }
+
+    #[test]
+    fn an_empty_name_in_a_list_is_rejected() {
+        let e = StaticTokens::from_credentials("secret-alice alice a,,b").unwrap_err();
+        assert_eq!(e.line, 1);
+        assert!(matches!(e.kind, CredentialsErrorKind::EmptyName));
+    }
+
+    #[test]
+    fn a_row_outside_two_to_four_fields_is_an_arity_error() {
         let one = StaticTokens::from_credentials("secret-alice").unwrap_err();
         assert_eq!(one.line, 1);
         assert!(matches!(one.kind, CredentialsErrorKind::Arity(1)));
-        let three = StaticTokens::from_credentials("cred actor extra").unwrap_err();
-        assert!(matches!(three.kind, CredentialsErrorKind::Arity(3)));
+        let five = StaticTokens::from_credentials("cred actor roles groups extra").unwrap_err();
+        assert!(matches!(five.kind, CredentialsErrorKind::Arity(5)));
     }
 
     #[test]
@@ -297,14 +449,28 @@ mod tests {
              phone-token  alice",
         )
         .unwrap();
-        assert_eq!(table.verify(b"laptop-token"), Some(b"alice".to_vec()));
-        assert_eq!(table.verify(b"phone-token"), Some(b"alice".to_vec()));
+        assert_eq!(
+            table.verify(b"laptop-token"),
+            Some(Identity::new(b"alice".to_vec()))
+        );
+        assert_eq!(
+            table.verify(b"phone-token"),
+            Some(Identity::new(b"alice".to_vec()))
+        );
     }
 
     #[test]
     fn insert_builds_a_table_programmatically() {
         let mut table = StaticTokens::new();
         table.insert(b"tok".to_vec(), b"carol".to_vec());
-        assert_eq!(table.verify(b"tok"), Some(b"carol".to_vec()));
+        assert_eq!(table.verify(b"tok"), Some(Identity::new(b"carol".to_vec())));
+
+        table.insert_identity(
+            b"tok2".to_vec(),
+            Identity::with_claims(b"dave".to_vec(), vec!["admin".into()], vec![]),
+        );
+        let id = table.verify(b"tok2").unwrap();
+        assert_eq!(id.actor(), b"dave");
+        assert_eq!(id.roles(), ["admin"]);
     }
 }

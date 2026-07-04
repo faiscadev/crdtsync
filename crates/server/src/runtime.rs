@@ -28,7 +28,7 @@ use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, COOKIE, SEC_WE
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::auth::{AllowAll, Verifier};
+use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Authorizer, PermitAll};
 use crate::{negotiate, ConnId, Registry, RoomId, RoomLog, Store};
 
@@ -267,16 +267,19 @@ async fn registry_actor(
                         // if policy allows, else it must authenticate in band.
                         let outcome = match credential {
                             Some(cred) => match reg.verify_credential(&cred) {
-                                Some(actor) => ConnOutcome::Open {
-                                    id: reg.connect_authenticated(actor.clone()),
-                                    authok: Some(actor),
-                                },
+                                Some(identity) => {
+                                    let actor = identity.actor().to_vec();
+                                    ConnOutcome::Open {
+                                        id: reg.connect_authenticated(identity),
+                                        authok: Some(actor),
+                                    }
+                                }
                                 None => ConnOutcome::Refused,
                             },
                             None if config.anonymous => {
                                 let actor = anon_actor();
                                 ConnOutcome::Open {
-                                    id: reg.connect_authenticated(actor.clone()),
+                                    id: reg.connect_authenticated(Identity::new(actor.clone())),
                                     authok: Some(actor),
                                 }
                             }
