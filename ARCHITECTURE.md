@@ -392,7 +392,17 @@ Core ships fixed repair rules. Apps don't pick. Configurable repair = configurab
 
 ## Rule Shape
 
-Orphan inline → wrap in declared default block. Disallowed child → drop. Exclusive collision → keep lamport-oldest, demote rest. Out-of-range scalar → clamp. Disallowed / mistyped attr → drop. Mark on disallowed type → drop. Tree-move cycle and Map slot type mismatch handled by their respective algorithms, not repair.
+Orphan inline → wrap in declared default block. Disallowed child → drop. Exclusive collision → keep lamport-oldest, demote rest. Out-of-range scalar → clamp. Disallowed / mistyped attr → drop. Mark on disallowed type → drop. Sequence over `max` → drop the lamport-newest excess. Tree-move cycle and Map slot type mismatch handled by their respective algorithms, not repair.
+
+## Mechanism: Read-Time Normalization
+
+Repair is a **deterministic read-time normalization of the merged state — never a minted op**. The stored/encoded state is the raw merged op-set; every materialized read applies the repair function to produce the canonical view. This is convergent *by construction*: repair is a pure function of the merged op-set, and the lamport order it needs (keep-oldest, drop-newest) comes from the **stamps already in the state** (Map-slot / Register / sequence-node stamps), never the local replica clock — so two replicas with the same ops produce byte-identical `encode_state` and identical repaired reads.
+
+- **No op, no stamp.** A clamp returns the value clamped on read; the stored value/stamp is untouched. A disallowed value or over-`max` excess is hidden on read. Nothing is written, so there is no repair-op stamp to diverge — the reason repair is normalization, not a new op.
+- **Element-creating repairs use derived ids.** The one repair that introduces structure — orphan inline → wrap in a declared default block — mints no op either: the wrapper's `element_id` is *derived* from the violating position (as Map slots derive theirs from `(parent, key, kind)`), so every replica synthesizes the same wrapper and a later op can target it. (Requires XmlElement / default-block; ships with those.)
+- **`onRepaired` fires at the apply boundary** — the validator (a deterministic function of state) detects the violation there and emits the observation event; the repaired *value* is produced at read. Apply detects and emits; read normalizes.
+
+Apply-time *materialization* (rewriting stored state to its repaired form) is rejected: a clamp that overwrote the stored value would need a new stamp and reintroduce the divergence problem. Read-time normalization sidesteps it entirely.
 
 ## Observation, Not Override
 
@@ -401,6 +411,13 @@ Apps cannot change what repair does. Apps can observe that it happened via a `re
 ## Closure of Violation Set
 
 Schema language has finite dimensions: type membership, children cardinality, attr presence / type / range, mark allowance, mark value shape. Every violation maps to one dimension. Every dimension has a rule. Schema declarations validated at parse time so apps cannot write a schema that admits unrepairable runtime states.
+
+**The closure invariant is why a sequence has no `min`.** An *upper* bound is repairable (drop the lamport-newest excess); a *minimum count* is not — concurrent deletes can underflow it and repair cannot invent items. Admitting a sequence `min` would let a schema describe a runtime state with no repair, breaking closure — so a `min` on a list (or text) is **rejected at schema parse time**. Minimum cardinality is a *semantic* constraint (structure = core, semantics = app, below), and apps express it without it:
+
+- **Structural floor** — model the required minimum as fixed Map slots (a slot cannot be concurrently deleted out of existence), with a List only for the variable part above it: two `optionA` / `optionB` slots + a `moreOptions` list guarantees "≥ 2 options" by construction, convergent under any concurrency.
+- **Gate at a transition** — enforce the minimum where best-effort actually holds (one actor, one moment): refuse to flip `published = true` unless the count is met. A draft may sit under the minimum; it just can't ship.
+
+Reactive UI (grey out the last delete) covers the everyday case on top of either.
 
 ## Out of Scope: Semantic Invariants
 
