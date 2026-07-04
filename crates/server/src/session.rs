@@ -359,6 +359,7 @@ pub fn step(
         // Peer updates and clears only travel server-to-client.
         Message::AwarenessUpdate { .. } => violation("client sent an awareness update"),
         Message::AwarenessClear { .. } => violation("client sent an awareness clear"),
+        Message::AwarenessClearKey { .. } => violation("client sent an awareness clear key"),
         // Versioning is a request/response sub-protocol over the channel's room.
         // A mutation replies with the fresh name list — the authoritative
         // post-state — and a list request the same; a fetch that hits replies

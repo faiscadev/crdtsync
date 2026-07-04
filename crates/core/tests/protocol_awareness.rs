@@ -43,6 +43,15 @@ fn awareness_clear_round_trips() {
 }
 
 #[test]
+fn awareness_clear_key_round_trips() {
+    round_trip(Message::AwarenessClearKey {
+        channel: Channel(3),
+        actor: b"alice".to_vec(),
+        key: b"cursor".to_vec(),
+    });
+}
+
+#[test]
 fn empty_key_and_value_round_trip() {
     round_trip(Message::AwarenessSet {
         channel: Channel(0),
@@ -54,6 +63,11 @@ fn empty_key_and_value_round_trip() {
         actor: Vec::new(),
         key: Vec::new(),
         value: Vec::new(),
+    });
+    round_trip(Message::AwarenessClearKey {
+        channel: Channel(0),
+        actor: Vec::new(),
+        key: Vec::new(),
     });
 }
 
@@ -87,6 +101,11 @@ fn a_truncated_awareness_message_is_an_error_not_a_panic() {
             actor: b"alice".to_vec(),
             key: b"cursor".to_vec(),
             value: b"xy".to_vec(),
+        },
+        Message::AwarenessClearKey {
+            channel: Channel(2),
+            actor: b"alice".to_vec(),
+            key: b"cursor".to_vec(),
         },
     ] {
         let bytes = encode_message(&m);

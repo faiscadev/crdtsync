@@ -276,6 +276,35 @@ fn a_clear_drops_all_of_an_actors_entries() {
 }
 
 #[test]
+fn a_per_key_clear_drops_only_that_entry() {
+    let mut session = ClientSession::new(cid(1));
+    let (ch, _) = session.subscribe(ROOM_A);
+    let upd = |actor: &[u8], key: &[u8]| Message::AwarenessUpdate {
+        channel: ch,
+        actor: actor.to_vec(),
+        key: key.to_vec(),
+        value: vec![1],
+    };
+    session.receive(upd(b"alice", b"cursor")).unwrap();
+    session.receive(upd(b"alice", b"typing")).unwrap();
+    session.receive(upd(b"bob", b"cursor")).unwrap();
+
+    // One of alice's entries expires by timed TTL; her others and bob's stay.
+    session
+        .receive(Message::AwarenessClearKey {
+            channel: ch,
+            actor: b"alice".to_vec(),
+            key: b"cursor".to_vec(),
+        })
+        .unwrap();
+
+    assert_eq!(session.awareness(ch, b"alice", b"cursor"), None);
+    assert_eq!(session.awareness(ch, b"alice", b"typing"), Some(&[1][..]));
+    assert_eq!(session.awareness(ch, b"bob", b"cursor"), Some(&[1][..]));
+    assert_eq!(session.awareness_len(ch), 2);
+}
+
+#[test]
 fn a_clear_on_an_unknown_channel_is_rejected() {
     let mut session = ClientSession::new(cid(1));
     session.subscribe(ROOM_A);
