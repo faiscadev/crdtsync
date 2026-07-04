@@ -345,6 +345,12 @@ CRDT merge needs no schema — the core op `{id, stamp, target, kind, tx}` conve
 
 A client-supplied schema **body is never trusted for enforcement**. The enforcing server enforces only its **registered** schema; a connecting client asserts a version *number*, used solely as a lookup key into the server's registered set (an unknown version is rejected, not fabricated). The registered schema is admin-provisioned — **registration is a meta-authed surface** (the app owner's CI credential, distinct from any sync connection) and hash-locked, so a client cannot slip a different body under a known version. A client's own schema is **advisory**: it drives the client's optimistic local validation / repair / typing, and the server re-validates every op against the trusted registered schema — client-side is advisory, the server is final authority. (Repair is `f(state, schema, lamport)`, so it converges across replicas *only* when they share the schema; the registered server is the arbiter that corrects a replica which repaired under a divergent schema.)
 
+## Registration
+
+Registration is a **control-plane** operation, separate from the data-plane sync WebSocket: the app owner's CI pushes `{app_id, version, schema, migrations}` to a dedicated **HTTP admin endpoint**. It is the **app-admin** surface (§Authorization) — gated by the `register_schema` action on the `App(app_id)` resource, authenticated with a registration credential (a `StaticTokens`-style admin key that maps to an admin `Identity`), the same authorization seam every data-plane check uses. The registry is keyed per `app_id`; the handshake resolves a client's `{app_id, version}` against it.
+
+The **hash-lock** pins the schema + migration chain by SHA-256 (matching the content-addressable blob store), so the server refuses to boot on a gap / out-of-sequence / hash mismatch (§Schema Migration gate 3). The crypto lives in the **server** crate, not core — core stays dependency-minimal (`#![forbid(unsafe_code)]`, `uuid`-only, wasm-embeddable) and a client never hash-verifies (it already trusts the server it connects to); only the server, which is not embedded, takes the `sha2` dependency.
+
 ## Enforcement Points
 
 Producer SDK rejects an op that violates the schema before sending (invalid ops never enter the log). An enforcing server validates inbound (defense in depth). The apply boundary at every schema-bearing replica validates merged state (triggers Invariant Repair on violation).
@@ -355,7 +361,7 @@ Core predefines: the validation engine, mark merge-kinds, attr type primitives, 
 
 ## Schema File
 
-JSON. Top-level keys: `schema` (name), `version`, `root` (top-level Map slot → type), `types` (named definitions, each a `kind` = one of the eight primitives with its constraints), `marks` (name → merge flavor + anchor expansion + value shape), `awareness` (entry kind → TTL + throttle + value shape), `auth` (roles + schema-level grants with `${actor_id}` / `${author_id}` templating). Every schema dimension maps to exactly one repair rule with a declaration home, so parse-time validation guarantees no schema admits an unrepairable runtime state:
+JSON. Top-level keys: `schema` (name), `version`, `root` (top-level Map slot → type), `types` (named definitions, each a `kind` = one of the eight primitives with its constraints), `marks` (name → merge flavor + anchor expansion + value shape), `awareness` (entry kind → TTL + throttle + value shape), `auth` (`roles` — the static role vocabulary — plus `grants` — role / subject → action → path, with `${actor_id}` / `${author_id}` templating). `auth` holds **only the static role-based defaults**; per-instance ownership and per-actor grants are **dynamic doc-level ACL state**, never declared in the schema (§Authorization). Every schema dimension maps to exactly one repair rule with a declaration home, so parse-time validation guarantees no schema admits an unrepairable runtime state:
 
 | Repair rule | Declared by |
 |-------------|-------------|
@@ -869,15 +875,32 @@ Apps need both. Schema covers default policy for things of type X. Doc-level cov
 
 ## Subject Types
 
-User, role, group — all first-class peers, composable. `authenticated:*`, `anonymous:*`, `*` (anyone) supported. Engine reads claims from token, never decides role membership itself; that's the app auth provider's job.
+User, role, group — all first-class peers, composable. `authenticated:*`, `anonymous:*`, `*` (anyone) supported. **Claims model:** the verifier maps a credential to an `Identity { actor, roles, groups }` — the engine reads role / group membership *from the token* (the app's identity provider issues it) and never decides membership itself. A grant's subject matches against that identity: a role name against `identity.roles`, a group against `identity.groups`, an actor id against `identity.actor`, or a subject class (`authenticated` / `anonymous` / `anyone`).
+
+## Three Authority Tiers
+
+Distinct mechanisms, not interchangeable — conflating them is a security hole:
+
+- **App admin** — the schema-registry authority (the app owner / CI). Lives *above* every document: registers schemas, migrations, and the static `@auth` for an `app_id`, and is a **superuser** that may act on every document in the app (bypasses the policy, decision-flow step 0). A credential class (the registration key), **not** a role and **not** an owner; never appears in `@auth` grants.
+- **Owner** — a **dynamic, recursive, path-scoped capability** held by an actor over a room or a path within it. An owner has full access to its subtree *and* meta-authority (grant / revoke) over it. The document creator auto-owns the root path `/`; multiple owners per path are allowed. Owners live as **doc-level ACL state** (the CRDT tier), self-organized at runtime — never declared in the schema.
+- **Role** — a static, schema-declared name (`viewer` / `editor`), membership from token claims, powers bounded by the schema `@auth` grants.
+
+## Ownership (Dynamic Capability Model)
+
+Ownership is pure runtime doc-level ACL state — the app admin never writes it in stone; owners grow the authority tree themselves. A doc-level ACL tuple is `{ subject, capability ∈ { read, write, publish_awareness, own }, path, grantor }`.
+
+- **Delegation with attenuation** — an owner of path P may write a tuple on P **or any subpath of P** (never above or outside): grant a **co-owner** of P, an **owner of a subpath** P/x (who can further delegate downward — recursive), or a **leaf** `read` / `write` / `publish_awareness` grant to a specific actor. Uniform rule: *an actor may write an ACL tuple on Q iff it owns Q or an ancestor of Q — or is app admin.*
+- **`own` is delegable authority; leaf grants are not** — an `own` grantee becomes an owner and can re-delegate; a plain `read` / `write` grantee gets access only and **cannot** hand out further grants. Only ownership confers granting power.
+- **Provenance-based revocation** — a tuple is removable only by its **grantor** (recorded as the tuple's author — un-forgeable, since the op carries `actor_id`) or someone above the grantor in the grant chain, **not** by whoever merely owns an ancestor path. So co-owners granted by a common superior cannot revoke each other (only their shared grantor / admin can), and a superior-imposed constraint on a subordinate's subtree cannot be removed by that subordinate. Revocation authority follows **provenance, not path-ancestry**.
+- **Downstream deny + owner carve-outs** — grants and denies both **inherit downward**; an explicit **deny wins globally** (an ancestor deny is a hard floor over its whole subtree — no re-opening below it, AWS-style). So `read` on `a/b` + `deny read` on `a/b/c` yields "read a/b, not a/b/c." The same shape carves ownership: a **superior** places `deny own` on `a/b/c` to strip a subordinate a/b-owner's authority over that subpath — and because removal follows provenance (above), the subordinate cannot delete the carve-out even though it owns an ancestor. Capability separation lets a carve-out excise one dimension surgically (`deny own` while leaving `read`).
 
 ## Actions
 
-Per room, branch, element, mark, version, snapshot, migration, awareness entry kind, and meta-auth on the ACL system itself.
+Read, write, publish-awareness per room / branch / path / element / mark; version create / restore / delete; branch create / delete; migration apply; snapshot export; ACL grant / revoke (meta-auth); and `register_schema` (app-admin meta-auth on the `App(app_id)` resource). Room + path level ship first; element / mark / branch widen as those land.
 
 ## Resources
 
-By room, branch, path (inherits downward), element id (survives moves), mark name, mark instance, version. Path-based inherit; instance-based precise.
+By app (registration), room, branch, path (inherits downward), element id (survives moves), mark name, mark instance, version. Path-based inherit; instance-based precise. A resource carries its `author` so `${author_id}` templating resolves at check time.
 
 ## Templating
 
@@ -885,15 +908,16 @@ Schema `@auth` supports `${actor_id}` / `${author_id}` / `${room_id}` / `${branc
 
 ## Decision Flow
 
-For every check:
+For every check, over the merged view of doc-level ACL tuples and schema `@auth` grants:
 
-1. Walk ACL tuples matching (actor, action, resource) and ancestors.
-2. Any explicit DENY match → DENY.
-3. Any explicit ALLOW match → ALLOW.
-4. Schema `@auth` grants actor's role → ALLOW.
+0. Identity is **app admin** → ALLOW (superuser, bypasses policy).
+1. Any explicit **DENY** (doc-level ACL) on the resource or an ancestor → DENY (deny-wins, global).
+2. Identity **owns** the resource or any ancestor path → ALLOW.
+3. Any explicit **ALLOW** (doc-level ACL leaf grant) on the resource or an ancestor → ALLOW.
+4. Schema **`@auth`** grants the identity's role / subject on the resource → ALLOW.
 5. Otherwise → DENY (default-deny).
 
-Standard IAM semantics: explicit deny always wins, user-specific not stronger than role for allow, absence of declaration = denial. Single source of truth used at every enforcement point.
+Standard IAM semantics: explicit deny always wins (below superuser), user-specific not stronger than role for allow, absence of declaration = denial. Permission state is versioned in lamport time, so a concurrent grant / revoke is checked at the op's lamport position (§Hard Problems) and resolves deterministically across replicas. Single source of truth used at every enforcement point.
 
 ## Enforcement Points
 
