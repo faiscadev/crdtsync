@@ -104,8 +104,9 @@ pub enum SubjectClass {
     Anyone,
 }
 
-/// A `${…}` template variable a grant subject or path resolves against the
-/// acting identity / resource at check time.
+/// A `${…}` template variable a grant subject (the `to` field) resolves
+/// against the acting identity / resource at check time. Grant paths are raw
+/// strings (structural validation only), so templates appear only in `to`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TemplateVar {
     ActorId,
