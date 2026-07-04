@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use cookie::Cookie;
 use crdtsync_core::{
     decode_header, decode_message, encode_message, ClientId, Document, ErrorCode, Message,
 };
@@ -388,25 +389,21 @@ fn subprotocol_credential(req: &Request) -> Option<Vec<u8>> {
 
 /// The credential in the `crdtsync_credential=<value>` cookie.
 fn cookie_credential(req: &Request) -> Option<Vec<u8>> {
-    let prefix = format!("{AUTH_COOKIE}=");
     req.headers()
         .get_all(COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .flat_map(|list| list.split(';'))
-        .map(str::trim)
-        .find_map(|kv| kv.strip_prefix(&prefix))
-        .map(|cred| cred.as_bytes().to_vec())
+        .flat_map(Cookie::split_parse)
+        .filter_map(Result::ok)
+        .find(|cookie| cookie.name() == AUTH_COOKIE)
+        .map(|cookie| cookie.value().as_bytes().to_vec())
 }
 
 /// The credential in the `?credential=<value>` query param.
 fn query_credential(req: &Request) -> Option<Vec<u8>> {
-    let prefix = format!("{AUTH_QUERY_KEY}=");
-    req.uri()
-        .query()?
-        .split('&')
-        .find_map(|kv| kv.strip_prefix(&prefix))
-        .map(|cred| cred.as_bytes().to_vec())
+    form_urlencoded::parse(req.uri().query()?.as_bytes())
+        .find(|(key, _)| key == AUTH_QUERY_KEY)
+        .map(|(_, value)| value.into_owned().into_bytes())
 }
 
 /// Drive one connection: handshake, then the message loop, then teardown.
