@@ -261,6 +261,36 @@ fn an_awareness_timer_must_be_a_non_negative_integer() {
     );
 }
 
+#[test]
+fn an_unknown_top_level_key_is_rejected_not_ignored() {
+    // A typo'd key must fail loud rather than be silently dropped.
+    assert_eq!(
+        err(r#"{ "schema": "s", "version": 1, "root": "R",
+                 "types": { "R": { "kind": "map" } }, "awarness": {} }"#),
+        SchemaErrorKind::UnknownField
+    );
+    assert_eq!(
+        err(r#"{ "schema": "s", "version": 1, "root": "R",
+                 "types": { "R": { "kind": "map" } }, "typo": 1 }"#),
+        SchemaErrorKind::UnknownField
+    );
+}
+
+#[test]
+fn the_language_defined_top_level_keys_are_accepted() {
+    // `marks` and `auth` are declared by the language (not yet modelled here),
+    // so a schema using them still parses.
+    let s = parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "marks": { "bold": {} },
+            "awareness": { "cursor": {} },
+            "auth": { "roles": {} } }"#,
+    );
+    assert_eq!(s.name(), "s");
+    assert_eq!(s.awareness_entry("cursor").map(|_| ()), Some(()));
+}
+
 // --- errors: each a distinct kind, none a panic ---
 
 #[test]
