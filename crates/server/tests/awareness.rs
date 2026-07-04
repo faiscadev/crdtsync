@@ -36,7 +36,9 @@ fn hello_auth(r: &mut Registry, client: u8) -> ConnId {
     assert!(r.deliver(
         id,
         Message::Hello {
-            client: cid(client)
+            client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         }
     ));
     assert!(r.deliver(
@@ -274,7 +276,14 @@ fn a_fresh_room_replays_no_presence() {
 fn awareness_before_auth_is_a_violation() {
     let mut r = registry();
     let c = r.connect();
-    r.deliver(c, Message::Hello { client: cid(1) });
+    r.deliver(
+        c,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0,
+        },
+    );
     r.take_outbox(c);
     let keep_open = r.deliver(
         c,

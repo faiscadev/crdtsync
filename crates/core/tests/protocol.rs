@@ -91,7 +91,19 @@ fn round_trips(m: Message) {
 
 #[test]
 fn hello_round_trips() {
-    round_trips(Message::Hello { client: cid(9) });
+    // A relay connection: no app, no declared version.
+    round_trips(Message::Hello {
+        client: cid(9),
+        app_id: Vec::new(),
+        schema_version: 0,
+    });
+    // An enforcing connection naming its app and the version it speaks — the
+    // fields survive the wire so the server can resolve them.
+    round_trips(Message::Hello {
+        client: cid(9),
+        app_id: b"acme-notes".to_vec(),
+        schema_version: 7,
+    });
 }
 
 #[test]
@@ -272,7 +284,11 @@ fn empty_input_is_an_error() {
 
 #[test]
 fn a_truncated_message_is_an_error() {
-    let bytes = encode_message(&Message::Hello { client: cid(9) });
+    let bytes = encode_message(&Message::Hello {
+        client: cid(9),
+        app_id: Vec::new(),
+        schema_version: 0,
+    });
     assert_eq!(
         decode_message(&bytes[..bytes.len() - 1]),
         Err(ProtocolError::UnexpectedEof)
@@ -281,7 +297,11 @@ fn a_truncated_message_is_an_error() {
 
 #[test]
 fn trailing_bytes_after_a_fixed_message_are_an_error() {
-    let mut bytes = encode_message(&Message::Hello { client: cid(9) });
+    let mut bytes = encode_message(&Message::Hello {
+        client: cid(9),
+        app_id: Vec::new(),
+        schema_version: 0,
+    });
     bytes.push(0);
     assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
 }

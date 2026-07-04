@@ -192,7 +192,14 @@ fn an_acl_gates_subscribe_when_set_on_the_registry() {
     )));
 
     let id = r.connect();
-    assert!(r.deliver(id, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(
+        id,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0
+        }
+    ));
     assert!(r.deliver(
         id,
         Message::Auth {

@@ -67,7 +67,7 @@ const ROOM_B: &[u8] = b"room-b";
 fn hello_names_the_client() {
     let session = ClientSession::new(cid(1));
     match session.hello() {
-        Message::Hello { client } => assert_eq!(client, cid(1)),
+        Message::Hello { client, .. } => assert_eq!(client, cid(1)),
         other => panic!("expected Hello, got {other:?}"),
     }
 }
@@ -542,7 +542,11 @@ fn a_server_error_surfaces_to_the_caller() {
 fn a_client_only_message_from_the_server_is_a_violation() {
     let mut session = ClientSession::new(cid(1));
     assert!(matches!(
-        session.receive(Message::Hello { client: cid(2) }),
+        session.receive(Message::Hello {
+            client: cid(2),
+            app_id: Vec::new(),
+            schema_version: 0
+        }),
         Err(ClientError::UnexpectedMessage(_))
     ));
     assert!(matches!(

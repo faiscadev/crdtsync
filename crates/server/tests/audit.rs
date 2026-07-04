@@ -118,7 +118,14 @@ fn wrapping_the_registry_authorizer_logs_enforcement() {
     r.set_authorizer(Box::new(Audited::new(policy, Box::new(rec.clone()))));
 
     let id = r.connect();
-    assert!(r.deliver(id, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(
+        id,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0
+        }
+    ));
     assert!(r.deliver(
         id,
         Message::Auth {
@@ -174,7 +181,14 @@ fn an_awareness_publish_logs_the_decision_not_the_entry() {
     r.set_authorizer(Box::new(Audited::new(policy, Box::new(rec.clone()))));
 
     let id = r.connect();
-    assert!(r.deliver(id, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(
+        id,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0
+        }
+    ));
     assert!(r.deliver(
         id,
         Message::Auth {

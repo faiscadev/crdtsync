@@ -65,6 +65,10 @@ impl ClientSession {
     pub fn hello(&self) -> Message {
         Message::Hello {
             client: self.client,
+            // The app declaration is wired through in a later unit; a bare
+            // client opens as a relay connection (no app, no schema version).
+            app_id: Vec::new(),
+            schema_version: 0,
         }
     }
 
