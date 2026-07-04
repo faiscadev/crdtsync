@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crdtsync_core::{ClientId, Message};
 
-use crate::auth::{AllowAll, Verifier};
+use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Action, Authorizer, PermitAll, Resource};
 use crate::clock::{Clock, SystemClock};
 use crate::{step, Hub, Session, Store};
@@ -78,9 +78,9 @@ impl Registry {
     }
 
     /// Verify a credential presented at the transport upgrade, returning the
-    /// server-derived actor, or `None` if refused. The fast path uses this to
-    /// establish auth during accept, so the connection skips the in-band Auth.
-    pub fn verify_credential(&self, credential: &[u8]) -> Option<Vec<u8>> {
+    /// server-derived [`Identity`], or `None` if refused. The fast path uses this
+    /// to establish auth during accept, so the connection skips the in-band Auth.
+    pub fn verify_credential(&self, credential: &[u8]) -> Option<Identity> {
         self.verifier.verify(credential)
     }
 
@@ -113,8 +113,8 @@ impl Registry {
     /// Open a connection already authenticated as `actor` — the upgrade fast path
     /// (credential verified at accept) or anonymous mode. Its client skips the
     /// in-band Auth phase.
-    pub fn connect_authenticated(&mut self, actor: Vec<u8>) -> ConnId {
-        self.insert_conn(Session::authenticated(actor))
+    pub fn connect_authenticated(&mut self, identity: Identity) -> ConnId {
+        self.insert_conn(Session::authenticated(identity))
     }
 
     fn insert_conn(&mut self, session: Session) -> ConnId {

@@ -9,7 +9,7 @@
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, ErrorCode, Message, Scalar};
-use crdtsync_server::{ConnId, Registry};
+use crdtsync_server::{ConnId, Identity, Registry};
 
 const CH: Channel = Channel(0);
 
@@ -206,7 +206,7 @@ fn a_fast_path_connection_subscribes_without_the_auth_phase() {
     let mut r = registry();
     // The credential was verified at the transport upgrade, so the connection
     // opens already authenticated and goes straight from Hello to Subscribe.
-    let id = r.connect_authenticated(b"alice".to_vec());
+    let id = r.connect_authenticated(Identity::new(b"alice".to_vec()));
     assert!(r.deliver(id, Message::Hello { client: cid(1) }));
     assert!(r.deliver(id, sub(ROOM)));
     assert_eq!(r.take_outbox(id), vec![ops_msg(Vec::new())]);
@@ -215,7 +215,7 @@ fn a_fast_path_connection_subscribes_without_the_auth_phase() {
 #[test]
 fn a_fast_path_actor_still_fans_out_awareness() {
     let mut r = registry();
-    let a = r.connect_authenticated(b"alice".to_vec());
+    let a = r.connect_authenticated(Identity::new(b"alice".to_vec()));
     assert!(r.deliver(a, Message::Hello { client: cid(1) }));
     assert!(r.deliver(a, sub(ROOM)));
     r.take_outbox(a);
@@ -245,8 +245,11 @@ fn a_fast_path_actor_still_fans_out_awareness() {
 fn verify_credential_reflects_the_verifier() {
     let mut r = registry();
     r.set_verifier(Box::new(|cred: &[u8]| {
-        (cred == b"good").then(|| b"alice".to_vec())
+        (cred == b"good").then(|| Identity::new(b"alice".to_vec()))
     }));
-    assert_eq!(r.verify_credential(b"good"), Some(b"alice".to_vec()));
+    assert_eq!(
+        r.verify_credential(b"good"),
+        Some(Identity::new(b"alice".to_vec()))
+    );
     assert_eq!(r.verify_credential(b"bad"), None);
 }
