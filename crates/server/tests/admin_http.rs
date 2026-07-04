@@ -249,3 +249,22 @@ async fn the_admin_plane_serves_registration_over_a_socket() {
         403
     );
 }
+
+// A request whose framing hyper cannot parse is answered 400 over the socket,
+// not left hanging — the transport swap must keep rejecting malformed HTTP.
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_malformed_request_over_the_socket_is_400() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_admin(
+        listener,
+        Box::new(verifier()),
+        Box::new(only_admin_on_app_x()),
+        SchemaRegistry::new(),
+    ));
+
+    let bad =
+        b"POST /apps/app-x/schemas/1 HTTP/9.9\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    assert_eq!(post(addr, bad).await, 400);
+}
