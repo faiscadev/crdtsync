@@ -641,6 +641,14 @@ fn scalar_to_js(s: &Scalar) -> JsValue {
                 &js_sys::Uint8Array::from(s.encode_state().as_slice()).into(),
             );
         }
+        Scalar::ElementRef(id) => {
+            set(&obj, "t", &JsValue::from_str("elementref"));
+            set(
+                &obj,
+                "v",
+                &js_sys::Uint8Array::from(&id.as_bytes()[..]).into(),
+            );
+        }
     }
     obj.into()
 }
