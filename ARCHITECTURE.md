@@ -130,7 +130,11 @@ Closed set of primitives. No generic CRDT abstractions.
 
 Document root is a Map of named top-level Elements.
 
-*Built today (v0.2):* Map, List, Text, Register, Counter (plus the Scalar leaf). XmlElement, XmlFragment, and RangedElement are v0.5 — described here as the data model, not yet implemented.
+*Built today (v0.2):* Map, List, Text, Register, Counter (plus the Scalar leaf). XmlElement, XmlFragment, and RangedElement are v0.5.
+
+**XmlElement / XmlFragment are composition + one hard algorithm, not new machinery.** `XmlElement { tag: String, attrs: Map, children: <Fugue sequence of XmlElement | Text> }` reuses the **Map** primitive for attrs (attrs hold CRDT values, not just scalars) and **Fugue** (the List/Text sequence engine) for children; `XmlFragment` is a tagless, attr-less children sequence — the document tree's root container. The only genuinely new algorithm is the **tree move** (§Tree Moves), sliced separately from the structural build (create / edit / delete children) so the structure lands before the hardest, most bug-prone part.
+
+**RangedElement is a first-class generic annotation, not a Text-local one.** A `RangedElement { start, end, payload }` where each endpoint is an anchor `(element_id, RelativePosition)` — so a range may span elements (a comment from one paragraph to another), not only a single Text run. RangedElements live in a **document/fragment-level annotation set** (a CRDT set keyed by RangedElement id), not inside the Text they annotate; "the marks on this Text" is a query over that set filtered by `element_id`. Marks are a convention over RangedElement (§Marks).
 
 ## Rationale
 
@@ -259,15 +263,19 @@ Core does not predefine mark names. App decides what marks exist and how to rend
 
 ## Merge Flavors
 
-Each mark name needs declared merge semantics. Three kinds: **boolean** (presence only, add+add = present), **value** (LWW on conflict), **object** (each mark independent, no range merging across instances).
+Each mark name needs declared merge semantics (in the schema `marks` block). Three kinds: **boolean** (presence only — concurrent add + add = present; concurrent **add + remove** on the same span resolves **LWW by stamp**, the highest-stamped op covering a character decides its presence — consistent with Register LWW), **value** (LWW on conflict — e.g. a link's href), **object** (each mark instance independent, no range merging across instances — e.g. comments; two overlapping comments both exist).
 
 ## Anchor Expansion
 
-Per-mark flags control whether a mark grows when text is inserted at its boundary. Bold typically grows both ways; link typically grows neither.
+Per-mark flags control whether a mark grows when text is inserted at its boundary. Bold typically grows both ways; link typically grows neither. This maps directly onto the **`RelativePosition` gravity** already built (`Before` / `After`): a boundary anchor's gravity *is* its expansion direction, so anchor expansion needs no new mechanism — it is the gravity chosen for the mark's start / end anchor.
 
 ## Algorithm
 
 Peritext-style range CRDT (Litt, van Hardenberg, Kleppmann — Ink & Switch 2022).
+
+## Representation
+
+A mark is a **RangedElement** (§CRDT Model) whose `payload` carries the mark name + value, whose `start` / `end` anchors are `RelativePosition`s (gravity = anchor expansion), stored in the document/fragment-level annotation set. The active marks on a character are **computed** from the set — each character's mark state is derived by resolving every RangedElement of a given name that covers it, per that name's declared flavor (boolean → LWW-by-stamp presence, value → LWW value, object → the set of instances). No per-character mark storage; the RangedElement set is the source of truth and per-character state is a read-time computation, so it converges by construction (a deterministic function of the merged mark set). A cross-element RangedElement (comment spanning paragraphs) is the same primitive with `start.element ≠ end.element`.
 
 ---
 
