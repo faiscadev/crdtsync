@@ -51,22 +51,27 @@ impl Subject {
     }
 }
 
-/// Which resource a rule covers. Room-scoped today; a variant widens it to
-/// path / element as [`Resource`] grows.
+/// Which resource a rule covers. Room- and app-scoped today; a variant widens
+/// the room case to path / element as [`Resource`] grows. A room match never
+/// covers an app resource, nor the reverse — the control plane and data plane
+/// are distinct.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ResourceMatch {
     /// Every room.
     AnyRoom,
     /// One specific room.
     Room(Vec<u8>),
+    /// One specific app, by `app_id` — the schema-registry control plane.
+    App(Vec<u8>),
 }
 
 impl ResourceMatch {
     fn matches(&self, resource: &Resource) -> bool {
-        let Resource::Room(room) = *resource;
-        match self {
-            ResourceMatch::AnyRoom => true,
-            ResourceMatch::Room(name) => name.as_slice() == room,
+        match (self, resource) {
+            (ResourceMatch::AnyRoom, Resource::Room(_)) => true,
+            (ResourceMatch::Room(name), Resource::Room(room)) => name.as_slice() == *room,
+            (ResourceMatch::App(name), Resource::App(app)) => name.as_slice() == *app,
+            _ => false,
         }
     }
 }
@@ -307,6 +312,7 @@ fn parse_action(tok: &str) -> Option<Option<Action>> {
         "read" => Some(Some(Action::Read)),
         "write" => Some(Some(Action::Write)),
         "publish_awareness" => Some(Some(Action::PublishAwareness)),
+        "register_schema" => Some(Some(Action::RegisterSchema)),
         "*" => Some(None),
         _ => None,
     }
@@ -315,9 +321,11 @@ fn parse_action(tok: &str) -> Option<Option<Action>> {
 fn parse_resource(tok: &str) -> Option<ResourceMatch> {
     if tok == "*" {
         Some(ResourceMatch::AnyRoom)
+    } else if let Some(name) = tok.strip_prefix("room:") {
+        Some(ResourceMatch::Room(name.as_bytes().to_vec()))
     } else {
-        tok.strip_prefix("room:")
-            .map(|name| ResourceMatch::Room(name.as_bytes().to_vec()))
+        tok.strip_prefix("app:")
+            .map(|id| ResourceMatch::App(id.as_bytes().to_vec()))
     }
 }
 

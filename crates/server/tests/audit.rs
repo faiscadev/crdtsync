@@ -39,7 +39,10 @@ impl Recorder {
 
 impl AccessLog for Recorder {
     fn record(&self, record: &AccessRecord) {
-        let Resource::Room(room) = *record.resource;
+        // This recorder only tracks room decisions; app-scoped ones are skipped.
+        let Resource::Room(room) = *record.resource else {
+            return;
+        };
         self.0.lock().unwrap().push(Entry {
             actor: record.actor.to_vec(),
             action: record.action,

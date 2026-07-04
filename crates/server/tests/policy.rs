@@ -21,6 +21,9 @@ fn write(a: &Acl, actor: &[u8], room: &[u8]) -> bool {
 fn publish(a: &Acl, actor: &[u8], room: &[u8]) -> bool {
     a.authorize(actor, Action::PublishAwareness, &Resource::Room(room))
 }
+fn register(a: &Acl, actor: &[u8], app: &[u8]) -> bool {
+    a.authorize(actor, Action::RegisterSchema, &Resource::App(app))
+}
 
 const ROOM: &[u8] = b"room-a";
 
@@ -274,4 +277,52 @@ fn a_policy_error_renders_a_message_naming_the_line() {
         shown.contains("fly"),
         "message names the bad token: {shown}"
     );
+}
+
+// --- app-admin meta-auth: register_schema on an app resource ---
+
+#[test]
+fn register_schema_on_an_app_parses_and_authorizes() {
+    let acl = Acl::from_policy("allow anyone register_schema app:myapp").expect("parses");
+    assert!(register(&acl, b"ci", b"myapp"));
+    assert!(
+        !register(&acl, b"ci", b"other"),
+        "a different app is not covered"
+    );
+    assert!(
+        !read(&acl, b"ci", ROOM),
+        "an app rule does not grant a room action"
+    );
+}
+
+#[test]
+fn room_and_app_scopes_are_disjoint() {
+    // A rule on room:shared never covers an app of the same name.
+    let room_acl = Acl::from_policy("allow anyone * room:shared").expect("parses");
+    assert!(read(&room_acl, b"x", b"shared"));
+    assert!(!register(&room_acl, b"x", b"shared"));
+
+    // And an app rule never covers a room of the same name.
+    let app_acl = Acl::from_policy("allow anyone * app:shared").expect("parses");
+    assert!(register(&app_acl, b"x", b"shared"));
+    assert!(!read(&app_acl, b"x", b"shared"));
+}
+
+#[test]
+fn a_wildcard_resource_covers_rooms_not_apps() {
+    // `*` is any *room*, the data plane — it never reaches the app control plane.
+    let acl = Acl::from_policy("allow anyone * *").expect("parses");
+    assert!(read(&acl, b"x", ROOM));
+    assert!(write(&acl, b"x", ROOM));
+    assert!(
+        !register(&acl, b"x", b"any-app"),
+        "a room wildcard must not grant schema registration"
+    );
+}
+
+#[test]
+fn an_unknown_resource_prefix_is_still_rejected() {
+    let (line, kind) = err_kind("allow anyone read zone:z");
+    assert_eq!(line, 1);
+    assert!(matches!(kind, PolicyErrorKind::Resource(_)));
 }

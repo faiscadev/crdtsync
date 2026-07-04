@@ -20,13 +20,20 @@ pub enum Action {
     Write,
     /// Publish an ephemeral awareness entry to a room.
     PublishAwareness,
+    /// Register (or migrate) an app's schema — the app-admin meta-auth on an
+    /// [`Resource::App`], distinct from any data-plane room action.
+    RegisterSchema,
 }
 
-/// What an [`Action`] targets. Room-level for now; a later variant carries a
-/// path or element id for fine-grained checks.
+/// What an [`Action`] targets: a room (the data plane) or an app (the schema
+/// registry control plane). Room-level within a room for now; a later variant
+/// carries a path or element id for fine-grained checks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Resource<'a> {
+    /// A room, named by its id.
     Room(&'a [u8]),
+    /// An app, named by its `app_id` — the target of schema registration.
+    App(&'a [u8]),
 }
 
 /// Decides whether `actor` may take `action` on `resource`. Deployments supply
