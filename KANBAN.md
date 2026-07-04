@@ -220,7 +220,13 @@ Not exhaustive — the full backlog **is** ARCHITECTURE. This is the prioritized
   - **Unit 5 — retires the deferred bits**: invariant-repair orphan→wrap-default-block + exclusive-collision-demote (now buildable), attrs enforcement, and XmlElement/marks/attrs **diff detail** (§Schema-Aware-Diff was blocked on these primitives).
   - **Unit 6 — SDK surface**: XmlElement/marks over FFI + Python/Go/wasm.
   → *CRDT Model / Marks / Invariant Repair / Schema-Aware Diff*. (v0.5, design-ready)
-- **Schema / invariant repair / zones** — schema + invariant repair now have their own Next epics (design-resolved 2026-07-03). **Zones** (coarse auth partition, per-zone lamport, opaque cross-zone reference token) remains design-gated and partly needs XmlElement. → *Schema*, *Invariant Repair*, *Authorization/zones*. (v0.5)
+- **Zones (coarse auth partition)** — **DESIGN RESOLVED (human, 2026-07-04, DECISIONS + ARCHITECTURE §Zones).** Static, path-rooted, schema-declared subtree partitions, each a separately replicated stream (own lamport, own op-log partition) — stronger isolation than doc-ACL redaction (unauthorized zone withholds ops/snapshot/structure/existence/size). Sliced:
+  - **Unit 1 — zone declaration (core)**: parse the schema `zones` block (name → subtree root path); reject cross-zone tree moves + cross-zone anchors at schema validation.
+  - **Unit 2 — per-zone lamport + envelope `zone` (core)**: the envelope `zone` field routed to per-zone lamport clocks (already reserved in the op envelope); causally-independent partitions.
+  - **Unit 3 — zone-scoped subscription + authz + wire redaction (server)**: `Resource::Zone` (subscribe-gated), the `Channel` widened to `(room, branch, zone)`, per-zone replication streams, and redaction so an unauthorized zone is entirely absent (no ops/snapshot/structure/count).
+  - **Unit 4 — cross-zone opaque token — DEFERRED (opt-in follow-on)**: AEAD-sealed handle minted per-recipient at fan-out (server key, deterministic sealing, room-bound associated data), stateless. First cut ships cross-zone anchors forbidden.
+  - **Unit 5 — SDK surface**: zone-scoped subscribe over the SDKs.
+  Depends on the tree primitives (meaningful subtrees) + the authz seam (design done). Unblocks channel-mux widening `(room,branch,zone)` and awareness zone-scoping. → *Authorization/zones / Networking*. (v0.5, design-ready)
 - **Mixed-version migrations** — migration log entries, per-op `schema_version`, four detection gates. → *Schema Migration*. (v0.6)
 - **Distributed cluster** — sharding, replication, failover, leader election, branches. → *Horizontal Scaling*, *Versioning and Branches*. (v0.4)
 
