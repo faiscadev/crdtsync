@@ -8,6 +8,14 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
+## 2026-07-04 · Unit 5b-ii-2a/#PENDING · admin HTTP is hand-rolled and strict; request parser split from the socket transport
+**Changed:** no ARCHITECTURE change — an implementation + build-slicing decision recorded so the registration transport is legible.
+- **The admin HTTP endpoint is hand-rolled, not a framework (`hyper`/`axum`) nor a parser crate (`httparse`).** It matches the engine's "one deployable unit, minimal deps, hand-rolled codec/durability" stance, and the surface is tiny and fully under our control: one `POST` route, `Content-Length` framing only, strict fail-loud rejection of everything else. `core` stays the dep-minimal boundary; the server crate already carries `tokio`/`tokio-tungstenite`/`sha2`, and this adds no HTTP dependency.
+- **Strictness is the security posture.** Only `HTTP/1.1`, only `Content-Length` (any `Transfer-Encoding` is rejected — supporting both is the classic request-smuggling vector), a 16 KiB head cap (memory guard, mirroring the codec's decompression-bomb guards), and a total-decode parser: any bytes yield a parsed head, `Ok(None)` for "read more", or a typed `HeadError` — never a panic.
+- **Split 5b-ii-2 into the pure parser (2a) and the socket transport (2b).** Untrusted HTTP request parsing is the risky part and is pure/Miri-testable, exactly like `core::json` and the binary codec — so it lands with its own edge-case spec (malformed request line, unsupported version, bad/duplicate `Content-Length`, chunked, over-large head, arbitrary-bytes-never-panic) before any `TcpListener`, route dispatch, or response formatting exists.
+
+**Why:** an admin endpoint may be network-exposed, so its request parser is a real attack surface; isolating it as a strict, spec'd, panic-free pure unit de-risks the transport, and hand-rolling keeps the deploy story ("no external infrastructure") honest without pulling a general HTTP stack in for a single route. Unblocks 5b-ii-2b (listener + route + response wiring).
+
 ## 2026-07-04 · Unit 5b-ii-1/#155 · admin registration sliced into a pure handler + an HTTP transport; meta-auth order pinned
 **Changed:** no ARCHITECTURE change — a build-slicing + semantics-pinning decision recorded so the registration arc stays legible.
 - **Sliced 5b-ii into 5b-ii-1 (pure meta-auth handler) and 5b-ii-2 (HTTP/1.1 transport + listener),** mirroring the existing `session`/`runtime` split — the security-critical authenticate→authorize→register decision is a pure function testable without sockets, and the HTTP wire is a thin shell that decodes a request into it and maps the outcome to a status. The decision flow is where a bug would let an unauthenticated or unpermitted caller mutate the schema registry, so it is isolated and exhaustively spec'd first.

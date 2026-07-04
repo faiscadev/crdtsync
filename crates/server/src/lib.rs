@@ -19,6 +19,7 @@ pub mod audit;
 pub mod auth;
 pub mod authz;
 pub mod clock;
+pub mod http;
 pub mod registry;
 pub mod runtime;
 pub mod schema_registry;
