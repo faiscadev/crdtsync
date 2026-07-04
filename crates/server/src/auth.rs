@@ -23,7 +23,11 @@ use std::collections::HashMap;
 ///
 /// Roles and groups are captured here at the handshake; the policy evaluator
 /// begins consuming them with the role-grant tier.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+///
+/// There is no `Default`: an identity always names a concrete actor, so callers
+/// construct it via [`Identity::new`] or [`Identity::with_claims`] — an
+/// empty-actor identity is never a valid authenticated state.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Identity {
     actor: Vec<u8>,
     roles: Vec<String>,

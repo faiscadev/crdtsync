@@ -53,14 +53,16 @@ impl Session {
         self.client
     }
 
-    /// The server-derived actor for this connection, once a credential has been
-    /// verified at Auth.
+    /// The server-derived actor for this connection, once it is authenticated —
+    /// by the in-band Auth phase, the transport-upgrade fast path, or anonymous
+    /// mode minting an actor.
     pub fn actor(&self) -> Option<&[u8]> {
         self.identity.as_ref().map(|i| i.actor())
     }
 
     /// The full identity (actor plus asserted roles and groups) for this
-    /// connection, once a credential has been verified.
+    /// connection, once it is authenticated — by in-band Auth, the fast path, or
+    /// anonymous minting.
     pub fn identity(&self) -> Option<&Identity> {
         self.identity.as_ref()
     }
