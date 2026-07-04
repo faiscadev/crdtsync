@@ -127,8 +127,17 @@ pub enum Message {
         value: Vec<u8>,
     },
     /// Drops all of `actor`'s awareness on `channel` — sent when that actor's
-    /// presence expires (disconnect past the grace window, or TTL).
+    /// presence expires (disconnect past the grace window, or a session-lifetime
+    /// entry going away).
     AwarenessClear { channel: Channel, actor: Vec<u8> },
+    /// Drops a single one of `actor`'s awareness entries — `key` — on `channel`,
+    /// sent when that entry's timed TTL expires while the actor's other entries
+    /// (and connection) live on.
+    AwarenessClearKey {
+        channel: Channel,
+        actor: Vec<u8>,
+        key: Vec<u8>,
+    },
     /// Captures the current state of `channel`'s room as a named version.
     VersionCreate { channel: Channel, name: Vec<u8> },
     /// Renames a version of `channel`'s room.
@@ -279,6 +288,16 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u32(&mut out, channel.0);
             put_bytes(&mut out, actor);
         }
+        Message::AwarenessClearKey {
+            channel,
+            actor,
+            key,
+        } => {
+            put_u8(&mut out, 20);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, actor);
+            put_bytes(&mut out, key);
+        }
         Message::VersionCreate { channel, name } => {
             put_u8(&mut out, 11);
             put_u32(&mut out, channel.0);
@@ -424,6 +443,16 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let channel = Channel(cur.u32()?);
             let actor = cur.bytes()?;
             Message::AwarenessClear { channel, actor }
+        }
+        20 => {
+            let channel = Channel(cur.u32()?);
+            let actor = cur.bytes()?;
+            let key = cur.bytes()?;
+            Message::AwarenessClearKey {
+                channel,
+                actor,
+                key,
+            }
         }
         11 => Message::VersionCreate {
             channel: Channel(cur.u32()?),

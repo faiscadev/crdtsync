@@ -394,6 +394,19 @@ impl ClientSession {
                 room.awareness.retain(|(a, _), _| *a != actor);
                 Ok(())
             }
+            Message::AwarenessClearKey {
+                channel,
+                actor,
+                key,
+            } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
+                // A single entry's timed TTL expired; drop just that (actor, key).
+                room.awareness.remove(&(actor, key));
+                Ok(())
+            }
             Message::Error { code, message, .. } => Err(ClientError::Server { code, message }),
             Message::Accepted { channel, through } => {
                 let room = self

@@ -8,6 +8,13 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
+## 2026-07-04 · Unit 3b-i/#166 · timed awareness TTL gets a per-key clear on the wire, not a reuse of the actor-wide clear
+**Changed:** no ARCHITECTURE change — refines the pre-implementation sketch. The board's Unit 3 note sketched "reuse `AwarenessClear`"; ARCHITECTURE §TTL is the authority ("Timed TTL cleared on expiry; removal broadcast", per entry), and awareness entries are per-kind.
+- **A new `Message::AwarenessClearKey { channel, actor, key }` (wire tag 20)** drops a single one of an actor's entries, complementing the existing actor-wide `AwarenessClear`. Timed TTL expires one kind ("cursor") after silence while the actor's other kinds ("selection") and its connection live on, so the actor-wide clear is too coarse — it would drop presence the actor still holds. The core client's `receive` removes just that `(actor, key)`; a client that sends one is a protocol violation (the message only travels server→client, like `AwarenessUpdate`/`AwarenessClear`).
+- **Sliced 3b wire → pure enforcement → schema wiring → throttle.** 3b-i is the forward-compat wire addition (cheap now, painful once adopted); 3b-ii is the pure sweep logic with an injected TTL; 3b-iii resolves the governing schema per room and feeds real TTLs; 3b-iv is throttle/coalesce.
+
+**Why:** per-kind timed TTL is genuinely per-entry, so the removal broadcast must name the entry — the actor-wide clear cannot express "one kind expired." Adding the wire variant first keeps the envelope stable for the enforcement slices to target. Break compat freely (pre-release). Unblocks 3b-ii.
+
 ## 2026-07-04 · Unit 5c-iii-b/#165 · the app declaration is one C-ABI entry point mirrored across every binding
 **Changed:** no ARCHITECTURE change — the SDK surface for the core `declare_app`.
 - **A single C-ABI `crdtsync_client_declare_app(client, app_id, app_id_len, schema_version) -> i32`** carries the declaration; the Python/Go/wasm bindings are thin forwards (`Client.declare_app`, `(*Client).DeclareApp`, `WasmClient.declare_app`). An empty `app_id` is accepted as a relay declaration (`as_slice` maps len 0 to an empty slice), so a binding need not special-case "no app". The C ABI returns `1`/`-1` (bad handle) matching the crate's other mutating entry points; the higher-level bindings drop the code since a live wrapper handle never fails.
