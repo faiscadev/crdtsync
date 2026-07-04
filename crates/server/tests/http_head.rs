@@ -132,6 +132,23 @@ fn an_over_large_head_is_rejected_not_buffered_forever() {
 }
 
 #[test]
+fn bare_lf_line_endings_are_rejected() {
+    // Line endings must be CRLF: accepting bare LF as well is a request-smuggling
+    // ambiguity, so a bare-LF request line or header line is malformed even when
+    // the head still terminates with a proper blank line.
+    assert_eq!(
+        parse(b"POST /x HTTP/1.1\nContent-Length: 3\r\n\r\n"),
+        Err(HeadError::BadRequestLine),
+        "a bare-LF request line"
+    );
+    assert_eq!(
+        parse(b"POST /x HTTP/1.1\r\nContent-Length: 3\nHost: a\r\n\r\n"),
+        Err(HeadError::BadHeader),
+        "a bare-LF-separated header line"
+    );
+}
+
+#[test]
 fn arbitrary_bytes_never_panic() {
     let hostile: &[&[u8]] = &[
         b"\x00\x01\x02",

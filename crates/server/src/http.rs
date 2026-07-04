@@ -44,10 +44,9 @@ impl Head {
 
     /// The value of `name`, matched case-insensitively; `None` if absent.
     pub fn header(&self, name: &str) -> Option<&str> {
-        let name = name.to_ascii_lowercase();
         self.headers
             .iter()
-            .find(|(n, _)| *n == name)
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
 }
@@ -94,7 +93,7 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<Head>, HeadError> {
         return Err(HeadError::HeadTooLarge);
     }
 
-    let mut lines = split_lines(&buf[..term]);
+    let mut lines = split_crlf(&buf[..term]);
     let request_line = lines.next().ok_or(HeadError::BadRequestLine)?;
     let (method, target) = parse_request_line(request_line)?;
 
@@ -123,11 +122,29 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<Head>, HeadError> {
     }))
 }
 
-/// Split header bytes into lines on `LF`, dropping a trailing `CR` from each so a
-/// `CRLF`-delimited head yields clean lines.
-fn split_lines(head: &[u8]) -> impl Iterator<Item = &[u8]> {
-    head.split(|&b| b == b'\n')
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+/// Split header bytes on the two-byte `CRLF` sequence. Line endings must be
+/// exactly `CRLF`: a segment carrying a stray `CR` or `LF` is a bare-`LF` (or
+/// bare-`CR`) ending, which the line parsers reject — accepting both `CRLF` and
+/// bare `LF` is a request-smuggling ambiguity.
+fn split_crlf(head: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = head;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        match rest.windows(2).position(|w| w == b"\r\n") {
+            Some(i) => {
+                let line = &rest[..i];
+                rest = &rest[i + 2..];
+                Some(line)
+            }
+            None => {
+                done = true;
+                Some(rest)
+            }
+        }
+    })
 }
 
 /// Parse `METHOD SP TARGET SP HTTP/1.1` into its method and target. Exactly three
@@ -135,6 +152,9 @@ fn split_lines(head: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// a present-but-wrong one is an unsupported version.
 fn parse_request_line(line: &[u8]) -> Result<(String, String), HeadError> {
     let line = std::str::from_utf8(line).map_err(|_| HeadError::BadRequestLine)?;
+    if line.contains(['\r', '\n']) {
+        return Err(HeadError::BadRequestLine);
+    }
     let mut parts = line.split(' ');
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -152,6 +172,9 @@ fn parse_request_line(line: &[u8]) -> Result<(String, String), HeadError> {
 /// trimmed. An empty name, an internal-whitespace name, or no colon is rejected.
 fn parse_header_line(line: &[u8]) -> Result<(String, String), HeadError> {
     let line = std::str::from_utf8(line).map_err(|_| HeadError::BadHeader)?;
+    if line.contains(['\r', '\n']) {
+        return Err(HeadError::BadHeader);
+    }
     let colon = line.find(':').ok_or(HeadError::BadHeader)?;
     let name = &line[..colon];
     if name.is_empty() || name.contains(char::is_whitespace) {
