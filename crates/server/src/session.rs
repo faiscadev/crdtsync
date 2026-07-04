@@ -92,6 +92,12 @@ impl Session {
         self.identity.as_ref()
     }
 
+    /// The room this connection has bound to `channel`, if any — the reverse of a
+    /// subscribe, for resolving an inbound frame's room from its channel handle.
+    pub fn room_for_channel(&self, channel: Channel) -> Option<&RoomId> {
+        self.channels.get(&channel)
+    }
+
     /// The channels this connection has bound to `room`. A broadcast for the
     /// room is delivered on each — one connection may hold the same room on
     /// more than one channel.
@@ -146,6 +152,7 @@ pub fn step(
     authorizer: &dyn Authorizer,
     registry: &Mutex<SchemaRegistry>,
     now: u64,
+    throttle: Option<u64>,
     msg: Message,
 ) -> Response {
     match msg {
@@ -349,25 +356,30 @@ pub fn step(
             }
             // Ephemeral: retained for late-joiner replay and fanned to the room's
             // peers, but never logged or snapshotted. A key dropped at the
-            // per-client cap is neither stored nor broadcast.
-            if !hub.set_awareness(
+            // per-client cap is neither stored nor broadcast; a throttled update
+            // arriving inside its window is coalesced — recorded but not fanned out
+            // from here (the client SDK's debounce delivers the trailing value).
+            let outcome = hub.set_awareness(
                 &room,
                 client,
                 actor.clone(),
                 key.clone(),
                 value.clone(),
                 now,
-            ) {
-                return Response::default();
-            }
-            Response {
-                awareness: Some(AwarenessBroadcast {
-                    room,
-                    actor,
-                    key,
-                    value,
-                }),
-                ..Response::default()
+                throttle,
+            );
+            if outcome.stored && outcome.broadcast {
+                Response {
+                    awareness: Some(AwarenessBroadcast {
+                        room,
+                        actor,
+                        key,
+                        value,
+                    }),
+                    ..Response::default()
+                }
+            } else {
+                Response::default()
             }
         }
         // Peer updates and clears only travel server-to-client.

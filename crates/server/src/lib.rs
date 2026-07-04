@@ -7,6 +7,7 @@
 //! replays everything past it — the log a fresh replica replays back to the
 //! same state. Pure state; the transport wraps it.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
@@ -98,6 +99,13 @@ pub trait AwarenessPolicy: Send + Sync {
     fn has_timed_ttls(&self) -> bool {
         true
     }
+
+    /// The coalesce window in milliseconds for entry `key` in `room`, or `None`
+    /// for an unthrottled kind — every update fans out at once. Within the window
+    /// an update is coalesced: recorded but not fanned out.
+    fn throttle(&self, _room: &[u8], _key: &[u8]) -> Option<u64> {
+        None
+    }
 }
 
 /// The default policy: every entry is session-lifetime, so a server with no
@@ -139,17 +147,25 @@ impl SchemaAwarenessPolicy {
             has_timed_ttls,
         }
     }
+
+    fn entry(&self, room: &[u8], key: &[u8]) -> Option<&crdtsync_core::AwarenessEntry> {
+        let schema = self.schemas.get(room)?;
+        let kind = std::str::from_utf8(key).ok()?;
+        schema.awareness_entry(kind)
+    }
 }
 
 impl AwarenessPolicy for SchemaAwarenessPolicy {
     fn ttl(&self, room: &[u8], key: &[u8]) -> Option<u64> {
-        let schema = self.schemas.get(room)?;
-        let kind = std::str::from_utf8(key).ok()?;
-        schema.awareness_entry(kind).and_then(|e| e.ttl)
+        self.entry(room, key).and_then(|e| e.ttl)
     }
 
     fn has_timed_ttls(&self) -> bool {
         self.has_timed_ttls
+    }
+
+    fn throttle(&self, room: &[u8], key: &[u8]) -> Option<u64> {
+        self.entry(room, key).and_then(|e| e.throttle)
     }
 }
 
@@ -193,18 +209,37 @@ impl AwarenessRemoval {
     }
 }
 
+/// The result of recording an awareness entry: whether it was stored (a key past
+/// the per-client cap is dropped) and whether it should fan out now (an update
+/// arriving faster than its throttle window is coalesced — recorded, not sent).
+pub struct SetOutcome {
+    pub stored: bool,
+    pub broadcast: bool,
+}
+
+/// One client's awareness entry for a key: the actor to surface it under, the last
+/// value fanned out to the room, the wall-clock millis it was last set
+/// (`last_seen`, the timed-TTL basis) and last fanned out (`last_broadcast`, the
+/// throttle-window basis). `value` is always what peers were last sent, so a
+/// joiner replaying it sees exactly what existing peers see.
+struct Presence {
+    actor: Vec<u8>,
+    value: Vec<u8>,
+    last_seen: u64,
+    last_broadcast: u64,
+}
+
 /// The set of rooms a single node serves, optionally over a durable log.
 pub struct Hub {
     server: ClientId,
     rooms: HashMap<RoomId, Room>,
     store: Option<Store>,
     compaction_threshold: u64,
-    /// Ephemeral presence per room: each owner client's latest entry per key,
-    /// with the actor to surface it under and the wall-clock millis it was last
-    /// set — the basis for timed-TTL expiry. Never persisted or snapshotted.
-    /// Per room, each client's presence keyed by key → (actor, value, last_seen).
-    /// Nesting by client keeps the per-client key cap an O(1) check.
-    awareness: HashMap<RoomId, HashMap<ClientId, HashMap<Vec<u8>, (Vec<u8>, Vec<u8>, u64)>>>,
+    /// Ephemeral presence per room: each owner client's latest [`Presence`] per
+    /// key. Never persisted or snapshotted. Nesting by client keeps the per-client
+    /// key cap an O(1) check and lets a disconnect find a client's own entries
+    /// directly.
+    awareness: HashMap<RoomId, HashMap<ClientId, HashMap<Vec<u8>, Presence>>>,
     /// Named versions per room, keyed by name — sorted, for listing/pagination.
     /// The in-memory versions index over the snapshot storage primitive.
     versions: HashMap<RoomId, BTreeMap<Vec<u8>, Version>>,
@@ -226,10 +261,20 @@ impl Hub {
     /// Record `client`'s ephemeral awareness entry `key` in `room`, last-writer-
     /// wins, so a later subscriber can be replayed the current presence. A new
     /// key past the per-client cap is dropped, so a client cannot grow the room's
-    /// awareness map without bound; an update to an existing key always applies.
-    /// Returns whether the entry was stored — a dropped key is not broadcast
-    /// either, so the cap bounds fan-out as well as memory. `now` stamps the
-    /// entry's last-seen time, so re-setting a key on activity refreshes its TTL.
+    /// awareness map without bound. `now` stamps the entry's last-seen time on
+    /// every set — including a coalesced one — so activity refreshes the TTL even
+    /// while the throttle holds the wire quiet.
+    ///
+    /// `throttle` is the kind's coalesce window. The first update, any update on an
+    /// unthrottled kind, and the first update once the window has elapsed fan out
+    /// at once ([`SetOutcome::broadcast`] `true`) and become the entry's stored
+    /// value. An update arriving inside the window is coalesced: it refreshes the
+    /// last-seen time but does not replace the stored value or fan out — the server
+    /// caps the outbound rate, and the client SDK's debounce owns delivering the
+    /// trailing value on its next past-window send. So the stored value is always
+    /// what the room was last sent, keeping every peer and any joiner in agreement.
+    /// `checked_sub` treats a backward clock step as elapsed, so a skew fans out
+    /// rather than freezing the entry. A dropped key is neither stored nor sent.
     pub fn set_awareness(
         &mut self,
         room: &[u8],
@@ -238,18 +283,57 @@ impl Hub {
         key: Vec<u8>,
         value: Vec<u8>,
         now: u64,
-    ) -> bool {
+        throttle: Option<u64>,
+    ) -> SetOutcome {
         let keys = self
             .awareness
             .entry(room.to_vec())
             .or_default()
             .entry(client)
             .or_default();
-        if !keys.contains_key(&key) && keys.len() >= MAX_AWARENESS_KEYS_PER_CLIENT {
-            return false;
+        let len = keys.len();
+        match keys.entry(key) {
+            Entry::Occupied(mut slot) => {
+                let p = slot.get_mut();
+                // Fan out an unthrottled kind, or the first update once the window
+                // has elapsed; otherwise coalesce — refresh the last-seen time
+                // (activity, so it does not TTL-expire mid-stream) but keep the
+                // stored value and hold the wire quiet. `checked_sub` treats a
+                // backward clock step as elapsed, so a skew fans out.
+                let broadcast = throttle.map_or(true, |window| {
+                    now.checked_sub(p.last_broadcast)
+                        .map_or(true, |elapsed| elapsed >= window)
+                });
+                p.last_seen = now;
+                if broadcast {
+                    p.actor = actor;
+                    p.value = value;
+                    p.last_broadcast = now;
+                }
+                SetOutcome {
+                    stored: true,
+                    broadcast,
+                }
+            }
+            Entry::Vacant(slot) => {
+                if len >= MAX_AWARENESS_KEYS_PER_CLIENT {
+                    return SetOutcome {
+                        stored: false,
+                        broadcast: false,
+                    };
+                }
+                slot.insert(Presence {
+                    actor,
+                    value,
+                    last_seen: now,
+                    last_broadcast: now,
+                });
+                SetOutcome {
+                    stored: true,
+                    broadcast: true,
+                }
+            }
         }
-        keys.insert(key, (actor, value, now));
-        true
     }
 
     /// The current awareness entries in `room` as `(actor, key, value)`, for
@@ -261,7 +345,7 @@ impl Hub {
             .flatten()
             .flat_map(|(_, keys)| {
                 keys.iter()
-                    .map(|(key, (actor, value, _))| (actor.clone(), key.clone(), value.clone()))
+                    .map(|(key, p)| (p.actor.clone(), key.clone(), p.value.clone()))
             })
             .collect()
     }
@@ -284,15 +368,13 @@ impl Hub {
         let mut expired = Vec::new();
         for (room, by_client) in self.awareness.iter_mut() {
             for keys in by_client.values_mut() {
-                keys.retain(
-                    |key, (actor, _value, last_seen)| match policy.ttl(room, key) {
-                        Some(ttl) if now.saturating_sub(*last_seen) > ttl => {
-                            expired.push((room.clone(), actor.clone(), key.clone()));
-                            false
-                        }
-                        _ => true,
-                    },
-                );
+                keys.retain(|key, p| match policy.ttl(room, key) {
+                    Some(ttl) if now.saturating_sub(p.last_seen) > ttl => {
+                        expired.push((room.clone(), p.actor.clone(), key.clone()));
+                        false
+                    }
+                    _ => true,
+                });
             }
             by_client.retain(|_, keys| !keys.is_empty());
         }
@@ -308,8 +390,8 @@ impl Hub {
         let mut surviving: HashSet<(RoomId, Vec<u8>, Vec<u8>)> = HashSet::new();
         for (room, by_client) in &self.awareness {
             for keys in by_client.values() {
-                for (key, (actor, _, _)) in keys {
-                    surviving.insert((room.clone(), actor.clone(), key.clone()));
+                for (key, p) in keys {
+                    surviving.insert((room.clone(), p.actor.clone(), key.clone()));
                 }
             }
         }
@@ -351,18 +433,18 @@ impl Hub {
             let Some(removed) = by_client.remove(&client) else {
                 continue;
             };
-            let Some((actor, _, _)) = removed.values().next() else {
+            let Some(first) = removed.values().next() else {
                 continue;
             };
-            let actor = actor.clone();
+            let actor = first.actor.clone();
             let holds = |key: &[u8]| {
                 by_client
                     .values()
-                    .any(|keys| keys.get(key).is_some_and(|(a, _, _)| a == &actor))
+                    .any(|keys| keys.get(key).is_some_and(|p| p.actor == actor))
             };
             let has_sibling = by_client
                 .values()
-                .any(|keys| keys.values().any(|(a, _, _)| a == &actor));
+                .any(|keys| keys.values().any(|p| p.actor == actor));
             if has_sibling {
                 for key in removed.keys() {
                     if !holds(key) {
