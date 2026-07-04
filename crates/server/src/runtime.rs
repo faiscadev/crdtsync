@@ -150,7 +150,7 @@ pub async fn serve_with_verifier(
     server: ClientId,
     store: Option<Store>,
     config: ServeConfig,
-    verifier: Box<dyn Verifier + Send>,
+    verifier: Box<dyn Verifier + Send + Sync>,
 ) -> std::io::Result<()> {
     serve_with_authorizer(
         listener,
@@ -174,8 +174,8 @@ pub async fn serve_with_authorizer(
     server: ClientId,
     store: Option<Store>,
     config: ServeConfig,
-    verifier: Box<dyn Verifier + Send>,
-    authorizer: Box<dyn Authorizer + Send>,
+    verifier: Box<dyn Verifier + Send + Sync>,
+    authorizer: Box<dyn Authorizer + Send + Sync>,
 ) -> std::io::Result<()> {
     // Replay the persisted log here, before serving: a corrupt log fails
     // startup rather than panicking inside the detached actor thread and
@@ -233,8 +233,8 @@ async fn registry_actor(
     rooms: Vec<(RoomId, RoomLog)>,
     store: Option<Store>,
     config: ServeConfig,
-    verifier: Box<dyn Verifier + Send>,
-    authorizer: Box<dyn Authorizer + Send>,
+    verifier: Box<dyn Verifier + Send + Sync>,
+    authorizer: Box<dyn Authorizer + Send + Sync>,
     mut cmds: UnboundedReceiver<Cmd>,
 ) {
     // The rooms were validated during startup, so reconstruction can't fail.

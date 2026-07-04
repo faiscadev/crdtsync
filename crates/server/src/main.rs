@@ -23,7 +23,9 @@ use crdtsync_core::ClientId;
 use crdtsync_server::acl::{Acl, PolicyFileError};
 use crdtsync_server::auth::CredentialsFileError;
 use crdtsync_server::runtime::{serve_with_authorizer, ServeConfig};
-use crdtsync_server::{AllowAll, Authorizer, PermitAll, StaticTokens, Store, Verifier};
+use crdtsync_server::{
+    serve_admin, AllowAll, Authorizer, PermitAll, SchemaRegistry, StaticTokens, Store, Verifier,
+};
 use tokio::net::TcpListener;
 
 /// Read an environment variable that names a filesystem path, mapping absence to
@@ -44,7 +46,7 @@ fn path_var(name: &'static str) -> std::io::Result<Option<String>> {
 /// [`CredentialsFileError`] (its "credentials file" context, with the underlying
 /// error as the source), keeping the original [`io::ErrorKind`](std::io::ErrorKind)
 /// so a missing file still reads as `NotFound`.
-fn verifier() -> std::io::Result<Box<dyn Verifier + Send>> {
+fn verifier() -> std::io::Result<Box<dyn Verifier + Send + Sync>> {
     match path_var("CRDTSYNC_CREDENTIALS_FILE")? {
         Some(path) => {
             let table = StaticTokens::from_credentials_file(path).map_err(|e| {
@@ -63,7 +65,7 @@ fn verifier() -> std::io::Result<Box<dyn Verifier + Send>> {
 /// The authorizer for the run: a declared policy if `CRDTSYNC_POLICY_FILE` is set,
 /// else the permissive `PermitAll`. A malformed policy surfaces the full
 /// [`PolicyFileError`] the way [`verifier`] surfaces its own.
-fn authorizer() -> std::io::Result<Box<dyn Authorizer + Send>> {
+fn authorizer() -> std::io::Result<Box<dyn Authorizer + Send + Sync>> {
     match path_var("CRDTSYNC_POLICY_FILE")? {
         Some(path) => {
             let acl = Acl::from_policy_file(path).map_err(|e| {
@@ -95,20 +97,37 @@ async fn main() -> std::io::Result<()> {
         Some(dir) => Some(Store::open(dir)?),
         None => None,
     };
-    let verifier = verifier()?;
-    let authorizer = authorizer()?;
     let listener = TcpListener::bind(&addr).await?;
     eprintln!("crdtsync serving on ws://{addr}");
     // The server never mints ops; its replicas only merge, so a fixed id is fine.
     // Both seams default to their permissive dev-mode value when unconfigured, so
     // one serve path covers every combination.
-    serve_with_authorizer(
+    let data = serve_with_authorizer(
         listener,
         ClientId::from_bytes([0; 16]),
         store,
         ServeConfig::default(),
-        verifier,
-        authorizer,
-    )
-    .await
+        verifier()?,
+        authorizer()?,
+    );
+
+    // The schema-registration admin plane is a separate control-plane listener,
+    // enabled only when CRDTSYNC_ADMIN_ADDR is set (unset → relay-only, no
+    // registration). It gates registration through the same verifier + policy as
+    // the data plane, differing only in the action + resource it checks.
+    match path_var("CRDTSYNC_ADMIN_ADDR")? {
+        Some(admin_addr) => {
+            let admin_listener = TcpListener::bind(&admin_addr).await?;
+            eprintln!("crdtsync admin on http://{admin_addr}");
+            let admin = serve_admin(
+                admin_listener,
+                verifier()?,
+                authorizer()?,
+                SchemaRegistry::new(),
+            );
+            tokio::try_join!(data, admin)?;
+            Ok(())
+        }
+        None => data.await,
+    }
 }
