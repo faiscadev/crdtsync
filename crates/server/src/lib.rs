@@ -30,7 +30,7 @@ pub use auth::{AllowAll, Identity, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use registry::{ConnId, Registry};
-pub use schema_registry::{RegisterError, Registered, SchemaRegistry};
+pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry};
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{RoomLog, Snapshot, Store};
 

@@ -8,6 +8,13 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
+## 2026-07-04 · Unit 5c-ii-a/#159 · the handshake tier decision is a pure method on the registry
+**Changed:** no ARCHITECTURE change — an implementation + slicing decision.
+- **The accept/reject/tier policy lives on `SchemaRegistry` as a pure `resolve_handshake`**, separate from the data-plane wiring that will call it (5c-ii-b). The decision is a pure function of registry state, so it is isolated as a spec'd, Miri-clean method — a bug here would mis-tier a connection or let an unknown version through, so it is worth verifying before any plumbing.
+- **The tier vocabulary is `Relay` / `Enforcing { version }` / `Reject`.** Relay covers both "no app" (empty `app_id`) and "app never registered" — ARCHITECTURE serves both with zero schema enforcement, so they collapse to one tier. A version-0 (dynamic) client on a registered app resolves to `Enforcing { head }` — it adopts the chain head — so `Enforcing` always carries a concrete version the caller can pin to. `Reject` is only reachable for a registered app with a declared version the registry does not hold (§Distribution: unknown version rejected, not fabricated).
+
+**Why:** pinning the tier decision to the registry keeps it where the data it needs lives, and isolating it as a pure unit lets the risky data-plane change (5c-ii-b: sharing the registry into the handshake, acting on a `Reject`) build on a proven decision. Unblocks 5c-ii-b.
+
 ## 2026-07-04 · Unit 5c-i/#158 · the handshake carries the app declaration in Hello, not a new phase
 **Changed:** no ARCHITECTURE change — an implementation decision for the handshake wire.
 - **`app_id` + `schema_version` are added to the existing `Hello` message**, not carried by a new fourth handshake phase. ARCHITECTURE pins the handshake as three phases (Hello / Auth / Subscribe, §Handshake / decided-decisions), and Hello is the connection-open message where the client names itself — so it is where the client also names the app it speaks for. `app_id` empty means a relay connection (no app); `schema_version` `0` means the client declares no version (a dynamic client that adopts whatever the server serves), distinct from a declared `>= 1` the server resolves against its registry.

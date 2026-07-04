@@ -48,6 +48,21 @@ pub enum Registered {
     Unchanged,
 }
 
+/// The tier a connection resolves to when a client names its `{app_id, version}`
+/// at the handshake.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Resolution {
+    /// No app, or an app that never registered a schema: served with no schema
+    /// enforcement.
+    Relay,
+    /// A registered app pinned to `version` — a declared known version, or the
+    /// head adopted by a version-0 dynamic client.
+    Enforcing { version: u32 },
+    /// A registered app for which the client declared a version the registry does
+    /// not hold: refused, not fabricated.
+    Reject,
+}
+
 /// Why a registration was refused. The chain stays hash-locked: contiguous from
 /// version 1, every link immutable once registered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -135,6 +150,29 @@ impl SchemaRegistry {
     /// version — the content hash a boot-time chain verification checks against.
     pub fn hash(&self, app_id: &[u8], version: u32) -> Option<[u8; 32]> {
         self.link(app_id, version).map(|l| l.hash)
+    }
+
+    /// Resolve a client's handshake declaration to its tier. An empty `app_id`,
+    /// or an app that never registered, is a [`Relay`](Resolution::Relay). A
+    /// registered app pins the connection to a version: `version` `0` is a
+    /// dynamic client that adopts the chain head, a declared version the registry
+    /// holds is [`Enforcing`](Resolution::Enforcing) at that version, and a
+    /// declared version it does not hold is a [`Reject`](Resolution::Reject).
+    pub fn resolve_handshake(&self, app_id: &[u8], version: u32) -> Resolution {
+        if app_id.is_empty() {
+            return Resolution::Relay;
+        }
+        let Some(head) = self.head_version(app_id) else {
+            return Resolution::Relay;
+        };
+        if version == 0 {
+            return Resolution::Enforcing { version: head };
+        }
+        if self.resolve(app_id, version).is_some() {
+            Resolution::Enforcing { version }
+        } else {
+            Resolution::Reject
+        }
     }
 
     /// The highest version registered for `app_id`, or `None` if it has none.
