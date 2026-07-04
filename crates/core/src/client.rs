@@ -46,29 +46,51 @@ struct Room {
 pub struct ClientSession {
     client: ClientId,
     actor: Option<Vec<u8>>,
+    app_id: Vec<u8>,
+    schema_version: u32,
     rooms: HashMap<Channel, Room>,
     next_channel: u32,
 }
 
 impl ClientSession {
-    /// A session for `client` holding no rooms yet.
+    /// A session for `client` holding no rooms yet. It opens as a relay — no app
+    /// named, no schema version — until [`declare_app`](Self::declare_app) names one.
     pub fn new(client: ClientId) -> Self {
         Self {
             client,
             actor: None,
+            app_id: Vec::new(),
+            schema_version: 0,
             rooms: HashMap::new(),
             next_channel: 0,
         }
     }
 
-    /// The opening frame, naming this replica to the server.
+    /// Declare the app this replica speaks for and the schema version it targets,
+    /// carried in the next [`hello`](Self::hello). An empty `app_id` (or the
+    /// default) opens a relay connection; a named app with `schema_version` 0 is a
+    /// dynamic client that adopts the server's head. Call before `hello`.
+    pub fn declare_app(&mut self, app_id: &[u8], schema_version: u32) {
+        self.app_id = app_id.to_vec();
+        self.schema_version = schema_version;
+    }
+
+    /// The declared app id — empty for a relay connection.
+    pub fn app_id(&self) -> &[u8] {
+        &self.app_id
+    }
+
+    /// The declared schema version — 0 for a relay or a dynamic client.
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// The opening frame, naming this replica and the app it speaks for.
     pub fn hello(&self) -> Message {
         Message::Hello {
             client: self.client,
-            // The app declaration is wired through in a later unit; a bare
-            // client opens as a relay connection (no app, no schema version).
-            app_id: Vec::new(),
-            schema_version: 0,
+            app_id: self.app_id.clone(),
+            schema_version: self.schema_version,
         }
     }
 

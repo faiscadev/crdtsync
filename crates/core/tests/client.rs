@@ -73,6 +73,71 @@ fn hello_names_the_client() {
 }
 
 #[test]
+fn a_bare_session_opens_as_a_relay() {
+    let session = ClientSession::new(cid(1));
+    assert_eq!(session.app_id(), b"");
+    assert_eq!(session.schema_version(), 0);
+    match session.hello() {
+        Message::Hello {
+            app_id,
+            schema_version,
+            ..
+        } => {
+            assert_eq!(app_id, b"");
+            assert_eq!(schema_version, 0, "empty app + version 0 is a relay");
+        }
+        other => panic!("expected Hello, got {other:?}"),
+    }
+}
+
+#[test]
+fn declaring_an_app_carries_it_and_the_version_into_hello() {
+    let mut session = ClientSession::new(cid(1));
+    session.declare_app(b"app-x", 3);
+    assert_eq!(session.app_id(), b"app-x");
+    assert_eq!(session.schema_version(), 3);
+    match session.hello() {
+        Message::Hello {
+            client,
+            app_id,
+            schema_version,
+        } => {
+            assert_eq!(client, cid(1));
+            assert_eq!(app_id, b"app-x");
+            assert_eq!(schema_version, 3);
+        }
+        other => panic!("expected Hello, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_declared_app_with_version_zero_is_a_dynamic_client() {
+    // Naming an app but leaving the version at 0 asks the server for its head.
+    let mut session = ClientSession::new(cid(1));
+    session.declare_app(b"app-x", 0);
+    match session.hello() {
+        Message::Hello {
+            app_id,
+            schema_version,
+            ..
+        } => {
+            assert_eq!(app_id, b"app-x");
+            assert_eq!(schema_version, 0);
+        }
+        other => panic!("expected Hello, got {other:?}"),
+    }
+}
+
+#[test]
+fn re_declaring_an_app_replaces_the_prior_declaration() {
+    let mut session = ClientSession::new(cid(1));
+    session.declare_app(b"app-x", 1);
+    session.declare_app(b"app-y", 7);
+    assert_eq!(session.app_id(), b"app-y");
+    assert_eq!(session.schema_version(), 7);
+}
+
+#[test]
 fn auth_presents_the_credential_verbatim() {
     let session = ClientSession::new(cid(1));
     match session.auth(b"my-token") {

@@ -8,6 +8,13 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
+## 2026-07-04 · Unit 5c-iii-a/#164 · the client declares its app through a setter, not a constructor argument
+**Changed:** no ARCHITECTURE change — an implementation + slicing decision.
+- **`ClientSession::declare_app(app_id, schema_version)` is a setter on the existing session**, not a new `new_for_app` constructor or a `new` parameter. `ClientSession::new(client)` has many call sites; a setter with a relay default (empty `app_id`, version 0) leaves every one untouched and keeps the bare-relay path the default a client falls into if it never declares an app. `hello()` reads the fields instead of hardcoding empty/0 (the placeholder left by 5c-i).
+- **Sliced 5c-iii core → SDK.** 5c-iii-a is the pure, Miri-clean core API (setter + accessors + `hello` wiring), unit-testable with no bindings. 5c-iii-b exposes it over the C ABI + Python/Go/wasm — four language surfaces that share nothing with the core logic, so they slice off cleanly.
+
+**Why:** a setter with a relay default keeps a client-facing API addition from rippling into unrelated construction sites and makes "no app declared ⇒ relay" the explicit default, matching the server's resolution (empty/0 ⇒ relay). Isolating the core API from the four-language SDK surface keeps each PR reviewable. Completes the data path of the handshake declaration; 5c-iii-b carries it to embedders.
+
 ## 2026-07-04 · Unit 5c-ii-b-2/#161 · one schema registry shared across the data + admin planes
 **Changed:** no ARCHITECTURE change — the cross-plane wiring that completes 5c-ii, rebased onto the axum admin plane (#162).
 - **A single `Arc<Mutex<SchemaRegistry>>` is shared by both planes.** `main.rs` creates it and threads it through `ServeConfig.schema` into `registry_actor` (which calls `Registry::set_schema_registry`, the data plane) and into `serve_admin` / `admin_router` (the admin plane, which writes it). One registry, both planes: a registration over the admin plane is at once visible to the data-plane handshake resolution. `admin_router`/`serve_admin` take the shared `Arc<Mutex<SchemaRegistry>>` rather than owning a fresh one.
