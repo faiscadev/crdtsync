@@ -18,9 +18,10 @@ use crate::{Catchup, Hub, RoomId};
 
 /// One client connection's protocol state. The handshake runs Hello → Auth →
 /// Subscribe: the client names itself, then presents a credential the server
-/// turns into an actor, then joins rooms. A connection multiplexes several room
-/// subscriptions, each on its own [`Channel`]; the client assigns the handle at
-/// Subscribe and every later frame names it.
+/// turns into an [`Identity`] (actor plus roles and groups), then joins rooms. A
+/// connection multiplexes several room subscriptions, each on its own
+/// [`Channel`]; the client assigns the handle at Subscribe and every later frame
+/// names it.
 pub struct Session {
     client: Option<ClientId>,
     identity: Option<Identity>,
