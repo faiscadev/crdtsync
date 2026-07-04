@@ -14,6 +14,7 @@
 pub mod anchor;
 pub mod host;
 pub mod json;
+pub mod repair;
 pub mod schema;
 pub mod validate;
 
