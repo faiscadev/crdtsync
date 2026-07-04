@@ -873,6 +873,61 @@ fn a_duplicate_role_is_rejected() {
 }
 
 #[test]
+fn a_role_named_like_a_subject_class_is_rejected() {
+    // Reserving the class keywords keeps a grant's `to` unambiguous.
+    for kw in ["authenticated", "anonymous", "anyone"] {
+        let src = format!(r#"{{ "roles": ["{kw}"] }}"#);
+        assert_eq!(auth_err(&src), SchemaErrorKind::ReservedRole, "{kw}");
+    }
+}
+
+#[test]
+fn a_duplicate_role_error_names_the_array_element() {
+    let e = Schema::parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "auth": { "roles": ["a", "b", "b"] } }"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::DuplicateRole);
+    assert_eq!(e.at, "auth.roles[2]", "names the duplicate's index");
+}
+
+#[test]
+fn grant_value_errors_name_the_real_key() {
+    // An unknown action names the allow/deny key that carries it, not a
+    // pseudo-key spelled after the value.
+    let e = Schema::parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "auth": { "grants": [ { "allow": "frobnicate", "to": "anyone", "on": "/" } ] } }"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::UnknownAction);
+    assert!(e.at.ends_with(".allow"), "names the allow key: {}", e.at);
+
+    // A bad subject names the `to` field, not a pseudo-key spelled after the
+    // offending value.
+    for (to, kind) in [
+        ("ghost", SchemaErrorKind::UnknownRoleRef),
+        ("${bogus}", SchemaErrorKind::BadSubject),
+    ] {
+        let src = format!(
+            r#"{{ "schema": "s", "version": 1, "root": "R",
+                 "types": {{ "R": {{ "kind": "map" }} }},
+                 "auth": {{ "grants": [ {{ "allow": "read", "to": "{to}", "on": "/" }} ] }} }}"#
+        );
+        let e = Schema::parse(&src).unwrap_err();
+        assert_eq!(e.kind, kind, "{to}");
+        assert!(
+            e.at.ends_with(".to"),
+            "names the to field for {to}: {}",
+            e.at
+        );
+    }
+}
+
+#[test]
 fn malformed_auth_shapes_are_rejected() {
     assert_eq!(auth_err("[]"), SchemaErrorKind::NotAnObject);
     assert_eq!(

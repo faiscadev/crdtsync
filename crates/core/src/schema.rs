@@ -186,6 +186,9 @@ pub enum SchemaErrorKind {
     BadPath,
     /// `auth.roles` declared the same role twice.
     DuplicateRole,
+    /// `auth.roles` declared a role with a reserved subject-class name
+    /// (`authenticated` / `anonymous` / `anyone`), which would shadow the class.
+    ReservedRole,
 }
 
 /// A schema failure: a [`SchemaErrorKind`] plus the field or type name it
@@ -225,6 +228,7 @@ impl std::fmt::Display for SchemaError {
             SchemaErrorKind::UnknownRoleRef => "grant references an undeclared role",
             SchemaErrorKind::BadPath => "grant path is not a well-formed absolute path",
             SchemaErrorKind::DuplicateRole => "duplicate role",
+            SchemaErrorKind::ReservedRole => "role name is a reserved subject class",
         };
         write!(f, "{what}: {}", self.at)
     }
@@ -515,6 +519,13 @@ fn parse_auth(json: &Json) -> Result<Auth, SchemaError> {
     Ok(Auth { roles, grants })
 }
 
+/// The subject-class keywords. A role may not be declared with one of these
+/// names, so a grant's `to` token resolves unambiguously (always the class,
+/// never a shadowed role).
+fn is_reserved_subject(name: &str) -> bool {
+    matches!(name, "authenticated" | "anonymous" | "anyone")
+}
+
 fn parse_roles(json: &Json) -> Result<Vec<String>, SchemaError> {
     let Some(roles) = json.get("roles") else {
         return Ok(Vec::new());
@@ -523,14 +534,21 @@ fn parse_roles(json: &Json) -> Result<Vec<String>, SchemaError> {
         .as_array()
         .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, "auth.roles"))?;
     let mut out: Vec<String> = Vec::with_capacity(arr.len());
-    for role in arr {
-        let name = role
-            .as_str()
-            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, "auth.roles"))?;
-        if out.iter().any(|r| r == name) {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(arr.len());
+    for (i, role) in arr.iter().enumerate() {
+        let name = role.as_str().ok_or_else(|| {
+            SchemaError::new(SchemaErrorKind::WrongType, format!("auth.roles[{i}]"))
+        })?;
+        if is_reserved_subject(name) {
+            return Err(SchemaError::new(
+                SchemaErrorKind::ReservedRole,
+                format!("auth.roles[{i}]"),
+            ));
+        }
+        if !seen.insert(name) {
             return Err(SchemaError::new(
                 SchemaErrorKind::DuplicateRole,
-                at("auth.roles", name),
+                format!("auth.roles[{i}]"),
             ));
         }
         out.push(name.to_string());
@@ -555,7 +573,7 @@ fn parse_grant(json: &Json, index: usize, roles: &HashSet<&str>) -> Result<Grant
     let action_name = action_val
         .as_str()
         .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, effect_key)))?;
-    let action = parse_action(action_name, &ctx)?;
+    let action = parse_action(action_name, &ctx, effect_key)?;
 
     let subject = parse_subject(required_str(json, "to", &ctx)?, roles, &ctx)?;
     let path = required_str(json, "on", &ctx)?.to_string();
@@ -569,29 +587,34 @@ fn parse_grant(json: &Json, index: usize, roles: &HashSet<&str>) -> Result<Grant
     })
 }
 
-fn parse_action(name: &str, ctx: &str) -> Result<Action, SchemaError> {
+/// The action is carried by the `allow` / `deny` key, so a bad value reports
+/// that key's location, not a pseudo-key named after the value.
+fn parse_action(name: &str, ctx: &str, effect_key: &str) -> Result<Action, SchemaError> {
     match name {
         "read" => Ok(Action::Read),
         "write" => Ok(Action::Write),
         "publish_awareness" => Ok(Action::PublishAwareness),
         _ => Err(SchemaError::new(
             SchemaErrorKind::UnknownAction,
-            at(ctx, name),
+            at(ctx, effect_key),
         )),
     }
 }
 
+/// The subject always comes from the `to` field, so every subject error reports
+/// `…grants[i].to`, not a pseudo-key named after the offending value.
 fn parse_subject(raw: &str, roles: &HashSet<&str>, ctx: &str) -> Result<Subject, SchemaError> {
+    let to = || at(ctx, "to");
     if let Some(rest) = raw.strip_prefix("${") {
         let var = rest
             .strip_suffix('}')
-            .ok_or_else(|| SchemaError::new(SchemaErrorKind::BadSubject, at(ctx, raw)))?;
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::BadSubject, to()))?;
         return match var {
             "actor_id" => Ok(Subject::Template(TemplateVar::ActorId)),
             "author_id" => Ok(Subject::Template(TemplateVar::AuthorId)),
             "room_id" => Ok(Subject::Template(TemplateVar::RoomId)),
             "branch_id" => Ok(Subject::Template(TemplateVar::BranchId)),
-            _ => Err(SchemaError::new(SchemaErrorKind::BadSubject, at(ctx, raw))),
+            _ => Err(SchemaError::new(SchemaErrorKind::BadSubject, to())),
         };
     }
     match raw {
@@ -599,10 +622,7 @@ fn parse_subject(raw: &str, roles: &HashSet<&str>, ctx: &str) -> Result<Subject,
         "anonymous" => Ok(Subject::Class(SubjectClass::Anonymous)),
         "anyone" => Ok(Subject::Class(SubjectClass::Anyone)),
         name if roles.contains(name) => Ok(Subject::Role(name.to_string())),
-        name => Err(SchemaError::new(
-            SchemaErrorKind::UnknownRoleRef,
-            at(ctx, name),
-        )),
+        _ => Err(SchemaError::new(SchemaErrorKind::UnknownRoleRef, to())),
     }
 }
 
