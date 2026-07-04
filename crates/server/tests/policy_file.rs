@@ -8,11 +8,15 @@
 #![cfg(not(miri))]
 
 use crdtsync_server::acl::{Acl, PolicyFileError};
-use crdtsync_server::{Action, Authorizer, Resource};
+use crdtsync_server::{Action, Authorizer, Identity, Resource};
 use std::path::PathBuf;
 
 fn read(a: &Acl, actor: &[u8], room: &[u8]) -> bool {
-    a.authorize(actor, Action::Read, &Resource::Room(room))
+    a.authorize(
+        &Identity::new(actor.to_vec()),
+        Action::Read,
+        &Resource::Room(room),
+    )
 }
 
 /// A unique temp path for this test, so parallel tests don't collide.

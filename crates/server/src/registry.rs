@@ -572,8 +572,8 @@ fn pick_app(apps: &HashMap<Vec<u8>, u32>) -> Option<(Vec<u8>, u32)> {
 /// on every fan-out. An unauthenticated connection holds no room subscription,
 /// so it never qualifies.
 fn peer_may_read(authorizer: &dyn Authorizer, session: &Session, room: &[u8]) -> bool {
-    match session.actor() {
-        Some(actor) => authorizer.authorize(actor, Action::Read, &Resource::Room(room)),
+    match session.identity() {
+        Some(identity) => authorizer.authorize(identity, Action::Read, &Resource::Room(room)),
         None => false,
     }
 }

@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Message};
 use crdtsync_server::{
-    Action, Authorizer, ConnId, ManualClock, NoTimedTtl, Registry, Resource, SchemaRegistry,
+    Action, Authorizer, ConnId, Identity, ManualClock, NoTimedTtl, Registry, Resource,
+    SchemaRegistry,
 };
 
 fn cid(first: u8) -> ClientId {
@@ -86,8 +87,8 @@ fn from_registry(sr: SchemaRegistry) -> (Registry, Arc<ManualClock>) {
 /// An authorizer denying `actor` the read of any room, permitting all else — so
 /// its subscribe is refused while others' succeed.
 fn deny_read(actor: &'static [u8]) -> Box<dyn Authorizer> {
-    Box::new(move |a: &[u8], action: Action, _res: &Resource| {
-        !(action == Action::Read && a == actor)
+    Box::new(move |id: &Identity, action: Action, _res: &Resource| {
+        !(action == Action::Read && id.actor() == actor)
     })
 }
 

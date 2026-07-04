@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Op, Scalar};
-use crdtsync_server::{Action, Authorizer, ConnId, ManualClock, Registry, Resource};
+use crdtsync_server::{Action, Authorizer, ConnId, Identity, ManualClock, Registry, Resource};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -68,8 +68,8 @@ fn revocable() -> (Arc<AtomicBool>, Box<dyn Authorizer>) {
     let revoked = Arc::new(AtomicBool::new(false));
     let flag = revoked.clone();
     let authorizer: Box<dyn Authorizer> =
-        Box::new(move |actor: &[u8], action: Action, _res: &Resource| {
-            !(action == Action::Read && actor == b"actor-2" && flag.load(Ordering::SeqCst))
+        Box::new(move |id: &Identity, action: Action, _res: &Resource| {
+            !(action == Action::Read && id.actor() == b"actor-2" && flag.load(Ordering::SeqCst))
         });
     (revoked, authorizer)
 }

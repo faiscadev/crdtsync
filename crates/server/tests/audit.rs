@@ -14,7 +14,7 @@ use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Message};
 use crdtsync_server::acl::{Acl, ResourceMatch, Subject};
 use crdtsync_server::audit::{AccessLog, AccessRecord, Audited, Decision};
-use crdtsync_server::{Action, Authorizer, ManualClock, Registry, Resource};
+use crdtsync_server::{Action, Authorizer, Identity, ManualClock, Registry, Resource};
 
 const ROOM: &[u8] = b"room-a";
 
@@ -54,14 +54,18 @@ impl AccessLog for Recorder {
 
 /// An authorizer that permits only reads, to drive both verdicts.
 fn read_only() -> Box<dyn Authorizer> {
-    Box::new(|_actor: &[u8], action: Action, _res: &Resource| action == Action::Read)
+    Box::new(|_id: &Identity, action: Action, _res: &Resource| action == Action::Read)
 }
 
 #[test]
 fn a_permitted_decision_is_recorded() {
     let rec = Recorder::default();
     let audited = Audited::new(read_only(), Box::new(rec.clone()));
-    assert!(audited.authorize(b"alice", Action::Read, &Resource::Room(ROOM)));
+    assert!(audited.authorize(
+        &Identity::new(b"alice".to_vec()),
+        Action::Read,
+        &Resource::Room(ROOM)
+    ));
     assert_eq!(
         rec.entries(),
         vec![Entry {
@@ -77,7 +81,11 @@ fn a_permitted_decision_is_recorded() {
 fn a_denied_decision_is_recorded() {
     let rec = Recorder::default();
     let audited = Audited::new(read_only(), Box::new(rec.clone()));
-    assert!(!audited.authorize(b"alice", Action::Write, &Resource::Room(ROOM)));
+    assert!(!audited.authorize(
+        &Identity::new(b"alice".to_vec()),
+        Action::Write,
+        &Resource::Room(ROOM)
+    ));
     assert_eq!(
         rec.entries(),
         vec![Entry {
@@ -93,8 +101,16 @@ fn a_denied_decision_is_recorded() {
 fn the_inner_verdict_is_forwarded_unchanged() {
     let rec = Recorder::default();
     let audited = Audited::new(read_only(), Box::new(rec.clone()));
-    assert!(audited.authorize(b"alice", Action::Read, &Resource::Room(ROOM)));
-    assert!(!audited.authorize(b"alice", Action::PublishAwareness, &Resource::Room(ROOM)));
+    assert!(audited.authorize(
+        &Identity::new(b"alice".to_vec()),
+        Action::Read,
+        &Resource::Room(ROOM)
+    ));
+    assert!(!audited.authorize(
+        &Identity::new(b"alice".to_vec()),
+        Action::PublishAwareness,
+        &Resource::Room(ROOM)
+    ));
 }
 
 fn cid(first: u8) -> ClientId {

@@ -230,7 +230,7 @@ pub fn step(
             room,
             last_seen_seq,
         } => {
-            let Some(actor) = session.actor() else {
+            let Some(identity) = session.identity() else {
                 return violation("subscribe before auth");
             };
             if session.channels.contains_key(&channel) {
@@ -238,7 +238,7 @@ pub fn step(
             }
             // A subscription reads the room; the server never serves a room the
             // actor may not read.
-            if !authorizer.authorize(actor, Action::Read, &Resource::Room(&room)) {
+            if !authorizer.authorize(identity, Action::Read, &Resource::Room(&room)) {
                 return forbidden("read denied");
             }
             let reply = match hub.catch_up(&room, last_seen_seq) {
@@ -292,8 +292,8 @@ pub fn step(
             if ops.iter().any(|op| op.id.client != client) {
                 return violation("op client mismatch");
             }
-            let actor = session.actor().expect("actor set, checked above");
-            if !authorizer.authorize(actor, Action::Write, &Resource::Room(&room)) {
+            let identity = session.identity().expect("identity set, checked above");
+            if !authorizer.authorize(identity, Action::Write, &Resource::Room(&room)) {
                 return forbidden("write denied");
             }
             // The batch's highest per-client op sequence: the frontier the author
@@ -342,16 +342,17 @@ pub fn step(
             key,
             value,
         } => {
-            let Some(actor) = session.actor().map(<[u8]>::to_vec) else {
+            let Some(identity) = session.identity() else {
                 return violation("awareness before auth");
             };
+            let actor = identity.actor().to_vec();
             let Some(client) = session.client else {
                 return violation("awareness before hello");
             };
             let Some(room) = session.channels.get(&channel).cloned() else {
                 return violation("awareness on an unbound channel");
             };
-            if !authorizer.authorize(&actor, Action::PublishAwareness, &Resource::Room(&room)) {
+            if !authorizer.authorize(identity, Action::PublishAwareness, &Resource::Room(&room)) {
                 return forbidden("awareness publish denied");
             }
             // Ephemeral: retained for late-joiner replay and fanned to the room's
@@ -460,10 +461,10 @@ fn version_room(
     authorizer: &dyn Authorizer,
     action: Action,
 ) -> Option<RoomId> {
-    let actor = session.actor()?;
+    let identity = session.identity()?;
     let room = session.channels.get(&channel)?.clone();
     authorizer
-        .authorize(actor, action, &Resource::Room(&room))
+        .authorize(identity, action, &Resource::Room(&room))
         .then_some(room)
 }
 

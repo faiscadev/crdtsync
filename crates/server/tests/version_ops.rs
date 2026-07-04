@@ -10,7 +10,7 @@
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, ErrorCode, Message, Op, Scalar};
-use crdtsync_server::{Action, ConnId, Registry, Resource};
+use crdtsync_server::{Action, ConnId, Identity, Registry, Resource};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -227,7 +227,7 @@ fn a_write_denied_actor_cannot_create_a_version() {
     let mut r = registry();
     // Writes denied everywhere; reads (subscribe) allowed.
     r.set_authorizer(Box::new(
-        |_actor: &[u8], action: Action, _res: &Resource| action != Action::Write,
+        |_id: &Identity, action: Action, _res: &Resource| action != Action::Write,
     ));
     let id = joined(&mut r, 1);
 

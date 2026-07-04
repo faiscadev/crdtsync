@@ -2,27 +2,31 @@
 //! tuples with standard IAM semantics: explicit deny always wins, an explicit
 //! allow grants, and the absence of any matching allow denies (default-deny).
 //!
-//! Subjects are matched from the server-derived actor id alone: an exact actor,
-//! anyone (`*`), any authenticated actor, or any anonymous (`anon:`) actor.
-//! Role/group subjects await a claims model; schema `@auth` defaults await the
-//! schema layer — neither is exercised here.
+//! Subjects are matched against the acting identity: an exact actor, anyone
+//! (`*`), any authenticated or anonymous (`anon:`) actor, or a role or group the
+//! credential asserts. Schema `@auth` defaults, which feed into this same
+//! evaluation, await the schema tier and are not exercised here.
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, ErrorCode, Message};
 use crdtsync_server::acl::{Acl, Effect, ResourceMatch, Subject};
-use crdtsync_server::{Action, Authorizer, Registry, Resource};
+use crdtsync_server::{Action, Authorizer, Identity, Registry, Resource};
 
 const ROOM: &[u8] = b"room-a";
 
+fn id(actor: &[u8]) -> Identity {
+    Identity::new(actor.to_vec())
+}
+
 fn read_room(a: &dyn Authorizer, actor: &[u8], room: &[u8]) -> bool {
-    a.authorize(actor, Action::Read, &Resource::Room(room))
+    a.authorize(&id(actor), Action::Read, &Resource::Room(room))
 }
 
 #[test]
 fn an_empty_acl_denies_everything() {
     let acl = Acl::new();
     assert!(!read_room(&acl, b"alice", ROOM));
-    assert!(!acl.authorize(b"alice", Action::Write, &Resource::Room(ROOM)));
+    assert!(!acl.authorize(&id(b"alice"), Action::Write, &Resource::Room(ROOM)));
 }
 
 #[test]
@@ -45,7 +49,7 @@ fn an_explicit_allow_grants_only_the_matched_tuple() {
         "another room is not covered"
     );
     assert!(
-        !acl.authorize(b"alice", Action::Write, &Resource::Room(ROOM)),
+        !acl.authorize(&id(b"alice"), Action::Write, &Resource::Room(ROOM)),
         "another action is not covered"
     );
 }
@@ -123,9 +127,13 @@ fn a_none_action_matches_every_action() {
         None,
         ResourceMatch::Room(ROOM.to_vec()),
     );
-    assert!(acl.authorize(b"alice", Action::Read, &Resource::Room(ROOM)));
-    assert!(acl.authorize(b"alice", Action::Write, &Resource::Room(ROOM)));
-    assert!(acl.authorize(b"alice", Action::PublishAwareness, &Resource::Room(ROOM)));
+    assert!(acl.authorize(&id(b"alice"), Action::Read, &Resource::Room(ROOM)));
+    assert!(acl.authorize(&id(b"alice"), Action::Write, &Resource::Room(ROOM)));
+    assert!(acl.authorize(
+        &id(b"alice"),
+        Action::PublishAwareness,
+        &Resource::Room(ROOM)
+    ));
 }
 
 #[test]
@@ -153,9 +161,13 @@ fn a_deny_scoped_to_one_action_leaves_others_allowed() {
             Some(Action::Write),
             ResourceMatch::Room(ROOM.to_vec()),
         );
-    assert!(acl.authorize(b"alice", Action::Read, &Resource::Room(ROOM)));
-    assert!(!acl.authorize(b"alice", Action::Write, &Resource::Room(ROOM)));
-    assert!(acl.authorize(b"alice", Action::PublishAwareness, &Resource::Room(ROOM)));
+    assert!(acl.authorize(&id(b"alice"), Action::Read, &Resource::Room(ROOM)));
+    assert!(!acl.authorize(&id(b"alice"), Action::Write, &Resource::Room(ROOM)));
+    assert!(acl.authorize(
+        &id(b"alice"),
+        Action::PublishAwareness,
+        &Resource::Room(ROOM)
+    ));
 }
 
 #[test]
@@ -169,6 +181,79 @@ fn effect_can_be_pushed_directly() {
         Effect::Allow,
     );
     assert!(read_room(&acl, b"alice", ROOM));
+}
+
+// --- role and group subjects match the credential's claims ---
+
+#[test]
+fn a_role_subject_matches_an_identity_that_holds_the_role() {
+    let acl = Acl::new().allow(
+        Subject::Role("editor".to_string()),
+        Some(Action::Write),
+        ResourceMatch::AnyRoom,
+    );
+    let editor = Identity::with_claims(b"alice".to_vec(), vec!["editor".to_string()], vec![]);
+    let viewer = Identity::with_claims(b"bob".to_vec(), vec!["viewer".to_string()], vec![]);
+    assert!(
+        acl.authorize(&editor, Action::Write, &Resource::Room(ROOM)),
+        "the role holder is allowed"
+    );
+    assert!(
+        !acl.authorize(&viewer, Action::Write, &Resource::Room(ROOM)),
+        "a different role is not covered"
+    );
+    assert!(
+        !acl.authorize(&id(b"carol"), Action::Write, &Resource::Room(ROOM)),
+        "no roles matches no role subject"
+    );
+}
+
+#[test]
+fn a_group_subject_matches_an_identity_in_the_group() {
+    let acl = Acl::new().allow(
+        Subject::Group("staff".to_string()),
+        Some(Action::Read),
+        ResourceMatch::AnyRoom,
+    );
+    let staff = Identity::with_claims(b"alice".to_vec(), vec![], vec!["staff".to_string()]);
+    assert!(acl.authorize(&staff, Action::Read, &Resource::Room(ROOM)));
+    assert!(
+        !read_room(&acl, b"bob", ROOM),
+        "an actor without the group is not covered"
+    );
+}
+
+#[test]
+fn a_role_grant_turns_on_the_claim_not_the_actor_id() {
+    // Same actor bytes; the decision turns only on the asserted role.
+    let acl = Acl::new().allow(
+        Subject::Role("admin".to_string()),
+        None,
+        ResourceMatch::AnyRoom,
+    );
+    let as_admin = Identity::with_claims(b"same".to_vec(), vec!["admin".to_string()], vec![]);
+    let no_claims = Identity::new(b"same".to_vec());
+    assert!(acl.authorize(&as_admin, Action::Write, &Resource::Room(ROOM)));
+    assert!(!acl.authorize(&no_claims, Action::Write, &Resource::Room(ROOM)));
+}
+
+#[test]
+fn a_role_deny_wins_over_a_broader_allow() {
+    // Anyone may read, but the "banned" role is denied — deny wins across subject
+    // kinds, whatever the actor id.
+    let acl = Acl::new()
+        .allow(Subject::Anyone, Some(Action::Read), ResourceMatch::AnyRoom)
+        .deny(
+            Subject::Role("banned".to_string()),
+            Some(Action::Read),
+            ResourceMatch::AnyRoom,
+        );
+    let banned = Identity::with_claims(b"alice".to_vec(), vec!["banned".to_string()], vec![]);
+    assert!(read_room(&acl, b"bob", ROOM), "an unbanned actor reads");
+    assert!(
+        !acl.authorize(&banned, Action::Read, &Resource::Room(ROOM)),
+        "the banned role loses"
+    );
 }
 
 // --- plugged into the server as the live authorizer ---

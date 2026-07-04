@@ -10,7 +10,7 @@
 use axum::body::Body;
 use axum::http::Request;
 use crdtsync_server::{
-    admin_router, serve_admin, Action, Authorizer, Resource, SchemaRegistry, StaticTokens,
+    admin_router, serve_admin, Action, Authorizer, Identity, Resource, SchemaRegistry, StaticTokens,
 };
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
@@ -25,9 +25,9 @@ fn verifier() -> StaticTokens {
 }
 
 fn only_admin_on_app_x() -> impl Authorizer + Clone {
-    |actor: &[u8], action: Action, res: &Resource| {
+    |id: &Identity, action: Action, res: &Resource| {
         action == Action::RegisterSchema
-            && actor == b"admin"
+            && id.actor() == b"admin"
             && matches!(res, Resource::App(a) if *a == APP)
     }
 }
