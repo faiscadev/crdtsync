@@ -379,6 +379,15 @@ mod tests {
     }
 
     #[test]
+    fn a_three_field_row_carries_roles_and_no_groups() {
+        let table = StaticTokens::from_credentials("secret-alice alice editor,viewer").unwrap();
+        let id = table.verify(b"secret-alice").unwrap();
+        assert_eq!(id.actor(), b"alice");
+        assert_eq!(id.roles(), ["editor", "viewer"]);
+        assert!(id.groups().is_empty());
+    }
+
+    #[test]
     fn a_dash_is_an_empty_list() {
         // A `-` in the roles slot lets a row assert groups but no roles.
         let table = StaticTokens::from_credentials("secret-alice alice - eng").unwrap();
