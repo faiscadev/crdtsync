@@ -8,6 +8,15 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
+## 2026-07-04 · Unit 5b-i/#PENDING · schema registry sliced from its HTTP transport; hash-lock semantics pinned
+**Changed:** no ARCHITECTURE change — a build-slicing + semantics-pinning decision recorded so the registration arc stays legible.
+- **Sliced 5b into 5b-i (pure registry + hash-lock) and 5b-ii (HTTP admin endpoint).** The hash-lock is the security-critical core the handshake resolves against; it is fully testable without a transport, so it lands first, exhaustively spec'd, and the HTTP route becomes a thin authenticated writer over it. Same rationale as 5a: the registry is an in-memory structure (not wire), so no forward-compat cost to deferring the transport.
+- **Pinned the three gate-3 failure modes to concrete registration semantics.** ARCHITECTURE §Schema Migration gate 3 names "gap / out-of-sequence / hash mismatch"; the registry realizes them as: a chain is contiguous from version 1 and appends only at `head+1` (skip-ahead → `Gap`); a backward or zero version → `OutOfSequence` (a chain only moves forward — a superseded version is never re-registered); an already-locked version re-registered with different content → `HashMismatch` (links are immutable). An **identical** re-push of the head is an idempotent `Unchanged`, so a CI retry after an unacked response is safe.
+- **Hash binds `version‖schema‖migration`, each length-framed.** Length framing so no boundary shift collides two links; the version is bound so identical bytes at two positions lock differently. Matches the content-addressable blob store (keyed by SHA-256 of content).
+- **`sha2` is a server-crate dependency, never core.** ARCHITECTURE already pins this ("the crypto lives in the server, not core … only the server takes the `sha2` dependency"); recorded here as the first code to consume it. Core stays `#![forbid(unsafe_code)]`, `uuid`-only, wasm-embeddable; a client never hash-verifies the server it already trusts.
+
+**Why:** the hash-lock is the trust root of the schema tier — a bug here lets a client slip a different schema body under a known version. Isolating it as a pure, Miri-clean unit with its own spec suite de-risks the larger 5b before any HTTP surface exists, and pins the otherwise-underspecified "gap / out-of-sequence" prose to testable behaviour. Unblocks 5b-ii (HTTP writer), then 5c (handshake resolve).
+
 ## 2026-07-04 · auto-version triggers — a general engine event bus, schema-declared triggers (scope, human-directed, pre-build)
 **Changed:** ARCHITECTURE §Auto-Version Triggers and §Schema (`autoVersion` key) are extended to pin the design:
 - **General engine event bus.** The engine emits typed `EngineEvent`s at lifecycle points, dispatched to pluggable `EventSink`s — generalizing the audit `AccessLog` sink pattern (#85). Auto-versioning is the first built-in sink; the bus is the substrate for future external integrations (webhooks) and can subsume the audit sink later. Chosen over a narrow trigger→version-only mechanism (which would be re-invented when webhooks land).

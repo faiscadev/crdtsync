@@ -12,6 +12,9 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 # Anonymous-mode actor ids are minted from system entropy at the transport
 # layer, kept out of the Miri-gated pure-logic core.
 getrandom = "0.2"
+# The schema registry hash-locks each chain link by SHA-256. The crypto lives in
+# the server, never in the wasm-embeddable core, and a client never verifies.
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
