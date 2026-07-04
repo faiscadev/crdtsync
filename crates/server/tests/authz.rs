@@ -70,7 +70,9 @@ fn a_read_denied_room_is_forbidden_but_keeps_the_connection() {
     let mut r = registry();
     // Reads allowed only on "open".
     r.set_authorizer(Box::new(|_actor: &[u8], action: Action, res: &Resource| {
-        let Resource::Room(room) = res;
+        let Resource::Room(room) = res else {
+            return false;
+        };
         action != Action::Read || room == b"open"
     }));
     let a = hello_auth(&mut r, 1);
