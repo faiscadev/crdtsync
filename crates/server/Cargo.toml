@@ -15,6 +15,15 @@ getrandom = "0.2"
 # The schema registry hash-locks each chain link by SHA-256. The crypto lives in
 # the server, never in the wasm-embeddable core, and a client never verifies.
 sha2 = "0.10"
+# The admin control plane serves HTTP over the tokio runtime already present. It
+# uses axum (hyper's battle-tested HTTP/1.1 parsing) rather than a hand-rolled
+# parser — an untrusted network boundary where request-smuggling and framing
+# edge cases are precisely what a hand-rolled parser gets wrong. tower-http adds
+# the per-request timeout. Neither reaches the dep-minimal, wasm-embeddable core.
+axum = "0.8"
+tower-http = { version = "0.6", features = ["timeout"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
+# `oneshot`-driving the admin router in-process (no socket) for the status matrix.
+tower = { version = "0.5", features = ["util"] }

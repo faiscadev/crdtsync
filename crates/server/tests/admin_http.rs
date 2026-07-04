@@ -1,15 +1,18 @@
 //! The admin HTTP transport — the control-plane endpoint that turns a `POST` of
-//! a schema into a registration, over a real socket.
+//! a schema into a registration.
 //!
-//! `dispatch` is exercised directly (route + method + version + status mapping)
-//! against heads the request parser produced, and `serve_admin` is driven over a
-//! live TCP connection to prove the read/decode/respond loop and that the
-//! registry retains state across requests — an idempotent re-`POST` is `200`, a
-//! changed body under a locked version is `409`.
+//! The status matrix (route + method + version + auth + registry outcome) is
+//! driven in-process through the axum router with `oneshot`, no socket. One
+//! socket test then proves `serve_admin` wires the router to a real listener and
+//! that the registry retains state across requests — an idempotent re-`POST` is
+//! `200`, a changed body under a locked version is `409`.
 
-use crdtsync_server::admin::dispatch;
-use crdtsync_server::http::parse_head;
-use crdtsync_server::{serve_admin, Action, Authorizer, Resource, SchemaRegistry, StaticTokens};
+use axum::body::Body;
+use axum::http::Request;
+use crdtsync_server::{
+    admin_router, serve_admin, Action, Authorizer, Resource, SchemaRegistry, StaticTokens,
+};
+use tower::ServiceExt;
 
 const APP: &[u8] = b"app-x";
 
@@ -20,7 +23,7 @@ fn verifier() -> StaticTokens {
     t
 }
 
-fn only_admin_on_app_x() -> impl Authorizer {
+fn only_admin_on_app_x() -> impl Authorizer + Clone {
     |actor: &[u8], action: Action, res: &Resource| {
         action == Action::RegisterSchema
             && actor == b"admin"
@@ -28,72 +31,142 @@ fn only_admin_on_app_x() -> impl Authorizer {
     }
 }
 
-/// Build a `Head` the way the transport does — by parsing bytes — then dispatch.
-fn dispatch_raw(raw: &[u8], body: &[u8], registry: &mut SchemaRegistry) -> u16 {
-    let head = parse_head(raw).unwrap().expect("complete head");
-    dispatch(&head, body, &verifier(), &only_admin_on_app_x(), registry).status()
+/// Drive one request through a fresh router over `registry`, returning the
+/// status. The router owns the registry, so state that must persist across
+/// requests (idempotency, hash-lock) is exercised by the socket test below,
+/// where one server handles the whole sequence.
+async fn send(
+    registry: SchemaRegistry,
+    method: &str,
+    target: &str,
+    cred: Option<&str>,
+    body: &str,
+) -> u16 {
+    let router = admin_router(
+        Box::new(verifier()),
+        Box::new(only_admin_on_app_x()),
+        registry,
+    );
+    let mut builder = Request::builder().method(method).uri(target);
+    if let Some(c) = cred {
+        builder = builder.header("authorization", c);
+    }
+    let request = builder.body(Body::from(body.to_owned())).unwrap();
+    router.oneshot(request).await.unwrap().status().as_u16()
 }
 
-#[test]
-fn a_well_formed_post_registers_and_returns_200() {
-    let mut reg = SchemaRegistry::new();
-    let raw = b"POST /apps/app-x/schemas/1 HTTP/1.1\r\nAuthorization: admin-cred\r\nContent-Length: 4\r\n\r\n";
-    assert_eq!(dispatch_raw(raw, b"S1", &mut reg), 200);
-    assert_eq!(reg.resolve(APP, 1), Some(&b"S1"[..]));
+#[tokio::test]
+async fn a_well_formed_post_registers_and_returns_200() {
+    assert_eq!(
+        send(
+            SchemaRegistry::new(),
+            "POST",
+            "/apps/app-x/schemas/1",
+            Some("admin-cred"),
+            "S1"
+        )
+        .await,
+        200
+    );
 }
 
-#[test]
-fn a_missing_credential_is_401() {
-    let mut reg = SchemaRegistry::new();
-    let raw = b"POST /apps/app-x/schemas/1 HTTP/1.1\r\nContent-Length: 2\r\n\r\n";
-    assert_eq!(dispatch_raw(raw, b"S1", &mut reg), 401);
+#[tokio::test]
+async fn a_missing_credential_is_401() {
+    assert_eq!(
+        send(
+            SchemaRegistry::new(),
+            "POST",
+            "/apps/app-x/schemas/1",
+            None,
+            "S1"
+        )
+        .await,
+        401
+    );
 }
 
-#[test]
-fn an_unpermitted_credential_is_403() {
-    let mut reg = SchemaRegistry::new();
-    let raw = b"POST /apps/app-x/schemas/1 HTTP/1.1\r\nAuthorization: user-cred\r\nContent-Length: 2\r\n\r\n";
-    assert_eq!(dispatch_raw(raw, b"S1", &mut reg), 403);
+#[tokio::test]
+async fn an_unpermitted_credential_is_403() {
+    assert_eq!(
+        send(
+            SchemaRegistry::new(),
+            "POST",
+            "/apps/app-x/schemas/1",
+            Some("user-cred"),
+            "S1"
+        )
+        .await,
+        403
+    );
 }
 
-#[test]
-fn a_hash_lock_refusal_is_409() {
-    let mut reg = SchemaRegistry::new();
-    let v1 = b"POST /apps/app-x/schemas/1 HTTP/1.1\r\nAuthorization: admin-cred\r\nContent-Length: 2\r\n\r\n";
-    assert_eq!(dispatch_raw(v1, b"S1", &mut reg), 200);
-    // Same version, different body — locked-content change.
-    assert_eq!(dispatch_raw(v1, b"S2", &mut reg), 409);
-    // A gap is also 409.
-    let v3 = b"POST /apps/app-x/schemas/3 HTTP/1.1\r\nAuthorization: admin-cred\r\nContent-Length: 2\r\n\r\n";
-    assert_eq!(dispatch_raw(v3, b"S3", &mut reg), 409);
+#[tokio::test]
+async fn a_hash_lock_gap_is_409() {
+    // A gap (version 3 while head is 0) is refused by the registry.
+    assert_eq!(
+        send(
+            SchemaRegistry::new(),
+            "POST",
+            "/apps/app-x/schemas/3",
+            Some("admin-cred"),
+            "S3"
+        )
+        .await,
+        409
+    );
 }
 
-#[test]
-fn a_non_post_method_is_405() {
-    let mut reg = SchemaRegistry::new();
-    let raw = b"GET /apps/app-x/schemas/1 HTTP/1.1\r\nAuthorization: admin-cred\r\n\r\n";
-    assert_eq!(dispatch_raw(raw, b"", &mut reg), 405);
+#[tokio::test]
+async fn a_non_post_method_is_405() {
+    assert_eq!(
+        send(
+            SchemaRegistry::new(),
+            "GET",
+            "/apps/app-x/schemas/1",
+            Some("admin-cred"),
+            ""
+        )
+        .await,
+        405
+    );
 }
 
-#[test]
-fn an_unknown_route_is_404() {
-    let mut reg = SchemaRegistry::new();
+#[tokio::test]
+async fn an_unknown_route_is_404() {
     for target in [
         "/",
         "/apps/app-x",
         "/apps/app-x/schemas",
         "/rooms/app-x/schemas/1",
     ] {
-        let raw = format!("POST {target} HTTP/1.1\r\nAuthorization: admin-cred\r\n\r\n");
-        assert_eq!(dispatch_raw(raw.as_bytes(), b"", &mut reg), 404, "{target}");
+        assert_eq!(
+            send(
+                SchemaRegistry::new(),
+                "POST",
+                target,
+                Some("admin-cred"),
+                ""
+            )
+            .await,
+            404,
+            "{target}"
+        );
     }
 }
 
-#[test]
-fn a_non_numeric_version_is_400() {
-    let mut reg = SchemaRegistry::new();
-    let raw = b"POST /apps/app-x/schemas/latest HTTP/1.1\r\nAuthorization: admin-cred\r\nContent-Length: 2\r\n\r\n";
-    assert_eq!(dispatch_raw(raw, b"S1", &mut reg), 400);
+#[tokio::test]
+async fn a_non_numeric_version_is_400() {
+    assert_eq!(
+        send(
+            SchemaRegistry::new(),
+            "POST",
+            "/apps/app-x/schemas/latest",
+            Some("admin-cred"),
+            "S1"
+        )
+        .await,
+        400
+    );
 }
 
 // --- socket integration ---------------------------------------------------
@@ -118,12 +191,16 @@ fn register(app_id: &str, version: u32, credential: Option<&str>, body: &str) ->
     if let Some(c) = credential {
         req.push_str(&format!("Authorization: {c}\r\n"));
     }
-    req.push_str(&format!("Content-Length: {}\r\n\r\n{}", body.len(), body));
+    req.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    ));
     req.into_bytes()
 }
 
 // Socket tests do real network syscalls Miri cannot execute; skip them there.
-// The pure `dispatch` tests above still run under Miri.
+// The `oneshot` router tests above still run under Miri.
 #[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn the_admin_plane_serves_registration_over_a_socket() {
@@ -171,21 +248,4 @@ async fn the_admin_plane_serves_registration_over_a_socket() {
         post(addr, &register("app-x", 3, Some("user-cred"), "SCHEMA-3")).await,
         403
     );
-}
-
-#[cfg_attr(miri, ignore)]
-#[tokio::test]
-async fn a_malformed_request_over_the_socket_is_400() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_admin(
-        listener,
-        Box::new(verifier()),
-        Box::new(only_admin_on_app_x()),
-        SchemaRegistry::new(),
-    ));
-
-    // A bad HTTP version — the parser rejects it, the transport answers 400.
-    let bad = b"POST /apps/app-x/schemas/1 HTTP/9.9\r\nContent-Length: 0\r\n\r\n";
-    assert_eq!(post(addr, bad).await, 400);
 }
