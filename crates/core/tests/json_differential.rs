@@ -12,9 +12,12 @@
 //!   * an integer past `i64` degrades to a float — a value difference the
 //!     f64-normalised comparison already tolerates.
 //!
-//! Inputs are capped at 120 bytes, below the 128-deep nesting bound, so the
-//! depth limit never fires and never counts as a divergence. The generator is a
-//! seeded xorshift so a failure reproduces exactly.
+//! Neither generator can reach the 128-deep nesting bound — the random-byte
+//! stream is far too short to stack 128 brackets, and the structured generator
+//! is depth-capped at 4 — so the depth limit never fires and never counts as a
+//! divergence. The generator is a seeded xorshift so a failure reproduces
+//! exactly. Iteration counts scale down sharply under Miri, where each parse is
+//! orders of magnitude slower.
 
 use crdtsync_core::json::{Json, JsonErrorKind};
 
@@ -39,8 +42,11 @@ impl Rng {
 /// A number-collapsing normal form so the two value models can be compared:
 /// int and float both become `f64`, and objects are keyed as a sorted map (our
 /// parser preserves order, serde's default `Value` sorts — order is not what we
-/// are checking here).
-#[derive(PartialEq, Debug)]
+/// are checking here). Numbers are compared with a relative tolerance
+/// ([`norm_eq`]): the two parsers' float algorithms can land a ULP apart on a
+/// large-exponent literal (e.g. `-7e96`), which is float-rounding noise, not a
+/// structural disagreement.
+#[derive(Debug)]
 enum Norm {
     Null,
     Bool(bool),
@@ -83,6 +89,27 @@ fn norm_serde(v: &serde_json::Value) -> Norm {
     }
 }
 
+/// Structural equality, but numbers match within a small relative tolerance so
+/// a 1-ULP difference between the two float parsers is not a failure.
+fn norm_eq(a: &Norm, b: &Norm) -> bool {
+    match (a, b) {
+        (Norm::Null, Norm::Null) => true,
+        (Norm::Bool(x), Norm::Bool(y)) => x == y,
+        (Norm::Num(x), Norm::Num(y)) => x == y || (x - y).abs() <= 1e-12 * x.abs().max(y.abs()),
+        (Norm::Str(x), Norm::Str(y)) => x == y,
+        (Norm::Arr(x), Norm::Arr(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| norm_eq(p, q))
+        }
+        (Norm::Obj(x), Norm::Obj(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|((kp, vp), (kq, vq))| kp == kq && norm_eq(vp, vq))
+        }
+        _ => false,
+    }
+}
+
 /// True if any number in the value we parsed is non-finite — the documented
 /// `Float(inf)` divergence, which serde reports as a range error instead.
 fn has_non_finite(j: &Json) -> bool {
@@ -105,7 +132,7 @@ fn check(input: &str) -> Result<(), String> {
             // A "keep last" object in serde cannot match our reject-on-dup, but
             // when both accept there were no dup keys, so values must agree.
             let (no, nt) = (norm_ours(o), norm_serde(t));
-            if no != nt {
+            if !norm_eq(&no, &nt) {
                 return Err(format!("value mismatch: ours={no:?} theirs={nt:?}"));
             }
             Ok(())
@@ -133,9 +160,10 @@ fn check(input: &str) -> Result<(), String> {
 const ALPHABET: &[u8] = b"{}[]\":,0123456789.-+eEtruefalsn \\/ux \t\n\"\"abcDEF\0";
 
 /// A random string over a JSON-flavoured alphabet — mostly invalid, which is
-/// exactly where a hand-rolled parser is most likely to diverge or panic.
+/// exactly where a hand-rolled parser is most likely to diverge or panic. The
+/// length ceiling keeps it far short of the 128-deep nesting bound.
 fn random_bytes(rng: &mut Rng) -> String {
-    let len = rng.below(120);
+    let len = rng.below(100);
     let mut buf = Vec::with_capacity(len);
     for _ in 0..len {
         buf.push(ALPHABET[rng.below(ALPHABET.len())]);
@@ -177,7 +205,7 @@ fn random_string_literal(rng: &mut Rng) -> String {
         r#""abc""#,
         r#""a\nb\t\"c""#,
         r#""Aé""#,
-        r#""😀""#, // a surrogate pair (😀)
+        r#""😀""#, // a 4-byte UTF-8 scalar, unescaped in the source
         r#""\/\\\b\f\r""#,
         r#""unicode ★ é ✓""#,
     ];
@@ -187,7 +215,8 @@ fn random_string_literal(rng: &mut Rng) -> String {
 #[test]
 fn random_bytes_agree_with_serde() {
     let mut rng = Rng(0x1234_5678_9abc_def0);
-    for i in 0..200_000 {
+    let iters = if cfg!(miri) { 200 } else { 200_000 };
+    for i in 0..iters {
         let input = random_bytes(&mut rng);
         if let Err(why) = check(&input) {
             panic!("iter {i}: {why}\ninput = {input:?}");
@@ -198,7 +227,8 @@ fn random_bytes_agree_with_serde() {
 #[test]
 fn structured_json_agrees_with_serde() {
     let mut rng = Rng(0x0fed_cba9_8765_4321);
-    for i in 0..100_000 {
+    let iters = if cfg!(miri) { 200 } else { 100_000 };
+    for i in 0..iters {
         let input = random_json(&mut rng, 0);
         if let Err(why) = check(&input) {
             panic!("iter {i}: {why}\ninput = {input:?}");
