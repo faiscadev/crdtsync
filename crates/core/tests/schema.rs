@@ -277,6 +277,37 @@ fn an_unknown_top_level_key_is_rejected_not_ignored() {
 }
 
 #[test]
+fn an_unknown_field_inside_a_type_is_rejected() {
+    // A typo'd bound (`mni` for `min`) would silently not-constrain — reject it.
+    let e = Schema::parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map", "children": { "n": "N" } },
+                       "N": { "kind": "register", "mni": 0 } } }"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::UnknownField);
+    assert_eq!(e.at, "N.mni", "the error names the type and field");
+    // A field valid for one kind but not another is rejected too.
+    assert_eq!(
+        err(r#"{ "schema": "s", "version": 1, "root": "R",
+                 "types": { "R": { "kind": "map", "children": {} }, "T": { "kind": "text", "min": 0 } } }"#),
+        SchemaErrorKind::UnknownField
+    );
+}
+
+#[test]
+fn an_unknown_field_inside_an_awareness_entry_is_rejected() {
+    let e = Schema::parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "awareness": { "cursor": { "tt": 100 } } }"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::UnknownField);
+    assert_eq!(e.at, "awareness.cursor.tt");
+}
+
+#[test]
 fn the_language_defined_top_level_keys_are_accepted() {
     // `marks` and `auth` are declared by the language (not yet modelled here),
     // so a schema using them still parses.
