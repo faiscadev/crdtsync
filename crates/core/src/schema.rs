@@ -134,12 +134,13 @@ pub enum TypeDef {
     /// A map with named, typed slots (each slot name → the type it holds).
     /// The slot set is the allowlist; declaration order is preserved.
     Map { children: Vec<(String, String)> },
-    /// An ordered list of `items`-typed elements, with an optional count range.
-    List {
-        items: String,
-        min: Option<u64>,
-        max: Option<u64>,
-    },
+    /// An ordered list of `items`-typed elements, with an optional maximum
+    /// count. A minimum count is not expressible: an over-max list is repaired by
+    /// dropping its lamport-newest items, but a below-min list cannot be — items
+    /// cannot be invented — so a `min` would admit an unrepairable state and
+    /// breaks the schema's closure guarantee. Min-cardinality is an app-layer
+    /// concern (fixed map slots, or a publish gate).
+    List { items: String, max: Option<u64> },
     /// Collaborative text, with an optional maximum length.
     Text { max: Option<u64> },
     /// A last-writer-wins scalar with optional numeric bounds.
@@ -444,10 +445,12 @@ fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, SchemaError> 
             })
         }
         "list" => {
-            reject_unknown_fields(obj, &["kind", "items", "min", "max"], type_name)?;
+            // `min` is deliberately not accepted — a below-min list is
+            // unrepairable, so it is rejected here as an unknown field.
+            reject_unknown_fields(obj, &["kind", "items", "max"], type_name)?;
             let items = required_str(json, "items", type_name)?.to_string();
-            let (min, max) = counts(json, type_name)?;
-            Ok(TypeDef::List { items, min, max })
+            let max = count_field(json, "max", type_name)?;
+            Ok(TypeDef::List { items, max })
         }
         "text" => {
             reject_unknown_fields(obj, &["kind", "max"], type_name)?;
@@ -665,21 +668,6 @@ fn parse_children(json: &Json, ctx: &str) -> Result<Vec<(String, String)>, Schem
 fn bounds(json: &Json, ctx: &str) -> Result<(Option<i64>, Option<i64>), SchemaError> {
     let min = int_field(json, "min", ctx)?;
     let max = int_field(json, "max", ctx)?;
-    if let (Some(a), Some(b)) = (min, max) {
-        if a > b {
-            return Err(SchemaError::new(
-                SchemaErrorKind::BadRange,
-                at(ctx, "min_gt_max"),
-            ));
-        }
-    }
-    Ok((min, max))
-}
-
-/// The `min`/`max` of a list — non-negative element counts.
-fn counts(json: &Json, ctx: &str) -> Result<(Option<u64>, Option<u64>), SchemaError> {
-    let min = count_field(json, "min", ctx)?;
-    let max = count_field(json, "max", ctx)?;
     if let (Some(a), Some(b)) = (min, max) {
         if a > b {
             return Err(SchemaError::new(

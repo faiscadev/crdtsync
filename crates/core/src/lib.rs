@@ -15,6 +15,7 @@ pub mod anchor;
 pub mod host;
 pub mod json;
 pub mod schema;
+pub mod validate;
 
 pub mod clientid;
 pub mod elementid;
