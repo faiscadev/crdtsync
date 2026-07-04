@@ -407,6 +407,18 @@ CrdtClient *crdtsync_client_new(const uint8_t *client);
 // `client` must be a handle from `crdtsync_client_new`, not yet freed.
 void crdtsync_client_free(CrdtClient *client);
 
+// Declare the app this client speaks for and the schema version it targets,
+// carried in the next Hello. An empty `app_id` opens a relay connection; a named
+// app with `schema_version` 0 is a dynamic client that adopts the server's head.
+// Returns 1 on success, -1 on a bad handle or input.
+//
+// # Safety
+// `client` is a live handle; `app_id`/`app_id_len` follow [`as_slice`].
+int32_t crdtsync_client_declare_app(CrdtClient *client,
+                                    const uint8_t *app_id,
+                                    uintptr_t app_id_len,
+                                    uint32_t schema_version);
+
 // The opening Hello frame to send, naming this client. Empty on a bad handle.
 //
 // # Safety

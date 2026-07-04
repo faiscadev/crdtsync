@@ -996,6 +996,33 @@ pub unsafe extern "C" fn crdtsync_client_free(client: *mut CrdtClient) {
     let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(client))));
 }
 
+/// Declare the app this client speaks for and the schema version it targets,
+/// carried in the next Hello. An empty `app_id` opens a relay connection; a named
+/// app with `schema_version` 0 is a dynamic client that adopts the server's head.
+/// Returns 1 on success, -1 on a bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `app_id`/`app_id_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_declare_app(
+    client: *mut CrdtClient,
+    app_id: *const u8,
+    app_id_len: usize,
+    schema_version: u32,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return -1;
+        }
+        let Some(app_id) = as_slice(app_id, app_id_len) else {
+            return -1;
+        };
+        (*client).session.declare_app(app_id, schema_version);
+        1
+    }))
+    .unwrap_or(-1)
+}
+
 /// The opening Hello frame to send, naming this client. Empty on a bad handle.
 ///
 /// # Safety

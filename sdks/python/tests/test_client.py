@@ -57,6 +57,15 @@ def test_handshake_frames_marshal():
         assert a.actor() is None
 
 
+def test_declared_app_rides_along_in_the_hello_frame():
+    with Client(cid(1)) as a:
+        # A bare client opens as a relay — no app named in the frame.
+        assert b"app-x" not in a.hello()
+        # Declaring an app names it in the next Hello.
+        a.declare_app(b"app-x", 3)
+        assert b"app-x" in a.hello()
+
+
 def test_awareness_publish_and_lifecycle():
     with Client(cid(1)) as a:
         ch, _ = a.subscribe(b"room-1")

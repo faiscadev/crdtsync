@@ -9,8 +9,8 @@
 
 use crdtsync_core::diff::{diff as core_diff, Change, SeqItem};
 use crdtsync_core::element::ElementKind;
-use crdtsync_core::op::Op;
 use crdtsync_core::list::Side;
+use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_ops, path, Channel, ClientId, ClientSession,
     Document, Message, RelativePosition, Scalar, UndoManager,
@@ -366,6 +366,14 @@ impl WasmClient {
         Ok(WasmClient {
             inner: ClientSession::new(ClientId::from_bytes(bytes)),
         })
+    }
+
+    /// Declare the app this client speaks for and the schema version it targets,
+    /// carried in the next `hello`. An empty `app_id` opens a relay connection; a
+    /// named app with `schema_version` 0 is a dynamic client that adopts the
+    /// server's head. Call before `hello`.
+    pub fn declare_app(&mut self, app_id: &[u8], schema_version: u32) {
+        self.inner.declare_app(app_id, schema_version);
     }
 
     /// The opening Hello frame to send, naming this client.

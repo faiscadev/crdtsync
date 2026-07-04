@@ -121,6 +121,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_new, [cbytes], doc)
     sig(lib.crdtsync_client_free, [doc], None)
     sig(lib.crdtsync_client_hello, [doc], buf)
+    sig(lib.crdtsync_client_declare_app, [doc, cbytes, size, c.c_uint32], c.c_int32)
     sig(lib.crdtsync_client_auth, [doc, cbytes, size], buf)
     sig(lib.crdtsync_client_actor, [doc, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_subscribe, [doc, cbytes, size, c.POINTER(ch)], buf)
@@ -633,6 +634,15 @@ class Client:
         self.close()
 
     # --- handshake ---
+
+    def declare_app(self, app_id: bytes, schema_version: int) -> None:
+        """Declare the app this client speaks for and the schema version it
+        targets, carried in the next :meth:`hello`. An empty ``app_id`` opens a
+        relay connection; a named app with ``schema_version`` 0 is a dynamic
+        client that adopts the server's head. Call before :meth:`hello`."""
+        _LIB.crdtsync_client_declare_app(
+            self._handle, app_id, len(app_id), schema_version
+        )
 
     def hello(self) -> bytes:
         """The opening Hello frame to send, naming this client."""
