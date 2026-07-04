@@ -56,7 +56,10 @@ pub use protocol::{
 };
 pub use register::Register;
 pub use scalar::{BlobRef, Scalar};
-pub use schema::{AwarenessEntry, Schema, SchemaError, SchemaErrorKind, TypeDef};
+pub use schema::{
+    Action, Auth, AwarenessEntry, Effect, Grant, Schema, SchemaError, SchemaErrorKind, Subject,
+    SubjectClass, TemplateVar, TypeDef,
+};
 pub use stamp::Stamp;
 pub use text::Text;
 pub use undo::UndoManager;
