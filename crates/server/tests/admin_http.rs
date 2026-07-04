@@ -12,6 +12,7 @@ use axum::http::Request;
 use crdtsync_server::{
     admin_router, serve_admin, Action, Authorizer, Resource, SchemaRegistry, StaticTokens,
 };
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 const APP: &[u8] = b"app-x";
@@ -45,7 +46,7 @@ async fn send(
     let router = admin_router(
         Box::new(verifier()),
         Box::new(only_admin_on_app_x()),
-        registry,
+        Arc::new(Mutex::new(registry)),
     );
     let mut builder = Request::builder().method(method).uri(target);
     if let Some(c) = cred {
@@ -210,7 +211,7 @@ async fn the_admin_plane_serves_registration_over_a_socket() {
         listener,
         Box::new(verifier()),
         Box::new(only_admin_on_app_x()),
-        SchemaRegistry::new(),
+        Arc::new(Mutex::new(SchemaRegistry::new())),
     ));
 
     // A permitted admin registers version 1.
@@ -261,7 +262,7 @@ async fn a_malformed_request_over_the_socket_is_400() {
         listener,
         Box::new(verifier()),
         Box::new(only_admin_on_app_x()),
-        SchemaRegistry::new(),
+        Arc::new(Mutex::new(SchemaRegistry::new())),
     ));
 
     let bad =

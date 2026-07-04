@@ -37,7 +37,7 @@ fn hello(app_id: &[u8], schema_version: u32) -> Message {
 
 // --- step level: the session records the resolved binding ---
 
-fn resolve(reg: &SchemaRegistry, msg: Message) -> (Session, crdtsync_server::Response) {
+fn resolve(reg: &Mutex<SchemaRegistry>, msg: Message) -> (Session, crdtsync_server::Response) {
     let mut hub = Hub::new(cid(0xFF));
     let mut session = Session::new();
     let resp = step(&mut hub, &mut session, &AllowAll, &PermitAll, reg, msg);
@@ -46,7 +46,7 @@ fn resolve(reg: &SchemaRegistry, msg: Message) -> (Session, crdtsync_server::Res
 
 #[test]
 fn a_relay_connection_records_no_enforced_version() {
-    let reg = registered();
+    let reg = Mutex::new(registered());
     // No app named at all.
     let (session, resp) = resolve(&reg, hello(b"", 0));
     assert!(!resp.close);
@@ -67,7 +67,7 @@ fn a_relay_connection_records_no_enforced_version() {
 
 #[test]
 fn a_registered_app_pins_the_declared_version() {
-    let reg = registered();
+    let reg = Mutex::new(registered());
     let (session, resp) = resolve(&reg, hello(APP, 1));
     assert!(!resp.close);
     assert_eq!(session.app_id(), APP);
@@ -76,7 +76,7 @@ fn a_registered_app_pins_the_declared_version() {
 
 #[test]
 fn a_dynamic_client_adopts_the_head_version() {
-    let reg = registered();
+    let reg = Mutex::new(registered());
     let (session, resp) = resolve(&reg, hello(APP, 0));
     assert!(!resp.close);
     assert_eq!(
@@ -88,7 +88,7 @@ fn a_dynamic_client_adopts_the_head_version() {
 
 #[test]
 fn an_unknown_version_closes_with_unsupported_version() {
-    let reg = registered();
+    let reg = Mutex::new(registered());
     let (session, resp) = resolve(&reg, hello(APP, 3));
     assert!(resp.close, "an unknown version closes the connection");
     assert!(matches!(

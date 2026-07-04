@@ -12,6 +12,7 @@
 use crdtsync_server::admin::{register_schema, RegisterOutcome, RegisterRequest};
 use crdtsync_server::schema_registry::{RegisterError, Registered, SchemaRegistry};
 use crdtsync_server::{Action, Authorizer, Resource, StaticTokens};
+use std::sync::Mutex;
 
 const APP: &[u8] = b"app-x";
 const S1: &[u8] = br#"{"schema":1}"#;
@@ -51,16 +52,16 @@ fn req<'a>(
 
 #[test]
 fn a_permitted_admin_registers_a_schema() {
-    let mut reg = SchemaRegistry::new();
+    let reg = Mutex::new(SchemaRegistry::new());
     let out = register_schema(
         &req(APP, 1, S1, Some(b"admin-cred")),
         &verifier(),
         &only_admin_on_app_x(),
-        &mut reg,
+        &reg,
     );
     assert_eq!(out, RegisterOutcome::Accepted(Registered::Appended));
     assert_eq!(
-        reg.resolve(APP, 1),
+        reg.lock().unwrap().resolve(APP, 1),
         Some(S1),
         "the schema is now registered"
     );
@@ -68,43 +69,47 @@ fn a_permitted_admin_registers_a_schema() {
 
 #[test]
 fn an_absent_credential_is_unauthenticated() {
-    let mut reg = SchemaRegistry::new();
+    let reg = Mutex::new(SchemaRegistry::new());
     let out = register_schema(
         &req(APP, 1, S1, None),
         &verifier(),
         &only_admin_on_app_x(),
-        &mut reg,
+        &reg,
     );
     assert_eq!(out, RegisterOutcome::Unauthenticated);
-    assert_eq!(reg.head_version(APP), None, "nothing was registered");
+    assert_eq!(
+        reg.lock().unwrap().head_version(APP),
+        None,
+        "nothing was registered"
+    );
 }
 
 #[test]
 fn an_unknown_credential_is_unauthenticated() {
-    let mut reg = SchemaRegistry::new();
+    let reg = Mutex::new(SchemaRegistry::new());
     let out = register_schema(
         &req(APP, 1, S1, Some(b"bogus")),
         &verifier(),
         &only_admin_on_app_x(),
-        &mut reg,
+        &reg,
     );
     assert_eq!(out, RegisterOutcome::Unauthenticated);
-    assert_eq!(reg.head_version(APP), None);
+    assert_eq!(reg.lock().unwrap().head_version(APP), None);
 }
 
 #[test]
 fn an_authenticated_but_unpermitted_credential_is_forbidden() {
-    let mut reg = SchemaRegistry::new();
+    let reg = Mutex::new(SchemaRegistry::new());
     // `user` authenticates but is not granted register_schema.
     let out = register_schema(
         &req(APP, 1, S1, Some(b"user-cred")),
         &verifier(),
         &only_admin_on_app_x(),
-        &mut reg,
+        &reg,
     );
     assert_eq!(out, RegisterOutcome::Forbidden);
     assert_eq!(
-        reg.head_version(APP),
+        reg.lock().unwrap().head_version(APP),
         None,
         "a forbidden request never writes"
     );
@@ -112,38 +117,38 @@ fn an_authenticated_but_unpermitted_credential_is_forbidden() {
 
 #[test]
 fn the_authorizer_is_scoped_to_the_request_app() {
-    let mut reg = SchemaRegistry::new();
+    let reg = Mutex::new(SchemaRegistry::new());
     // The same admin is permitted on app-x but not on app-y.
     let denied = register_schema(
         &req(b"app-y", 1, S1, Some(b"admin-cred")),
         &verifier(),
         &only_admin_on_app_x(),
-        &mut reg,
+        &reg,
     );
     assert_eq!(denied, RegisterOutcome::Forbidden);
     let allowed = register_schema(
         &req(APP, 1, S1, Some(b"admin-cred")),
         &verifier(),
         &only_admin_on_app_x(),
-        &mut reg,
+        &reg,
     );
     assert_eq!(allowed, RegisterOutcome::Accepted(Registered::Appended));
 }
 
 #[test]
 fn a_hash_lock_refusal_surfaces_as_rejected() {
-    let mut reg = SchemaRegistry::new();
+    let reg = Mutex::new(SchemaRegistry::new());
     let v = verifier();
     let a = only_admin_on_app_x();
-    register_schema(&req(APP, 1, S1, Some(b"admin-cred")), &v, &a, &mut reg);
+    register_schema(&req(APP, 1, S1, Some(b"admin-cred")), &v, &a, &reg);
     // Re-registering version 1 with a different body is a locked-content change.
-    let out = register_schema(&req(APP, 1, S2, Some(b"admin-cred")), &v, &a, &mut reg);
+    let out = register_schema(&req(APP, 1, S2, Some(b"admin-cred")), &v, &a, &reg);
     assert_eq!(
         out,
         RegisterOutcome::Rejected(RegisterError::HashMismatch { version: 1 })
     );
     // A skip-ahead is likewise refused, not accepted.
-    let gap = register_schema(&req(APP, 3, S2, Some(b"admin-cred")), &v, &a, &mut reg);
+    let gap = register_schema(&req(APP, 3, S2, Some(b"admin-cred")), &v, &a, &reg);
     assert_eq!(
         gap,
         RegisterOutcome::Rejected(RegisterError::Gap {
@@ -155,25 +160,25 @@ fn a_hash_lock_refusal_surfaces_as_rejected() {
 
 #[test]
 fn an_identical_retry_is_accepted_unchanged() {
-    let mut reg = SchemaRegistry::new();
+    let reg = Mutex::new(SchemaRegistry::new());
     let v = verifier();
     let a = only_admin_on_app_x();
-    register_schema(&req(APP, 1, S1, Some(b"admin-cred")), &v, &a, &mut reg);
-    let retry = register_schema(&req(APP, 1, S1, Some(b"admin-cred")), &v, &a, &mut reg);
+    register_schema(&req(APP, 1, S1, Some(b"admin-cred")), &v, &a, &reg);
+    let retry = register_schema(&req(APP, 1, S1, Some(b"admin-cred")), &v, &a, &reg);
     assert_eq!(retry, RegisterOutcome::Accepted(Registered::Unchanged));
 }
 
 #[test]
 fn authentication_precedes_the_registry() {
-    let mut reg = SchemaRegistry::new();
+    let reg = Mutex::new(SchemaRegistry::new());
     // An unauthenticated request that would also be a gap reports the auth
     // failure, not the chain refusal — auth is checked before the registry.
     let out = register_schema(
         &req(APP, 5, S1, None),
         &verifier(),
         &only_admin_on_app_x(),
-        &mut reg,
+        &reg,
     );
     assert_eq!(out, RegisterOutcome::Unauthenticated);
-    assert_eq!(reg.head_version(APP), None);
+    assert_eq!(reg.lock().unwrap().head_version(APP), None);
 }

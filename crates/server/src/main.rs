@@ -18,6 +18,7 @@
 //! the library and calling `serve_with_verifier` / `serve_with_authorizer`.
 
 use std::env::VarError;
+use std::sync::{Arc, Mutex};
 
 use crdtsync_core::ClientId;
 use crdtsync_server::acl::{Acl, PolicyFileError};
@@ -99,6 +100,11 @@ async fn main() -> std::io::Result<()> {
     };
     let listener = TcpListener::bind(&addr).await?;
     eprintln!("crdtsync serving on ws://{addr}");
+    // One schema registry, shared between the data plane (which resolves each
+    // handshake against it) and the admin plane (which registers into it), so a
+    // registration is at once visible to connecting clients. Empty until the
+    // admin plane writes it — with no admin plane, every connection is a relay.
+    let schema = Arc::new(Mutex::new(SchemaRegistry::new()));
     // The server never mints ops; its replicas only merge, so a fixed id is fine.
     // Both seams default to their permissive dev-mode value when unconfigured, so
     // one serve path covers every combination.
@@ -106,7 +112,10 @@ async fn main() -> std::io::Result<()> {
         listener,
         ClientId::from_bytes([0; 16]),
         store,
-        ServeConfig::default(),
+        ServeConfig {
+            schema: schema.clone(),
+            ..ServeConfig::default()
+        },
         verifier()?,
         authorizer()?,
     );
@@ -119,12 +128,7 @@ async fn main() -> std::io::Result<()> {
         Some(admin_addr) => {
             let admin_listener = TcpListener::bind(&admin_addr).await?;
             eprintln!("crdtsync admin on http://{admin_addr}");
-            let admin = serve_admin(
-                admin_listener,
-                verifier()?,
-                authorizer()?,
-                SchemaRegistry::new(),
-            );
+            let admin = serve_admin(admin_listener, verifier()?, authorizer()?, schema);
             tokio::try_join!(data, admin)?;
             Ok(())
         }

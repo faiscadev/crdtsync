@@ -8,6 +8,7 @@
 //! async transport drives it.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
@@ -137,7 +138,7 @@ pub fn step(
     session: &mut Session,
     verifier: &dyn Verifier,
     authorizer: &dyn Authorizer,
-    registry: &SchemaRegistry,
+    registry: &Mutex<SchemaRegistry>,
     msg: Message,
 ) -> Response {
     match msg {
@@ -152,8 +153,16 @@ pub fn step(
             // Resolve the app declaration against the registry: a registered app
             // for which the client asked a version the server does not hold is
             // refused and the connection closes; a relay or a known version
-            // proceeds, and the enforced version (if any) is recorded.
-            match registry.resolve_handshake(&app_id, schema_version) {
+            // proceeds, and the enforced version (if any) is recorded. The lock
+            // is taken only here — the sole registry read on the data plane — so
+            // authentication below never runs under it and cannot stall the admin
+            // plane's writes. A poisoned lock is recovered: the read leaves the
+            // map intact.
+            let resolution = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .resolve_handshake(&app_id, schema_version);
+            match resolution {
                 Resolution::Reject => {
                     return Response {
                         replies: vec![Message::Error {

@@ -14,6 +14,7 @@ use crdtsync_core::protocol::{Channel, PROTOCOL_VERSION};
 use crdtsync_core::{ClientId, Document, ErrorCode, Message, Scalar};
 use crdtsync_server::auth::AllowAll;
 use crdtsync_server::{negotiate, step, Hub, SchemaRegistry, Session};
+use std::sync::Mutex;
 
 const V: AllowAll = AllowAll;
 
@@ -41,7 +42,7 @@ fn st(hub: &mut Hub, s: &mut Session, msg: Message) -> crdtsync_server::Response
         s,
         &V,
         &crdtsync_server::PermitAll,
-        &SchemaRegistry::new(),
+        &Mutex::new(SchemaRegistry::new()),
         msg,
     )
 }

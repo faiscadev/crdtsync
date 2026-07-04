@@ -8,6 +8,14 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
+## 2026-07-04 · Unit 5c-ii-b-2/#161 · one schema registry shared across the data + admin planes
+**Changed:** no ARCHITECTURE change — the cross-plane wiring that completes 5c-ii, rebased onto the axum admin plane (#162).
+- **A single `Arc<Mutex<SchemaRegistry>>` is shared by both planes.** `main.rs` creates it and threads it through `ServeConfig.schema` into `registry_actor` (which calls `Registry::set_schema_registry`, the data plane) and into `serve_admin` / `admin_router` (the admin plane, which writes it). One registry, both planes: a registration over the admin plane is at once visible to the data-plane handshake resolution. `admin_router`/`serve_admin` take the shared `Arc<Mutex<SchemaRegistry>>` rather than owning a fresh one.
+- **`ServeConfig` drops `Copy`, keeps `Clone`.** It now holds an `Arc`, which is not `Copy`. It is only ever moved once (built via `..ServeConfig::default()` and handed to one serve call), so removing `Copy` is transparent at every call site.
+- **The lock is scoped to the registry access on both planes, never across a user callback.** `register_schema` runs the verifier + authorizer lock-free and locks only for the `register` write; `step` locks only in the `Hello` arm around `resolve_handshake` (the data plane's sole registry read), so the `Auth` branch's verifier never holds it. A poisoned lock is recovered via `into_inner()` rather than propagated, so a panic under the lock in one plane cannot wedge the other — the read leaves the map intact and the write validates before it mutates.
+
+**Why:** sharing one authority is the whole point of the unit — the handshake must resolve against what the admin plane actually registered. Scoping each lock to just the registry touch (auth lock-free) keeps a slow verifier on either plane from stalling the other, and recovering a poisoned lock keeps the two planes' fault domains independent. Completes 5c-ii. Unblocks 5c-iii (client declares real values).
+
 ## 2026-07-04 · Unit 5b-ii-2/#162 · the admin plane serves on axum, not a hand-rolled HTTP/1.1 parser
 **Changed:** ARCHITECTURE §Schema Registration gains a transport note — the admin control plane is served with axum over hyper, not a bespoke parser. The route, credential carrier, and status contract are unchanged; the endpoint was always transport-agnostic ("HTTP admin endpoint").
 - **The hand-rolled `http::parse_head` (#156) + `admin::dispatch`/`AdminResponse` (#157) are deleted, replaced by `admin::admin_router` + `serve_admin` on axum 0.8 / tower-http.** The admin plane is an untrusted network boundary; request smuggling and framing edge cases (conflicting `Content-Length`/`Transfer-Encoding`, chunked bodies, header limits) are precisely what a hand-rolled parser gets wrong, and hyper is battle-tested against them. Unlike `core::json`/codec — hand-rolled because core is dep-minimal and wasm-embeddable — the *server* crate already carries tokio, so axum adds no new runtime and never touches core.
@@ -15,6 +23,13 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 - **Registry state is per-router.** The status matrix is driven in-process via `tower::ServiceExt::oneshot` (Miri-friendly, no socket); cross-request state (idempotent re-POST → 200, changed body → 409, gap → 409) and malformed-framing → 400 are proven by socket tests against `serve_admin`.
 
 **Why:** hand-rolling a parser at an untrusted HTTP boundary trades a mature, fuzzed implementation for bespoke code whose failure modes are security bugs — the opposite of the dep-minimalism rationale that justifies the core-crate hand-rolls. The server crate's existing tokio dependency means the swap costs nothing the runtime didn't already carry.
+## 2026-07-04 · Unit 5c-ii-b-2/#161 · one schema registry shared across the data + admin planes via ServeConfig
+**Changed:** no ARCHITECTURE change — the cross-plane wiring that completes 5c-ii.
+- **A single `Arc<Mutex<SchemaRegistry>>` is threaded through `ServeConfig.schema`**, from `main.rs` into `registry_actor` (which calls `Registry::set_schema_registry`, the data plane) and into `serve_admin` (the admin plane, which writes it). One registry, both planes: a registration over the admin plane is at once visible to the data-plane handshake resolution.
+- **`ServeConfig` drops `Copy`, keeps `Clone`.** It now holds an `Arc`, which is not `Copy`. It is only ever moved once (built via `..ServeConfig::default()` and handed to one serve call), so removing `Copy` is transparent at every call site.
+- **`serve_admin` locks the registry per request, only around the synchronous `dispatch`** — never held across an `.await`. Registration is rare and the critical section is a pure map write, so a short lock per request is cheaper than any sharding.
+
+**Why:** carrying the shared registry in the already-threaded `ServeConfig` avoids widening the serve-chain signatures with a new parameter, and the per-request lock keeps the admin plane's writes and the data plane's reads on one authority without either blocking the other. Completes 5c-ii — the handshake now resolves against what the admin plane actually registered. Unblocks 5c-iii (client declares real values).
 
 ## 2026-07-04 · Unit 5c-ii-b-1/#160 · the schema registry is injected into the connection Registry, not threaded through its constructor
 **Changed:** no ARCHITECTURE change — an implementation decision for wiring resolution into the handshake.
