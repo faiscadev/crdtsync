@@ -24,9 +24,12 @@ use std::collections::HashMap;
 /// Roles and groups are captured here at the handshake; the policy evaluator
 /// begins consuming them with the role-grant tier.
 ///
-/// There is no `Default`: an identity always names a concrete actor, so callers
-/// construct it via [`Identity::new`] or [`Identity::with_claims`] — an
-/// empty-actor identity is never a valid authenticated state.
+/// There is deliberately no `Default`: an identity always names an actor, so a
+/// caller constructs it via [`Identity::new`] or [`Identity::with_claims`] —
+/// this rules out an *accidental* empty-actor identity (a stray
+/// `Identity::default()` marking a session authenticated). The actor bytes are
+/// whatever the verifier derives; a verifier that yields an empty actor (e.g.
+/// dev-mode [`AllowAll`] on an empty credential) is the verifier's concern.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Identity {
     actor: Vec<u8>,

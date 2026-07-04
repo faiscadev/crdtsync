@@ -110,9 +110,9 @@ impl Registry {
         self.insert_conn(Session::new())
     }
 
-    /// Open a connection already authenticated as `actor` — the upgrade fast path
-    /// (credential verified at accept) or anonymous mode. Its client skips the
-    /// in-band Auth phase.
+    /// Open a connection already authenticated as `identity` — the upgrade fast
+    /// path (credential verified at accept) or anonymous mode (a minted actor).
+    /// Its client skips the in-band Auth phase.
     pub fn connect_authenticated(&mut self, identity: Identity) -> ConnId {
         self.insert_conn(Session::authenticated(identity))
     }
