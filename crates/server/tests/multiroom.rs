@@ -34,7 +34,9 @@ fn hello(r: &mut Registry, client: u8) -> ConnId {
     assert!(r.deliver(
         id,
         Message::Hello {
-            client: cid(client)
+            client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         }
     ));
     // The dev-mode verifier accepts any credential; drop the AuthOk reply.

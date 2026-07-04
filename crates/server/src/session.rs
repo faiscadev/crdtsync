@@ -117,7 +117,7 @@ pub fn step(
     msg: Message,
 ) -> Response {
     match msg {
-        Message::Hello { client } => {
+        Message::Hello { client, .. } => {
             if session.client.is_some() {
                 return violation("already said hello");
             }

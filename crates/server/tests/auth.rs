@@ -40,6 +40,8 @@ fn hello(hub: &mut Hub, s: &mut Session, v: &dyn Verifier, client: u8) {
         v,
         Message::Hello {
             client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         },
     );
     assert!(

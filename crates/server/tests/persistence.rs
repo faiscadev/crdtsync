@@ -128,7 +128,9 @@ fn ingest_via(r: &mut Registry, client: u8, room: &[u8], ops: Vec<crdtsync_core:
     assert!(r.deliver(
         id,
         Message::Hello {
-            client: cid(client)
+            client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         }
     ));
     assert!(r.deliver(
@@ -209,7 +211,14 @@ fn catch_up_uses_stable_sequences_across_a_restart() {
     {
         let mut r = Registry::with_store(cid(SERVER), Store::open(tmp.path()).unwrap()).unwrap();
         let id = r.connect();
-        r.deliver(id, Message::Hello { client: cid(1) });
+        r.deliver(
+            id,
+            Message::Hello {
+                client: cid(1),
+                app_id: Vec::new(),
+                schema_version: 0,
+            },
+        );
         r.deliver(
             id,
             Message::Auth {

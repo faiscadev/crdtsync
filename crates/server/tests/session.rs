@@ -54,6 +54,8 @@ fn handshake(hub: &mut Hub, s: &mut Session, client: u8) {
         s,
         Message::Hello {
             client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         },
     );
     assert!(
@@ -86,7 +88,15 @@ fn is_violation(m: &Message) -> bool {
 fn hello_establishes_the_client() {
     let mut h = hub();
     let mut s = Session::new();
-    st(&mut h, &mut s, Message::Hello { client: cid(1) });
+    st(
+        &mut h,
+        &mut s,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0,
+        },
+    );
     assert_eq!(s.client(), Some(cid(1)));
 }
 
@@ -105,7 +115,15 @@ fn a_second_hello_is_a_violation() {
     let mut h = hub();
     let mut s = Session::new();
     handshake(&mut h, &mut s, 1);
-    let r = st(&mut h, &mut s, Message::Hello { client: cid(2) });
+    let r = st(
+        &mut h,
+        &mut s,
+        Message::Hello {
+            client: cid(2),
+            app_id: Vec::new(),
+            schema_version: 0,
+        },
+    );
     assert!(r.close);
     assert!(is_violation(&r.replies[0]));
 }

@@ -8,7 +8,15 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
-## 2026-07-04 · Unit 5b-ii-2b/#PENDING · admin plane is a sequential control-plane listener; serve seam unified to Send + Sync
+## 2026-07-04 · Unit 5c-i/#158 · the handshake carries the app declaration in Hello, not a new phase
+**Changed:** no ARCHITECTURE change — an implementation decision for the handshake wire.
+- **`app_id` + `schema_version` are added to the existing `Hello` message**, not carried by a new fourth handshake phase. ARCHITECTURE pins the handshake as three phases (Hello / Auth / Subscribe, §Handshake / decided-decisions), and Hello is the connection-open message where the client names itself — so it is where the client also names the app it speaks for. `app_id` empty means a relay connection (no app); `schema_version` `0` means the client declares no version (a dynamic client that adopts whatever the server serves), distinct from a declared `>= 1` the server resolves against its registry.
+- **Sliced 5c wire → server → client.** 5c-i is the pure core wire change (message + codec + round-trip/total-decode tests); the server retains-and-resolves (5c-ii, where the registry is shared into the data plane) and the client declares real values (5c-iii) build on it. The wire change lands first so both ends have a stable envelope to target.
+- **Break compat, no reservation dance.** Pre-release, so the two fields are added to `Hello` outright (every construction site updated) rather than reserved-then-adopted; there is no deployed wire to preserve.
+
+**Why:** keeping the app declaration inside Hello preserves the pinned three-phase handshake and the "client names itself at Hello" model, rather than inventing a phase for two fields. The relay-vs-enforcing distinction is expressed by the values (`empty app_id` / `version 0`) so the same message serves both tiers with no branching on the wire. Unblocks 5c-ii (resolve against the registry) and 5c-iii (client declaration).
+
+## 2026-07-04 · Unit 5b-ii-2b/#157 · admin plane is a sequential control-plane listener; serve seam unified to Send + Sync
 **Changed:** no ARCHITECTURE change — implementation decisions for the registration transport.
 - **The admin plane serves requests sequentially, no per-connection spawn.** Registration is a rare control-plane operation (an app owner's CI on release), so `serve_admin` handles one request at a time and the `SchemaRegistry` is a plain `&mut` — no `Arc`/`Mutex`. A 30 s per-request timeout keeps a slow or stalled client from wedging the loop; an I/O error or timeout drops that one connection and the plane keeps serving.
 - **The registry is admin-plane-owned for now.** 5b-ii-2b only needs registration to *land and be retained* — proven by the response state machine over a socket (a re-`POST` of the same version is `200`, a changed body under a locked version is `409`), with no read route. Sharing the registry into the data-plane handshake is 5c's job (where the WS handshake resolves `{app_id, version}`), so the ownership/`Arc` question is deferred to the unit that actually needs the read side.

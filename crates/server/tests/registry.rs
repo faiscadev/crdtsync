@@ -47,7 +47,9 @@ fn auth(r: &mut Registry, id: ConnId, client: u8) {
     assert!(r.deliver(
         id,
         Message::Hello {
-            client: cid(client)
+            client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         }
     ));
     assert!(r.deliver(
@@ -196,7 +198,14 @@ fn delivering_to_an_unknown_connection_signals_close() {
     let mut r = registry();
     let c = r.connect();
     r.disconnect(c);
-    assert!(!r.deliver(c, Message::Hello { client: cid(1) }));
+    assert!(!r.deliver(
+        c,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0
+        }
+    ));
 }
 
 // --- the upgrade fast path ---
@@ -207,7 +216,14 @@ fn a_fast_path_connection_subscribes_without_the_auth_phase() {
     // The credential was verified at the transport upgrade, so the connection
     // opens already authenticated and goes straight from Hello to Subscribe.
     let id = r.connect_authenticated(Identity::new(b"alice".to_vec()));
-    assert!(r.deliver(id, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(
+        id,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0
+        }
+    ));
     assert!(r.deliver(id, sub(ROOM)));
     assert_eq!(r.take_outbox(id), vec![ops_msg(Vec::new())]);
 }
@@ -216,7 +232,14 @@ fn a_fast_path_connection_subscribes_without_the_auth_phase() {
 fn a_fast_path_actor_still_fans_out_awareness() {
     let mut r = registry();
     let a = r.connect_authenticated(Identity::new(b"alice".to_vec()));
-    assert!(r.deliver(a, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(
+        a,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0
+        }
+    ));
     assert!(r.deliver(a, sub(ROOM)));
     r.take_outbox(a);
     let b = join(&mut r, 2, ROOM);

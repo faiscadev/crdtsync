@@ -158,6 +158,8 @@ async fn join(url: &str, client: u8) -> Ws {
         &mut ws,
         &Message::Hello {
             client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         },
     )
     .await;
@@ -282,7 +284,15 @@ async fn a_real_verifier_makes_actor_policy_enforceable() {
     // An unknown credential never authenticates — it cannot spoof alice.
     let mut imposter = open(url).await;
     send_bytes(&mut imposter, encode_header(PROTOCOL_VERSION).to_vec()).await;
-    send(&mut imposter, &Message::Hello { client: cid(2) }).await;
+    send(
+        &mut imposter,
+        &Message::Hello {
+            client: cid(2),
+            app_id: Vec::new(),
+            schema_version: 0,
+        },
+    )
+    .await;
     send(
         &mut imposter,
         &Message::Auth {
@@ -311,6 +321,8 @@ async fn auth_expecting(url: &str, client: u8, credential: &[u8], actor: &[u8]) 
         &mut ws,
         &Message::Hello {
             client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         },
     )
     .await;
@@ -549,7 +561,15 @@ async fn a_credential_at_the_upgrade_skips_the_auth_phase() {
     );
 
     // Straight from Hello to Subscribe.
-    send(&mut ws, &Message::Hello { client: cid(1) }).await;
+    send(
+        &mut ws,
+        &Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0,
+        },
+    )
+    .await;
     send(
         &mut ws,
         &Message::Subscribe {

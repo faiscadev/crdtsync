@@ -30,7 +30,9 @@ fn hello_auth(r: &mut Registry, client: u8) -> ConnId {
     assert!(r.deliver(
         id,
         Message::Hello {
-            client: cid(client)
+            client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         }
     ));
     assert!(r.deliver(

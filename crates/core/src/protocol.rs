@@ -68,8 +68,17 @@ pub enum ErrorCode {
 /// One framed message on the wire.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Message {
-    /// Opens a connection, naming the client.
-    Hello { client: ClientId },
+    /// Opens a connection, naming the client and the app it speaks for. `app_id`
+    /// selects the tenant whose registered schema (if any) the server enforces —
+    /// empty means no app, a relay connection. `schema_version` is the single
+    /// version the client speaks; `0` declares none (a dynamic client that adopts
+    /// whatever the server serves). The server resolves `{app_id, schema_version}`
+    /// against its registry — an unknown version for a registered app is refused.
+    Hello {
+        client: ClientId,
+        app_id: Vec<u8>,
+        schema_version: u32,
+    },
     /// Presents an opaque credential for the server to verify. The core does not
     /// parse it; a deployment-configured verifier interprets the bytes.
     Auth { credential: Vec<u8> },
@@ -186,9 +195,15 @@ pub fn decode_header(bytes: &[u8]) -> Result<u32, ProtocolError> {
 pub fn encode_message(m: &Message) -> Vec<u8> {
     let mut out = Vec::new();
     match m {
-        Message::Hello { client } => {
+        Message::Hello {
+            client,
+            app_id,
+            schema_version,
+        } => {
             put_u8(&mut out, 0);
             out.extend_from_slice(&client.as_bytes());
+            put_bytes(&mut out, app_id);
+            put_u32(&mut out, *schema_version);
         }
         Message::Subscribe {
             channel,
@@ -332,6 +347,8 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
     let msg = match cur.u8()? {
         0 => Message::Hello {
             client: cur.client()?,
+            app_id: cur.bytes()?,
+            schema_version: cur.u32()?,
         },
         1 => {
             let channel = Channel(cur.u32()?);

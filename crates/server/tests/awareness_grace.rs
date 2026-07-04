@@ -40,7 +40,9 @@ fn hello_auth(r: &mut Registry, client: u8) -> ConnId {
     assert!(r.deliver(
         id,
         Message::Hello {
-            client: cid(client)
+            client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
         }
     ));
     assert!(r.deliver(
@@ -252,7 +254,14 @@ fn a_second_connection_asserting_a_live_client_cannot_steal_its_presence() {
     // departure must not schedule a sweep of a presence another live connection
     // still holds.
     let intruder = r.connect();
-    assert!(r.deliver(intruder, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(
+        intruder,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0
+        }
+    ));
     r.disconnect(intruder);
 
     clock.advance(GRACE);
@@ -336,7 +345,14 @@ fn an_unauthenticated_socket_does_not_keep_a_departed_clients_presence() {
     // holding the presence, so the victim's real departure still schedules a
     // sweep and the presence expires.
     let ghost = r.connect();
-    assert!(r.deliver(ghost, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(
+        ghost,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0
+        }
+    ));
     r.disconnect(victim);
 
     clock.advance(GRACE);
@@ -368,7 +384,14 @@ fn an_unauthenticated_hello_does_not_cancel_a_pending_sweep() {
     // A bare Hello asserting the id must not cancel the pending sweep — only an
     // authenticated reconnect does.
     let ghost = r.connect();
-    assert!(r.deliver(ghost, Message::Hello { client: cid(1) }));
+    assert!(r.deliver(
+        ghost,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0
+        }
+    ));
 
     clock.advance(GRACE);
     r.sweep();
