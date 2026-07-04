@@ -289,6 +289,7 @@ fn awareness_keys_per_client_are_bounded() {
             b"actor".to_vec(),
             k.to_le_bytes().to_vec(),
             vec![0],
+            0,
         );
     }
     // Exactly the cap is retained — the first 64 distinct keys, no more.
@@ -301,6 +302,7 @@ fn awareness_keys_per_client_are_bounded() {
         b"actor".to_vec(),
         0u32.to_le_bytes().to_vec(),
         vec![9],
+        0,
     );
     let updated = h
         .awareness_entries(b"room")

@@ -55,6 +55,27 @@ fn hello_auth(r: &mut Registry, client: u8) -> ConnId {
     id
 }
 
+/// Hello + Auth under an explicit credential, so two clients can share an actor.
+fn hello_auth_as(r: &mut Registry, client: u8, credential: &[u8]) -> ConnId {
+    let id = r.connect();
+    assert!(r.deliver(
+        id,
+        Message::Hello {
+            client: cid(client),
+            app_id: Vec::new(),
+            schema_version: 0,
+        }
+    ));
+    assert!(r.deliver(
+        id,
+        Message::Auth {
+            credential: credential.to_vec(),
+        }
+    ));
+    r.take_outbox(id);
+    id
+}
+
 fn subscribe(r: &mut Registry, id: ConnId, channel: u32, room: &[u8]) {
     assert!(r.deliver(
         id,
@@ -137,6 +158,50 @@ fn a_sweep_tells_room_peers_the_presence_expired() {
             actor: actor_of(1),
         }]
     );
+}
+
+#[test]
+fn closing_one_tab_keeps_a_sibling_tabs_presence() {
+    let (mut r, clock) = registry();
+    // Two tabs of one actor (same credential, distinct clients) plus an observer.
+    let tab1 = hello_auth_as(&mut r, 1, b"user");
+    let tab2 = hello_auth_as(&mut r, 2, b"user");
+    let observer = hello_auth(&mut r, 3);
+    subscribe(&mut r, tab1, 1, ROOM_A);
+    subscribe(&mut r, tab2, 2, ROOM_A);
+    subscribe(&mut r, observer, 9, ROOM_A);
+
+    set_awareness(&mut r, tab1, 1, b"cursor", vec![1]);
+    set_awareness(&mut r, tab2, 2, b"cursor", vec![2]);
+    r.take_outbox(observer);
+
+    // Tab 1 closes; after grace, the actor still holds cursor via tab 2.
+    r.disconnect(tab1);
+    clock.advance(GRACE);
+    r.sweep();
+
+    // The observer is told nothing — neither an actor-wide clear nor a per-key
+    // one — because the actor's cursor is still live through tab 2.
+    let out = r.take_outbox(observer);
+    assert!(
+        !out.iter().any(|m| matches!(
+            m,
+            Message::AwarenessClear { .. } | Message::AwarenessClearKey { .. }
+        )),
+        "a sibling tab's live presence must not be cleared",
+    );
+
+    // A joiner still sees the actor's cursor.
+    let joiner = hello_auth(&mut r, 4);
+    r.deliver(
+        joiner,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM_A.to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert!(!awareness_updates(r.take_outbox(joiner)).is_empty());
 }
 
 #[test]

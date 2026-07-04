@@ -40,7 +40,7 @@ fn hello(app_id: &[u8], schema_version: u32) -> Message {
 fn resolve(reg: &Mutex<SchemaRegistry>, msg: Message) -> (Session, crdtsync_server::Response) {
     let mut hub = Hub::new(cid(0xFF));
     let mut session = Session::new();
-    let resp = step(&mut hub, &mut session, &AllowAll, &PermitAll, reg, msg);
+    let resp = step(&mut hub, &mut session, &AllowAll, &PermitAll, reg, 0, msg);
     (session, resp)
 }
 

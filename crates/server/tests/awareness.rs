@@ -19,7 +19,12 @@ fn cid(first: u8) -> ClientId {
 }
 
 fn registry() -> Registry {
-    Registry::new(cid(0xFF))
+    let mut r = Registry::new(cid(0xFF));
+    // A fixed manual clock: these tests don't exercise time, but an awareness set
+    // now reads the clock to stamp last-seen, and the default SystemClock cannot
+    // be read under Miri's isolation.
+    r.set_clock(Arc::new(ManualClock::new(0)));
+    r
 }
 
 const ROOM_A: &[u8] = b"room-a";

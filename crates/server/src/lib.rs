@@ -85,6 +85,75 @@ struct Version {
 /// the room's awareness map against a client that floods distinct keys.
 const MAX_AWARENESS_KEYS_PER_CLIENT: usize = 64;
 
+/// The timed-TTL policy an enforcing server applies to awareness entries: how
+/// long an entry kind may go silent before the periodic sweep expires it.
+pub trait AwarenessPolicy: Send + Sync {
+    /// The timed TTL in milliseconds for entry `key` in `room`, or `None` for a
+    /// session-lifetime entry — one cleared only on disconnect, never by silence.
+    fn ttl(&self, room: &[u8], key: &[u8]) -> Option<u64>;
+
+    /// Whether any entry can carry a timed TTL. A policy that declares none lets
+    /// the sweep skip the whole per-entry expiry scan. Conservatively `true`.
+    fn has_timed_ttls(&self) -> bool {
+        true
+    }
+}
+
+/// The default policy: every entry is session-lifetime, so a server with no
+/// registered schema never times an entry out — awareness behaves as pure
+/// presence cleared only on disconnect.
+pub struct NoTimedTtl;
+
+impl AwarenessPolicy for NoTimedTtl {
+    fn ttl(&self, _room: &[u8], _key: &[u8]) -> Option<u64> {
+        None
+    }
+
+    fn has_timed_ttls(&self) -> bool {
+        false
+    }
+}
+
+/// How a departing client's presence is cleared from a room. An actor-wide
+/// clear when no other connection of that actor remains; otherwise a per-key
+/// clear for each key no surviving connection still holds — so closing one of an
+/// actor's tabs never wipes the presence a sibling tab keeps live.
+pub enum AwarenessRemoval {
+    /// Every entry of `actor` in `room` is gone — no connection of it remains.
+    Actor { room: RoomId, actor: Vec<u8> },
+    /// Just `actor`'s `key` in `room` is gone; its other entries (via a sibling
+    /// connection) live on.
+    Key {
+        room: RoomId,
+        actor: Vec<u8>,
+        key: Vec<u8>,
+    },
+}
+
+impl AwarenessRemoval {
+    /// The room this removal is scoped to.
+    pub fn room(&self) -> &[u8] {
+        match self {
+            AwarenessRemoval::Actor { room, .. } | AwarenessRemoval::Key { room, .. } => room,
+        }
+    }
+
+    /// The wire message telling a subscriber of the removal on `channel`.
+    pub fn message(&self, channel: crdtsync_core::protocol::Channel) -> crdtsync_core::Message {
+        match self {
+            AwarenessRemoval::Actor { actor, .. } => crdtsync_core::Message::AwarenessClear {
+                channel,
+                actor: actor.clone(),
+            },
+            AwarenessRemoval::Key { actor, key, .. } => crdtsync_core::Message::AwarenessClearKey {
+                channel,
+                actor: actor.clone(),
+                key: key.clone(),
+            },
+        }
+    }
+}
+
 /// The set of rooms a single node serves, optionally over a durable log.
 pub struct Hub {
     server: ClientId,
@@ -92,10 +161,11 @@ pub struct Hub {
     store: Option<Store>,
     compaction_threshold: u64,
     /// Ephemeral presence per room: each owner client's latest entry per key,
-    /// with the actor to surface it under. Never persisted or snapshotted.
-    /// Per room, each client's presence keyed by awareness key → (actor, value).
+    /// with the actor to surface it under and the wall-clock millis it was last
+    /// set — the basis for timed-TTL expiry. Never persisted or snapshotted.
+    /// Per room, each client's presence keyed by key → (actor, value, last_seen).
     /// Nesting by client keeps the per-client key cap an O(1) check.
-    awareness: HashMap<RoomId, HashMap<ClientId, HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>>>,
+    awareness: HashMap<RoomId, HashMap<ClientId, HashMap<Vec<u8>, (Vec<u8>, Vec<u8>, u64)>>>,
     /// Named versions per room, keyed by name — sorted, for listing/pagination.
     /// The in-memory versions index over the snapshot storage primitive.
     versions: HashMap<RoomId, BTreeMap<Vec<u8>, Version>>,
@@ -119,7 +189,8 @@ impl Hub {
     /// key past the per-client cap is dropped, so a client cannot grow the room's
     /// awareness map without bound; an update to an existing key always applies.
     /// Returns whether the entry was stored — a dropped key is not broadcast
-    /// either, so the cap bounds fan-out as well as memory.
+    /// either, so the cap bounds fan-out as well as memory. `now` stamps the
+    /// entry's last-seen time, so re-setting a key on activity refreshes its TTL.
     pub fn set_awareness(
         &mut self,
         room: &[u8],
@@ -127,6 +198,7 @@ impl Hub {
         actor: Vec<u8>,
         key: Vec<u8>,
         value: Vec<u8>,
+        now: u64,
     ) -> bool {
         let keys = self
             .awareness
@@ -137,7 +209,7 @@ impl Hub {
         if !keys.contains_key(&key) && keys.len() >= MAX_AWARENESS_KEYS_PER_CLIENT {
             return false;
         }
-        keys.insert(key, (actor, value));
+        keys.insert(key, (actor, value, now));
         true
     }
 
@@ -150,8 +222,66 @@ impl Hub {
             .flatten()
             .flat_map(|(_, keys)| {
                 keys.iter()
-                    .map(|(key, (actor, value))| (actor.clone(), key.clone(), value.clone()))
+                    .map(|(key, (actor, value, _))| (actor.clone(), key.clone(), value.clone()))
             })
+            .collect()
+    }
+
+    /// Expire every awareness entry whose silence since its last set exceeds the
+    /// timed TTL `policy` assigns it, returning the per-key removals the caller
+    /// should tell each room's peers. An entry `policy` gives no TTL is session-
+    /// lifetime and never expires here. Empty client and room maps left behind are
+    /// pruned, matching a disconnect clear.
+    ///
+    /// Peers key presence by `(actor, key)`, so a removal is returned only when no
+    /// other client of that actor still holds that key in the room — a second
+    /// connection of the same actor (another tab) with a live entry keeps the
+    /// actor's presence, and a sibling's expiry must not wipe it from peers.
+    pub fn expire_silent_awareness(
+        &mut self,
+        now: u64,
+        policy: &dyn AwarenessPolicy,
+    ) -> Vec<AwarenessRemoval> {
+        let mut expired = Vec::new();
+        for (room, by_client) in self.awareness.iter_mut() {
+            for keys in by_client.values_mut() {
+                keys.retain(
+                    |key, (actor, _value, last_seen)| match policy.ttl(room, key) {
+                        Some(ttl) if now.saturating_sub(*last_seen) > ttl => {
+                            expired.push((room.clone(), actor.clone(), key.clone()));
+                            false
+                        }
+                        _ => true,
+                    },
+                );
+            }
+            by_client.retain(|_, keys| !keys.is_empty());
+        }
+        self.awareness.retain(|_, by_client| !by_client.is_empty());
+        // Nothing timed out — the common sweep tick — so skip walking the rest of
+        // the presence map for survivors there is no clear to suppress.
+        if expired.is_empty() {
+            return Vec::new();
+        }
+        // The `(room, actor, key)` triples a surviving client still holds after
+        // the sweep — a second tab of the actor keeps the presence, so its
+        // sibling's expiry must not clear it. One pass over what remains.
+        let mut surviving: HashSet<(RoomId, Vec<u8>, Vec<u8>)> = HashSet::new();
+        for (room, by_client) in &self.awareness {
+            for keys in by_client.values() {
+                for (key, (actor, _, _)) in keys {
+                    surviving.insert((room.clone(), actor.clone(), key.clone()));
+                }
+            }
+        }
+        // Suppress a clear a survivor still holds, then dedup (two tabs of one
+        // actor can expire the same key at once).
+        expired.retain(|triple| !surviving.contains(triple));
+        expired.sort_unstable();
+        expired.dedup();
+        expired
+            .into_iter()
+            .map(|(room, actor, key)| AwarenessRemoval::Key { room, actor, key })
             .collect()
     }
 
@@ -165,19 +295,48 @@ impl Hub {
     }
 
     /// Drop every awareness entry owned by `client` across all rooms, returning
-    /// the `(room, actor)` pairs cleared so the caller can tell each room's peers
-    /// the presence expired. A client holds one actor per room, so at most one
-    /// pair per room it had presence in.
-    pub fn clear_client_awareness(&mut self, client: ClientId) -> Vec<(RoomId, Vec<u8>)> {
-        let mut cleared = Vec::new();
+    /// the removals the caller should tell each room's peers. Peers key presence
+    /// by `(actor, key)`, so an actor with another live connection in the room
+    /// (a second tab) keeps its presence: only the keys no surviving connection
+    /// still holds are cleared, per-key. When no connection of the actor remains,
+    /// the whole actor is cleared at once.
+    pub fn clear_client_awareness(&mut self, client: ClientId) -> Vec<AwarenessRemoval> {
+        let mut removals = Vec::new();
         for (room, by_client) in self.awareness.iter_mut() {
-            if let Some(keys) = by_client.remove(&client) {
-                if let Some((actor, _)) = keys.into_values().next() {
-                    cleared.push((room.clone(), actor));
+            let Some(removed) = by_client.remove(&client) else {
+                continue;
+            };
+            let Some((actor, _, _)) = removed.values().next() else {
+                continue;
+            };
+            let actor = actor.clone();
+            let holds = |key: &[u8]| {
+                by_client
+                    .values()
+                    .any(|keys| keys.get(key).is_some_and(|(a, _, _)| a == &actor))
+            };
+            let has_sibling = by_client
+                .values()
+                .any(|keys| keys.values().any(|(a, _, _)| a == &actor));
+            if has_sibling {
+                for key in removed.keys() {
+                    if !holds(key) {
+                        removals.push(AwarenessRemoval::Key {
+                            room: room.clone(),
+                            actor: actor.clone(),
+                            key: key.clone(),
+                        });
+                    }
                 }
+            } else {
+                removals.push(AwarenessRemoval::Actor {
+                    room: room.clone(),
+                    actor,
+                });
             }
         }
-        cleared
+        self.awareness.retain(|_, by_client| !by_client.is_empty());
+        removals
     }
 
     /// Auto-compact a room once its retained log reaches `threshold` ops, folding

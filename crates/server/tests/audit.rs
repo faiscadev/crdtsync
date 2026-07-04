@@ -14,7 +14,7 @@ use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Message};
 use crdtsync_server::acl::{Acl, ResourceMatch, Subject};
 use crdtsync_server::audit::{AccessLog, AccessRecord, Audited, Decision};
-use crdtsync_server::{Action, Authorizer, Registry, Resource};
+use crdtsync_server::{Action, Authorizer, ManualClock, Registry, Resource};
 
 const ROOM: &[u8] = b"room-a";
 
@@ -115,6 +115,7 @@ fn wrapping_the_registry_authorizer_logs_enforcement() {
         ResourceMatch::Room(b"open".to_vec()),
     ));
     let mut r = Registry::new(cid(0xFF));
+    r.set_clock(std::sync::Arc::new(ManualClock::new(0)));
     r.set_authorizer(Box::new(Audited::new(policy, Box::new(rec.clone()))));
 
     let id = r.connect();
@@ -178,6 +179,7 @@ fn an_awareness_publish_logs_the_decision_not_the_entry() {
     let policy: Box<dyn Authorizer> =
         Box::new(Acl::new().allow(Subject::Anyone, None, ResourceMatch::AnyRoom));
     let mut r = Registry::new(cid(0xFF));
+    r.set_clock(std::sync::Arc::new(ManualClock::new(0)));
     r.set_authorizer(Box::new(Audited::new(policy, Box::new(rec.clone()))));
 
     let id = r.connect();
