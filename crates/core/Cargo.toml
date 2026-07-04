@@ -9,3 +9,9 @@ description = "Portable CRDT core: refcounted lifecycle, Share slot semantics, n
 # feature on purpose: ClientId v7 is built from injected Host entropy + clock,
 # so we avoid pulling getrandom into the core (keeps wasm/embedding clean).
 uuid = { version = "1", default-features = false, features = ["v5"] }
+
+# Dev-only: differential oracle for the hand-rolled JSON parser. Never enters the
+# shipped core/wasm/ffi dependency graph — it exists solely to cross-check
+# `json::Json::parse` against a battle-tested parser in the test suite.
+[dev-dependencies]
+serde_json = "1"
