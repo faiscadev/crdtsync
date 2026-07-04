@@ -875,7 +875,16 @@ Apps need both. Schema covers default policy for things of type X. Doc-level cov
 
 ## Subject Types
 
-User, role, group — all first-class peers, composable. `authenticated:*`, `anonymous:*`, `*` (anyone) supported. **Claims model:** the verifier maps a credential to an `Identity { actor, roles, groups }` — the engine reads role / group membership *from the token* (the app's identity provider issues it) and never decides membership itself. A grant's subject matches against that identity: a role name against `identity.roles`, a group against `identity.groups`, an actor id against `identity.actor`, or a subject class (`authenticated` / `anonymous` / `anyone`).
+User, role, group — all first-class peers, composable. `authenticated:*`, `anonymous:*`, `*` (anyone) supported. **Claims model:** the verifier maps a credential to an `Identity { actor, groups, roles }` — the engine reads membership *from the token* (the app's identity provider issues it) and never decides membership itself. A grant's subject matches against that identity: an actor id against `identity.actor`, a group against `identity.groups`, a role name against the identity's *effective* roles, or a subject class.
+
+**Role membership has two sources — one global, one per-doc:**
+
+- **Token roles are deliberately global.** A role claimed in the token holds *everywhere* in the `app_id`. Reserve token roles for genuinely app-wide authority (e.g. `admin`); a bare token `editor` means editor of *every* document.
+- **Per-doc roles are assigned in the doc-level ACL.** An owner grants a role to an actor **or a group**, scoped to a path — "Alice is `editor` of doc X," "group `designers` is `editor` of `X/content`." This is the normal way to scope a role to a document (the Notion / Google-Docs model), and it never touches the token.
+
+**Groups** are the membership indirection: the *token* carries which groups the actor belongs to; the *doc-level ACL* carries which groups hold which role / capability where. So `alice ∈ designers` (token) + `designers = editor on X` (doc-ACL) makes Alice an editor of X — assign a whole team at once.
+
+An actor's **effective roles** on a resource = token roles (global) ∪ roles assigned to the actor or any of its groups on that resource or an ancestor (per-doc). Schema `@auth` then maps those effective roles to permissions.
 
 ## Three Authority Tiers
 
@@ -883,16 +892,26 @@ Distinct mechanisms, not interchangeable — conflating them is a security hole:
 
 - **App admin** — the schema-registry authority (the app owner / CI). Lives *above* every document: registers schemas, migrations, and the static `@auth` for an `app_id`, and is a **superuser** that may act on every document in the app (bypasses the policy, decision-flow step 0). A credential class (the registration key), **not** a role and **not** an owner; never appears in `@auth` grants.
 - **Owner** — a **dynamic, recursive, path-scoped capability** held by an actor over a room or a path within it. An owner has full access to its subtree *and* meta-authority (grant / revoke) over it. The document creator auto-owns the root path `/`; multiple owners per path are allowed. Owners live as **doc-level ACL state** (the CRDT tier), self-organized at runtime — never declared in the schema.
-- **Role** — a static, schema-declared name (`viewer` / `editor`), membership from token claims, powers bounded by the schema `@auth` grants.
+- **Role** — a static, schema-declared name (`viewer` / `editor`) whose powers are the schema `@auth` grants. Membership is two-source: a **token** claim (global, for app-wide roles) or a **doc-level ACL** assignment to an actor or group (per-doc — the usual case). The schema defines what a role *can do*; who *has* it is a token claim or a per-doc grant, never the schema.
 
 ## Ownership (Dynamic Capability Model)
 
-Ownership is pure runtime doc-level ACL state — the app admin never writes it in stone; owners grow the authority tree themselves. A doc-level ACL tuple is `{ subject, capability ∈ { read, write, publish_awareness, own }, path, grantor }`.
+Ownership is pure runtime doc-level ACL state — the app admin never writes it in stone; owners grow the authority tree themselves. A doc-level ACL tuple is:
 
-- **Delegation with attenuation** — an owner of path P may write a tuple on P **or any subpath of P** (never above or outside): grant a **co-owner** of P, an **owner of a subpath** P/x (who can further delegate downward — recursive), or a **leaf** `read` / `write` / `publish_awareness` grant to a specific actor. Uniform rule: *an actor may write an ACL tuple on Q iff it owns Q or an ancestor of Q — or is app admin.*
-- **`own` is delegable authority; leaf grants are not** — an `own` grantee becomes an owner and can re-delegate; a plain `read` / `write` grantee gets access only and **cannot** hand out further grants. Only ownership confers granting power.
+```
+{ subject:  Actor(id) | Group(name) | Authenticated | Anonymous | Anyone,
+  grant:    Capability(read | write | publish_awareness | own) | Role(name),
+  effect:   allow | deny,
+  path, grantor }
+```
+
+An owner assigns a **capability or a role**, to an **actor or a group**, on a path, with an allow or deny effect. `Role(name)` is per-doc role assignment (resolved through the schema `@auth` grants); `Capability` is a direct grant.
+
+- **Delegation with attenuation** — an owner of path P may write a tuple on P **or any subpath of P** (never above or outside): grant a **co-owner** of P, an **owner of a subpath** P/x (who can further delegate downward — recursive), a **role** to an actor / group, or a **leaf** capability. Uniform rule: *an actor may write an ACL tuple on Q iff it owns Q or an ancestor of Q — or is app admin.*
+- **`own` is delegable authority; other grants are not** — an `own` grantee becomes an owner and can re-delegate; a plain capability or role grantee gets access only and **cannot** hand out further grants. Only ownership confers granting power.
 - **Provenance-based revocation** — a tuple is removable only by its **grantor** (recorded as the tuple's author — un-forgeable, since the op carries `actor_id`) or someone above the grantor in the grant chain, **not** by whoever merely owns an ancestor path. So co-owners granted by a common superior cannot revoke each other (only their shared grantor / admin can), and a superior-imposed constraint on a subordinate's subtree cannot be removed by that subordinate. Revocation authority follows **provenance, not path-ancestry**.
-- **Downstream deny + owner carve-outs** — grants and denies both **inherit downward**; an explicit **deny wins globally** (an ancestor deny is a hard floor over its whole subtree — no re-opening below it, AWS-style). So `read` on `a/b` + `deny read` on `a/b/c` yields "read a/b, not a/b/c." The same shape carves ownership: a **superior** places `deny own` on `a/b/c` to strip a subordinate a/b-owner's authority over that subpath — and because removal follows provenance (above), the subordinate cannot delete the carve-out even though it owns an ancestor. Capability separation lets a carve-out excise one dimension surgically (`deny own` while leaving `read`).
+- **Deny: beats static defaults always, provenance-bounded between doc-ACL grants.** Grants and denies inherit downward. A `deny` **always** overrides static policy — a schema `@auth` role-grant or a global token role (so an owner's `deny read alice` on doc X beats Alice's app-wide `viewer` role). Between *doc-level* grants, a deny is **provenance-bounded**: it overrides an allow / ownership only from the deny author's **own subtree** (a superior carving out a subordinate — `deny own` on `a/b/c` strips a subordinate a/b-owner, and provenance-removal makes it stick), and **cannot** override an allow / ownership granted by a **peer or a superior**. This is the same guarantee as revocation — a co-owner can no more *deny* a peer than *revoke* one; only their shared grantor / admin can. Deny is not a backdoor around provenance.
+- **Downstream deny** — `read` on `a/b` + `deny read` on `a/b/c` yields "read a/b, not a/b/c"; an ancestor deny is a hard floor over its subtree, no re-opening below it (AWS-style). Capability separation lets a carve-out excise one dimension surgically (`deny own` while leaving `read`).
 
 ## Actions
 
@@ -911,13 +930,13 @@ Schema `@auth` supports `${actor_id}` / `${author_id}` / `${room_id}` / `${branc
 For every check, over the merged view of doc-level ACL tuples and schema `@auth` grants:
 
 0. Identity is **app admin** → ALLOW (superuser, bypasses policy).
-1. Any explicit **DENY** (doc-level ACL) on the resource or an ancestor → DENY (deny-wins, global).
+1. An explicit **DENY** (doc-level ACL) on the resource or an ancestor → DENY — provenance-bounded: it fires against a static default (schema role-grant / global token role) or against a grant from the deny author's own subtree, but not against a peer's or superior's allow / ownership.
 2. Identity **owns** the resource or any ancestor path → ALLOW.
-3. Any explicit **ALLOW** (doc-level ACL leaf grant) on the resource or an ancestor → ALLOW.
-4. Schema **`@auth`** grants the identity's role / subject on the resource → ALLOW.
+3. An explicit **ALLOW** (doc-level ACL capability grant) on the resource or an ancestor → ALLOW.
+4. Schema **`@auth`** grants one of the identity's **effective roles** (token roles ∪ per-doc role assignments for the actor or its groups) on the resource → ALLOW.
 5. Otherwise → DENY (default-deny).
 
-Standard IAM semantics: explicit deny always wins (below superuser), user-specific not stronger than role for allow, absence of declaration = denial. Permission state is versioned in lamport time, so a concurrent grant / revoke is checked at the op's lamport position (§Hard Problems) and resolves deterministically across replicas. Single source of truth used at every enforcement point.
+Standard IAM semantics: explicit deny wins over static and same-or-lower-provenance policy (below superuser), user-specific not stronger than role for allow, absence of declaration = denial. Permission state is versioned in lamport time, so a concurrent grant / revoke is checked at the op's lamport position (§Hard Problems) and resolves deterministically across replicas. Single source of truth used at every enforcement point.
 
 ## Enforcement Points
 
