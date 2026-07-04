@@ -9,9 +9,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
+use std::sync::Arc;
 
 use crdtsync_core::op::OpId;
-use crdtsync_core::{ClientId, Document, Element, Op};
+use crdtsync_core::{ClientId, Document, Element, Op, Schema};
 
 pub mod acl;
 pub mod admin;
@@ -111,6 +112,44 @@ impl AwarenessPolicy for NoTimedTtl {
 
     fn has_timed_ttls(&self) -> bool {
         false
+    }
+}
+
+/// A policy resolved from each room's governing schema for one sweep: a snapshot
+/// of `room → parsed schema`, built from the rooms with live presence and the
+/// `{app_id, version}` bound to each. An entry's TTL is the `ttl` its kind
+/// declares in the room's schema; a room with no governing schema (a relay
+/// room), or a kind the schema gives no `ttl`, is session-lifetime. The parsed
+/// schema is shared (an [`Arc`]), so many rooms of one app hold one copy.
+pub struct SchemaAwarenessPolicy {
+    schemas: HashMap<RoomId, Arc<Schema>>,
+    /// Whether any mapped schema declares a timed TTL — precomputed so the sweep's
+    /// `has_timed_ttls` check is O(1), not a rescan of every room's schema.
+    has_timed_ttls: bool,
+}
+
+impl SchemaAwarenessPolicy {
+    /// A policy over the resolved `room → schema` snapshot.
+    pub fn new(schemas: HashMap<RoomId, Arc<Schema>>) -> Self {
+        let has_timed_ttls = schemas
+            .values()
+            .any(|s| s.awareness().iter().any(|(_, e)| e.ttl.is_some()));
+        Self {
+            schemas,
+            has_timed_ttls,
+        }
+    }
+}
+
+impl AwarenessPolicy for SchemaAwarenessPolicy {
+    fn ttl(&self, room: &[u8], key: &[u8]) -> Option<u64> {
+        let schema = self.schemas.get(room)?;
+        let kind = std::str::from_utf8(key).ok()?;
+        schema.awareness_entry(kind).and_then(|e| e.ttl)
+    }
+
+    fn has_timed_ttls(&self) -> bool {
+        self.has_timed_ttls
     }
 }
 
@@ -283,6 +322,12 @@ impl Hub {
             .into_iter()
             .map(|(room, actor, key)| AwarenessRemoval::Key { room, actor, key })
             .collect()
+    }
+
+    /// The rooms that currently hold any awareness presence — the sweep resolves
+    /// a governing schema only for these, not for every room the hub serves.
+    pub fn awareness_rooms(&self) -> impl Iterator<Item = &RoomId> {
+        self.awareness.keys()
     }
 
     /// Whether `client` currently holds any awareness entry in any room — so a

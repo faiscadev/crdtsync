@@ -6,17 +6,17 @@
 //! room's other connections. Pure, synchronous routing; the async transport
 //! pumps bytes through it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use crdtsync_core::{ClientId, Message};
+use crdtsync_core::{ClientId, Message, Schema};
 
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Action, Authorizer, PermitAll, Resource};
 use crate::clock::{Clock, SystemClock};
 use crate::schema_registry::SchemaRegistry;
-use crate::{step, AwarenessPolicy, Hub, NoTimedTtl, Session, Store};
+use crate::{step, AwarenessPolicy, Hub, RoomId, SchemaAwarenessPolicy, Session, Store};
 
 /// How long a departed client's presence is retained before a sweep clears it,
 /// so a brief reconnect keeps its awareness alive across the gap.
@@ -49,10 +49,22 @@ pub struct Registry {
     /// against. Shared with the registration admin plane, which writes it; empty
     /// by default, so every connection resolves to a relay.
     schema: Arc<Mutex<SchemaRegistry>>,
-    /// The timed-TTL policy the sweep applies to awareness entries. Defaults to
-    /// [`NoTimedTtl`] — every entry is session-lifetime — so a server with no
-    /// schema-derived policy never times presence out.
-    awareness_policy: Arc<dyn AwarenessPolicy>,
+    /// An injected timed-TTL policy, authoritative when set: it alone governs
+    /// expiry — one declaring no TTLs suppresses it entirely. `None` (the default)
+    /// leaves the sweep to resolve TTLs from each room's governing schema.
+    awareness_policy: Option<Arc<dyn AwarenessPolicy>>,
+    /// The `{app_id, version}` governing each room's awareness, seeded when an
+    /// enforcing client subscribes and reconciled each sweep against who is
+    /// present ([`reconcile_room_apps`](Registry::reconcile_room_apps)): the first
+    /// (incumbent) app governs while the room stays live — a foreign app never
+    /// seizes it — at the incumbent's highest present version. Dormant rooms are
+    /// dropped.
+    room_apps: HashMap<RoomId, (Vec<u8>, u32)>,
+    /// Parsed schemas keyed by `{app_id, version}`, the sweep's TTL source. A
+    /// registry link is immutable once locked, so the outcome — the parsed schema
+    /// or `None` for an absent/unparseable one — is cached for the process
+    /// lifetime and never re-resolved for the same version.
+    schema_cache: HashMap<(Vec<u8>, u32), Option<Arc<Schema>>>,
 }
 
 impl Registry {
@@ -74,7 +86,9 @@ impl Registry {
             grace_millis: DEFAULT_GRACE_MILLIS,
             stale: HashMap::new(),
             schema: Arc::new(Mutex::new(SchemaRegistry::new())),
-            awareness_policy: Arc::new(NoTimedTtl),
+            awareness_policy: None,
+            room_apps: HashMap::new(),
+            schema_cache: HashMap::new(),
         }
     }
 
@@ -84,10 +98,11 @@ impl Registry {
         self.schema = schema;
     }
 
-    /// Apply `policy` to time awareness entries out in the sweep. Defaults to
-    /// [`NoTimedTtl`]; an enforcing server sets a schema-derived one.
+    /// Inject `policy` as the authoritative timer for awareness entries — it
+    /// alone governs expiry (one declaring no TTLs suppresses it). By default no
+    /// policy is injected and the sweep resolves TTLs from each room's schema.
     pub fn set_awareness_policy(&mut self, policy: Arc<dyn AwarenessPolicy>) {
-        self.awareness_policy = policy;
+        self.awareness_policy = Some(policy);
     }
 
     /// Use `verifier` to authenticate connections' credentials.
@@ -207,13 +222,147 @@ impl Registry {
         }
         // Timed-TTL expiry: an entry silent past the TTL its kind is assigned is
         // dropped and its removal fanned out per-key, leaving the actor's other
-        // entries (and connection) intact — unlike the actor-wide grace clear. A
-        // policy that declares no TTLs skips the whole scan.
-        if self.awareness_policy.has_timed_ttls() {
-            let removals = self
-                .hub
-                .expire_silent_awareness(now, &*self.awareness_policy);
-            self.fan_out_removals(removals);
+        // entries (and connection) intact — unlike the actor-wide grace clear. An
+        // injected policy is authoritative — it alone governs, suppressing expiry
+        // when it declares no TTLs; with none injected the TTLs are resolved from
+        // each room's schema. Either way a policy that declares none skips the scan.
+        match self.awareness_policy.clone() {
+            Some(policy) => {
+                if policy.has_timed_ttls() {
+                    let removals = self.hub.expire_silent_awareness(now, &*policy);
+                    self.fan_out_removals(removals);
+                }
+            }
+            None => {
+                // Reconcile each room's schema binding against who is present
+                // before resolving TTLs from it; only this path uses the bindings.
+                self.reconcile_room_apps();
+                let policy = self.resolve_schema_policy();
+                if policy.has_timed_ttls() {
+                    let removals = self.hub.expire_silent_awareness(now, &policy);
+                    self.fan_out_removals(removals);
+                }
+            }
+        }
+    }
+
+    /// Recompute every live room's governing `{app_id, version}` and drop the
+    /// bindings of dormant rooms. The first enforcing app to bind a room governs
+    /// it for as long as the room stays live — a foreign app subscribing never
+    /// seizes it, so it cannot grief-expire the incumbent's presence (a room is
+    /// served by one app; cross-app reuse governs by the first app until the room
+    /// fully empties, then rebinds). The governing version is the highest version
+    /// of that app seen while the room has held presence — the bound version is a
+    /// floor a present higher version lifts, so a rolling upgrade adopts the newer
+    /// schema and a just-departed newer client's grace-held presence keeps its own
+    /// (longer) TTL rather than an older peer's; the floor resets when the room
+    /// goes dormant. A room with neither presence nor any subscriber is dropped,
+    /// bounding the map on a server that churns through rooms.
+    fn reconcile_room_apps(&mut self) {
+        // One pass over connections: the enforcing apps present per room (each at
+        // its highest version) and the set of rooms anyone subscribes.
+        let mut present: HashMap<RoomId, HashMap<Vec<u8>, u32>> = HashMap::new();
+        let mut subscribed: HashSet<RoomId> = HashSet::new();
+        for conn in self.conns.values() {
+            let version = conn.session.schema_version();
+            for room in conn.session.subscribed_rooms() {
+                subscribed.insert(room.clone());
+                if let Some(version) = version {
+                    let by_app = present.entry(room.clone()).or_default();
+                    let entry = by_app
+                        .entry(conn.session.app_id().to_vec())
+                        .or_insert(version);
+                    *entry = (*entry).max(version);
+                }
+            }
+        }
+        // A room is live if it holds presence or has a subscriber.
+        let mut live: HashSet<RoomId> = self.hub.awareness_rooms().cloned().collect();
+        live.extend(subscribed);
+        let mut next: HashMap<RoomId, (Vec<u8>, u32)> = HashMap::new();
+        for room in live {
+            let apps = present.get(&room);
+            let governing = match self.room_apps.get(&room) {
+                // The incumbent app keeps governing at the highest version of it
+                // seen while the room has held presence — the bound version is a
+                // floor a currently-present higher version lifts, never lowered.
+                // So a rolling upgrade adopts the newer schema and a just-departed
+                // newer client's grace-held presence is not expired early under an
+                // older peer's shorter TTL; the floor resets when the room goes
+                // dormant and the binding is dropped below.
+                Some((bound_app, bound_version)) => {
+                    let present_version = apps
+                        .and_then(|apps| apps.get(bound_app).copied())
+                        .unwrap_or(0);
+                    Some((bound_app.clone(), present_version.max(*bound_version)))
+                }
+                // No binding yet — the first present enforcing app takes it.
+                None => apps.and_then(pick_app),
+            };
+            if let Some(governing) = governing {
+                next.insert(room, governing);
+            }
+        }
+        self.room_apps = next;
+    }
+
+    /// Resolve the timed TTLs for this sweep from each bound room's schema. The
+    /// binding is already reconciled against who is present, so this parses each
+    /// governing schema out of the shared registry (cached across sweeps, since a
+    /// link is immutable) and maps it to the room. A room with no binding resolves
+    /// to no schema, so its presence is session-lifetime.
+    fn resolve_schema_policy(&mut self) -> SchemaAwarenessPolicy {
+        let bindings: Vec<(RoomId, (Vec<u8>, u32))> = self
+            .room_apps
+            .iter()
+            .map(|(room, app)| (room.clone(), app.clone()))
+            .collect();
+        let mut schemas: HashMap<RoomId, Arc<Schema>> = HashMap::new();
+        for (room, app) in bindings {
+            if let Some(schema) = self.parsed_schema(&app) {
+                schemas.insert(room, schema);
+            }
+        }
+        SchemaAwarenessPolicy::new(schemas)
+    }
+
+    /// The parsed schema for `{app_id, version}`, resolved out of the shared
+    /// registry and cached for the process lifetime — a link never changes once
+    /// registered, so the outcome is cached even when it is `None` (a version the
+    /// registry does not hold, or a body that fails to parse), sparing a re-lock
+    /// and re-parse on every sweep of a room bound to an unparseable schema.
+    fn parsed_schema(&mut self, app: &(Vec<u8>, u32)) -> Option<Arc<Schema>> {
+        if let Some(schema) = self.schema_cache.get(app) {
+            return schema.clone();
+        }
+        let registry = match self.schema.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let schema = registry
+            .resolve(&app.0, app.1)
+            .and_then(|src| std::str::from_utf8(src).ok())
+            .and_then(|src| Schema::parse(src).ok())
+            .map(Arc::new);
+        self.schema_cache.insert(app.clone(), schema.clone());
+        schema
+    }
+
+    /// Bind `room`'s governing schema to `{app_id, version}`. The first app to
+    /// bind a room governs it — a later subscribe naming a *different* app is
+    /// ignored, so a room is never re-governed by a foreign app's (shorter) TTL.
+    /// A later subscribe on the *same* app lifts the binding to the higher
+    /// version, so a rolling upgrade resolves to the newest version.
+    fn bind_room_app(&mut self, room: RoomId, app_id: Vec<u8>, version: u32) {
+        match self.room_apps.get(&room) {
+            Some((bound_app, bound_version)) => {
+                if *bound_app == app_id && version > *bound_version {
+                    self.room_apps.insert(room, (app_id, version));
+                }
+            }
+            None => {
+                self.room_apps.insert(room, (app_id, version));
+            }
         }
     }
 
@@ -247,7 +396,13 @@ impl Registry {
         } else {
             0
         };
-        let (broadcast, close, room, awareness, authed_client) = {
+        // A subscribe binds the room's governing schema to the connection's app,
+        // once the subscribe is known to have been accepted below.
+        let subscribed_room = match &msg {
+            Message::Subscribe { room, .. } => Some(room.clone()),
+            _ => None,
+        };
+        let (broadcast, close, room, awareness, authed_client, bind) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
@@ -274,18 +429,39 @@ impl Registry {
                 .is_some()
                 .then(|| conn.session.client())
                 .flatten();
+            // Bind the room only if the subscribe was accepted — a channel now
+            // maps it — and the connection is enforcing (a resolved version). A
+            // rejected (unauthenticated or read-denied) or relay subscribe
+            // governs nothing, so it cannot schema-expire a room's presence.
+            let bind = subscribed_room.as_deref().and_then(|room| {
+                let version = conn.session.schema_version()?;
+                if !conn.session.subscribed_rooms().any(|r| r == room) {
+                    return None;
+                }
+                Some((room.to_vec(), conn.session.app_id().to_vec(), version))
+            });
             (
                 resp.broadcast,
                 resp.close,
                 resp.broadcast_room,
                 resp.awareness,
                 authed_client,
+                bind,
             )
         };
         // A client reappearing within its grace window cancels the pending
         // clear once it re-authenticates, so its presence survives the gap.
         if let Some(client) = authed_client {
             self.stale.remove(&client);
+        }
+        // Bind the subscribed room to the enforcing app governing it, so its
+        // presence times out even after that client leaves. Only the schema path
+        // reads the bindings; with a policy injected, skip seeding entirely so the
+        // map cannot grow on a path that never prunes it.
+        if self.awareness_policy.is_none() {
+            if let Some((room, app_id, version)) = bind {
+                self.bind_room_app(room, app_id, version);
+            }
         }
         // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),
         // so fanning it out never advertises an unpersisted write. Each peer is
@@ -351,6 +527,15 @@ impl Registry {
     pub fn hub(&self) -> &Hub {
         &self.hub
     }
+}
+
+/// The app to govern a room among those present, chosen deterministically: the
+/// lexicographically-smallest app id — a room is normally served by a single
+/// app, so this only needs to be stable — at its highest present version.
+fn pick_app(apps: &HashMap<Vec<u8>, u32>) -> Option<(Vec<u8>, u32)> {
+    apps.iter()
+        .min_by(|a, b| a.0.cmp(b.0))
+        .map(|(app, version)| (app.clone(), *version))
 }
 
 /// Whether a peer connection may currently read `room` — the per-recipient gate
