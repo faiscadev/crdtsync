@@ -420,6 +420,15 @@ func (c *Client) Close() {
 	}
 }
 
+// DeclareApp declares the app this client speaks for and the schema version it
+// targets, carried in the next Hello. An empty appID opens a relay connection; a
+// named app with schemaVersion 0 is a dynamic client that adopts the server's
+// head. Call before Hello.
+func (c *Client) DeclareApp(appID []byte, schemaVersion uint32) {
+	ap, al := bytesArg(appID)
+	C.crdtsync_client_declare_app(c.h, ap, al, C.uint32_t(schemaVersion))
+}
+
 // Hello is the opening frame to send, naming this client.
 func (c *Client) Hello() []byte {
 	return takeBuf(C.crdtsync_client_hello(c.h))

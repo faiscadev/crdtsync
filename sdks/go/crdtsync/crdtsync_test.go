@@ -256,6 +256,21 @@ func newClient(t *testing.T, first byte) *Client {
 	return c
 }
 
+func TestDeclaredAppRidesAlongInTheHelloFrame(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+
+	// A bare client opens as a relay — no app named in the frame.
+	if bytes.Contains(c.Hello(), []byte("app-x")) {
+		t.Fatalf("bare client named an app in its Hello")
+	}
+	// Declaring an app names it in the next Hello.
+	c.DeclareApp([]byte("app-x"), 3)
+	if !bytes.Contains(c.Hello(), []byte("app-x")) {
+		t.Fatalf("declared app missing from Hello")
+	}
+}
+
 func TestClientEditTravelsToAPeer(t *testing.T) {
 	a := newClient(t, 1)
 	defer a.Close()

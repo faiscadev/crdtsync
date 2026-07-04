@@ -6,7 +6,7 @@
 //! channel the client assigned at subscribe. Every buffer and handle is freed so
 //! the round trip is leak-clean under Miri.
 
-use crdtsync_core::{encode_message, Channel, Message};
+use crdtsync_core::{decode_message, encode_message, Channel, Message};
 use crdtsync_ffi::*;
 use std::ptr;
 
@@ -135,6 +135,56 @@ fn a_bad_handle_is_rejected_not_dereferenced() {
             crdtsync_client_receive(ptr::null_mut(), p.as_ptr(), p.len()),
             -1
         );
+    }
+}
+
+#[test]
+fn declaring_an_app_carries_it_into_the_hello_frame() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+
+        // A bare client's Hello opens a relay: no app, version 0.
+        let hello = crdtsync_client_hello(c);
+        match decode_message(std::slice::from_raw_parts(hello.ptr, hello.len)).unwrap() {
+            Message::Hello {
+                app_id,
+                schema_version,
+                ..
+            } => {
+                assert!(app_id.is_empty());
+                assert_eq!(schema_version, 0);
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        crdtsync_buf_free(hello);
+
+        // Declaring an app names it and the version in the next Hello.
+        let app = b"app-x";
+        assert_eq!(
+            crdtsync_client_declare_app(c, app.as_ptr(), app.len(), 3),
+            1
+        );
+        let hello = crdtsync_client_hello(c);
+        match decode_message(std::slice::from_raw_parts(hello.ptr, hello.len)).unwrap() {
+            Message::Hello {
+                app_id,
+                schema_version,
+                ..
+            } => {
+                assert_eq!(app_id, b"app-x");
+                assert_eq!(schema_version, 3);
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        crdtsync_buf_free(hello);
+
+        // A bad handle is rejected, not dereferenced.
+        assert_eq!(
+            crdtsync_client_declare_app(ptr::null_mut(), app.as_ptr(), app.len(), 1),
+            -1
+        );
+
+        crdtsync_client_free(c);
     }
 }
 

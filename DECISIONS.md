@@ -8,6 +8,13 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
+## 2026-07-04 · Unit 5c-iii-b/#165 · the app declaration is one C-ABI entry point mirrored across every binding
+**Changed:** no ARCHITECTURE change — the SDK surface for the core `declare_app`.
+- **A single C-ABI `crdtsync_client_declare_app(client, app_id, app_id_len, schema_version) -> i32`** carries the declaration; the Python/Go/wasm bindings are thin forwards (`Client.declare_app`, `(*Client).DeclareApp`, `WasmClient.declare_app`). An empty `app_id` is accepted as a relay declaration (`as_slice` maps len 0 to an empty slice), so a binding need not special-case "no app". The C ABI returns `1`/`-1` (bad handle) matching the crate's other mutating entry points; the higher-level bindings drop the code since a live wrapper handle never fails.
+- **Binding coverage is a Hello-frame smoke test, not a re-test of the framing.** Core + FFI already unit-test the exact wire bytes; each binding test only asserts a declared app id appears in `hello()` and is absent for a bare client, proving the value crossed the language boundary.
+
+**Why:** one ABI entry point keeps the four language surfaces in lockstep with no per-binding logic to drift, and accepting an empty `app_id` as a relay keeps the "no app ⇒ relay" default uniform from core through every SDK. Completes 5c-iii and the 5c arc.
+
 ## 2026-07-04 · Unit 5c-iii-a/#164 · the client declares its app through a setter, not a constructor argument
 **Changed:** no ARCHITECTURE change — an implementation + slicing decision.
 - **`ClientSession::declare_app(app_id, schema_version)` is a setter on the existing session**, not a new `new_for_app` constructor or a `new` parameter. `ClientSession::new(client)` has many call sites; a setter with a relay default (empty `app_id`, version 0) leaves every one untouched and keeps the bare-relay path the default a client falls into if it never declares an app. `hello()` reads the fields instead of hardcoding empty/0 (the placeholder left by 5c-i).

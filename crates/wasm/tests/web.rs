@@ -294,6 +294,16 @@ fn a_client_handshake_and_awareness_marshal() {
 }
 
 #[wasm_bindgen_test]
+fn a_declared_app_rides_along_in_the_hello_frame() {
+    let mut c = wasm_client(1);
+    // A bare client opens as a relay — no app named in the frame.
+    assert!(!c.hello().windows(5).any(|w| w == b"app-x"));
+    // Declaring an app names it in the next Hello.
+    c.declare_app(b"app-x", 3);
+    assert!(c.hello().windows(5).any(|w| w == b"app-x"));
+}
+
+#[wasm_bindgen_test]
 fn a_client_outbox_drains_on_ack() {
     use crdtsync_core::protocol::{encode_message, Channel, Message};
     let mut a = wasm_client(1);
