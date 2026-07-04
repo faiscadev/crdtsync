@@ -8,13 +8,14 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crdtsync_core::{ClientId, Message};
 
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Action, Authorizer, PermitAll, Resource};
 use crate::clock::{Clock, SystemClock};
+use crate::schema_registry::SchemaRegistry;
 use crate::{step, Hub, Session, Store};
 
 /// How long a departed client's presence is retained before a sweep clears it,
@@ -44,6 +45,10 @@ pub struct Registry {
     /// keyed by client. A reconnect cancels the entry; a [`sweep`](Registry::sweep)
     /// past the deadline clears the presence and tells the room.
     stale: HashMap<ClientId, u64>,
+    /// The schema registry the handshake resolves a client's `{app_id, version}`
+    /// against. Shared with the registration admin plane, which writes it; empty
+    /// by default, so every connection resolves to a relay.
+    schema: Arc<Mutex<SchemaRegistry>>,
 }
 
 impl Registry {
@@ -64,7 +69,14 @@ impl Registry {
             clock: Arc::new(SystemClock),
             grace_millis: DEFAULT_GRACE_MILLIS,
             stale: HashMap::new(),
+            schema: Arc::new(Mutex::new(SchemaRegistry::new())),
         }
+    }
+
+    /// Resolve handshakes against `schema` — the registry the registration admin
+    /// plane writes. A connection that shares it sees every registered app.
+    pub fn set_schema_registry(&mut self, schema: Arc<Mutex<SchemaRegistry>>) {
+        self.schema = schema;
     }
 
     /// Use `verifier` to authenticate connections' credentials.
@@ -198,13 +210,16 @@ impl Registry {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
+            let schema = self.schema.lock().expect("schema registry lock poisoned");
             let resp = step(
                 &mut self.hub,
                 &mut conn.session,
                 &*self.verifier,
                 &*self.authorizer,
+                &schema,
                 msg,
             );
+            drop(schema);
             conn.outbox.extend(resp.replies);
             // Only an authenticated session may touch a client's grace timer, so
             // a bare Hello-only socket can neither cancel a pending sweep nor

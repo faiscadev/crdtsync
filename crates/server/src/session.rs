@@ -14,6 +14,7 @@ use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
 
 use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Resource};
+use crate::schema_registry::{Resolution, SchemaRegistry};
 use crate::{Catchup, Hub, RoomId};
 
 /// One client connection's protocol state. The handshake runs Hello → Auth →
@@ -26,6 +27,11 @@ pub struct Session {
     client: Option<ClientId>,
     identity: Option<Identity>,
     channels: HashMap<Channel, RoomId>,
+    /// The app named at Hello (empty for a relay connection with no app).
+    app_id: Vec<u8>,
+    /// The registered schema version this connection is enforced at, resolved at
+    /// Hello; `None` for a relay connection (no app, or an unregistered app).
+    schema_version: Option<u32>,
 }
 
 impl Session {
@@ -34,6 +40,8 @@ impl Session {
             client: None,
             identity: None,
             channels: HashMap::new(),
+            app_id: Vec::new(),
+            schema_version: None,
         }
     }
 
@@ -46,12 +54,27 @@ impl Session {
             client: None,
             identity: Some(identity),
             channels: HashMap::new(),
+            app_id: Vec::new(),
+            schema_version: None,
         }
     }
 
     /// The client named at Hello, if the handshake is done.
     pub fn client(&self) -> Option<ClientId> {
         self.client
+    }
+
+    /// The app this connection named at Hello — empty for a relay connection that
+    /// named no app.
+    pub fn app_id(&self) -> &[u8] {
+        &self.app_id
+    }
+
+    /// The registered schema version this connection is enforced at, resolved
+    /// against the registry at Hello; `None` for a relay connection (no app, or
+    /// an app that never registered a schema).
+    pub fn schema_version(&self) -> Option<u32> {
+        self.schema_version
     }
 
     /// The server-derived actor for this connection, once it is authenticated —
@@ -114,15 +137,38 @@ pub fn step(
     session: &mut Session,
     verifier: &dyn Verifier,
     authorizer: &dyn Authorizer,
+    registry: &SchemaRegistry,
     msg: Message,
 ) -> Response {
     match msg {
-        Message::Hello { client, .. } => {
+        Message::Hello {
+            client,
+            app_id,
+            schema_version,
+        } => {
             if session.client.is_some() {
                 return violation("already said hello");
             }
-            // Hello establishes quietly; the version was negotiated at the
-            // connection header before any message.
+            // Resolve the app declaration against the registry: a registered app
+            // for which the client asked a version the server does not hold is
+            // refused and the connection closes; a relay or a known version
+            // proceeds, and the enforced version (if any) is recorded.
+            match registry.resolve_handshake(&app_id, schema_version) {
+                Resolution::Reject => {
+                    return Response {
+                        replies: vec![Message::Error {
+                            code: ErrorCode::UnsupportedVersion,
+                            message: "unknown schema version for this app".to_string(),
+                            details: Vec::new(),
+                        }],
+                        close: true,
+                        ..Response::default()
+                    };
+                }
+                Resolution::Relay => session.schema_version = None,
+                Resolution::Enforcing { version } => session.schema_version = Some(version),
+            }
+            session.app_id = app_id;
             session.client = Some(client);
             Response::default()
         }
