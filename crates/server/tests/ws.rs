@@ -683,6 +683,13 @@ async fn a_credential_in_the_query_string_skips_the_auth_phase() {
 }
 
 #[tokio::test]
+async fn a_percent_encoded_query_credential_is_decoded() {
+    let server = start_server().await;
+    let mut ws = open(&format!("{}/?credential=cr%65d", server.url)).await;
+    assert_fast_path_actor(&mut ws, b"cred").await;
+}
+
+#[tokio::test]
 async fn the_authorization_header_wins_over_other_carriers() {
     let server = start_server().await;
     // Both a header and a cookie are present; the header takes precedence.

@@ -22,6 +22,9 @@ sha2 = "0.10"
 # the per-request timeout. Neither reaches the dep-minimal, wasm-embeddable core.
 axum = "0.8"
 tower-http = { version = "0.6", features = ["timeout"] }
+# Parse the WS upgrade's cookie / query credential carriers.
+cookie = { version = "0.18", default-features = false }
+form_urlencoded = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
