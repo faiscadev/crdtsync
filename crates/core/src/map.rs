@@ -233,6 +233,19 @@ impl Map {
         keys
     }
 
+    /// Live `(key, handle)` slots, sorted by key — a single-pass ordered walk
+    /// that avoids a re-lookup per key.
+    pub(crate) fn entries(&self) -> Vec<(Vec<u8>, Element)> {
+        let mut entries: Vec<(Vec<u8>, Element)> = self
+            .slots
+            .iter()
+            .filter(|(_, e)| !e.tombstone)
+            .filter_map(|(k, e)| e.value.clone().map(|v| (k.clone(), v)))
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries
+    }
+
     /// Slot handle for a live key, else `None`.
     pub fn get(&self, key: &[u8]) -> Option<Element> {
         self.slots

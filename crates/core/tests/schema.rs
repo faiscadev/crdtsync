@@ -32,7 +32,7 @@ const FULL: &str = r#"
         "Doc": { "kind": "map", "children": { "title": "Title", "body": "Body", "tags": "Tags", "hits": "Hits" } },
         "Title": { "kind": "register", "min": 0, "max": 280 },
         "Body": { "kind": "text", "max": 100000 },
-        "Tags": { "kind": "list", "items": "Title", "min": 0, "max": 16 },
+        "Tags": { "kind": "list", "items": "Title", "max": 16 },
         "Hits": { "kind": "counter", "min": 0 }
     }
 }
@@ -84,7 +84,6 @@ fn parses_every_built_primitive_kind_with_its_constraints() {
         s.type_def("Tags"),
         Some(&TypeDef::List {
             items: "Title".into(),
-            min: Some(0),
             max: Some(16),
         })
     );
@@ -152,7 +151,6 @@ fn numeric_bounds_are_optional_and_default_to_none() {
         s.type_def("L"),
         Some(&TypeDef::List {
             items: "N".into(),
-            min: None,
             max: None
         })
     );
@@ -509,12 +507,18 @@ fn min_greater_than_max_is_a_bad_range() {
             "dot-separated, operator-free location"
         );
     }
+}
+
+#[test]
+fn a_list_min_is_rejected() {
+    // A below-min list is unrepairable (items cannot be invented), so `min` is
+    // not an accepted list field — it is rejected as unknown, not stored.
     assert_eq!(
         err(r#"{ "schema": "s", "version": 1, "root": "R",
                 "types": { "R": { "kind": "map", "children": { "l": "L" } },
                            "N": { "kind": "register" },
-                           "L": { "kind": "list", "items": "N", "min": 5, "max": 4 } } }"#),
-        SchemaErrorKind::BadRange
+                           "L": { "kind": "list", "items": "N", "min": 0 } } }"#),
+        SchemaErrorKind::UnknownField
     );
 }
 
@@ -524,13 +528,6 @@ fn a_negative_count_bound_is_a_bad_range() {
         err(r#"{ "schema": "s", "version": 1, "root": "R",
                 "types": { "R": { "kind": "map", "children": { "t": "T" } },
                            "T": { "kind": "text", "max": -1 } } }"#),
-        SchemaErrorKind::BadRange
-    );
-    assert_eq!(
-        err(r#"{ "schema": "s", "version": 1, "root": "R",
-                "types": { "R": { "kind": "map", "children": { "l": "L" } },
-                           "N": { "kind": "register" },
-                           "L": { "kind": "list", "items": "N", "min": -1 } } }"#),
         SchemaErrorKind::BadRange
     );
 }
