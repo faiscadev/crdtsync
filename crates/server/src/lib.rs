@@ -14,6 +14,7 @@ use crdtsync_core::op::OpId;
 use crdtsync_core::{ClientId, Document, Element, Op};
 
 pub mod acl;
+pub mod admin;
 pub mod audit;
 pub mod auth;
 pub mod authz;
@@ -23,6 +24,7 @@ pub mod runtime;
 pub mod schema_registry;
 pub mod session;
 pub mod store;
+pub use admin::{register_schema, RegisterOutcome, RegisterRequest};
 pub use auth::{AllowAll, Identity, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};
 pub use clock::{Clock, ManualClock, SystemClock};

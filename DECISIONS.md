@@ -8,6 +8,14 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 
 
+## 2026-07-04 · Unit 5b-ii-1/#PENDING · admin registration sliced into a pure handler + an HTTP transport; meta-auth order pinned
+**Changed:** no ARCHITECTURE change — a build-slicing + semantics-pinning decision recorded so the registration arc stays legible.
+- **Sliced 5b-ii into 5b-ii-1 (pure meta-auth handler) and 5b-ii-2 (HTTP/1.1 transport + listener),** mirroring the existing `session`/`runtime` split — the security-critical authenticate→authorize→register decision is a pure function testable without sockets, and the HTTP wire is a thin shell that decodes a request into it and maps the outcome to a status. The decision flow is where a bug would let an unauthenticated or unpermitted caller mutate the schema registry, so it is isolated and exhaustively spec'd first.
+- **Pinned the enforcement order: authenticate → authorize → register.** `admin::register_schema` returns `Unauthenticated` for an absent/unknown credential, `Forbidden` for an authenticated identity lacking `RegisterSchema` on the request's `App(app_id)`, and only then reaches the registry (`Accepted`/`Rejected`). Matches every data-plane enforcement point (verify actor, then authorize, then act) — so a forbidden or unauthenticated request never performs a chain write, even one that would also be a hash-lock refusal.
+- **Reuses the data-plane trust seams, not a parallel admin auth.** Registration authenticates through the same `Verifier` (a `StaticTokens`-style admin key → admin `Identity`) and authorizes through the same `Authorizer`, differing only in the action (`RegisterSchema`) and resource (`App`) — the app-admin surface ARCHITECTURE §Registration pins, with no second credential system.
+
+**Why:** the registration endpoint is the schema tier's write path; getting its auth ordering wrong is a privilege-escalation bug, so it lands as a pure, Miri-clean unit with its own spec before any HTTP parsing exists. The HTTP transport (5b-ii-2) then only has to decode bytes and format a status — the trust decision is already proven. Unblocks 5b-ii-2 (the wire) and, with 5b-i, the whole registration path 5c resolves against.
+
 ## 2026-07-04 · Unit 5b-i/#154 · schema registry sliced from its HTTP transport; hash-lock semantics pinned
 **Changed:** no ARCHITECTURE change — a build-slicing + semantics-pinning decision recorded so the registration arc stays legible.
 - **Sliced 5b into 5b-i (pure registry + hash-lock) and 5b-ii (HTTP admin endpoint).** The hash-lock is the security-critical core the handshake resolves against; it is fully testable without a transport, so it lands first, exhaustively spec'd, and the HTTP route becomes a thin authenticated writer over it. Same rationale as 5a: the registry is an in-memory structure (not wire), so no forward-compat cost to deferring the transport.
