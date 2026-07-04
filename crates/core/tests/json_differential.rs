@@ -211,26 +211,26 @@ fn structured_json_agrees_with_serde() {
 #[test]
 fn known_corners_agree_with_serde() {
     let corners = [
-        "1e999",                    // overflow -> Float(inf) here, range error in serde
-        "-1e999",                   // same, negative
-        "1e-999",                   // underflows to a finite 0.0 both sides
-        "18446744073709551616",     // 2^64, past i64 -> float
-        "9223372036854775807",      // i64::MAX
-        "-9223372036854775808",     // i64::MIN
+        "1e999",                // overflow -> Float(inf) here, range error in serde
+        "-1e999",               // same, negative
+        "1e-999",               // underflows to a finite 0.0 both sides
+        "18446744073709551616", // 2^64, past i64 -> float
+        "9223372036854775807",  // i64::MAX
+        "-9223372036854775808", // i64::MIN
         "[]",
         "{}",
-        "\"\\ud83d\\ude00\"",       // valid surrogate pair
-        "\"\\ud83d\"",              // lone high surrogate -> both reject
-        "\"\\udc00\"",              // lone low surrogate -> both reject
-        "  \n\t 42 \r\n ",          // surrounding whitespace
-        "01",                       // leading zero -> both reject
-        "1.",                       // dangling point -> both reject
-        ".5",                       // no integer part -> both reject
-        "+1",                       // leading plus -> both reject
+        "\"\\ud83d\\ude00\"", // valid surrogate pair
+        "\"\\ud83d\"",        // lone high surrogate -> both reject
+        "\"\\udc00\"",        // lone low surrogate -> both reject
+        "  \n\t 42 \r\n ",    // surrounding whitespace
+        "01",                 // leading zero -> both reject
+        "1.",                 // dangling point -> both reject
+        ".5",                 // no integer part -> both reject
+        "+1",                 // leading plus -> both reject
         "nan",
         "Infinity",
-        "",                         // empty -> both reject
-        "1 2",                      // trailing value -> both reject
+        "",    // empty -> both reject
+        "1 2", // trailing value -> both reject
         "\"unterminated",
     ];
     for c in corners {
