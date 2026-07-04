@@ -227,22 +227,26 @@ impl Registry {
         // when it declares no TTLs; with none injected the TTLs are resolved from
         // each room's schema. Either way a policy that declares none skips the scan.
         match self.awareness_policy.clone() {
-            Some(policy) => {
-                if policy.has_timed_ttls() {
-                    let removals = self.hub.expire_silent_awareness(now, &*policy);
-                    self.fan_out_removals(removals);
-                }
-            }
+            Some(policy) => self.apply_awareness_policy(now, &*policy),
             None => {
                 // Reconcile each room's schema binding against who is present
                 // before resolving TTLs from it; only this path uses the bindings.
                 self.reconcile_room_apps();
                 let policy = self.resolve_schema_policy();
-                if policy.has_timed_ttls() {
-                    let removals = self.hub.expire_silent_awareness(now, &policy);
-                    self.fan_out_removals(removals);
-                }
+                self.apply_awareness_policy(now, &policy);
             }
+        }
+    }
+
+    /// Run `policy` over the current presence: expire entries silent past their
+    /// TTL, fanning each removal out to the room's readable peers. Throttling is
+    /// enforced on the set path (a coalesced update is simply not fanned out), so
+    /// the sweep has nothing to flush. A policy that declares no timed TTL does
+    /// nothing.
+    fn apply_awareness_policy(&mut self, now: u64, policy: &dyn AwarenessPolicy) {
+        if policy.has_timed_ttls() {
+            let removals = self.hub.expire_silent_awareness(now, policy);
+            self.fan_out_removals(removals);
         }
     }
 
@@ -326,6 +330,19 @@ impl Registry {
         SchemaAwarenessPolicy::new(schemas)
     }
 
+    /// The coalesce window for entry `key` in `room`: an injected policy's, else
+    /// the room's governing schema's `awareness.<kind>.throttle`. Resolved on the
+    /// set path, so a room with no binding (relay) or no throttle is unthrottled.
+    fn resolve_throttle(&mut self, room: &[u8], key: &[u8]) -> Option<u64> {
+        if let Some(policy) = &self.awareness_policy {
+            return policy.throttle(room, key);
+        }
+        let app = self.room_apps.get(room)?.clone();
+        let schema = self.parsed_schema(&app)?;
+        let kind = std::str::from_utf8(key).ok()?;
+        schema.awareness_entry(kind).and_then(|e| e.throttle)
+    }
+
     /// The parsed schema for `{app_id, version}`, resolved out of the shared
     /// registry and cached for the process lifetime — a link never changes once
     /// registered, so the outcome is cached even when it is `None` (a version the
@@ -396,6 +413,17 @@ impl Registry {
         } else {
             0
         };
+        // An awareness set consults the room's throttle for its kind, to coalesce
+        // a within-window update; resolved here (from the channel's room) since
+        // `step` has no policy.
+        let throttle = match &msg {
+            Message::AwarenessSet { channel, key, .. } => self
+                .conns
+                .get(&id)
+                .and_then(|conn| conn.session.room_for_channel(*channel).cloned())
+                .and_then(|room| self.resolve_throttle(&room, key)),
+            _ => None,
+        };
         // A subscribe binds the room's governing schema to the connection's app,
         // once the subscribe is known to have been accepted below.
         let subscribed_room = match &msg {
@@ -417,6 +445,7 @@ impl Registry {
                 &*self.authorizer,
                 &self.schema,
                 now,
+                throttle,
                 msg,
             );
             conn.outbox.extend(resp.replies);
@@ -490,7 +519,8 @@ impl Registry {
             }
         }
         // Awareness is ephemeral: fan the entry out to the room's other
-        // subscribers on each peer's channel; nothing is stored or echoed back.
+        // subscribers on each peer's channel; nothing is echoed back to the
+        // originating connection.
         if let Some(a) = awareness {
             let authorizer = &*self.authorizer;
             for (peer, conn) in self.conns.iter_mut() {
