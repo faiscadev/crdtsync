@@ -8,8 +8,9 @@
 //! returns `true` only for what it explicitly permits — though the dev-mode
 //! [`PermitAll`] allows everything for local development and tests.
 //!
-//! Resources are room-level today; the enum widens to path / element / branch as
-//! those land, without disturbing the trait.
+//! Resources cover rooms (the data plane) and apps (the schema-registry control
+//! plane); the room case widens to path / element / branch as those land,
+//! without disturbing the trait.
 
 /// What an actor is attempting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
