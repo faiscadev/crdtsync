@@ -369,7 +369,7 @@ Core predefines: the validation engine, mark merge-kinds, attr type primitives, 
 
 ## Schema File
 
-JSON. Top-level keys: `schema` (name), `version`, `root` (top-level Map slot → type), `types` (named definitions, each a `kind` = one of the eight primitives with its constraints), `marks` (name → merge flavor + anchor expansion + value shape), `awareness` (entry kind → TTL + throttle + value shape), `auth` (`roles` — the static role vocabulary — plus `grants` — role / subject → action → path, with `${actor_id}` / `${author_id}` templating), `zones` (name → subtree root path — coarse auth partitions, §Zones). `auth` holds **only the static role-based defaults**; per-instance ownership and per-actor grants are **dynamic doc-level ACL state**, never declared in the schema (§Authorization). Every schema dimension maps to exactly one repair rule with a declaration home, so parse-time validation guarantees no schema admits an unrepairable runtime state:
+JSON. Top-level keys: `schema` (name), `version`, `root` (top-level Map slot → type), `types` (named definitions, each a `kind` = one of the eight primitives with its constraints), `marks` (name → merge flavor + anchor expansion + value shape), `awareness` (entry kind → TTL + throttle + value shape), `auth` (`roles` — the static role vocabulary — plus `grants` — role / subject → action → path, with `${actor_id}` / `${author_id}` templating), `zones` (name → subtree root path — coarse auth partitions, §Zones), `autoVersion` (declarative version triggers — event / schedule + name template + retention, §Auto-Version Triggers). `auth` holds **only the static role-based defaults**; per-instance ownership and per-actor grants are **dynamic doc-level ACL state**, never declared in the schema (§Authorization). Every schema dimension maps to exactly one repair rule with a declaration home, so parse-time validation guarantees no schema admits an unrepairable runtime state:
 
 | Repair rule | Declared by |
 |-------------|-------------|
@@ -592,6 +592,20 @@ Snapshot + entry in a versions index. List, paginate, rename, delete are first-c
 ## Auto-Version Triggers
 
 Versions can be created declaratively in response to engine events (`before-publish`, `after-restore`, `before-migration`, ...) or schedules.
+
+**Built on a general engine event bus.** The engine emits typed `EngineEvent`s at lifecycle points and dispatches them to pluggable `EventSink`s — the same pattern as the audit `AccessLog` sink (§Audit), generalized. Auto-versioning is the first built-in sink; the same bus is the substrate for external integrations (webhooks) and can subsume the audit sink later. One event system, many sinks.
+
+**Triggers are schema-declared** (an `autoVersion` block — app-level declarative policy that ships with app code and is version-controlled, like `@auth` / `zones`). Each trigger is an event or a schedule, a name template, and an optional retention count:
+
+```json
+"autoVersion": [
+  { "on": "before-publish", "name": "auto/publish/${timestamp}", "keep": 20 },
+  { "every": "1h",          "name": "auto/hourly/${timestamp}",  "keep": 24 }
+]
+```
+
+- **`on: <event>`** fires the version create when that `EngineEvent` is emitted; **`every: <duration>`** is a schedule, driven by the `Clock` seam + periodic sweep already used for the awareness grace window. `name` is a template (`${timestamp}`, `${event}`, ...); `keep: N` prunes the oldest auto-versions of that trigger (the retention-window mechanism).
+- **Event vocabulary is staged.** The available events fire now — version created / deleted, connect, subscribe, snapshot / compaction; the branch / migration events (`before-publish`, `after-restore`, `before-migration`) are declarable but **fire once those operations exist** (gated on the branch / migration layers). A trigger on an unavailable event parses and waits, never errors.
 
 ## Branches
 
