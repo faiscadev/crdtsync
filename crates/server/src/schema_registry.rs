@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
 /// One registered link in an app's chain: the schema body, the migration edge
-/// that reaches it (empty at version 1, which has no predecessor), and the
-/// SHA-256 that locks both.
+/// that reaches it (none at version 1 — it has no predecessor to migrate from),
+/// and the SHA-256 that locks both.
 struct Link {
     schema: Vec<u8>,
     migration: Vec<u8>,
@@ -70,7 +70,7 @@ impl SchemaRegistry {
     }
 
     /// Register `version` of `app_id` with its `schema` body and the `migration`
-    /// edge that reaches it (empty for version 1). Appends the next contiguous
+    /// edge that reaches it (there is none to supply at version 1). Appends the next contiguous
     /// version; a re-push of the current head with identical content is an
     /// idempotent [`Unchanged`](Registered::Unchanged). Refuses a gap, a
     /// backward or zero version, or a content change under the head.
@@ -83,8 +83,10 @@ impl SchemaRegistry {
     ) -> Result<Registered, RegisterError> {
         let head = self.apps.get(app_id).map_or(0, |c| c.links.len() as u32);
         let expected = head + 1;
-        let hash = content_hash(version, schema, migration);
+        // The hash is computed only where a version is accepted — a gap or a
+        // backward version is rejected without hashing a payload it discards.
         if version == expected {
+            let hash = content_hash(version, schema, migration);
             self.apps
                 .entry(app_id.to_vec())
                 .or_default()
@@ -97,6 +99,7 @@ impl SchemaRegistry {
             Ok(Registered::Appended)
         } else if version == head && head >= 1 {
             // A retry of the head: honoured only if it reproduces the lock.
+            let hash = content_hash(version, schema, migration);
             if self.apps[app_id].links[(version - 1) as usize].hash == hash {
                 Ok(Registered::Unchanged)
             } else {
@@ -149,9 +152,10 @@ impl SchemaRegistry {
     }
 }
 
-/// The SHA-256 content lock for a link. The version, schema, and migration are
-/// each length-framed so no boundary shift can collide two distinct links, and
-/// the version is bound so identical bytes at two positions lock differently.
+/// The SHA-256 content lock for a link. The schema and migration are each
+/// length-framed so no boundary shift can collide two distinct links, and the
+/// fixed-width version prefix binds the position so identical bytes at two
+/// versions lock differently.
 fn content_hash(version: u32, schema: &[u8], migration: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(version.to_be_bytes());
