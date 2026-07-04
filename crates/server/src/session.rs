@@ -139,6 +139,7 @@ pub fn step(
     verifier: &dyn Verifier,
     authorizer: &dyn Authorizer,
     registry: &Mutex<SchemaRegistry>,
+    now: u64,
     msg: Message,
 ) -> Response {
     match msg {
@@ -343,7 +344,14 @@ pub fn step(
             // Ephemeral: retained for late-joiner replay and fanned to the room's
             // peers, but never logged or snapshotted. A key dropped at the
             // per-client cap is neither stored nor broadcast.
-            if !hub.set_awareness(&room, client, actor.clone(), key.clone(), value.clone()) {
+            if !hub.set_awareness(
+                &room,
+                client,
+                actor.clone(),
+                key.clone(),
+                value.clone(),
+                now,
+            ) {
                 return Response::default();
             }
             Response {

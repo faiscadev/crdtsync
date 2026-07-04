@@ -16,7 +16,7 @@ use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Action, Authorizer, PermitAll, Resource};
 use crate::clock::{Clock, SystemClock};
 use crate::schema_registry::SchemaRegistry;
-use crate::{step, Hub, Session, Store};
+use crate::{step, AwarenessPolicy, Hub, NoTimedTtl, Session, Store};
 
 /// How long a departed client's presence is retained before a sweep clears it,
 /// so a brief reconnect keeps its awareness alive across the gap.
@@ -49,6 +49,10 @@ pub struct Registry {
     /// against. Shared with the registration admin plane, which writes it; empty
     /// by default, so every connection resolves to a relay.
     schema: Arc<Mutex<SchemaRegistry>>,
+    /// The timed-TTL policy the sweep applies to awareness entries. Defaults to
+    /// [`NoTimedTtl`] — every entry is session-lifetime — so a server with no
+    /// schema-derived policy never times presence out.
+    awareness_policy: Arc<dyn AwarenessPolicy>,
 }
 
 impl Registry {
@@ -70,6 +74,7 @@ impl Registry {
             grace_millis: DEFAULT_GRACE_MILLIS,
             stale: HashMap::new(),
             schema: Arc::new(Mutex::new(SchemaRegistry::new())),
+            awareness_policy: Arc::new(NoTimedTtl),
         }
     }
 
@@ -77,6 +82,12 @@ impl Registry {
     /// plane writes. A connection that shares it sees every registered app.
     pub fn set_schema_registry(&mut self, schema: Arc<Mutex<SchemaRegistry>>) {
         self.schema = schema;
+    }
+
+    /// Apply `policy` to time awareness entries out in the sweep. Defaults to
+    /// [`NoTimedTtl`]; an enforcing server sets a schema-derived one.
+    pub fn set_awareness_policy(&mut self, policy: Arc<dyn AwarenessPolicy>) {
+        self.awareness_policy = policy;
     }
 
     /// Use `verifier` to authenticate connections' credentials.
@@ -189,14 +200,37 @@ impl Registry {
             .collect();
         for client in due {
             self.stale.remove(&client);
-            for (room, actor) in self.hub.clear_client_awareness(client) {
-                for conn in self.conns.values_mut() {
-                    for channel in conn.session.channels_for_room(&room) {
-                        conn.outbox.push(Message::AwarenessClear {
-                            channel,
-                            actor: actor.clone(),
-                        });
-                    }
+            // An actor-wide clear when the actor fully departed the room, else a
+            // per-key clear for a key no sibling connection still holds.
+            let removals = self.hub.clear_client_awareness(client);
+            self.fan_out_removals(removals);
+        }
+        // Timed-TTL expiry: an entry silent past the TTL its kind is assigned is
+        // dropped and its removal fanned out per-key, leaving the actor's other
+        // entries (and connection) intact — unlike the actor-wide grace clear. A
+        // policy that declares no TTLs skips the whole scan.
+        if self.awareness_policy.has_timed_ttls() {
+            let removals = self
+                .hub
+                .expire_silent_awareness(now, &*self.awareness_policy);
+            self.fan_out_removals(removals);
+        }
+    }
+
+    /// Tell each room's readable subscribers of the awareness removals a sweep
+    /// produced, on every channel they opened for the room. Learning a peer's
+    /// presence cleared is a read of the room, so the same per-recipient gate as
+    /// the set fan-out applies — a read-revoked peer is not told of the removal.
+    fn fan_out_removals(&mut self, removals: Vec<crate::AwarenessRemoval>) {
+        let authorizer = &*self.authorizer;
+        for removal in removals {
+            let room = removal.room();
+            for conn in self.conns.values_mut() {
+                if !peer_may_read(authorizer, &conn.session, room) {
+                    continue;
+                }
+                for channel in conn.session.channels_for_room(room) {
+                    conn.outbox.push(removal.message(channel));
                 }
             }
         }
@@ -206,19 +240,28 @@ impl Registry {
     /// replies and fanning any broadcast out to the room's other connections.
     /// Returns whether the connection should stay open.
     pub fn deliver(&mut self, id: ConnId, msg: Message) -> bool {
+        // Only an awareness set consults the clock (to stamp last-seen), so the
+        // op hot path never reads wall time.
+        let now = if matches!(msg, Message::AwarenessSet { .. }) {
+            self.clock.now_millis()
+        } else {
+            0
+        };
         let (broadcast, close, room, awareness, authed_client) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
             // Pass the shared registry unlocked: `step` locks it only for the
             // Hello resolve, so a slow verifier in the Auth branch never holds it
-            // and cannot stall the admin plane's writes.
+            // and cannot stall the admin plane's writes. `now` stamps an awareness
+            // set's last-seen time, the basis for its timed-TTL expiry.
             let resp = step(
                 &mut self.hub,
                 &mut conn.session,
                 &*self.verifier,
                 &*self.authorizer,
                 &self.schema,
+                now,
                 msg,
             );
             conn.outbox.extend(resp.replies);

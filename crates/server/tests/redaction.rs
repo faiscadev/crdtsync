@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Op, Scalar};
-use crdtsync_server::{Action, Authorizer, ConnId, Registry, Resource};
+use crdtsync_server::{Action, Authorizer, ConnId, ManualClock, Registry, Resource};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -21,7 +21,11 @@ fn doc(first: u8) -> Document {
 }
 
 fn registry() -> Registry {
-    Registry::new(cid(0xFF))
+    let mut r = Registry::new(cid(0xFF));
+    // An awareness set reads the clock to stamp last-seen; the default SystemClock
+    // is not readable under Miri isolation, so drive a fixed manual clock.
+    r.set_clock(std::sync::Arc::new(ManualClock::new(0)));
+    r
 }
 
 /// Drive a connection through Hello + Auth so it holds `actor-<client>`.
