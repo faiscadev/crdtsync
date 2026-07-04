@@ -178,7 +178,7 @@ SDK ships a documented cookbook of "build this custom-feeling type from these pr
 
 Every operation is immutable and append-only. This describes the **wire/stored envelope**: identity, authorship (`client_id` + `actor_id`), scope (`room` / `branch` / `zone`), versioning (`schema_version`), causality (`lamport`), wall time (informational, not used for causality), kind, target, payload. The **core op** the CRDT engine actually merges is the inner subset — `{id, stamp, target, kind, tx}`; authorship, scope, schema version, and wall time are envelope concerns layered around the core op, not core op fields (see *Implementation Status & Divergences*).
 
-Value types in op payloads: scalars, blob refs, element refs. (The blob-ref slot is reserved in the built op envelope as `Scalar::BlobRef`; the element-ref slot is not yet reserved — see *Implementation Status & Divergences*.)
+Value types in op payloads: scalars, blob refs, element refs. Both ref slots are `Scalar` leaves: `Scalar::BlobRef` (reserved, #60) and `Scalar::ElementRef(ElementId)` — a leaf that names another element in the same room (mentions, links, foreign keys). An element-ref is a plain LWW value like any scalar: no substructure, does not merge; a dangling target (the element was deleted) is an app concern, not a merge concern. It carries a bare `ElementId` (references are same-room — a room is the sync-isolation unit, so no room qualifier is needed); a `kind` hint can be added later if schema validation wants it. Reserved forward-compat like the blob-ref slot — round-tripped in the codec, no producer / consumer yet.
 
 ---
 
@@ -575,7 +575,9 @@ When a client connects to a room it has not seen, catch-up returns **either** th
 
 ## Export / Import
 
-Snapshots are portable. CLI ships export / import. Use cases: backup, cloning rooms (templates), cross-server moves, debug repro. Import bumps clocks past imported lamport; element / client IDs are namespaced so no identity conflict.
+Snapshots are portable. CLI ships export / import. Use cases: backup, cloning rooms (templates), cross-server moves, debug repro. The identity-preserving move (backup / cross-server / debug — the origin ceases, the target takes over its id) landed in #107.
+
+**Cloning under a new room id** (a live template — origin and clone both live) is a thin layer over the same primitives: `clone_room(src, dst)` = `export_room(src)` then `import_room(dst, …)` under a fresh room id. It is safe **by room-scoping**, without the id-rewrite / namespacing once feared: server sequences renumber per-room on import; `OpId (client_id, client_seq)` never collides because `client_seq` is monotonic *per-client-global* (a client editing a clone of its own past work still mints fresh seqs); a client subscribed to both origin and clone holds *separate per-room replicas*, so a shared `element_id` names distinct objects in distinct documents; and the clock-bump past the imported lamport rides the existing snapshot-adoption high-water (#126). An explicit id-namespacing scheme (prefix element / client ids) would be needed **only** if cross-room id references or cross-room merge ever existed — they don't (element-refs are same-room, rooms are isolated sync units) — so it is deferred until such a feature appears.
 
 ---
 
@@ -1126,7 +1128,7 @@ This document is the **end-state** — the full scope + intended design; everyth
 ## Planned, not yet built (the prose above reads present-tense — it isn't yet)
 
 - **In-memory tombstone range representation** — the state codec now collapses contiguous deleted runs to range records and drops dead values, so snapshot/wire/disk state no longer grows linearly with deleted items (§Tombstone GC is design-of-record). What remains: the in-memory `List` still holds one node per tombstone, so live RAM (not encoded size) still grows with deletes until a range representation lands. The `Accepted` frame + `ClientSession` outbox (the offline queue) **are** built; the `Ack` frame is a reserved no-consumer wire slot (its GC-watermark purpose was dropped for compression).
-- **Element-ref envelope slot** — the `tx` and blob-ref slots are reserved (`Scalar::BlobRef`); the **element-ref value slot is not**. Its shape is under-specified and it carries no v0.1 reservation promise, so it is deferred until its design settles. Tracked in KANBAN.
+- **Element-ref value slot** — the `tx` and blob-ref slots are reserved (`Scalar::BlobRef`); the **element-ref slot's shape is now pinned** (`Scalar::ElementRef(ElementId)`, a bare same-room element id — §Internal Data Model) but the codec reservation is not yet built. Ships as a forward-compat reservation like the blob-ref slot (round-tripped, no producer). Tracked in KANBAN.
 - **Op-batching RLE** — the codec frames one op per record; cross-op run-length encoding is a later additive op kind.
 - **Also absent:** `RelativePosition`/anchor SDK type, client_id generation/persistence in the SDKs (they take a caller-supplied 16-byte id), codec negotiation, and the XmlElement / XmlFragment / RangedElement primitives (v0.5). (The Error `details` field is now reserved on the wire — round-tripped, empty, no producer — see §Error Envelope.)
 
