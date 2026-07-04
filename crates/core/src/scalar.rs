@@ -4,6 +4,7 @@
 //! binary-safe (embedded NULs are part of the value).
 
 use crate::codec::{put_scalar, Cursor, DecodeError};
+use crate::elementid::ElementId;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Scalar {
@@ -17,6 +18,11 @@ pub enum Scalar {
     /// a ref is a leaf value like any other — it has no substructure and does
     /// not merge.
     BlobRef(BlobRef),
+    /// A link to another element in the same room (a mention, a foreign key).
+    /// The target is a bare [`ElementId`]; references never cross rooms, so no
+    /// room qualifier is carried. A plain LWW value like any other leaf — no
+    /// substructure, no merge; a dangling target is an app concern.
+    ElementRef(ElementId),
 }
 
 /// An opaque reference to a blob in the store.

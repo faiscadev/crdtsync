@@ -132,6 +132,10 @@ pub(crate) fn put_scalar(out: &mut Vec<u8>, s: &Scalar) {
                 }
             }
         }
+        Scalar::ElementRef(id) => {
+            put_u8(out, 5);
+            out.extend_from_slice(&id.as_bytes());
+        }
     }
 }
 
@@ -360,6 +364,7 @@ impl<'a> Cursor<'a> {
                     inline,
                 }))
             }
+            5 => Ok(Scalar::ElementRef(self.element_id()?)),
             tag => Err(DecodeError::BadTag {
                 what: "scalar",
                 tag,

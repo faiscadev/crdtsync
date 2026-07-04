@@ -345,6 +345,7 @@ fn show_scalar(s: &Scalar) -> String {
         Scalar::Int(n) => n.to_string(),
         Scalar::Bytes(b) => format!("<{} bytes>", b.len()),
         Scalar::BlobRef(_) => String::from("<blobref>"),
+        Scalar::ElementRef(_) => String::from("<elementref>"),
     }
 }
 
