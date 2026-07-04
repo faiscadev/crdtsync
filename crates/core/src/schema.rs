@@ -547,14 +547,14 @@ fn parse_grant(json: &Json, index: usize, roles: &HashSet<&str>) -> Result<Grant
 
     // The effect and the action are fused: exactly one of `allow` / `deny`
     // carries the action as its value.
-    let (effect, action_val) = match (json.get("allow"), json.get("deny")) {
-        (Some(a), None) => (Effect::Allow, a),
-        (None, Some(d)) => (Effect::Deny, d),
+    let (effect, effect_key, action_val) = match (json.get("allow"), json.get("deny")) {
+        (Some(a), None) => (Effect::Allow, "allow", a),
+        (None, Some(d)) => (Effect::Deny, "deny", d),
         _ => return Err(SchemaError::new(SchemaErrorKind::BadGrant, ctx)),
     };
     let action_name = action_val
         .as_str()
-        .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, "action")))?;
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, effect_key)))?;
     let action = parse_action(action_name, &ctx)?;
 
     let subject = parse_subject(required_str(json, "to", &ctx)?, roles, &ctx)?;

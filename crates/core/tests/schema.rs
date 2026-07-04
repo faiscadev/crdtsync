@@ -897,6 +897,24 @@ fn malformed_auth_shapes_are_rejected() {
 }
 
 #[test]
+fn a_wrong_typed_effect_value_names_its_own_key() {
+    // The location must name the key that actually carries the action (`allow`
+    // or `deny`), not a synthetic `action` key that does not exist in the JSON.
+    let e = Schema::parse(
+        r#"{ "schema": "s", "version": 1, "root": "R",
+            "types": { "R": { "kind": "map" } },
+            "auth": { "grants": [ { "deny": 5, "to": "anyone", "on": "/" } ] } }"#,
+    )
+    .unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::WrongType);
+    assert!(
+        e.at.ends_with(".deny"),
+        "location names the deny key: {}",
+        e.at
+    );
+}
+
+#[test]
 fn auth_error_locations_name_the_offending_grant() {
     let e = Schema::parse(
         r#"{ "schema": "s", "version": 1, "root": "R",
