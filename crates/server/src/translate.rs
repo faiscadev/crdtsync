@@ -12,7 +12,7 @@
 //! Pure over the registry, no connection state; the live fan-out seam and the
 //! cold-start snapshot both drive it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crdtsync_core::migration::{
     reachable_down, rewrite_down_along, rewrite_up_along, Migration, OpRewrite,
@@ -21,6 +21,7 @@ use crdtsync_core::op::TxId;
 use crdtsync_core::{ClientId, Op};
 
 use crate::schema_registry::SchemaRegistry;
+use crate::store::StoredOp;
 
 /// Why a translation could not be produced.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -193,6 +194,49 @@ pub fn translate_ops(
         Ok(chain) => chain.translate_ops(ops),
         Err(_) => Vec::new(),
     }
+}
+
+/// Translate a heterogeneous catch-up delta to a single recipient version `to`.
+///
+/// A catch-up delta is a slice of the room's log, so its ops may carry different
+/// creation versions (mixed-version writers). Each op is translated from *its*
+/// stored version to `to` along `app_id`'s chain. Consecutive ops at one version
+/// are translated together — one resolved [`Chain`] per distinct source version
+/// (cached across the delta) driving [`Chain::translate_ops`] — so ordering is
+/// preserved and an atomic transaction (contiguous in the log, one version) stays
+/// within a single run and keeps its all-or-nothing / destrand handling. A relay
+/// op (no stored version) or an op already at `to` passes verbatim; a source
+/// whose chain to `to` is broken or unreachable drops its run, fail-closed.
+pub fn translate_delta(
+    reg: &SchemaRegistry,
+    app_id: &[u8],
+    delta: &[StoredOp],
+    to: u32,
+) -> Vec<Op> {
+    let mut out = Vec::new();
+    let mut chains: HashMap<u32, Option<Chain>> = HashMap::new();
+    let mut i = 0;
+    while i < delta.len() {
+        let version = delta[i].schema_version;
+        let mut j = i + 1;
+        while j < delta.len() && delta[j].schema_version == version {
+            j += 1;
+        }
+        let run: Vec<Op> = delta[i..j].iter().map(|rec| rec.op.clone()).collect();
+        match version {
+            Some(from) if from != to => {
+                let chain = chains
+                    .entry(from)
+                    .or_insert_with(|| resolve_chain(reg, app_id, from, to).ok());
+                if let Some(chain) = chain {
+                    out.extend(chain.translate_ops(&run));
+                }
+            }
+            _ => out.extend(run),
+        }
+        i = j;
+    }
+    out
 }
 
 /// Whether a recipient at `to` can be reached from an op created at `from`.

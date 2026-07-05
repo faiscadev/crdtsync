@@ -19,7 +19,7 @@ use crate::acl::authorized;
 use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Resource};
 use crate::schema_registry::{Resolution, SchemaRegistry};
-use crate::{Catchup, Hub, RoomId};
+use crate::{Catchup, Hub, RoomId, StoredOp};
 
 /// One client connection's protocol state. The handshake runs Hello → Auth →
 /// Subscribe: the client names itself, then presents a credential the server
@@ -159,6 +159,7 @@ pub fn step(
     authorizer: &dyn Authorizer,
     schema: Option<&Schema>,
     registry: &Mutex<SchemaRegistry>,
+    governing_app: Option<&[u8]>,
     now: u64,
     throttle: Option<u64>,
     msg: Message,
@@ -273,7 +274,10 @@ pub fn step(
                 return forbidden("read denied");
             }
             let reply = match hub.catch_up(&room, last_seen_seq) {
-                Catchup::Ops(ops) => Message::Ops { channel, ops },
+                Catchup::Ops(delta) => Message::Ops {
+                    channel,
+                    ops: catch_up_ops(registry, governing_app, session, delta),
+                },
                 Catchup::Snapshot { seq, state } => Message::Snapshot {
                     channel,
                     seq,
@@ -538,6 +542,29 @@ fn versions_list(hub: &Hub, channel: Channel, room: &[u8]) -> Response {
             names: hub.version_names(room),
         }],
         ..Response::default()
+    }
+}
+
+/// Translate a catch-up delta to the joining session's version, on the same
+/// app-scoping as the live fan-out: only when the room is bound to an app the
+/// joiner also speaks, and the joiner declared an enforced version. A relay
+/// joiner, an unbound room, or a foreign-app joiner takes the delta verbatim —
+/// its version is a different space and must never drive the room's chain.
+fn catch_up_ops(
+    registry: &Mutex<SchemaRegistry>,
+    governing_app: Option<&[u8]>,
+    session: &Session,
+    delta: Vec<StoredOp>,
+) -> Vec<Op> {
+    match (governing_app, session.schema_version()) {
+        (Some(app), Some(target)) if session.app_id() == app => {
+            let reg = match registry.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            crate::translate::translate_delta(&reg, app, &delta, target)
+        }
+        _ => delta.into_iter().map(|rec| rec.op).collect(),
     }
 }
 

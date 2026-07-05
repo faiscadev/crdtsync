@@ -49,6 +49,7 @@ fn resolve(reg: &Mutex<SchemaRegistry>, msg: Message) -> (Session, crdtsync_serv
         &PermitAll,
         None,
         reg,
+        None,
         0,
         None,
         msg,

@@ -69,8 +69,10 @@ impl Room {
 /// What a subscriber needs to catch up, given the sequence it last saw.
 pub enum Catchup {
     /// The subscriber is at or above the compaction floor: fold these ops, in
-    /// server-sequence order.
-    Ops(Vec<Op>),
+    /// server-sequence order. Each carries its stored creation version, so the
+    /// subscribe seam can translate the heterogeneous delta to the joiner's own
+    /// version — the delta can mix versions, unlike a single-writer broadcast.
+    Ops(Vec<StoredOp>),
     /// The subscriber fell below the floor: load this whole-replica state, then
     /// treat `seq` as the sequence it has now caught up to.
     Snapshot { seq: u64, state: Vec<u8> },
@@ -616,7 +618,7 @@ impl Hub {
         let delta = room
             .log
             .get(start..)
-            .map(|records| records.iter().map(|rec| rec.op.clone()).collect())
+            .map(|records| records.to_vec())
             .unwrap_or_default();
         Catchup::Ops(delta)
     }

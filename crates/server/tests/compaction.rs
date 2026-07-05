@@ -51,7 +51,7 @@ fn counter(e: Option<Element>) -> i64 {
 /// Unwrap a catch-up that must be a plain op delta.
 fn ops(c: Catchup) -> Vec<Op> {
     match c {
-        Catchup::Ops(v) => v,
+        Catchup::Ops(v) => v.into_iter().map(|rec| rec.op).collect(),
         Catchup::Snapshot { .. } => panic!("expected an op delta, got a snapshot"),
     }
 }

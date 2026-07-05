@@ -543,6 +543,13 @@ impl Registry {
             Some(None) => self.connection_schema(id),
             None => None,
         };
+        // The app governing the acted-on room, if bound — the chain a catch-up
+        // delta is translated along. Unbound (a first subscriber, whose log is
+        // empty) or no room: no governing app, so the delta is served verbatim.
+        let governing_app = authz_room
+            .as_deref()
+            .and_then(|room| self.room_apps.get(room))
+            .map(|(app, _)| app.clone());
         let (broadcast, broadcast_version, close, room, awareness, authed_client, bind) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
@@ -558,6 +565,7 @@ impl Registry {
                 &*self.authorizer,
                 acting_schema.as_deref(),
                 &self.schema,
+                governing_app.as_deref(),
                 now,
                 throttle,
                 msg,
