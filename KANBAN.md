@@ -157,7 +157,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **Unit 7c — bidirectional op-rewrite (core)** — handed to `/cs-implement` (cs-next 2026-07-05): per-op forward (up) rewrite + inverse (down, iff back-compat) for each `migration::Step`, on `op::Op`. Only the *field* steps rewrite ops (they manipulate a slot `key`); the *type* steps (add/remove/rename type) have no op-rewrite since an op never names a type. Type-scoped applicability is Unit 8; 7c is the pure per-op transform assuming scope. Builds on 7a/7b (#181/#182).
 
 ---
 
