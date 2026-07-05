@@ -85,6 +85,14 @@ pub enum Message {
     /// Reports a verified credential, carrying the server-derived actor id. The
     /// client never asserts its own actor — it learns it here.
     AuthOk { actor: Vec<u8> },
+    /// The enforcing server's advertisement of the schema it is serving this
+    /// connection: `schema_version` is the active version, `schema` its bytes (a
+    /// dynamic client that did not bundle adopts them; a client that already holds
+    /// the version can ignore the body). A relay connection is never sent one.
+    SchemaAdvert {
+        schema_version: u32,
+        schema: Vec<u8>,
+    },
     /// Joins a room on `channel`, requesting every op past `last_seen_seq`.
     Subscribe {
         channel: Channel,
@@ -250,6 +258,14 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
         Message::AuthOk { actor } => {
             put_u8(&mut out, 7);
             put_bytes(&mut out, actor);
+        }
+        Message::SchemaAdvert {
+            schema_version,
+            schema,
+        } => {
+            put_u8(&mut out, 21);
+            put_u32(&mut out, *schema_version);
+            put_bytes(&mut out, schema);
         }
         Message::Accepted { channel, through } => {
             put_u8(&mut out, 18);
@@ -417,6 +433,14 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
         7 => Message::AuthOk {
             actor: cur.bytes()?,
         },
+        21 => {
+            let schema_version = cur.u32()?;
+            let schema = cur.bytes()?;
+            Message::SchemaAdvert {
+                schema_version,
+                schema,
+            }
+        }
         8 => {
             let channel = Channel(cur.u32()?);
             let key = cur.bytes()?;

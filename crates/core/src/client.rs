@@ -370,6 +370,10 @@ impl ClientSession {
                 self.actor = Some(actor);
                 Ok(())
             }
+            // The server's schema advertisement is carried on the wire here;
+            // caching the version and adopting the bytes is a later slice, so it
+            // is accepted without effect for now.
+            Message::SchemaAdvert { .. } => Ok(()),
             Message::AwarenessUpdate {
                 channel,
                 actor,
