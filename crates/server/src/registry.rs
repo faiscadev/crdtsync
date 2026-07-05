@@ -135,6 +135,13 @@ impl Registry {
         self.grace_millis = millis;
     }
 
+    /// Auto-compact a room once its retained log reaches `threshold` ops, so a
+    /// below-floor joiner is served a snapshot instead of a delta. `0` (default)
+    /// never compacts.
+    pub fn set_compaction_threshold(&mut self, threshold: u64) {
+        self.hub.set_compaction_threshold(threshold);
+    }
+
     /// A registry backed by `store`: its hub replays the persisted log, and
     /// every op the hub ingests is appended before it fans out to peers.
     pub fn with_store(server: ClientId, store: Store) -> io::Result<Self> {

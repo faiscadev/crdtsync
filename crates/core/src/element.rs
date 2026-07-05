@@ -36,6 +36,19 @@ impl Element {
         }
     }
 
+    /// Whether this element is a nested container (map / list / text) — the
+    /// kinds addressed by element id, whose create a migration carries verbatim.
+    /// The single source of truth for the container/leaf split the snapshot and
+    /// op translations share; kept exhaustive with no catch-all, mirroring
+    /// [`OpKind::creates_container`](crate::op::OpKind::creates_container), so a
+    /// new kind must be classified here or the crate does not compile.
+    pub fn is_container(&self) -> bool {
+        match self {
+            Element::Map(_) | Element::List(_) | Element::Text(_) => true,
+            Element::Scalar(_) | Element::Register(_) | Element::Counter(_) => false,
+        }
+    }
+
     /// Id of the underlying composite. Scalars have no id.
     pub fn id(&self) -> ElementId {
         match self {

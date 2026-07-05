@@ -106,6 +106,57 @@ impl Map {
         self.id
     }
 
+    /// Every slot key, live or tombstoned — the set a snapshot migration walks.
+    pub(crate) fn slot_keys(&self) -> Vec<Vec<u8>> {
+        self.slots.keys().cloned().collect()
+    }
+
+    /// Whether `key` holds a live container (map / list / text) — the slots a
+    /// migration carries verbatim, never dropping or re-keying.
+    pub(crate) fn slot_is_live_container(&self, key: &[u8]) -> bool {
+        self.slots
+            .get(key)
+            .and_then(|e| e.value.as_ref())
+            .is_some_and(Element::is_container)
+    }
+
+    /// Whether `key`'s slot is a tombstone (deleted, no live value). A migration
+    /// consults this to tell a deleted container's slot — whose lost identity a
+    /// snapshot cannot re-key faithfully — from a live one.
+    pub(crate) fn slot_is_tombstone(&self, key: &[u8]) -> bool {
+        self.slots.get(key).is_some_and(|e| e.tombstone)
+    }
+
+    /// Remove the slot at `key`, returning its `(stamp, value, tombstone)`.
+    pub(crate) fn take_slot(&mut self, key: &[u8]) -> Option<(Stamp, Option<Element>, bool)> {
+        self.slots
+            .remove(key)
+            .map(|e| (e.stamp, e.value, e.tombstone))
+    }
+
+    /// Install a migrated slot at `key`, keeping the later stamp if one is already
+    /// there — the same LWW rule a concurrent write resolves by, so re-keying onto
+    /// an occupied slot converges with the op seam.
+    pub(crate) fn put_slot_lww(
+        &mut self,
+        key: Vec<u8>,
+        stamp: Stamp,
+        value: Option<Element>,
+        tombstone: bool,
+    ) {
+        if self.slots.get(&key).is_some_and(|e| !stamp.gt(&e.stamp)) {
+            return;
+        }
+        self.slots.insert(
+            key,
+            Entry {
+                stamp,
+                value,
+                tombstone,
+            },
+        );
+    }
+
     /// Append this map's state — id and every slot, live or tombstoned — to
     /// `out`. Slots are ordered by key so equal states encode identically. A
     /// composite slot stores a kind-tagged reference to its child's id for the

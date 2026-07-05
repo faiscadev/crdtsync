@@ -95,6 +95,19 @@ impl Register {
         }
     }
 
+    /// A copy carrying the same value and LWW stamp under a new id — for moving a
+    /// register to the id its slot key now derives when a migration renames the
+    /// field, matching the id the renamed `RegisterSet` would derive at the new
+    /// key.
+    pub fn rehomed(&self, id: ElementId) -> Self {
+        Self {
+            id,
+            value: self.value.clone(),
+            stamp: self.stamp,
+            displaced: Cell::new(false),
+        }
+    }
+
     pub fn displace(&self) {
         self.displaced.set(true);
     }
