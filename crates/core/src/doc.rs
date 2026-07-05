@@ -29,7 +29,7 @@ use crate::stamp::Stamp;
 use crate::text::Text;
 use crate::validate::Step;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 /// The well-known root slot every replica shares, so children derive under the
@@ -152,6 +152,24 @@ impl Document {
     /// Read a live slot of the root map.
     pub fn get(&self, key: &[u8]) -> Option<Element> {
         self.root.borrow().get(key)
+    }
+
+    /// Project the snapshot down for a recipient below a schema version that
+    /// added these field keys: across every map, drop each slot at one of `keys`
+    /// that is not a live container. A scalar / register / counter value (or a
+    /// tombstone) at such a key is removed; a map / list / text is kept with its
+    /// subtree — the same split the server's op translation makes on the op seam
+    /// (drop an added field's key-bearing set/inc ops, carry its
+    /// container-creates verbatim), so a snapshot-served joiner converges with a
+    /// peer served the down-translated op delta. Empty `keys` is a no-op; other
+    /// slots, stamps, and identities are unchanged.
+    pub fn drop_leaf_slots(&mut self, keys: &BTreeSet<Vec<u8>>) {
+        if keys.is_empty() {
+            return;
+        }
+        for map in self.maps.values() {
+            map.borrow_mut().drop_projected_slots(keys);
+        }
     }
 
     /// Drain the orphan events accumulated since the last call.

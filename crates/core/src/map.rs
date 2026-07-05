@@ -15,7 +15,7 @@ use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 use crate::text::Text;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 /// Slot-value tags in a map snapshot. Leaves (scalar, register) are inline; a
@@ -104,6 +104,21 @@ impl Map {
 
     pub fn id(&self) -> ElementId {
         self.id
+    }
+
+    /// Remove every slot at a key in `keys` that does not hold a live container.
+    /// A leaf value (scalar / register / counter) or a tombstone at such a key is
+    /// dropped; a live map / list / text is kept, since a migration carries its
+    /// create verbatim and dropping it would strand the subtree. Slots at keys
+    /// outside `keys` are untouched.
+    pub(crate) fn drop_projected_slots(&mut self, keys: &BTreeSet<Vec<u8>>) {
+        self.slots.retain(|key, entry| {
+            !keys.contains(key)
+                || matches!(
+                    entry.value,
+                    Some(Element::Map(_)) | Some(Element::List(_)) | Some(Element::Text(_))
+                )
+        });
     }
 
     /// Append this map's state — id and every slot, live or tombstoned — to

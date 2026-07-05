@@ -295,7 +295,7 @@ pub fn step(
                 Catchup::Snapshot { seq, state } => Message::Snapshot {
                     channel,
                     seq,
-                    state,
+                    state: catch_up_snapshot(registry, governing, session, state),
                 },
             };
             // After the catch-up, replay the room's current presence so the
@@ -604,6 +604,29 @@ fn catch_up_ops(
             crate::translate::translate_delta(&reg, app, delta, target)
         }
         None => delta.into_iter().map(|rec| rec.op).collect(),
+    }
+}
+
+/// Down-project a catch-up snapshot to the joining session's version, on the
+/// same app-scoping as the op delta: an enforcing joiner of the room's governing
+/// app has fields added above its version projected out of the snapshot; a
+/// relay, unbound, or foreign-app joiner takes it verbatim — its version is a
+/// different space and must never drive the room's chain.
+fn catch_up_snapshot(
+    registry: &Mutex<SchemaRegistry>,
+    governing: Option<(&[u8], u32)>,
+    session: &Session,
+    state: Vec<u8>,
+) -> Vec<u8> {
+    match governing_target(governing, session) {
+        Some((app, governing_version, target)) => {
+            let reg = match registry.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            crate::translate::translate_snapshot(&reg, app, &state, governing_version, target)
+        }
+        None => state,
     }
 }
 
