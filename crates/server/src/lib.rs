@@ -745,6 +745,28 @@ impl Hub {
         Ok(true)
     }
 
+    /// Clone `src`'s live state into a fresh room `dst` — "duplicate this doc as a
+    /// template". `dst` is created from `src`'s current whole-replica snapshot and
+    /// takes further edits independently: its server sequences renumber from the
+    /// clone's own floor, room-scoped, so they never collide with the origin's.
+    ///
+    /// Identities ride the snapshot, exactly as for [`import_room`](Hub::import_room):
+    /// the clone comes up holding the origin's element ids and its op-dedup set. So
+    /// a *new* author editing the clone diverges freely, but a client resending an
+    /// op it already authored to the origin is deduped in the clone too — the same
+    /// idempotency import gives a moved room, not a collision.
+    ///
+    /// Returns `Ok(false)` — cloning nothing — if `src` is unknown or `dst` already
+    /// exists (clone is create-only, like import); with a store attached `dst` is
+    /// persisted before it commits. The named-version index is not cloned: a
+    /// template starts from the live state with a fresh version history.
+    pub fn clone_room(&mut self, src: &[u8], dst: &[u8]) -> io::Result<bool> {
+        let Some(state) = self.export_room(src) else {
+            return Ok(false);
+        };
+        self.import_room(dst, &state)
+    }
+
     /// The room's current high-water server sequence (0 if unseen or empty).
     pub fn seq(&self, room: &[u8]) -> u64 {
         self.rooms.get(room).map_or(0, Room::head)
