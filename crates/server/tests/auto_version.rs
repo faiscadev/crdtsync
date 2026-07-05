@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Op, Scalar};
-use crdtsync_server::{ConnId, ManualClock, Registry, SchemaRegistry};
+use crdtsync_server::{ConnId, ManualClock, NoTimedTtl, Registry, SchemaRegistry};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -346,6 +346,27 @@ fn two_schedules_sharing_an_interval_and_name_apply_the_tighter_keep() {
         version_names(&r),
         vec![format!("auto/tick/{}", stamp(3000)).into_bytes()],
         "the keep:1 schedule prunes despite sharing the key with keep:3",
+    );
+}
+
+#[test]
+fn a_schedule_fires_under_an_injected_awareness_policy() {
+    // An injected awareness policy makes the sweep skip resolving schemas for TTL
+    // (`resolve_schema_policy`). The schedule pass must still resolve each bound
+    // room's schema and fire on its own — it does not depend on the TTL path having
+    // parsed the schema.
+    let (mut r, clock) = registry_with(r#"[{ "every": "1s", "name": "auto/tick/${timestamp}" }]"#);
+    r.set_awareness_policy(Arc::new(NoTimedTtl));
+    seed_room(&mut r);
+
+    r.sweep(); // arm at 0
+    clock.advance(1_000);
+    r.sweep(); // fires
+
+    assert_eq!(
+        version_names(&r),
+        vec![format!("auto/tick/{}", stamp(1000)).into_bytes()],
+        "the schedule fires regardless of the awareness policy in force",
     );
 }
 

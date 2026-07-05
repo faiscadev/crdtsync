@@ -295,12 +295,6 @@ impl Registry {
     /// A schedule state whose room is no longer bound is pruned, so a rebound room
     /// re-arms rather than firing on a stale timer.
     fn fire_schedule_triggers(&mut self, now: u64) {
-        // Nothing is armed until a bound schema declares a trigger; a schedule needs
-        // a bound room (an enforcing subscribe, which arms), so an unarmed sweep has
-        // no schedule to fire — skip the scan and its allocations entirely.
-        if !self.auto_version.is_armed() {
-            return;
-        }
         let bindings: Vec<(RoomId, (Vec<u8>, u32))> = self
             .room_apps
             .iter()
