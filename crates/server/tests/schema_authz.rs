@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Op, Scalar};
 use crdtsync_server::acl::Acl;
-use crdtsync_server::{ConnId, Identity, ManualClock, Registry, StaticTokens};
+use crdtsync_server::{ConnId, Identity, ManualClock, NoTimedTtl, Registry, StaticTokens};
 
 const APP: &[u8] = b"collab";
 const ROOM: &[u8] = b"room-a";
@@ -31,6 +31,16 @@ const SCHEMA: &str = r#"{ "schema": "collab", "version": 1, "root": "R",
         ]
     } }"#;
 
+/// A second app whose schema grants read only to the `owner` role — a room this
+/// app governs is closed to a bare authenticated actor.
+const APP_STRICT: &[u8] = b"strict";
+const SCHEMA_STRICT: &str = r#"{ "schema": "strict", "version": 1, "root": "R",
+    "types": { "R": { "kind": "map" } },
+    "auth": {
+        "roles": ["owner"],
+        "grants": [ { "allow": "read", "to": "owner", "on": "/" } ]
+    } }"#;
+
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
     b[0] = first;
@@ -43,6 +53,8 @@ fn cid(first: u8) -> ClientId {
 fn registry(tokens: StaticTokens) -> Registry {
     let mut sr = crdtsync_server::SchemaRegistry::new();
     sr.register(APP, 1, SCHEMA.as_bytes(), b"").unwrap();
+    sr.register(APP_STRICT, 1, SCHEMA_STRICT.as_bytes(), b"")
+        .unwrap();
     let mut r = Registry::new(cid(0xFF));
     r.set_schema_registry(Arc::new(Mutex::new(sr)));
     r.set_verifier(Box::new(tokens));
@@ -70,12 +82,17 @@ fn tokens(rows: &[(&str, &str, &[&str])]) -> StaticTokens {
 
 /// Hello + Auth a connection as `credential` declaring `{APP, 1}`.
 fn hello_auth(r: &mut Registry, client: u8, credential: &str) -> ConnId {
+    hello_auth_app(r, client, credential, APP)
+}
+
+/// Hello + Auth a connection as `credential` declaring `{app, 1}`.
+fn hello_auth_app(r: &mut Registry, client: u8, credential: &str, app: &[u8]) -> ConnId {
     let id = r.connect();
     assert!(r.deliver(
         id,
         Message::Hello {
             client: cid(client),
-            app_id: APP.to_vec(),
+            app_id: app.to_vec(),
             schema_version: 1,
         }
     ));
@@ -197,6 +214,61 @@ fn the_op_fan_out_is_gated_by_each_peers_schema_read_grant() {
         got.len(),
         1,
         "an authenticated peer receives the broadcast ops"
+    );
+}
+
+#[test]
+fn a_foreign_app_cannot_read_a_room_governed_by_a_stricter_schema() {
+    // Room bound to `strict` (grants read only to `owner`) by an owner. An
+    // attacker holding no `owner` role declares the permissive `collab` app and
+    // subscribes: the room's *governing* schema (strict) gates the read, not the
+    // attacker's self-declared one, so the escalation is refused.
+    let mut r = registry(tokens(&[
+        ("t-owner", "owner", &["owner"]),
+        ("t-attacker", "mallory", &[]),
+    ]));
+    let owner = hello_auth_app(&mut r, 1, "t-owner", APP_STRICT);
+    assert!(
+        subscribe_ok(&mut r, owner),
+        "the owner establishes the room"
+    );
+
+    let attacker = hello_auth_app(&mut r, 2, "t-attacker", APP);
+    assert!(
+        !subscribe_ok(&mut r, attacker),
+        "a foreign app's schema must not authorize a read of a room another app governs",
+    );
+}
+
+#[test]
+fn the_schema_read_grant_gates_fan_out_even_under_an_injected_awareness_policy() {
+    // An injected awareness policy must not disable the schema authorization tier:
+    // the room binding it depends on is maintained regardless. A schema-granted
+    // peer keeps receiving the live op fan-out.
+    let mut r = registry(tokens(&[
+        ("t-ed", "ed", &["editor"]),
+        ("t-peer", "peer", &["viewer"]),
+    ]));
+    r.set_awareness_policy(Arc::new(NoTimedTtl));
+    let ed = hello_auth(&mut r, 1, "t-ed");
+    let peer = hello_auth(&mut r, 2, "t-peer");
+    assert!(subscribe_ok(&mut r, ed));
+    assert!(subscribe_ok(&mut r, peer));
+    r.take_outbox(ed);
+    r.take_outbox(peer);
+    assert!(write_ok(&mut r, ed, 1));
+
+    let ops: usize = r
+        .take_outbox(peer)
+        .into_iter()
+        .filter_map(|m| match m {
+            Message::Ops { ops, .. } => Some(ops.len()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        ops, 1,
+        "the schema-granted peer still receives the fan-out under an injected policy",
     );
 }
 

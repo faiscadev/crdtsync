@@ -8,6 +8,7 @@
 
 use crdtsync_core::schema::Schema;
 use crdtsync_server::acl::{authorized, Acl, ResourceMatch, Subject};
+use crdtsync_server::audit::{AccessRecord, Audited};
 use crdtsync_server::authz::{Action, Authorizer, Decision, Resource};
 use crdtsync_server::{Identity, PermitAll};
 
@@ -259,6 +260,28 @@ fn an_empty_acl_abstains_rather_than_denies() {
         Decision::Abstain
     );
     assert!(!acl.authorize(&actor("alice"), Action::Read, &ROOM));
+}
+
+#[test]
+fn an_audited_wrapper_preserves_the_abstain_so_the_schema_tier_still_runs() {
+    let s = schema(SCHEMA);
+    // The documented composition: audit an abstaining ACL. The wrapper must
+    // forward the Abstain, not flatten it to a deny — else the schema read grant
+    // (to any authenticated actor) is silently suppressed for every audited
+    // deployment.
+    let audited = Audited::new(Box::new(Acl::new()), Box::new(|_: &AccessRecord| {}));
+    assert!(authorized(
+        &audited,
+        Some(&s),
+        &actor("alice"),
+        Action::Read,
+        &ROOM
+    ));
+    // A definitive inner verdict still flows through unchanged.
+    assert_eq!(
+        audited.decide(&actor("alice"), Action::Read, &ROOM),
+        Decision::Abstain
+    );
 }
 
 #[test]

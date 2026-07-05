@@ -433,7 +433,7 @@ pub fn authorized(
     action: Action,
     resource: &Resource,
 ) -> bool {
-    match deployment.decide(identity, action, resource) {
+    let granted = match deployment.decide(identity, action, resource) {
         Decision::Allow => true,
         Decision::Deny => false,
         Decision::Abstain => matches!(
@@ -444,7 +444,11 @@ pub fn authorized(
             )),
             Decision::Allow
         ),
-    }
+    };
+    // Report the composed verdict, not the deployment tier's — an auditing
+    // authorizer records what was actually enforced, schema grants included.
+    deployment.observe(identity, action, resource, granted);
+    granted
 }
 
 /// The schema `@auth` grant tier: deny-wins over the whole-document grants whose

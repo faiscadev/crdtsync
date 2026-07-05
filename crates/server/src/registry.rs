@@ -227,12 +227,13 @@ impl Registry {
         // injected policy is authoritative — it alone governs, suppressing expiry
         // when it declares no TTLs; with none injected the TTLs are resolved from
         // each room's schema. Either way a policy that declares none skips the scan.
+        // Reconcile each room's schema binding against who is present every sweep:
+        // it governs the authorization tier (consulted under any awareness policy)
+        // as well as schema-resolved TTLs, and its pruning bounds the map.
+        self.reconcile_room_apps();
         match self.awareness_policy.clone() {
             Some(policy) => self.apply_awareness_policy(now, &*policy),
             None => {
-                // Reconcile each room's schema binding against who is present
-                // before resolving TTLs from it; only this path uses the bindings.
-                self.reconcile_room_apps();
                 let policy = self.resolve_schema_policy();
                 self.apply_awareness_policy(now, &policy);
             }
@@ -366,11 +367,12 @@ impl Registry {
         schema
     }
 
-    /// The parsed schema a connection is enforced under — its own declared
-    /// `{app_id, version}` resolved against the registry — which governs its
-    /// authorization. `None` for a relay connection (no app, or an unregistered
-    /// one). A connection is judged by the schema it declared, so its first
-    /// subscribe to a room not yet bound still resolves a governing schema.
+    /// The parsed schema a connection declared — its own `{app_id, version}`
+    /// resolved against the registry. The authorization fallback for a room not
+    /// yet bound (its first subscriber, about to become the room's incumbent):
+    /// once a room is bound, [`governing_schema`](Registry::governing_schema) —
+    /// the room's, not the connection's — governs, so a foreign app cannot pick a
+    /// permissive schema to escalate. `None` for a relay connection.
     fn connection_schema(&mut self, id: ConnId) -> Option<Arc<Schema>> {
         let conn = self.conns.get(&id)?;
         let version = conn.session.schema_version()?;
@@ -451,11 +453,33 @@ impl Registry {
             Message::Subscribe { room, .. } => Some(room.clone()),
             _ => None,
         };
-        // The schema governing this connection's own action, whose `@auth` grants
-        // the enforcement points compose under the deployment authorizer.
-        // Resolved from the connection's declared app (not the room binding), so a
-        // first subscribe to an as-yet-unbound room is still schema-gated.
-        let acting_schema = self.connection_schema(id);
+        // The room this message authorizes against, so its enforcement composes
+        // under the schema that governs *that room* — never the actor's own,
+        // self-declared app, which a foreign connection could pick to escalate.
+        let authz_room: Option<RoomId> = match &msg {
+            Message::Subscribe { room, .. } => Some(room.clone()),
+            Message::Ops { channel, .. }
+            | Message::AwarenessSet { channel, .. }
+            | Message::VersionCreate { channel, .. }
+            | Message::VersionRename { channel, .. }
+            | Message::VersionDelete { channel, .. }
+            | Message::VersionList { channel, .. }
+            | Message::VersionFetch { channel, .. } => self
+                .conns
+                .get(&id)
+                .and_then(|c| c.session.room_for_channel(*channel).cloned()),
+            _ => None,
+        };
+        // The schema whose `@auth` grants the enforcement points compose under the
+        // deployment authorizer: the room's bound governing schema, falling back to
+        // the connection's own declared app only for a room not yet bound (its
+        // first subscriber, which is about to become that room's incumbent).
+        let acting_schema = match &authz_room {
+            Some(room) => self
+                .governing_schema(room)
+                .or_else(|| self.connection_schema(id)),
+            None => None,
+        };
         let (broadcast, close, room, awareness, authed_client, bind) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
@@ -510,14 +534,13 @@ impl Registry {
         if let Some(client) = authed_client {
             self.stale.remove(&client);
         }
-        // Bind the subscribed room to the enforcing app governing it, so its
-        // presence times out even after that client leaves. Only the schema path
-        // reads the bindings; with a policy injected, skip seeding entirely so the
-        // map cannot grow on a path that never prunes it.
-        if self.awareness_policy.is_none() {
-            if let Some((room, app_id, version)) = bind {
-                self.bind_room_app(room, app_id, version);
-            }
+        // Bind the subscribed room to the enforcing app governing it, so both the
+        // schema-authorization tier and (with no injected policy) presence expiry
+        // resolve its schema. Bound unconditionally — authorization consults the
+        // binding on every room even under an injected awareness policy — and a
+        // sweep's reconcile prunes dormant rooms, so the map stays bounded.
+        if let Some((room, app_id, version)) = bind {
+            self.bind_room_app(room, app_id, version);
         }
         // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),
         // so fanning it out never advertises an unpersisted write. Each peer is

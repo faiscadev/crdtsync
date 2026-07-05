@@ -74,6 +74,16 @@ pub trait Authorizer {
             Decision::Deny
         }
     }
+
+    /// Observe the *final* enforced verdict for a request — after the schema
+    /// `@auth` tier has resolved any deployment [`Abstain`](Decision::Abstain).
+    /// The composition ([`authorized`](crate::acl::authorized)) calls it once per
+    /// data-plane access; a plain authorizer ignores it, an auditing one records
+    /// the true decision (which [`decide`](Authorizer::decide) alone cannot know,
+    /// since a lower tier may still turn its abstain into an allow).
+    fn observe(&self, identity: &Identity, action: Action, resource: &Resource, granted: bool) {
+        let _ = (identity, action, resource, granted);
+    }
 }
 
 /// An authorizer from a plain closure, so a deployment (or a test) can supply the
