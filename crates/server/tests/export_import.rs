@@ -61,7 +61,7 @@ fn age_in(state: &[u8]) -> i64 {
 
 fn write_age(h: &mut Hub, room: &[u8], value: i64) {
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(value)));
-    h.ingest(room, ops).unwrap();
+    h.ingest(room, ops, None).unwrap();
 }
 
 // --- export ---
@@ -157,13 +157,13 @@ fn an_imported_room_dedups_its_origin_ops() {
     let mut writer = doc(1);
     let ops = writer.transact(|tx| tx.register(b"age", Scalar::Int(30)));
     let mut src = hub();
-    src.ingest(ROOM, ops.clone()).unwrap();
+    src.ingest(ROOM, ops.clone(), None).unwrap();
     let state = src.export_room(ROOM).unwrap();
 
     let mut dst = hub();
     dst.import_room(DEST, &state).unwrap();
     let seq_before = dst.seq(DEST);
-    assert!(dst.ingest(DEST, ops).unwrap().is_empty());
+    assert!(dst.ingest(DEST, ops, None).unwrap().is_empty());
     assert_eq!(dst.seq(DEST), seq_before);
 }
 
@@ -180,7 +180,7 @@ fn an_imported_room_takes_further_edits() {
     let head = dst.seq(DEST);
 
     let ops = doc(2).transact(|tx| tx.register(b"note", Scalar::Int(5)));
-    assert!(!dst.ingest(DEST, ops).unwrap().is_empty());
+    assert!(!dst.ingest(DEST, ops, None).unwrap().is_empty());
     assert!(dst.seq(DEST) > head);
     assert_eq!(age(&dst, DEST), 1);
 }
@@ -191,7 +191,7 @@ fn export_import_round_trips_a_composite_document() {
     let mut w = doc(1);
     let mut ops = w.transact(|tx| tx.register(b"age", Scalar::Int(11)));
     ops.extend(w.transact(|tx| tx.inc(b"hits", 3)));
-    src.ingest(ROOM, ops).unwrap();
+    src.ingest(ROOM, ops, None).unwrap();
     let state = src.export_room(ROOM).unwrap();
 
     let mut dst = hub();

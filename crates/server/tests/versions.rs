@@ -34,7 +34,7 @@ const ROOM: &[u8] = b"room-a";
 /// Ingest a register-write into the room.
 fn write_age(h: &mut Hub, value: i64) {
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(value)));
-    h.ingest(ROOM, ops).unwrap();
+    h.ingest(ROOM, ops, None).unwrap();
 }
 
 /// The `age` register value in a decoded version state.
@@ -164,6 +164,7 @@ fn versions_are_isolated_per_room() {
     h.ingest(
         other,
         doc(2).transact(|tx| tx.register(b"age", Scalar::Int(99))),
+        None,
     )
     .unwrap();
 

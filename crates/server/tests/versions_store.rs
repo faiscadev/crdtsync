@@ -42,6 +42,7 @@ fn write_age(h: &mut Hub, d: &mut Document, value: i64) {
     h.ingest(
         ROOM,
         d.transact(|tx| tx.register(b"age", Scalar::Int(value))),
+        None,
     )
     .unwrap();
 }

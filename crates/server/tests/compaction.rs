@@ -28,7 +28,7 @@ fn doc(first: u8) -> Document {
 }
 
 fn ingest(h: &mut Hub, room: &[u8], ops: Vec<Op>) -> Vec<Op> {
-    h.ingest(room, ops).unwrap()
+    h.ingest(room, ops, None).unwrap()
 }
 
 fn int(e: Option<Element>) -> i64 {
