@@ -8,13 +8,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use crdtsync_core::schema::{Trigger, TriggerEvent};
 use crdtsync_core::{ClientId, Message, Op, Schema};
 
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Action, Authorizer, PermitAll, Resource};
+use crate::auto_version::{expand_name, AutoVersionSink, AutoVersionState};
 use crate::clock::{Clock, SystemClock};
 use crate::schema_registry::SchemaRegistry;
 use crate::{
@@ -69,6 +72,10 @@ pub struct Registry {
     /// or `None` for an absent/unparseable one — is cached for the process
     /// lifetime and never re-resolved for the same version.
     schema_cache: HashMap<(Vec<u8>, u32), Option<Arc<Schema>>>,
+    /// Auto-version signals a recording sink queued during a delivery, drained
+    /// after it: each room-bearing lifecycle event, awaiting its schema's trigger
+    /// match. Shared with the sink the hub holds.
+    auto_version: Rc<AutoVersionState>,
 }
 
 impl Registry {
@@ -79,7 +86,13 @@ impl Registry {
 
     /// A registry over an existing hub — durable or not. Defaults to the
     /// dev-mode [`AllowAll`] verifier; set one with [`Registry::set_verifier`].
-    pub(crate) fn from_hub(hub: Hub) -> Self {
+    pub(crate) fn from_hub(mut hub: Hub) -> Self {
+        // The built-in auto-version sink records room-bearing lifecycle events; the
+        // registry drains them after each delivery. Registered here, so a room
+        // whose governing schema declares `autoVersion` triggers auto-versions with
+        // no further wiring.
+        let auto_version = Rc::new(AutoVersionState::default());
+        hub.add_event_sink(Box::new(AutoVersionSink(auto_version.clone())));
         Self {
             hub,
             conns: HashMap::new(),
@@ -93,6 +106,7 @@ impl Registry {
             awareness_policy: None,
             room_apps: HashMap::new(),
             schema_cache: HashMap::new(),
+            auto_version,
         }
     }
 
@@ -373,19 +387,36 @@ impl Registry {
     /// registry does not hold, or a body that fails to parse), sparing a re-lock
     /// and re-parse on every sweep of a room bound to an unparseable schema.
     fn parsed_schema(&mut self, app: &(Vec<u8>, u32)) -> Option<Arc<Schema>> {
-        if let Some(schema) = self.schema_cache.get(app) {
-            return schema.clone();
-        }
-        let registry = match self.schema.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+        let schema = match self.schema_cache.get(app) {
+            Some(schema) => schema.clone(),
+            None => {
+                let registry = match self.schema.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let schema = registry
+                    .resolve(&app.0, app.1)
+                    .and_then(|src| std::str::from_utf8(src).ok())
+                    .and_then(|src| Schema::parse(src).ok())
+                    .map(Arc::new);
+                drop(registry);
+                self.schema_cache.insert(app.clone(), schema.clone());
+                schema
+            }
         };
-        let schema = registry
-            .resolve(&app.0, app.1)
-            .and_then(|src| std::str::from_utf8(src).ok())
-            .and_then(|src| Schema::parse(src).ok())
-            .map(Arc::new);
-        self.schema_cache.insert(app.clone(), schema.clone());
+        // Arm auto-version recording the first time a schema that declares any
+        // trigger is resolved — resolved for a subscribe's authorization *before*
+        // its `Subscribed` fires, so the arming subscribe is itself recorded (a
+        // room already populated at a fresh server's first subscribe still
+        // captures). Until armed the sink records nothing, so a deployment with no
+        // `autoVersion` pays no per-event cost.
+        if !self.auto_version.is_armed()
+            && schema
+                .as_ref()
+                .is_some_and(|s| !s.auto_version().is_empty())
+        {
+            self.auto_version.arm();
+        }
         schema
     }
 
@@ -789,7 +820,72 @@ impl Registry {
                 }
             }
         }
+        // Every room-bearing lifecycle event this delivery emitted (a subscribe, a
+        // version mutation, a compaction) was recorded by the auto-version sink;
+        // act on them now that the delivery has committed.
+        self.drain_auto_versions();
         !close
+    }
+
+    /// Capture the auto-versions the recorded lifecycle events call for. For each
+    /// signal, resolve the room's governing schema and, for every `on:` trigger it
+    /// declares matching the event, capture a version named by the expanded
+    /// template. A relay room (no governing schema) or an unmatched event captures
+    /// nothing. `every:` schedule triggers are the sweep's concern, not an event's;
+    /// the `keep` retention window is Unit 3b (see `capture_auto_version`).
+    ///
+    /// A capture re-emits `VersionCreated`; the `draining` flag suppresses the sink
+    /// recording that, so an auto-created version never cascades into another.
+    fn drain_auto_versions(&mut self) {
+        if self.auto_version.is_empty() {
+            return;
+        }
+        let signals = self.auto_version.take();
+        // Read wall time once for every `${timestamp}` in this drain — off the op
+        // hot path, which emits no room-bearing event and so never reaches here.
+        let now = self.clock.now_millis();
+        self.auto_version.set_draining(true);
+        for (room, event) in signals {
+            let Some(app) = self.room_apps.get(&room).cloned() else {
+                continue;
+            };
+            let Some(schema) = self.parsed_schema(&app) else {
+                continue;
+            };
+            // Copy the matching triggers out, releasing the schema borrow before
+            // mutating the hub.
+            let templates: Vec<String> = schema
+                .auto_version()
+                .iter()
+                .filter(|av| matches!(av.trigger, Trigger::On(e) if e == event))
+                .map(|av| av.name.clone())
+                .collect();
+            for template in templates {
+                self.capture_auto_version(&room, &template, event, now);
+            }
+        }
+        self.auto_version.set_draining(false);
+    }
+
+    /// Capture one trigger's version, naming it by the expanded template. Best-
+    /// effort: a room with no state yet or a name already taken this tick is a
+    /// silent no-op (`Ok(false)`); a durable-store persist failure is logged (a
+    /// snapshot the operator wanted was not captured) but never aborts the delivery
+    /// — auto-versioning is a passive server-side observer.
+    ///
+    /// The trigger's `keep` retention window is **not yet enforced** — bounding a
+    /// trigger's captures exactly needs durable per-version provenance (which
+    /// trigger authored a version) plus a monotonic capture order, a store-format
+    /// change tracked as its own unit. Every heuristic tried is unsound: a
+    /// name-pattern prune deletes manual versions that fit the pattern, collides
+    /// same-named triggers, and orders by a non-monotonic wall clock; an in-memory
+    /// tally resets across room dormancy and restart. So `keep` parses but stays
+    /// inert until provenance lands.
+    fn capture_auto_version(&mut self, room: &[u8], template: &str, event: TriggerEvent, now: u64) {
+        let name = expand_name(template, now, event);
+        if let Err(e) = self.hub.create_version(room, name.as_bytes()) {
+            eprintln!("crdtsync: auto-version capture of {name:?} in room {room:?} failed: {e}");
+        }
     }
 
     /// Take and clear the messages queued to send a connection.
