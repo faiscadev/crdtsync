@@ -664,12 +664,10 @@ impl Registry {
                         (Some((app, from)), Some(target))
                             if conn.session.app_id() == app && target != *from =>
                         {
-                            Some(
-                                translated_by_target
-                                    .get(&target)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]),
-                            )
+                            // Total over every eligible recipient: `resolve_chains`
+                            // keyed the memo on this same (same-app, target != from)
+                            // predicate, so the target is always present.
+                            Some(translated_by_target[&target].as_slice())
                         }
                         _ => None,
                     };

@@ -47,7 +47,7 @@ fn registry() -> Registry {
         DOWN,
         2,
         MAP_V2.as_bytes(),
-        br#"{ "from": 1, "to": 2, "steps": [ { "kind": "addField", "type": "R", "field": "note", "fieldType": "text" } ] }"#,
+        br#"{ "from": 1, "to": 2, "steps": [ { "kind": "addField", "type": "R", "field": "note", "fieldType": "text" }, { "kind": "addField", "type": "R", "field": "extra", "fieldType": "int" } ] }"#,
     )
     .unwrap();
 
@@ -249,6 +249,52 @@ fn a_container_create_and_its_subtree_survive_verbatim_to_an_older_recipient() {
     assert!(got[1..]
         .iter()
         .all(|op| matches!(op.kind, OpKind::TextInsert { .. })));
+}
+
+#[test]
+fn a_container_create_in_a_poisoned_transaction_is_destranded_not_dropped() {
+    let mut r = registry();
+    let writer = hello(&mut r, 1, DOWN, 2);
+    let older = hello(&mut r, 2, DOWN, 1);
+    for id in [writer, older] {
+        subscribe(&mut r, id);
+    }
+    // One atomic transaction creates the v2-only "note" text container and sets a
+    // v2-only scalar; a separate un-transacted op then inserts into the container,
+    // all in one fan-out batch. Down at v1 the scalar member drops, poisoning the
+    // transaction. Dropping the whole group would take the TextCreate with it and
+    // strand the keyless TextInsert against a container that never arrives. The
+    // create is destranded instead — carried standalone (no tx tag) — so the v1
+    // recipient receives the container and its insert, internally consistent.
+    let mut wdoc = Document::new(cid(1));
+    let note = crdtsync_core::path::encode_path(&[b"note"]);
+    let mut batch = wdoc.atomic_transact(|c| {
+        c.text(b"note");
+        c.register(b"extra", Scalar::Int(1));
+    });
+    batch.extend(crdtsync_core::path::text_insert(&mut wdoc, &note, 0, "hi"));
+    write(&mut r, writer, batch);
+
+    let got = delivered_ops(&mut r, older);
+    assert!(
+        got.iter()
+            .any(|op| matches!(op.kind, OpKind::TextCreate { .. })),
+        "the container-create survives the poisoned transaction"
+    );
+    assert!(
+        got.iter()
+            .any(|op| matches!(op.kind, OpKind::TextInsert { .. })),
+        "its keyless descendant is delivered, not stranded"
+    );
+    assert!(
+        got.iter().all(|op| op.tx.is_none()),
+        "the destranded create carries no tx tag, so it applies without buffering"
+    );
+    assert!(
+        !got.iter()
+            .any(|op| matches!(&op.kind, OpKind::RegisterSet { key, .. } if key == b"extra")),
+        "the v2-only scalar member does not cross"
+    );
 }
 
 #[test]

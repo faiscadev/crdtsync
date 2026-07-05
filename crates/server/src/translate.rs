@@ -18,7 +18,7 @@ use crdtsync_core::migration::{
     reachable_down, rewrite_down_along, rewrite_up_along, Migration, OpRewrite,
 };
 use crdtsync_core::op::TxId;
-use crdtsync_core::{ClientId, Op, OpKind};
+use crdtsync_core::{ClientId, Op};
 
 use crate::schema_registry::SchemaRegistry;
 
@@ -99,18 +99,21 @@ impl Chain {
     /// cannot faithfully carry every member of an atomic edit does not carry the
     /// edit at all.
     ///
-    /// A container-create ([`MapCreate`]/[`ListCreate`]/[`TextCreate`]) is always
-    /// carried verbatim, never dropped or key-rewritten. Per-op rewriting is
-    /// key-local; it cannot see a container's descendants (an insert into it
-    /// carries no field key, so a migration step never matches it). Dropping the
-    /// create while keeping its descendants would strand them against a container
-    /// that never arrives; rewriting the create's key would repoint it away from
-    /// descendants that derive their element id from the original key. Either way
-    /// the subtree tears. Carrying the create as-is keeps the subtree whole and
-    /// internally consistent — a field the recipient's version does not model
-    /// surfaces as an unknown slot its invariant repair elides, never a strand.
-    /// Faithful subtree elision needs per-recipient element-set awareness, which
-    /// this per-op seam does not have.
+    /// A container-create ([`MapCreate`]/[`ListCreate`]/[`TextCreate`]) is carried
+    /// verbatim, never key-rewritten, and never dropped by the chain. Per-op
+    /// rewriting is key-local; it cannot see a container's descendants (an insert
+    /// into it carries no field key, so a migration step never matches it).
+    /// Dropping the create while keeping its descendants would strand them against
+    /// a container that never arrives; rewriting the create's key would repoint it
+    /// away from descendants that derive their element id from the original key.
+    /// Either way the subtree tears. Carrying the create as-is keeps the subtree
+    /// whole and internally consistent — a field the recipient's version does not
+    /// model surfaces as an unknown slot its invariant repair elides, never a
+    /// strand. When the create's transaction is poisoned it is not dropped with
+    /// the group but *destranded* — carried with its tx tag stripped, so it
+    /// applies standalone instead of buffering forever as a lone member of a group
+    /// that never completes. Faithful subtree elision needs per-recipient
+    /// element-set awareness, which this per-op seam does not have.
     ///
     /// [`MapCreate`]: crdtsync_core::OpKind::MapCreate
     /// [`ListCreate`]: crdtsync_core::OpKind::ListCreate
@@ -119,7 +122,7 @@ impl Chain {
         let rewritten: Vec<OpRewrite> = ops
             .iter()
             .map(|op| {
-                if is_container_create(&op.kind) {
+                if op.kind.creates_container() {
                     OpRewrite::Keep(op.clone())
                 } else {
                     self.translate_op(op)
@@ -137,25 +140,30 @@ impl Chain {
         }
         ops.iter()
             .zip(rewritten)
-            .filter_map(|(op, r)| match r {
-                OpRewrite::Keep(out) => match &op.tx {
-                    Some(tx) if poisoned.contains(&(op.id.client, tx.id)) => None,
-                    _ => Some(out),
-                },
-                OpRewrite::Drop => None,
+            .filter_map(|(op, r)| {
+                let out = match r {
+                    OpRewrite::Keep(out) => out,
+                    OpRewrite::Drop => return None,
+                };
+                let poisoned_group = op
+                    .tx
+                    .as_ref()
+                    .is_some_and(|tx| poisoned.contains(&(op.id.client, tx.id)));
+                if !poisoned_group {
+                    return Some(out);
+                }
+                // The group cannot cross whole, so its members are dropped to keep
+                // the transaction all-or-nothing — except a container-create,
+                // whose drop would strand its keyless descendants against a
+                // container that never arrives. It is carried anyway, destranded:
+                // stripped of its tx tag so it applies standalone rather than
+                // buffering forever as a lone member of a group that never
+                // completes. The members it can no longer be atomic with are ones
+                // this recipient's version cannot represent regardless.
+                op.kind.creates_container().then(|| Op { tx: None, ..out })
             })
             .collect()
     }
-}
-
-/// Whether `kind` installs a nested container — the ops whose subtree a per-op
-/// key rewrite cannot keep consistent, so [`Chain::translate_ops`] carries them
-/// verbatim.
-fn is_container_create(kind: &OpKind) -> bool {
-    matches!(
-        kind,
-        OpKind::MapCreate { .. } | OpKind::ListCreate { .. } | OpKind::TextCreate { .. }
-    )
 }
 
 /// Rewrite `op`, created under schema version `from`, for a recipient at `to` —
