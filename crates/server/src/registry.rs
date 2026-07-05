@@ -477,9 +477,15 @@ impl Registry {
         // escalate against a permissive self-declared app. The connection's own app
         // is the fallback only for a room not yet in the bindings — its first
         // subscriber, about to become the incumbent.
-        let acting_schema = match &authz_room {
-            Some(room) if self.room_apps.contains_key(room) => self.governing_schema(room),
-            Some(_) => self.connection_schema(id),
+        let acting_schema = match authz_room
+            .as_deref()
+            .map(|room| self.room_apps.get(room).cloned())
+        {
+            // Bound: governed by the room's own app's schema — never the
+            // connection's — even when it fails to parse (`None`: no grants).
+            Some(Some(app)) => self.parsed_schema(&app),
+            // Unbound (first subscriber): fall back to the connection's own app.
+            Some(None) => self.connection_schema(id),
             None => None,
         };
         let (broadcast, close, room, awareness, authed_client, bind) = {
