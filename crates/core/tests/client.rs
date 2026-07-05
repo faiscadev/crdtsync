@@ -159,6 +159,19 @@ fn authok_records_the_server_derived_actor() {
     assert_eq!(session.actor(), Some(&b"alice"[..]));
 }
 
+#[test]
+fn a_schema_advert_is_accepted_without_effect() {
+    // A schema advertisement drives no room replica: the session accepts it and
+    // its state is unchanged.
+    let mut session = ClientSession::new(cid(1));
+    session
+        .receive(Message::SchemaAdvert {
+            schema_version: 3,
+            schema: b"{}".to_vec(),
+        })
+        .unwrap();
+}
+
 // --- awareness ---
 
 #[test]

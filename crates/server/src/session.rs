@@ -345,6 +345,7 @@ pub fn step(
         Message::Snapshot { .. } => violation("client sent a snapshot"),
         Message::Error { .. } => violation("client sent an error"),
         Message::AuthOk { .. } => violation("client sent an authok"),
+        Message::SchemaAdvert { .. } => violation("client sent a schema advert"),
         // The client reports its applied sequence; recording it into the
         // per-client GC watermark is the next unit. Until then the report is
         // accepted and ignored rather than treated as a violation — a

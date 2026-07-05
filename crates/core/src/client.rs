@@ -370,6 +370,9 @@ impl ClientSession {
                 self.actor = Some(actor);
                 Ok(())
             }
+            // The client accepts the server's schema advertisement without acting
+            // on it — it does not drive any room's replica.
+            Message::SchemaAdvert { .. } => Ok(()),
             Message::AwarenessUpdate {
                 channel,
                 actor,

@@ -107,6 +107,45 @@ fn hello_round_trips() {
 }
 
 #[test]
+fn schema_advert_round_trips() {
+    // The enforcing server's advertisement of the schema it is serving.
+    round_trips(Message::SchemaAdvert {
+        schema_version: 7,
+        schema: br#"{"schema":"notes","version":7}"#.to_vec(),
+    });
+    // A version with an empty body still round-trips (the client already holds
+    // the bytes, so the server need only confirm the version it enforces).
+    round_trips(Message::SchemaAdvert {
+        schema_version: 1,
+        schema: Vec::new(),
+    });
+}
+
+#[test]
+fn a_truncated_schema_advert_is_an_error() {
+    let bytes = encode_message(&Message::SchemaAdvert {
+        schema_version: 3,
+        schema: b"{}".to_vec(),
+    });
+    for cut in 0..bytes.len() {
+        assert!(
+            decode_message(&bytes[..cut]).is_err(),
+            "truncating to {cut} bytes must error, not panic",
+        );
+    }
+}
+
+#[test]
+fn trailing_bytes_after_a_schema_advert_are_an_error() {
+    let mut bytes = encode_message(&Message::SchemaAdvert {
+        schema_version: 3,
+        schema: b"{}".to_vec(),
+    });
+    bytes.push(0);
+    assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
+}
+
+#[test]
 fn subscribe_round_trips() {
     round_trips(Message::Subscribe {
         channel: Channel(1),

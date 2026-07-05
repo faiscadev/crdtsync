@@ -209,6 +209,27 @@ fn a_second_auth_is_a_violation() {
 }
 
 #[test]
+fn a_client_sent_schema_advert_is_a_violation() {
+    // The advertisement travels server-to-client only; a client that sends one is
+    // speaking out of turn.
+    let v = only_good();
+    let mut h = hub();
+    let mut s = Session::new();
+    hello(&mut h, &mut s, &v, 1);
+    let r = drive(
+        &mut h,
+        &mut s,
+        &v,
+        Message::SchemaAdvert {
+            schema_version: 1,
+            schema: b"{}".to_vec(),
+        },
+    );
+    assert!(r.close);
+    assert!(is_violation(&r.replies[0]));
+}
+
+#[test]
 fn subscribe_before_auth_is_a_violation() {
     let v = only_good();
     let mut h = hub();
