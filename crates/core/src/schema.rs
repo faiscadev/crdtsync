@@ -649,7 +649,7 @@ fn parse_trigger_event(name: &str, ctx: &str) -> Result<TriggerEvent, SchemaErro
 /// overflowing product.
 fn parse_duration_millis(spec: &str, ctx: &str) -> Result<u64, SchemaError> {
     let bad = || SchemaError::new(SchemaErrorKind::BadDuration, at(ctx, "every"));
-    let unit = spec.chars().last().ok_or_else(|| bad())?;
+    let unit = spec.chars().last().ok_or_else(&bad)?;
     let factor: u64 = match unit {
         's' => 1_000,
         'm' => 60_000,
@@ -662,7 +662,7 @@ fn parse_duration_millis(spec: &str, ctx: &str) -> Result<u64, SchemaError> {
         return Err(bad());
     }
     let n: u64 = digits.parse().map_err(|_| bad())?;
-    n.checked_mul(factor).ok_or_else(|| bad())
+    n.checked_mul(factor).ok_or_else(&bad)
 }
 
 /// Parse the `@auth` block: a role vocabulary and static grants. `roles` is

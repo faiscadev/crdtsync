@@ -728,6 +728,14 @@ fn hostile_inputs_never_panic() {
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map", "children": { "x": { "kind": "map" } } } } }"#,
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "list", "items": "R" } } }"#,
         "\u{1F600}",
+        // autoVersion shapes, incl. a multibyte `every` unit — the duration
+        // parser slices off the last char, so a non-ASCII unit must not panic.
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": 3 }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ 3 ] }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "every": "1€", "name": "n" } ] }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "every": "€", "name": "n" } ] }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "every": "999999999999999999999d", "name": "n" } ] }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "on": 7, "name": "n" } ] }"#,
     ];
     for s in inputs {
         // The contract is only that it returns — Ok or Err, never a panic.
