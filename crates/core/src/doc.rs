@@ -200,28 +200,34 @@ impl Document {
                     .take_slot(&key)
                     .expect("a key from slot_keys is present");
                 changed = true;
-                // A counter's value lives in the registry keyed by the id its old
-                // key derives; drop or re-home it to match the slot.
-                let counter = matches!(value, Some(Element::Counter(_)))
+                // A counter's tally lives in the registry keyed by the id its key
+                // derives (leaf counters are not in the parent graph, so that is
+                // left untouched); its slot moves in lock-step with the registry.
+                let old_counter = matches!(value, Some(Element::Counter(_)))
                     .then(|| ElementId::derive(map_id, &key, ElementKind::Counter));
                 match fate {
                     SlotFate::Keep => unreachable!("filtered above"),
                     SlotFate::Drop => {
-                        if let Some(old) = counter {
+                        if let Some(old) = old_counter {
                             self.counters.remove(&old);
-                            self.parents.remove(&old);
                         }
                     }
+                    // Re-key the slot; a counter merges into the id its new key
+                    // derives, exactly as the renamed increment ops would at that
+                    // shared id — so a collision with a counter already there sums
+                    // rather than clobbers, and the moved slot points at the same
+                    // merged handle the LWW winner resolves through.
                     SlotFate::Rename(to) => {
-                        let value = match (counter, &value) {
-                            (Some(old), Some(Element::Counter(c))) => {
-                                let new = ElementId::derive(map_id, &to, ElementKind::Counter);
+                        let value = match (old_counter, &value) {
+                            (Some(old), Some(Element::Counter(src))) => {
                                 self.counters.remove(&old);
-                                self.parents.remove(&old);
-                                let rehomed = Rc::new(RefCell::new(c.borrow().rehomed(new)));
-                                self.counters.insert(new, Rc::clone(&rehomed));
-                                self.parents.insert(new, map_id);
-                                Some(Element::Counter(rehomed))
+                                let new = ElementId::derive(map_id, &to, ElementKind::Counter);
+                                let dest =
+                                    Rc::clone(self.counters.entry(new).or_insert_with(|| {
+                                        Rc::new(RefCell::new(Counter::new(new)))
+                                    }));
+                                dest.borrow_mut().merge(&src.borrow());
+                                Some(Element::Counter(dest))
                             }
                             _ => value,
                         };

@@ -142,19 +142,6 @@ impl Counter {
         }
     }
 
-    /// A copy carrying the same per-client tallies under a new id — for moving a
-    /// counter to the element id its slot key now derives, when a migration
-    /// renames the field. The tally is the sum of per-client increments, so it
-    /// rides along unchanged, exactly as the renamed increment ops would rebuild
-    /// it at the new id.
-    pub fn rehomed(&self, id: ElementId) -> Self {
-        Self {
-            id,
-            entries: self.entries.clone(),
-            displaced: Cell::new(false),
-        }
-    }
-
     pub fn displace(&self) {
         self.displaced.set(true);
     }

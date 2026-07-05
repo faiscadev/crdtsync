@@ -208,6 +208,33 @@ fn a_renamed_counter_rehomes_its_tally_and_leaves_no_phantom() {
     );
 }
 
+#[test]
+fn a_counter_renamed_onto_an_occupied_counter_merges_at_the_shared_id() {
+    // A rename can land on a key already holding a counter (a cross-type key
+    // collision the type-scope-blind seam does not narrow). It must merge into
+    // the id the new key derives — as the renamed increment ops would at that
+    // shared id — leaving the slot and the registry pointing at one merged
+    // counter, never a phantom or a desync, whichever stamp wins the slot.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.inc(b"a", 5);
+        tx.inc(b"b", 10);
+    });
+    assert!(d.migrate_leaf_slots(rename(b"a", b"b")));
+    assert_eq!(counter(&d, b"a"), None, "the source key is vacated");
+    // Same author, so the PN-counter merge keeps the larger tally.
+    assert_eq!(
+        counter(&d, b"b"),
+        Some(10),
+        "the counters merge at the shared id"
+    );
+    // The slot and registry agree through a round-trip — no phantom, no desync.
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).unwrap();
+    assert_eq!(counter(&back, b"b"), Some(10));
+    assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
+}
+
 // --- identity / no-op ---
 
 #[test]
