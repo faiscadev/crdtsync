@@ -556,11 +556,11 @@ impl Registry {
         // (a dormant sweep, or a store restart that restores the log but not the
         // binding) translate that log along the wrong chain — a durable binding
         // that survives both is the robust fix, not yet built.
-        let governing_app = match &room_binding {
+        let governing_app = match room_binding {
             Some(Some((app, _)))
                 if matches!(msg, Message::Subscribe { .. } | Message::Ops { .. }) =>
             {
-                Some(app.clone())
+                Some(app)
             }
             _ => None,
         };
