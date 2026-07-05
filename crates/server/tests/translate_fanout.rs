@@ -316,6 +316,51 @@ fn a_poisoned_transactions_container_subtree_is_destranded_whole_not_left_empty(
 }
 
 #[test]
+fn an_untransacted_insert_beside_a_poisoned_create_is_delivered_as_is() {
+    let mut r = registry();
+    let writer = hello(&mut r, 1, DOWN, 2);
+    let older = hello(&mut r, 2, DOWN, 1);
+    for id in [writer, older] {
+        subscribe(&mut r, id);
+    }
+    // A poisoned transaction (the v2-only "note" create + a v2-only scalar) sits in
+    // the same fan-out batch as a separate un-transacted insert into that
+    // container. Down at v1 the scalar poisons the transaction, so its create is
+    // destranded; the insert, never in the transaction, is not poisoned and passes
+    // through as-is — the survivor branch that carries an already-standalone op.
+    // The container still arrives with its content, from two different code paths.
+    let mut wdoc = Document::new(cid(1));
+    let note = crdtsync_core::path::encode_path(&[b"note"]);
+    let mut batch = wdoc.atomic_transact(|c| {
+        c.text(b"note");
+        c.register(b"extra", Scalar::Int(1));
+    });
+    batch.extend(crdtsync_core::path::text_insert(&mut wdoc, &note, 0, "hi"));
+    write(&mut r, writer, batch);
+
+    let got = delivered_ops(&mut r, older);
+    assert!(
+        got.iter()
+            .any(|op| matches!(op.kind, OpKind::TextCreate { .. })),
+        "the destranded create survives"
+    );
+    assert!(
+        got.iter()
+            .any(|op| matches!(op.kind, OpKind::TextInsert { .. })),
+        "the un-transacted insert is delivered, not stranded against a missing container"
+    );
+    assert!(
+        got.iter().all(|op| op.tx.is_none()),
+        "the create is destranded and the insert was already standalone"
+    );
+    assert!(
+        !got.iter()
+            .any(|op| matches!(&op.kind, OpKind::RegisterSet { key, .. } if key == b"extra")),
+        "the v2-only scalar member does not cross"
+    );
+}
+
+#[test]
 fn a_foreign_app_write_is_not_translated_along_the_rooms_chain() {
     let mut r = registry();
     // App UP at v1 subscribes first, binding the room to UP.
