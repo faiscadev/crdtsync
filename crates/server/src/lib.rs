@@ -85,6 +85,14 @@ pub enum Catchup {
 /// covered, retained under an app-chosen name until deleted.
 struct Version {
     seq: u64,
+    /// The auto-version trigger that authored it (its stable identity), or `None`
+    /// for a manually created version. Retention prunes within one origin, so it
+    /// never touches a manual version or a different trigger's captures.
+    origin: Option<Vec<u8>>,
+    /// A monotonic capture order stamped by the hub — retention orders a trigger's
+    /// captures by this, not by a wall-clock name, so a backward clock step cannot
+    /// misorder them.
+    ordinal: u64,
     state: Vec<u8>,
 }
 
@@ -249,6 +257,11 @@ pub struct Hub {
     /// Named versions per room, keyed by name — sorted, for listing/pagination.
     /// The in-memory versions index over the snapshot storage primitive.
     versions: HashMap<RoomId, BTreeMap<Vec<u8>, Version>>,
+    /// The next capture ordinal, stamped on each created version and never reused.
+    /// Restored past the highest persisted ordinal on load, so the order survives a
+    /// restart; a gap (a rolled-back persist) is harmless — only monotonicity
+    /// matters.
+    version_ordinal: u64,
     /// The engine event sinks, notified of each lifecycle moment. Empty by
     /// default — no sink, no emission cost.
     sinks: Vec<Box<dyn EventSink>>,
@@ -264,6 +277,7 @@ impl Hub {
             compaction_threshold: 0,
             awareness: HashMap::new(),
             versions: HashMap::new(),
+            version_ordinal: 0,
             sinks: Vec::new(),
         }
     }
@@ -510,6 +524,15 @@ impl Hub {
         for (room, log) in rooms {
             hub.install_room(room, log)?;
         }
+        // Resume the capture order past every persisted ordinal, so a version
+        // created after the restart never collides with or predates a restored one.
+        hub.version_ordinal = hub
+            .versions
+            .values()
+            .flat_map(|index| index.values())
+            .map(|v| v.ordinal.saturating_add(1))
+            .max()
+            .unwrap_or(0);
         Ok(hub)
     }
 
@@ -539,8 +562,16 @@ impl Hub {
             .expect("a store-less replay never fails");
         if !log.versions.is_empty() {
             let index = self.versions.entry(room).or_default();
-            for (name, seq, state) in log.versions {
-                index.insert(name, Version { seq, state });
+            for (name, seq, origin, ordinal, state) in log.versions {
+                index.insert(
+                    name,
+                    Version {
+                        seq,
+                        origin,
+                        ordinal,
+                        state,
+                    },
+                );
             }
         }
         Ok(())
@@ -742,11 +773,35 @@ impl Hub {
     /// is persisted before the version is committed, so a persist failure leaves
     /// no version the disk has not accepted.
     pub fn create_version(&mut self, room: &[u8], name: &[u8]) -> io::Result<bool> {
+        self.create_version_with(room, name, None)
+    }
+
+    /// Capture a version authored by an auto-version trigger, tagged with its
+    /// `origin` (the trigger's stable identity) so [`retain_by_origin`] can prune
+    /// that trigger's captures without touching a manual version or another
+    /// trigger's. Otherwise identical to [`create_version`](Hub::create_version).
+    pub(crate) fn create_auto_version(
+        &mut self,
+        room: &[u8],
+        name: &[u8],
+        origin: &[u8],
+    ) -> io::Result<bool> {
+        self.create_version_with(room, name, Some(origin))
+    }
+
+    fn create_version_with(
+        &mut self,
+        room: &[u8],
+        name: &[u8],
+        origin: Option<&[u8]>,
+    ) -> io::Result<bool> {
         let Some(r) = self.rooms.get(room) else {
             return Ok(false);
         };
         let version = Version {
             seq: r.head(),
+            origin: origin.map(<[u8]>::to_vec),
+            ordinal: self.version_ordinal,
             state: r.doc.encode_state(),
         };
         let index = self.versions.entry(room.to_vec()).or_default();
@@ -754,6 +809,10 @@ impl Hub {
             return Ok(false);
         }
         index.insert(name.to_vec(), version);
+        // The ordinal is consumed only once the version is actually recorded, so a
+        // no-op (unknown room / taken name) reuses it; a rolled-back persist leaves
+        // a harmless gap, since only the relative order matters.
+        self.version_ordinal += 1;
         if let Err(e) = self.persist_versions(room) {
             self.versions
                 .get_mut(room)
@@ -763,6 +822,73 @@ impl Hub {
         }
         self.emit(EngineEvent::VersionCreated { room, name });
         Ok(true)
+    }
+
+    /// Prune an auto-version trigger's captures to its `keep` retention window:
+    /// keep the newest `keep` versions of `room` whose `origin` is this trigger's,
+    /// deleting the older ones by capture order (the monotonic ordinal, so a
+    /// backward clock step never misorders them). Only this trigger's own captures
+    /// are eligible — a manual version (no origin) or another trigger's is never
+    /// touched. Best-effort: a persist failure while deleting leaves an extra
+    /// retained version, propagated so the caller can log it.
+    pub(crate) fn retain_by_origin(
+        &mut self,
+        room: &[u8],
+        origin: &[u8],
+        keep: u64,
+    ) -> io::Result<()> {
+        let Some(index) = self.versions.get(room) else {
+            return Ok(());
+        };
+        // Count in `u64` — a `keep` past `usize::MAX` (a 32-bit target) must not
+        // truncate and prune. While the window is still filling this is the whole
+        // cost: no sort, no allocation.
+        let matches = index
+            .values()
+            .filter(|v| v.origin.as_deref() == Some(origin))
+            .count();
+        if matches as u64 <= keep {
+            return Ok(());
+        }
+        // `keep` is now below the group size, so it fits `usize` losslessly.
+        let remove = matches - keep as usize;
+        // Partition the lowest `remove` ordinals (the oldest captures) to the front —
+        // a linear select, not a full sort of the window, and no name is cloned until
+        // it is known doomed.
+        let mut by_ordinal: Vec<(u64, &[u8])> = index
+            .iter()
+            .filter(|(_, v)| v.origin.as_deref() == Some(origin))
+            .map(|(name, v)| (v.ordinal, name.as_slice()))
+            .collect();
+        by_ordinal.select_nth_unstable_by_key(remove - 1, |&(ordinal, _)| ordinal);
+        let doomed: Vec<Vec<u8>> = by_ordinal[..remove]
+            .iter()
+            .map(|&(_, name)| name.to_vec())
+            .collect();
+        drop(by_ordinal);
+
+        // Evict the whole batch from the index, then persist once — not one atomic
+        // rewrite (with its two fsyncs) per eviction. A persist failure restores the
+        // entire batch, so retention never commits a partial prune.
+        let index = self.versions.get_mut(room).expect("index present above");
+        let evicted: Vec<(Vec<u8>, Version)> = doomed
+            .into_iter()
+            .map(|name| {
+                let version = index.remove(&name).expect("name drawn from this index");
+                (name, version)
+            })
+            .collect();
+        if let Err(e) = self.persist_versions(room) {
+            let index = self.versions.get_mut(room).expect("index present above");
+            for (name, version) in evicted {
+                index.insert(name, version);
+            }
+            return Err(e);
+        }
+        for (name, _) in &evicted {
+            self.emit(EngineEvent::VersionDeleted { room, name });
+        }
+        Ok(())
     }
 
     /// The server sequence a named version covers, if it exists.
@@ -798,11 +924,15 @@ impl Hub {
         if !index.contains_key(from) || index.contains_key(to) {
             return Ok(false);
         }
-        let version = index.remove(from).expect("presence checked above");
+        let mut version = index.remove(from).expect("presence checked above");
+        // A rename is a deliberate operator act — the version is now curated, not a
+        // disposable auto-capture, so detach it from its trigger's retention window.
+        let prev_origin = version.origin.take();
         index.insert(to.to_vec(), version);
         if let Err(e) = self.persist_versions(room) {
             let index = self.versions.get_mut(room).expect("index present above");
-            let version = index.remove(to).expect("just inserted");
+            let mut version = index.remove(to).expect("just inserted");
+            version.origin = prev_origin;
             index.insert(from.to_vec(), version);
             return Err(e);
         }
@@ -839,9 +969,17 @@ impl Hub {
         };
         let empty = BTreeMap::new();
         let index = self.versions.get(room).unwrap_or(&empty);
-        let records: Vec<(&[u8], u64, &[u8])> = index
+        let records: Vec<(&[u8], u64, Option<&[u8]>, u64, &[u8])> = index
             .iter()
-            .map(|(name, v)| (name.as_slice(), v.seq, v.state.as_slice()))
+            .map(|(name, v)| {
+                (
+                    name.as_slice(),
+                    v.seq,
+                    v.origin.as_deref(),
+                    v.ordinal,
+                    v.state.as_slice(),
+                )
+            })
             .collect();
         store.write_versions(room, &records)
     }

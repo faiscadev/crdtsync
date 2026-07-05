@@ -6,9 +6,9 @@
 //! (`${timestamp}`, `${event}`) at fire time. Only room-bearing events drive a
 //! capture (subscribe, version create/rename/delete, compaction); a relay room
 //! with no governing schema never auto-versions; an `every:` schedule trigger is
-//! the scheduler's job, not an event's. The `keep` retention window is a follow-on
-//! unit — it parses but is inert here. A [`ManualClock`] drives `${timestamp}`
-//! deterministically.
+//! the scheduler's job, not an event's. A trigger's `keep` prunes its own oldest
+//! captures (by provenance, never a manual version or another trigger's) past the
+//! window. A [`ManualClock`] drives `${timestamp}` deterministically.
 
 use std::sync::{Arc, Mutex};
 
@@ -256,10 +256,7 @@ fn two_triggers_on_the_same_event_both_fire() {
 }
 
 #[test]
-fn keep_is_parsed_but_not_yet_enforced() {
-    // Retention (bounding a trigger's captures to its `keep` window) needs durable
-    // per-version provenance and is a follow-on unit; until then `keep` parses but
-    // is inert, so every capture is retained.
+fn keep_prunes_the_oldest_captures_of_the_trigger() {
     let (mut r, clock) =
         registry_with(r#"[{ "on": "subscribe", "name": "auto/join/${timestamp}", "keep": 2 }]"#);
     seed_room(&mut r);
@@ -273,12 +270,218 @@ fn keep_is_parsed_but_not_yet_enforced() {
     assert_eq!(
         version_names(&r),
         vec![
-            format!("auto/join/{}", stamp(1000)).into_bytes(),
             format!("auto/join/{}", stamp(2000)).into_bytes(),
             format!("auto/join/{}", stamp(3000)).into_bytes(),
         ],
-        "keep is inert for now — all three captures retained despite keep:2",
+        "keep:2 retains the two newest, prunes the oldest",
     );
+}
+
+#[test]
+fn a_lowered_window_prunes_the_whole_backlog_at_once() {
+    // Five captures accumulate, then keep:1 must evict four in a single batch —
+    // exercising the multi-eviction path, not just a one-off trim.
+    let (mut r, clock) =
+        registry_with(r#"[{ "on": "subscribe", "name": "auto/join/${timestamp}", "keep": 1 }]"#);
+    seed_room(&mut r);
+
+    for client in [2u8, 3, 4, 5, 6] {
+        clock.advance(1000);
+        let c = hello_auth(&mut r, client, APP, 1);
+        subscribe(&mut r, c, ROOM);
+    }
+
+    assert_eq!(
+        version_names(&r),
+        vec![format!("auto/join/{}", stamp(5000)).into_bytes()],
+        "keep:1 evicts the four older captures in one batch, leaving the newest",
+    );
+}
+
+#[test]
+fn keep_never_prunes_a_manual_version() {
+    // A manually created version whose name fits the trigger's naming is not the
+    // trigger's capture — retention keys on provenance, not the name — so it is
+    // never pruned by the trigger's window.
+    let (mut r, clock) =
+        registry_with(r#"[{ "on": "subscribe", "name": "auto/join/${timestamp}", "keep": 1 }]"#);
+    let a = seed_room(&mut r);
+    // A manual version named exactly as a capture would be — but authored by the
+    // operator, not the trigger.
+    let manual = format!("auto/join/{}", stamp(0));
+    assert!(r.deliver(
+        a,
+        Message::VersionCreate {
+            channel: CH,
+            name: manual.clone().into_bytes(),
+        }
+    ));
+    r.take_outbox(a);
+
+    for client in [2u8, 3] {
+        clock.advance(1000);
+        let c = hello_auth(&mut r, client, APP, 1);
+        subscribe(&mut r, c, ROOM);
+    }
+
+    // keep:1 pruned the trigger's own older capture, but the manual version stays.
+    assert_eq!(
+        version_names(&r),
+        vec![
+            manual.into_bytes(),
+            format!("auto/join/{}", stamp(2000)).into_bytes(),
+        ],
+        "retention prunes only the trigger's captures, never the manual version",
+    );
+}
+
+#[test]
+fn two_triggers_sharing_a_template_keep_independent_windows() {
+    // Two triggers on different events render the same name pattern. Provenance is
+    // per (event, template), so each keeps its own window — a shared name does not
+    // collapse them into one destructive group.
+    let (mut r, clock) = registry_with(
+        r#"[{ "on": "subscribe", "name": "snap/${timestamp}", "keep": 3 },
+             { "on": "version-created", "name": "snap/${timestamp}", "keep": 1 }]"#,
+    );
+    let a = seed_room(&mut r);
+
+    // Three subscribes → three subscribe-captures (room already populated).
+    for client in [2u8, 3, 4] {
+        clock.advance(1000);
+        let c = hello_auth(&mut r, client, APP, 1);
+        subscribe(&mut r, c, ROOM);
+    }
+    // A manual version create fires the version-created trigger → one capture.
+    clock.advance(1000);
+    assert!(r.deliver(
+        a,
+        Message::VersionCreate {
+            channel: CH,
+            name: b"manual".to_vec(),
+        }
+    ));
+    r.take_outbox(a);
+
+    let names = version_names(&r);
+    // The subscribe trigger keeps its newest 3; the version-created trigger keeps
+    // its 1 — its single capture did not prune the subscribe group.
+    let snaps = names.iter().filter(|n| n.starts_with(b"snap/")).count();
+    assert_eq!(
+        snaps, 4,
+        "3 (subscribe window) + 1 (version-created window) survive despite the shared name",
+    );
+}
+
+#[test]
+fn keep_orders_by_capture_not_wall_clock() {
+    // Retention orders by the monotonic capture ordinal, not the timestamp in the
+    // name, so a backward clock step does not make the newest capture look oldest
+    // and get pruned.
+    let (mut r, clock) =
+        registry_with(r#"[{ "on": "subscribe", "name": "auto/join/${timestamp}", "keep": 1 }]"#);
+    seed_room(&mut r);
+
+    clock.advance(1000);
+    let b = hello_auth(&mut r, 2, APP, 1);
+    subscribe(&mut r, b, ROOM); // capture at 1000
+
+    // The wall clock steps backward (an NTP correction) to 500.
+    r.set_clock(Arc::new(ManualClock::new(500)));
+    let c = hello_auth(&mut r, 3, APP, 1);
+    subscribe(&mut r, c, ROOM); // capture at 500 — but a later ordinal
+
+    assert_eq!(
+        version_names(&r),
+        vec![format!("auto/join/{}", stamp(500)).into_bytes()],
+        "keep:1 retains the latest capture (by ordinal), even with a smaller stamp",
+    );
+}
+
+#[test]
+fn a_renamed_capture_survives_its_triggers_retention() {
+    // Renaming an auto-capture is a deliberate operator act — it detaches the
+    // version from its trigger's window, so a later capture's `keep` must never
+    // prune the curated snapshot.
+    let (mut r, clock) =
+        registry_with(r#"[{ "on": "subscribe", "name": "auto/join/${timestamp}", "keep": 1 }]"#);
+    let a = seed_room(&mut r);
+
+    clock.advance(1000);
+    let b = hello_auth(&mut r, 2, APP, 1);
+    subscribe(&mut r, b, ROOM); // capture "auto/join/{1000}"
+
+    // The operator renames it — now curated, exempt from the window.
+    assert!(r.deliver(
+        a,
+        Message::VersionRename {
+            channel: CH,
+            from: format!("auto/join/{}", stamp(1000)).into_bytes(),
+            to: b"keeper".to_vec(),
+        }
+    ));
+    r.take_outbox(a);
+
+    clock.advance(1000);
+    let c = hello_auth(&mut r, 3, APP, 1);
+    subscribe(&mut r, c, ROOM); // capture "auto/join/{2000}"; keep:1 prunes the group
+
+    assert_eq!(
+        version_names(&r),
+        vec![
+            format!("auto/join/{}", stamp(2000)).into_bytes(),
+            b"keeper".to_vec(),
+        ],
+        "the renamed version is detached from the window and survives",
+    );
+}
+
+#[test]
+fn a_name_collision_still_applies_the_tighter_window() {
+    // Two triggers on the same event render the same name — the second's capture
+    // collides and no-ops, but retention still runs on that path, so the tighter
+    // `keep` governs the shared provenance group.
+    let (mut r, clock) = registry_with(
+        r#"[{ "on": "subscribe", "name": "dup/${timestamp}", "keep": 2 },
+             { "on": "subscribe", "name": "dup/${timestamp}", "keep": 1 }]"#,
+    );
+    seed_room(&mut r);
+
+    for client in [2u8, 3] {
+        clock.advance(1000);
+        let c = hello_auth(&mut r, client, APP, 1);
+        subscribe(&mut r, c, ROOM);
+    }
+
+    assert_eq!(
+        version_names(&r),
+        vec![format!("dup/{}", stamp(2000)).into_bytes()],
+        "the keep:1 trigger prunes on the collision path, leaving only the newest",
+    );
+}
+
+#[test]
+fn keep_zero_captures_nothing() {
+    let (mut r, clock) =
+        registry_with(r#"[{ "on": "subscribe", "name": "auto/join/${timestamp}", "keep": 0 }]"#);
+    seed_room(&mut r);
+    clock.advance(1000);
+    let b = hello_auth(&mut r, 2, APP, 1);
+    subscribe(&mut r, b, ROOM);
+    assert!(version_names(&r).is_empty());
+}
+
+#[test]
+fn keep_none_retains_all() {
+    let (mut r, clock) =
+        registry_with(r#"[{ "on": "subscribe", "name": "auto/join/${timestamp}" }]"#);
+    seed_room(&mut r);
+    for client in [2u8, 3] {
+        clock.advance(1000);
+        let c = hello_auth(&mut r, client, APP, 1);
+        subscribe(&mut r, c, ROOM);
+    }
+    assert_eq!(version_names(&r).len(), 2);
 }
 
 #[test]
@@ -302,3 +505,65 @@ fn an_auto_created_version_does_not_cascade() {
         "the join capture does not cascade into a version-created capture",
     );
 }
+
+/// Retention is durable — a trigger's provenance and capture order persist, so a
+/// reopened server prunes the pre-restart captures rather than orphaning them (the
+/// failure the abandoned in-memory tally had). Real filesystem I/O, not under Miri.
+#[test]
+#[cfg(not(miri))]
+fn retention_survives_a_store_restart() {
+    use crdtsync_server::Store;
+
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("crdtsync-autover-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    let _guard = TempDir(path.clone());
+
+    let mut sr = SchemaRegistry::new();
+    sr.register(APP, 1, schema(SUBSCRIBE_KEEP_2).as_bytes(), b"")
+        .unwrap();
+    let sr = Arc::new(Mutex::new(sr));
+
+    // First run: seed the room and take two captures (filling keep:2).
+    {
+        let mut r = Registry::with_store(cid(0xFF), Store::open(&path).unwrap()).unwrap();
+        r.set_schema_registry(sr.clone());
+        let clock = Arc::new(ManualClock::new(0));
+        r.set_clock(clock.clone());
+        seed_room(&mut r);
+        for client in [2u8, 3] {
+            clock.advance(1000);
+            let c = hello_auth(&mut r, client, APP, 1);
+            subscribe(&mut r, c, ROOM);
+        }
+        assert_eq!(r.hub().version_names(ROOM).len(), 2);
+    }
+
+    // Reopen the store into a fresh registry — a restart.
+    let mut r = Registry::with_store(cid(0xFF), Store::open(&path).unwrap()).unwrap();
+    r.set_schema_registry(sr);
+    r.set_clock(Arc::new(ManualClock::new(3000)));
+    let c = hello_auth(&mut r, 4, APP, 1);
+    subscribe(&mut r, c, ROOM); // a third capture, at 3000
+
+    assert_eq!(
+        r.hub().version_names(ROOM),
+        vec![
+            format!("auto/join/{}", stamp(2000)).into_bytes(),
+            format!("auto/join/{}", stamp(3000)).into_bytes(),
+        ],
+        "keep:2 pruned the pre-restart oldest across the reopen, not orphaned it",
+    );
+}
+
+const SUBSCRIBE_KEEP_2: &str =
+    r#"[{ "on": "subscribe", "name": "auto/join/${timestamp}", "keep": 2 }]"#;

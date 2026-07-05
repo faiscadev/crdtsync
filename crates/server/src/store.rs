@@ -60,8 +60,9 @@ pub struct Snapshot {
 pub struct RoomLog {
     pub snapshot: Option<Snapshot>,
     pub ops: Vec<StoredOp>,
-    /// The room's named versions as `(name, covered seq, state)`.
-    pub versions: Vec<(Vec<u8>, u64, Vec<u8>)>,
+    /// The room's named versions as `(name, covered seq, auto-version origin,
+    /// capture ordinal, state)`. `origin` is `None` for a manual version.
+    pub versions: Vec<(Vec<u8>, u64, Option<Vec<u8>>, u64, Vec<u8>)>,
 }
 
 /// A directory of per-room logs and snapshots.
@@ -141,14 +142,16 @@ impl Store {
 
     /// Rewrite `room`'s named versions to their own file, replacing whatever it
     /// held. Each record is the name (length-prefixed), the covered sequence
-    /// (8-byte little-endian), then the state (length-prefixed). The file lands
-    /// atomically — temp, flushed, renamed, directory flushed — so a crash never
-    /// leaves a torn index; an empty set removes the file. A version is immutable
-    /// but the *index* is not, so the whole file is rewritten on every change.
+    /// (8-byte little-endian), a 1-byte origin present-flag then the origin
+    /// (length-prefixed, only when present), the capture ordinal (8-byte
+    /// little-endian), then the state (length-prefixed). The file lands atomically
+    /// — temp, flushed, renamed, directory flushed — so a crash never leaves a torn
+    /// index; an empty set removes the file. A version is immutable but the *index*
+    /// is not, so the whole file is rewritten on every change.
     pub fn write_versions(
         &mut self,
         room: &[u8],
-        versions: &[(&[u8], u64, &[u8])],
+        versions: &[(&[u8], u64, Option<&[u8]>, u64, &[u8])],
     ) -> io::Result<()> {
         if versions.is_empty() {
             match fs::remove_file(self.versions_path(room)) {
@@ -158,9 +161,17 @@ impl Store {
             }
         }
         let mut buf = Vec::new();
-        for (name, seq, state) in versions {
+        for (name, seq, origin, ordinal, state) in versions {
             put_bytes(&mut buf, name);
             buf.extend_from_slice(&seq.to_le_bytes());
+            match origin {
+                Some(origin) => {
+                    buf.push(1);
+                    put_bytes(&mut buf, origin);
+                }
+                None => buf.push(0),
+            }
+            buf.extend_from_slice(&ordinal.to_le_bytes());
             put_bytes(&mut buf, state);
         }
         let tmp = self.versions_tmp_path(room);
@@ -302,16 +313,36 @@ fn parse_snapshot(bytes: &[u8]) -> io::Result<Snapshot> {
 /// length-prefixed name, an 8-byte little-endian sequence, and a length-prefixed
 /// state. The file is rewritten atomically, so it is never torn — any framing
 /// shortfall or trailing garbage is corruption, not a tolerable tail.
-fn parse_versions(bytes: &[u8]) -> io::Result<Vec<(Vec<u8>, u64, Vec<u8>)>> {
+fn parse_versions(bytes: &[u8]) -> io::Result<Vec<(Vec<u8>, u64, Option<Vec<u8>>, u64, Vec<u8>)>> {
     let mut versions = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
         let name = take_bytes(bytes, &mut at)?;
         let seq = take_u64(bytes, &mut at)?;
+        let origin = match take_u8(bytes, &mut at)? {
+            0 => None,
+            1 => Some(take_bytes(bytes, &mut at)?),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "versions record has a bad origin flag",
+                ))
+            }
+        };
+        let ordinal = take_u64(bytes, &mut at)?;
         let state = take_bytes(bytes, &mut at)?;
-        versions.push((name, seq, state));
+        versions.push((name, seq, origin, ordinal, state));
     }
     Ok(versions)
+}
+
+/// Read a single byte at `at`, advancing it.
+fn take_u8(bytes: &[u8], at: &mut usize) -> io::Result<u8> {
+    let byte = bytes.get(*at).copied().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "versions record is truncated")
+    })?;
+    *at += 1;
+    Ok(byte)
 }
 
 /// Read a `u32`-length-prefixed byte string at `at`, advancing it.
