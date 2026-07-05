@@ -26,6 +26,7 @@ pub mod runtime;
 pub mod schema_registry;
 pub mod session;
 pub mod store;
+pub mod translate;
 pub use admin::{admin_router, register_schema, serve_admin, RegisterOutcome, RegisterRequest};
 pub use auth::{AllowAll, Identity, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};
