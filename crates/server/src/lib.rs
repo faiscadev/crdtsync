@@ -745,6 +745,22 @@ impl Hub {
         Ok(true)
     }
 
+    /// Clone `src`'s live state into a fresh room `dst` — "duplicate this doc as a
+    /// template". `dst` is created from `src`'s current whole-replica snapshot and
+    /// diverges independently thereafter; the two are separate replicas whose
+    /// server sequences are room-scoped, so their identities never collide even
+    /// though they share the origin's element/client ids. Returns `Ok(false)` —
+    /// cloning nothing — if `src` is unknown or `dst` already exists (clone is
+    /// create-only, like [`import_room`](Hub::import_room)); with a store attached
+    /// `dst` is persisted before it commits. The named-version index is not cloned:
+    /// a template starts from the live state with a fresh version history.
+    pub fn clone_room(&mut self, src: &[u8], dst: &[u8]) -> io::Result<bool> {
+        let Some(state) = self.export_room(src) else {
+            return Ok(false);
+        };
+        self.import_room(dst, &state)
+    }
+
     /// The room's current high-water server sequence (0 if unseen or empty).
     pub fn seq(&self, room: &[u8]) -> u64 {
         self.rooms.get(room).map_or(0, Room::head)

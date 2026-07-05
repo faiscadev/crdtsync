@@ -10,10 +10,13 @@
 //! clobbering live state (an overwrite needs an explicit delete first), and it
 //! rejects malformed bytes as an error, never a panic. Element and op
 //! identities ride the state, so a client that resends its ops against the
-//! imported room is deduped exactly as against the origin. Cloning a room under
-//! a *new* id — with clock bumps and id namespacing so two live copies of the
-//! same origin can't collide — is a separate layer; these cover the identity-
-//! preserving move.
+//! imported room is deduped exactly as against the origin.
+//!
+//! [`Hub::clone_room`] duplicates a room's live state into a fresh room id within
+//! one hub — "duplicate this doc as a template". Two live copies of one origin
+//! sharing element/client ids never collide: server sequences are room-scoped, so
+//! room-scoping alone keeps the replicas distinct (no id namespacing needed). The
+//! clone carries the live state, not the named-version history.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::{ClientId, Element, Scalar};
@@ -203,6 +206,91 @@ fn export_import_round_trips_a_composite_document() {
     }
 }
 
+// --- clone ---
+
+#[test]
+fn clone_duplicates_the_live_state_into_a_fresh_room() {
+    let mut h = hub();
+    write_age(&mut h, ROOM, 42);
+    assert!(h.clone_room(ROOM, DEST).unwrap());
+    assert_eq!(age(&h, DEST), 42);
+    // The origin is untouched.
+    assert_eq!(age(&h, ROOM), 42);
+}
+
+#[test]
+fn clone_of_an_unknown_source_is_false() {
+    let mut h = hub();
+    assert!(!h.clone_room(b"absent", DEST).unwrap());
+    // Nothing was created for the missing source.
+    assert!(h.export_room(DEST).is_none());
+}
+
+#[test]
+fn clone_refuses_an_existing_destination() {
+    let mut h = hub();
+    write_age(&mut h, ROOM, 1);
+    write_age(&mut h, DEST, 99);
+    // The destination already holds live state; clone declines rather than clobber.
+    assert!(!h.clone_room(ROOM, DEST).unwrap());
+    assert_eq!(age(&h, DEST), 99);
+}
+
+#[test]
+fn a_clone_and_its_origin_diverge_independently() {
+    // After the clone the two rooms are separate replicas: an edit to one does not
+    // appear in the other.
+    let mut origin = doc(1);
+    let mut h = hub();
+    h.ingest(
+        ROOM,
+        origin.transact(|tx| tx.register(b"age", Scalar::Int(10))),
+        None,
+    )
+    .unwrap();
+    h.clone_room(ROOM, DEST).unwrap();
+
+    // The origin advances under its writer (its lamport moves past the cloned op).
+    h.ingest(
+        ROOM,
+        origin.transact(|tx| tx.register(b"age", Scalar::Int(20))),
+        None,
+    )
+    .unwrap();
+    // The clone advances under a different author, so its op is fresh against the
+    // dedup set that rode in with the clone.
+    let mut other = doc(2);
+    h.ingest(
+        DEST,
+        other.transact(|tx| tx.register(b"age", Scalar::Int(30))),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(age(&h, ROOM), 20);
+    assert_eq!(age(&h, DEST), 30);
+}
+
+#[test]
+fn a_clone_takes_and_dedups_like_any_room() {
+    // The clone is a live room: a fresh subscriber gets a snapshot, and the origin
+    // identities rode along so a resend of the cloned ops dedups.
+    let mut writer = doc(1);
+    let ops = writer.transact(|tx| tx.register(b"age", Scalar::Int(7)));
+    let mut h = hub();
+    h.ingest(ROOM, ops.clone(), None).unwrap();
+    h.clone_room(ROOM, DEST).unwrap();
+
+    let seq_before = h.seq(DEST);
+    // The origin's ops are already in the clone's dedup set.
+    assert!(h.ingest(DEST, ops, None).unwrap().is_empty());
+    assert_eq!(h.seq(DEST), seq_before);
+    match h.catch_up(DEST, 0) {
+        Catchup::Snapshot { seq, .. } => assert_eq!(seq, h.seq(DEST)),
+        Catchup::Ops(_) => panic!("a fresh subscriber to a clone expects a snapshot"),
+    }
+}
+
 // --- durability ---
 
 // Real filesystem I/O, which Miri does not model.
@@ -232,6 +320,27 @@ mod durable {
         let reloaded =
             Hub::from_rooms(cid(0xFF), Store::open(tmp.path()).unwrap().load().unwrap()).unwrap();
         assert_eq!(age(&reloaded, DEST), 55);
+        assert_eq!(reloaded.seq(DEST), seq);
+    }
+
+    #[test]
+    fn a_cloned_room_survives_a_restart() {
+        let tmp = tempdir();
+        let seq;
+        {
+            let mut h = hub();
+            h.attach_store(Store::open(tmp.path()).unwrap());
+            write_age(&mut h, ROOM, 77);
+            assert!(h.clone_room(ROOM, DEST).unwrap());
+            seq = h.seq(DEST);
+        }
+
+        // A new node over the same store reloads both the origin and the clone —
+        // the clone was persisted before it committed.
+        let reloaded =
+            Hub::from_rooms(cid(0xFF), Store::open(tmp.path()).unwrap().load().unwrap()).unwrap();
+        assert_eq!(age(&reloaded, ROOM), 77);
+        assert_eq!(age(&reloaded, DEST), 77);
         assert_eq!(reloaded.seq(DEST), seq);
     }
 
