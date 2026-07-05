@@ -245,9 +245,7 @@ fn an_unknown_app_has_no_edge() {
 #[test]
 fn unparseable_edge_bytes_are_a_bad_migration() {
     // Version 1 registers cleanly; version 2's migration body is garbage.
-    let mut reg = SchemaRegistry::new();
-    reg.register(APP, 1, b"{}", b"").unwrap();
-    reg.register(APP, 2, b"{}", b"not json").unwrap();
+    let reg = registry_with(&["not json"]);
     assert_eq!(
         translate_op(&reg, APP, &set("age"), 1, 2),
         Err(TranslateError::BadMigration { version: 2 })
@@ -289,9 +287,7 @@ fn the_edge_walk_runs_to_the_top_of_the_space_without_overflowing() {
 fn a_down_path_reports_a_bad_edge() {
     // Error classification holds on the inverse (to < from) direction too: the
     // down slice edge_slice(to, from) walks version 2, whose body is garbage.
-    let mut reg = SchemaRegistry::new();
-    reg.register(APP, 1, b"{}", b"").unwrap();
-    reg.register(APP, 2, b"{}", b"not json").unwrap();
+    let reg = registry_with(&["not json"]);
     assert_eq!(
         translate_op(&reg, APP, &set("x"), 2, 1),
         Err(TranslateError::BadMigration { version: 2 })
