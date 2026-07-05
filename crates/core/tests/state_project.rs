@@ -171,6 +171,53 @@ fn a_deleted_container_slot_is_carried_verbatim() {
 }
 
 #[test]
+fn a_phantom_counter_under_a_deleted_container_key_is_dropped() {
+    // A key can hold BOTH a deleted container (retained in the container registry)
+    // and a displaced counter (retained in the counter registry): create a
+    // container, delete it, increment the same key (a counter wins the slot),
+    // delete again. The slot is a tombstone with container identity, so its body
+    // is carried verbatim — but the counter registry entry is a separate identity
+    // and must still be pruned, or a phantom tally survives and diverges from an
+    // op-served peer whose CounterInc was dropped.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"note").set(b"x", Scalar::Int(1));
+    });
+    d.transact(|tx| tx.delete(b"note")); // container displaced, slot tombstoned
+    d.transact(|tx| tx.inc(b"note", 5)); // a counter wins the slot
+    d.transact(|tx| tx.delete(b"note")); // counter displaced, slot tombstoned
+    assert!(
+        d.migrate_leaf_slots(drop_keys(&[b"note"])),
+        "the phantom counter is pruned even under a container-identity slot"
+    );
+    // Re-creating a counter at the key starts fresh, not resuming the phantom tally.
+    d.transact(|tx| tx.inc(b"note", 3));
+    assert_eq!(counter(&d, b"note"), Some(3), "no phantom tally re-adopted");
+}
+
+#[test]
+fn a_phantom_counter_under_a_deleted_container_key_rehomes_on_rename() {
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"a").set(b"x", Scalar::Int(1));
+    });
+    d.transact(|tx| tx.delete(b"a"));
+    d.transact(|tx| tx.inc(b"a", 5));
+    d.transact(|tx| tx.delete(b"a")); // phantom counter + displaced map both at `a`
+    assert!(d.migrate_leaf_slots(rename(b"a", b"b")));
+    // The old key's counter id is vacated: a fresh increment there starts at zero.
+    d.transact(|tx| tx.inc(b"a", 1));
+    assert_eq!(counter(&d, b"a"), Some(1), "no phantom left at the old key");
+    // The tally rehomed to the new key's counter id: a later increment resumes it.
+    d.transact(|tx| tx.inc(b"b", 4));
+    assert_eq!(
+        counter(&d, b"b"),
+        Some(9),
+        "the phantom tally rehomed to the new key (5 + 4)"
+    );
+}
+
+#[test]
 fn a_leaf_inside_a_kept_container_is_migrated() {
     let mut d = doc();
     d.transact(|tx| {

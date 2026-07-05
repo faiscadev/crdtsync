@@ -58,21 +58,28 @@ pub enum SlotFate {
     Drop,
 }
 
-/// A leaf slot taken out during a rename, held until the second phase re-homes
-/// it at the new key. Its slot body and its retained counter tally travel
-/// separately, because a counter is retained in the registry keyed by the id its
-/// key derives whether or not the slot still holds it live — a scalar or register
-/// may have displaced it, or it may be tombstoned — so the tally must re-home
-/// even when the slot body is something else.
+/// A rename mover, held until the second phase re-homes it at the new key. Its
+/// slot body and its retained counter tally travel separately: a counter is
+/// retained in the registry keyed by the id its key derives whether or not the
+/// slot still holds it live — a scalar or register may have displaced it, it may
+/// be tombstoned, or a deleted container may occupy the slot — so the tally must
+/// re-home independent of, and even in the absence of, a slot-body move.
 struct LeafMove {
     to: Vec<u8>,
-    stamp: Stamp,
-    tombstone: bool,
-    body: SlotBody,
     /// The counter tally retained at the old key's derived id, captured as an
     /// isolated copy so merging it into the destination cannot leak through to
     /// another mover. `None` when the key never had a counter.
     counter: Option<Counter>,
+    /// The slot body to place at the new key. `None` for a container slot carried
+    /// verbatim (live, or a deleted one) — only its counter, if any, re-homes.
+    slot: Option<SlotMove>,
+}
+
+/// A slot body taken out of its old key during a rename.
+struct SlotMove {
+    stamp: Stamp,
+    tombstone: bool,
+    body: SlotBody,
 }
 
 /// The value a renamed slot places at its new key.
@@ -196,14 +203,10 @@ impl Document {
     /// deleted container at the id its key derives, so a tombstoned slot can still
     /// carry container identity a leaf migration must not disturb.
     fn has_container_identity(&self, map_id: ElementId, key: &[u8]) -> bool {
-        [ElementKind::Map, ElementKind::List, ElementKind::Text]
-            .into_iter()
-            .any(|kind| {
-                let id = ElementId::derive(map_id, key, kind);
-                self.maps.contains_key(&id)
-                    || self.lists.contains_key(&id)
-                    || self.texts.contains_key(&id)
-            })
+        let id = |kind| ElementId::derive(map_id, key, kind);
+        self.maps.contains_key(&id(ElementKind::Map))
+            || self.lists.contains_key(&id(ElementKind::List))
+            || self.texts.contains_key(&id(ElementKind::Text))
     }
 
     /// Migrate a snapshot's leaf slots by `fate`, keyed on the slot key — the
@@ -243,73 +246,86 @@ impl Document {
             let mut moved: Vec<LeafMove> = Vec::new();
             let keys = map.borrow().slot_keys();
             for key in keys {
-                // Carry a container slot verbatim — a live one, or a tombstoned
-                // deleted one whose container identity the registry still holds.
-                // The latter's `value` is `None`, so it would otherwise migrate as
-                // a leaf tombstone; a snapshot cannot re-key it faithfully (the
-                // create's stamp is gone), so leave it untouched.
-                let is_container = map.borrow().slot_is_live_container(&key)
-                    || (map.borrow().slot_is_tombstone(&key)
-                        && self.has_container_identity(map_id, &key));
-                if is_container {
-                    continue;
-                }
                 let fate = match fate(&key) {
                     SlotFate::Keep => continue,
                     other => other,
                 };
-                let (stamp, value, tombstone) = map
-                    .borrow_mut()
-                    .take_slot(&key)
-                    .expect("a key from slot_keys is present");
-                changed = true;
-                // A counter's tally lives in the registry keyed by the id its key
-                // derives (leaf counters are not in the parent graph, so that is
-                // left untouched), and it is retained there across displacement —
-                // so migrate the registry entry from the key's derived id whether
-                // or not the slot currently holds the counter live.
+                // The slot body is carried verbatim for a container slot — a live
+                // one, or a tombstoned deleted one whose container identity the
+                // registry still holds (its value is `None`, so it would otherwise
+                // migrate as a leaf tombstone the snapshot cannot re-key faithfully,
+                // the create's stamp being gone). The COUNTER registry at the key's
+                // derived id migrates regardless: it is a separate identity from the
+                // slot body and from any container at the key, retained across
+                // displacement, so it must prune / re-home even when the slot is
+                // carried verbatim.
+                let carry_slot = map.borrow().slot_is_live_container(&key)
+                    || (map.borrow().slot_is_tombstone(&key)
+                        && self.has_container_identity(map_id, &key));
                 let old_counter = ElementId::derive(map_id, &key, ElementKind::Counter);
-                let live_counter = matches!(value, Some(Element::Counter(_)));
                 match fate {
                     SlotFate::Keep => unreachable!("filtered above"),
                     SlotFate::Drop => {
-                        self.counters.remove(&old_counter);
+                        if self.counters.remove(&old_counter).is_some() {
+                            changed = true;
+                        }
+                        if !carry_slot {
+                            map.borrow_mut().take_slot(&key);
+                            changed = true;
+                        }
                     }
                     SlotFate::Rename(to) => {
-                        // Capture the retained tally from the registry, falling
-                        // back to the live slot handle so a live counter always
-                        // carries its tally even if it was never registered.
+                        // Take the slot body (unless the slot is carried verbatim),
+                        // capturing a live counter's tally as an isolated copy.
+                        let (slot, slot_counter) = if carry_slot {
+                            (None, None)
+                        } else {
+                            let (stamp, value, tombstone) = map
+                                .borrow_mut()
+                                .take_slot(&key)
+                                .expect("a key from slot_keys is present");
+                            changed = true;
+                            let slot_counter = match &value {
+                                Some(Element::Counter(c)) => Some(c.borrow().deep_clone()),
+                                _ => None,
+                            };
+                            let body = if slot_counter.is_some() {
+                                SlotBody::LiveCounter
+                            } else {
+                                SlotBody::Value(value)
+                            };
+                            (
+                                Some(SlotMove {
+                                    stamp,
+                                    tombstone,
+                                    body,
+                                }),
+                                slot_counter,
+                            )
+                        };
+                        // The retained tally rides from the registry, falling back
+                        // to the live slot handle so a live counter carries its
+                        // tally even if it was never registered.
                         let captured = self
                             .counters
                             .remove(&old_counter)
                             .map(|c| c.borrow().deep_clone())
-                            .or_else(|| match &value {
-                                Some(Element::Counter(c)) => Some(c.borrow().deep_clone()),
-                                _ => None,
+                            .or(slot_counter);
+                        if captured.is_some() {
+                            changed = true;
+                        }
+                        if slot.is_some() || captured.is_some() {
+                            moved.push(LeafMove {
+                                to,
+                                counter: captured,
+                                slot,
                             });
-                        let body = if live_counter {
-                            SlotBody::LiveCounter
-                        } else {
-                            SlotBody::Value(value)
-                        };
-                        moved.push(LeafMove {
-                            to,
-                            stamp,
-                            tombstone,
-                            body,
-                            counter: captured,
-                        });
+                        }
                     }
                 }
             }
             for mv in moved {
-                let LeafMove {
-                    to,
-                    stamp,
-                    tombstone,
-                    body,
-                    counter,
-                } = mv;
+                let LeafMove { to, counter, slot } = mv;
                 // Re-home a retained tally to the id the new key derives, merging
                 // into any counter already there — a cross-type key collision sums
                 // rather than clobbers, as the renamed increment ops would at that
@@ -324,6 +340,15 @@ impl Document {
                     dest.borrow_mut().merge(&captured);
                     dest
                 });
+                let Some(SlotMove {
+                    stamp,
+                    tombstone,
+                    body,
+                }) = slot
+                else {
+                    // Only the counter re-homed; a carried container slot stays put.
+                    continue;
+                };
                 let value = match body {
                     // The live counter's slot points at the merged registry handle
                     // the LWW winner resolves through. `rehomed` is `Some` whenever
