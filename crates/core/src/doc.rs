@@ -285,8 +285,11 @@ impl Document {
                                 .take_slot(&key)
                                 .expect("a key from slot_keys is present");
                             changed = true;
+                            // Hold a cheap handle to a live counter for the body
+                            // decision; the tally is deep-cloned lazily below, only
+                            // if the registry misses.
                             let slot_counter = match &value {
-                                Some(Element::Counter(c)) => Some(c.borrow().deep_clone()),
+                                Some(Element::Counter(c)) => Some(Rc::clone(c)),
                                 _ => None,
                             };
                             let body = if slot_counter.is_some() {
@@ -310,7 +313,7 @@ impl Document {
                             .counters
                             .remove(&old_counter)
                             .map(|c| c.borrow().deep_clone())
-                            .or(slot_counter);
+                            .or_else(|| slot_counter.map(|c| c.borrow().deep_clone()));
                         if captured.is_some() {
                             changed = true;
                         }
