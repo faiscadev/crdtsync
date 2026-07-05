@@ -105,10 +105,22 @@ impl OpKind {
     /// on to know it cannot rewrite or drop a container-create without tearing
     /// its subtree.
     pub fn creates_container(&self) -> bool {
-        matches!(
-            self,
-            OpKind::MapCreate { .. } | OpKind::ListCreate { .. } | OpKind::TextCreate { .. }
-        )
+        // Exhaustive with no catch-all: a new container kind must be classified
+        // here or the crate does not compile — the source of truth cannot drift.
+        match self {
+            OpKind::MapCreate { .. } | OpKind::ListCreate { .. } | OpKind::TextCreate { .. } => {
+                true
+            }
+            OpKind::RegisterSet { .. }
+            | OpKind::CounterInc { .. }
+            | OpKind::CounterDec { .. }
+            | OpKind::MapSet { .. }
+            | OpKind::MapDelete { .. }
+            | OpKind::ListInsert { .. }
+            | OpKind::ListDelete { .. }
+            | OpKind::TextInsert { .. }
+            | OpKind::TextDelete { .. } => false,
+        }
     }
 }
 

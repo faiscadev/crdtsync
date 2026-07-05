@@ -186,7 +186,7 @@ fn a_back_compatible_addition_is_dropped_for_an_older_recipient() {
 }
 
 #[test]
-fn a_partly_translatable_transaction_is_dropped_whole_for_an_older_recipient() {
+fn a_partly_translatable_transaction_delivers_its_representable_members_destranded() {
     let mut r = registry();
     let writer = hello(&mut r, 1, DOWN, 2);
     let older = hello(&mut r, 2, DOWN, 1);
@@ -195,19 +195,39 @@ fn a_partly_translatable_transaction_is_dropped_whole_for_an_older_recipient() {
         subscribe(&mut r, id);
     }
     // One atomic transaction touching a shared field and a v2-only field. At v1
-    // the "note" member has no image, so the whole group is dropped — "title"
-    // too — rather than stranding a partial transaction the recipient could
-    // never complete. The v2 recipient receives both members intact.
+    // the "note" member has no image and drops; the group can never reach its
+    // count there, so the surviving "title" is destranded — delivered without its
+    // tx tag so it applies standalone rather than buffering forever. Dropping it
+    // with the group would diverge the v1 recipient from the down-projection of
+    // the writer's state, which does contain "title". The v2 recipient receives
+    // both members intact, still atomic.
     let mut wdoc = Document::new(cid(1));
     let tx = wdoc.atomic_transact(|c| {
         c.register(b"title", Scalar::Int(1));
         c.register(b"note", Scalar::Int(2));
     });
     write(&mut r, writer, tx);
-    assert!(delivered_keys(&mut r, older).is_empty());
+
+    let older_got = delivered_ops(&mut r, older);
+    assert_eq!(older_got.len(), 1, "only the representable member crosses");
+    assert!(
+        matches!(&older_got[0].kind, OpKind::RegisterSet { key, .. } if key == b"title"),
+        "the shared member survives"
+    );
+    assert!(
+        older_got[0].tx.is_none(),
+        "it is destranded, so it applies without buffering for the dropped member"
+    );
+
+    let peer_got = delivered_ops(&mut r, peer_v2);
     assert_eq!(
-        delivered_keys(&mut r, peer_v2),
-        vec![b"title".to_vec(), b"note".to_vec()]
+        peer_got.len(),
+        2,
+        "the same-version recipient receives both members"
+    );
+    assert!(
+        peer_got.iter().all(|op| op.tx.is_some()),
+        "and they stay atomic — the group crosses whole"
     );
 }
 
@@ -252,27 +272,25 @@ fn a_container_create_and_its_subtree_survive_verbatim_to_an_older_recipient() {
 }
 
 #[test]
-fn a_container_create_in_a_poisoned_transaction_is_destranded_not_dropped() {
+fn a_poisoned_transactions_container_subtree_is_destranded_whole_not_left_empty() {
     let mut r = registry();
     let writer = hello(&mut r, 1, DOWN, 2);
     let older = hello(&mut r, 2, DOWN, 1);
     for id in [writer, older] {
         subscribe(&mut r, id);
     }
-    // One atomic transaction creates the v2-only "note" text container and sets a
-    // v2-only scalar; a separate un-transacted op then inserts into the container,
-    // all in one fan-out batch. Down at v1 the scalar member drops, poisoning the
-    // transaction. Dropping the whole group would take the TextCreate with it and
-    // strand the keyless TextInsert against a container that never arrives. The
-    // create is destranded instead — carried standalone (no tx tag) — so the v1
-    // recipient receives the container and its insert, internally consistent.
+    // One atomic transaction creates the v2-only "note" text container, types into
+    // it, and sets a v2-only scalar — the create, its keyless insert, and the
+    // scalar all share one tx. Down at v1 the scalar drops, poisoning the group.
+    // Dropping the survivors would leave the container empty (the insert lost,
+    // though v1 can represent it); tagging them would strand them against a count
+    // that never completes. Both survivors are destranded instead, so the v1
+    // recipient receives the container with its content intact.
     let mut wdoc = Document::new(cid(1));
-    let note = crdtsync_core::path::encode_path(&[b"note"]);
-    let mut batch = wdoc.atomic_transact(|c| {
-        c.text(b"note");
+    let batch = wdoc.atomic_transact(|c| {
+        c.text(b"note").insert(0, "hi");
         c.register(b"extra", Scalar::Int(1));
     });
-    batch.extend(crdtsync_core::path::text_insert(&mut wdoc, &note, 0, "hi"));
     write(&mut r, writer, batch);
 
     let got = delivered_ops(&mut r, older);
@@ -284,11 +302,11 @@ fn a_container_create_in_a_poisoned_transaction_is_destranded_not_dropped() {
     assert!(
         got.iter()
             .any(|op| matches!(op.kind, OpKind::TextInsert { .. })),
-        "its keyless descendant is delivered, not stranded"
+        "its in-tx descendant is delivered too — the container is not left empty"
     );
     assert!(
         got.iter().all(|op| op.tx.is_none()),
-        "the destranded create carries no tx tag, so it applies without buffering"
+        "every survivor is destranded, so it applies without buffering"
     );
     assert!(
         !got.iter()

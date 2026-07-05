@@ -91,13 +91,7 @@ impl Chain {
         }
     }
 
-    /// Rewrite a batch of ops, dropping any the chain removes. Atomic
-    /// transactions are all-or-nothing: if the chain drops any member of a
-    /// group, the whole group is dropped for this recipient — a partial group
-    /// could never complete (the receiver holds members until it has the whole
-    /// count), so the surviving members would strand forever. A version that
-    /// cannot faithfully carry every member of an atomic edit does not carry the
-    /// edit at all.
+    /// Rewrite a batch of ops for this recipient, dropping any the chain removes.
     ///
     /// A container-create ([`MapCreate`]/[`ListCreate`]/[`TextCreate`]) is carried
     /// verbatim, never key-rewritten, and never dropped by the chain. Per-op
@@ -109,11 +103,20 @@ impl Chain {
     /// Either way the subtree tears. Carrying the create as-is keeps the subtree
     /// whole and internally consistent — a field the recipient's version does not
     /// model surfaces as an unknown slot its invariant repair elides, never a
-    /// strand. When the create's transaction is poisoned it is not dropped with
-    /// the group but *destranded* — carried with its tx tag stripped, so it
-    /// applies standalone instead of buffering forever as a lone member of a group
-    /// that never completes. Faithful subtree elision needs per-recipient
-    /// element-set awareness, which this per-op seam does not have.
+    /// strand. Faithful subtree elision needs per-recipient element-set awareness,
+    /// which this per-op seam does not have.
+    ///
+    /// An atomic transaction with a member this version cannot carry can never
+    /// reach its `count` at the recipient, so its surviving members are
+    /// **destranded** — each delivered with its tx tag stripped, applying
+    /// standalone rather than buffering forever as members of a group that never
+    /// completes. Delivering them (rather than dropping the group whole) is a
+    /// convergence requirement: every op the recipient's version *can* represent
+    /// must reach it, or the recipient diverges from the correct down-projection
+    /// of the writer's state. The transaction's atomic-view boundary is lost at
+    /// such a recipient — unavoidably, since it cannot see the member that could
+    /// not cross — but the underlying ops still merge, so state converges. A fully
+    /// carried transaction keeps its tags and stays atomic.
     ///
     /// [`MapCreate`]: crdtsync_core::OpKind::MapCreate
     /// [`ListCreate`]: crdtsync_core::OpKind::ListCreate
@@ -129,7 +132,7 @@ impl Chain {
                 }
             })
             .collect();
-        // A transaction with any dropped member is poisoned: drop it whole.
+        // A transaction with any dropped member cannot reach its count here.
         let mut poisoned: HashSet<(ClientId, TxId)> = HashSet::new();
         for (op, r) in ops.iter().zip(&rewritten) {
             if matches!(r, OpRewrite::Drop) {
@@ -149,18 +152,13 @@ impl Chain {
                     .tx
                     .as_ref()
                     .is_some_and(|tx| poisoned.contains(&(op.id.client, tx.id)));
-                if !poisoned_group {
-                    return Some(out);
-                }
-                // The group cannot cross whole, so its members are dropped to keep
-                // the transaction all-or-nothing — except a container-create,
-                // whose drop would strand its keyless descendants against a
-                // container that never arrives. It is carried anyway, destranded:
-                // stripped of its tx tag so it applies standalone rather than
-                // buffering forever as a lone member of a group that never
-                // completes. The members it can no longer be atomic with are ones
-                // this recipient's version cannot represent regardless.
-                op.kind.creates_container().then(|| Op { tx: None, ..out })
+                // A survivor of a poisoned group is destranded so it applies
+                // standalone; a survivor of an intact group keeps its tag.
+                Some(if poisoned_group {
+                    Op { tx: None, ..out }
+                } else {
+                    out
+                })
             })
             .collect()
     }
