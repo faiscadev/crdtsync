@@ -104,6 +104,12 @@ pub(crate) fn expand_name(template: &str, now_millis: u64, event: TriggerEvent) 
         .replace("${event}", event.as_kebab())
 }
 
+/// Expand a schedule trigger's name template. A schedule carries no event, so only
+/// `${timestamp}` resolves; an `${event}` (or any other `${…}`) is left verbatim.
+pub(crate) fn expand_schedule_name(template: &str, now_millis: u64) -> String {
+    template.replace("${timestamp}", &format!("{now_millis:020}"))
+}
+
 /// A trigger's stable identity — the retention provenance tag stamped on every
 /// version it captures. Its `(event, template)` pair, so two triggers that render
 /// the same name under different events keep independent retention windows, while
@@ -111,6 +117,19 @@ pub(crate) fn expand_name(template: &str, now_millis: u64, event: TriggerEvent) 
 /// neither an event kebab nor (in practice) a template contains.
 pub(crate) fn trigger_origin(event: TriggerEvent, template: &str) -> Vec<u8> {
     let mut origin = event.as_kebab().as_bytes().to_vec();
+    origin.push(0);
+    origin.extend_from_slice(template.as_bytes());
+    origin
+}
+
+/// A schedule trigger's stable identity, keyed on `(interval, template)` so two
+/// schedules that render the same name at different periods keep independent
+/// retention windows. Its leading `every` field is no event kebab, so it never
+/// collides with an [`trigger_origin`] identity even for the same template.
+pub(crate) fn schedule_origin(interval_millis: u64, template: &str) -> Vec<u8> {
+    let mut origin = b"every".to_vec();
+    origin.push(0);
+    origin.extend_from_slice(interval_millis.to_string().as_bytes());
     origin.push(0);
     origin.extend_from_slice(template.as_bytes());
     origin

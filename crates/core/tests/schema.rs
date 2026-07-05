@@ -318,7 +318,8 @@ fn a_trigger_needs_exactly_one_of_on_or_every() {
 
 #[test]
 fn a_malformed_schedule_duration_is_rejected() {
-    for spec in ["1", "h", "1y", "", "1.5h", "1h30m", "x"] {
+    // A zero interval is rejected too — it would fire every sweep, flooding versions.
+    for spec in ["1", "h", "1y", "", "1.5h", "1h30m", "x", "0s", "0h", "00m"] {
         let src = with_auto_version(&format!(r#"[ {{ "every": "{spec}", "name": "n" }} ]"#));
         assert_eq!(
             err(&src),
