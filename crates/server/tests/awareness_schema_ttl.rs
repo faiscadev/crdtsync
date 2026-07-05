@@ -60,8 +60,13 @@ fn registry_versions(up_to: u32) -> (Registry, Arc<ManualClock>) {
     let mut sr = SchemaRegistry::new();
     sr.register(APP, 1, SCHEMA.as_bytes(), b"").unwrap();
     if up_to >= 2 {
-        sr.register(APP, 2, SCHEMA_V2.as_bytes(), b"migrate")
-            .unwrap();
+        sr.register(
+            APP,
+            2,
+            SCHEMA_V2.as_bytes(),
+            br#"{ "from": 1, "to": 2, "steps": [] }"#,
+        )
+        .unwrap();
     }
     from_registry(sr)
 }
