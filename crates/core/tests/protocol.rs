@@ -267,6 +267,7 @@ fn every_error_code_round_trips() {
         ErrorCode::UnknownRoom,
         ErrorCode::Internal,
         ErrorCode::Forbidden,
+        ErrorCode::UpdateRequired,
     ] {
         round_trips(Message::Error {
             code,

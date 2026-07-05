@@ -223,14 +223,27 @@ fn a_heterogeneous_log_translates_each_op_from_its_own_version() {
         vec![b"years".to_vec(), b"years".to_vec()]
     );
 
-    // A v1 joiner catches up: the v1 op stays "age", but the v2 op cannot reach v1
-    // — the rename is a breaking (forward-only) edge with no inverse — so it is
-    // dropped fail-closed, exactly as the live seam drops an unreachable batch
-    // (the handshake range-check of 8e refuses such a joiner outright). The v1 op
-    // still arrives.
+    // A v1 joiner cannot reach the room's governing v2 — the rename is a breaking
+    // (forward-only) edge with no inverse — so the handshake range-check of 8e
+    // refuses it outright with `UpdateRequired` before any catch-up: it becomes no
+    // subscriber and receives no ops.
     let joiner1 = hello(&mut r, 3, UP, 1);
     subscribe(&mut r, joiner1);
-    assert_eq!(caught_up_keys(&mut r, joiner1), vec![b"age".to_vec()]);
+    let replies = r.take_outbox(joiner1);
+    assert!(
+        replies.iter().any(|m| matches!(
+            m,
+            Message::Error {
+                code: crdtsync_core::ErrorCode::UpdateRequired,
+                ..
+            }
+        )),
+        "a v1 joiner below the breaking gap is refused"
+    );
+    assert!(
+        !replies.iter().any(|m| matches!(m, Message::Ops { .. })),
+        "and receives no catch-up ops"
+    );
 }
 
 #[test]

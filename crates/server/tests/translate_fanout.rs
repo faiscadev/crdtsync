@@ -141,15 +141,15 @@ fn a_forward_write_is_translated_up_for_a_newer_recipient() {
     let mut r = registry();
     let writer = hello(&mut r, 1, UP, 1);
     let newer = hello(&mut r, 2, UP, 2);
-    let peer_v1 = hello(&mut r, 3, UP, 1);
-    for id in [writer, newer, peer_v1] {
+    for id in [writer, newer] {
         subscribe(&mut r, id);
     }
-    // The v1 writer sets "age"; the v2 recipient sees it renamed to "years", the
-    // v1 recipient sees it unchanged.
+    // The v2 subscriber lifts the room's governing version to 2; a v1 recipient
+    // could no longer reach it across the breaking rename, so 8e refuses such a
+    // joiner outright (covered in `subscribe_range_check`). The v1 writer sets
+    // "age"; the v2 recipient sees it up-translated to "years".
     write(&mut r, writer, set(1, b"age"));
     assert_eq!(delivered_keys(&mut r, newer), vec![b"years".to_vec()]);
-    assert_eq!(delivered_keys(&mut r, peer_v1), vec![b"age".to_vec()]);
 }
 
 #[test]

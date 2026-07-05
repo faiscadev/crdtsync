@@ -159,7 +159,7 @@ pub fn step(
     authorizer: &dyn Authorizer,
     schema: Option<&Schema>,
     registry: &Mutex<SchemaRegistry>,
-    governing_app: Option<&[u8]>,
+    governing: Option<(&[u8], u32)>,
     now: u64,
     throttle: Option<u64>,
     msg: Message,
@@ -273,10 +273,24 @@ pub fn step(
             ) {
                 return forbidden("read denied");
             }
+            // The handshake range-check: a joiner that cannot reach the room's
+            // governing version across a back-compatible path is refused with
+            // `onUpdateRequired` before it becomes a subscriber, so down-
+            // translation at fan-out only ever traverses invertible edges.
+            if !subscriber_reaches_governing(registry, governing, session) {
+                return Response {
+                    replies: vec![Message::Error {
+                        code: ErrorCode::UpdateRequired,
+                        message: "schema version cannot reach the room's version".to_string(),
+                        details: Vec::new(),
+                    }],
+                    ..Response::default()
+                };
+            }
             let reply = match hub.catch_up(&room, last_seen_seq) {
                 Catchup::Ops(delta) => Message::Ops {
                     channel,
-                    ops: catch_up_ops(registry, governing_app, session, delta),
+                    ops: catch_up_ops(registry, governing, session, delta),
                 },
                 Catchup::Snapshot { seq, state } => Message::Snapshot {
                     channel,
@@ -349,10 +363,7 @@ pub fn step(
             // never drive this room's chain, so its ops are logged untagged
             // (`None`, relay-like) and pass verbatim on both the live and the
             // catch-up seam, exactly as the fan-out already leaves them.
-            let write_version = match governing_app {
-                Some(app) if app == session.app_id() => session.schema_version(),
-                _ => None,
-            };
+            let write_version = governing_target(governing, session).map(|(_, _, client)| client);
             // The deduped ops fan out to the room's other subscribers; nothing
             // echoes back to the sender. A hub that cannot durably record the
             // ops rejects the write rather than advertising an unpersisted one.
@@ -555,6 +566,24 @@ fn versions_list(hub: &Hub, channel: Channel, room: &[u8]) -> Response {
     }
 }
 
+/// The `(governing_app, governing_version, client_version)` when this session is
+/// the enforcing speaker of the room's governing app — the one connection class
+/// whose ops drive the room's chain, whose catch-up is translated, and whose
+/// subscribe is range-checked. `None` for a relay, a foreign app, or a
+/// versionless session: a different version space, served verbatim, its writes
+/// logged untagged, never refused.
+fn governing_target<'a>(
+    governing: Option<(&'a [u8], u32)>,
+    session: &Session,
+) -> Option<(&'a [u8], u32, u32)> {
+    match (governing, session.schema_version()) {
+        (Some((app, governing_version)), Some(client_version)) if session.app_id() == app => {
+            Some((app, governing_version, client_version))
+        }
+        _ => None,
+    }
+}
+
 /// Translate a catch-up delta to the joining session's version, on the same
 /// app-scoping as the live fan-out: only when the room is bound to an app the
 /// joiner also speaks, and the joiner declared an enforced version. A relay
@@ -562,19 +591,45 @@ fn versions_list(hub: &Hub, channel: Channel, room: &[u8]) -> Response {
 /// its version is a different space and must never drive the room's chain.
 fn catch_up_ops(
     registry: &Mutex<SchemaRegistry>,
-    governing_app: Option<&[u8]>,
+    governing: Option<(&[u8], u32)>,
     session: &Session,
     delta: Vec<StoredOp>,
 ) -> Vec<Op> {
-    match (governing_app, session.schema_version()) {
-        (Some(app), Some(target)) if session.app_id() == app => {
+    match governing_target(governing, session) {
+        Some((app, _, target)) => {
             let reg = match registry.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
             crate::translate::translate_delta(&reg, app, delta, target)
         }
-        _ => delta.into_iter().map(|rec| rec.op).collect(),
+        None => delta.into_iter().map(|rec| rec.op).collect(),
+    }
+}
+
+/// Whether a subscriber may be served the room's ops, or must be refused with
+/// `onUpdateRequired`. Only an enforcing joiner of the room's governing app is
+/// range-checked: it must reach the governing version across a back-compatible
+/// path (forward always, backward only over invertible edges). A relay or
+/// foreign-app joiner is a different version space and is never refused. A
+/// broken chain (a gap the registry cannot bridge) refuses, fail-closed.
+fn subscriber_reaches_governing(
+    registry: &Mutex<SchemaRegistry>,
+    governing: Option<(&[u8], u32)>,
+    session: &Session,
+) -> bool {
+    match governing_target(governing, session) {
+        Some((app, governing_version, client_version)) => {
+            let reg = match registry.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            matches!(
+                crate::translate::reachable(&reg, app, governing_version, client_version),
+                Ok(true)
+            )
+        }
+        None => true,
     }
 }
 

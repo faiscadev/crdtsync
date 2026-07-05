@@ -63,6 +63,11 @@ pub enum ErrorCode {
     Internal,
     /// The authenticated actor is not permitted the requested action.
     Forbidden,
+    /// The client's version cannot reach the room's governing version across a
+    /// back-compatible path — a breaking gap lies between them. Surfaced at
+    /// subscribe as the `onUpdateRequired` signal, before the client joins; the
+    /// app prompts an update or falls back to read-only.
+    UpdateRequired,
 }
 
 /// One framed message on the wire.
@@ -554,6 +559,7 @@ fn error_code_tag(code: ErrorCode) -> u16 {
         ErrorCode::UnknownRoom => 3,
         ErrorCode::Internal => 4,
         ErrorCode::Forbidden => 5,
+        ErrorCode::UpdateRequired => 6,
     }
 }
 
@@ -565,6 +571,7 @@ fn error_code(tag: u16) -> Result<ErrorCode, ProtocolError> {
         3 => Ok(ErrorCode::UnknownRoom),
         4 => Ok(ErrorCode::Internal),
         5 => Ok(ErrorCode::Forbidden),
+        6 => Ok(ErrorCode::UpdateRequired),
         tag => Err(ProtocolError::BadTag {
             what: "error code",
             tag: tag as u8,

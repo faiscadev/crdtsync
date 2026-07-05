@@ -556,11 +556,11 @@ impl Registry {
         // (a dormant sweep, or a store restart that restores the log but not the
         // binding) translate that log along the wrong chain — a durable binding
         // that survives both is the robust fix, not yet built.
-        let governing_app = match room_binding {
-            Some(Some((app, _)))
+        let governing = match room_binding {
+            Some(Some((app, version)))
                 if matches!(msg, Message::Subscribe { .. } | Message::Ops { .. }) =>
             {
-                Some(app)
+                Some((app, version))
             }
             _ => None,
         };
@@ -579,7 +579,9 @@ impl Registry {
                 &*self.authorizer,
                 acting_schema.as_deref(),
                 &self.schema,
-                governing_app.as_deref(),
+                governing
+                    .as_ref()
+                    .map(|(app, version)| (app.as_slice(), *version)),
                 now,
                 throttle,
                 msg,
