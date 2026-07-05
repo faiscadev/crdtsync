@@ -160,16 +160,44 @@ fn authok_records_the_server_derived_actor() {
 }
 
 #[test]
-fn a_schema_advert_is_accepted_without_effect() {
-    // A schema advertisement drives no room replica: the session accepts it and
-    // its state is unchanged.
+fn a_fresh_session_has_no_active_schema() {
+    let session = ClientSession::new(cid(1));
+    assert_eq!(session.active_schema_version(), None);
+    assert_eq!(session.active_schema(), None);
+}
+
+#[test]
+fn a_schema_advert_records_the_active_version_and_bytes() {
     let mut session = ClientSession::new(cid(1));
     session
         .receive(Message::SchemaAdvert {
             schema_version: 3,
-            schema: b"{}".to_vec(),
+            schema: br#"{"v":3}"#.to_vec(),
         })
         .unwrap();
+    assert_eq!(session.active_schema_version(), Some(3));
+    assert_eq!(session.active_schema(), Some(&br#"{"v":3}"#[..]));
+}
+
+#[test]
+fn a_later_advert_replaces_the_recorded_schema() {
+    // The server is authoritative — a fresh advertisement (e.g. a rolling upgrade)
+    // supersedes the last.
+    let mut session = ClientSession::new(cid(1));
+    session
+        .receive(Message::SchemaAdvert {
+            schema_version: 1,
+            schema: br#"{"v":1}"#.to_vec(),
+        })
+        .unwrap();
+    session
+        .receive(Message::SchemaAdvert {
+            schema_version: 2,
+            schema: br#"{"v":2}"#.to_vec(),
+        })
+        .unwrap();
+    assert_eq!(session.active_schema_version(), Some(2));
+    assert_eq!(session.active_schema(), Some(&br#"{"v":2}"#[..]));
 }
 
 // --- awareness ---

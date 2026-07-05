@@ -48,6 +48,11 @@ pub struct ClientSession {
     actor: Option<Vec<u8>>,
     app_id: Vec<u8>,
     schema_version: u32,
+    /// The schema the server advertised it serves this connection — its active
+    /// version and bytes — learned from a `SchemaAdvert`. Distinct from the
+    /// declared `schema_version`: a dynamic client declares 0 and learns the
+    /// concrete version the server picked here. `None` until an advert arrives.
+    active_schema: Option<(u32, Vec<u8>)>,
     rooms: HashMap<Channel, Room>,
     next_channel: u32,
 }
@@ -61,6 +66,7 @@ impl ClientSession {
             actor: None,
             app_id: Vec::new(),
             schema_version: 0,
+            active_schema: None,
             rooms: HashMap::new(),
             next_channel: 0,
         }
@@ -83,6 +89,19 @@ impl ClientSession {
     /// The declared schema version — 0 for a relay or a dynamic client.
     pub fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    /// The active version the server advertised it serves this connection, or
+    /// `None` before any `SchemaAdvert` arrives. A dynamic client (declared
+    /// version 0) reads its concrete served version here.
+    pub fn active_schema_version(&self) -> Option<u32> {
+        self.active_schema.as_ref().map(|(v, _)| *v)
+    }
+
+    /// The bytes of the schema the server advertised, or `None` before any
+    /// `SchemaAdvert` arrives.
+    pub fn active_schema(&self) -> Option<&[u8]> {
+        self.active_schema.as_ref().map(|(_, s)| s.as_slice())
     }
 
     /// The opening frame, naming this replica and the app it speaks for.
@@ -370,9 +389,16 @@ impl ClientSession {
                 self.actor = Some(actor);
                 Ok(())
             }
-            // The client accepts the server's schema advertisement without acting
-            // on it — it does not drive any room's replica.
-            Message::SchemaAdvert { .. } => Ok(()),
+            // The server advertises the schema it serves this connection; record
+            // its active version and bytes, the latest advert winning. It drives no
+            // room replica.
+            Message::SchemaAdvert {
+                schema_version,
+                schema,
+            } => {
+                self.active_schema = Some((schema_version, schema));
+                Ok(())
+            }
             Message::AwarenessUpdate {
                 channel,
                 actor,
