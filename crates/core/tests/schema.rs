@@ -1116,3 +1116,37 @@ fn auth_error_locations_name_the_offending_grant() {
         e.at
     );
 }
+
+#[test]
+fn every_trigger_event_kebab_round_trips_through_parse() {
+    // `TriggerEvent::as_kebab` (the `${event}` name-template value) and the
+    // `on:` parser are inverse tables; a drift between them would let a template
+    // expand to a name whose event the parser rejects. Every variant must parse
+    // back from its own kebab.
+    let all = [
+        TriggerEvent::Connect,
+        TriggerEvent::Disconnect,
+        TriggerEvent::Subscribe,
+        TriggerEvent::VersionCreated,
+        TriggerEvent::VersionRenamed,
+        TriggerEvent::VersionDeleted,
+        TriggerEvent::Compaction,
+        TriggerEvent::BeforePublish,
+        TriggerEvent::AfterRestore,
+        TriggerEvent::BeforeMigration,
+    ];
+    for ev in all {
+        let kebab = ev.as_kebab();
+        let src = format!(
+            r#"{{ "schema": "s", "version": 1, "root": "R",
+                "types": {{ "R": {{ "kind": "map" }} }},
+                "autoVersion": [{{ "on": "{kebab}", "name": "v" }}] }}"#
+        );
+        let schema = parse(&src);
+        assert_eq!(
+            schema.auto_version()[0].trigger,
+            Trigger::On(ev),
+            "kebab {kebab:?} must parse back to its own event",
+        );
+    }
+}

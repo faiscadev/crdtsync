@@ -176,6 +176,25 @@ pub enum TriggerEvent {
     BeforeMigration,
 }
 
+impl TriggerEvent {
+    /// The event's kebab-case name — the vocabulary a schema declares and the
+    /// value a name template's `${event}` expands to.
+    pub fn as_kebab(self) -> &'static str {
+        match self {
+            TriggerEvent::Connect => "connect",
+            TriggerEvent::Disconnect => "disconnect",
+            TriggerEvent::Subscribe => "subscribe",
+            TriggerEvent::VersionCreated => "version-created",
+            TriggerEvent::VersionRenamed => "version-renamed",
+            TriggerEvent::VersionDeleted => "version-deleted",
+            TriggerEvent::Compaction => "compaction",
+            TriggerEvent::BeforePublish => "before-publish",
+            TriggerEvent::AfterRestore => "after-restore",
+            TriggerEvent::BeforeMigration => "before-migration",
+        }
+    }
+}
+
 /// One named type: a built primitive with its declared constraints.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeDef {
