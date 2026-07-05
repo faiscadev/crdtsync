@@ -13,11 +13,14 @@
 //! versions, well-formed step params, non-empty names, no unknown keys). Each
 //! step and the composed edge classify as back-compatible or breaking
 //! ([`Compat`]) — whether an inverse exists, the guard mixed-version fan-out
-//! consults. The step set is the structural transforms over the built
-//! primitives; the value-transform kinds (wrap / setAttr / mapValues) belong to
-//! the marks / XML layer and are not part of it.
+//! consults — and each step rewrites one op forward ([`Step::rewrite_up`]) and,
+//! when back-compatible, backward ([`Step::rewrite_down`]), the structural
+//! surgery the fan-out applies per recipient. The step set is the structural
+//! transforms over the built primitives; the value-transform kinds (wrap /
+//! setAttr / mapValues) belong to the marks / XML layer and are not part of it.
 
 use crate::json::{Json, JsonError, JsonErrorKind};
+use crate::op::{Op, OpKind};
 use crate::schema::{self, SchemaErrorKind, TypeDef};
 
 /// A parsed, validated migration edge.
@@ -31,8 +34,8 @@ pub struct Migration {
 }
 
 /// One structural transform in a migration, over the built-primitive type model
-/// (`schema::TypeDef`). Each names the type or field it acts on; the op-rewrite
-/// it implies is a later slice.
+/// (`schema::TypeDef`). Each names the type or field it acts on; its
+/// compatibility class and per-op rewrite follow from the kind.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
     /// Introduce a new named type.
@@ -72,6 +75,14 @@ pub enum Compat {
     Breaking,
 }
 
+/// The image of one op across an edge: it survives (possibly with a rewritten
+/// slot key), or it has no image at the target version and is dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpRewrite {
+    Keep(Op),
+    Drop,
+}
+
 impl Step {
     /// Whether this step has an inverse. The additive steps drop cleanly on the
     /// way down; removals and bare renames do not (a rename needs the
@@ -85,6 +96,108 @@ impl Step {
             | Step::RenameField { .. } => Compat::Breaking,
         }
     }
+
+    /// Rewrite one op forward, to the version this step produces. Field steps act
+    /// on the op's slot key; type steps leave every op untouched, since an op
+    /// names a slot key, never a schema type. The op is assumed already scoped to
+    /// this step's type — narrowing a rewrite to the elements of a given type is
+    /// the fan-out's concern, not this transform's.
+    pub fn rewrite_up(&self, op: &Op) -> OpRewrite {
+        match self {
+            Step::RenameField { from, to, .. } => rename_key(op, from, to),
+            Step::RemoveField { field, .. } => drop_on_key(op, field),
+            // The additive and type steps introduce nothing an existing op
+            // already references, so nothing to rewrite on the way up.
+            Step::AddField { .. }
+            | Step::AddType { .. }
+            | Step::RemoveType { .. }
+            | Step::RenameType { .. } => OpRewrite::Keep(op.clone()),
+        }
+    }
+
+    /// Rewrite one op backward, to the version this step migrates from — `None`
+    /// when the step is breaking (no inverse). Inverting an additive step drops
+    /// the op that references the addition; inverting an added type is a no-op on
+    /// the op stream. Kept consistent with [`compat`](Step::compat): a step has a
+    /// down-rewrite exactly when it is back-compatible.
+    pub fn rewrite_down(&self, op: &Op) -> Option<OpRewrite> {
+        match self {
+            Step::AddField { field, .. } => Some(drop_on_key(op, field)),
+            Step::AddType { .. } => Some(OpRewrite::Keep(op.clone())),
+            Step::RemoveType { .. }
+            | Step::RemoveField { .. }
+            | Step::RenameType { .. }
+            | Step::RenameField { .. } => None,
+        }
+    }
+}
+
+/// The slot key an op addresses, for the map-level kinds that carry one. The
+/// sequence-internal kinds (list / text insert and delete) address by anchor or
+/// id, not a map key, and have none.
+fn op_key(op: &Op) -> Option<&[u8]> {
+    match &op.kind {
+        OpKind::RegisterSet { key, .. }
+        | OpKind::CounterInc { key, .. }
+        | OpKind::CounterDec { key, .. }
+        | OpKind::MapSet { key, .. }
+        | OpKind::MapDelete { key }
+        | OpKind::MapCreate { key }
+        | OpKind::ListCreate { key }
+        | OpKind::TextCreate { key } => Some(key),
+        OpKind::ListInsert { .. }
+        | OpKind::ListDelete { .. }
+        | OpKind::TextInsert { .. }
+        | OpKind::TextDelete { .. } => None,
+    }
+}
+
+/// Keep the op, rewriting its key from `from` to `to` when it matches; a key
+/// name is the UTF-8 of the schema field name.
+fn rename_key(op: &Op, from: &str, to: &str) -> OpRewrite {
+    if op_key(op) == Some(from.as_bytes()) {
+        OpRewrite::Keep(with_key(op, to.as_bytes().to_vec()))
+    } else {
+        OpRewrite::Keep(op.clone())
+    }
+}
+
+/// Drop the op when it addresses `field`, else keep it unchanged.
+fn drop_on_key(op: &Op, field: &str) -> OpRewrite {
+    if op_key(op) == Some(field.as_bytes()) {
+        OpRewrite::Drop
+    } else {
+        OpRewrite::Keep(op.clone())
+    }
+}
+
+/// A copy of `op` with its slot key replaced. Called only for a key-bearing op,
+/// so the sequence-internal kinds fall through unchanged.
+fn with_key(op: &Op, new_key: Vec<u8>) -> Op {
+    let kind = match &op.kind {
+        OpKind::RegisterSet { value, .. } => OpKind::RegisterSet {
+            key: new_key,
+            value: value.clone(),
+        },
+        OpKind::CounterInc { amount, .. } => OpKind::CounterInc {
+            key: new_key,
+            amount: *amount,
+        },
+        OpKind::CounterDec { amount, .. } => OpKind::CounterDec {
+            key: new_key,
+            amount: *amount,
+        },
+        OpKind::MapSet { value, .. } => OpKind::MapSet {
+            key: new_key,
+            value: value.clone(),
+        },
+        OpKind::MapDelete { .. } => OpKind::MapDelete { key: new_key },
+        OpKind::MapCreate { .. } => OpKind::MapCreate { key: new_key },
+        OpKind::ListCreate { .. } => OpKind::ListCreate { key: new_key },
+        OpKind::TextCreate { .. } => OpKind::TextCreate { key: new_key },
+        other => other.clone(),
+    };
+    Op { kind, ..op.clone() }
 }
 
 /// Why a migration failed to parse or validate.

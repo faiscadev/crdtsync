@@ -7,11 +7,16 @@
 //! map field. Parsing is total — every input yields a `Migration` or a
 //! `MigrationError`, never a panic — and validates the envelope at parse time
 //! (contiguous versions, well-formed step params, non-empty names, no unknown
-//! keys). Op-rewrite and back-compat classification are later slices; this is
-//! the model + parser only.
+//! keys). Each step carries a compatibility class (back-compatible vs breaking)
+//! and a per-op rewrite (forward always, backward when back-compatible).
 
-use crdtsync_core::migration::{Compat, Migration, MigrationErrorKind, Step};
+use crdtsync_core::migration::{Compat, Migration, MigrationErrorKind, OpRewrite, Step};
+use crdtsync_core::op::{Op, OpId, OpKind, Tx, TxId};
 use crdtsync_core::schema::TypeDef;
+use crdtsync_core::{Anchor, Scalar, Side};
+
+mod common;
+use common::{cid, eid, stmp};
 
 fn parse(s: &str) -> Migration {
     Migration::parse(s).unwrap_or_else(|e| panic!("parse of migration failed: {e:?}\n{s}"))
@@ -467,6 +472,212 @@ fn one_breaking_step_makes_the_whole_edge_breaking() {
         ] }"#,
     );
     assert_eq!(m.compat(), Compat::Breaking);
+}
+
+// --- op-rewrite ---
+
+fn mk_op(kind: OpKind) -> Op {
+    // A non-`None` tx so a rewrite that dropped the op envelope is caught — with
+    // a `None` tx on every op a lost tx would still compare equal.
+    Op {
+        id: OpId {
+            client: cid(1),
+            seq: 1,
+        },
+        stamp: stmp(1, 1),
+        target: eid(1, 2),
+        kind,
+        tx: Some(Tx {
+            id: TxId(9),
+            count: 2,
+        }),
+    }
+}
+
+/// One op of every key-bearing kind, all addressing `key`. Each carries a
+/// distinct, non-trivial payload so a rewrite that dropped or defaulted it (not
+/// just the key) would fail the equality check.
+fn key_bearing_ops(key: &str) -> Vec<Op> {
+    let k = || key.as_bytes().to_vec();
+    vec![
+        mk_op(OpKind::RegisterSet {
+            key: k(),
+            value: Scalar::Bool(true),
+        }),
+        mk_op(OpKind::CounterInc {
+            key: k(),
+            amount: 7,
+        }),
+        mk_op(OpKind::CounterDec {
+            key: k(),
+            amount: 5,
+        }),
+        mk_op(OpKind::MapSet {
+            key: k(),
+            value: Scalar::Bool(false),
+        }),
+        mk_op(OpKind::MapDelete { key: k() }),
+        mk_op(OpKind::MapCreate { key: k() }),
+        mk_op(OpKind::ListCreate { key: k() }),
+        mk_op(OpKind::TextCreate { key: k() }),
+    ]
+}
+
+/// The sequence-internal kinds, which carry no map key.
+fn non_key_ops() -> Vec<Op> {
+    let anchor = Anchor {
+        parent: None,
+        side: Side::Right,
+    };
+    vec![
+        mk_op(OpKind::ListInsert {
+            value: Scalar::Null,
+            anchor: anchor.clone(),
+        }),
+        mk_op(OpKind::ListDelete { id: stmp(1, 1) }),
+        mk_op(OpKind::TextInsert {
+            s: "hi".into(),
+            anchor,
+        }),
+        mk_op(OpKind::TextDelete {
+            ids: vec![stmp(1, 1)],
+        }),
+    ]
+}
+
+#[test]
+fn rename_field_up_rewrites_a_matching_key() {
+    let step = Step::RenameField {
+        ty: "todo".into(),
+        from: "done".into(),
+        to: "completed".into(),
+    };
+    // Each key-bearing op with key "done" becomes the same op with key "completed".
+    for (before, after) in key_bearing_ops("done")
+        .into_iter()
+        .zip(key_bearing_ops("completed"))
+    {
+        assert_eq!(step.rewrite_up(&before), OpRewrite::Keep(after));
+    }
+}
+
+#[test]
+fn rename_field_up_leaves_other_keys_and_nonkey_ops_untouched() {
+    let step = Step::RenameField {
+        ty: "todo".into(),
+        from: "done".into(),
+        to: "completed".into(),
+    };
+    for o in key_bearing_ops("other").into_iter().chain(non_key_ops()) {
+        assert_eq!(step.rewrite_up(&o), OpRewrite::Keep(o.clone()));
+    }
+}
+
+#[test]
+fn remove_field_up_drops_the_matching_key_and_keeps_the_rest() {
+    let step = Step::RemoveField {
+        ty: "todo".into(),
+        field: "legacy".into(),
+    };
+    for o in key_bearing_ops("legacy") {
+        assert_eq!(step.rewrite_up(&o), OpRewrite::Drop);
+    }
+    for o in key_bearing_ops("keep").into_iter().chain(non_key_ops()) {
+        assert_eq!(step.rewrite_up(&o), OpRewrite::Keep(o.clone()));
+    }
+}
+
+#[test]
+fn add_field_up_is_identity_and_down_drops_the_added_key() {
+    let step = Step::AddField {
+        ty: "todo".into(),
+        field: "priority".into(),
+        field_type: "register".into(),
+    };
+    for o in key_bearing_ops("priority") {
+        // Up never rewrites an existing op; down drops the op on the added slot.
+        assert_eq!(step.rewrite_up(&o), OpRewrite::Keep(o.clone()));
+        assert_eq!(step.rewrite_down(&o), Some(OpRewrite::Drop));
+    }
+    for o in key_bearing_ops("other").into_iter().chain(non_key_ops()) {
+        assert_eq!(step.rewrite_up(&o), OpRewrite::Keep(o.clone()));
+        assert_eq!(step.rewrite_down(&o), Some(OpRewrite::Keep(o.clone())));
+    }
+}
+
+#[test]
+fn type_steps_are_inert_on_every_op() {
+    let steps = [
+        Step::AddType {
+            name: "tag".into(),
+            def: TypeDef::Text { max: None },
+        },
+        Step::RemoveType { name: "old".into() },
+        Step::RenameType {
+            from: "a".into(),
+            to: "b".into(),
+        },
+    ];
+    for step in &steps {
+        for o in key_bearing_ops("done").into_iter().chain(non_key_ops()) {
+            assert_eq!(step.rewrite_up(&o), OpRewrite::Keep(o.clone()));
+            // When a down-rewrite exists (the back-compatible AddType), it too is
+            // inert on the op stream.
+            if let Some(r) = step.rewrite_down(&o) {
+                assert_eq!(r, OpRewrite::Keep(o.clone()));
+            }
+        }
+    }
+}
+
+#[test]
+fn rewrite_down_exists_exactly_for_back_compatible_steps() {
+    let sample = mk_op(OpKind::MapDelete { key: b"k".to_vec() });
+    let cases = [
+        (
+            Step::AddType {
+                name: "t".into(),
+                def: TypeDef::Text { max: None },
+            },
+            true,
+        ),
+        (
+            Step::AddField {
+                ty: "m".into(),
+                field: "f".into(),
+                field_type: "text".into(),
+            },
+            true,
+        ),
+        (Step::RemoveType { name: "t".into() }, false),
+        (
+            Step::RemoveField {
+                ty: "m".into(),
+                field: "f".into(),
+            },
+            false,
+        ),
+        (
+            Step::RenameType {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            false,
+        ),
+        (
+            Step::RenameField {
+                ty: "m".into(),
+                from: "a".into(),
+                to: "b".into(),
+            },
+            false,
+        ),
+    ];
+    for (step, has_down) in cases {
+        assert_eq!(step.rewrite_down(&sample).is_some(), has_down);
+        // The down-rewrite exists exactly when the step is back-compatible.
+        assert_eq!(step.compat() == Compat::BackCompatible, has_down);
+    }
 }
 
 #[test]
