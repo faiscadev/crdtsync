@@ -681,6 +681,11 @@ fn parse_duration_millis(spec: &str, ctx: &str) -> Result<u64, SchemaError> {
         return Err(bad());
     }
     let n: u64 = digits.parse().map_err(|_| bad())?;
+    // A zero interval is no schedule — it would fire on every sweep. Reject it at
+    // parse rather than let it flood versions at runtime.
+    if n == 0 {
+        return Err(bad());
+    }
     n.checked_mul(factor).ok_or_else(&bad)
 }
 

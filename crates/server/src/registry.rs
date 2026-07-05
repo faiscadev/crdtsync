@@ -295,15 +295,26 @@ impl Registry {
     /// A schedule state whose room is no longer bound is pruned, so a rebound room
     /// re-arms rather than firing on a stale timer.
     fn fire_schedule_triggers(&mut self, now: u64) {
+        // Nothing is armed until a bound schema declares a trigger; a schedule needs
+        // a bound room (an enforcing subscribe, which arms), so an unarmed sweep has
+        // no schedule to fire — skip the scan and its allocations entirely.
+        if !self.auto_version.is_armed() {
+            return;
+        }
         let bindings: Vec<(RoomId, (Vec<u8>, u32))> = self
             .room_apps
             .iter()
             .map(|(room, app)| (room.clone(), app.clone()))
             .collect();
         let mut live: HashSet<(RoomId, Vec<u8>)> = HashSet::new();
-        // (room, template, origin, keep) for each schedule due this sweep; collected
-        // first so the schema borrow is released before the hub is mutated.
+        // (room, template, origin, keep) for each schedule due this sweep, and the
+        // keys to stamp with `now`. The fire decision reads the last-fire map as it
+        // stood at sweep start and stamping is deferred, so two schedules sharing a
+        // key (same interval + name) do not shadow each other — the first's stamp
+        // cannot make the second read a fresh `now` and skip. Collected first so the
+        // schema borrow is released before the hub is mutated.
         let mut due: Vec<(RoomId, String, Vec<u8>, Option<u64>)> = Vec::new();
+        let mut stamp: Vec<(RoomId, Vec<u8>)> = Vec::new();
         for (room, app) in bindings {
             let Some(schema) = self.parsed_schema(&app) else {
                 continue;
@@ -322,16 +333,22 @@ impl Registry {
                 live.insert(key.clone());
                 match self.schedule_fires.get(&key) {
                     // First sight — arm to now, capture one interval later.
-                    None => {
-                        self.schedule_fires.insert(key, now);
-                    }
-                    Some(&last) if now.saturating_sub(last) >= millis => {
-                        self.schedule_fires.insert(key, now);
+                    None => stamp.push(key),
+                    // The wall clock stepped backward (an NTP correction) below the
+                    // last fire; re-arm to now rather than stall the schedule for the
+                    // whole regression (the elapsed would floor to zero until the
+                    // clock climbs back past it).
+                    Some(&last) if now < last => stamp.push(key),
+                    Some(&last) if now - last >= millis => {
+                        stamp.push(key);
                         due.push((room.clone(), template, origin, keep));
                     }
                     Some(_) => {}
                 }
             }
+        }
+        for key in stamp {
+            self.schedule_fires.insert(key, now);
         }
         // Prune schedules whose room unbound, bounding the map and re-arming a room
         // that later rebinds.

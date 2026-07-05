@@ -326,6 +326,61 @@ fn a_scheduled_capture_does_not_cascade_to_version_created() {
 }
 
 #[test]
+fn two_schedules_sharing_an_interval_and_name_apply_the_tighter_keep() {
+    // Two schedules with the same interval and name render one version per sweep and
+    // share a provenance group; the first stamps the fire time, but the second must
+    // still be considered (not shadowed by that stamp), so the tighter `keep` wins.
+    let (mut r, clock) = registry_with(
+        r#"[{ "every": "1s", "name": "auto/tick/${timestamp}", "keep": 3 },
+             { "every": "1s", "name": "auto/tick/${timestamp}", "keep": 1 }]"#,
+    );
+    seed_room(&mut r);
+    r.sweep(); // arm at 0
+
+    for _ in 0..3 {
+        clock.advance(1_000);
+        r.sweep();
+    }
+
+    assert_eq!(
+        version_names(&r),
+        vec![format!("auto/tick/{}", stamp(3000)).into_bytes()],
+        "the keep:1 schedule prunes despite sharing the key with keep:3",
+    );
+}
+
+#[test]
+fn a_backward_clock_step_rearms_a_schedule() {
+    // A backward wall-clock step (NTP) must not strand the schedule: it re-arms to
+    // the new time and fires an interval later, rather than stalling for the whole
+    // regression.
+    let (mut r, clock) = registry_with(r#"[{ "every": "1s", "name": "auto/tick/${timestamp}" }]"#);
+    seed_room(&mut r);
+    r.sweep(); // arm at 0
+
+    clock.advance(1_000);
+    r.sweep(); // fires at 1000
+    assert_eq!(version_names(&r).len(), 1);
+
+    // The clock steps back to 500 — below the last fire at 1000.
+    r.set_clock(Arc::new(ManualClock::new(500)));
+    r.sweep(); // re-arm, no capture
+    assert_eq!(
+        version_names(&r).len(),
+        1,
+        "no capture on the backward step"
+    );
+
+    r.set_clock(Arc::new(ManualClock::new(1_500))); // one interval past the re-arm
+    r.sweep();
+    assert_eq!(
+        version_names(&r).len(),
+        2,
+        "the schedule resumes at its cadence after the correction",
+    );
+}
+
+#[test]
 fn a_schedule_rearms_after_the_room_goes_dormant() {
     // A room that empties drops its binding, so its schedule state is pruned;
     // rebinding re-arms it — it does not immediately fire on the strength of a
