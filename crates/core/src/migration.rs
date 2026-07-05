@@ -10,11 +10,12 @@
 //!
 //! Parsing is total — every input yields a [`Migration`] or a [`MigrationError`],
 //! never a panic — and validates the envelope at parse time (contiguous
-//! versions, well-formed step params, non-empty names, no unknown keys). The
-//! op-rewrite each step defines and the back-compatible-vs-breaking edge
-//! classification are later slices; this is the model + parser only. The
-//! value-transform kinds (wrap / setAttr / mapValues) are deferred with the
-//! marks / XML layer they operate over.
+//! versions, well-formed step params, non-empty names, no unknown keys). Each
+//! step and the composed edge classify as back-compatible or breaking
+//! ([`Compat`]) — whether an inverse exists, the guard mixed-version fan-out
+//! consults. The step set is the structural transforms over the built
+//! primitives; the value-transform kinds (wrap / setAttr / mapValues) belong to
+//! the marks / XML layer and are not part of it.
 
 use crate::json::{Json, JsonError, JsonErrorKind};
 use crate::schema::{self, SchemaErrorKind, TypeDef};
@@ -54,6 +55,36 @@ pub enum Step {
         from: String,
         to: String,
     },
+}
+
+/// The compatibility class of a step or an edge — whether an inverse
+/// (down-migration) exists, so mixed-version fleets can coexist across it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compat {
+    /// Bidirectional: a down-migration exists, so a client on the older version
+    /// is served by inverting the edge. The additive steps — down is dropping the
+    /// addition.
+    BackCompatible,
+    /// Forward-only: the down-migration is lossy or impossible, so a client that
+    /// cannot reach the newer version is stranded across this edge. Removals lose
+    /// state; a bare rename leaves the old construct unreachable without an
+    /// expand/contract data copy.
+    Breaking,
+}
+
+impl Step {
+    /// Whether this step has an inverse. The additive steps drop cleanly on the
+    /// way down; removals and bare renames do not (a rename needs the
+    /// expand/contract data copy to stay reachable at the old version).
+    pub fn compat(&self) -> Compat {
+        match self {
+            Step::AddType { .. } | Step::AddField { .. } => Compat::BackCompatible,
+            Step::RemoveType { .. }
+            | Step::RemoveField { .. }
+            | Step::RenameType { .. }
+            | Step::RenameField { .. } => Compat::Breaking,
+        }
+    }
 }
 
 /// Why a migration failed to parse or validate.
@@ -128,6 +159,21 @@ impl Migration {
     /// The steps of this edge, in declaration order.
     pub fn steps(&self) -> &[Step] {
         &self.steps
+    }
+
+    /// The compatibility class of the whole edge: back-compatible only when every
+    /// step is, since a single forward-only step leaves no inverse for the edge.
+    /// An edge with no steps changes nothing, so it inverts trivially.
+    pub fn compat(&self) -> Compat {
+        if self
+            .steps
+            .iter()
+            .all(|s| s.compat() == Compat::BackCompatible)
+        {
+            Compat::BackCompatible
+        } else {
+            Compat::Breaking
+        }
     }
 
     /// Parse and validate a migration from its JSON source.
