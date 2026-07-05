@@ -881,3 +881,31 @@ fn a_chain_with_any_breaking_edge_is_unreachable_downward() {
         Some(OpRewrite::Keep(reg("a")))
     );
 }
+
+#[test]
+fn a_drop_by_an_upper_edge_does_not_hide_a_lower_breaking_edge() {
+    // The breaking edge is the LOWER one; the upper edge drops the op before the
+    // reverse walk reaches it. The path is still unreachable, so the chain refuses
+    // it — the reachability verdict is a property of the path, not of where a given
+    // op happens to be dropped. rewrite_down_along must be None exactly when
+    // reachable_down is false, for every op.
+    let chain = [
+        edge_v(
+            1,
+            2,
+            r#"[ { "kind": "removeField", "type": "m", "field": "old" } ]"#,
+        ),
+        edge_v(
+            2,
+            3,
+            r#"[ { "kind": "addField", "type": "m", "field": "x", "fieldType": "text" } ]"#,
+        ),
+    ];
+    assert!(!reachable_down(&chain));
+    // The upper edge (2->3 addField x) would drop reg("x") on the way down, but the
+    // lower edge (1->2 removeField) is breaking, so the whole path is unreachable.
+    assert_eq!(rewrite_down_along(&chain, &reg("x")), None);
+    // An op untouched by the upper edge must agree — no op-dependent disagreement
+    // between rewrite_down_along and reachable_down.
+    assert_eq!(rewrite_down_along(&chain, &reg("z")), None);
+}

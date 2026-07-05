@@ -225,6 +225,9 @@ pub fn rewrite_up_along(edges: &[Migration], op: &Op) -> OpRewrite {
 /// The caller supplies the same ascending, contiguous segment as
 /// [`rewrite_up_along`]; an empty slice is identity.
 pub fn rewrite_down_along(edges: &[Migration], op: &Op) -> Option<OpRewrite> {
+    if !reachable_down(edges) {
+        return None;
+    }
     let mut current = op.clone();
     for edge in edges.iter().rev() {
         match edge.rewrite_down(&current)? {
