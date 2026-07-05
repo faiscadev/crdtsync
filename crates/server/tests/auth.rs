@@ -21,6 +21,7 @@ fn drive(hub: &mut Hub, s: &mut Session, v: &dyn Verifier, msg: Message) -> Resp
         s,
         v,
         &PermitAll,
+        None,
         &Mutex::new(SchemaRegistry::new()),
         0,
         None,

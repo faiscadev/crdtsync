@@ -43,10 +43,37 @@ pub enum Resource<'a> {
     App(&'a [u8]),
 }
 
+/// One layer's verdict on a request. [`Abstain`](Decision::Abstain) is "no
+/// opinion" — it lets a lower-priority tier decide, where a bare `bool` would
+/// force a premature allow or deny. It is what lets the schema `@auth` grant tier
+/// sit *below* a deployment's explicit allow/deny but *above* the terminal
+/// default-deny: a deployment that abstains defers to the schema, and a schema
+/// that abstains falls through to default-deny.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Decision {
+    Allow,
+    Deny,
+    Abstain,
+}
+
 /// Decides whether `identity` may take `action` on `resource`. Deployments supply
 /// their own; the engine only asks.
 pub trait Authorizer {
+    /// The final verdict: `true` only for what is explicitly permitted.
     fn authorize(&self, identity: &Identity, action: Action, resource: &Resource) -> bool;
+
+    /// The three-valued verdict the layered evaluation composes on. A plain
+    /// `bool` authorizer never abstains — its `false` is an explicit deny, its
+    /// final word — so the schema tier is consulted only under an authorizer that
+    /// can [`Abstain`](Decision::Abstain) (the [`Acl`](crate::acl::Acl)). A
+    /// deployment wanting the schema to fill its gaps supplies one that abstains.
+    fn decide(&self, identity: &Identity, action: Action, resource: &Resource) -> Decision {
+        if self.authorize(identity, action, resource) {
+            Decision::Allow
+        } else {
+            Decision::Deny
+        }
+    }
 }
 
 /// An authorizer from a plain closure, so a deployment (or a test) can supply the

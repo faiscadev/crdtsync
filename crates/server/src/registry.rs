@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use crdtsync_core::{ClientId, Message, Schema};
 
+use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Action, Authorizer, PermitAll, Resource};
 use crate::clock::{Clock, SystemClock};
@@ -365,6 +366,25 @@ impl Registry {
         schema
     }
 
+    /// The parsed schema a connection is enforced under — its own declared
+    /// `{app_id, version}` resolved against the registry — which governs its
+    /// authorization. `None` for a relay connection (no app, or an unregistered
+    /// one). A connection is judged by the schema it declared, so its first
+    /// subscribe to a room not yet bound still resolves a governing schema.
+    fn connection_schema(&mut self, id: ConnId) -> Option<Arc<Schema>> {
+        let conn = self.conns.get(&id)?;
+        let version = conn.session.schema_version()?;
+        let app = (conn.session.app_id().to_vec(), version);
+        self.parsed_schema(&app)
+    }
+
+    /// The parsed schema governing `room` — the app bound to it — which gates a
+    /// peer's read of the room's fan-out. `None` for a relay room none enforces.
+    fn governing_schema(&mut self, room: &[u8]) -> Option<Arc<Schema>> {
+        let app = self.room_apps.get(room)?.clone();
+        self.parsed_schema(&app)
+    }
+
     /// Bind `room`'s governing schema to `{app_id, version}`. The first app to
     /// bind a room governs it — a later subscribe naming a *different* app is
     /// ignored, so a room is never re-governed by a foreign app's (shorter) TTL.
@@ -388,14 +408,15 @@ impl Registry {
     /// presence cleared is a read of the room, so the same per-recipient gate as
     /// the set fan-out applies — a read-revoked peer is not told of the removal.
     fn fan_out_removals(&mut self, removals: Vec<crate::AwarenessRemoval>) {
-        let authorizer = &*self.authorizer;
         for removal in removals {
-            let room = removal.room();
+            let room = removal.room().to_vec();
+            let schema = self.governing_schema(&room);
+            let authorizer = &*self.authorizer;
             for conn in self.conns.values_mut() {
-                if !peer_may_read(authorizer, &conn.session, room) {
+                if !peer_may_read(authorizer, schema.as_deref(), &conn.session, &room) {
                     continue;
                 }
-                for channel in conn.session.channels_for_room(room) {
+                for channel in conn.session.channels_for_room(&room) {
                     conn.outbox.push(removal.message(channel));
                 }
             }
@@ -430,6 +451,11 @@ impl Registry {
             Message::Subscribe { room, .. } => Some(room.clone()),
             _ => None,
         };
+        // The schema governing this connection's own action, whose `@auth` grants
+        // the enforcement points compose under the deployment authorizer.
+        // Resolved from the connection's declared app (not the room binding), so a
+        // first subscribe to an as-yet-unbound room is still schema-gated.
+        let acting_schema = self.connection_schema(id);
         let (broadcast, close, room, awareness, authed_client, bind) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
@@ -443,6 +469,7 @@ impl Registry {
                 &mut conn.session,
                 &*self.verifier,
                 &*self.authorizer,
+                acting_schema.as_deref(),
                 &self.schema,
                 now,
                 throttle,
@@ -498,6 +525,9 @@ impl Registry {
         // multiplexing several rooms can route what it receives.
         if !broadcast.is_empty() {
             if let Some(room) = room {
+                // The room's governing schema gates each peer's read consistently,
+                // resolved once (owned) so the peer loop can borrow the conns.
+                let schema = self.governing_schema(&room);
                 let authorizer = &*self.authorizer;
                 for (peer, conn) in self.conns.iter_mut() {
                     if *peer == id {
@@ -506,7 +536,7 @@ impl Registry {
                     // Per-recipient redaction: a peer whose read was revoked
                     // mid-session stops receiving the room's ops at once, without
                     // waiting for it to resubscribe.
-                    if !peer_may_read(authorizer, &conn.session, &room) {
+                    if !peer_may_read(authorizer, schema.as_deref(), &conn.session, &room) {
                         continue;
                     }
                     for channel in conn.session.channels_for_room(&room) {
@@ -522,6 +552,7 @@ impl Registry {
         // subscribers on each peer's channel; nothing is echoed back to the
         // originating connection.
         if let Some(a) = awareness {
+            let schema = self.governing_schema(&a.room);
             let authorizer = &*self.authorizer;
             for (peer, conn) in self.conns.iter_mut() {
                 if *peer == id {
@@ -529,7 +560,7 @@ impl Registry {
                 }
                 // Seeing a peer's presence is a read of the room, so the same
                 // per-recipient check gates the awareness fan-out.
-                if !peer_may_read(authorizer, &conn.session, &a.room) {
+                if !peer_may_read(authorizer, schema.as_deref(), &conn.session, &a.room) {
                     continue;
                 }
                 for channel in conn.session.channels_for_room(&a.room) {
@@ -571,9 +602,20 @@ fn pick_app(apps: &HashMap<Vec<u8>, u32>) -> Option<(Vec<u8>, u32)> {
 /// Whether a peer connection may currently read `room` — the per-recipient gate
 /// on every fan-out. An unauthenticated connection holds no room subscription,
 /// so it never qualifies.
-fn peer_may_read(authorizer: &dyn Authorizer, session: &Session, room: &[u8]) -> bool {
+fn peer_may_read(
+    authorizer: &dyn Authorizer,
+    schema: Option<&Schema>,
+    session: &Session,
+    room: &[u8],
+) -> bool {
     match session.identity() {
-        Some(identity) => authorizer.authorize(identity, Action::Read, &Resource::Room(room)),
+        Some(identity) => authorized(
+            authorizer,
+            schema,
+            identity,
+            Action::Read,
+            &Resource::Room(room),
+        ),
         None => false,
     }
 }

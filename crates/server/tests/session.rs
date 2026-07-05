@@ -42,6 +42,7 @@ fn st(hub: &mut Hub, s: &mut Session, msg: Message) -> crdtsync_server::Response
         s,
         &V,
         &crdtsync_server::PermitAll,
+        None,
         &Mutex::new(SchemaRegistry::new()),
         0,
         None,

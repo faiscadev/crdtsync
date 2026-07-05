@@ -13,6 +13,9 @@ use std::sync::Mutex;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
 
+use crdtsync_core::schema::Schema;
+
+use crate::acl::authorized;
 use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Resource};
 use crate::schema_registry::{Resolution, SchemaRegistry};
@@ -150,6 +153,7 @@ pub fn step(
     session: &mut Session,
     verifier: &dyn Verifier,
     authorizer: &dyn Authorizer,
+    schema: Option<&Schema>,
     registry: &Mutex<SchemaRegistry>,
     now: u64,
     throttle: Option<u64>,
@@ -238,7 +242,13 @@ pub fn step(
             }
             // A subscription reads the room; the server never serves a room the
             // actor may not read.
-            if !authorizer.authorize(identity, Action::Read, &Resource::Room(&room)) {
+            if !authorized(
+                authorizer,
+                schema,
+                identity,
+                Action::Read,
+                &Resource::Room(&room),
+            ) {
                 return forbidden("read denied");
             }
             let reply = match hub.catch_up(&room, last_seen_seq) {
@@ -293,7 +303,13 @@ pub fn step(
                 return violation("op client mismatch");
             }
             let identity = session.identity().expect("identity set, checked above");
-            if !authorizer.authorize(identity, Action::Write, &Resource::Room(&room)) {
+            if !authorized(
+                authorizer,
+                schema,
+                identity,
+                Action::Write,
+                &Resource::Room(&room),
+            ) {
                 return forbidden("write denied");
             }
             // The batch's highest per-client op sequence: the frontier the author
@@ -352,7 +368,13 @@ pub fn step(
             let Some(room) = session.channels.get(&channel).cloned() else {
                 return violation("awareness on an unbound channel");
             };
-            if !authorizer.authorize(identity, Action::PublishAwareness, &Resource::Room(&room)) {
+            if !authorized(
+                authorizer,
+                schema,
+                identity,
+                Action::PublishAwareness,
+                &Resource::Room(&room),
+            ) {
                 return forbidden("awareness publish denied");
             }
             // Ephemeral: retained for late-joiner replay and fanned to the room's
@@ -392,7 +414,8 @@ pub fn step(
         // post-state — and a list request the same; a fetch that hits replies
         // with the version's state, and one that misses falls back to the list.
         Message::VersionCreate { channel, name } => {
-            let Some(room) = version_room(session, channel, authorizer, Action::Write) else {
+            let Some(room) = version_room(session, channel, authorizer, schema, Action::Write)
+            else {
                 return version_denied(session, channel);
             };
             match hub.create_version(&room, &name) {
@@ -401,7 +424,8 @@ pub fn step(
             }
         }
         Message::VersionRename { channel, from, to } => {
-            let Some(room) = version_room(session, channel, authorizer, Action::Write) else {
+            let Some(room) = version_room(session, channel, authorizer, schema, Action::Write)
+            else {
                 return version_denied(session, channel);
             };
             match hub.rename_version(&room, &from, &to) {
@@ -410,7 +434,8 @@ pub fn step(
             }
         }
         Message::VersionDelete { channel, name } => {
-            let Some(room) = version_room(session, channel, authorizer, Action::Write) else {
+            let Some(room) = version_room(session, channel, authorizer, schema, Action::Write)
+            else {
                 return version_denied(session, channel);
             };
             match hub.delete_version(&room, &name) {
@@ -419,13 +444,15 @@ pub fn step(
             }
         }
         Message::VersionList { channel } => {
-            let Some(room) = version_room(session, channel, authorizer, Action::Read) else {
+            let Some(room) = version_room(session, channel, authorizer, schema, Action::Read)
+            else {
                 return version_denied(session, channel);
             };
             versions_list(hub, channel, &room)
         }
         Message::VersionFetch { channel, name } => {
-            let Some(room) = version_room(session, channel, authorizer, Action::Read) else {
+            let Some(room) = version_room(session, channel, authorizer, schema, Action::Read)
+            else {
                 return version_denied(session, channel);
             };
             match hub.version_state(&room, &name) {
@@ -459,13 +486,12 @@ fn version_room(
     session: &Session,
     channel: Channel,
     authorizer: &dyn Authorizer,
+    schema: Option<&Schema>,
     action: Action,
 ) -> Option<RoomId> {
     let identity = session.identity()?;
     let room = session.channels.get(&channel)?.clone();
-    authorizer
-        .authorize(identity, action, &Resource::Room(&room))
-        .then_some(room)
+    authorized(authorizer, schema, identity, action, &Resource::Room(&room)).then_some(room)
 }
 
 /// The refusal for a version request that [`version_room`] rejected: a violation
