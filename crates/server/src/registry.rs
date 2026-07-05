@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use crdtsync_core::{ClientId, Message, Schema};
+use crdtsync_core::{ClientId, Message, Op, Schema};
 
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
@@ -387,6 +387,61 @@ impl Registry {
         self.parsed_schema(&app)
     }
 
+    /// The `(app, version)` a broadcast is translated *from*, or `None` when it
+    /// needs no translation. Migration translation walks the room's governing
+    /// app's chain, so it applies only when the write carried a version and the
+    /// writer speaks that same app — a relay write, an unbound room, or a
+    /// foreign-app write (whose version number is a different app's space) is
+    /// left verbatim.
+    fn translation_source(
+        &self,
+        room: &[u8],
+        writer: &ConnId,
+        version: Option<u32>,
+    ) -> Option<(Vec<u8>, u32)> {
+        let from = version?;
+        let (app, _) = self.room_apps.get(room)?;
+        let writer_app = self.conns.get(writer)?.session.app_id();
+        (writer_app == app.as_slice()).then(|| (app.clone(), from))
+    }
+
+    /// The parsed migration chain from `from` to each distinct target version
+    /// among the room's same-app recipients, resolved once (the registry is
+    /// locked only here, not across the fan-out). A target whose chain is
+    /// unreachable, gapped, or unparseable maps to `None`, so the fan-out drops
+    /// that recipient's batch rather than serving it wrong.
+    fn resolve_chains(
+        &self,
+        writer: &ConnId,
+        app: &[u8],
+        from: u32,
+    ) -> HashMap<u32, Option<crate::translate::Chain>> {
+        let targets: HashSet<u32> = self
+            .conns
+            .iter()
+            .filter(|(peer, _)| *peer != writer)
+            .filter(|(_, conn)| conn.session.app_id() == app)
+            .filter_map(|(_, conn)| conn.session.schema_version())
+            .filter(|target| *target != from)
+            .collect();
+        if targets.is_empty() {
+            return HashMap::new();
+        }
+        let registry = match self.schema.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        targets
+            .into_iter()
+            .map(|target| {
+                (
+                    target,
+                    crate::translate::resolve_chain(&registry, app, from, target).ok(),
+                )
+            })
+            .collect()
+    }
+
     /// Bind `room`'s governing schema to `{app_id, version}`. The first app to
     /// bind a room governs it — a later subscribe naming a *different* app is
     /// ignored, so a room is never re-governed by a foreign app's (shorter) TTL.
@@ -488,7 +543,7 @@ impl Registry {
             Some(None) => self.connection_schema(id),
             None => None,
         };
-        let (broadcast, close, room, awareness, authed_client, bind) = {
+        let (broadcast, broadcast_version, close, room, awareness, authed_client, bind) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
@@ -530,6 +585,7 @@ impl Registry {
             });
             (
                 resp.broadcast,
+                resp.broadcast_version,
                 resp.close,
                 resp.broadcast_room,
                 resp.awareness,
@@ -560,6 +616,37 @@ impl Registry {
                 // resolved once (owned) so the peer loop can borrow the conns.
                 let schema = self.governing_schema(&room);
                 let authorizer = &*self.authorizer;
+                // Per-recipient migration translation rides the same seam as
+                // redaction. It is scoped to the room's governing app: the write
+                // is translated only when the writer speaks that app (its version
+                // number lives in that app's space), and only to recipients of
+                // that app — a foreign-app connection's version is a different
+                // space and must never drive the room's chain.
+                let source = self.translation_source(&room, &id, broadcast_version);
+                // Resolve every distinct target version's chain up front, holding
+                // the registry lock only for that (not across the fan-out), then
+                // translate the peer loop against the owned, parsed chains.
+                let chains = source
+                    .as_ref()
+                    .map(|(app, from)| self.resolve_chains(&id, app, *from));
+                // Translate the batch once per distinct target version — the
+                // rewrite depends only on the version, not the recipient, so a
+                // same-version fleet shares one result. A resolved chain
+                // translates; an unresolved one (unreachable / gapped /
+                // unparseable) yields an empty batch, dropping it for that
+                // target's recipients pending the handshake range-check that
+                // refuses them outright.
+                let translated_by_target: HashMap<u32, Vec<Op>> = chains
+                    .iter()
+                    .flatten()
+                    .map(|(target, chain)| {
+                        let ops = match chain {
+                            Some(chain) => chain.translate_ops(&broadcast),
+                            None => Vec::new(),
+                        };
+                        (*target, ops)
+                    })
+                    .collect();
                 for (peer, conn) in self.conns.iter_mut() {
                     if *peer == id {
                         continue;
@@ -570,10 +657,28 @@ impl Registry {
                     if !peer_may_read(authorizer, schema.as_deref(), &conn.session, &room) {
                         continue;
                     }
+                    // Translate to the recipient's version, or send verbatim when
+                    // there is nothing to bridge — a same-version, relay, or
+                    // foreign-app recipient, or a relay write.
+                    let translated = match (&source, conn.session.schema_version()) {
+                        (Some((app, from)), Some(target))
+                            if conn.session.app_id() == app && target != *from =>
+                        {
+                            // Total over every eligible recipient: `resolve_chains`
+                            // keyed the memo on this same (same-app, target != from)
+                            // predicate, so the target is always present.
+                            Some(translated_by_target[&target].as_slice())
+                        }
+                        _ => None,
+                    };
+                    let ops = translated.unwrap_or(&broadcast);
+                    if ops.is_empty() {
+                        continue;
+                    }
                     for channel in conn.session.channels_for_room(&room) {
                         conn.outbox.push(Message::Ops {
                             channel,
-                            ops: broadcast.clone(),
+                            ops: ops.to_vec(),
                         });
                     }
                 }

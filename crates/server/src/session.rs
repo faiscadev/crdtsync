@@ -142,6 +142,10 @@ pub struct Response {
     pub replies: Vec<Message>,
     pub broadcast: Vec<Op>,
     pub broadcast_room: Option<RoomId>,
+    /// The schema version the broadcast ops were created under — the writing
+    /// connection's — so the fan-out translates each op from it to every
+    /// recipient's own version. `None` for a relay write (no schema).
+    pub broadcast_version: Option<u32>,
     pub awareness: Option<AwarenessBroadcast>,
     pub close: bool,
 }
@@ -346,6 +350,7 @@ pub fn step(
                         .collect(),
                     broadcast: applied,
                     broadcast_room: Some(room),
+                    broadcast_version: session.schema_version(),
                     ..Response::default()
                 },
                 Err(_) => Response {
