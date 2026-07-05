@@ -766,6 +766,14 @@ async fn a_registered_apps_unknown_version_is_refused_at_the_handshake() {
         },
     )
     .await;
+    // The enforcing handshake advertises the schema it serves before auth completes.
+    assert!(matches!(
+        recv(&mut ws).await,
+        Message::SchemaAdvert {
+            schema_version: 1,
+            ..
+        }
+    ));
     assert_eq!(
         recv(&mut ws).await,
         Message::AuthOk {
