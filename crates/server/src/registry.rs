@@ -310,19 +310,17 @@ impl Registry {
         let mut due: Vec<(RoomId, String, Vec<u8>, Option<u64>)> = Vec::new();
         let mut stamp: Vec<(RoomId, Vec<u8>)> = Vec::new();
         for (room, app) in bindings {
+            // `parsed_schema` returns an owned `Arc`, so iterating its triggers
+            // borrows the schema, not `self` — the last-fire map is read directly and
+            // a name is cloned only on the sweep a schedule actually fires.
             let Some(schema) = self.parsed_schema(&app) else {
                 continue;
             };
-            let schedules: Vec<(u64, String, Option<u64>)> = schema
-                .auto_version()
-                .iter()
-                .filter_map(|av| match av.trigger {
-                    Trigger::Every(millis) => Some((millis, av.name.clone(), av.keep)),
-                    Trigger::On(_) => None,
-                })
-                .collect();
-            for (millis, template, keep) in schedules {
-                let origin = schedule_origin(millis, &template);
+            for av in schema.auto_version() {
+                let Trigger::Every(millis) = av.trigger else {
+                    continue;
+                };
+                let origin = schedule_origin(millis, &av.name);
                 let key = (room.clone(), origin.clone());
                 live.insert(key.clone());
                 match self.schedule_fires.get(&key) {
@@ -335,7 +333,7 @@ impl Registry {
                     Some(&last) if now < last => stamp.push(key),
                     Some(&last) if now - last >= millis => {
                         stamp.push(key);
-                        due.push((room.clone(), template, origin, keep));
+                        due.push((room.clone(), av.name.clone(), origin, av.keep));
                     }
                     Some(_) => {}
                 }
