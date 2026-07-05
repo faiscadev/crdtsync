@@ -20,10 +20,20 @@ use crate::registry::ConnId;
 pub enum EngineEvent<'a> {
     /// A connection was opened.
     Connected { conn: ConnId },
-    /// A connection's subscribe to `room` was accepted.
+    /// A connection was closed — the counterpart to [`Connected`](Self::Connected),
+    /// so a sink pairing the two stays balanced.
+    Disconnected { conn: ConnId },
+    /// A connection's subscribe to `room` was accepted (the room was not already
+    /// subscribed on this connection).
     Subscribed { conn: ConnId, room: &'a [u8] },
     /// A named version of `room` was captured.
     VersionCreated { room: &'a [u8], name: &'a [u8] },
+    /// A named version of `room` was renamed from `from` to `to`.
+    VersionRenamed {
+        room: &'a [u8],
+        from: &'a [u8],
+        to: &'a [u8],
+    },
     /// A named version of `room` was removed.
     VersionDeleted { room: &'a [u8], name: &'a [u8] },
     /// `room` was compacted, advancing its retained-log floor to `floor`.

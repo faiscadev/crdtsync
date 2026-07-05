@@ -650,21 +650,24 @@ impl Hub {
     /// store attached, the snapshot is persisted and the on-disk log truncated,
     /// so the reclaim survives a restart.
     pub fn compact(&mut self, room: &[u8]) -> io::Result<()> {
-        let snapshot = match self.rooms.get_mut(room) {
+        let (floor, state, reclaimed) = match self.rooms.get_mut(room) {
             None => return Ok(()),
             Some(r) => {
+                // An empty log reclaims nothing and cannot advance the floor; the
+                // event is suppressed (as the version paths suppress their no-op),
+                // though the snapshot is still re-persisted below.
+                let reclaimed = !r.log.is_empty();
                 r.base_seq += r.log.len() as u64;
                 r.log.clear();
-                (r.base_seq, r.doc.encode_state())
+                (r.base_seq, r.doc.encode_state(), reclaimed)
             }
         };
         if let Some(store) = self.store.as_mut() {
-            store.compact(room, snapshot.0, &snapshot.1)?;
+            store.compact(room, floor, &state)?;
         }
-        self.emit(EngineEvent::Compacted {
-            room,
-            floor: snapshot.0,
-        });
+        if reclaimed {
+            self.emit(EngineEvent::Compacted { room, floor });
+        }
         Ok(())
     }
 
@@ -802,6 +805,7 @@ impl Hub {
             index.insert(from.to_vec(), version);
             return Err(e);
         }
+        self.emit(EngineEvent::VersionRenamed { room, from, to });
         Ok(true)
     }
 

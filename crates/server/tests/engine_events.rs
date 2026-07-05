@@ -33,8 +33,10 @@ const ROOM: &[u8] = b"room-1";
 #[derive(Clone, PartialEq, Debug)]
 enum Ev {
     Connected(ConnId),
+    Disconnected(ConnId),
     Subscribed(ConnId, Vec<u8>),
     VersionCreated(Vec<u8>, Vec<u8>),
+    VersionRenamed(Vec<u8>, Vec<u8>, Vec<u8>),
     VersionDeleted(Vec<u8>, Vec<u8>),
     Compacted(Vec<u8>, u64),
     Reserved,
@@ -43,9 +45,13 @@ enum Ev {
 fn snapshot(e: &EngineEvent) -> Ev {
     match e {
         EngineEvent::Connected { conn } => Ev::Connected(*conn),
+        EngineEvent::Disconnected { conn } => Ev::Disconnected(*conn),
         EngineEvent::Subscribed { conn, room } => Ev::Subscribed(*conn, room.to_vec()),
         EngineEvent::VersionCreated { room, name } => {
             Ev::VersionCreated(room.to_vec(), name.to_vec())
+        }
+        EngineEvent::VersionRenamed { room, from, to } => {
+            Ev::VersionRenamed(room.to_vec(), from.to_vec(), to.to_vec())
         }
         EngineEvent::VersionDeleted { room, name } => {
             Ev::VersionDeleted(room.to_vec(), name.to_vec())
@@ -149,6 +155,39 @@ fn every_sink_receives_every_event() {
     assert_eq!(*log2.lock().unwrap(), expected);
 }
 
+#[test]
+fn a_version_rename_emits_a_rename_event() {
+    let mut h = hub();
+    let (log, sink) = recording();
+    h.add_event_sink(sink);
+    populate(&mut h);
+    h.create_version(ROOM, b"v1").unwrap();
+    assert!(h.rename_version(ROOM, b"v1", b"v2").unwrap());
+    // A no-op rename (absent source / taken target) emits nothing.
+    assert!(!h.rename_version(ROOM, b"absent", b"v3").unwrap());
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            Ev::VersionCreated(ROOM.to_vec(), b"v1".to_vec()),
+            Ev::VersionRenamed(ROOM.to_vec(), b"v1".to_vec(), b"v2".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn a_no_op_compaction_emits_nothing() {
+    let mut h = hub();
+    let (log, sink) = recording();
+    h.add_event_sink(sink);
+    populate(&mut h);
+    h.compact(ROOM).unwrap();
+    // The log is now empty — a second compaction reclaims nothing, so no event.
+    h.compact(ROOM).unwrap();
+    // An unknown room likewise emits nothing.
+    h.compact(b"ghost").unwrap();
+    assert_eq!(*log.lock().unwrap(), vec![Ev::Compacted(ROOM.to_vec(), 1)]);
+}
+
 // --- registry lifecycle ---
 
 #[test]
@@ -183,6 +222,57 @@ fn the_registry_emits_connect_then_subscribe() {
     assert_eq!(
         *log.lock().unwrap(),
         vec![Ev::Connected(id), Ev::Subscribed(id, ROOM.to_vec())]
+    );
+}
+
+#[test]
+fn a_rejected_duplicate_subscribe_does_not_re_emit() {
+    let mut r = Registry::new(cid(0xFF));
+    let (log, sink) = recording();
+    r.add_event_sink(sink);
+    let id = r.connect();
+    assert!(r.deliver(
+        id,
+        Message::Hello {
+            client: cid(1),
+            app_id: b"app".to_vec(),
+            schema_version: 0,
+        }
+    ));
+    assert!(r.deliver(
+        id,
+        Message::Auth {
+            credential: b"actor".to_vec(),
+        }
+    ));
+    let sub = || Message::Subscribe {
+        channel: Channel(0),
+        room: ROOM.to_vec(),
+        last_seen_seq: 0,
+    };
+    assert!(r.deliver(id, sub()));
+    // The identical re-subscribe is rejected — the room is already mapped — so no
+    // second Subscribed fires.
+    r.deliver(id, sub());
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![Ev::Connected(id), Ev::Subscribed(id, ROOM.to_vec())]
+    );
+}
+
+#[test]
+fn disconnect_emits_the_connected_counterpart() {
+    let mut r = Registry::new(cid(0xFF));
+    let (log, sink) = recording();
+    r.add_event_sink(sink);
+    // A bare unauthenticated connection still balances connect/disconnect.
+    let id = r.connect();
+    r.disconnect(id);
+    // A second disconnect of the same id removes nothing, so it emits nothing.
+    r.disconnect(id);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![Ev::Connected(id), Ev::Disconnected(id)]
     );
 }
 

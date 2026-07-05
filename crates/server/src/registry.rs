@@ -193,6 +193,10 @@ impl Registry {
     /// and only a later [`sweep`](Registry::sweep) past the deadline drops it.
     pub fn disconnect(&mut self, id: ConnId) {
         if let Some(conn) = self.conns.remove(&id) {
+            // The counterpart to the Connected emitted at accept — fires for every
+            // closed connection, authenticated or not, so a connect/disconnect
+            // pairing stays balanced.
+            self.hub.emit(EngineEvent::Disconnected { conn: id });
             // Only an authenticated connection can have published awareness, so
             // only one may influence its grace retention — an unauthenticated
             // Hello-only socket cannot schedule or refresh a sweep for a client
@@ -582,10 +586,25 @@ impl Registry {
             }
             _ => None,
         };
-        let (broadcast, broadcast_version, close, room, awareness, authed_client, bind, subscribed) = {
+        let (
+            broadcast,
+            broadcast_version,
+            close,
+            room,
+            awareness,
+            authed_client,
+            bind,
+            newly_subscribed,
+        ) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
+            // Whether the acted-on room was already subscribed before this step, so
+            // an accepted subscribe is told from a rejected re-subscribe of an
+            // already-mapped room — only the transition is the lifecycle event.
+            let was_subscribed = subscribed_room
+                .as_deref()
+                .is_some_and(|room| conn.session.subscribed_rooms().any(|r| r == room));
             // Pass the shared registry unlocked: `step` locks it only for the
             // Hello resolve, so a slow verifier in the Auth branch never holds it
             // and cannot stall the admin plane's writes. `now` stamps an awareness
@@ -614,26 +633,27 @@ impl Registry {
                 .is_some()
                 .then(|| conn.session.client())
                 .flatten();
+            // Whether the acted-on room is subscribed after the step — the single
+            // acceptance fact `bind` and the lifecycle event both read.
+            let is_subscribed = subscribed_room
+                .as_deref()
+                .is_some_and(|room| conn.session.subscribed_rooms().any(|r| r == room));
             // Bind the room only if the subscribe was accepted — a channel now
             // maps it — and the connection is enforcing (a resolved version). A
             // rejected (unauthenticated or read-denied) or relay subscribe
             // governs nothing, so it cannot schema-expire a room's presence.
-            let bind = subscribed_room.as_deref().and_then(|room| {
-                let version = conn.session.schema_version()?;
-                if !conn.session.subscribed_rooms().any(|r| r == room) {
-                    return None;
-                }
-                Some((room.to_vec(), conn.session.app_id().to_vec(), version))
-            });
-            // A subscribe the session accepted — the room now maps to a channel,
-            // relay or enforcing alike — is an observable lifecycle event, broader
-            // than `bind` (which fires only for an enforcing subscribe).
-            let subscribed = subscribed_room.as_deref().and_then(|room| {
-                conn.session
-                    .subscribed_rooms()
-                    .any(|r| r == room)
-                    .then(|| room.to_vec())
-            });
+            let bind = if is_subscribed {
+                subscribed_room.as_deref().and_then(|room| {
+                    let version = conn.session.schema_version()?;
+                    Some((room.to_vec(), conn.session.app_id().to_vec(), version))
+                })
+            } else {
+                None
+            };
+            // A Subscribed fires only on the transition — this delivery is what
+            // subscribed the room — so a rejected re-subscribe of an already-mapped
+            // room does not re-fire. Relay or enforcing alike, broader than `bind`.
+            let newly_subscribed = is_subscribed && !was_subscribed;
             (
                 resp.broadcast,
                 resp.broadcast_version,
@@ -642,14 +662,16 @@ impl Registry {
                 resp.awareness,
                 authed_client,
                 bind,
-                subscribed,
+                newly_subscribed,
             )
         };
-        if let Some(room) = subscribed {
-            self.hub.emit(EngineEvent::Subscribed {
-                conn: id,
-                room: &room,
-            });
+        if newly_subscribed {
+            if let Some(room) = &subscribed_room {
+                self.hub.emit(EngineEvent::Subscribed {
+                    conn: id,
+                    room: room.as_slice(),
+                });
+            }
         }
         // A client reappearing within its grace window cancels the pending
         // clear once it re-authenticates, so its presence survives the gap.
