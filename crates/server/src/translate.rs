@@ -12,10 +12,13 @@
 //! Pure over the registry, no connection state; the live fan-out seam and the
 //! cold-start snapshot both drive it.
 
+use std::collections::HashSet;
+
 use crdtsync_core::migration::{
     reachable_down, rewrite_down_along, rewrite_up_along, Migration, OpRewrite,
 };
-use crdtsync_core::Op;
+use crdtsync_core::op::TxId;
+use crdtsync_core::{ClientId, Op};
 
 use crate::schema_registry::SchemaRegistry;
 
@@ -33,17 +36,95 @@ pub enum TranslateError {
     Unreachable,
 }
 
-/// Rewrite `op`, created under schema version `from`, for a recipient served at
-/// version `to`. Identity when `from == to`; composes the chain forward when
-/// `to > from`; inverts it when `to < from`, [`Unreachable`] if any edge on the
-/// down path is breaking. A `Drop` propagates.
+/// A resolved, parsed migration path between two versions in one direction —
+/// the edge slice plus which way it is walked. Resolve it once (parsing each
+/// edge on the way) and reuse it across a whole batch and every same-version
+/// recipient, rather than re-parsing the chain per op.
+pub struct Chain {
+    edges: Vec<Migration>,
+    up: bool,
+}
+
+/// Resolve and parse the migration path from `from` to `to` for `app_id`.
+/// Identity when the versions match; forward when `to > from`; backward when
+/// `to < from`, [`Unreachable`](TranslateError::Unreachable) if the down path
+/// crosses a breaking edge. `MissingEdge` / `BadMigration` when the chain is
+/// gapped or an edge does not parse.
 ///
 /// Both versions are real, registered versions (`>= 1`): a chain starts at
 /// version 1, and the handshake resolves the version-0 dynamic sentinel to the
-/// head before an op is ever tagged, so 0 is not a creation version reaching
-/// here.
-///
-/// [`Unreachable`]: TranslateError::Unreachable
+/// head before an op is tagged, so 0 is not a creation version reaching here.
+pub fn resolve_chain(
+    reg: &SchemaRegistry,
+    app_id: &[u8],
+    from: u32,
+    to: u32,
+) -> Result<Chain, TranslateError> {
+    match from.cmp(&to) {
+        std::cmp::Ordering::Equal => Ok(Chain {
+            edges: Vec::new(),
+            up: true,
+        }),
+        std::cmp::Ordering::Less => Ok(Chain {
+            edges: edge_slice(reg, app_id, from, to)?,
+            up: true,
+        }),
+        std::cmp::Ordering::Greater => {
+            let edges = edge_slice(reg, app_id, to, from)?;
+            if !reachable_down(&edges) {
+                return Err(TranslateError::Unreachable);
+            }
+            Ok(Chain { edges, up: false })
+        }
+    }
+}
+
+impl Chain {
+    /// Rewrite one op along this resolved path. A down chain is only ever built
+    /// when reachable, so the inverse rewrite is always defined.
+    pub fn translate_op(&self, op: &Op) -> OpRewrite {
+        if self.up {
+            rewrite_up_along(&self.edges, op)
+        } else {
+            rewrite_down_along(&self.edges, op)
+                .expect("a resolved down chain is reachable, so every op inverts")
+        }
+    }
+
+    /// Rewrite a batch of ops, dropping any the chain removes. Atomic
+    /// transactions are all-or-nothing: if the chain drops any member of a
+    /// group, the whole group is dropped for this recipient — a partial group
+    /// could never complete (the receiver holds members until it has the whole
+    /// count), so the surviving members would strand forever. A version that
+    /// cannot faithfully carry every member of an atomic edit does not carry the
+    /// edit at all.
+    pub fn translate_ops(&self, ops: &[Op]) -> Vec<Op> {
+        let rewritten: Vec<OpRewrite> = ops.iter().map(|op| self.translate_op(op)).collect();
+        // A transaction with any dropped member is poisoned: drop it whole.
+        let mut poisoned: HashSet<(ClientId, TxId)> = HashSet::new();
+        for (op, r) in ops.iter().zip(&rewritten) {
+            if matches!(r, OpRewrite::Drop) {
+                if let Some(tx) = &op.tx {
+                    poisoned.insert((op.id.client, tx.id));
+                }
+            }
+        }
+        ops.iter()
+            .zip(rewritten)
+            .filter_map(|(op, r)| match r {
+                OpRewrite::Keep(out) => match &op.tx {
+                    Some(tx) if poisoned.contains(&(op.id.client, tx.id)) => None,
+                    _ => Some(out),
+                },
+                OpRewrite::Drop => None,
+            })
+            .collect()
+    }
+}
+
+/// Rewrite `op`, created under schema version `from`, for a recipient at `to` —
+/// a convenience over [`resolve_chain`] for a single op. See it for the version
+/// preconditions and error cases.
 pub fn translate_op(
     reg: &SchemaRegistry,
     app_id: &[u8],
@@ -51,25 +132,14 @@ pub fn translate_op(
     from: u32,
     to: u32,
 ) -> Result<OpRewrite, TranslateError> {
-    match from.cmp(&to) {
-        std::cmp::Ordering::Equal => Ok(OpRewrite::Keep(op.clone())),
-        std::cmp::Ordering::Less => {
-            let edges = edge_slice(reg, app_id, from, to)?;
-            Ok(rewrite_up_along(&edges, op))
-        }
-        std::cmp::Ordering::Greater => {
-            let edges = edge_slice(reg, app_id, to, from)?;
-            rewrite_down_along(&edges, op).ok_or(TranslateError::Unreachable)
-        }
-    }
+    resolve_chain(reg, app_id, from, to).map(|chain| chain.translate_op(op))
 }
 
-/// Translate a batch of ops created at version `from` for a recipient at `to`,
-/// keeping each op's rewritten image and dropping any the chain removes. An op
-/// the recipient cannot be served — a `Drop`, or an error (an unreachable
-/// breaking gap, a chain gap, an unparseable edge) — is omitted rather than
-/// delivered wrong; the handshake range-check (a later slice) refuses an
-/// unreachable recipient outright, so a drop here is a safe interim.
+/// Translate a batch of ops from `from` to `to` — a convenience over
+/// [`resolve_chain`] + [`Chain::translate_ops`]. A broken or unreachable chain
+/// drops the whole batch (fail-closed): the recipient receives nothing it
+/// cannot be served correctly, pending the handshake range-check that refuses an
+/// unreachable recipient outright.
 pub fn translate_ops(
     reg: &SchemaRegistry,
     app_id: &[u8],
@@ -77,12 +147,10 @@ pub fn translate_ops(
     from: u32,
     to: u32,
 ) -> Vec<Op> {
-    ops.iter()
-        .filter_map(|op| match translate_op(reg, app_id, op, from, to) {
-            Ok(OpRewrite::Keep(op)) => Some(op),
-            Ok(OpRewrite::Drop) | Err(_) => None,
-        })
-        .collect()
+    match resolve_chain(reg, app_id, from, to) {
+        Ok(chain) => chain.translate_ops(ops),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Whether a recipient at `to` can be reached from an op created at `from`.

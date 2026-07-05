@@ -174,6 +174,50 @@ fn a_back_compatible_addition_is_dropped_for_an_older_recipient() {
 }
 
 #[test]
+fn a_partly_translatable_transaction_is_dropped_whole_for_an_older_recipient() {
+    let mut r = registry();
+    let writer = hello(&mut r, 1, DOWN, 2);
+    let older = hello(&mut r, 2, DOWN, 1);
+    let peer_v2 = hello(&mut r, 3, DOWN, 2);
+    for id in [writer, older, peer_v2] {
+        subscribe(&mut r, id);
+    }
+    // One atomic transaction touching a shared field and a v2-only field. At v1
+    // the "note" member has no image, so the whole group is dropped — "title"
+    // too — rather than stranding a partial transaction the recipient could
+    // never complete. The v2 recipient receives both members intact.
+    let mut wdoc = Document::new(cid(1));
+    let tx = wdoc.atomic_transact(|c| {
+        c.register(b"title", Scalar::Int(1));
+        c.register(b"note", Scalar::Int(2));
+    });
+    write(&mut r, writer, tx);
+    assert!(delivered_keys(&mut r, older).is_empty());
+    assert_eq!(
+        delivered_keys(&mut r, peer_v2),
+        vec![b"title".to_vec(), b"note".to_vec()]
+    );
+}
+
+#[test]
+fn a_foreign_app_write_is_not_translated_along_the_rooms_chain() {
+    let mut r = registry();
+    // App UP at v1 subscribes first, binding the room to UP.
+    let up_v1 = hello(&mut r, 2, UP, 1);
+    subscribe(&mut r, up_v1);
+    // A connection of a different app (DOWN, v2) writes into the same room. Its
+    // version number lives in DOWN's space, not UP's, so it must never drive
+    // UP's age<->years edge.
+    let foreign = hello(&mut r, 1, DOWN, 2);
+    subscribe(&mut r, foreign);
+    r.take_outbox(up_v1);
+    write(&mut r, foreign, set(1, b"years"));
+    // The write is delivered verbatim — down-translating along UP's chain would
+    // have corrupted "years" into "age".
+    assert_eq!(delivered_keys(&mut r, up_v1), vec![b"years".to_vec()]);
+}
+
+#[test]
 fn a_same_version_fleet_is_untranslated() {
     let mut r = registry();
     let writer = hello(&mut r, 1, UP, 2);
