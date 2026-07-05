@@ -17,7 +17,10 @@ use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Action, Authorizer, PermitAll, Resource};
 use crate::clock::{Clock, SystemClock};
 use crate::schema_registry::SchemaRegistry;
-use crate::{step, AwarenessPolicy, Hub, RoomId, SchemaAwarenessPolicy, Session, Store};
+use crate::{
+    step, AwarenessPolicy, EngineEvent, EventSink, Hub, RoomId, SchemaAwarenessPolicy, Session,
+    Store,
+};
 
 /// How long a departed client's presence is retained before a sweep clears it,
 /// so a brief reconnect keeps its awareness alive across the gap.
@@ -116,6 +119,13 @@ impl Registry {
         self.authorizer = authorizer;
     }
 
+    /// Register an [`EventSink`] to observe the engine's lifecycle events —
+    /// connections and subscribes here, versions and compaction from the hub. The
+    /// one seam every lifecycle moment fans out through.
+    pub fn add_event_sink(&mut self, sink: Box<dyn EventSink>) {
+        self.hub.add_event_sink(sink);
+    }
+
     /// Verify a credential presented at the transport upgrade, returning the
     /// server-derived [`Identity`], or `None` if refused. The fast path uses this
     /// to establish auth during accept, so the connection skips the in-band Auth.
@@ -173,6 +183,7 @@ impl Registry {
                 outbox: Vec::new(),
             },
         );
+        self.hub.emit(EngineEvent::Connected { conn: id });
         id
     }
 
@@ -571,7 +582,7 @@ impl Registry {
             }
             _ => None,
         };
-        let (broadcast, broadcast_version, close, room, awareness, authed_client, bind) = {
+        let (broadcast, broadcast_version, close, room, awareness, authed_client, bind, subscribed) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
@@ -614,6 +625,15 @@ impl Registry {
                 }
                 Some((room.to_vec(), conn.session.app_id().to_vec(), version))
             });
+            // A subscribe the session accepted — the room now maps to a channel,
+            // relay or enforcing alike — is an observable lifecycle event, broader
+            // than `bind` (which fires only for an enforcing subscribe).
+            let subscribed = subscribed_room.as_deref().and_then(|room| {
+                conn.session
+                    .subscribed_rooms()
+                    .any(|r| r == room)
+                    .then(|| room.to_vec())
+            });
             (
                 resp.broadcast,
                 resp.broadcast_version,
@@ -622,8 +642,15 @@ impl Registry {
                 resp.awareness,
                 authed_client,
                 bind,
+                subscribed,
             )
         };
+        if let Some(room) = subscribed {
+            self.hub.emit(EngineEvent::Subscribed {
+                conn: id,
+                room: &room,
+            });
+        }
         // A client reappearing within its grace window cancels the pending
         // clear once it re-authenticates, so its presence survives the gap.
         if let Some(client) = authed_client {

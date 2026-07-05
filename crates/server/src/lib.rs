@@ -21,6 +21,7 @@ pub mod audit;
 pub mod auth;
 pub mod authz;
 pub mod clock;
+pub mod event;
 pub mod registry;
 pub mod runtime;
 pub mod schema_registry;
@@ -31,6 +32,7 @@ pub use admin::{admin_router, register_schema, serve_admin, RegisterOutcome, Reg
 pub use auth::{AllowAll, Identity, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use event::{EngineEvent, EventSink};
 pub use registry::{ConnId, Registry};
 pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry};
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
@@ -246,6 +248,9 @@ pub struct Hub {
     /// Named versions per room, keyed by name — sorted, for listing/pagination.
     /// The in-memory versions index over the snapshot storage primitive.
     versions: HashMap<RoomId, BTreeMap<Vec<u8>, Version>>,
+    /// The engine event sinks, notified of each lifecycle moment. Empty by
+    /// default — no sink, no emission cost.
+    sinks: Vec<Box<dyn EventSink>>,
 }
 
 impl Hub {
@@ -258,6 +263,21 @@ impl Hub {
             compaction_threshold: 0,
             awareness: HashMap::new(),
             versions: HashMap::new(),
+            sinks: Vec::new(),
+        }
+    }
+
+    /// Register an [`EventSink`] to observe the engine's lifecycle events. Several
+    /// may be registered; each is notified of every event, in registration order.
+    pub fn add_event_sink(&mut self, sink: Box<dyn EventSink>) {
+        self.sinks.push(sink);
+    }
+
+    /// Fan a lifecycle event out to every registered sink. Called after the moment
+    /// has committed, so a sink observes settled state; a no-sink hub does nothing.
+    pub(crate) fn emit(&self, event: EngineEvent) {
+        for sink in &self.sinks {
+            sink.on_event(&event);
         }
     }
 
@@ -641,6 +661,10 @@ impl Hub {
         if let Some(store) = self.store.as_mut() {
             store.compact(room, snapshot.0, &snapshot.1)?;
         }
+        self.emit(EngineEvent::Compacted {
+            room,
+            floor: snapshot.0,
+        });
         Ok(())
     }
 
@@ -733,6 +757,7 @@ impl Hub {
                 .remove(name);
             return Err(e);
         }
+        self.emit(EngineEvent::VersionCreated { room, name });
         Ok(true)
     }
 
@@ -796,6 +821,7 @@ impl Hub {
                 .insert(name.to_vec(), removed);
             return Err(e);
         }
+        self.emit(EngineEvent::VersionDeleted { room, name });
         Ok(true)
     }
 
