@@ -38,6 +38,11 @@ pub enum TranslateError {
 /// `to > from`; inverts it when `to < from`, [`Unreachable`] if any edge on the
 /// down path is breaking. A `Drop` propagates.
 ///
+/// Both versions are real, registered versions (`>= 1`): a chain starts at
+/// version 1, and the handshake resolves the version-0 dynamic sentinel to the
+/// head before an op is ever tagged, so 0 is not a creation version reaching
+/// here.
+///
 /// [`Unreachable`]: TranslateError::Unreachable
 pub fn translate_op(
     reg: &SchemaRegistry,
@@ -94,9 +99,9 @@ fn edge_slice(
     high: u32,
 ) -> Result<Vec<Migration>, TranslateError> {
     let mut edges = Vec::new();
-    // Walk `low` exclusive to `high` inclusive without ever computing `low + 1`,
-    // so a `low` at the top of the version space cannot overflow before the range
-    // is even built. Empty when `low >= high`.
+    // Exclusive `low`, inclusive `high`, incrementing rather than a `low + 1`
+    // range so the top of the version space never overflows. Empty when
+    // `low >= high`.
     let mut version = low;
     while version < high {
         version += 1;

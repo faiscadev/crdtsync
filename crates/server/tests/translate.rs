@@ -266,3 +266,56 @@ fn a_version_match_at_the_top_of_the_space_does_not_overflow() {
     );
     assert_eq!(reachable(&reg, APP, top, top), Ok(true));
 }
+
+#[test]
+fn the_edge_walk_runs_to_the_top_of_the_space_without_overflowing() {
+    // A one-version step ending at u32::MAX drives edge_slice's increment loop
+    // right up to the boundary (not the identity shortcut). The edge is
+    // unregistered, so it surfaces as MissingEdge at the top version — the walk
+    // must reach it, never overflow computing the range.
+    let reg = registry_with(&[]);
+    let top = u32::MAX;
+    assert_eq!(
+        translate_op(&reg, APP, &set("age"), top - 1, top),
+        Err(TranslateError::MissingEdge { version: top })
+    );
+    assert_eq!(
+        reachable(&reg, APP, top, top - 1),
+        Err(TranslateError::MissingEdge { version: top })
+    );
+}
+
+#[test]
+fn a_down_path_reports_a_bad_edge() {
+    // Error classification holds on the inverse (to < from) direction too: the
+    // down slice edge_slice(to, from) walks version 2, whose body is garbage.
+    let mut reg = SchemaRegistry::new();
+    reg.register(APP, 1, b"{}", b"").unwrap();
+    reg.register(APP, 2, b"{}", b"not json").unwrap();
+    assert_eq!(
+        translate_op(&reg, APP, &set("x"), 2, 1),
+        Err(TranslateError::BadMigration { version: 2 })
+    );
+    assert_eq!(
+        reachable(&reg, APP, 2, 1),
+        Err(TranslateError::BadMigration { version: 2 })
+    );
+}
+
+#[test]
+fn a_down_path_reports_a_missing_edge_past_the_head() {
+    // A well-formed v1->v2 chain; a v3 op down to v1 walks past the head, so
+    // version 3 has no edge — surfaced on the inverse direction.
+    let reg = registry_with(&[&edge(
+        2,
+        r#"{ "kind": "addField", "type": "m", "field": "note", "fieldType": "text" }"#,
+    )]);
+    assert_eq!(
+        translate_op(&reg, APP, &set("x"), 3, 1),
+        Err(TranslateError::MissingEdge { version: 3 })
+    );
+    assert_eq!(
+        reachable(&reg, APP, 3, 1),
+        Err(TranslateError::MissingEdge { version: 3 })
+    );
+}
