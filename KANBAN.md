@@ -157,7 +157,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **Unit 6b — server advertises on an enforcing handshake (server)** — handed to `/cs-implement` (cs-next 2026-07-05): `step`'s `Hello` handler replies with `SchemaAdvert` on `Enforcing`, resolving the schema bytes from the shared registry; `Relay`/`Reject` send none.
 
 ---
 

@@ -1,11 +1,13 @@
 //! The handshake gate — the server resolves a client's `{app_id, schema_version}`
 //! at Hello and refuses a registered app's unknown version.
 //!
-//! A relay connection (no app, or an app that never registered) always proceeds
-//! and records no enforced version. A registered app pins the session to a
-//! version — the declared one, or the head a version-0 dynamic client adopts —
-//! and a declared version the registry does not hold closes the connection with
-//! an `UnsupportedVersion` error, before the client is ever a subscriber.
+//! A relay connection (no app, or an app that never registered) always proceeds,
+//! records no enforced version, and is advertised no schema. A registered app
+//! pins the session to a version — the declared one, or the head a version-0
+//! dynamic client adopts — and is answered with a `SchemaAdvert` carrying that
+//! version and its bytes; a declared version the registry does not hold closes
+//! the connection with an `UnsupportedVersion` error, before the client is ever a
+//! subscriber.
 
 use std::sync::{Arc, Mutex};
 
@@ -63,6 +65,7 @@ fn a_relay_connection_records_no_enforced_version() {
     assert_eq!(session.client(), Some(cid(1)));
     assert_eq!(session.app_id(), b"");
     assert_eq!(session.schema_version(), None);
+    assert!(resp.replies.is_empty(), "a relay is advertised no schema");
 
     // A named app that never registered is still a relay.
     let (session, resp) = resolve(&reg, hello(b"other-app", 4));
@@ -73,19 +76,28 @@ fn a_relay_connection_records_no_enforced_version() {
         None,
         "unregistered app is a relay"
     );
+    assert!(
+        resp.replies.is_empty(),
+        "an unregistered app gets no advert"
+    );
 }
 
 #[test]
-fn a_registered_app_pins_the_declared_version() {
+fn a_registered_app_pins_the_declared_version_and_advertises_it() {
     let reg = Mutex::new(registered());
     let (session, resp) = resolve(&reg, hello(APP, 1));
     assert!(!resp.close);
     assert_eq!(session.app_id(), APP);
     assert_eq!(session.schema_version(), Some(1));
+    // The enforcing handshake advertises the resolved version and its bytes.
+    assert!(matches!(
+        resp.replies.as_slice(),
+        [Message::SchemaAdvert { schema_version: 1, schema }] if schema == br#"{"v":1}"#,
+    ));
 }
 
 #[test]
-fn a_dynamic_client_adopts_the_head_version() {
+fn a_dynamic_client_adopts_the_head_version_and_is_advertised_it() {
     let reg = Mutex::new(registered());
     let (session, resp) = resolve(&reg, hello(APP, 0));
     assert!(!resp.close);
@@ -94,6 +106,11 @@ fn a_dynamic_client_adopts_the_head_version() {
         Some(2),
         "version 0 adopts the head"
     );
+    // The dynamic client is advertised the head version + bytes to adopt.
+    assert!(matches!(
+        resp.replies.as_slice(),
+        [Message::SchemaAdvert { schema_version: 2, schema }] if schema == br#"{"v":2}"#,
+    ));
 }
 
 #[test]
@@ -132,10 +149,14 @@ fn the_registry_refuses_an_unknown_version_and_admits_a_known_one() {
         }]
     ));
 
-    // A known version proceeds — the handshake is quiet and the connection stays.
+    // A known version proceeds — the connection stays and is advertised the
+    // schema it is enforced at.
     let good = r.connect();
     assert!(r.deliver(good, hello(APP, 2)));
-    assert!(r.take_outbox(good).is_empty());
+    assert!(matches!(
+        r.take_outbox(good).as_slice(),
+        [Message::SchemaAdvert { schema_version: 2, schema }] if schema == br#"{"v":2}"#,
+    ));
 }
 
 #[test]
