@@ -10,7 +10,10 @@
 //! keys). Each step carries a compatibility class (back-compatible vs breaking)
 //! and a per-op rewrite (forward always, backward when back-compatible).
 
-use crdtsync_core::migration::{Compat, Migration, MigrationErrorKind, OpRewrite, Step};
+use crdtsync_core::migration::{
+    reachable_down, rewrite_down_along, rewrite_up_along, Compat, Migration, MigrationErrorKind,
+    OpRewrite, Step,
+};
 use crdtsync_core::op::{Op, OpId, OpKind, Tx, TxId};
 use crdtsync_core::schema::TypeDef;
 use crdtsync_core::{Anchor, Scalar, Side};
@@ -699,4 +702,182 @@ fn parse_is_total_on_assorted_garbage() {
         // Every one is an error, none panics.
         assert!(Migration::parse(src).is_err(), "expected error for {src:?}");
     }
+}
+
+// --- edge + chain composition ---
+
+/// A RegisterSet op addressing `key`, matching the payload `key_bearing_ops`
+/// uses so a rewritten op compares equal.
+fn reg(key: &str) -> Op {
+    mk_op(OpKind::RegisterSet {
+        key: key.as_bytes().to_vec(),
+        value: Scalar::Bool(true),
+    })
+}
+
+/// A 1->2 edge carrying `steps` (raw JSON array).
+fn edge(steps: &str) -> Migration {
+    parse(&format!(r#"{{ "from": 1, "to": 2, "steps": {steps} }}"#))
+}
+
+/// A `from`->`to` edge carrying `steps`, for building a multi-edge chain.
+fn edge_v(from: u32, to: u32, steps: &str) -> Migration {
+    parse(&format!(
+        r#"{{ "from": {from}, "to": {to}, "steps": {steps} }}"#
+    ))
+}
+
+#[test]
+fn an_edge_composes_its_steps_up_in_order() {
+    // rename a->b then b->c: forward, a becomes c.
+    let e = edge(
+        r#"[
+            { "kind": "renameField", "type": "m", "from": "a", "to": "b" },
+            { "kind": "renameField", "type": "m", "from": "b", "to": "c" }
+        ]"#,
+    );
+    assert_eq!(e.rewrite_up(&reg("a")), OpRewrite::Keep(reg("c")));
+    // A key touched by neither rename passes through.
+    assert_eq!(e.rewrite_up(&reg("z")), OpRewrite::Keep(reg("z")));
+}
+
+#[test]
+fn a_drop_short_circuits_the_rest_of_the_edge() {
+    // Remove "f" then rename g->h: an op on "f" is dropped before the rename.
+    let e = edge(
+        r#"[
+            { "kind": "removeField", "type": "m", "field": "f" },
+            { "kind": "renameField", "type": "m", "from": "g", "to": "h" }
+        ]"#,
+    );
+    assert_eq!(e.rewrite_up(&reg("f")), OpRewrite::Drop);
+    assert_eq!(e.rewrite_up(&reg("g")), OpRewrite::Keep(reg("h")));
+}
+
+#[test]
+fn an_empty_edge_is_identity_both_ways() {
+    let e = edge("[]");
+    assert_eq!(e.rewrite_up(&reg("a")), OpRewrite::Keep(reg("a")));
+    assert_eq!(e.rewrite_down(&reg("a")), Some(OpRewrite::Keep(reg("a"))));
+}
+
+#[test]
+fn a_breaking_edge_has_no_down_rewrite() {
+    let e = edge(r#"[ { "kind": "removeField", "type": "m", "field": "f" } ]"#);
+    assert_eq!(e.compat(), Compat::Breaking);
+    assert_eq!(e.rewrite_down(&reg("f")), None);
+}
+
+#[test]
+fn a_back_compatible_edge_inverts_by_dropping_its_additions() {
+    // Adding two fields is back-compatible; inverting drops ops on either.
+    let e = edge(
+        r#"[
+            { "kind": "addField", "type": "m", "field": "x", "fieldType": "text" },
+            { "kind": "addField", "type": "m", "field": "y", "fieldType": "text" }
+        ]"#,
+    );
+    assert_eq!(e.compat(), Compat::BackCompatible);
+    assert_eq!(e.rewrite_down(&reg("x")), Some(OpRewrite::Drop));
+    assert_eq!(e.rewrite_down(&reg("y")), Some(OpRewrite::Drop));
+    assert_eq!(e.rewrite_down(&reg("z")), Some(OpRewrite::Keep(reg("z"))));
+}
+
+#[test]
+fn a_chain_composes_up_across_versions() {
+    // 1->2 renames a->b, 2->3 renames b->c: a at v1 arrives as c at v3.
+    let chain = [
+        edge_v(
+            1,
+            2,
+            r#"[ { "kind": "renameField", "type": "m", "from": "a", "to": "b" } ]"#,
+        ),
+        edge_v(
+            2,
+            3,
+            r#"[ { "kind": "renameField", "type": "m", "from": "b", "to": "c" } ]"#,
+        ),
+    ];
+    assert_eq!(
+        rewrite_up_along(&chain, &reg("a")),
+        OpRewrite::Keep(reg("c"))
+    );
+    // An empty path is identity.
+    assert_eq!(rewrite_up_along(&[], &reg("a")), OpRewrite::Keep(reg("a")));
+}
+
+#[test]
+fn a_chain_drop_short_circuits_later_edges() {
+    // 1->2 removes "f"; 2->3 renames f->g. An op on "f" is dropped at the first
+    // edge and never reaches the rename.
+    let chain = [
+        edge_v(
+            1,
+            2,
+            r#"[ { "kind": "removeField", "type": "m", "field": "f" } ]"#,
+        ),
+        edge_v(
+            2,
+            3,
+            r#"[ { "kind": "renameField", "type": "m", "from": "f", "to": "g" } ]"#,
+        ),
+    ];
+    assert_eq!(rewrite_up_along(&chain, &reg("f")), OpRewrite::Drop);
+}
+
+#[test]
+fn a_chain_composes_down_when_every_edge_is_back_compatible() {
+    // 1->2 adds "x", 2->3 adds "y": down from v3 to v1 drops ops on x or y.
+    let chain = [
+        edge_v(
+            1,
+            2,
+            r#"[ { "kind": "addField", "type": "m", "field": "x", "fieldType": "text" } ]"#,
+        ),
+        edge_v(
+            2,
+            3,
+            r#"[ { "kind": "addField", "type": "m", "field": "y", "fieldType": "text" } ]"#,
+        ),
+    ];
+    assert!(reachable_down(&chain));
+    assert_eq!(rewrite_down_along(&chain, &reg("x")), Some(OpRewrite::Drop));
+    assert_eq!(rewrite_down_along(&chain, &reg("y")), Some(OpRewrite::Drop));
+    assert_eq!(
+        rewrite_down_along(&chain, &reg("z")),
+        Some(OpRewrite::Keep(reg("z")))
+    );
+}
+
+#[test]
+fn a_chain_with_any_breaking_edge_is_unreachable_downward() {
+    // One back-compatible add and one breaking remove: the older version cannot
+    // be reached by down-migration.
+    let chain = [
+        edge_v(
+            1,
+            2,
+            r#"[ { "kind": "addField", "type": "m", "field": "x", "fieldType": "text" } ]"#,
+        ),
+        edge_v(
+            2,
+            3,
+            r#"[ { "kind": "removeField", "type": "m", "field": "old" } ]"#,
+        ),
+    ];
+    assert!(!reachable_down(&chain));
+    assert_eq!(rewrite_down_along(&chain, &reg("x")), None);
+    // An all-back-compatible chain is reachable.
+    let ok = [edge_v(
+        1,
+        2,
+        r#"[ { "kind": "addField", "type": "m", "field": "x", "fieldType": "text" } ]"#,
+    )];
+    assert!(reachable_down(&ok));
+    // An empty path is trivially reachable and identity.
+    assert!(reachable_down(&[]));
+    assert_eq!(
+        rewrite_down_along(&[], &reg("a")),
+        Some(OpRewrite::Keep(reg("a")))
+    );
 }
