@@ -363,10 +363,7 @@ pub fn step(
             // never drive this room's chain, so its ops are logged untagged
             // (`None`, relay-like) and pass verbatim on both the live and the
             // catch-up seam, exactly as the fan-out already leaves them.
-            let write_version = match governing {
-                Some((app, _)) if app == session.app_id() => session.schema_version(),
-                _ => None,
-            };
+            let write_version = governing_target(governing, session).map(|(_, _, client)| client);
             // The deduped ops fan out to the room's other subscribers; nothing
             // echoes back to the sender. A hub that cannot durably record the
             // ops rejects the write rather than advertising an unpersisted one.
@@ -569,6 +566,24 @@ fn versions_list(hub: &Hub, channel: Channel, room: &[u8]) -> Response {
     }
 }
 
+/// The `(governing_app, governing_version, client_version)` when this session is
+/// the enforcing speaker of the room's governing app — the one connection class
+/// whose ops drive the room's chain, whose catch-up is translated, and whose
+/// subscribe is range-checked. `None` for a relay, a foreign app, or a
+/// versionless session: a different version space, served verbatim, its writes
+/// logged untagged, never refused.
+fn governing_target<'a>(
+    governing: Option<(&'a [u8], u32)>,
+    session: &Session,
+) -> Option<(&'a [u8], u32, u32)> {
+    match (governing, session.schema_version()) {
+        (Some((app, governing_version)), Some(client_version)) if session.app_id() == app => {
+            Some((app, governing_version, client_version))
+        }
+        _ => None,
+    }
+}
+
 /// Translate a catch-up delta to the joining session's version, on the same
 /// app-scoping as the live fan-out: only when the room is bound to an app the
 /// joiner also speaks, and the joiner declared an enforced version. A relay
@@ -580,15 +595,15 @@ fn catch_up_ops(
     session: &Session,
     delta: Vec<StoredOp>,
 ) -> Vec<Op> {
-    match (governing, session.schema_version()) {
-        (Some((app, _)), Some(target)) if session.app_id() == app => {
+    match governing_target(governing, session) {
+        Some((app, _, target)) => {
             let reg = match registry.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
             crate::translate::translate_delta(&reg, app, delta, target)
         }
-        _ => delta.into_iter().map(|rec| rec.op).collect(),
+        None => delta.into_iter().map(|rec| rec.op).collect(),
     }
 }
 
@@ -603,8 +618,8 @@ fn subscriber_reaches_governing(
     governing: Option<(&[u8], u32)>,
     session: &Session,
 ) -> bool {
-    match (governing, session.schema_version()) {
-        (Some((app, governing_version)), Some(client_version)) if session.app_id() == app => {
+    match governing_target(governing, session) {
+        Some((app, governing_version, client_version)) => {
             let reg = match registry.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -614,7 +629,7 @@ fn subscriber_reaches_governing(
                 Ok(true)
             )
         }
-        _ => true,
+        None => true,
     }
 }
 
