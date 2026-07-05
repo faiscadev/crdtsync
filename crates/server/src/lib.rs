@@ -852,22 +852,28 @@ impl Hub {
         }
         // `keep` is now below the group size, so it fits `usize` losslessly.
         let remove = matches - keep as usize;
-        // Oldest first by capture order; the lowest `remove` ordinals leave the window.
-        let mut group: Vec<(u64, Vec<u8>)> = index
+        // Partition the lowest `remove` ordinals (the oldest captures) to the front —
+        // a linear select, not a full sort of the window, and no name is cloned until
+        // it is known doomed.
+        let mut by_ordinal: Vec<(u64, &[u8])> = index
             .iter()
             .filter(|(_, v)| v.origin.as_deref() == Some(origin))
-            .map(|(name, v)| (v.ordinal, name.clone()))
+            .map(|(name, v)| (v.ordinal, name.as_slice()))
             .collect();
-        group.sort_by_key(|(ordinal, _)| *ordinal);
+        by_ordinal.select_nth_unstable_by_key(remove - 1, |&(ordinal, _)| ordinal);
+        let doomed: Vec<Vec<u8>> = by_ordinal[..remove]
+            .iter()
+            .map(|&(_, name)| name.to_vec())
+            .collect();
+        drop(by_ordinal);
 
         // Evict the whole batch from the index, then persist once — not one atomic
         // rewrite (with its two fsyncs) per eviction. A persist failure restores the
         // entire batch, so retention never commits a partial prune.
         let index = self.versions.get_mut(room).expect("index present above");
-        let evicted: Vec<(Vec<u8>, Version)> = group
+        let evicted: Vec<(Vec<u8>, Version)> = doomed
             .into_iter()
-            .take(remove)
-            .map(|(_, name)| {
+            .map(|name| {
                 let version = index.remove(&name).expect("name drawn from this index");
                 (name, version)
             })
