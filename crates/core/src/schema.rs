@@ -30,6 +30,7 @@ pub struct Schema {
     types: Vec<(String, TypeDef)>,
     awareness: Vec<(String, AwarenessEntry)>,
     auth: Auth,
+    auto_version: Vec<AutoVersion>,
 }
 
 /// The schema-level `@auth`: the static, role-based access defaults that ship
@@ -128,6 +129,53 @@ pub struct AwarenessEntry {
     pub throttle: Option<u64>,
 }
 
+/// One declarative version trigger: an event or a schedule that fires a version
+/// capture, a name template for the captured version, and an optional retention
+/// count. The engine sink (a later unit) reads these off the registered schema
+/// and drives `create_version`; this unit is the parse only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoVersion {
+    /// What fires the capture — an engine event or a periodic schedule.
+    pub trigger: Trigger,
+    /// The captured version's name, a template the sink expands (`${timestamp}`,
+    /// `${event}`, …) at fire time. Validated non-empty; the template variables
+    /// are the sink's concern, an open set here.
+    pub name: String,
+    /// Retain only this many of the trigger's own auto-versions, pruning the
+    /// oldest past it. `None` retains all.
+    pub keep: Option<u64>,
+}
+
+/// What fires an [`AutoVersion`] capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    /// On an engine lifecycle event.
+    On(TriggerEvent),
+    /// On a periodic schedule, every this many milliseconds.
+    Every(u64),
+}
+
+/// A lifecycle event an [`AutoVersion`] may trigger on. The vocabulary is staged:
+/// the first group fires today; the branch/migration events are declarable now
+/// and fire once those layers exist — a trigger on one parses and waits, never
+/// errors. An event name outside this vocabulary is a typo and is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Connect,
+    Disconnect,
+    Subscribe,
+    VersionCreated,
+    VersionRenamed,
+    VersionDeleted,
+    Compaction,
+    /// Reserved: fires once the branch layer publishes.
+    BeforePublish,
+    /// Reserved: fires once a version is restored as a branch.
+    AfterRestore,
+    /// Reserved: fires once the migration layer runs.
+    BeforeMigration,
+}
+
 /// One named type: a built primitive with its declared constraints.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeDef {
@@ -191,6 +239,14 @@ pub enum SchemaErrorKind {
     /// `auth.roles` declared a role with a reserved subject-class name
     /// (`authenticated` / `anonymous` / `anyone`), which would shadow the class.
     ReservedRole,
+    /// An `autoVersion` trigger did not carry exactly one of `on` / `every`.
+    BadTrigger,
+    /// An `autoVersion` `on` named an event outside the staged vocabulary.
+    UnknownEvent,
+    /// An `autoVersion` `every` was not a well-formed duration (`<n><s|m|h|d>`).
+    BadDuration,
+    /// An `autoVersion` `name` template was empty.
+    EmptyName,
 }
 
 /// A schema failure: a [`SchemaErrorKind`] plus the field or type name it
@@ -231,6 +287,10 @@ impl std::fmt::Display for SchemaError {
             SchemaErrorKind::BadPath => "grant path is not a well-formed absolute path",
             SchemaErrorKind::DuplicateRole => "duplicate role",
             SchemaErrorKind::ReservedRole => "role name is a reserved subject class",
+            SchemaErrorKind::BadTrigger => "autoVersion trigger needs exactly one of on/every",
+            SchemaErrorKind::UnknownEvent => "unknown autoVersion trigger event",
+            SchemaErrorKind::BadDuration => "malformed autoVersion schedule duration",
+            SchemaErrorKind::EmptyName => "empty autoVersion name template",
         };
         write!(f, "{what}: {}", self.at)
     }
@@ -285,6 +345,11 @@ impl Schema {
         &self.auth
     }
 
+    /// The declarative version triggers (`autoVersion`), in declaration order.
+    pub fn auto_version(&self) -> &[AutoVersion] {
+        &self.auto_version
+    }
+
     /// Parse a schema from its JSON source. Total — any input yields a `Schema`
     /// or a [`SchemaError`], never a panic.
     pub fn parse(src: &str) -> Result<Schema, SchemaError> {
@@ -298,7 +363,7 @@ impl Schema {
     /// and is rejected. `marks` is declared by the language but not yet modelled
     /// here; it is accepted structurally so a spec-valid schema parses, and
     /// modelled by its own unit.
-    const TOP_LEVEL_KEYS: [&'static str; 7] = [
+    const TOP_LEVEL_KEYS: [&'static str; 8] = [
         "schema",
         "version",
         "root",
@@ -306,6 +371,7 @@ impl Schema {
         "marks",
         "awareness",
         "auth",
+        "autoVersion",
     ];
 
     /// Build a schema from an already-parsed JSON value.
@@ -346,6 +412,11 @@ impl Schema {
             Some(a) => parse_auth(a)?,
         };
 
+        let auto_version = match json.get("autoVersion") {
+            None => Vec::new(),
+            Some(a) => parse_auto_version(a)?,
+        };
+
         let schema = Schema {
             name,
             version,
@@ -353,6 +424,7 @@ impl Schema {
             types,
             awareness,
             auth,
+            auto_version,
         };
         schema.validate_references()?;
         Ok(schema)
@@ -491,6 +563,106 @@ fn parse_awareness(json: &Json) -> Result<Vec<(String, AwarenessEntry)>, SchemaE
         out.push((kind.clone(), AwarenessEntry { ttl, throttle }));
     }
     Ok(out)
+}
+
+/// Parse the `autoVersion` block: an array of triggers, each an event or a
+/// schedule with a name template and an optional retention count. Order is
+/// preserved.
+fn parse_auto_version(json: &Json) -> Result<Vec<AutoVersion>, SchemaError> {
+    let arr = json
+        .as_array()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, "autoVersion"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, trigger) in arr.iter().enumerate() {
+        out.push(parse_trigger(trigger, i)?);
+    }
+    Ok(out)
+}
+
+fn parse_trigger(json: &Json, index: usize) -> Result<AutoVersion, SchemaError> {
+    let ctx = format!("autoVersion[{index}]");
+    let obj = json
+        .as_object()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, ctx.clone()))?;
+    reject_unknown_fields(obj, &["on", "every", "name", "keep"], &ctx)?;
+
+    // Exactly one of `on` / `every`: an event or a schedule, never both or neither.
+    let trigger = match (json.get("on"), json.get("every")) {
+        (Some(on), None) => {
+            let name = on
+                .as_str()
+                .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, "on")))?;
+            Trigger::On(parse_trigger_event(name, &ctx)?)
+        }
+        (None, Some(every)) => {
+            let spec = every
+                .as_str()
+                .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, "every")))?;
+            Trigger::Every(parse_duration_millis(spec, &ctx)?)
+        }
+        _ => return Err(SchemaError::new(SchemaErrorKind::BadTrigger, ctx)),
+    };
+
+    let name = required_str(json, "name", &ctx)?.to_string();
+    if name.is_empty() {
+        return Err(SchemaError::new(
+            SchemaErrorKind::EmptyName,
+            at(&ctx, "name"),
+        ));
+    }
+    let keep = count_field(json, "keep", &ctx)?;
+
+    Ok(AutoVersion {
+        trigger,
+        name,
+        keep,
+    })
+}
+
+/// Map an `on` event name to its [`TriggerEvent`]. The vocabulary spans the
+/// events that fire today and the reserved branch/migration events (declarable,
+/// waiting); a name outside it is a typo and is rejected.
+fn parse_trigger_event(name: &str, ctx: &str) -> Result<TriggerEvent, SchemaError> {
+    let event = match name {
+        "connect" => TriggerEvent::Connect,
+        "disconnect" => TriggerEvent::Disconnect,
+        "subscribe" => TriggerEvent::Subscribe,
+        "version-created" => TriggerEvent::VersionCreated,
+        "version-renamed" => TriggerEvent::VersionRenamed,
+        "version-deleted" => TriggerEvent::VersionDeleted,
+        "compaction" => TriggerEvent::Compaction,
+        "before-publish" => TriggerEvent::BeforePublish,
+        "after-restore" => TriggerEvent::AfterRestore,
+        "before-migration" => TriggerEvent::BeforeMigration,
+        _ => {
+            return Err(SchemaError::new(
+                SchemaErrorKind::UnknownEvent,
+                at(ctx, "on"),
+            ))
+        }
+    };
+    Ok(event)
+}
+
+/// Parse a schedule duration `<n><unit>` (`s`/`m`/`h`/`d`) into milliseconds.
+/// Rejects an empty or non-numeric count, a missing or unknown unit, and an
+/// overflowing product.
+fn parse_duration_millis(spec: &str, ctx: &str) -> Result<u64, SchemaError> {
+    let bad = || SchemaError::new(SchemaErrorKind::BadDuration, at(ctx, "every"));
+    let unit = spec.chars().last().ok_or_else(|| bad())?;
+    let factor: u64 = match unit {
+        's' => 1_000,
+        'm' => 60_000,
+        'h' => 3_600_000,
+        'd' => 86_400_000,
+        _ => return Err(bad()),
+    };
+    let digits = &spec[..spec.len() - unit.len_utf8()];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    n.checked_mul(factor).ok_or_else(|| bad())
 }
 
 /// Parse the `@auth` block: a role vocabulary and static grants. `roles` is
