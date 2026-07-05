@@ -78,7 +78,7 @@ pub fn register_schema(
         return RegisterOutcome::Unauthenticated;
     };
     let resource = Resource::App(req.app_id);
-    if !authorizer.authorize(identity.actor(), Action::RegisterSchema, &resource) {
+    if !authorizer.authorize(&identity, Action::RegisterSchema, &resource) {
         return RegisterOutcome::Forbidden;
     }
     // Authentication and authorization ran lock-free above; the registry — shared

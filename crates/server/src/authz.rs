@@ -11,6 +11,12 @@
 //! Resources cover rooms (the data plane) and apps (the schema-registry control
 //! plane); the room case widens to path / element / branch as those land,
 //! without disturbing the trait.
+//!
+//! A check carries the full [`Identity`] the [`Verifier`](crate::auth) derived,
+//! not just its actor id, so an authorizer can match a rule by the credential's
+//! roles and groups — not only by who the actor is.
+
+use crate::auth::Identity;
 
 /// What an actor is attempting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,20 +43,20 @@ pub enum Resource<'a> {
     App(&'a [u8]),
 }
 
-/// Decides whether `actor` may take `action` on `resource`. Deployments supply
+/// Decides whether `identity` may take `action` on `resource`. Deployments supply
 /// their own; the engine only asks.
 pub trait Authorizer {
-    fn authorize(&self, actor: &[u8], action: Action, resource: &Resource) -> bool;
+    fn authorize(&self, identity: &Identity, action: Action, resource: &Resource) -> bool;
 }
 
 /// An authorizer from a plain closure, so a deployment (or a test) can supply the
 /// policy inline.
 impl<F> Authorizer for F
 where
-    F: Fn(&[u8], Action, &Resource) -> bool,
+    F: Fn(&Identity, Action, &Resource) -> bool,
 {
-    fn authorize(&self, actor: &[u8], action: Action, resource: &Resource) -> bool {
-        self(actor, action, resource)
+    fn authorize(&self, identity: &Identity, action: Action, resource: &Resource) -> bool {
+        self(identity, action, resource)
     }
 }
 
@@ -59,7 +65,7 @@ where
 pub struct PermitAll;
 
 impl Authorizer for PermitAll {
-    fn authorize(&self, _actor: &[u8], _action: Action, _resource: &Resource) -> bool {
+    fn authorize(&self, _identity: &Identity, _action: Action, _resource: &Resource) -> bool {
         true
     }
 }

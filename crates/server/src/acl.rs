@@ -7,12 +7,13 @@
 //! allow denies. This is the doc-independent policy engine; the doc-level
 //! ACL-as-CRDT layer feeds its tuples into the same evaluation once it lands.
 //!
-//! A [`Subject`] is matched from the server-derived actor id alone — the only
-//! thing an enforcement point carries. Role and group subjects need a claims
-//! model the engine does not read yet; schema `@auth` role grants (decision-flow
-//! step 4) need the schema layer. Neither participates here, so the flow reduces
-//! to its explicit-tuple steps: deny-wins, then allow, then default-deny.
+//! A [`Subject`] is matched against the full [`Identity`] an enforcement point
+//! carries: its actor id, or the roles and groups its credential asserts. Schema
+//! `@auth` role grants (decision-flow step 4) feed into this same evaluation once
+//! the schema tier lands; here the flow is its explicit-tuple steps: deny-wins,
+//! then allow, then default-deny.
 
+use crate::auth::Identity;
 use crate::authz::{Action, Authorizer, Resource};
 
 /// Anonymous actors are minted with this prefix, so a subject can tell an
@@ -27,11 +28,16 @@ pub enum Effect {
     Deny,
 }
 
-/// Who a rule applies to, matched against the server-derived actor id.
+/// Who a rule applies to, matched against the acting [`Identity`]: its actor id,
+/// its subject class, or a role or group its credential asserts.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Subject {
     /// One specific actor id.
     Actor(Vec<u8>),
+    /// Any actor holding this role among its credential's claims.
+    Role(String),
+    /// Any actor in this group among its credential's claims.
+    Group(String),
     /// Any credentialed (non-anonymous) actor — `authenticated:*`.
     Authenticated,
     /// Any anonymous actor — `anonymous:*`, an `anon:`-prefixed id.
@@ -41,9 +47,12 @@ pub enum Subject {
 }
 
 impl Subject {
-    fn matches(&self, actor: &[u8]) -> bool {
+    fn matches(&self, identity: &Identity) -> bool {
+        let actor = identity.actor();
         match self {
             Subject::Actor(id) => id.as_slice() == actor,
+            Subject::Role(role) => identity.roles().iter().any(|r| r == role),
+            Subject::Group(group) => identity.groups().iter().any(|g| g == group),
             Subject::Authenticated => !actor.starts_with(ANON_PREFIX),
             Subject::Anonymous => actor.starts_with(ANON_PREFIX),
             Subject::Anyone => true,
@@ -87,8 +96,8 @@ struct Rule {
 }
 
 impl Rule {
-    fn matches(&self, actor: &[u8], action: Action, resource: &Resource) -> bool {
-        self.subject.matches(actor)
+    fn matches(&self, identity: &Identity, action: Action, resource: &Resource) -> bool {
+        self.subject.matches(identity)
             && self.action.map_or(true, |a| a == action)
             && self.resource.matches(resource)
     }
@@ -205,7 +214,7 @@ impl Acl {
     /// [`PolicyError`] naming its physical line, never a panic.
     ///
     /// - effect: `allow` | `deny`
-    /// - subject: `actor:<hex>` | `authenticated` | `anonymous` | `anyone` | `*`
+    /// - subject: `actor:<hex>` | `role:<name>` | `group:<name>` | `authenticated` | `anonymous` | `anyone` | `*`
     /// - action: `read` | `write` | `publish_awareness` | `*`
     /// - resource: `room:<name>` | `*`
     pub fn from_policy(text: &str) -> Result<Self, PolicyError> {
@@ -283,6 +292,17 @@ impl From<PolicyError> for PolicyFileError {
     }
 }
 
+/// A role or group name, rejecting the empty string (a malformed `role:` /
+/// `group:` token whose name was omitted). The original token is quoted so the
+/// error names what was wrong.
+fn non_empty(name: &str) -> Result<String, PolicyErrorKind> {
+    if name.is_empty() {
+        Err(PolicyErrorKind::Subject(name.into()))
+    } else {
+        Ok(name.to_string())
+    }
+}
+
 fn parse_effect(tok: &str) -> Option<Effect> {
     match tok {
         "allow" => Some(Effect::Allow),
@@ -296,12 +316,23 @@ fn parse_subject(tok: &str) -> Result<Subject, PolicyErrorKind> {
         "authenticated" => Ok(Subject::Authenticated),
         "anonymous" => Ok(Subject::Anonymous),
         "anyone" | "*" => Ok(Subject::Anyone),
-        _ => match tok.strip_prefix("actor:") {
-            Some(hex) => decode_hex(hex)
-                .map(Subject::Actor)
-                .ok_or_else(|| PolicyErrorKind::ActorHex(hex.into())),
-            None => Err(PolicyErrorKind::Subject(tok.into())),
-        },
+        _ => {
+            if let Some(hex) = tok.strip_prefix("actor:") {
+                return decode_hex(hex)
+                    .map(Subject::Actor)
+                    .ok_or_else(|| PolicyErrorKind::ActorHex(hex.into()));
+            }
+            if let Some(role) = tok.strip_prefix("role:") {
+                // An empty name is a dead rule no identity can match — a
+                // credential never carries an empty role — so reject it as
+                // malformed rather than load a silently-inert line.
+                return non_empty(role).map(Subject::Role);
+            }
+            if let Some(group) = tok.strip_prefix("group:") {
+                return non_empty(group).map(Subject::Group);
+            }
+            Err(PolicyErrorKind::Subject(tok.into()))
+        }
     }
 }
 
@@ -353,10 +384,10 @@ fn unhex(c: u8) -> Option<u8> {
 }
 
 impl Authorizer for Acl {
-    fn authorize(&self, actor: &[u8], action: Action, resource: &Resource) -> bool {
+    fn authorize(&self, identity: &Identity, action: Action, resource: &Resource) -> bool {
         let mut allowed = false;
         for rule in &self.rules {
-            if rule.matches(actor, action, resource) {
+            if rule.matches(identity, action, resource) {
                 match rule.effect {
                     // An explicit deny wins outright, whatever else matched.
                     Effect::Deny => return false,

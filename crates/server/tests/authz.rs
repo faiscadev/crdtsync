@@ -9,7 +9,7 @@
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, ErrorCode, Message, Op, Scalar};
-use crdtsync_server::{Action, ConnId, ManualClock, Registry, Resource};
+use crdtsync_server::{Action, ConnId, Identity, ManualClock, Registry, Resource};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -75,12 +75,14 @@ fn sample_ops() -> Vec<Op> {
 fn a_read_denied_room_is_forbidden_but_keeps_the_connection() {
     let mut r = registry();
     // Reads allowed only on "open".
-    r.set_authorizer(Box::new(|_actor: &[u8], action: Action, res: &Resource| {
-        let Resource::Room(room) = res else {
-            return false;
-        };
-        action != Action::Read || room == b"open"
-    }));
+    r.set_authorizer(Box::new(
+        |_id: &Identity, action: Action, res: &Resource| {
+            let Resource::Room(room) = res else {
+                return false;
+            };
+            action != Action::Read || room == b"open"
+        },
+    ));
     let a = hello_auth(&mut r, 1);
 
     // The permitted room subscribes normally.
@@ -98,7 +100,7 @@ fn a_write_denied_room_rejects_ops_and_does_not_ingest() {
     let mut r = registry();
     // Writes denied everywhere; reads allowed.
     r.set_authorizer(Box::new(
-        |_actor: &[u8], action: Action, _res: &Resource| action != Action::Write,
+        |_id: &Identity, action: Action, _res: &Resource| action != Action::Write,
     ));
     let a = hello_auth(&mut r, 1);
     assert!(r.deliver(a, sub(0, b"room-a")));
@@ -120,7 +122,7 @@ fn a_write_denied_room_rejects_ops_and_does_not_ingest() {
 fn a_denied_write_does_not_reach_peers() {
     let mut r = registry();
     r.set_authorizer(Box::new(
-        |_actor: &[u8], action: Action, _res: &Resource| action != Action::Write,
+        |_id: &Identity, action: Action, _res: &Resource| action != Action::Write,
     ));
     let a = hello_auth(&mut r, 1);
     let b = hello_auth(&mut r, 2);
@@ -146,7 +148,7 @@ fn a_denied_write_does_not_reach_peers() {
 fn awareness_publish_can_be_denied() {
     let mut r = registry();
     r.set_authorizer(Box::new(
-        |_actor: &[u8], action: Action, _res: &Resource| action != Action::PublishAwareness,
+        |_id: &Identity, action: Action, _res: &Resource| action != Action::PublishAwareness,
     ));
     let a = hello_auth(&mut r, 1);
     assert!(r.deliver(a, sub(0, b"room-a")));

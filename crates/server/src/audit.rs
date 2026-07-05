@@ -13,6 +13,7 @@
 //! entry's key or value: an awareness publish is logged as *that a publish was
 //! decided*, never as the ephemeral presence it carried.
 
+use crate::auth::Identity;
 use crate::authz::{Action, Authorizer, Resource};
 
 /// How an access was decided.
@@ -64,15 +65,15 @@ impl Audited {
 }
 
 impl Authorizer for Audited {
-    fn authorize(&self, actor: &[u8], action: Action, resource: &Resource) -> bool {
-        let allowed = self.inner.authorize(actor, action, resource);
+    fn authorize(&self, identity: &Identity, action: Action, resource: &Resource) -> bool {
+        let allowed = self.inner.authorize(identity, action, resource);
         let decision = if allowed {
             Decision::Permitted
         } else {
             Decision::Denied
         };
         self.log.record(&AccessRecord {
-            actor,
+            actor: identity.actor(),
             action,
             resource,
             decision,

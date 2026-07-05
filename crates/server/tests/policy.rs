@@ -10,19 +10,35 @@
 //! lines and `#` comment lines are ignored.
 
 use crdtsync_server::acl::{Acl, PolicyErrorKind};
-use crdtsync_server::{Action, Authorizer, Resource};
+use crdtsync_server::{Action, Authorizer, Identity, Resource};
 
 fn read(a: &Acl, actor: &[u8], room: &[u8]) -> bool {
-    a.authorize(actor, Action::Read, &Resource::Room(room))
+    a.authorize(
+        &Identity::new(actor.to_vec()),
+        Action::Read,
+        &Resource::Room(room),
+    )
 }
 fn write(a: &Acl, actor: &[u8], room: &[u8]) -> bool {
-    a.authorize(actor, Action::Write, &Resource::Room(room))
+    a.authorize(
+        &Identity::new(actor.to_vec()),
+        Action::Write,
+        &Resource::Room(room),
+    )
 }
 fn publish(a: &Acl, actor: &[u8], room: &[u8]) -> bool {
-    a.authorize(actor, Action::PublishAwareness, &Resource::Room(room))
+    a.authorize(
+        &Identity::new(actor.to_vec()),
+        Action::PublishAwareness,
+        &Resource::Room(room),
+    )
 }
 fn register(a: &Acl, actor: &[u8], app: &[u8]) -> bool {
-    a.authorize(actor, Action::RegisterSchema, &Resource::App(app))
+    a.authorize(
+        &Identity::new(actor.to_vec()),
+        Action::RegisterSchema,
+        &Resource::App(app),
+    )
 }
 
 const ROOM: &[u8] = b"room-a";
@@ -181,13 +197,51 @@ fn a_parsed_policy_authorizes_identically_to_the_programmatic_builder() {
             for action in actions {
                 let res = Resource::Room(room);
                 assert_eq!(
-                    parsed.authorize(actor, action, &res),
-                    built.authorize(actor, action, &res),
+                    parsed.authorize(&Identity::new(actor.to_vec()), action, &res),
+                    built.authorize(&Identity::new(actor.to_vec()), action, &res),
                     "parsed and built disagree for {actor:?} {action:?} {room:?}",
                 );
             }
         }
     }
+}
+
+#[test]
+fn role_and_group_subjects_parse_and_match_the_claims() {
+    use crdtsync_server::acl::{ResourceMatch, Subject};
+    let parsed = Acl::from_policy(
+        "allow role:editor write *\n\
+         allow group:staff read *",
+    )
+    .unwrap();
+    let built = Acl::new()
+        .allow(
+            Subject::Role("editor".to_string()),
+            Some(Action::Write),
+            ResourceMatch::AnyRoom,
+        )
+        .allow(
+            Subject::Group("staff".to_string()),
+            Some(Action::Read),
+            ResourceMatch::AnyRoom,
+        );
+
+    let editor = Identity::with_claims(b"a".to_vec(), vec!["editor".to_string()], vec![]);
+    let staff = Identity::with_claims(b"b".to_vec(), vec![], vec!["staff".to_string()]);
+    let plain = Identity::new(b"c".to_vec());
+    for id in [&editor, &staff, &plain] {
+        for action in [Action::Read, Action::Write] {
+            let res = Resource::Room(b"room-a");
+            assert_eq!(
+                parsed.authorize(id, action, &res),
+                built.authorize(id, action, &res),
+                "parsed and built disagree",
+            );
+        }
+    }
+    assert!(parsed.authorize(&editor, Action::Write, &Resource::Room(b"room-a")));
+    assert!(parsed.authorize(&staff, Action::Read, &Resource::Room(b"room-a")));
+    assert!(!parsed.authorize(&plain, Action::Write, &Resource::Room(b"room-a")));
 }
 
 // --- malformed input: every class is a typed error on the offending line, never a panic ---
@@ -223,6 +277,17 @@ fn an_unknown_subject_is_a_subject_error() {
     let (line, kind) = err_kind("allow nobody read *");
     assert_eq!(line, 1);
     assert!(matches!(kind, PolicyErrorKind::Subject(_)), "got {kind:?}");
+}
+
+#[test]
+fn an_empty_role_or_group_name_is_a_subject_error() {
+    // A truncated `role:` / `group:` token is a dead rule no identity can match,
+    // so it is rejected rather than loaded silently inert.
+    for policy in ["allow role: read *", "allow group: read *"] {
+        let (line, kind) = err_kind(policy);
+        assert_eq!(line, 1);
+        assert!(matches!(kind, PolicyErrorKind::Subject(_)), "got {kind:?}");
+    }
 }
 
 #[test]

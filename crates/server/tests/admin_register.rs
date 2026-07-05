@@ -11,7 +11,7 @@
 
 use crdtsync_server::admin::{register_schema, RegisterOutcome, RegisterRequest};
 use crdtsync_server::schema_registry::{RegisterError, Registered, SchemaRegistry};
-use crdtsync_server::{Action, Authorizer, Resource, StaticTokens};
+use crdtsync_server::{Action, Authorizer, Identity, Resource, StaticTokens};
 use std::sync::Mutex;
 
 const APP: &[u8] = b"app-x";
@@ -28,9 +28,9 @@ fn verifier() -> StaticTokens {
 
 /// An authorizer that grants `register_schema` to actor `admin` on `app-x` only.
 fn only_admin_on_app_x() -> impl Authorizer {
-    |actor: &[u8], action: Action, res: &Resource| {
+    |id: &Identity, action: Action, res: &Resource| {
         action == Action::RegisterSchema
-            && actor == b"admin"
+            && id.actor() == b"admin"
             && matches!(res, Resource::App(a) if *a == APP)
     }
 }
