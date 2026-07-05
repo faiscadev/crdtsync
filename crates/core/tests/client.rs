@@ -161,8 +161,8 @@ fn authok_records_the_server_derived_actor() {
 
 #[test]
 fn a_schema_advert_is_accepted_without_effect() {
-    // The wire carrier lands here; caching the version and adopting the bytes is a
-    // later slice, so receiving one is a no-op the session accepts.
+    // A schema advertisement drives no room replica: the session accepts it and
+    // its state is unchanged.
     let mut session = ClientSession::new(cid(1));
     session
         .receive(Message::SchemaAdvert {
