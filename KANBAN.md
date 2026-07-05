@@ -157,7 +157,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **Auto-version Unit 1 — engine event bus (server).** `EngineEvent` enum (version created/deleted, connect, subscribe, snapshot/compaction; branch/migration events reserved) + a pluggable `EventSink`, emitted at the lifecycle points — generalizing the audit `AccessLog` sink (#85) into a shared engine event substrate (the webhook + auto-version foundation). First slice of Auto-Version Triggers (§Auto-Version Triggers, design human-resolved 2026-07-04); unblocks the AutoVersion sink (Unit 3), schedule triggers (Unit 4), and the retention-window item. → *Versioning / Debugging*.
 
 ---
 
