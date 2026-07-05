@@ -17,8 +17,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crdtsync_core::doc::Document;
-use crdtsync_core::{ClientId, Op, Scalar};
-use crdtsync_server::store::{RoomLog, Store};
+use crdtsync_core::{ClientId, Scalar};
+use crdtsync_server::store::{RoomLog, Store, StoredOp};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -26,9 +26,14 @@ fn cid(first: u8) -> ClientId {
     ClientId::from_bytes(b)
 }
 
-/// A couple of real ops from client `first`, distinct per call site via `key`.
-fn ops(first: u8, key: &[u8], value: i64) -> Vec<Op> {
-    Document::new(cid(first)).transact(|tx| tx.register(key, Scalar::Int(value)))
+/// A couple of real relay ops (no schema) from client `first`, distinct per
+/// call site via `key`.
+fn ops(first: u8, key: &[u8], value: i64) -> Vec<StoredOp> {
+    Document::new(cid(first))
+        .transact(|tx| tx.register(key, Scalar::Int(value)))
+        .into_iter()
+        .map(|op| StoredOp::new(op, None))
+        .collect()
 }
 
 /// Some opaque snapshot bytes — the store treats a snapshot as a blob.

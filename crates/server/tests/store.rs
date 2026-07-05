@@ -5,7 +5,8 @@
 //!
 //! A [`Store`] persists each room's ops to disk so a restarted node replays
 //! back to the same state. One append-only file per room; each op is one
-//! record, framed as a `u32` little-endian length prefix followed by its
+//! record, framed as a `u32` little-endian creation schema version (`0` for a
+//! relay op), then a `u32` little-endian length prefix followed by its
 //! `encode_op` bytes. `append` is durable — a second handle (a restart) sees
 //! ops the moment the call returns. Loading tolerates a torn tail (a record
 //! half-written when the process died) but rejects a complete, corrupt record.
@@ -14,8 +15,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 
 use crdtsync_core::doc::Document;
-use crdtsync_core::{encode_op, ClientId, Op, Scalar};
-use crdtsync_server::store::Store;
+use crdtsync_core::{encode_op, ClientId, Scalar};
+use crdtsync_server::store::{Store, StoredOp};
 use crdtsync_server::RoomId;
 
 fn cid(first: u8) -> ClientId {
@@ -24,15 +25,22 @@ fn cid(first: u8) -> ClientId {
     ClientId::from_bytes(b)
 }
 
-/// A couple of real ops from client `first`, distinct per call site via `key`.
-fn ops(first: u8, key: &[u8], value: i64) -> Vec<Op> {
-    Document::new(cid(first)).transact(|tx| tx.register(key, Scalar::Int(value)))
+/// A couple of real relay ops (no schema) from client `first`, distinct per
+/// call site via `key`.
+fn ops(first: u8, key: &[u8], value: i64) -> Vec<StoredOp> {
+    Document::new(cid(first))
+        .transact(|tx| tx.register(key, Scalar::Int(value)))
+        .into_iter()
+        .map(|op| StoredOp::new(op, None))
+        .collect()
 }
 
-/// Frame an op the way the store does: `u32` LE length prefix, then its bytes.
-fn frame(op: &Op) -> Vec<u8> {
-    let body = encode_op(op);
-    let mut rec = (body.len() as u32).to_le_bytes().to_vec();
+/// Frame a record the way the store does: `u32` LE creation version, `u32` LE
+/// length prefix, then the op's bytes.
+fn frame(stored: &StoredOp) -> Vec<u8> {
+    let body = encode_op(&stored.op);
+    let mut rec = stored.schema_version.unwrap_or(0).to_le_bytes().to_vec();
+    rec.extend((body.len() as u32).to_le_bytes());
     rec.extend(body);
     rec
 }
@@ -49,7 +57,7 @@ fn sole_file(root: &std::path::Path) -> std::path::PathBuf {
 
 /// The ops loaded for `room`, or panic if the room is absent. These rooms are
 /// never compacted, so a room carries only its log.
-fn loaded(store: &Store, room: &[u8]) -> Vec<Op> {
+fn loaded(store: &Store, room: &[u8]) -> Vec<StoredOp> {
     let logs = store.load().unwrap();
     logs.into_iter()
         .find(|(r, _)| r == room)
@@ -206,7 +214,10 @@ fn a_complete_but_undecodable_record_is_an_error() {
     let file = sole_file(tmp.path());
     let garbage = {
         let body = [0xffu8, 0xff, 0xff];
-        let mut rec = (body.len() as u32).to_le_bytes().to_vec();
+        // A complete record — version 0, then a length prefix that matches the
+        // body — whose body is not a decodable op.
+        let mut rec = 0u32.to_le_bytes().to_vec();
+        rec.extend((body.len() as u32).to_le_bytes());
         rec.extend(body);
         rec
     };
@@ -221,9 +232,9 @@ fn a_complete_but_undecodable_record_is_an_error() {
 }
 
 #[test]
-fn framing_matches_a_length_prefixed_encode_op() {
-    // The on-disk record format is stable contract: readers of an older file
-    // must keep decoding it. One op is its `u32` LE length prefix then bytes.
+fn framing_is_a_version_then_a_length_prefixed_encode_op() {
+    // One record on disk is its `u32` LE creation version, then a `u32` LE
+    // length prefix, then the op bytes.
     let tmp = tempdir();
     let mut store = Store::open(tmp.path()).unwrap();
     let op = ops(1, b"age", 30);
@@ -231,6 +242,28 @@ fn framing_matches_a_length_prefixed_encode_op() {
 
     let on_disk = fs::read(sole_file(tmp.path())).unwrap();
     assert_eq!(on_disk, frame(&op[0]));
+}
+
+#[test]
+fn a_records_creation_version_round_trips() {
+    // A heterogeneous batch — a relay op and an enforced-version op — reloads
+    // with each op's own creation version intact.
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let mut batch = ops(1, b"a", 1); // relay: None
+    batch.extend(
+        ops(2, b"b", 2)
+            .into_iter()
+            .map(|s| StoredOp::new(s.op, Some(7))),
+    );
+    store.append(ROOM, &batch).unwrap();
+
+    let back = loaded(&store, ROOM);
+    assert_eq!(
+        back.iter().map(|s| s.schema_version).collect::<Vec<_>>(),
+        vec![None, Some(7)]
+    );
+    assert_eq!(back, batch);
 }
 
 // --- a tempdir without pulling in a dev-dependency ---

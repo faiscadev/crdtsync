@@ -13,8 +13,13 @@ use std::fs;
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, Message, Op, Scalar};
-use crdtsync_server::store::Store;
+use crdtsync_server::store::{Store, StoredOp};
 use crdtsync_server::{Catchup, Hub, Registry, RoomId, RoomLog};
+
+/// Tag a batch of ops as relay records (no schema) — the store's unit.
+fn relay(ops: Vec<Op>) -> Vec<StoredOp> {
+    ops.into_iter().map(|op| StoredOp::new(op, None)).collect()
+}
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -55,7 +60,7 @@ fn one_room_log(room: &[u8], ops: Vec<Op>) -> Vec<(RoomId, RoomLog)> {
         room.to_vec(),
         RoomLog {
             snapshot: None,
-            ops,
+            ops: relay(ops),
             versions: Vec::new(),
         },
     )]
@@ -81,7 +86,7 @@ fn from_rooms_restores_the_dedup_set() {
     let mut h = Hub::from_rooms(cid(SERVER), one_room_log(ROOM, ops.clone())).unwrap();
     // A client that reconnects and resends a replayed op grows nothing: the
     // log's identities came back with the state.
-    assert!(h.ingest(ROOM, ops).unwrap().is_empty());
+    assert!(h.ingest(ROOM, ops, None).unwrap().is_empty());
     assert_eq!(h.seq(ROOM), 1);
 }
 
@@ -93,6 +98,44 @@ fn from_rooms_with_no_rooms_is_a_fresh_hub() {
 }
 
 #[test]
+fn ingest_tags_the_creation_version_and_replay_preserves_it() {
+    // Three writers at different versions — two enforced, one relay — build a
+    // heterogeneous log; the tags survive a restart from the store, so each op
+    // still knows the version it was created under for later translation.
+    let tmp = tempdir();
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        hub.ingest(
+            ROOM,
+            doc(1).transact(|tx| tx.register(b"a", Scalar::Int(1))),
+            Some(1),
+        )
+        .unwrap();
+        hub.ingest(
+            ROOM,
+            doc(2).transact(|tx| tx.register(b"b", Scalar::Int(2))),
+            Some(2),
+        )
+        .unwrap();
+        hub.ingest(
+            ROOM,
+            doc(3).transact(|tx| tx.register(b"c", Scalar::Int(3))),
+            None,
+        )
+        .unwrap();
+        assert_eq!(hub.logged_versions(ROOM), vec![Some(1), Some(2), None]);
+    }
+    // A restart replays the log from the store: the per-op versions come back.
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hub.logged_versions(ROOM), vec![Some(1), Some(2), None]);
+}
+
+#[test]
 fn from_rooms_replays_independent_rooms() {
     let a = doc(1).transact(|tx| tx.register(b"k", Scalar::Int(1)));
     let b = doc(2).transact(|tx| tx.register(b"k", Scalar::Int(2)));
@@ -101,7 +144,7 @@ fn from_rooms_replays_independent_rooms() {
             b"room-a".to_vec(),
             RoomLog {
                 snapshot: None,
-                ops: a,
+                ops: relay(a),
                 versions: Vec::new(),
             },
         ),
@@ -109,7 +152,7 @@ fn from_rooms_replays_independent_rooms() {
             b"room-b".to_vec(),
             RoomLog {
                 snapshot: None,
-                ops: b,
+                ops: relay(b),
                 versions: Vec::new(),
             },
         ),
@@ -279,7 +322,7 @@ fn write_snapshot(root: &std::path::Path, room: &[u8], base_seq: u64, state: &[u
 /// An in-memory reference: the merged state and sequence a store-less hub reaches.
 fn hub_over(ops: &[Op]) -> Hub {
     let mut hub = Hub::new(cid(SERVER));
-    hub.ingest(ROOM, ops.to_vec()).unwrap();
+    hub.ingest(ROOM, ops.to_vec(), None).unwrap();
     hub
 }
 
@@ -291,7 +334,7 @@ fn a_compacted_hub_reloads_from_its_snapshot() {
     {
         let mut hub = Hub::new(cid(SERVER));
         hub.attach_store(Store::open(tmp.path()).unwrap());
-        hub.ingest(ROOM, ops).unwrap();
+        hub.ingest(ROOM, ops, None).unwrap();
         hub.compact(ROOM).unwrap();
         seq = hub.seq(ROOM);
     }
@@ -317,7 +360,7 @@ fn a_reingested_op_after_a_compacted_restart_is_deduped() {
     {
         let mut hub = Hub::new(cid(SERVER));
         hub.attach_store(Store::open(tmp.path()).unwrap());
-        hub.ingest(ROOM, ops.clone()).unwrap();
+        hub.ingest(ROOM, ops.clone(), None).unwrap();
         hub.compact(ROOM).unwrap();
     }
     // The compacted op's id returns with the snapshot, so a resend is a no-op.
@@ -327,7 +370,7 @@ fn a_reingested_op_after_a_compacted_restart_is_deduped() {
     )
     .unwrap();
     hub.attach_store(Store::open(tmp.path()).unwrap());
-    assert!(hub.ingest(ROOM, ops).unwrap().is_empty());
+    assert!(hub.ingest(ROOM, ops, None).unwrap().is_empty());
     assert_eq!(hub.seq(ROOM), 1);
     assert_eq!(int(hub.get(ROOM, b"age")), 30);
 }
@@ -341,9 +384,9 @@ fn a_snapshot_and_a_tail_reload_together() {
     {
         let mut hub = Hub::new(cid(SERVER));
         hub.attach_store(Store::open(tmp.path()).unwrap());
-        hub.ingest(ROOM, first).unwrap();
+        hub.ingest(ROOM, first, None).unwrap();
         hub.compact(ROOM).unwrap(); // snapshot at seq 1
-        hub.ingest(ROOM, second).unwrap(); // tail: seq 2
+        hub.ingest(ROOM, second, None).unwrap(); // tail: seq 2
     }
     let hub = Hub::from_rooms(
         cid(SERVER),
@@ -369,8 +412,8 @@ fn a_snapshot_beside_a_full_log_reconstructs_correctly() {
 
     {
         let mut store = Store::open(tmp.path()).unwrap();
-        store.append(ROOM, &first).unwrap();
-        store.append(ROOM, &second).unwrap();
+        store.append(ROOM, &relay(first.clone())).unwrap();
+        store.append(ROOM, &relay(second.clone())).unwrap();
     }
     // A snapshot of the state at seq 2, written beside the untruncated log.
     let mut snap = Document::new(cid(SERVER));
@@ -398,12 +441,20 @@ fn an_auto_compacted_room_persists_its_snapshot() {
         hub.attach_store(Store::open(tmp.path()).unwrap());
         hub.set_compaction_threshold(2);
         let mut a = doc(1);
-        hub.ingest(ROOM, a.transact(|tx| tx.register(b"a", Scalar::Int(1))))
-            .unwrap();
+        hub.ingest(
+            ROOM,
+            a.transact(|tx| tx.register(b"a", Scalar::Int(1))),
+            None,
+        )
+        .unwrap();
         // The second op takes the retained log to the threshold, folding it into
         // a durable snapshot.
-        hub.ingest(ROOM, a.transact(|tx| tx.register(b"b", Scalar::Int(2))))
-            .unwrap();
+        hub.ingest(
+            ROOM,
+            a.transact(|tx| tx.register(b"b", Scalar::Int(2))),
+            None,
+        )
+        .unwrap();
     }
     let rooms = Store::open(tmp.path()).unwrap().load().unwrap();
     let (_, rl) = rooms.iter().find(|(room, _)| room == ROOM).unwrap();

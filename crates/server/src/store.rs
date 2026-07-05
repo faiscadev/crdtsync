@@ -2,7 +2,11 @@
 //! compaction snapshot.
 //!
 //! A [`Store`] persists each room's ops to a `<room>.log` file — one record per
-//! op, a `u32` little-endian length prefix followed by its `encode_op` bytes.
+//! op: a `u32` little-endian creation schema version (`0` for a relay op with no
+//! schema), then a `u32` little-endian length prefix followed by its `encode_op`
+//! bytes. The version rides on the record so a heterogeneous log — ops created
+//! under different schema versions — round-trips a restart, and per-recipient
+//! translation can rewrite each op from its own creation version.
 //! An [`append`](Store::append) is durable — it flushes before it returns, so a
 //! restart or a second handle sees the ops immediately. [`compact`](Store::compact)
 //! folds a room's log prefix into a `<room>.snap` snapshot (an `8`-byte
@@ -24,6 +28,23 @@ use crdtsync_core::{decode_op, encode_op, Op};
 
 use crate::RoomId;
 
+/// One logged op with the schema version it was created under — the unit the
+/// heterogeneous log stores and persists. A relay op, created with no schema in
+/// force, carries `None`; an enforced op carries the writing client's version
+/// (always `>= 1`), which per-recipient translation rewrites from.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StoredOp {
+    pub op: Op,
+    pub schema_version: Option<u32>,
+}
+
+impl StoredOp {
+    /// A logged op tagged with its creation schema version.
+    pub fn new(op: Op, schema_version: Option<u32>) -> Self {
+        Self { op, schema_version }
+    }
+}
+
 /// A room's compaction snapshot: the sequence its state covers and the encoded
 /// document state.
 pub struct Snapshot {
@@ -38,7 +59,7 @@ pub struct Snapshot {
 #[derive(Default)]
 pub struct RoomLog {
     pub snapshot: Option<Snapshot>,
-    pub ops: Vec<Op>,
+    pub ops: Vec<StoredOp>,
     /// The room's named versions as `(name, covered seq, state)`.
     pub versions: Vec<(Vec<u8>, u64, Vec<u8>)>,
 }
@@ -56,17 +77,19 @@ impl Store {
         Ok(Store { root })
     }
 
-    /// Append `ops` to `room`'s log, each as a length-prefixed record. Flushes
-    /// before returning so the records survive a crash and are visible to any
-    /// handle opened afterward. An empty batch writes nothing.
-    pub fn append(&mut self, room: &[u8], ops: &[Op]) -> io::Result<()> {
+    /// Append `ops` to `room`'s log, each as a version-tagged, length-prefixed
+    /// record. Flushes before returning so the records survive a crash and are
+    /// visible to any handle opened afterward. An empty batch writes nothing.
+    pub fn append(&mut self, room: &[u8], ops: &[StoredOp]) -> io::Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
         let mut buf = Vec::new();
-        for op in ops {
-            let body = encode_op(op);
+        for stored in ops {
+            let body = encode_op(&stored.op);
             let len = u32::try_from(body.len()).expect("op length exceeds u32");
+            // A relay op (no schema) is version 0; an enforced op is >= 1.
+            buf.extend_from_slice(&stored.schema_version.unwrap_or(0).to_le_bytes());
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&body);
         }
@@ -333,21 +356,25 @@ fn unhex(c: u8) -> Option<u8> {
     }
 }
 
-/// Decode a file's records in order. A trailing record that runs past the end
-/// of the bytes is a torn write and is dropped; a fully-present record that
+/// Decode a file's records in order. Each record is a `u32` creation version
+/// then a `u32`-length-prefixed op body. A trailing record that runs past the
+/// end of the bytes is a torn write and is dropped; a fully-present record that
 /// fails to decode is corruption.
-fn decode_records(bytes: &[u8]) -> io::Result<Vec<Op>> {
+fn decode_records(bytes: &[u8]) -> io::Result<Vec<StoredOp>> {
     let mut ops = Vec::new();
     let mut at = 0;
-    while at + 4 <= bytes.len() {
-        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-        let start = at + 4;
+    // Each record needs a 4-byte version plus a 4-byte length before its body.
+    while at + 8 <= bytes.len() {
+        let version = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let start = at + 8;
         let Some(body) = bytes.get(start..).and_then(|rest| rest.get(..len)) else {
             break; // torn tail: the record outruns the bytes on disk
         };
         let op = decode_op(body)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
-        ops.push(op);
+        // Version 0 is a relay op with no schema; >= 1 is an enforced version.
+        ops.push(StoredOp::new(op, (version != 0).then_some(version)));
         at = start + len;
     }
     Ok(ops)

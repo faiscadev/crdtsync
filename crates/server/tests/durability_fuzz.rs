@@ -148,7 +148,7 @@ fn a_reopened_hub_reproduces_state_sequence_and_catch_up() {
         for _ in 0..16 {
             let which = rng.below(clients.len());
             let ops = random_edit(&mut clients[which], &mut rng);
-            hub.ingest(ROOM, ops).unwrap();
+            hub.ingest(ROOM, ops, None).unwrap();
         }
 
         let live = fingerprint(&hub);
@@ -177,7 +177,7 @@ fn a_reopened_hub_reproduces_state_sequence_and_catch_up() {
         // Re-ingesting the whole log is idempotent — no double-count, no growth.
         let replay = ops(reloaded.catch_up(ROOM, 0));
         assert!(
-            reloaded.ingest(ROOM, replay).unwrap().is_empty(),
+            reloaded.ingest(ROOM, replay, None).unwrap().is_empty(),
             "seed {seed}: a resend of the log grew it"
         );
         assert_eq!(reloaded.seq(ROOM), seq);

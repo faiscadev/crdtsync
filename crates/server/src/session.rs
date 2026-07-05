@@ -338,7 +338,7 @@ pub fn step(
             // The deduped ops fan out to the room's other subscribers; nothing
             // echoes back to the sender. A hub that cannot durably record the
             // ops rejects the write rather than advertising an unpersisted one.
-            match hub.ingest(&room, ops) {
+            match hub.ingest(&room, ops, session.schema_version()) {
                 Ok(applied) => Response {
                     replies: through
                         .map(|through| Message::Accepted { channel, through })

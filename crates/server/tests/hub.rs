@@ -31,7 +31,7 @@ fn doc(first: u8) -> Document {
 
 /// Ingest into an in-memory hub, where persistence can never fail.
 fn ingest(h: &mut Hub, room: &[u8], ops: Vec<Op>) -> Vec<Op> {
-    h.ingest(room, ops).unwrap()
+    h.ingest(room, ops, None).unwrap()
 }
 
 /// Unwrap a catch-up that must be a plain op delta — every room here is

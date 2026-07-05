@@ -34,7 +34,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use registry::{ConnId, Registry};
 pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry};
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
-pub use store::{RoomLog, Snapshot, Store};
+pub use store::{RoomLog, Snapshot, Store, StoredOp};
 
 /// A room name, opaque bytes chosen by the deployment.
 pub type RoomId = Vec<u8>;
@@ -45,7 +45,7 @@ pub type RoomId = Vec<u8>;
 /// `log[i]` carries seq `base_seq + i + 1`.
 struct Room {
     doc: Document,
-    log: Vec<Op>,
+    log: Vec<StoredOp>,
     seen: HashSet<OpId>,
     base_seq: u64,
 }
@@ -509,8 +509,10 @@ impl Hub {
                 },
             );
         }
-        // Store-less replay: these ops are already durable, so ingest can't fail.
-        self.ingest(&room, log.ops)
+        // Store-less replay: these records are already durable and carry their
+        // own creation versions, so replay commits them as-is (never re-tagging
+        // the batch) and cannot fail.
+        self.ingest_records(&room, log.ops)
             .expect("a store-less replay never fails");
         if !log.versions.is_empty() {
             let index = self.versions.entry(room).or_default();
@@ -528,24 +530,45 @@ impl Hub {
         self.store = Some(store);
     }
 
-    /// Apply a client's ops to `room` (creating it if new), skipping any op
+    /// Apply a client's ops to `room` (creating it if new), tagging each with
+    /// the `schema_version` it was created under — the writing connection's
+    /// enforced version, or `None` for a relay op with no schema. Skips any op
     /// already seen. A new op is durably logged before it is applied, so the
     /// merged state and the catch-up log never expose a write the disk has not
     /// accepted. Returns the ops newly applied, in server-sequence order — the
     /// batch to broadcast to the room's subscribers.
-    pub fn ingest(&mut self, room: &[u8], ops: Vec<Op>) -> io::Result<Vec<Op>> {
+    pub fn ingest(
+        &mut self,
+        room: &[u8],
+        ops: Vec<Op>,
+        schema_version: Option<u32>,
+    ) -> io::Result<Vec<Op>> {
+        let records = ops
+            .into_iter()
+            .map(|op| StoredOp::new(op, schema_version))
+            .collect();
+        self.ingest_records(room, records)
+    }
+
+    /// Commit already-tagged records — the shared body of live [`ingest`](Hub::ingest)
+    /// and store replay. Dedups against the room's seen set and within the batch,
+    /// persists the fresh records (when a store is attached), then applies and
+    /// logs them. Replay passes the records decoded from disk, preserving each
+    /// op's own creation version rather than re-tagging the batch.
+    fn ingest_records(&mut self, room: &[u8], records: Vec<StoredOp>) -> io::Result<Vec<Op>> {
         let server = self.server;
         let key = room;
-        // The ops not already logged, deduped within the batch too — the set
+        // The records not already logged, deduped within the batch too — the set
         // that would grow the log.
-        let fresh: Vec<Op> = {
+        let fresh: Vec<StoredOp> = {
             let room = self
                 .rooms
                 .entry(room.to_vec())
                 .or_insert_with(|| Room::new(server));
             let mut batch = HashSet::new();
-            ops.into_iter()
-                .filter(|op| !room.seen.contains(&op.id) && batch.insert(op.id))
+            records
+                .into_iter()
+                .filter(|rec| !room.seen.contains(&rec.op.id) && batch.insert(rec.op.id))
                 .collect()
         };
         // Persist before committing: an op reaches the replica and the log only
@@ -554,10 +577,10 @@ impl Hub {
             store.append(room, &fresh)?;
         }
         let room = self.rooms.get_mut(room).expect("room created above");
-        for op in &fresh {
-            room.seen.insert(op.id);
-            room.doc.apply(op);
-            room.log.push(op.clone());
+        for rec in &fresh {
+            room.seen.insert(rec.op.id);
+            room.doc.apply(&rec.op);
+            room.log.push(rec.clone());
         }
         // A retained log that has grown to the threshold folds into a snapshot
         // now, resetting the window; the applied batch is returned unchanged.
@@ -566,7 +589,7 @@ impl Hub {
         {
             self.compact(key)?;
         }
-        Ok(fresh)
+        Ok(fresh.into_iter().map(|rec| rec.op).collect())
     }
 
     /// What a subscriber needs given the sequence it last saw. Above the
@@ -593,7 +616,7 @@ impl Hub {
         let delta = room
             .log
             .get(start..)
-            .map(<[Op]>::to_vec)
+            .map(|records| records.iter().map(|rec| rec.op.clone()).collect())
             .unwrap_or_default();
         Catchup::Ops(delta)
     }
@@ -669,6 +692,17 @@ impl Hub {
     /// Read the merged state of a top-level slot in `room`.
     pub fn get(&self, room: &[u8], key: &[u8]) -> Option<Element> {
         self.rooms.get(room).and_then(|r| r.doc.get(key))
+    }
+
+    /// The creation schema version of each op still retained in `room`'s log, in
+    /// server-sequence order — `None` for a relay op. The heterogeneous log:
+    /// ops from different schema versions coexist, each carrying its own, which
+    /// per-recipient translation rewrites from. Empty for an unknown room.
+    pub fn logged_versions(&self, room: &[u8]) -> Vec<Option<u32>> {
+        self.rooms
+            .get(room)
+            .map(|r| r.log.iter().map(|rec| rec.schema_version).collect())
+            .unwrap_or_default()
     }
 
     /// Capture the room's current whole-replica state as a named version, keyed

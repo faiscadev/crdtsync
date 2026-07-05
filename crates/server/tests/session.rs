@@ -172,7 +172,7 @@ fn subscribe_binds_the_room_to_its_channel() {
 fn subscribe_replies_with_the_catch_up_batch() {
     let mut h = hub();
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    h.ingest(ROOM, ops.clone()).unwrap();
+    h.ingest(ROOM, ops.clone(), None).unwrap();
 
     let mut s = Session::new();
     handshake(&mut h, &mut s, 2);
@@ -185,7 +185,7 @@ fn subscribe_replies_with_the_catch_up_batch() {
 fn subscribe_below_a_compaction_floor_replies_with_a_snapshot() {
     let mut h = hub();
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    h.ingest(ROOM, ops).unwrap();
+    h.ingest(ROOM, ops, None).unwrap();
     let head = h.seq(ROOM);
     h.compact(ROOM).unwrap();
 
@@ -217,7 +217,7 @@ fn subscribe_below_a_compaction_floor_replies_with_a_snapshot() {
 fn subscribe_at_the_head_of_a_compacted_room_replies_with_an_empty_batch() {
     let mut h = hub();
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
-    h.ingest(ROOM, ops).unwrap();
+    h.ingest(ROOM, ops, None).unwrap();
     let head = h.seq(ROOM);
     h.compact(ROOM).unwrap();
 
