@@ -200,6 +200,53 @@ fn with_key(op: &Op, new_key: Vec<u8>) -> Op {
     Op { kind, ..op.clone() }
 }
 
+/// Rewrite one op forward along a contiguous ascending chain of edges — from the
+/// op's creation version up to the target — folding each edge's forward rewrite,
+/// a drop short-circuiting the rest. Forward translation is always defined.
+///
+/// The caller supplies the chain segment between the two versions, ascending and
+/// contiguous (`edges[i].to == edges[i + 1].from`); an empty slice is identity.
+pub fn rewrite_up_along(edges: &[Migration], op: &Op) -> OpRewrite {
+    let mut current = op.clone();
+    for edge in edges {
+        match edge.rewrite_up(&current) {
+            OpRewrite::Keep(next) => current = next,
+            OpRewrite::Drop => return OpRewrite::Drop,
+        }
+    }
+    OpRewrite::Keep(current)
+}
+
+/// Rewrite one op backward along a contiguous ascending chain — from the top
+/// version down to the target — `None` when any edge on the path is breaking, so
+/// the target is unreachable and the recipient is refused at the handshake. The
+/// chain inverts top-first, so it is walked in reverse.
+///
+/// The caller supplies the same ascending, contiguous segment as
+/// [`rewrite_up_along`]; an empty slice is identity.
+pub fn rewrite_down_along(edges: &[Migration], op: &Op) -> Option<OpRewrite> {
+    if !reachable_down(edges) {
+        return None;
+    }
+    let mut current = op.clone();
+    for edge in edges.iter().rev() {
+        match edge.rewrite_down(&current)? {
+            OpRewrite::Keep(next) => current = next,
+            OpRewrite::Drop => return Some(OpRewrite::Drop),
+        }
+    }
+    Some(OpRewrite::Keep(current))
+}
+
+/// Whether the bottom of a contiguous ascending chain is reachable from the top
+/// by down-migration — true iff every edge is back-compatible (has an inverse).
+/// A single breaking edge strands the older version; forward (up) is always
+/// reachable, so there is no `reachable_up`. Consistent with
+/// [`rewrite_down_along`], which is `Some` exactly when this holds.
+pub fn reachable_down(edges: &[Migration]) -> bool {
+    edges.iter().all(|e| e.compat() == Compat::BackCompatible)
+}
+
 /// Why a migration failed to parse or validate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MigrationErrorKind {
@@ -287,6 +334,37 @@ impl Migration {
         } else {
             Compat::Breaking
         }
+    }
+
+    /// Rewrite one op forward across the whole edge — its steps threaded in
+    /// declaration order, a drop short-circuiting the rest.
+    pub fn rewrite_up(&self, op: &Op) -> OpRewrite {
+        let mut current = op.clone();
+        for step in &self.steps {
+            match step.rewrite_up(&current) {
+                OpRewrite::Keep(next) => current = next,
+                OpRewrite::Drop => return OpRewrite::Drop,
+            }
+        }
+        OpRewrite::Keep(current)
+    }
+
+    /// Rewrite one op backward across the whole edge — `None` when the edge is
+    /// breaking (no inverse). Inverting an edge inverts its steps last-to-first,
+    /// so the steps are threaded in reverse; every step of a back-compatible edge
+    /// is itself back-compatible, so each has a down-rewrite.
+    pub fn rewrite_down(&self, op: &Op) -> Option<OpRewrite> {
+        if self.compat() == Compat::Breaking {
+            return None;
+        }
+        let mut current = op.clone();
+        for step in self.steps.iter().rev() {
+            match step.rewrite_down(&current)? {
+                OpRewrite::Keep(next) => current = next,
+                OpRewrite::Drop => return Some(OpRewrite::Drop),
+            }
+        }
+        Some(OpRewrite::Keep(current))
     }
 
     /// Parse and validate a migration from its JSON source.

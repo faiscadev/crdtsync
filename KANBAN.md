@@ -157,7 +157,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **Unit 7d — chain composition + reachability (core)** — handed to `/cs-implement` (cs-next 2026-07-05): edge-level `Migration::rewrite_up/down` (fold steps, Drop short-circuits; down reverses order, None if the edge is breaking) + chain-level composition of a version path into one `OpRewrite`, plus the reachability predicate (down bridges iff every edge is back-compatible; up always bridges). Resolves the 7c-deferred edge composition. Builds on 7a/7b/7c (#181/#182/#183).
 
 ---
 
