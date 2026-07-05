@@ -192,13 +192,28 @@ impl Document {
         self.root.borrow().get(key)
     }
 
+    /// Whether `key` in `map_id` ever named a container — the registry retains a
+    /// deleted container at the id its key derives, so a tombstoned slot can still
+    /// carry container identity a leaf migration must not disturb.
+    fn has_container_identity(&self, map_id: ElementId, key: &[u8]) -> bool {
+        [ElementKind::Map, ElementKind::List, ElementKind::Text]
+            .into_iter()
+            .any(|kind| {
+                let id = ElementId::derive(map_id, key, kind);
+                self.maps.contains_key(&id)
+                    || self.lists.contains_key(&id)
+                    || self.texts.contains_key(&id)
+            })
+    }
+
     /// Migrate a snapshot's leaf slots by `fate`, keyed on the slot key — the
     /// state-level analogue of translating the op stream between two schema
     /// versions, so a snapshot-served joiner converges with a peer served the
     /// same history as a translated op delta. Across every map, each leaf slot
     /// (scalar / register / counter, live or tombstoned) is `Keep`t, `Drop`ped,
-    /// or `Rename`d to a new key per `fate`; a live container (map / list / text)
-    /// is always kept unre-keyed, mirroring the op seam, which carries a
+    /// or `Rename`d to a new key per `fate`; a container slot (map / list / text)
+    /// — live, or a tombstoned deleted one whose identity the registry still holds
+    /// — is always carried verbatim, mirroring the op seam, which carries a
     /// container-create verbatim rather than tear its subtree. A dropped or
     /// renamed counter's element moves with its slot — dropped from the registry,
     /// or merged into the counter at the id its new key derives (matching the op
@@ -206,6 +221,13 @@ impl Document {
     /// counter lingers. Returns whether any slot changed. `fate` is the
     /// composition of the chain's per-step key rewrites; supplying `|_| Keep` is
     /// a no-op.
+    ///
+    /// A container field's *full* migration is out of scope here: re-keying a
+    /// deleted container to match the op seam (which resurrects the create at the
+    /// old key while re-keying the delete) needs the create's stamp, which the
+    /// materialized tombstone has dropped. Such a slot is left verbatim rather
+    /// than mis-migrated as a leaf; faithful container-field migration is the
+    /// deferred element-set-aware seam.
     pub fn migrate_leaf_slots(&mut self, fate: impl Fn(&[u8]) -> SlotFate) -> bool {
         let mut changed = false;
         let map_ids: Vec<ElementId> = self.maps.keys().copied().collect();
@@ -221,7 +243,15 @@ impl Document {
             let mut moved: Vec<LeafMove> = Vec::new();
             let keys = map.borrow().slot_keys();
             for key in keys {
-                if map.borrow().slot_is_live_container(&key) {
+                // Carry a container slot verbatim — a live one, or a tombstoned
+                // deleted one whose container identity the registry still holds.
+                // The latter's `value` is `None`, so it would otherwise migrate as
+                // a leaf tombstone; a snapshot cannot re-key it faithfully (the
+                // create's stamp is gone), so leave it untouched.
+                let is_container = map.borrow().slot_is_live_container(&key)
+                    || (map.borrow().slot_is_tombstone(&key)
+                        && self.has_container_identity(map_id, &key));
+                if is_container {
                     continue;
                 }
                 let fate = match fate(&key) {
@@ -246,10 +276,17 @@ impl Document {
                         self.counters.remove(&old_counter);
                     }
                     SlotFate::Rename(to) => {
+                        // Capture the retained tally from the registry, falling
+                        // back to the live slot handle so a live counter always
+                        // carries its tally even if it was never registered.
                         let captured = self
                             .counters
                             .remove(&old_counter)
-                            .map(|c| c.borrow().deep_clone());
+                            .map(|c| c.borrow().deep_clone())
+                            .or_else(|| match &value {
+                                Some(Element::Counter(c)) => Some(c.borrow().deep_clone()),
+                                _ => None,
+                            });
                         let body = if live_counter {
                             SlotBody::LiveCounter
                         } else {
@@ -289,10 +326,10 @@ impl Document {
                 });
                 let value = match body {
                     // The live counter's slot points at the merged registry handle
-                    // the LWW winner resolves through.
-                    SlotBody::LiveCounter => Some(Element::Counter(
-                        rehomed.expect("a live counter captured its tally"),
-                    )),
+                    // the LWW winner resolves through. `rehomed` is `Some` whenever
+                    // a tally was captured (always, for a live counter); a `None`
+                    // leaves the slot empty rather than panicking.
+                    SlotBody::LiveCounter => rehomed.map(Element::Counter),
                     // Re-derive a register's id from the new key so a snapshot-served
                     // joiner encodes the same id an op-served peer derives from the
                     // renamed RegisterSet.

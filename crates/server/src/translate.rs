@@ -94,6 +94,21 @@ impl Chain {
         }
     }
 
+    /// The fate of a leaf slot at `key` under this chain — the state-level image
+    /// of translating a key-bearing op at that key. A drop of the op is a
+    /// [`SlotFate::Drop`], a key rewrite a [`SlotFate::Rename`], an unchanged
+    /// keep a [`SlotFate::Keep`]. Drives the snapshot migration exactly as the
+    /// op-rewrite drives the live/catch-up seam, so the two converge.
+    pub fn translate_key(&self, key: &[u8]) -> SlotFate {
+        match self.translate_op(&key_probe(key)) {
+            OpRewrite::Drop => SlotFate::Drop,
+            OpRewrite::Keep(out) => match out.kind {
+                OpKind::MapSet { key: rekeyed, .. } if rekeyed != key => SlotFate::Rename(rekeyed),
+                _ => SlotFate::Keep,
+            },
+        }
+    }
+
     /// Rewrite a batch of ops for this recipient, dropping any the chain removes.
     ///
     /// A container-create ([`MapCreate`]/[`ListCreate`]/[`TextCreate`]) is carried
@@ -124,21 +139,6 @@ impl Chain {
     /// [`MapCreate`]: crdtsync_core::OpKind::MapCreate
     /// [`ListCreate`]: crdtsync_core::OpKind::ListCreate
     /// [`TextCreate`]: crdtsync_core::OpKind::TextCreate
-    /// The fate of a leaf slot at `key` under this chain — the state-level image
-    /// of translating a key-bearing op at that key. A drop of the op is a
-    /// [`SlotFate::Drop`], a key rewrite a [`SlotFate::Rename`], an unchanged
-    /// keep a [`SlotFate::Keep`]. Drives the snapshot migration exactly as the
-    /// op-rewrite drives the live/catch-up seam, so the two converge.
-    pub fn translate_key(&self, key: &[u8]) -> SlotFate {
-        match self.translate_op(&key_probe(key)) {
-            OpRewrite::Drop => SlotFate::Drop,
-            OpRewrite::Keep(out) => match out.kind {
-                OpKind::MapSet { key: rekeyed, .. } if rekeyed != key => SlotFate::Rename(rekeyed),
-                _ => SlotFate::Keep,
-            },
-        }
-    }
-
     pub fn translate_ops(&self, ops: &[Op]) -> Vec<Op> {
         let rewritten: Vec<OpRewrite> = ops
             .iter()

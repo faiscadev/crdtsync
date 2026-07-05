@@ -120,6 +120,13 @@ impl Map {
             .is_some_and(Element::is_container)
     }
 
+    /// Whether `key`'s slot is a tombstone (deleted, no live value). A migration
+    /// consults this to tell a deleted container's slot — whose lost identity a
+    /// snapshot cannot re-key faithfully — from a live one.
+    pub(crate) fn slot_is_tombstone(&self, key: &[u8]) -> bool {
+        self.slots.get(key).is_some_and(|e| e.tombstone)
+    }
+
     /// Remove the slot at `key`, returning its `(stamp, value, tombstone)`.
     pub(crate) fn take_slot(&mut self, key: &[u8]) -> Option<(Stamp, Option<Element>, bool)> {
         self.slots

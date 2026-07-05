@@ -148,6 +148,29 @@ fn a_text_slot_is_never_dropped_or_renamed() {
 }
 
 #[test]
+fn a_deleted_container_slot_is_carried_verbatim() {
+    // A create-then-delete leaves a tombstone slot (value None) plus the displaced
+    // container retained in the registry. It must NOT migrate as a leaf tombstone:
+    // the op seam carries the create verbatim (resurrecting it at the old key) and
+    // the materialized snapshot has lost the create's stamp, so a snapshot cannot
+    // re-key it faithfully — it is carried verbatim, both drop and rename a no-op.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"note").set(b"inner", Scalar::Int(7));
+    });
+    d.transact(|tx| tx.delete(b"note"));
+    assert!(
+        !d.migrate_leaf_slots(drop_keys(&[b"note"])),
+        "a deleted container's tombstone is not dropped as a leaf"
+    );
+    assert!(
+        !d.migrate_leaf_slots(rename(b"note", b"renamed")),
+        "a deleted container's tombstone is not re-keyed as a leaf"
+    );
+    assert!(d.get(b"renamed").is_none(), "nothing lands at the new key");
+}
+
+#[test]
 fn a_leaf_inside_a_kept_container_is_migrated() {
     let mut d = doc();
     d.transact(|tx| {
