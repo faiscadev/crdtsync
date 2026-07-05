@@ -8,7 +8,7 @@
 use crdtsync_core::migration::OpRewrite;
 use crdtsync_core::{ClientId, ElementId, Op, OpId, OpKind, Scalar, Stamp};
 use crdtsync_server::schema_registry::SchemaRegistry;
-use crdtsync_server::translate::{reachable, translate_op, TranslateError};
+use crdtsync_server::translate::{reachable, translate_op, translate_ops, TranslateError};
 
 const APP: &[u8] = b"app";
 
@@ -240,6 +240,30 @@ fn an_unknown_app_has_no_edge() {
         translate_op(&reg, b"other", &set("age"), 1, 2),
         Err(TranslateError::MissingEdge { version: 2 })
     );
+}
+
+#[test]
+fn translate_ops_keeps_the_translatable_and_drops_the_rest() {
+    // 1->2 renames age->years and removes secret. Up, a batch of [age, secret,
+    // name] yields [years, name]: age renamed, secret dropped, name untouched.
+    let reg = registry_with(&[&edge(
+        2,
+        r#"{ "kind": "renameField", "type": "m", "from": "age", "to": "years" }, { "kind": "removeField", "type": "m", "field": "secret" }"#,
+    )]);
+    let batch = [set("age"), set("secret"), set("name")];
+    let out = translate_ops(&reg, APP, &batch, 1, 2);
+    assert_eq!(out, vec![set("years"), set("name")]);
+}
+
+#[test]
+fn translate_ops_drops_an_op_it_cannot_reach() {
+    // A breaking down edge: every op is dropped rather than served wrong.
+    let reg = registry_with(&[&edge(
+        2,
+        r#"{ "kind": "removeField", "type": "m", "field": "old" }"#,
+    )]);
+    let batch = [set("a"), set("b")];
+    assert!(translate_ops(&reg, APP, &batch, 2, 1).is_empty());
 }
 
 #[test]

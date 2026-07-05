@@ -488,7 +488,7 @@ impl Registry {
             Some(None) => self.connection_schema(id),
             None => None,
         };
-        let (broadcast, close, room, awareness, authed_client, bind) = {
+        let (broadcast, broadcast_version, close, room, awareness, authed_client, bind) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
             };
@@ -530,6 +530,7 @@ impl Registry {
             });
             (
                 resp.broadcast,
+                resp.broadcast_version,
                 resp.close,
                 resp.broadcast_room,
                 resp.awareness,
@@ -560,6 +561,21 @@ impl Registry {
                 // resolved once (owned) so the peer loop can borrow the conns.
                 let schema = self.governing_schema(&room);
                 let authorizer = &*self.authorizer;
+                // Per-recipient migration translation rides the same seam as
+                // redaction: an enforcing room with a versioned write rewrites
+                // each op from the writer's version to the recipient's. Resolve
+                // the room's app and lock the registry across the fan-out only
+                // then — a relay write (no source version) or an unbound room
+                // needs no translation and no lock.
+                let translate = broadcast_version
+                    .zip(self.room_apps.get(&room).map(|(app_id, _)| app_id.clone()));
+                // Locked by direct field access (not a `&self` method) so the
+                // guard borrows only `self.schema`, leaving `self.conns` free for
+                // the peer loop below.
+                let registry = translate.as_ref().map(|_| match self.schema.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                });
                 for (peer, conn) in self.conns.iter_mut() {
                     if *peer == id {
                         continue;
@@ -570,10 +586,28 @@ impl Registry {
                     if !peer_may_read(authorizer, schema.as_deref(), &conn.session, &room) {
                         continue;
                     }
+                    // Translate to the recipient's version, or send verbatim when
+                    // there is nothing to bridge — a same-version or relay
+                    // recipient, or a relay write. A recipient the chain cannot
+                    // reach receives the ops it can (the rest dropped), pending
+                    // the handshake range-check that refuses it outright.
+                    let ops = match (&translate, &registry, conn.session.schema_version()) {
+                        (Some((source, app_id)), Some(registry), Some(target))
+                            if target != *source =>
+                        {
+                            crate::translate::translate_ops(
+                                registry, app_id, &broadcast, *source, target,
+                            )
+                        }
+                        _ => broadcast.clone(),
+                    };
+                    if ops.is_empty() {
+                        continue;
+                    }
                     for channel in conn.session.channels_for_room(&room) {
                         conn.outbox.push(Message::Ops {
                             channel,
-                            ops: broadcast.clone(),
+                            ops: ops.clone(),
                         });
                     }
                 }

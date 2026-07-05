@@ -64,6 +64,27 @@ pub fn translate_op(
     }
 }
 
+/// Translate a batch of ops created at version `from` for a recipient at `to`,
+/// keeping each op's rewritten image and dropping any the chain removes. An op
+/// the recipient cannot be served — a `Drop`, or an error (an unreachable
+/// breaking gap, a chain gap, an unparseable edge) — is omitted rather than
+/// delivered wrong; the handshake range-check (a later slice) refuses an
+/// unreachable recipient outright, so a drop here is a safe interim.
+pub fn translate_ops(
+    reg: &SchemaRegistry,
+    app_id: &[u8],
+    ops: &[Op],
+    from: u32,
+    to: u32,
+) -> Vec<Op> {
+    ops.iter()
+        .filter_map(|op| match translate_op(reg, app_id, op, from, to) {
+            Ok(OpRewrite::Keep(op)) => Some(op),
+            Ok(OpRewrite::Drop) | Err(_) => None,
+        })
+        .collect()
+}
+
 /// Whether a recipient at `to` can be reached from an op created at `from`.
 /// Forward (`to >= from`) always, once the edges are registered; down only when
 /// every edge on the path is back-compatible. A `MissingEdge` / `BadMigration`
