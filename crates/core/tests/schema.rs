@@ -10,8 +10,8 @@
 
 use crdtsync_core::json::JsonErrorKind;
 use crdtsync_core::schema::{
-    Action, AwarenessEntry, Effect, Schema, SchemaErrorKind, Subject, SubjectClass, TemplateVar,
-    TypeDef,
+    Action, AutoVersion, AwarenessEntry, Effect, Schema, SchemaErrorKind, Subject, SubjectClass,
+    TemplateVar, Trigger, TriggerEvent, TypeDef,
 };
 
 fn parse(s: &str) -> Schema {
@@ -226,6 +226,132 @@ fn awareness_kinds_keep_declaration_order() {
     );
     let kinds: Vec<&str> = s.awareness().iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(kinds, ["cursor", "selection", "presence"]);
+}
+
+// --- autoVersion ---
+
+fn with_auto_version(body: &str) -> String {
+    format!(
+        r#"{{ "schema": "s", "version": 1, "root": "R",
+            "types": {{ "R": {{ "kind": "map" }} }},
+            "autoVersion": {body} }}"#
+    )
+}
+
+#[test]
+fn a_schema_without_auto_version_has_no_triggers() {
+    let s = parse(FULL);
+    assert!(s.auto_version().is_empty());
+}
+
+#[test]
+fn parses_event_and_schedule_triggers_with_retention() {
+    let s = parse(&with_auto_version(
+        r#"[
+            { "on": "before-publish", "name": "auto/publish/${timestamp}", "keep": 20 },
+            { "every": "1h", "name": "auto/hourly/${timestamp}", "keep": 24 },
+            { "on": "subscribe", "name": "auto/join" }
+        ]"#,
+    ));
+    assert_eq!(
+        s.auto_version(),
+        [
+            AutoVersion {
+                trigger: Trigger::On(TriggerEvent::BeforePublish),
+                name: "auto/publish/${timestamp}".to_string(),
+                keep: Some(20),
+            },
+            AutoVersion {
+                // 1h in milliseconds.
+                trigger: Trigger::Every(3_600_000),
+                name: "auto/hourly/${timestamp}".to_string(),
+                keep: Some(24),
+            },
+            AutoVersion {
+                trigger: Trigger::On(TriggerEvent::Subscribe),
+                name: "auto/join".to_string(),
+                keep: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn every_duration_unit_converts_to_milliseconds() {
+    for (spec, millis) in [
+        ("30s", 30_000),
+        ("5m", 300_000),
+        ("2h", 7_200_000),
+        ("1d", 86_400_000),
+    ] {
+        let s = parse(&with_auto_version(&format!(
+            r#"[ {{ "every": "{spec}", "name": "n" }} ]"#
+        )));
+        assert_eq!(s.auto_version()[0].trigger, Trigger::Every(millis));
+    }
+}
+
+#[test]
+fn the_reserved_events_are_declarable() {
+    // The branch/migration events parse now and fire once those layers land.
+    for event in ["before-publish", "after-restore", "before-migration"] {
+        let s = parse(&with_auto_version(&format!(
+            r#"[ {{ "on": "{event}", "name": "n" }} ]"#
+        )));
+        assert!(matches!(s.auto_version()[0].trigger, Trigger::On(_)));
+    }
+}
+
+#[test]
+fn an_unknown_trigger_event_is_rejected() {
+    let src = with_auto_version(r#"[ { "on": "subscrib", "name": "n" } ]"#);
+    assert_eq!(err(&src), SchemaErrorKind::UnknownEvent);
+}
+
+#[test]
+fn a_trigger_needs_exactly_one_of_on_or_every() {
+    let both = with_auto_version(r#"[ { "on": "subscribe", "every": "1h", "name": "n" } ]"#);
+    assert_eq!(err(&both), SchemaErrorKind::BadTrigger);
+    let neither = with_auto_version(r#"[ { "name": "n" } ]"#);
+    assert_eq!(err(&neither), SchemaErrorKind::BadTrigger);
+}
+
+#[test]
+fn a_malformed_schedule_duration_is_rejected() {
+    for spec in ["1", "h", "1y", "", "1.5h", "1h30m", "x"] {
+        let src = with_auto_version(&format!(r#"[ {{ "every": "{spec}", "name": "n" }} ]"#));
+        assert_eq!(
+            err(&src),
+            SchemaErrorKind::BadDuration,
+            "duration {spec:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn an_empty_or_missing_name_is_rejected() {
+    let empty = with_auto_version(r#"[ { "on": "subscribe", "name": "" } ]"#);
+    assert_eq!(err(&empty), SchemaErrorKind::EmptyName);
+    let missing = with_auto_version(r#"[ { "on": "subscribe" } ]"#);
+    assert_eq!(err(&missing), SchemaErrorKind::MissingField);
+}
+
+#[test]
+fn a_negative_keep_is_rejected() {
+    let src = with_auto_version(r#"[ { "on": "subscribe", "name": "n", "keep": -1 } ]"#);
+    assert_eq!(err(&src), SchemaErrorKind::BadRange);
+}
+
+#[test]
+fn an_unknown_trigger_field_is_rejected() {
+    let src = with_auto_version(r#"[ { "on": "subscribe", "name": "n", "retain": 5 } ]"#);
+    assert_eq!(err(&src), SchemaErrorKind::UnknownField);
+}
+
+#[test]
+fn auto_version_must_be_an_array() {
+    let src = with_auto_version(r#"{ "on": "subscribe", "name": "n" }"#);
+    assert_eq!(err(&src), SchemaErrorKind::WrongType);
 }
 
 #[test]
@@ -602,6 +728,14 @@ fn hostile_inputs_never_panic() {
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map", "children": { "x": { "kind": "map" } } } } }"#,
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "list", "items": "R" } } }"#,
         "\u{1F600}",
+        // autoVersion shapes, incl. a multibyte `every` unit — the duration
+        // parser slices off the last char, so a non-ASCII unit must not panic.
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": 3 }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ 3 ] }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "every": "1€", "name": "n" } ] }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "every": "€", "name": "n" } ] }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "every": "999999999999999999999d", "name": "n" } ] }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "on": 7, "name": "n" } ] }"#,
     ];
     for s in inputs {
         // The contract is only that it returns — Ok or Err, never a panic.
