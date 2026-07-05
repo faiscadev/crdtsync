@@ -8,13 +8,19 @@
 //! ACL-as-CRDT layer feeds its tuples into the same evaluation once it lands.
 //!
 //! A [`Subject`] is matched against the full [`Identity`] an enforcement point
-//! carries: its actor id, or the roles and groups its credential asserts. Schema
-//! `@auth` role grants (decision-flow step 4) feed into this same evaluation once
-//! the schema tier lands; here the flow is its explicit-tuple steps: deny-wins,
-//! then allow, then default-deny.
+//! carries: its actor id, or the roles and groups its credential asserts. Within
+//! an [`Acl`] the flow is its explicit-tuple steps: deny-wins, then allow, then —
+//! for a request no rule mentions — [`Abstain`](crate::authz::Decision::Abstain).
+//! [`authorized`] composes that abstain with the room's governing schema `@auth`
+//! grants (decision-flow step 4) and a terminal default-deny.
+
+use crdtsync_core::schema::{
+    Action as SchemaAction, Auth, Effect as GrantEffect, Schema, Subject as GrantSubject,
+    SubjectClass,
+};
 
 use crate::auth::Identity;
-use crate::authz::{Action, Authorizer, Resource};
+use crate::authz::{Action, Authorizer, Decision, Resource};
 
 /// Anonymous actors are minted with this prefix, so a subject can tell an
 /// anonymous connection from a credentialed one without reading claims.
@@ -385,17 +391,119 @@ fn unhex(c: u8) -> Option<u8> {
 
 impl Authorizer for Acl {
     fn authorize(&self, identity: &Identity, action: Action, resource: &Resource) -> bool {
+        matches!(self.decide(identity, action, resource), Decision::Allow)
+    }
+
+    /// Deny-wins over the matching rules, then explicit-allow; a request no rule
+    /// mentions is [`Abstain`](Decision::Abstain), not a deny — so the schema
+    /// tier can still speak for it. (A standalone [`Acl`] resolves that abstain to
+    /// a deny through [`authorize`](Acl::authorize); only the layered
+    /// [`authorized`] evaluation consults the schema.)
+    fn decide(&self, identity: &Identity, action: Action, resource: &Resource) -> Decision {
         let mut allowed = false;
         for rule in &self.rules {
             if rule.matches(identity, action, resource) {
                 match rule.effect {
-                    // An explicit deny wins outright, whatever else matched.
-                    Effect::Deny => return false,
+                    Effect::Deny => return Decision::Deny,
                     Effect::Allow => allowed = true,
                 }
             }
         }
-        // No matching allow (and no deny) is a denial: absence of a grant denies.
-        allowed
+        if allowed {
+            Decision::Allow
+        } else {
+            Decision::Abstain
+        }
+    }
+}
+
+/// The composed authorization decision the data-plane enforcement points make:
+/// the deployment [`Authorizer`] first, then — only where it abstains — the room's
+/// governing schema `@auth` grants, then a terminal default-deny. This is the
+/// decision flow's tail (explicit deny → explicit allow → schema role-grant →
+/// default-deny); ownership and per-actor doc-ACL tiers slot in above the schema
+/// once a carrier exists.
+///
+/// `schema` is the schema governing the request's room, or `None` for a relay
+/// room (then the deployment authorizer is the whole decision).
+pub fn authorized(
+    deployment: &dyn Authorizer,
+    schema: Option<&Schema>,
+    identity: &Identity,
+    action: Action,
+    resource: &Resource,
+) -> bool {
+    let granted = match deployment.decide(identity, action, resource) {
+        Decision::Allow => true,
+        Decision::Deny => false,
+        Decision::Abstain => matches!(
+            schema.map_or(Decision::Abstain, |s| schema_decision(
+                s.auth(),
+                identity,
+                action
+            )),
+            Decision::Allow
+        ),
+    };
+    // Report the composed verdict, not the deployment tier's — an auditing
+    // authorizer records what was actually enforced, schema grants included.
+    deployment.observe(identity, action, resource, granted);
+    granted
+}
+
+/// The schema `@auth` grant tier: deny-wins over the whole-document grants whose
+/// action matches, then explicit-allow, then [`Abstain`](Decision::Abstain).
+///
+/// Only root (`/`) grants are evaluated — a path-scoped grant needs a
+/// path-carrying resource the room-level check does not yet have, so it is left
+/// unenforced (deferred with doc-ACL). Ownership templates (`${actor_id}` …)
+/// never match: there is no ownership carrier at this tier yet.
+fn schema_decision(auth: &Auth, identity: &Identity, action: Action) -> Decision {
+    let Some(want) = schema_action(action) else {
+        return Decision::Abstain;
+    };
+    let mut allowed = false;
+    for grant in auth.grants() {
+        if grant.action != want
+            || grant.path != "/"
+            || !grant_subject_matches(&grant.subject, identity)
+        {
+            continue;
+        }
+        match grant.effect {
+            GrantEffect::Deny => return Decision::Deny,
+            GrantEffect::Allow => allowed = true,
+        }
+    }
+    if allowed {
+        Decision::Allow
+    } else {
+        Decision::Abstain
+    }
+}
+
+/// The schema action a data-plane [`Action`] maps to. `RegisterSchema` is a
+/// control-plane meta-auth with no schema-grantable form, so it never resolves
+/// through the grant tier.
+fn schema_action(action: Action) -> Option<SchemaAction> {
+    match action {
+        Action::Read => Some(SchemaAction::Read),
+        Action::Write => Some(SchemaAction::Write),
+        Action::PublishAwareness => Some(SchemaAction::PublishAwareness),
+        Action::RegisterSchema => None,
+    }
+}
+
+/// Whether a grant's subject covers `identity`. A role matches an asserted claim;
+/// a class matches by credential kind; an ownership template never matches here.
+fn grant_subject_matches(subject: &GrantSubject, identity: &Identity) -> bool {
+    match subject {
+        GrantSubject::Role(role) => identity.roles().iter().any(|r| r == role),
+        GrantSubject::Class(SubjectClass::Authenticated) => {
+            !identity.actor().starts_with(ANON_PREFIX)
+        }
+        GrantSubject::Class(SubjectClass::Anonymous) => identity.actor().starts_with(ANON_PREFIX),
+        GrantSubject::Class(SubjectClass::Anyone) => true,
+        GrantSubject::Template(_) => false,
     }
 }

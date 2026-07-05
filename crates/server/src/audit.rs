@@ -14,7 +14,7 @@
 //! decided*, never as the ephemeral presence it carried.
 
 use crate::auth::Identity;
-use crate::authz::{Action, Authorizer, Resource};
+use crate::authz::{Action, Authorizer, Decision as Verdict, Resource};
 
 /// How an access was decided.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,10 +64,9 @@ impl Audited {
     }
 }
 
-impl Authorizer for Audited {
-    fn authorize(&self, identity: &Identity, action: Action, resource: &Resource) -> bool {
-        let allowed = self.inner.authorize(identity, action, resource);
-        let decision = if allowed {
+impl Audited {
+    fn record(&self, identity: &Identity, action: Action, resource: &Resource, granted: bool) {
+        let decision = if granted {
             Decision::Permitted
         } else {
             Decision::Denied
@@ -78,6 +77,31 @@ impl Authorizer for Audited {
             resource,
             decision,
         });
-        allowed
+    }
+}
+
+impl Authorizer for Audited {
+    /// A direct (non-composed) caller — the control plane's `RegisterSchema`
+    /// check — gets the inner verdict logged here as the final decision.
+    fn authorize(&self, identity: &Identity, action: Action, resource: &Resource) -> bool {
+        let granted = self.inner.authorize(identity, action, resource);
+        self.record(identity, action, resource, granted);
+        granted
+    }
+
+    /// Forward the inner verdict *unchanged*, preserving an
+    /// [`Abstain`](Verdict::Abstain) so a wrapped [`Acl`](crate::acl::Acl) still
+    /// defers to the schema `@auth` tier — flattening it to a deny here would
+    /// silently disable schema grants for every audited deployment. The final
+    /// decision is logged by [`observe`](Audited::observe), once the composition
+    /// has resolved this abstain.
+    fn decide(&self, identity: &Identity, action: Action, resource: &Resource) -> Verdict {
+        self.inner.decide(identity, action, resource)
+    }
+
+    /// The data-plane composition reports the final verdict here — schema grants
+    /// included — so the log reflects what was actually enforced.
+    fn observe(&self, identity: &Identity, action: Action, resource: &Resource, granted: bool) {
+        self.record(identity, action, resource, granted);
     }
 }
