@@ -1023,6 +1023,61 @@ pub unsafe extern "C" fn crdtsync_client_declare_app(
     .unwrap_or(-1)
 }
 
+/// Write the concrete schema version the enforcing server advertised for this
+/// session into `out`. Returns 1 once an advert has arrived, 0 before it, -1 on
+/// a bad handle or output pointer. Distinct from the declared version: a dynamic
+/// client (declared 0) learns the served version here. The app persists it
+/// across restart itself; the SDK caches, owns no storage.
+///
+/// # Safety
+/// `client` is a live handle; `out` points to a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_active_schema_version(
+    client: *const CrdtClient,
+    out: *mut u32,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        match (*client).session.active_schema_version() {
+            Some(version) => {
+                *out = version;
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// The bytes of the schema the enforcing server advertised for this session into
+/// a fresh buffer at `out` the caller frees. Returns 1 once an advert has arrived
+/// (its body may be empty), 0 before it, -1 on a bad handle or output pointer.
+/// Pairs with [`crdtsync_client_active_schema_version`].
+///
+/// # Safety
+/// `client` is a live handle; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_active_schema(
+    client: *const CrdtClient,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        match (*client).session.active_schema() {
+            Some(schema) => {
+                *out = CrdtBuf::from_vec(schema.to_vec());
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
 /// The opening Hello frame to send, naming this client. Empty on a bad handle.
 ///
 /// # Safety

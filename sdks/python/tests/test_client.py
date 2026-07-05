@@ -66,6 +66,31 @@ def test_declared_app_rides_along_in_the_hello_frame():
         assert b"app-x" in a.hello()
 
 
+def test_server_advertised_schema_is_readable():
+    import struct
+
+    def advert(version: int, body: bytes) -> bytes:
+        # SchemaAdvert: tag 21, u32 version, u32 length prefix, bytes.
+        return struct.pack("<BII", 21, version, len(body)) + body
+
+    with Client(cid(1)) as a:
+        # Nothing advertised yet.
+        assert a.active_schema_version() is None
+        assert a.active_schema() is None
+        # Folding a SchemaAdvert records the served version and its bytes.
+        assert a.receive(advert(4, b"schema-body")) == 1
+        assert a.active_schema_version() == 4
+        assert a.active_schema() == b"schema-body"
+        # A later advert supersedes it.
+        assert a.receive(advert(5, b"next-body")) == 1
+        assert a.active_schema_version() == 5
+        assert a.active_schema() == b"next-body"
+        # An empty body is still an advertisement, not "none".
+        assert a.receive(advert(6, b"")) == 1
+        assert a.active_schema_version() == 6
+        assert a.active_schema() == b""
+
+
 def test_awareness_publish_and_lifecycle():
     with Client(cid(1)) as a:
         ch, _ = a.subscribe(b"room-1")

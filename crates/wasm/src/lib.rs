@@ -376,6 +376,21 @@ impl WasmClient {
         self.inner.declare_app(app_id, schema_version);
     }
 
+    /// The concrete schema version the enforcing server advertised for this
+    /// session, or `None` before any advertisement. Distinct from the version
+    /// declared in `declare_app`: a dynamic client (declared 0) learns the served
+    /// version here. The app persists it across restart itself; the SDK caches,
+    /// owns no storage.
+    pub fn active_schema_version(&self) -> Option<u32> {
+        self.inner.active_schema_version()
+    }
+
+    /// The bytes of the schema the enforcing server advertised for this session,
+    /// or `None` before any advertisement. Pairs with `active_schema_version`.
+    pub fn active_schema(&self) -> Option<Vec<u8>> {
+        self.inner.active_schema().map(<[u8]>::to_vec)
+    }
+
     /// The opening Hello frame to send, naming this client.
     pub fn hello(&self) -> Vec<u8> {
         encode_message(&self.inner.hello())

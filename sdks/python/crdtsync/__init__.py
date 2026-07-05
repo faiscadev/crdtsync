@@ -122,6 +122,8 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_free, [doc], None)
     sig(lib.crdtsync_client_hello, [doc], buf)
     sig(lib.crdtsync_client_declare_app, [doc, cbytes, size, c.c_uint32], c.c_int32)
+    sig(lib.crdtsync_client_active_schema_version, [doc, c.POINTER(c.c_uint32)], c.c_int32)
+    sig(lib.crdtsync_client_active_schema, [doc, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_auth, [doc, cbytes, size], buf)
     sig(lib.crdtsync_client_actor, [doc, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_subscribe, [doc, cbytes, size, c.POINTER(ch)], buf)
@@ -643,6 +645,23 @@ class Client:
         _LIB.crdtsync_client_declare_app(
             self._handle, app_id, len(app_id), schema_version
         )
+
+    def active_schema_version(self) -> Optional[int]:
+        """The concrete schema version the enforcing server advertised for this
+        session, or ``None`` before any advertisement. Distinct from the version
+        declared in :meth:`declare_app`: a dynamic client (declared 0) learns the
+        served version here. The app persists it across restart itself."""
+        out = ctypes.c_uint32()
+        rc = _LIB.crdtsync_client_active_schema_version(self._handle, ctypes.byref(out))
+        return out.value if rc == 1 else None
+
+    def active_schema(self) -> Optional[bytes]:
+        """The bytes of the schema the enforcing server advertised for this
+        session (possibly empty), or ``None`` before any advertisement. Pairs
+        with :meth:`active_schema_version`."""
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_active_schema(self._handle, ctypes.byref(out))
+        return _take_buf(out) if rc == 1 else None
 
     def hello(self) -> bytes:
         """The opening Hello frame to send, naming this client."""

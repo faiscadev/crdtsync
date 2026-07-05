@@ -157,7 +157,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **Unit 6c-ii — SDK surface for the advertised schema (FFI + Python/Go/wasm)** — handed to `/cs-implement` (cs-next 2026-07-05): C ABI accessors for the cached active schema bytes + version, header regen, plus Python/Go/wasm wrappers, mirroring 5c-iii-b.
 
 ---
 

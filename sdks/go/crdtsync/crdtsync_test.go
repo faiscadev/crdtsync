@@ -271,6 +271,62 @@ func TestDeclaredAppRidesAlongInTheHelloFrame(t *testing.T) {
 	}
 }
 
+func TestServerAdvertisedSchemaIsReadable(t *testing.T) {
+	// SchemaAdvert: tag 21, u32 version, u32 length prefix, bytes.
+	advert := func(version uint32, body []byte) []byte {
+		frame := make([]byte, 9+len(body))
+		frame[0] = 21
+		binary.LittleEndian.PutUint32(frame[1:], version)
+		binary.LittleEndian.PutUint32(frame[5:], uint32(len(body)))
+		copy(frame[9:], body)
+		return frame
+	}
+
+	c := newClient(t, 1)
+	defer c.Close()
+
+	// Nothing advertised yet.
+	if v, ok := c.ActiveSchemaVersion(); ok || v != 0 {
+		t.Fatalf("fresh client reported an active schema version %d", v)
+	}
+	if got, ok := c.ActiveSchema(); ok || got != nil {
+		t.Fatalf("fresh client reported active schema bytes")
+	}
+
+	// Folding a SchemaAdvert records the served version and its bytes.
+	if rc := c.Receive(advert(4, []byte("schema-body"))); rc != 1 {
+		t.Fatalf("advert not applied: rc=%d", rc)
+	}
+	if v, ok := c.ActiveSchemaVersion(); !ok || v != 4 {
+		t.Fatalf("active version %d ok=%v, want 4 true", v, ok)
+	}
+	if got, ok := c.ActiveSchema(); !ok || !bytes.Equal(got, []byte("schema-body")) {
+		t.Fatalf("active schema %q ok=%v, want schema-body true", got, ok)
+	}
+
+	// A later advert supersedes it.
+	if rc := c.Receive(advert(5, []byte("next-body"))); rc != 1 {
+		t.Fatalf("second advert not applied: rc=%d", rc)
+	}
+	if v, _ := c.ActiveSchemaVersion(); v != 5 {
+		t.Fatalf("active version %d, want 5", v)
+	}
+	if got, _ := c.ActiveSchema(); !bytes.Equal(got, []byte("next-body")) {
+		t.Fatalf("active schema %q, want next-body", got)
+	}
+
+	// An empty body is still an advertisement, not "none".
+	if rc := c.Receive(advert(6, []byte{})); rc != 1 {
+		t.Fatalf("empty-body advert not applied: rc=%d", rc)
+	}
+	if v, ok := c.ActiveSchemaVersion(); !ok || v != 6 {
+		t.Fatalf("active version %d ok=%v, want 6 true", v, ok)
+	}
+	if got, ok := c.ActiveSchema(); !ok || len(got) != 0 {
+		t.Fatalf("active schema %q ok=%v, want empty present", got, ok)
+	}
+}
+
 func TestClientEditTravelsToAPeer(t *testing.T) {
 	a := newClient(t, 1)
 	defer a.Close()

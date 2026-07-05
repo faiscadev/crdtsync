@@ -189,6 +189,81 @@ fn declaring_an_app_carries_it_into_the_hello_frame() {
 }
 
 #[test]
+fn the_server_advertised_schema_is_recorded_and_readable() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+
+        // Nothing advertised yet: both accessors report absence (0), untouched out.
+        let mut version: u32 = 0;
+        assert_eq!(crdtsync_client_active_schema_version(c, &mut version), 0);
+        let mut schema = out_buf();
+        assert_eq!(crdtsync_client_active_schema(c, &mut schema), 0);
+
+        // Folding a SchemaAdvert records the concrete version and its bytes.
+        let advert = encode_message(&Message::SchemaAdvert {
+            schema_version: 4,
+            schema: b"schema-body".to_vec(),
+        });
+        assert_eq!(crdtsync_client_receive(c, advert.as_ptr(), advert.len()), 1);
+        assert_eq!(crdtsync_client_active_schema_version(c, &mut version), 1);
+        assert_eq!(version, 4);
+        assert_eq!(crdtsync_client_active_schema(c, &mut schema), 1);
+        assert_eq!(
+            std::slice::from_raw_parts(schema.ptr, schema.len),
+            b"schema-body"
+        );
+        crdtsync_buf_free(schema);
+        schema = out_buf();
+
+        // A later advert supersedes the recorded one.
+        let advert = encode_message(&Message::SchemaAdvert {
+            schema_version: 5,
+            schema: b"next-body".to_vec(),
+        });
+        assert_eq!(crdtsync_client_receive(c, advert.as_ptr(), advert.len()), 1);
+        assert_eq!(crdtsync_client_active_schema_version(c, &mut version), 1);
+        assert_eq!(version, 5);
+        assert_eq!(crdtsync_client_active_schema(c, &mut schema), 1);
+        assert_eq!(
+            std::slice::from_raw_parts(schema.ptr, schema.len),
+            b"next-body"
+        );
+        crdtsync_buf_free(schema);
+        schema = out_buf();
+
+        // An advert whose body is empty is still an advertisement: present (1),
+        // not collapsed into the absent (0) reading.
+        let advert = encode_message(&Message::SchemaAdvert {
+            schema_version: 6,
+            schema: Vec::new(),
+        });
+        assert_eq!(crdtsync_client_receive(c, advert.as_ptr(), advert.len()), 1);
+        assert_eq!(crdtsync_client_active_schema_version(c, &mut version), 1);
+        assert_eq!(version, 6);
+        assert_eq!(crdtsync_client_active_schema(c, &mut schema), 1);
+        assert_eq!(schema.len, 0);
+        crdtsync_buf_free(schema);
+        schema = out_buf();
+
+        // A bad handle is rejected (-1), never dereferenced.
+        assert_eq!(
+            crdtsync_client_active_schema_version(ptr::null(), &mut version),
+            -1
+        );
+        assert_eq!(crdtsync_client_active_schema(ptr::null(), &mut schema), -1);
+
+        // A null out pointer on a live handle is rejected too, never written.
+        assert_eq!(
+            crdtsync_client_active_schema_version(c, ptr::null_mut()),
+            -1
+        );
+        assert_eq!(crdtsync_client_active_schema(c, ptr::null_mut()), -1);
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
 fn auth_establishes_the_actor_once_authok_arrives() {
     unsafe {
         let c = crdtsync_client_new(client_id(1).as_ptr());
