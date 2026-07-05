@@ -41,11 +41,17 @@ fn a_declared_known_version_enforces_that_version() {
     let r = registered();
     assert_eq!(
         r.resolve_handshake(APP, 1),
-        Resolution::Enforcing { version: 1 }
+        Resolution::Enforcing {
+            version: 1,
+            schema: S1.to_vec()
+        }
     );
     assert_eq!(
         r.resolve_handshake(APP, 2),
-        Resolution::Enforcing { version: 2 }
+        Resolution::Enforcing {
+            version: 2,
+            schema: S2.to_vec()
+        }
     );
 }
 
@@ -56,7 +62,10 @@ fn a_dynamic_client_adopts_the_head_version() {
     // serves, i.e. the chain head.
     assert_eq!(
         r.resolve_handshake(APP, 0),
-        Resolution::Enforcing { version: 2 }
+        Resolution::Enforcing {
+            version: 2,
+            schema: S2.to_vec()
+        }
     );
 }
 

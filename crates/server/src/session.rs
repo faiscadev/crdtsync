@@ -176,14 +176,16 @@ pub fn step(
             // authentication below never runs under it and cannot stall the admin
             // plane's writes. A poisoned lock is recovered: the read leaves the
             // map intact.
-            let guard = registry
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             // An enforcing handshake is answered with the schema the server serves
             // this connection, so a dynamic client that did not bundle can adopt
-            // it; a relay names no schema. Resolved under the same lock as the tier
-            // decision (the sole registry read on the data plane).
-            let advert = match guard.resolve_handshake(&app_id, schema_version) {
+            // it; a relay names no schema. The resolution carries the registered
+            // bytes, so the advertisement needs no second registry read. The lock
+            // is the sole registry read on the data plane.
+            let resolution = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .resolve_handshake(&app_id, schema_version);
+            let advert = match resolution {
                 Resolution::Reject => {
                     return Response {
                         replies: vec![Message::Error {
@@ -199,18 +201,14 @@ pub fn step(
                     session.schema_version = None;
                     None
                 }
-                Resolution::Enforcing { version } => {
+                Resolution::Enforcing { version, schema } => {
                     session.schema_version = Some(version);
-                    // The resolved version is in the chain, so its bytes are held;
-                    // an absent body is advertised empty rather than panicking.
-                    let schema = guard.resolve(&app_id, version).unwrap_or_default().to_vec();
                     Some(Message::SchemaAdvert {
                         schema_version: version,
                         schema,
                     })
                 }
             };
-            drop(guard);
             session.app_id = app_id;
             session.client = Some(client);
             Response {

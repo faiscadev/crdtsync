@@ -50,14 +50,15 @@ pub enum Registered {
 
 /// The tier a connection resolves to when a client names its `{app_id, version}`
 /// at the handshake.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Resolution {
     /// No app, or an app that never registered a schema: served with no schema
     /// enforcement.
     Relay,
     /// A registered app pinned to `version` — a declared known version, or the
-    /// head adopted by a version-0 dynamic client.
-    Enforcing { version: u32 },
+    /// head adopted by a version-0 dynamic client — carrying `schema`, its
+    /// registered bytes, so the caller advertises them without a second lookup.
+    Enforcing { version: u32, schema: Vec<u8> },
     /// A registered app for which the client declared a version the registry does
     /// not hold: refused, not fabricated.
     Reject,
@@ -165,13 +166,13 @@ impl SchemaRegistry {
         let Some(head) = self.head_version(app_id) else {
             return Resolution::Relay;
         };
-        if version == 0 {
-            return Resolution::Enforcing { version: head };
-        }
-        if self.resolve(app_id, version).is_some() {
-            Resolution::Enforcing { version }
-        } else {
-            Resolution::Reject
+        let version = if version == 0 { head } else { version };
+        match self.resolve(app_id, version) {
+            Some(schema) => Resolution::Enforcing {
+                version,
+                schema: schema.to_vec(),
+            },
+            None => Resolution::Reject,
         }
     }
 
