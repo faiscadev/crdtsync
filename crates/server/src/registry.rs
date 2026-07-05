@@ -525,6 +525,11 @@ impl Registry {
                 .and_then(|c| c.session.room_for_channel(*channel).cloned()),
             _ => None,
         };
+        // The acted-on room's binding, resolved once: `Some(Some((app, ver)))`
+        // bound, `Some(None)` an addressed-but-unbound room, `None` no room.
+        let room_binding = authz_room
+            .as_deref()
+            .map(|room| self.room_apps.get(room).cloned());
         // The schema whose `@auth` grants the enforcement points compose under the
         // deployment authorizer. A room already bound is governed by *its* app's
         // schema — never the connection's own, even when that schema fails to parse
@@ -532,13 +537,10 @@ impl Registry {
         // escalate against a permissive self-declared app. The connection's own app
         // is the fallback only for a room not yet in the bindings — its first
         // subscriber, about to become the incumbent.
-        let acting_schema = match authz_room
-            .as_deref()
-            .map(|room| self.room_apps.get(room).cloned())
-        {
+        let acting_schema = match &room_binding {
             // Bound: governed by the room's own app's schema — never the
             // connection's — even when it fails to parse (`None`: no grants).
-            Some(Some(app)) => self.parsed_schema(&app),
+            Some(Some(app)) => self.parsed_schema(app),
             // Unbound (first subscriber): fall back to the connection's own app.
             Some(None) => self.connection_schema(id),
             None => None,
@@ -546,27 +548,21 @@ impl Registry {
         // The app governing the acted-on room — the chain a catch-up delta is
         // translated along and the space a write's version is tagged in. Resolved
         // only for the two data-plane messages that consult it (a subscribe's
-        // catch-up, an ops write's tag). A bound room yields its governing app; an
-        // unbound one falls back to the connection's own app — mirroring the
-        // acting schema — so a first subscriber to a room restored from the store
-        // (its `room_apps` binding not yet rebuilt, but its log already populated)
-        // translates that log along the app it is about to bind, rather than
-        // serving it untranslated.
-        let governing_app = if matches!(msg, Message::Subscribe { .. } | Message::Ops { .. }) {
-            match authz_room
-                .as_deref()
-                .map(|room| self.room_apps.get(room).cloned())
+        // catch-up, an ops write's tag), and only for a *bound* room: an unbound
+        // room's governing app is unknown (a catch-up there serves the delta
+        // verbatim; an ops write is impossible until the room is bound by the
+        // writer's own subscribe). Inferring it from the connecting app would
+        // let a foreign first subscriber to a room whose binding was dropped
+        // (a dormant sweep, or a store restart that restores the log but not the
+        // binding) translate that log along the wrong chain — a durable binding
+        // that survives both is the robust fix, not yet built.
+        let governing_app = match &room_binding {
+            Some(Some((app, _)))
+                if matches!(msg, Message::Subscribe { .. } | Message::Ops { .. }) =>
             {
-                Some(Some((app, _))) => Some(app),
-                Some(None) => self
-                    .conns
-                    .get(&id)
-                    .map(|c| c.session.app_id().to_vec())
-                    .filter(|app| !app.is_empty()),
-                None => None,
+                Some(app.clone())
             }
-        } else {
-            None
+            _ => None,
         };
         let (broadcast, broadcast_version, close, room, awareness, authed_client, bind) = {
             let Some(conn) = self.conns.get_mut(&id) else {
