@@ -10,7 +10,7 @@
 //! keys). Op-rewrite and back-compat classification are later slices; this is
 //! the model + parser only.
 
-use crdtsync_core::migration::{Migration, MigrationErrorKind, Step};
+use crdtsync_core::migration::{Compat, Migration, MigrationErrorKind, Step};
 use crdtsync_core::schema::TypeDef;
 
 fn parse(s: &str) -> Migration {
@@ -353,6 +353,120 @@ fn malformed_json_is_a_json_error_not_a_panic() {
 #[test]
 fn the_document_must_be_an_object() {
     assert_eq!(kind("[1, 2, 3]"), MigrationErrorKind::NotAnObject);
+}
+
+// --- compatibility classification ---
+
+fn add_type() -> Step {
+    Step::AddType {
+        name: "tag".into(),
+        def: TypeDef::Text { max: None },
+    }
+}
+
+fn add_field() -> Step {
+    Step::AddField {
+        ty: "todo".into(),
+        field: "priority".into(),
+        field_type: "register".into(),
+    }
+}
+
+fn remove_field() -> Step {
+    Step::RemoveField {
+        ty: "todo".into(),
+        field: "legacy".into(),
+    }
+}
+
+fn rename_field() -> Step {
+    Step::RenameField {
+        ty: "todo".into(),
+        from: "done".into(),
+        to: "completed".into(),
+    }
+}
+
+#[test]
+fn additive_steps_are_back_compatible() {
+    assert_eq!(add_type().compat(), Compat::BackCompatible);
+    assert_eq!(add_field().compat(), Compat::BackCompatible);
+}
+
+#[test]
+fn removals_and_renames_are_breaking() {
+    assert_eq!(
+        Step::RemoveType {
+            name: "obsolete".into()
+        }
+        .compat(),
+        Compat::Breaking
+    );
+    assert_eq!(remove_field().compat(), Compat::Breaking);
+    assert_eq!(
+        Step::RenameType {
+            from: "task".into(),
+            to: "todo".into()
+        }
+        .compat(),
+        Compat::Breaking
+    );
+    assert_eq!(rename_field().compat(), Compat::Breaking);
+}
+
+#[test]
+fn classification_ignores_the_names() {
+    // A rename of any names is still breaking; an add of any names still back-compat.
+    let other_rename = Step::RenameField {
+        ty: "note".into(),
+        from: "x".into(),
+        to: "y".into(),
+    };
+    assert_eq!(other_rename.compat(), Compat::Breaking);
+    let other_add = Step::AddField {
+        ty: "note".into(),
+        field: "z".into(),
+        field_type: "text".into(),
+    };
+    assert_eq!(other_add.compat(), Compat::BackCompatible);
+}
+
+#[test]
+fn an_empty_edge_is_back_compatible() {
+    let m = parse(r#"{ "from": 1, "to": 2, "steps": [] }"#);
+    assert_eq!(m.compat(), Compat::BackCompatible);
+}
+
+#[test]
+fn an_all_additive_edge_is_back_compatible() {
+    let m = parse(
+        r#"{ "from": 1, "to": 2, "steps": [
+            { "kind": "addType", "name": "tag", "def": { "kind": "text" } },
+            { "kind": "addField", "type": "todo", "field": "priority", "fieldType": "register" }
+        ] }"#,
+    );
+    assert_eq!(m.compat(), Compat::BackCompatible);
+}
+
+#[test]
+fn one_breaking_step_makes_the_whole_edge_breaking() {
+    // A single removal among additions is the weakest link.
+    let m = parse(
+        r#"{ "from": 1, "to": 2, "steps": [
+            { "kind": "addType", "name": "tag", "def": { "kind": "text" } },
+            { "kind": "removeField", "type": "todo", "field": "legacy" },
+            { "kind": "addField", "type": "todo", "field": "priority", "fieldType": "register" }
+        ] }"#,
+    );
+    assert_eq!(m.compat(), Compat::Breaking);
+    // As does a single rename.
+    let m = parse(
+        r#"{ "from": 1, "to": 2, "steps": [
+            { "kind": "addField", "type": "todo", "field": "priority", "fieldType": "register" },
+            { "kind": "renameField", "type": "todo", "from": "done", "to": "completed" }
+        ] }"#,
+    );
+    assert_eq!(m.compat(), Compat::Breaking);
 }
 
 #[test]

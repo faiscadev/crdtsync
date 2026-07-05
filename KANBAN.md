@@ -157,7 +157,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **Unit 7b — compatibility classification (core)** — handed to `/cs-implement` (cs-next 2026-07-05): classify each `migration::Step` and the composed edge as back-compatible (has an inverse) vs breaking (forward-only), per ARCHITECTURE §Compatibility Classes — add* back-compat, remove*/rename* breaking; an edge is back-compat iff every step is. Builds on the 7a model (#181).
 
 ---
 
