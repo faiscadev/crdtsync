@@ -432,7 +432,7 @@ fn reject_unknown_fields(
     Ok(())
 }
 
-fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, SchemaError> {
+pub(crate) fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, SchemaError> {
     let obj = json
         .as_object()
         .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, type_name.to_string()))?;
