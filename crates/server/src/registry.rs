@@ -11,13 +11,16 @@ use std::io;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use crdtsync_core::schema::{Trigger, TriggerEvent};
+use crdtsync_core::schema::Trigger;
 use crdtsync_core::{ClientId, Message, Op, Schema};
 
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Action, Authorizer, PermitAll, Resource};
-use crate::auto_version::{expand_name, trigger_origin, AutoVersionSink, AutoVersionState};
+use crate::auto_version::{
+    expand_name, expand_schedule_name, schedule_origin, trigger_origin, AutoVersionSink,
+    AutoVersionState,
+};
 use crate::clock::{Clock, SystemClock};
 use crate::schema_registry::SchemaRegistry;
 use crate::{
@@ -76,6 +79,11 @@ pub struct Registry {
     /// after it: each room-bearing lifecycle event, awaiting its schema's trigger
     /// match. Shared with the sink the hub holds.
     auto_version: Rc<AutoVersionState>,
+    /// The wall time each `every:` schedule trigger last fired, keyed by
+    /// `(room, schedule-origin)`. A trigger is armed to `now` the first sweep it is
+    /// seen and captures once its interval has since elapsed; entries for unbound
+    /// rooms are pruned each sweep, so a rebound room re-arms.
+    schedule_fires: HashMap<(RoomId, Vec<u8>), u64>,
 }
 
 impl Registry {
@@ -107,6 +115,7 @@ impl Registry {
             room_apps: HashMap::new(),
             schema_cache: HashMap::new(),
             auto_version,
+            schedule_fires: HashMap::new(),
         }
     }
 
@@ -274,6 +283,71 @@ impl Registry {
                 self.apply_awareness_policy(now, &policy);
             }
         }
+        self.fire_schedule_triggers(now);
+    }
+
+    /// Fire each bound room's `every:` schedule triggers whose interval has elapsed.
+    /// The same sweep that ages the awareness grace window drives the schedules off
+    /// one `Clock` read: a trigger is armed to `now` the first sweep it is seen (it
+    /// does not capture on the sweep that binds its room) and thereafter captures
+    /// once its interval has passed, at most once per sweep — a long gap between
+    /// sweeps produces one capture, not a burst catching up every missed interval.
+    /// A schedule state whose room is no longer bound is pruned, so a rebound room
+    /// re-arms rather than firing on a stale timer.
+    fn fire_schedule_triggers(&mut self, now: u64) {
+        let bindings: Vec<(RoomId, (Vec<u8>, u32))> = self
+            .room_apps
+            .iter()
+            .map(|(room, app)| (room.clone(), app.clone()))
+            .collect();
+        let mut live: HashSet<(RoomId, Vec<u8>)> = HashSet::new();
+        // (room, template, origin, keep) for each schedule due this sweep; collected
+        // first so the schema borrow is released before the hub is mutated.
+        let mut due: Vec<(RoomId, String, Vec<u8>, Option<u64>)> = Vec::new();
+        for (room, app) in bindings {
+            let Some(schema) = self.parsed_schema(&app) else {
+                continue;
+            };
+            let schedules: Vec<(u64, String, Option<u64>)> = schema
+                .auto_version()
+                .iter()
+                .filter_map(|av| match av.trigger {
+                    Trigger::Every(millis) => Some((millis, av.name.clone(), av.keep)),
+                    Trigger::On(_) => None,
+                })
+                .collect();
+            for (millis, template, keep) in schedules {
+                let origin = schedule_origin(millis, &template);
+                let key = (room.clone(), origin.clone());
+                live.insert(key.clone());
+                match self.schedule_fires.get(&key) {
+                    // First sight — arm to now, capture one interval later.
+                    None => {
+                        self.schedule_fires.insert(key, now);
+                    }
+                    Some(&last) if now.saturating_sub(last) >= millis => {
+                        self.schedule_fires.insert(key, now);
+                        due.push((room.clone(), template, origin, keep));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        // Prune schedules whose room unbound, bounding the map and re-arming a room
+        // that later rebinds.
+        self.schedule_fires.retain(|key, _| live.contains(key));
+
+        if due.is_empty() {
+            return;
+        }
+        // A capture re-emits VersionCreated; suppress the sink recording it, as the
+        // post-delivery drain does, so a scheduled version never cascades.
+        self.auto_version.set_draining(true);
+        for (room, template, origin, keep) in due {
+            let name = expand_schedule_name(&template, now);
+            self.capture_version(&room, &name, &origin, keep);
+        }
+        self.auto_version.set_draining(false);
     }
 
     /// Run `policy` over the current presence: expire entries silent past their
@@ -861,39 +935,31 @@ impl Registry {
                 .map(|av| (av.name.clone(), av.keep))
                 .collect();
             for (template, keep) in triggers {
-                self.capture_auto_version(&room, &template, keep, event, now);
+                let origin = trigger_origin(event, &template);
+                let name = expand_name(&template, now, event);
+                self.capture_version(&room, &name, &origin, keep);
             }
         }
         self.auto_version.set_draining(false);
     }
 
-    /// Capture one trigger's version, naming it by the expanded template, and hold
-    /// its `keep` retention window. Best-effort: a room with no state yet or a name
-    /// already taken this tick is a silent no-op (`Ok(false)`); a durable-store
-    /// persist failure is logged (a snapshot the operator wanted was not captured)
-    /// but never aborts the delivery — auto-versioning is a passive server-side
-    /// observer.
+    /// Capture one trigger's version under the already-expanded `name` and its
+    /// stable `origin`, then hold the `keep` retention window. Best-effort: a room
+    /// with no state yet or a name already taken this tick is a silent no-op
+    /// (`Ok(false)`); a durable-store persist failure is logged (a snapshot the
+    /// operator wanted was not captured) but never aborts the caller — auto-
+    /// versioning is a passive server-side observer.
     ///
-    /// The version is tagged with the trigger's stable identity (its event and
-    /// template), so retention prunes only this trigger's own captures — never a
-    /// manual version or a different trigger's — ordered by the hub's monotonic
-    /// capture ordinal, not the wall-clock name. `keep: 0` retains nothing, so the
-    /// capture is skipped; `keep: none` retains all (no pruning). A lowered `keep`
-    /// takes effect on the trigger's next capture.
-    fn capture_auto_version(
-        &mut self,
-        room: &[u8],
-        template: &str,
-        keep: Option<u64>,
-        event: TriggerEvent,
-        now: u64,
-    ) {
-        let origin = trigger_origin(event, template);
+    /// `origin` tags the version so retention prunes only this trigger's own
+    /// captures — never a manual version or a different trigger's — ordered by the
+    /// hub's monotonic capture ordinal, not the wall-clock name. `keep: 0` retains
+    /// nothing, so the capture is skipped; `keep: none` retains all (no pruning). A
+    /// lowered `keep` takes effect on the trigger's next capture.
+    fn capture_version(&mut self, room: &[u8], name: &str, origin: &[u8], keep: Option<u64>) {
         // `keep: 0` retains nothing, so skip the capture — but still prune, so a
         // trigger whose window was lowered to 0 clears its earlier captures.
         if keep != Some(0) {
-            let name = expand_name(template, now, event);
-            match self.hub.create_auto_version(room, name.as_bytes(), &origin) {
+            match self.hub.create_auto_version(room, name.as_bytes(), origin) {
                 // A no-op (`Ok(false)`: empty room / name taken this tick) still
                 // falls through to retention, so a lowered `keep` applies and a
                 // colliding name never leaves the group over its window.
@@ -911,7 +977,7 @@ impl Registry {
         // `keep: none` retains all — no pruning. Otherwise hold the window (`0`
         // prunes the whole group).
         if let Some(keep) = keep {
-            if let Err(e) = self.hub.retain_by_origin(room, &origin, keep) {
+            if let Err(e) = self.hub.retain_by_origin(room, origin, keep) {
                 eprintln!("crdtsync: auto-version retention in room {room:?} failed: {e}");
             }
         }

@@ -235,6 +235,127 @@ fn an_every_schedule_trigger_does_not_fire_on_an_event() {
 }
 
 #[test]
+fn a_schedule_does_not_capture_on_the_binding_sweep() {
+    // The first sweep that sees a room's schedule arms it to `now`; it captures one
+    // interval later, not the instant the room binds.
+    let (mut r, _clock) = registry_with(r#"[{ "every": "1s", "name": "auto/tick/${timestamp}" }]"#);
+    seed_room(&mut r);
+    r.sweep();
+    assert!(version_names(&r).is_empty());
+}
+
+#[test]
+fn a_schedule_trigger_captures_after_its_interval() {
+    let (mut r, clock) = registry_with(r#"[{ "every": "1s", "name": "auto/tick/${timestamp}" }]"#);
+    seed_room(&mut r);
+    r.sweep(); // arm at 0
+
+    clock.advance(500);
+    r.sweep(); // 500ms elapsed — under the window
+    assert!(version_names(&r).is_empty());
+
+    clock.advance(500);
+    r.sweep(); // 1000ms elapsed — fires
+    assert_eq!(
+        version_names(&r),
+        vec![format!("auto/tick/{}", stamp(1000)).into_bytes()],
+        "the schedule captures once its interval has elapsed",
+    );
+}
+
+#[test]
+fn a_schedule_fires_at_most_once_per_sweep() {
+    // A long gap (a paused or slow server) captures once on the next sweep, not one
+    // per missed interval — no catch-up burst.
+    let (mut r, clock) = registry_with(r#"[{ "every": "1s", "name": "auto/tick/${timestamp}" }]"#);
+    seed_room(&mut r);
+    r.sweep(); // arm at 0
+
+    clock.advance(5_000); // five intervals pass between sweeps
+    r.sweep();
+
+    assert_eq!(
+        version_names(&r),
+        vec![format!("auto/tick/{}", stamp(5000)).into_bytes()],
+        "one capture for the whole gap, not five",
+    );
+}
+
+#[test]
+fn a_schedule_keep_prunes_its_captures() {
+    let (mut r, clock) =
+        registry_with(r#"[{ "every": "1s", "name": "auto/tick/${timestamp}", "keep": 2 }]"#);
+    seed_room(&mut r);
+    r.sweep(); // arm at 0
+
+    for _ in 0..3 {
+        clock.advance(1_000);
+        r.sweep();
+    }
+
+    assert_eq!(
+        version_names(&r),
+        vec![
+            format!("auto/tick/{}", stamp(2000)).into_bytes(),
+            format!("auto/tick/{}", stamp(3000)).into_bytes(),
+        ],
+        "keep:2 retains the two newest scheduled captures",
+    );
+}
+
+#[test]
+fn a_scheduled_capture_does_not_cascade_to_version_created() {
+    // A schedule fires a version create, whose VersionCreated event a
+    // version-created trigger would capture — the drain latch suppresses it, so a
+    // sweep produces exactly the scheduled version.
+    let (mut r, clock) = registry_with(
+        r#"[{ "every": "1s", "name": "auto/tick/x" },
+             { "on": "version-created", "name": "auto/vc/${timestamp}" }]"#,
+    );
+    seed_room(&mut r);
+    r.sweep(); // arm at 0
+
+    clock.advance(1_000);
+    r.sweep();
+
+    assert_eq!(
+        version_names(&r),
+        vec![b"auto/tick/x".to_vec()],
+        "the scheduled capture does not re-fire the version-created trigger",
+    );
+}
+
+#[test]
+fn a_schedule_rearms_after_the_room_goes_dormant() {
+    // A room that empties drops its binding, so its schedule state is pruned;
+    // rebinding re-arms it — it does not immediately fire on the strength of a
+    // pre-dormancy timer.
+    let (mut r, clock) = registry_with(r#"[{ "every": "1s", "name": "auto/tick/${timestamp}" }]"#);
+    r.set_grace_millis(0);
+    let a = seed_room(&mut r);
+    r.sweep(); // arm at 0
+
+    clock.advance(1_000);
+    r.sweep(); // fires at 1000
+    assert_eq!(version_names(&r).len(), 1);
+
+    // The only subscriber departs; a sweep clears its presence and unbinds the room.
+    r.disconnect(a);
+    r.sweep();
+
+    // A new subscriber rebinds the room; this sweep arms afresh — no capture.
+    let b = seed_room(&mut r);
+    let _ = b;
+    clock.advance(500);
+    r.sweep();
+    assert_eq!(
+        version_names(&r).len(),
+        1,
+        "the rebound schedule arms, it does not fire on the old timer",
+    );
+}
+
+#[test]
 fn two_triggers_on_the_same_event_both_fire() {
     let (mut r, clock) = registry_with(
         r#"[{ "on": "subscribe", "name": "a/${timestamp}" },
