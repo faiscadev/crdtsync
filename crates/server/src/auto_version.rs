@@ -103,3 +103,15 @@ pub(crate) fn expand_name(template: &str, now_millis: u64, event: TriggerEvent) 
         .replace("${timestamp}", &format!("{now_millis:020}"))
         .replace("${event}", event.as_kebab())
 }
+
+/// A trigger's stable identity — the retention provenance tag stamped on every
+/// version it captures. Its `(event, template)` pair, so two triggers that render
+/// the same name under different events keep independent retention windows, while
+/// two genuinely identical triggers share one. A NUL separates the fields, which
+/// neither an event kebab nor (in practice) a template contains.
+pub(crate) fn trigger_origin(event: TriggerEvent, template: &str) -> Vec<u8> {
+    let mut origin = event.as_kebab().as_bytes().to_vec();
+    origin.push(0);
+    origin.extend_from_slice(template.as_bytes());
+    origin
+}

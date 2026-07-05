@@ -17,7 +17,7 @@ use crdtsync_core::{ClientId, Message, Op, Schema};
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Action, Authorizer, PermitAll, Resource};
-use crate::auto_version::{expand_name, AutoVersionSink, AutoVersionState};
+use crate::auto_version::{expand_name, trigger_origin, AutoVersionSink, AutoVersionState};
 use crate::clock::{Clock, SystemClock};
 use crate::schema_registry::SchemaRegistry;
 use crate::{
@@ -830,9 +830,9 @@ impl Registry {
     /// Capture the auto-versions the recorded lifecycle events call for. For each
     /// signal, resolve the room's governing schema and, for every `on:` trigger it
     /// declares matching the event, capture a version named by the expanded
-    /// template. A relay room (no governing schema) or an unmatched event captures
-    /// nothing. `every:` schedule triggers are the sweep's concern, not an event's;
-    /// the `keep` retention window is Unit 3b (see `capture_auto_version`).
+    /// template and prune the trigger's captures to its `keep` window. A relay room
+    /// (no governing schema) or an unmatched event captures nothing. `every:`
+    /// schedule triggers are the sweep's concern, not an event's.
     ///
     /// A capture re-emits `VersionCreated`; the `draining` flag suppresses the sink
     /// recording that, so an auto-created version never cascades into another.
@@ -854,37 +854,64 @@ impl Registry {
             };
             // Copy the matching triggers out, releasing the schema borrow before
             // mutating the hub.
-            let templates: Vec<String> = schema
+            let triggers: Vec<(String, Option<u64>)> = schema
                 .auto_version()
                 .iter()
                 .filter(|av| matches!(av.trigger, Trigger::On(e) if e == event))
-                .map(|av| av.name.clone())
+                .map(|av| (av.name.clone(), av.keep))
                 .collect();
-            for template in templates {
-                self.capture_auto_version(&room, &template, event, now);
+            for (template, keep) in triggers {
+                self.capture_auto_version(&room, &template, keep, event, now);
             }
         }
         self.auto_version.set_draining(false);
     }
 
-    /// Capture one trigger's version, naming it by the expanded template. Best-
-    /// effort: a room with no state yet or a name already taken this tick is a
-    /// silent no-op (`Ok(false)`); a durable-store persist failure is logged (a
-    /// snapshot the operator wanted was not captured) but never aborts the delivery
-    /// — auto-versioning is a passive server-side observer.
+    /// Capture one trigger's version, naming it by the expanded template, and hold
+    /// its `keep` retention window. Best-effort: a room with no state yet or a name
+    /// already taken this tick is a silent no-op (`Ok(false)`); a durable-store
+    /// persist failure is logged (a snapshot the operator wanted was not captured)
+    /// but never aborts the delivery — auto-versioning is a passive server-side
+    /// observer.
     ///
-    /// The trigger's `keep` retention window is **not yet enforced** — bounding a
-    /// trigger's captures exactly needs durable per-version provenance (which
-    /// trigger authored a version) plus a monotonic capture order, a store-format
-    /// change tracked as its own unit. Every heuristic tried is unsound: a
-    /// name-pattern prune deletes manual versions that fit the pattern, collides
-    /// same-named triggers, and orders by a non-monotonic wall clock; an in-memory
-    /// tally resets across room dormancy and restart. So `keep` parses but stays
-    /// inert until provenance lands.
-    fn capture_auto_version(&mut self, room: &[u8], template: &str, event: TriggerEvent, now: u64) {
-        let name = expand_name(template, now, event);
-        if let Err(e) = self.hub.create_version(room, name.as_bytes()) {
-            eprintln!("crdtsync: auto-version capture of {name:?} in room {room:?} failed: {e}");
+    /// The version is tagged with the trigger's stable identity (its event and
+    /// template), so retention prunes only this trigger's own captures — never a
+    /// manual version or a different trigger's — ordered by the hub's monotonic
+    /// capture ordinal, not the wall-clock name. `keep: 0` retains nothing, so the
+    /// capture is skipped; `keep: none` retains all (no pruning). A lowered `keep`
+    /// takes effect on the trigger's next capture.
+    fn capture_auto_version(
+        &mut self,
+        room: &[u8],
+        template: &str,
+        keep: Option<u64>,
+        event: TriggerEvent,
+        now: u64,
+    ) {
+        let origin = trigger_origin(event, template);
+        // `keep: 0` retains nothing, so skip the capture — but still prune, so a
+        // trigger whose window was lowered to 0 clears its earlier captures.
+        if keep != Some(0) {
+            let name = expand_name(template, now, event);
+            match self.hub.create_auto_version(room, name.as_bytes(), &origin) {
+                // A no-op (`Ok(false)`: empty room / name taken this tick) still
+                // falls through to retention, so a lowered `keep` applies and a
+                // colliding name never leaves the group over its window.
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "crdtsync: auto-version capture of {name:?} in room {room:?} failed: {e}"
+                    );
+                    return;
+                }
+            }
+        }
+        // `keep: none` retains all — no pruning. Otherwise hold the window (`0`
+        // prunes the whole group).
+        if let Some(keep) = keep {
+            if let Err(e) = self.hub.retain_by_origin(room, &origin, keep) {
+                eprintln!("crdtsync: auto-version retention in room {room:?} failed: {e}");
+            }
         }
     }
 
