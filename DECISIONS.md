@@ -7,6 +7,13 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
+## 2026-07-04 · Unit 4c-i/#175 · the `Authorizer` seam authorizes an `Identity`, not a bare actor
+**Changed:** no ARCHITECTURE change — realizes the §Authorization decision-flow seam (4a captures claims, the evaluator consumes them) as the code shape it forces; sliced 4c into the seam (this PR) and the schema-grant tier (4c-ii).
+- **`Authorizer::authorize` takes `&Identity`, not `&[u8]` actor.** 4a already threads a full `Identity { actor, roles, groups }` through `Session`; the evaluator can only match `Subject::Role`/`Group` against the claim set if the seam carries it. So every enforcement call site (`session.rs` Subscribe/Ops/AwarenessSet/version, `registry.rs` `peer_may_read`, `admin.rs` RegisterSchema) switches `session.actor()` → `session.identity()`; `audit.rs` records `identity.actor()` unchanged. The bare-actor signature would have left role/group grants unmatchable without a second lookup at each site.
+- **`acl::Subject` grows `Role(String)`/`Group(String)`**, matched against `Identity::roles()`/`groups()`; policy tokens `role:<name>`/`group:<name>`. A role-grant turns on the *claim*, not the actor id — so `role:editor` allows any identity carrying that role, and deny-wins still overrides a broader role allow. An empty `role:`/`group:` name is a `PolicyErrorKind::Subject` parse error (a claim with no name matches nothing meaningful and is a policy typo, caught loud).
+- **Sliced 4c into 4c-i (identity seam + acl Role/Group, this PR) + 4c-ii (schema `@auth` grant tier).** The seam widening is the deployment-ACL half — buildable and testable against hand-built identities now; feeding the room's resolved-schema grants into the evaluation is the next slice, gated on nothing new (Unit 5 already resolves the schema per room).
+
+
 
 ## 2026-07-04 · Unit 2b-2/#174 · `onRepaired` is a lazy observation of settled locations, diffed on the repaired reading — not an eager per-apply event
 **Changed:** refines ARCHITECTURE §Invariant Repair's "`onRepaired` fires at apply" into the shape the implementation forced; no scope change.
