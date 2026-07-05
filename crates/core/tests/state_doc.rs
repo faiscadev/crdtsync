@@ -45,7 +45,20 @@ fn fp_element(e: &Element) -> String {
             format!("L[{}]", parts.join(","))
         }
         Element::Text(t) => format!("T{:?}", t.borrow().as_string()),
+        Element::XmlElement(x) => {
+            let x = x.borrow();
+            format!("X{:?}[{}]", x.tag(), fp_seq(&x.children()))
+        }
+        Element::XmlFragment(f) => format!("F[{}]", fp_seq(&f.borrow().children())),
     }
+}
+
+fn fp_seq(children: &std::rc::Rc<std::cell::RefCell<crdtsync_core::list::List>>) -> String {
+    let c = children.borrow();
+    (0..c.len())
+        .filter_map(|i| c.get(i).map(|v| fp_element(&v)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// A stable rendering of a document's observable state over a fixed vocabulary.

@@ -170,7 +170,21 @@ fn fp_element(e: &Element) -> String {
             format!("L[{}]", parts.join(","))
         }
         Element::Text(t) => format!("T{:?}", t.borrow().as_string()),
+        Element::XmlElement(x) => {
+            let x = x.borrow();
+            format!("X{:?}[{}]", x.tag(), fp_children(&x.children()))
+        }
+        Element::XmlFragment(f) => format!("F[{}]", fp_children(&f.borrow().children())),
     }
+}
+
+/// Fingerprint a children sequence in order — the convergence-critical structure.
+fn fp_children(children: &std::rc::Rc<std::cell::RefCell<crdtsync_core::list::List>>) -> String {
+    let c = children.borrow();
+    (0..c.len())
+        .filter_map(|i| c.get(i).map(|v| fp_element(&v)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Fisher-Yates shuffle under the PRNG.
