@@ -18,7 +18,7 @@ use crdtsync_core::migration::{
     reachable_down, rewrite_down_along, rewrite_up_along, Migration, OpRewrite,
 };
 use crdtsync_core::op::TxId;
-use crdtsync_core::{ClientId, Op};
+use crdtsync_core::{ClientId, Op, OpKind};
 
 use crate::schema_registry::SchemaRegistry;
 
@@ -98,8 +98,34 @@ impl Chain {
     /// count), so the surviving members would strand forever. A version that
     /// cannot faithfully carry every member of an atomic edit does not carry the
     /// edit at all.
+    ///
+    /// A container-create ([`MapCreate`]/[`ListCreate`]/[`TextCreate`]) is always
+    /// carried verbatim, never dropped or key-rewritten. Per-op rewriting is
+    /// key-local; it cannot see a container's descendants (an insert into it
+    /// carries no field key, so a migration step never matches it). Dropping the
+    /// create while keeping its descendants would strand them against a container
+    /// that never arrives; rewriting the create's key would repoint it away from
+    /// descendants that derive their element id from the original key. Either way
+    /// the subtree tears. Carrying the create as-is keeps the subtree whole and
+    /// internally consistent — a field the recipient's version does not model
+    /// surfaces as an unknown slot its invariant repair elides, never a strand.
+    /// Faithful subtree elision needs per-recipient element-set awareness, which
+    /// this per-op seam does not have.
+    ///
+    /// [`MapCreate`]: crdtsync_core::OpKind::MapCreate
+    /// [`ListCreate`]: crdtsync_core::OpKind::ListCreate
+    /// [`TextCreate`]: crdtsync_core::OpKind::TextCreate
     pub fn translate_ops(&self, ops: &[Op]) -> Vec<Op> {
-        let rewritten: Vec<OpRewrite> = ops.iter().map(|op| self.translate_op(op)).collect();
+        let rewritten: Vec<OpRewrite> = ops
+            .iter()
+            .map(|op| {
+                if is_container_create(&op.kind) {
+                    OpRewrite::Keep(op.clone())
+                } else {
+                    self.translate_op(op)
+                }
+            })
+            .collect();
         // A transaction with any dropped member is poisoned: drop it whole.
         let mut poisoned: HashSet<(ClientId, TxId)> = HashSet::new();
         for (op, r) in ops.iter().zip(&rewritten) {
@@ -120,6 +146,16 @@ impl Chain {
             })
             .collect()
     }
+}
+
+/// Whether `kind` installs a nested container — the ops whose subtree a per-op
+/// key rewrite cannot keep consistent, so [`Chain::translate_ops`] carries them
+/// verbatim.
+fn is_container_create(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::MapCreate { .. } | OpKind::ListCreate { .. } | OpKind::TextCreate { .. }
+    )
 }
 
 /// Rewrite `op`, created under schema version `from`, for a recipient at `to` —

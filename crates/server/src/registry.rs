@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use crdtsync_core::{ClientId, Message, Schema};
+use crdtsync_core::{ClientId, Message, Op, Schema};
 
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
@@ -629,6 +629,24 @@ impl Registry {
                 let chains = source
                     .as_ref()
                     .map(|(app, from)| self.resolve_chains(&id, app, *from));
+                // Translate the batch once per distinct target version — the
+                // rewrite depends only on the version, not the recipient, so a
+                // same-version fleet shares one result. A resolved chain
+                // translates; an unresolved one (unreachable / gapped /
+                // unparseable) yields an empty batch, dropping it for that
+                // target's recipients pending the handshake range-check that
+                // refuses them outright.
+                let translated_by_target: HashMap<u32, Vec<Op>> = chains
+                    .iter()
+                    .flatten()
+                    .map(|(target, chain)| {
+                        let ops = match chain {
+                            Some(chain) => chain.translate_ops(&broadcast),
+                            None => Vec::new(),
+                        };
+                        (*target, ops)
+                    })
+                    .collect();
                 for (peer, conn) in self.conns.iter_mut() {
                     if *peer == id {
                         continue;
@@ -641,24 +659,21 @@ impl Registry {
                     }
                     // Translate to the recipient's version, or send verbatim when
                     // there is nothing to bridge — a same-version, relay, or
-                    // foreign-app recipient, or a relay write. A recipient whose
-                    // chain is unreachable or broken receives nothing (the ops it
-                    // could take are dropped too), pending the handshake
-                    // range-check that refuses it outright.
-                    let translated = match (&source, &chains, conn.session.schema_version()) {
-                        (Some((app, from)), Some(chains), Some(target))
+                    // foreign-app recipient, or a relay write.
+                    let translated = match (&source, conn.session.schema_version()) {
+                        (Some((app, from)), Some(target))
                             if conn.session.app_id() == app && target != *from =>
                         {
-                            // A resolved chain translates; an unresolved one
-                            // (unreachable / gapped / unparseable) drops the batch.
-                            Some(match chains.get(&target) {
-                                Some(Some(chain)) => chain.translate_ops(&broadcast),
-                                _ => Vec::new(),
-                            })
+                            Some(
+                                translated_by_target
+                                    .get(&target)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
+                            )
                         }
                         _ => None,
                     };
-                    let ops = translated.as_deref().unwrap_or(&broadcast);
+                    let ops = translated.unwrap_or(&broadcast);
                     if ops.is_empty() {
                         continue;
                     }

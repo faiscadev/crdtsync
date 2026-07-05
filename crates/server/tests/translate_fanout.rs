@@ -124,6 +124,18 @@ fn delivered_keys(r: &mut Registry, id: ConnId) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Every op delivered to `id`'s outbox, across every `Ops` message, in order.
+fn delivered_ops(r: &mut Registry, id: ConnId) -> Vec<Op> {
+    r.take_outbox(id)
+        .into_iter()
+        .filter_map(|m| match m {
+            Message::Ops { ops, .. } => Some(ops),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 #[test]
 fn a_forward_write_is_translated_up_for_a_newer_recipient() {
     let mut r = registry();
@@ -197,6 +209,46 @@ fn a_partly_translatable_transaction_is_dropped_whole_for_an_older_recipient() {
         delivered_keys(&mut r, peer_v2),
         vec![b"title".to_vec(), b"note".to_vec()]
     );
+}
+
+#[test]
+fn a_container_create_and_its_subtree_survive_verbatim_to_an_older_recipient() {
+    let mut r = registry();
+    let writer = hello(&mut r, 1, DOWN, 2);
+    let older = hello(&mut r, 2, DOWN, 1);
+    for id in [writer, older] {
+        subscribe(&mut r, id);
+    }
+    // The v2 writer creates the v2-only "note" text field and inserts into it —
+    // a container-create followed by an insert whose target is the container's
+    // element id, carrying no field key. Down at v1 the chain would drop the
+    // create (the field is v2-only) but cannot see the keyless insert, so a naive
+    // rewrite would strand the insert against a container that never arrives.
+    // The whole subtree is carried verbatim instead: the v1 recipient receives
+    // both ops, internally consistent.
+    let mut wdoc = Document::new(cid(1));
+    let note = crdtsync_core::path::encode_path(&[b"note"]);
+    let ops = crdtsync_core::path::text_insert(&mut wdoc, &note, 0, "hi");
+    assert!(
+        matches!(
+            ops.first().map(|op| &op.kind),
+            Some(OpKind::TextCreate { .. })
+        ),
+        "the write should open with a TextCreate"
+    );
+    let sent = ops.len();
+    write(&mut r, writer, ops);
+
+    let got = delivered_ops(&mut r, older);
+    assert_eq!(
+        got.len(),
+        sent,
+        "the older recipient receives the whole subtree"
+    );
+    assert!(matches!(got[0].kind, OpKind::TextCreate { .. }));
+    assert!(got[1..]
+        .iter()
+        .all(|op| matches!(op.kind, OpKind::TextInsert { .. })));
 }
 
 #[test]
