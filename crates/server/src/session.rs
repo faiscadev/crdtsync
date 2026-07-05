@@ -19,7 +19,7 @@ use crate::acl::authorized;
 use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Resource};
 use crate::schema_registry::{Resolution, SchemaRegistry};
-use crate::{Catchup, Hub, RoomId};
+use crate::{Catchup, Hub, RoomId, StoredOp};
 
 /// One client connection's protocol state. The handshake runs Hello → Auth →
 /// Subscribe: the client names itself, then presents a credential the server
@@ -159,6 +159,7 @@ pub fn step(
     authorizer: &dyn Authorizer,
     schema: Option<&Schema>,
     registry: &Mutex<SchemaRegistry>,
+    governing_app: Option<&[u8]>,
     now: u64,
     throttle: Option<u64>,
     msg: Message,
@@ -273,7 +274,10 @@ pub fn step(
                 return forbidden("read denied");
             }
             let reply = match hub.catch_up(&room, last_seen_seq) {
-                Catchup::Ops(ops) => Message::Ops { channel, ops },
+                Catchup::Ops(delta) => Message::Ops {
+                    channel,
+                    ops: catch_up_ops(registry, governing_app, session, delta),
+                },
                 Catchup::Snapshot { seq, state } => Message::Snapshot {
                     channel,
                     seq,
@@ -339,10 +343,20 @@ pub fn step(
             // the fresh ops, so a resent op the hub already holds is still acked
             // and pruned. An empty batch acknowledges nothing.
             let through = ops.iter().map(|op| op.id.seq).max();
+            // The op's creation version is recorded only when the writer speaks
+            // the room's governing app — its version number lives in that app's
+            // space. A foreign-app writer's version is a different space and must
+            // never drive this room's chain, so its ops are logged untagged
+            // (`None`, relay-like) and pass verbatim on both the live and the
+            // catch-up seam, exactly as the fan-out already leaves them.
+            let write_version = match governing_app {
+                Some(app) if app == session.app_id() => session.schema_version(),
+                _ => None,
+            };
             // The deduped ops fan out to the room's other subscribers; nothing
             // echoes back to the sender. A hub that cannot durably record the
             // ops rejects the write rather than advertising an unpersisted one.
-            match hub.ingest(&room, ops, session.schema_version()) {
+            match hub.ingest(&room, ops, write_version) {
                 Ok(applied) => Response {
                     replies: through
                         .map(|through| Message::Accepted { channel, through })
@@ -350,7 +364,7 @@ pub fn step(
                         .collect(),
                     broadcast: applied,
                     broadcast_room: Some(room),
-                    broadcast_version: session.schema_version(),
+                    broadcast_version: write_version,
                     ..Response::default()
                 },
                 Err(_) => Response {
@@ -538,6 +552,29 @@ fn versions_list(hub: &Hub, channel: Channel, room: &[u8]) -> Response {
             names: hub.version_names(room),
         }],
         ..Response::default()
+    }
+}
+
+/// Translate a catch-up delta to the joining session's version, on the same
+/// app-scoping as the live fan-out: only when the room is bound to an app the
+/// joiner also speaks, and the joiner declared an enforced version. A relay
+/// joiner, an unbound room, or a foreign-app joiner takes the delta verbatim —
+/// its version is a different space and must never drive the room's chain.
+fn catch_up_ops(
+    registry: &Mutex<SchemaRegistry>,
+    governing_app: Option<&[u8]>,
+    session: &Session,
+    delta: Vec<StoredOp>,
+) -> Vec<Op> {
+    match (governing_app, session.schema_version()) {
+        (Some(app), Some(target)) if session.app_id() == app => {
+            let reg = match registry.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            crate::translate::translate_delta(&reg, app, delta, target)
+        }
+        _ => delta.into_iter().map(|rec| rec.op).collect(),
     }
 }
 
