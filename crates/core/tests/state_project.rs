@@ -235,6 +235,32 @@ fn a_counter_renamed_onto_an_occupied_counter_merges_at_the_shared_id() {
     assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
 }
 
+#[test]
+fn a_chained_counter_rename_is_order_independent() {
+    // A non-composed fate renames a→c and c→d in one pass. Each source must
+    // contribute its ORIGINAL tally to its own target: capturing an isolated copy
+    // when the slot is taken keeps a's tally from leaking through c's live handle
+    // into d, so the result never depends on the traversal (HashMap) order.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.inc(b"a", 5);
+        tx.inc(b"c", 7);
+    });
+    let fate = |key: &[u8]| match key {
+        b"a" => SlotFate::Rename(b"c".to_vec()),
+        b"c" => SlotFate::Rename(b"d".to_vec()),
+        _ => SlotFate::Keep,
+    };
+    assert!(d.migrate_leaf_slots(fate));
+    assert_eq!(counter(&d, b"a"), None);
+    assert_eq!(counter(&d, b"c"), Some(5), "c holds a's original tally");
+    assert_eq!(
+        counter(&d, b"d"),
+        Some(7),
+        "d holds c's original tally, not a+c"
+    );
+}
+
 // --- identity / no-op ---
 
 #[test]

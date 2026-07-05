@@ -58,6 +58,14 @@ pub enum SlotFate {
     Drop,
 }
 
+/// A leaf slot taken out during a rename, held until the second phase re-homes
+/// it. A counter carries an isolated copy of its tally (not its live handle), so
+/// merging it into the destination cannot leak through to another mover.
+enum LeafMove {
+    Value(Option<Element>),
+    Counter(Counter),
+}
+
 pub struct Document {
     client: ClientId,
     root: Rc<RefCell<Map>>,
@@ -174,18 +182,24 @@ impl Document {
     /// is always kept unre-keyed, mirroring the op seam, which carries a
     /// container-create verbatim rather than tear its subtree. A dropped or
     /// renamed counter's element moves with its slot — dropped from the registry,
-    /// or re-homed to the id its new key derives — so no phantom counter lingers.
-    /// Returns whether any slot changed. `fate` is the composition of the chain's
-    /// per-step key rewrites; supplying `|_| Keep` is a no-op.
+    /// or merged into the counter at the id its new key derives (matching the op
+    /// seam, where renamed increments merge at that shared id) — so no phantom
+    /// counter lingers. Returns whether any slot changed. `fate` is the
+    /// composition of the chain's per-step key rewrites; supplying `|_| Keep` is
+    /// a no-op.
     pub fn migrate_leaf_slots(&mut self, fate: impl Fn(&[u8]) -> SlotFate) -> bool {
         let mut changed = false;
         let map_ids: Vec<ElementId> = self.maps.keys().copied().collect();
         for map_id in map_ids {
             let map = Rc::clone(&self.maps[&map_id]);
             // Decide every slot's fate against the pre-migration key set, then
-            // apply: take all movers out first, then re-home them, so a rename
-            // onto a key this pass also moves resolves by stamp, never by order.
-            let mut moved: Vec<(Vec<u8>, Stamp, Option<Element>, bool)> = Vec::new();
+            // apply in two phases: take every mover out (capturing a counter's
+            // tally as an isolated copy, so no in-place merge can leak between
+            // movers), then re-home them. Both phases are order-independent — a
+            // rename onto a key this pass also moves resolves by stamp at the
+            // slot and by commutative merge at the counter id, never by the
+            // traversal order.
+            let mut moved: Vec<(Vec<u8>, Stamp, LeafMove, bool)> = Vec::new();
             let keys = map.borrow().slot_keys();
             for key in keys {
                 if map.borrow().slot_is_live_container(&key) {
@@ -212,30 +226,38 @@ impl Document {
                             self.counters.remove(&old);
                         }
                     }
-                    // Re-key the slot; a counter merges into the id its new key
-                    // derives, exactly as the renamed increment ops would at that
-                    // shared id — so a collision with a counter already there sums
-                    // rather than clobbers, and the moved slot points at the same
-                    // merged handle the LWW winner resolves through.
                     SlotFate::Rename(to) => {
-                        let value = match (old_counter, &value) {
+                        let mover = match (old_counter, &value) {
                             (Some(old), Some(Element::Counter(src))) => {
+                                let captured = src.borrow().deep_clone();
                                 self.counters.remove(&old);
-                                let new = ElementId::derive(map_id, &to, ElementKind::Counter);
-                                let dest =
-                                    Rc::clone(self.counters.entry(new).or_insert_with(|| {
-                                        Rc::new(RefCell::new(Counter::new(new)))
-                                    }));
-                                dest.borrow_mut().merge(&src.borrow());
-                                Some(Element::Counter(dest))
+                                LeafMove::Counter(captured)
                             }
-                            _ => value,
+                            _ => LeafMove::Value(value),
                         };
-                        moved.push((to, stamp, value, tombstone));
+                        moved.push((to, stamp, mover, tombstone));
                     }
                 }
             }
-            for (key, stamp, value, tombstone) in moved {
+            for (key, stamp, mover, tombstone) in moved {
+                let value = match mover {
+                    LeafMove::Value(value) => value,
+                    // Merge the captured tally into the id the new key derives, as
+                    // the renamed increment ops would at that shared id — a
+                    // collision with a counter already there sums rather than
+                    // clobbers, and the slot points at the merged handle the LWW
+                    // winner resolves through.
+                    LeafMove::Counter(captured) => {
+                        let new = ElementId::derive(map_id, &key, ElementKind::Counter);
+                        let dest = Rc::clone(
+                            self.counters
+                                .entry(new)
+                                .or_insert_with(|| Rc::new(RefCell::new(Counter::new(new)))),
+                        );
+                        dest.borrow_mut().merge(&captured);
+                        Some(Element::Counter(dest))
+                    }
+                };
                 map.borrow_mut().put_slot_lww(key, stamp, value, tombstone);
             }
         }
