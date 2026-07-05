@@ -530,7 +530,7 @@ impl Hub {
             .versions
             .values()
             .flat_map(|index| index.values())
-            .map(|v| v.ordinal + 1)
+            .map(|v| v.ordinal.saturating_add(1))
             .max()
             .unwrap_or(0);
         Ok(hub)
@@ -840,22 +840,47 @@ impl Hub {
         let Some(index) = self.versions.get(room) else {
             return Ok(());
         };
+        // Count in `u64` — a `keep` past `usize::MAX` (a 32-bit target) must not
+        // truncate and prune. While the window is still filling this is the whole
+        // cost: no sort, no allocation.
+        let matches = index
+            .values()
+            .filter(|v| v.origin.as_deref() == Some(origin))
+            .count();
+        if matches as u64 <= keep {
+            return Ok(());
+        }
+        // `keep` is now below the group size, so it fits `usize` losslessly.
+        let remove = matches - keep as usize;
+        // Oldest first by capture order; the lowest `remove` ordinals leave the window.
         let mut group: Vec<(u64, Vec<u8>)> = index
             .iter()
             .filter(|(_, v)| v.origin.as_deref() == Some(origin))
             .map(|(name, v)| (v.ordinal, name.clone()))
             .collect();
-        // Compare in `u64` — a `keep` past `usize::MAX` (a 32-bit target) must not
-        // truncate and prune. Once the group is known larger, `keep` is below it and
-        // fits `usize` losslessly.
-        if group.len() as u64 <= keep {
-            return Ok(());
-        }
-        // Oldest first by capture order; delete everything past the newest `keep`.
         group.sort_by_key(|(ordinal, _)| *ordinal);
-        let remove = group.len() - keep as usize;
-        for (_, name) in group.into_iter().take(remove) {
-            self.delete_version(room, &name)?;
+
+        // Evict the whole batch from the index, then persist once — not one atomic
+        // rewrite (with its two fsyncs) per eviction. A persist failure restores the
+        // entire batch, so retention never commits a partial prune.
+        let index = self.versions.get_mut(room).expect("index present above");
+        let evicted: Vec<(Vec<u8>, Version)> = group
+            .into_iter()
+            .take(remove)
+            .map(|(_, name)| {
+                let version = index.remove(&name).expect("name drawn from this index");
+                (name, version)
+            })
+            .collect();
+        if let Err(e) = self.persist_versions(room) {
+            let index = self.versions.get_mut(room).expect("index present above");
+            for (name, version) in evicted {
+                index.insert(name, version);
+            }
+            return Err(e);
+        }
+        for (name, _) in &evicted {
+            self.emit(EngineEvent::VersionDeleted { room, name });
         }
         Ok(())
     }

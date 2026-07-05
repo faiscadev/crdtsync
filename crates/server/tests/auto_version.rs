@@ -278,6 +278,27 @@ fn keep_prunes_the_oldest_captures_of_the_trigger() {
 }
 
 #[test]
+fn a_lowered_window_prunes_the_whole_backlog_at_once() {
+    // Five captures accumulate, then keep:1 must evict four in a single batch —
+    // exercising the multi-eviction path, not just a one-off trim.
+    let (mut r, clock) =
+        registry_with(r#"[{ "on": "subscribe", "name": "auto/join/${timestamp}", "keep": 1 }]"#);
+    seed_room(&mut r);
+
+    for client in [2u8, 3, 4, 5, 6] {
+        clock.advance(1000);
+        let c = hello_auth(&mut r, client, APP, 1);
+        subscribe(&mut r, c, ROOM);
+    }
+
+    assert_eq!(
+        version_names(&r),
+        vec![format!("auto/join/{}", stamp(5000)).into_bytes()],
+        "keep:1 evicts the four older captures in one batch, leaving the newest",
+    );
+}
+
+#[test]
 fn keep_never_prunes_a_manual_version() {
     // A manually created version whose name fits the trigger's naming is not the
     // trigger's capture — retention keys on provenance, not the name — so it is

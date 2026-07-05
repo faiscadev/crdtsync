@@ -898,11 +898,13 @@ impl Registry {
                 // falls through to retention, so a lowered `keep` applies and a
                 // colliding name never leaves the group over its window.
                 Ok(_) => {}
+                // A failed capture still falls through to retention: a lowered
+                // `keep` must hold the window even on the tick a new capture could
+                // not be written.
                 Err(e) => {
                     eprintln!(
                         "crdtsync: auto-version capture of {name:?} in room {room:?} failed: {e}"
                     );
-                    return;
                 }
             }
         }
