@@ -59,11 +59,30 @@ pub enum SlotFate {
 }
 
 /// A leaf slot taken out during a rename, held until the second phase re-homes
-/// it. A counter carries an isolated copy of its tally (not its live handle), so
-/// merging it into the destination cannot leak through to another mover.
-enum LeafMove {
+/// it at the new key. Its slot body and its retained counter tally travel
+/// separately, because a counter is retained in the registry keyed by the id its
+/// key derives whether or not the slot still holds it live — a scalar or register
+/// may have displaced it, or it may be tombstoned — so the tally must re-home
+/// even when the slot body is something else.
+struct LeafMove {
+    to: Vec<u8>,
+    stamp: Stamp,
+    tombstone: bool,
+    body: SlotBody,
+    /// The counter tally retained at the old key's derived id, captured as an
+    /// isolated copy so merging it into the destination cannot leak through to
+    /// another mover. `None` when the key never had a counter.
+    counter: Option<Counter>,
+}
+
+/// The value a renamed slot places at its new key.
+enum SlotBody {
+    /// A scalar, a register (re-keyed to the new id on placement), or a tombstone
+    /// (a `None` value).
     Value(Option<Element>),
-    Counter(Counter),
+    /// The slot held a live counter; its placed value is the rehomed registry
+    /// counter at the new id, filled in the second phase.
+    LiveCounter,
 }
 
 pub struct Document {
@@ -199,7 +218,7 @@ impl Document {
             // rename onto a key this pass also moves resolves by stamp at the
             // slot and by commutative merge at the counter id, never by the
             // traversal order.
-            let mut moved: Vec<(Vec<u8>, Stamp, LeafMove, bool)> = Vec::new();
+            let mut moved: Vec<LeafMove> = Vec::new();
             let keys = map.borrow().slot_keys();
             for key in keys {
                 if map.borrow().slot_is_live_container(&key) {
@@ -216,49 +235,76 @@ impl Document {
                 changed = true;
                 // A counter's tally lives in the registry keyed by the id its key
                 // derives (leaf counters are not in the parent graph, so that is
-                // left untouched); its slot moves in lock-step with the registry.
-                let old_counter = matches!(value, Some(Element::Counter(_)))
-                    .then(|| ElementId::derive(map_id, &key, ElementKind::Counter));
+                // left untouched), and it is retained there across displacement —
+                // so migrate the registry entry from the key's derived id whether
+                // or not the slot currently holds the counter live.
+                let old_counter = ElementId::derive(map_id, &key, ElementKind::Counter);
+                let live_counter = matches!(value, Some(Element::Counter(_)));
                 match fate {
                     SlotFate::Keep => unreachable!("filtered above"),
                     SlotFate::Drop => {
-                        if let Some(old) = old_counter {
-                            self.counters.remove(&old);
-                        }
+                        self.counters.remove(&old_counter);
                     }
                     SlotFate::Rename(to) => {
-                        let mover = match (old_counter, &value) {
-                            (Some(old), Some(Element::Counter(src))) => {
-                                let captured = src.borrow().deep_clone();
-                                self.counters.remove(&old);
-                                LeafMove::Counter(captured)
-                            }
-                            _ => LeafMove::Value(value),
+                        let captured = self
+                            .counters
+                            .remove(&old_counter)
+                            .map(|c| c.borrow().deep_clone());
+                        let body = if live_counter {
+                            SlotBody::LiveCounter
+                        } else {
+                            SlotBody::Value(value)
                         };
-                        moved.push((to, stamp, mover, tombstone));
+                        moved.push(LeafMove {
+                            to,
+                            stamp,
+                            tombstone,
+                            body,
+                            counter: captured,
+                        });
                     }
                 }
             }
-            for (key, stamp, mover, tombstone) in moved {
-                let value = match mover {
-                    LeafMove::Value(value) => value,
-                    // Merge the captured tally into the id the new key derives, as
-                    // the renamed increment ops would at that shared id — a
-                    // collision with a counter already there sums rather than
-                    // clobbers, and the slot points at the merged handle the LWW
-                    // winner resolves through.
-                    LeafMove::Counter(captured) => {
-                        let new = ElementId::derive(map_id, &key, ElementKind::Counter);
-                        let dest = Rc::clone(
-                            self.counters
-                                .entry(new)
-                                .or_insert_with(|| Rc::new(RefCell::new(Counter::new(new)))),
-                        );
-                        dest.borrow_mut().merge(&captured);
-                        Some(Element::Counter(dest))
+            for mv in moved {
+                let LeafMove {
+                    to,
+                    stamp,
+                    tombstone,
+                    body,
+                    counter,
+                } = mv;
+                // Re-home a retained tally to the id the new key derives, merging
+                // into any counter already there — a cross-type key collision sums
+                // rather than clobbers, as the renamed increment ops would at that
+                // shared id.
+                let rehomed = counter.map(|captured| {
+                    let new = ElementId::derive(map_id, &to, ElementKind::Counter);
+                    let dest = Rc::clone(
+                        self.counters
+                            .entry(new)
+                            .or_insert_with(|| Rc::new(RefCell::new(Counter::new(new)))),
+                    );
+                    dest.borrow_mut().merge(&captured);
+                    dest
+                });
+                let value = match body {
+                    // The live counter's slot points at the merged registry handle
+                    // the LWW winner resolves through.
+                    SlotBody::LiveCounter => Some(Element::Counter(
+                        rehomed.expect("a live counter captured its tally"),
+                    )),
+                    // Re-derive a register's id from the new key so a snapshot-served
+                    // joiner encodes the same id an op-served peer derives from the
+                    // renamed RegisterSet.
+                    SlotBody::Value(Some(Element::Register(r))) => {
+                        let new = ElementId::derive(map_id, &to, ElementKind::Register);
+                        Some(Element::Register(Rc::new(RefCell::new(
+                            r.borrow().rehomed(new),
+                        ))))
                     }
+                    SlotBody::Value(other) => other,
                 };
-                map.borrow_mut().put_slot_lww(key, stamp, value, tombstone);
+                map.borrow_mut().put_slot_lww(to, stamp, value, tombstone);
             }
         }
         changed

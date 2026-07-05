@@ -13,7 +13,7 @@
 //! leaving no phantom behind.
 
 use crdtsync_core::doc::{Document, SlotFate};
-use crdtsync_core::{Element, Scalar};
+use crdtsync_core::{Element, ElementId, ElementKind, Scalar};
 
 mod common;
 use common::cid;
@@ -259,6 +259,74 @@ fn a_chained_counter_rename_is_order_independent() {
         Some(7),
         "d holds c's original tally, not a+c"
     );
+}
+
+#[test]
+fn a_renamed_register_is_rekeyed_to_the_new_id() {
+    // A register carries an id derived from its slot key, encoded into the
+    // snapshot. Moving it verbatim under a rename would keep the old-key id,
+    // diverging from an op-served peer whose renamed RegisterSet derives the id
+    // from the new key. The moved register must re-derive its id.
+    let mut d = doc();
+    d.transact(|tx| tx.register(b"a", Scalar::Int(9)));
+    assert!(d.migrate_leaf_slots(rename(b"a", b"b")));
+    match d.get(b"b") {
+        Some(Element::Register(r)) => assert_eq!(
+            r.borrow().id(),
+            ElementId::derive(d.root_id(), b"b", ElementKind::Register),
+            "the register id is re-derived from the new key"
+        ),
+        _ => panic!("expected the renamed register at b"),
+    }
+    // The re-key survives a round-trip: the snapshot encodes the new-key id.
+    let back = Document::decode_state(&d.encode_state()).unwrap();
+    match back.get(b"b") {
+        Some(Element::Register(r)) => assert_eq!(
+            r.borrow().id(),
+            ElementId::derive(back.root_id(), b"b", ElementKind::Register)
+        ),
+        _ => panic!("expected the register to round-trip"),
+    }
+}
+
+#[test]
+fn a_dropped_displaced_counter_leaves_no_phantom() {
+    // A scalar can displace a counter, which stays retained in the registry at
+    // its derived id. Dropping the key must prune that retained tally too, or it
+    // lingers as a phantom — diverging from an op-served peer whose CounterInc
+    // was simply dropped.
+    let mut d = doc();
+    d.transact(|tx| tx.inc(b"note", 5));
+    d.transact(|tx| tx.set(b"note", Scalar::Int(1))); // scalar displaces the counter
+    assert!(d.migrate_leaf_slots(drop_keys(&[b"note"])));
+    assert!(d.get(b"note").is_none());
+    // Re-creating a counter at the key starts fresh, not resuming the displaced tally.
+    d.transact(|tx| tx.inc(b"note", 3));
+    assert_eq!(counter(&d, b"note"), Some(3), "no phantom tally re-adopted");
+}
+
+#[test]
+fn a_renamed_displaced_counter_rehomes_its_tally() {
+    // A displaced counter's tally must ride the rename to the new key's derived
+    // id even though the slot body is now a scalar — matching an op-served peer
+    // whose renamed CounterInc lands at that id while the renamed set holds the
+    // slot.
+    let mut d = doc();
+    d.transact(|tx| tx.inc(b"a", 5));
+    d.transact(|tx| tx.set(b"a", Scalar::Int(1))); // scalar displaces the counter
+    assert!(d.migrate_leaf_slots(rename(b"a", b"b")));
+    // The slot moves the scalar; the retained tally re-homes under b's counter id.
+    assert!(matches!(d.get(b"b"), Some(Element::Scalar(Scalar::Int(1)))));
+    // A later increment at b re-wins the slot and resumes the rehomed tally (5+4).
+    d.transact(|tx| tx.inc(b"b", 4));
+    assert_eq!(
+        counter(&d, b"b"),
+        Some(9),
+        "the rehomed tally (5) resumes when the slot is re-won at the new key"
+    );
+    // Nothing lingers at the old key's counter id: an increment there starts fresh.
+    d.transact(|tx| tx.inc(b"a", 1));
+    assert_eq!(counter(&d, b"a"), Some(1), "no phantom left at the old id");
 }
 
 // --- identity / no-op ---
