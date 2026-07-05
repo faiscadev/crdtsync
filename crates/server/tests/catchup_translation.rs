@@ -31,7 +31,7 @@ const MAP_V1: &str = r#"{ "schema": "s", "version": 1, "root": "R",
 const MAP_V2: &str = r#"{ "schema": "s", "version": 2, "root": "R",
     "types": { "R": { "kind": "map" } } }"#;
 
-fn registry() -> Registry {
+fn schema_registry() -> Arc<Mutex<SchemaRegistry>> {
     let mut sr = SchemaRegistry::new();
     sr.register(UP, 1, MAP_V1.as_bytes(), b"").unwrap();
     sr.register(
@@ -49,11 +49,47 @@ fn registry() -> Registry {
         br#"{ "from": 1, "to": 2, "steps": [ { "kind": "addField", "type": "R", "field": "note", "fieldType": "text" }, { "kind": "addField", "type": "R", "field": "extra", "fieldType": "int" } ] }"#,
     )
     .unwrap();
+    Arc::new(Mutex::new(sr))
+}
 
+fn registry() -> Registry {
     let mut r = Registry::new(cid(0xFF));
-    r.set_schema_registry(Arc::new(Mutex::new(sr)));
+    r.set_schema_registry(schema_registry());
     r.set_clock(Arc::new(ManualClock::new(0)));
     r
+}
+
+/// A registry backed by the durable store at `path`, sharing the same schema
+/// registry and a deterministic clock.
+fn store_registry(path: &std::path::Path) -> Registry {
+    let store = crdtsync_server::store::Store::open(path).unwrap();
+    let mut r = Registry::with_store(cid(0xFF), store).unwrap();
+    r.set_schema_registry(schema_registry());
+    r.set_clock(Arc::new(ManualClock::new(0)));
+    r
+}
+
+struct TempDir(std::path::PathBuf);
+impl TempDir {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempdir() -> TempDir {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("crdtsync-catchup-{pid}-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    TempDir(dir)
 }
 
 fn hello(r: &mut Registry, client: u8, app: &[u8], version: u32) -> ConnId {
@@ -290,6 +326,60 @@ fn a_foreign_app_joiner_catches_up_untranslated() {
     let foreign = hello(&mut r, 2, DOWN, 1);
     subscribe(&mut r, foreign);
     assert_eq!(caught_up_keys(&mut r, foreign), vec![b"age".to_vec()]);
+}
+
+#[test]
+fn a_foreign_app_writers_op_in_the_log_is_not_translated_for_a_governing_joiner() {
+    let mut r = registry();
+    // A v1 UP writer binds the room and writes "age" — a governing op, tagged at
+    // UP v1.
+    let gov = hello(&mut r, 1, UP, 1);
+    subscribe(&mut r, gov);
+    r.take_outbox(gov);
+    write(&mut r, gov, set(1, b"age"));
+
+    // A DOWN-app connection (foreign to the UP-governed room) also writes "age".
+    // Its version lives in DOWN's space, so its op is logged untagged and must
+    // never be rewritten along UP's chain.
+    let foreign = hello(&mut r, 2, DOWN, 1);
+    subscribe(&mut r, foreign);
+    r.take_outbox(foreign);
+    write(&mut r, foreign, set(2, b"age"));
+
+    // A v2 UP joiner catches up: the governing v1 op is up-translated "age"->
+    // "years"; the foreign op passes verbatim as "age". If the foreign op were
+    // translated along UP's chain it would corrupt to "years" — the joiner would
+    // diverge from what the live seam delivered it verbatim.
+    let joiner = hello(&mut r, 3, UP, 2);
+    subscribe(&mut r, joiner);
+    assert_eq!(
+        caught_up_keys(&mut r, joiner),
+        vec![b"years".to_vec(), b"age".to_vec()]
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // drives the durable store on the filesystem
+fn a_first_subscriber_after_a_restart_catches_up_translated() {
+    let tmp = tempdir();
+    // A v1 UP writer binds the room and writes "age"; the op persists tagged at
+    // UP v1.
+    {
+        let mut r = store_registry(tmp.path());
+        let w = hello(&mut r, 1, UP, 1);
+        subscribe(&mut r, w);
+        write(&mut r, w, set(1, b"age"));
+    }
+
+    // A fresh node over the same store restores the log but not the in-memory
+    // room binding. The first joiner — a v2 UP client — still catches up
+    // translated: the unbound room falls back to the joiner's own app, the very
+    // app whose persisted log this is, so "age" is up-translated to "years"
+    // rather than served raw.
+    let mut r = store_registry(tmp.path());
+    let joiner = hello(&mut r, 2, UP, 2);
+    subscribe(&mut r, joiner);
+    assert_eq!(caught_up_keys(&mut r, joiner), vec![b"years".to_vec()]);
 }
 
 /// A single RegisterSet on `key` from a fresh doc for `client`.

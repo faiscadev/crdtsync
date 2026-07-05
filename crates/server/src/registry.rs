@@ -543,13 +543,31 @@ impl Registry {
             Some(None) => self.connection_schema(id),
             None => None,
         };
-        // The app governing the acted-on room, if bound — the chain a catch-up
-        // delta is translated along. Unbound (a first subscriber, whose log is
-        // empty) or no room: no governing app, so the delta is served verbatim.
-        let governing_app = authz_room
-            .as_deref()
-            .and_then(|room| self.room_apps.get(room))
-            .map(|(app, _)| app.clone());
+        // The app governing the acted-on room — the chain a catch-up delta is
+        // translated along and the space a write's version is tagged in. Resolved
+        // only for the two data-plane messages that consult it (a subscribe's
+        // catch-up, an ops write's tag). A bound room yields its governing app; an
+        // unbound one falls back to the connection's own app — mirroring the
+        // acting schema — so a first subscriber to a room restored from the store
+        // (its `room_apps` binding not yet rebuilt, but its log already populated)
+        // translates that log along the app it is about to bind, rather than
+        // serving it untranslated.
+        let governing_app = if matches!(msg, Message::Subscribe { .. } | Message::Ops { .. }) {
+            match authz_room
+                .as_deref()
+                .map(|room| self.room_apps.get(room).cloned())
+            {
+                Some(Some((app, _))) => Some(app),
+                Some(None) => self
+                    .conns
+                    .get(&id)
+                    .map(|c| c.session.app_id().to_vec())
+                    .filter(|app| !app.is_empty()),
+                None => None,
+            }
+        } else {
+            None
+        };
         let (broadcast, broadcast_version, close, room, awareness, authed_client, bind) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;

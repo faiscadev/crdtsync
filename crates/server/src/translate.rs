@@ -210,19 +210,21 @@ pub fn translate_ops(
 pub fn translate_delta(
     reg: &SchemaRegistry,
     app_id: &[u8],
-    delta: &[StoredOp],
+    delta: Vec<StoredOp>,
     to: u32,
 ) -> Vec<Op> {
     let mut out = Vec::new();
     let mut chains: HashMap<u32, Option<Chain>> = HashMap::new();
-    let mut i = 0;
-    while i < delta.len() {
-        let version = delta[i].schema_version;
-        let mut j = i + 1;
-        while j < delta.len() && delta[j].schema_version == version {
-            j += 1;
+    let mut records = delta.into_iter().peekable();
+    while let Some(first) = records.next() {
+        let version = first.schema_version;
+        let mut run = vec![first.op];
+        while records
+            .peek()
+            .is_some_and(|rec| rec.schema_version == version)
+        {
+            run.push(records.next().expect("peeked a record").op);
         }
-        let run: Vec<Op> = delta[i..j].iter().map(|rec| rec.op.clone()).collect();
         match version {
             Some(from) if from != to => {
                 let chain = chains
@@ -234,7 +236,6 @@ pub fn translate_delta(
             }
             _ => out.extend(run),
         }
-        i = j;
     }
     out
 }

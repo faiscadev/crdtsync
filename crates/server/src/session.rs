@@ -343,10 +343,20 @@ pub fn step(
             // the fresh ops, so a resent op the hub already holds is still acked
             // and pruned. An empty batch acknowledges nothing.
             let through = ops.iter().map(|op| op.id.seq).max();
+            // The op's creation version is recorded only when the writer speaks
+            // the room's governing app — its version number lives in that app's
+            // space. A foreign-app writer's version is a different space and must
+            // never drive this room's chain, so its ops are logged untagged
+            // (`None`, relay-like) and pass verbatim on both the live and the
+            // catch-up seam, exactly as the fan-out already leaves them.
+            let write_version = match governing_app {
+                Some(app) if app == session.app_id() => session.schema_version(),
+                _ => None,
+            };
             // The deduped ops fan out to the room's other subscribers; nothing
             // echoes back to the sender. A hub that cannot durably record the
             // ops rejects the write rather than advertising an unpersisted one.
-            match hub.ingest(&room, ops, session.schema_version()) {
+            match hub.ingest(&room, ops, write_version) {
                 Ok(applied) => Response {
                     replies: through
                         .map(|through| Message::Accepted { channel, through })
@@ -354,7 +364,7 @@ pub fn step(
                         .collect(),
                     broadcast: applied,
                     broadcast_room: Some(room),
-                    broadcast_version: session.schema_version(),
+                    broadcast_version: write_version,
                     ..Response::default()
                 },
                 Err(_) => Response {
@@ -562,7 +572,7 @@ fn catch_up_ops(
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            crate::translate::translate_delta(&reg, app, &delta, target)
+            crate::translate::translate_delta(&reg, app, delta, target)
         }
         _ => delta.into_iter().map(|rec| rec.op).collect(),
     }
