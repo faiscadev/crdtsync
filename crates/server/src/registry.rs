@@ -457,7 +457,7 @@ impl Registry {
         // under the schema that governs *that room* — never the actor's own,
         // self-declared app, which a foreign connection could pick to escalate.
         let authz_room: Option<RoomId> = match &msg {
-            Message::Subscribe { room, .. } => Some(room.clone()),
+            Message::Subscribe { .. } => subscribed_room.clone(),
             Message::Ops { channel, .. }
             | Message::AwarenessSet { channel, .. }
             | Message::VersionCreate { channel, .. }
@@ -471,13 +471,15 @@ impl Registry {
             _ => None,
         };
         // The schema whose `@auth` grants the enforcement points compose under the
-        // deployment authorizer: the room's bound governing schema, falling back to
-        // the connection's own declared app only for a room not yet bound (its
-        // first subscriber, which is about to become that room's incumbent).
+        // deployment authorizer. A room already bound is governed by *its* app's
+        // schema — never the connection's own, even when that schema fails to parse
+        // (then `None`: no grants, default-deny), so a foreign connection cannot
+        // escalate against a permissive self-declared app. The connection's own app
+        // is the fallback only for a room not yet in the bindings — its first
+        // subscriber, about to become the incumbent.
         let acting_schema = match &authz_room {
-            Some(room) => self
-                .governing_schema(room)
-                .or_else(|| self.connection_schema(id)),
+            Some(room) if self.room_apps.contains_key(room) => self.governing_schema(room),
+            Some(_) => self.connection_schema(id),
             None => None,
         };
         let (broadcast, close, room, awareness, authed_client, bind) = {
