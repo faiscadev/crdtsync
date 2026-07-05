@@ -12,13 +12,15 @@
 //! Pure over the registry, no connection state; the live fan-out seam and the
 //! cold-start snapshot both drive it.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
+use crdtsync_core::doc::SlotFate;
 use crdtsync_core::migration::{
-    reachable_down, rewrite_down_along, rewrite_up_along, Migration, OpRewrite, Step,
+    reachable_down, rewrite_down_along, rewrite_up_along, Migration, OpRewrite,
 };
-use crdtsync_core::op::TxId;
-use crdtsync_core::{ClientId, Document, Op};
+use crdtsync_core::op::{OpId, OpKind, TxId};
+use crdtsync_core::stamp::Stamp;
+use crdtsync_core::{ClientId, Document, ElementId, Op, Scalar};
 
 use crate::schema_registry::SchemaRegistry;
 use crate::store::StoredOp;
@@ -122,6 +124,21 @@ impl Chain {
     /// [`MapCreate`]: crdtsync_core::OpKind::MapCreate
     /// [`ListCreate`]: crdtsync_core::OpKind::ListCreate
     /// [`TextCreate`]: crdtsync_core::OpKind::TextCreate
+    /// The fate of a leaf slot at `key` under this chain — the state-level image
+    /// of translating a key-bearing op at that key. A drop of the op is a
+    /// [`SlotFate::Drop`], a key rewrite a [`SlotFate::Rename`], an unchanged
+    /// keep a [`SlotFate::Keep`]. Drives the snapshot migration exactly as the
+    /// op-rewrite drives the live/catch-up seam, so the two converge.
+    pub fn translate_key(&self, key: &[u8]) -> SlotFate {
+        match self.translate_op(&key_probe(key)) {
+            OpRewrite::Drop => SlotFate::Drop,
+            OpRewrite::Keep(out) => match out.kind {
+                OpKind::MapSet { key: rekeyed, .. } if rekeyed != key => SlotFate::Rename(rekeyed),
+                _ => SlotFate::Keep,
+            },
+        }
+    }
+
     pub fn translate_ops(&self, ops: &[Op]) -> Vec<Op> {
         let rewritten: Vec<OpRewrite> = ops
             .iter()
@@ -240,42 +257,17 @@ pub fn translate_delta(
     out
 }
 
-/// The field keys added on the ascending path `(to, from]` — the fields a
-/// recipient at `to` does not model that a snapshot at `from` may carry. A
-/// reachable down path crosses only back-compatible edges, whose sole
-/// slot-bearing step is `addField`, so this is the exact set to project out of a
-/// snapshot down-served to `to`. `from <= to` (a same/newer recipient) adds
-/// nothing.
-fn added_fields(
-    reg: &SchemaRegistry,
-    app_id: &[u8],
-    from: u32,
-    to: u32,
-) -> Result<BTreeSet<Vec<u8>>, TranslateError> {
-    if from <= to {
-        return Ok(BTreeSet::new());
-    }
-    let edges = edge_slice(reg, app_id, to, from)?;
-    let mut fields = BTreeSet::new();
-    for edge in &edges {
-        for step in edge.steps() {
-            if let Step::AddField { field, .. } = step {
-                fields.insert(field.clone().into_bytes());
-            }
-        }
-    }
-    Ok(fields)
-}
-
-/// Down-project a room snapshot (`Document::encode_state` bytes materialised at
-/// version `from`) for a recipient at version `to`. Every map slot at a field
-/// added above `to` that is not a live container is dropped — the same split the
-/// op seam makes ([`Chain::translate_ops`] drops an added field's key-bearing
-/// set/inc ops, carries its container-creates verbatim) — so a snapshot-served
-/// joiner converges with a peer served the same history as a down-translated op
-/// delta. A same/newer recipient, a path that added nothing, or bytes that
+/// Migrate a room snapshot (`Document::encode_state` bytes materialised at
+/// version `from`) for a recipient at version `to`, mirroring the op seam so a
+/// snapshot-served joiner converges with a peer served the same history as a
+/// translated op delta. Each leaf slot's key is run through the same chain that
+/// rewrites an op's key — dropped (an added field down, a removed field up),
+/// re-keyed (a renamed field), or kept — while a container slot is carried
+/// verbatim, exactly as [`Chain::translate_ops`] carries a container-create. A
+/// same-version recipient, a migration that changed nothing, or bytes that
 /// cannot be decoded or whose chain cannot be resolved are returned verbatim
-/// (fail-safe); an unreachable recipient is already refused at the handshake.
+/// (fail-safe); an unreachable down recipient is already refused at the
+/// handshake, so the chain here is always reachable.
 pub fn translate_snapshot(
     reg: &SchemaRegistry,
     app_id: &[u8],
@@ -283,16 +275,43 @@ pub fn translate_snapshot(
     from: u32,
     to: u32,
 ) -> Vec<u8> {
-    let fields = match added_fields(reg, app_id, from, to) {
-        Ok(fields) if !fields.is_empty() => fields,
-        _ => return state.to_vec(),
+    if from == to {
+        return state.to_vec();
+    }
+    let chain = match resolve_chain(reg, app_id, from, to) {
+        Ok(chain) => chain,
+        Err(_) => return state.to_vec(),
     };
     let mut doc = match Document::decode_state(state) {
         Ok(doc) => doc,
         Err(_) => return state.to_vec(),
     };
-    doc.drop_leaf_slots(&fields);
-    doc.encode_state()
+    if doc.migrate_leaf_slots(|key| chain.translate_key(key)) {
+        doc.encode_state()
+    } else {
+        state.to_vec()
+    }
+}
+
+/// A synthetic key-bearing op, so a slot's key can be run through the same
+/// rewrite an op of that key would take. Only the key is read back; the id,
+/// stamp, target, and value are inert.
+fn key_probe(key: &[u8]) -> Op {
+    Op::new(
+        OpId {
+            client: ClientId::from_bytes([0; 16]),
+            seq: 0,
+        },
+        Stamp {
+            lamport: 0,
+            client: ClientId::from_bytes([0; 16]),
+        },
+        ElementId::from_bytes([0; 16]),
+        OpKind::MapSet {
+            key: key.to_vec(),
+            value: Scalar::Null,
+        },
+    )
 }
 
 /// Whether a recipient at `to` can be reached from an op created at `from`.

@@ -619,14 +619,16 @@ fn catch_up_snapshot(
     state: Vec<u8>,
 ) -> Vec<u8> {
     match governing_target(governing, session) {
-        Some((app, governing_version, target)) => {
+        // A same-version joiner needs no migration and no chain — skip the lock
+        // and serve the snapshot as is.
+        Some((app, governing_version, target)) if governing_version != target => {
             let reg = match registry.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
             crate::translate::translate_snapshot(&reg, app, &state, governing_version, target)
         }
-        None => state,
+        _ => state,
     }
 }
 

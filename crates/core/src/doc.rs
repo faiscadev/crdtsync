@@ -29,7 +29,7 @@ use crate::stamp::Stamp;
 use crate::text::Text;
 use crate::validate::Step;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// The well-known root slot every replica shares, so children derive under the
@@ -45,6 +45,17 @@ const STATE_VERSION: u8 = 2;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OrphanEvent {
     pub id: ElementId,
+}
+
+/// What a snapshot migration does to one leaf slot, keyed on its slot key — the
+/// state-level image of an op's [`OpRewrite`](crate::migration::OpRewrite):
+/// `Keep` it, `Drop` it (an added field down, a removed field up), or `Rename`
+/// it to a new key (a renamed field).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SlotFate {
+    Keep,
+    Rename(Vec<u8>),
+    Drop,
 }
 
 pub struct Document {
@@ -154,22 +165,75 @@ impl Document {
         self.root.borrow().get(key)
     }
 
-    /// Project the snapshot down for a recipient below a schema version that
-    /// added these field keys: across every map, drop each slot at one of `keys`
-    /// that is not a live container. A scalar / register / counter value (or a
-    /// tombstone) at such a key is removed; a map / list / text is kept with its
-    /// subtree — the same split the server's op translation makes on the op seam
-    /// (drop an added field's key-bearing set/inc ops, carry its
-    /// container-creates verbatim), so a snapshot-served joiner converges with a
-    /// peer served the down-translated op delta. Empty `keys` is a no-op; other
-    /// slots, stamps, and identities are unchanged.
-    pub fn drop_leaf_slots(&mut self, keys: &BTreeSet<Vec<u8>>) {
-        if keys.is_empty() {
-            return;
+    /// Migrate a snapshot's leaf slots by `fate`, keyed on the slot key — the
+    /// state-level analogue of translating the op stream between two schema
+    /// versions, so a snapshot-served joiner converges with a peer served the
+    /// same history as a translated op delta. Across every map, each leaf slot
+    /// (scalar / register / counter, live or tombstoned) is `Keep`t, `Drop`ped,
+    /// or `Rename`d to a new key per `fate`; a live container (map / list / text)
+    /// is always kept unre-keyed, mirroring the op seam, which carries a
+    /// container-create verbatim rather than tear its subtree. A dropped or
+    /// renamed counter's element moves with its slot — dropped from the registry,
+    /// or re-homed to the id its new key derives — so no phantom counter lingers.
+    /// Returns whether any slot changed. `fate` is the composition of the chain's
+    /// per-step key rewrites; supplying `|_| Keep` is a no-op.
+    pub fn migrate_leaf_slots(&mut self, fate: impl Fn(&[u8]) -> SlotFate) -> bool {
+        let mut changed = false;
+        let map_ids: Vec<ElementId> = self.maps.keys().copied().collect();
+        for map_id in map_ids {
+            let map = Rc::clone(&self.maps[&map_id]);
+            // Decide every slot's fate against the pre-migration key set, then
+            // apply: take all movers out first, then re-home them, so a rename
+            // onto a key this pass also moves resolves by stamp, never by order.
+            let mut moved: Vec<(Vec<u8>, Stamp, Option<Element>, bool)> = Vec::new();
+            let keys = map.borrow().slot_keys();
+            for key in keys {
+                if map.borrow().slot_is_live_container(&key) {
+                    continue;
+                }
+                let fate = match fate(&key) {
+                    SlotFate::Keep => continue,
+                    other => other,
+                };
+                let (stamp, value, tombstone) = map
+                    .borrow_mut()
+                    .take_slot(&key)
+                    .expect("a key from slot_keys is present");
+                changed = true;
+                // A counter's value lives in the registry keyed by the id its old
+                // key derives; drop or re-home it to match the slot.
+                let counter = matches!(value, Some(Element::Counter(_)))
+                    .then(|| ElementId::derive(map_id, &key, ElementKind::Counter));
+                match fate {
+                    SlotFate::Keep => unreachable!("filtered above"),
+                    SlotFate::Drop => {
+                        if let Some(old) = counter {
+                            self.counters.remove(&old);
+                            self.parents.remove(&old);
+                        }
+                    }
+                    SlotFate::Rename(to) => {
+                        let value = match (counter, &value) {
+                            (Some(old), Some(Element::Counter(c))) => {
+                                let new = ElementId::derive(map_id, &to, ElementKind::Counter);
+                                self.counters.remove(&old);
+                                self.parents.remove(&old);
+                                let rehomed = Rc::new(RefCell::new(c.borrow().rehomed(new)));
+                                self.counters.insert(new, Rc::clone(&rehomed));
+                                self.parents.insert(new, map_id);
+                                Some(Element::Counter(rehomed))
+                            }
+                            _ => value,
+                        };
+                        moved.push((to, stamp, value, tombstone));
+                    }
+                }
+            }
+            for (key, stamp, value, tombstone) in moved {
+                map.borrow_mut().put_slot_lww(key, stamp, value, tombstone);
+            }
         }
-        for map in self.maps.values() {
-            map.borrow_mut().drop_projected_slots(keys);
-        }
+        changed
     }
 
     /// Drain the orphan events accumulated since the last call.

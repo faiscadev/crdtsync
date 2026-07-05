@@ -2,12 +2,11 @@
 //!
 //! A joiner below the room's compaction floor is served a whole-replica snapshot
 //! (the merged state at the room's governing version) rather than an op delta.
-//! For a joiner at an older schema version that governing state carries fields
-//! its version does not model, so the snapshot is down-projected the same way
-//! the op seam translates a delta: a field added above the joiner's version is
-//! dropped unless it holds a container (whose create the op seam carries
-//! verbatim). So a snapshot-served joiner and a peer served the same history as
-//! a down-translated op delta converge on the same observable state.
+//! When the joiner's schema version differs from the room's, the snapshot is
+//! migrated the same way the op seam translates a delta — down (a field added
+//! above the joiner is dropped, a container carried verbatim) or up (a renamed
+//! field re-keyed, a removed field dropped) — so a snapshot-served joiner and a
+//! peer served the same history as a translated op delta converge.
 
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +28,11 @@ const MAP_V2: &str = r#"{ "schema": "s", "version": 2, "root": "R",
 const EDGE_V2: &[u8] = br#"{ "from": 1, "to": 2, "steps": [
     { "kind": "addField", "type": "R", "field": "note", "fieldType": "int" },
     { "kind": "addField", "type": "R", "field": "body", "fieldType": "text" } ] }"#;
+/// A second app whose v1→v2 renames `title`→`heading` — a breaking edge an older
+/// snapshot must be up-migrated across for a newer below-floor joiner.
+const UP: &[u8] = b"up";
+const UP_EDGE_V2: &[u8] = br#"{ "from": 1, "to": 2, "steps": [
+    { "kind": "renameField", "type": "R", "from": "title", "to": "heading" } ] }"#;
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -40,6 +44,8 @@ fn schema_registry() -> SchemaRegistry {
     let mut sr = SchemaRegistry::new();
     sr.register(APP, 1, MAP_V1.as_bytes(), b"").unwrap();
     sr.register(APP, 2, MAP_V2.as_bytes(), EDGE_V2).unwrap();
+    sr.register(UP, 1, MAP_V1.as_bytes(), b"").unwrap();
+    sr.register(UP, 2, MAP_V2.as_bytes(), UP_EDGE_V2).unwrap();
     sr
 }
 
@@ -55,22 +61,26 @@ fn v2_history() -> (Vec<Op>, Vec<u8>) {
     (ops, w.encode_state())
 }
 
-/// The observable `(title, note, body)` reading of a document.
-fn observe(d: &Document) -> (Option<i64>, Option<i64>, Option<String>) {
-    let int = |key: &[u8]| match d.get(key) {
+/// The Int behind a register slot, or `None` if absent.
+fn int_at(d: &Document, key: &[u8]) -> Option<i64> {
+    match d.get(key) {
         Some(Element::Register(r)) => match r.borrow().read() {
             Scalar::Int(n) => Some(*n),
             _ => panic!("expected an Int register"),
         },
         None => None,
         _ => panic!("expected a register or nothing"),
-    };
+    }
+}
+
+/// The observable `(title, note, body)` reading of a document.
+fn observe(d: &Document) -> (Option<i64>, Option<i64>, Option<String>) {
     let body = match d.get(b"body") {
         Some(Element::Text(t)) => Some(t.borrow().as_string()),
         None => None,
         _ => panic!("expected a text or nothing"),
     };
-    (int(b"title"), int(b"note"), body)
+    (int_at(d, b"title"), int_at(d, b"note"), body)
 }
 
 // --- the projection itself ---
@@ -143,6 +153,38 @@ fn a_snapshot_joiner_converges_with_an_op_delta_joiner() {
     assert_eq!(
         observe(&via_snapshot),
         (Some(1), None, Some("hi".to_string()))
+    );
+}
+
+#[test]
+fn a_snapshot_up_migrates_a_renamed_field_and_converges() {
+    let reg = schema_registry();
+    // The whole history authored at v1: a single `title` field.
+    let mut w = Document::new(cid(1));
+    let ops = w.transact(|tx| tx.register(b"title", Scalar::Int(1)));
+    let snapshot = w.encode_state();
+
+    // A v2 joiner below the floor: the v1 snapshot up-migrated to v2 (title→heading).
+    let projected = translate_snapshot(&reg, UP, &snapshot, 1, 2);
+    let via_snapshot = Document::decode_state(&projected).unwrap();
+
+    // A v2 joiner above the floor: the same history up-translated as an op delta.
+    let translated = translate_ops(&reg, UP, &ops, 1, 2);
+    let mut via_delta = Document::new(cid(2));
+    for op in &translated {
+        via_delta.apply(op);
+    }
+
+    let read = |d: &Document| (int_at(d, b"title"), int_at(d, b"heading"));
+    assert_eq!(
+        read(&via_snapshot),
+        read(&via_delta),
+        "the up-migrated snapshot converges with the op delta"
+    );
+    assert_eq!(
+        read(&via_snapshot),
+        (None, Some(1)),
+        "title is re-keyed to heading"
     );
 }
 
