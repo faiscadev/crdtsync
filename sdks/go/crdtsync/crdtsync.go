@@ -429,6 +429,30 @@ func (c *Client) DeclareApp(appID []byte, schemaVersion uint32) {
 	C.crdtsync_client_declare_app(c.h, ap, al, C.uint32_t(schemaVersion))
 }
 
+// ActiveSchemaVersion is the concrete schema version the enforcing server
+// advertised for this session, present once a SchemaAdvert has been received.
+// It is distinct from the version declared in DeclareApp: a dynamic client
+// (declared 0) learns the served version here. The app persists it across
+// restart itself; the SDK caches but owns no storage.
+func (c *Client) ActiveSchemaVersion() (uint32, bool) {
+	var out C.uint32_t
+	if C.crdtsync_client_active_schema_version(c.h, &out) != 1 {
+		return 0, false
+	}
+	return uint32(out), true
+}
+
+// ActiveSchema is the bytes of the schema the enforcing server advertised for
+// this session (possibly empty), present once a SchemaAdvert has been received.
+// Pairs with ActiveSchemaVersion.
+func (c *Client) ActiveSchema() ([]byte, bool) {
+	var out C.CrdtBuf
+	if C.crdtsync_client_active_schema(c.h, &out) != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
 // Hello is the opening frame to send, naming this client.
 func (c *Client) Hello() []byte {
 	return takeBuf(C.crdtsync_client_hello(c.h))

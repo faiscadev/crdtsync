@@ -304,6 +304,42 @@ fn a_declared_app_rides_along_in_the_hello_frame() {
 }
 
 #[wasm_bindgen_test]
+fn the_server_advertised_schema_is_recorded_and_readable() {
+    use crdtsync_core::protocol::{encode_message, Message};
+    let mut c = wasm_client(1);
+    // Nothing advertised yet.
+    assert_eq!(c.active_schema_version(), None);
+    assert_eq!(c.active_schema(), None);
+
+    // Folding a SchemaAdvert records the served version and its bytes.
+    let advert = encode_message(&Message::SchemaAdvert {
+        schema_version: 4,
+        schema: b"schema-body".to_vec(),
+    });
+    assert!(c.receive(&advert));
+    assert_eq!(c.active_schema_version(), Some(4));
+    assert_eq!(c.active_schema().as_deref(), Some(&b"schema-body"[..]));
+
+    // A later advert supersedes it.
+    let advert = encode_message(&Message::SchemaAdvert {
+        schema_version: 5,
+        schema: b"next-body".to_vec(),
+    });
+    assert!(c.receive(&advert));
+    assert_eq!(c.active_schema_version(), Some(5));
+    assert_eq!(c.active_schema().as_deref(), Some(&b"next-body"[..]));
+
+    // An empty body is still an advertisement, not `None`.
+    let advert = encode_message(&Message::SchemaAdvert {
+        schema_version: 6,
+        schema: Vec::new(),
+    });
+    assert!(c.receive(&advert));
+    assert_eq!(c.active_schema_version(), Some(6));
+    assert_eq!(c.active_schema().as_deref(), Some(&[][..]));
+}
+
+#[wasm_bindgen_test]
 fn a_client_outbox_drains_on_ack() {
     use crdtsync_core::protocol::{encode_message, Channel, Message};
     let mut a = wasm_client(1);
