@@ -13,10 +13,11 @@
 //! imported room is deduped exactly as against the origin.
 //!
 //! [`Hub::clone_room`] duplicates a room's live state into a fresh room id within
-//! one hub — "duplicate this doc as a template". Two live copies of one origin
-//! sharing element/client ids never collide: server sequences are room-scoped, so
-//! room-scoping alone keeps the replicas distinct (no id namespacing needed). The
-//! clone carries the live state, not the named-version history.
+//! one hub — "duplicate this doc as a template". The clone renumbers its own
+//! room-scoped server sequences, so it takes edits independently of the origin; it
+//! also inherits the origin's op-dedup set (identities ride the snapshot, as for
+//! import), so a resend of an already-authored op is deduped rather than colliding.
+//! The clone carries the live state, not the named-version history.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::{ClientId, Element, Scalar};
