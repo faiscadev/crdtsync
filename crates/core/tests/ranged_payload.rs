@@ -291,7 +291,15 @@ fn a_delete_wins_over_a_concurrent_payload_edit() {
             .unwrap()
             .set(b"a", Scalar::Int(1))
     });
-    apply_all(&mut r1, &edit);
+    // r1 receives the edit after deleting the range: it must apply to the retained
+    // (now hidden) payload, NOT buffer forever — a permanent buffer would leak and
+    // desync r1's snapshot from r2's. `apply` returns true only when applied now.
+    for op in &edit {
+        assert!(
+            r1.apply(op),
+            "a payload edit racing a delete applies to the hidden payload, not buffered",
+        );
+    }
     apply_all(&mut r2, &del);
 
     // Observable state converges: both hide the range and its payload.
@@ -300,6 +308,31 @@ fn a_delete_wins_over_a_concurrent_payload_edit() {
         assert!(r.ranged_payload(rid).is_none());
         assert_eq!(r.ranged_elements().len(), 0);
     }
+}
+
+#[test]
+fn set_payload_on_a_composite_range_emits_nothing() {
+    // set_payload targets a scalar payload; a composite is edited through its
+    // container. A set against a composite range must emit no op — an emitted
+    // RangedSetPayload would be silently inert on every replica (a lost write).
+    let mut d = Document::new(cid(1));
+    build_text(&mut d, b"t", "x");
+    let seq = text_id(&d, b"t");
+    let mut rid = ElementId::from_bytes([0u8; 16]);
+    d.transact(|tx| {
+        rid = tx.ranged().create_map(
+            at(seq, RelativePosition::Start),
+            at(seq, RelativePosition::End),
+        );
+    });
+
+    let ops = d.transact(|tx| tx.ranged().set_payload(rid, Scalar::Int(1)));
+    assert!(
+        ops.is_empty(),
+        "set_payload on a composite range emits nothing"
+    );
+    // The composite payload is untouched and still addressable.
+    assert!(d.ranged_payload(rid).is_some());
 }
 
 #[test]

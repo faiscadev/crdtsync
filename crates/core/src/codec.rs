@@ -500,20 +500,25 @@ impl<'a> Cursor<'a> {
     fn ranged_init(&mut self) -> Result<RangedInit, DecodeError> {
         match self.u8()? {
             0 => Ok(RangedInit::Scalar(self.scalar()?)),
-            1 => {
-                let kind = ElementKind::from_tag(self.u8()?)
-                    .filter(|k| is_composite_payload_kind(*k))
-                    .ok_or(DecodeError::BadTag {
-                        what: "ranged create composite kind",
-                        tag: 1,
-                    })?;
-                Ok(RangedInit::Composite(kind))
-            }
+            1 => Ok(RangedInit::Composite(self.composite_payload_kind()?)),
             tag => Err(DecodeError::BadTag {
                 what: "ranged create payload",
                 tag,
             }),
         }
+    }
+
+    /// Decode one RangedElement composite-payload container kind (Map / List /
+    /// Text), reporting the offending byte on an invalid kind. Shared by the op
+    /// codec and the state codec, which encode the kind identically.
+    pub(crate) fn composite_payload_kind(&mut self) -> Result<ElementKind, DecodeError> {
+        let byte = self.u8()?;
+        ElementKind::from_tag(byte)
+            .filter(|k| is_composite_payload_kind(*k))
+            .ok_or(DecodeError::BadTag {
+                what: "ranged composite payload kind",
+                tag: byte,
+            })
     }
 
     fn opkind(&mut self) -> Result<OpKind, DecodeError> {

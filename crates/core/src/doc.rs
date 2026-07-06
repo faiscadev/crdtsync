@@ -23,9 +23,7 @@ use crate::elementid::{ElementId, ElementKind};
 use crate::list::{Anchor, List};
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
-use crate::ranged::{
-    is_composite_payload_kind, RangeAnchor, RangedElement, RangedInit, RangedPayload,
-};
+use crate::ranged::{RangeAnchor, RangedElement, RangedInit, RangedPayload};
 use crate::repair::{keyed_repairs, Repair, RepairId};
 use crate::scalar::Scalar;
 use crate::schema::Schema;
@@ -792,12 +790,24 @@ impl Document {
                     stamp: cur.stamp()?,
                 },
                 1 => {
-                    let kind = ElementKind::from_tag(cur.u8()?)
-                        .filter(|k| is_composite_payload_kind(*k))
-                        .ok_or(DecodeError::BadTag {
-                            what: "ranged element composite kind",
-                            tag: 1,
-                        })?;
+                    let kind = cur.composite_payload_kind()?;
+                    // A valid snapshot encodes the payload container into the
+                    // registries; a stream naming a composite payload without its
+                    // container is corrupt, so reject rather than decode a range
+                    // whose body silently resolves to nothing.
+                    let pid = payload_id(id, kind);
+                    let present = match kind {
+                        ElementKind::Map => maps.contains_key(&pid),
+                        ElementKind::List => lists.contains_key(&pid),
+                        ElementKind::Text => texts.contains_key(&pid),
+                        _ => false,
+                    };
+                    if !present {
+                        return Err(DecodeError::BadTag {
+                            what: "ranged composite payload: missing container",
+                            tag: 0,
+                        });
+                    }
                     Payload::Composite { kind }
                 }
                 tag => {
@@ -1492,11 +1502,15 @@ impl Document {
         if let Some(f) = self.xml_fragments.get(&id) {
             return Some(f.borrow().is_displaced());
         }
-        // A RangedElement is a virtual container: present unless tombstoned, so a
-        // delete of the range makes its composite payload unreachable — delete
-        // wins, the payload subtree kept but hidden.
-        if let Some(e) = self.ranged.get(&id) {
-            return Some(e.tombstone);
+        // A materialised RangedElement is a virtual container holding its composite
+        // payload. It reports installed even when tombstoned: delete-wins is a
+        // read-layer filter (the payload is hidden from `ranged_payload`), not a
+        // reachability break — so a peer edit that raced the delete applies to the
+        // retained-hidden payload instead of buffering forever (which would leak
+        // and desync the snapshot). An unmaterialised range (create unseen) is
+        // absent here, so its payload stays unreachable until the create arrives.
+        if self.ranged.contains_key(&id) {
+            return Some(false);
         }
         None
     }
@@ -2369,15 +2383,14 @@ fn mark_displaced(
     // later re-win of the ancestor restores the whole subtree).
     let mut installed: HashSet<ElementId> = HashSet::new();
     installed.insert(root_id);
-    // A live RangedElement's composite payload is held by the range, not a slot,
-    // so seed it here; its own nested containers are picked up by the map/list
-    // scans below. A tombstoned range's payload is left out — delete keeps it
-    // hidden and displaced.
+    // A materialised RangedElement's composite payload is held by the range, not a
+    // slot, so seed it here; its own nested containers are picked up by the
+    // map/list scans below. A tombstoned range's payload is seeded too, matching
+    // live state (a delete hides the payload at the read layer but never displaces
+    // its container), so the container decodes with the same flag on every replica.
     for (id, e) in ranged {
-        if !e.tombstone {
-            if let Payload::Composite { kind } = &e.payload {
-                installed.insert(payload_id(*id, *kind));
-            }
+        if let Payload::Composite { kind } = &e.payload {
+            installed.insert(payload_id(*id, *kind));
         }
     }
     for m in maps.values() {
@@ -2701,12 +2714,15 @@ impl RangedCursor<'_> {
             .then(|| payload_id(id, kind))
     }
 
-    /// Replace a RangedElement's payload (last-writer-wins). Emits nothing for an
-    /// id this replica has not yet materialised: a local apply would no-op while
-    /// still broadcasting, so the author would diverge from a peer that applied
-    /// the change against the present entry.
+    /// Replace a RangedElement's scalar payload (last-writer-wins). Emits nothing
+    /// for an id this replica has not yet materialised (a local apply would no-op
+    /// while still broadcasting, diverging the author from a peer that applied the
+    /// change against the present entry) or one whose payload is a composite — a
+    /// composite is edited through its container, so a set here would be an inert
+    /// op on every replica.
     pub fn set_payload(&mut self, id: ElementId, payload: Scalar) {
-        if !self.doc.ranged.contains_key(&id) {
+        if !matches!(self.doc.ranged.get(&id), Some(e) if matches!(e.payload, Payload::Scalar { .. }))
+        {
             return;
         }
         let root = self.doc.root_id();
