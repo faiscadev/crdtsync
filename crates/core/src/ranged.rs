@@ -52,6 +52,10 @@ pub struct RangedElement {
     pub start: RangeAnchor,
     pub end: RangeAnchor,
     pub payload: RangedPayload,
+    /// The mark name this range carries, or `None` for a plain annotation. A
+    /// named range is a mark: the read model gathers same-named marks covering a
+    /// character and combines them per the schema's declared flavor.
+    pub name: Option<Vec<u8>>,
 }
 
 impl RangedElement {

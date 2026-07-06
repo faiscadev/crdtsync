@@ -574,6 +574,23 @@ impl List {
         }
     }
 
+    /// Like [`resolve_position`](Self::resolve_position), but yields `None` when
+    /// the position is bound to an item absent from the sequence — an anchor
+    /// whose referent has not arrived yet — rather than clamping to a boundary.
+    /// `Start`/`End` always resolve. A consumer that must distinguish "the anchor
+    /// resolves here" from "the anchor cannot resolve yet" (mark coverage) uses
+    /// this; a cursor that wants a best-effort index uses `resolve_position`.
+    pub fn resolve_position_present(&self, pos: &RelativePosition) -> Option<usize> {
+        match pos {
+            RelativePosition::Start => Some(0),
+            RelativePosition::End => Some(self.len()),
+            RelativePosition::Before(id) => self.live_rank(*id).map(|(before, _)| before),
+            RelativePosition::After(id) => self
+                .live_rank(*id)
+                .map(|(before, live)| before + usize::from(live)),
+        }
+    }
+
     /// The number of live items strictly before `id` in sequence order, and
     /// whether `id` itself is live — or `None` if `id` is not in the sequence.
     /// One traversal of the order (no repeated `live_index` scans, which made the
