@@ -392,7 +392,10 @@ fn a_mark_whose_anchor_chars_have_not_arrived_covers_nothing() {
     // A RangedCreate is accept-and-store — a mark can apply before the inserts
     // that carry its span's codepoints. Until those codepoints arrive its anchors
     // cannot resolve, so it covers nothing; it must not collapse onto a boundary
-    // and paint the whole current text.
+    // and paint the whole current text. A grow-both span makes the hazard sharp:
+    // its start anchor is `After(w)` and end `Before(d)` — with both codepoints
+    // absent a boundary-clamping resolve gives `After(absent) = 0`,
+    // `Before(absent) = len`, i.e. `[0, len)`, painting every present character.
     let mut author = Document::new(cid(1));
     author.set_schema(crdtsync_core::schema::Schema::parse(SCHEMA).unwrap());
     let ins_hello = author.transact(|tx| {
@@ -401,8 +404,8 @@ fn a_mark_whose_anchor_chars_have_not_arrived_covers_nothing() {
     let ins_world = author.transact(|tx| {
         tx.text(b"body").insert(5, " world");
     });
-    // Bold "world" — anchors bind to codepoints inserted by ins_world.
-    let (s, e) = span(&author, 6, 11);
+    // Bold "orl" (indices 7..10) — both anchors bind to codepoints ins_world adds.
+    let (s, e) = grow_span(&author, 7, 10);
     let mark = author.transact(|tx| {
         tx.ranged().mark(b"bold", s, e, Scalar::Bool(true));
     });
@@ -419,13 +422,16 @@ fn a_mark_whose_anchor_chars_have_not_arrived_covers_nothing() {
         );
     }
 
-    // Once " world" arrives the mark resolves and covers exactly "world".
+    // Once " world" arrives the mark resolves and covers exactly "orl".
     apply_all(&mut r, &ins_world);
-    for i in 0..6 {
-        assert!(!is_bold(&r, i, b"bold"), "char {i} still not bold");
+    for i in 0..7 {
+        assert!(!is_bold(&r, i, b"bold"), "char {i} not bold");
     }
-    for i in 6..11 {
+    for i in 7..10 {
         assert!(is_bold(&r, i, b"bold"), "char {i} now bold");
+    }
+    for i in 10..11 {
+        assert!(!is_bold(&r, i, b"bold"), "char {i} not bold");
     }
 }
 
