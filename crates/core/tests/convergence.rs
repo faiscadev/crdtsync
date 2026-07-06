@@ -172,7 +172,12 @@ fn fp_element(e: &Element) -> String {
         Element::Text(t) => format!("T{:?}", t.borrow().as_string()),
         Element::XmlElement(x) => {
             let x = x.borrow();
-            format!("X{:?}[{}]", x.tag(), fp_children(&x.children()))
+            format!(
+                "X{:?}{{{}}}[{}]",
+                x.tag(),
+                fp_attrs(&x.attrs()),
+                fp_children(&x.children())
+            )
         }
         Element::XmlFragment(f) => format!("F[{}]", fp_children(&f.borrow().children())),
     }
@@ -180,9 +185,25 @@ fn fp_element(e: &Element) -> String {
 
 /// Fingerprint a children sequence in order — the convergence-critical structure.
 fn fp_children(children: &std::rc::Rc<std::cell::RefCell<crdtsync_core::list::List>>) -> String {
-    let c = children.borrow();
-    (0..c.len())
-        .filter_map(|i| c.get(i).map(|v| fp_element(&v)))
+    children
+        .borrow()
+        .values()
+        .iter()
+        .map(fp_element)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Fingerprint an attrs map by sorted key, so a divergent attr shows up.
+fn fp_attrs(attrs: &std::rc::Rc<std::cell::RefCell<crdtsync_core::map::Map>>) -> String {
+    let a = attrs.borrow();
+    let mut keys = a.keys();
+    keys.sort();
+    keys.iter()
+        .filter_map(|k| {
+            a.get(k)
+                .map(|v| format!("{}={}", String::from_utf8_lossy(k), fp_element(&v)))
+        })
         .collect::<Vec<_>>()
         .join(",")
 }

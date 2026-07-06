@@ -27,8 +27,6 @@ const SLOT_COUNTER: u8 = 2;
 const SLOT_MAP: u8 = 3;
 const SLOT_LIST: u8 = 4;
 const SLOT_TEXT: u8 = 5;
-const SLOT_XML_ELEMENT: u8 = 6;
-const SLOT_XML_FRAGMENT: u8 = 7;
 
 /// A map read from a snapshot: its id and slots, with composite children still
 /// unresolved references into the document's by-id registries.
@@ -192,8 +190,11 @@ impl Map {
                 Element::Map(m) => put_ref(out, SLOT_MAP, m.borrow().id()),
                 Element::List(l) => put_ref(out, SLOT_LIST, l.borrow().id()),
                 Element::Text(t) => put_ref(out, SLOT_TEXT, t.borrow().id()),
-                Element::XmlElement(x) => put_ref(out, SLOT_XML_ELEMENT, x.borrow().id()),
-                Element::XmlFragment(f) => put_ref(out, SLOT_XML_FRAGMENT, f.borrow().id()),
+                Element::XmlElement(_) | Element::XmlFragment(_) => {
+                    unreachable!(
+                        "a map slot holds a scalar, register, or counter/map/list/text ref"
+                    )
+                }
             }
         }
     }
@@ -228,10 +229,6 @@ impl Map {
                     SLOT_MAP => SlotValue::Ref(ElementKind::Map, cur.element_id()?),
                     SLOT_LIST => SlotValue::Ref(ElementKind::List, cur.element_id()?),
                     SLOT_TEXT => SlotValue::Ref(ElementKind::Text, cur.element_id()?),
-                    SLOT_XML_ELEMENT => SlotValue::Ref(ElementKind::XmlElement, cur.element_id()?),
-                    SLOT_XML_FRAGMENT => {
-                        SlotValue::Ref(ElementKind::XmlFragment, cur.element_id()?)
-                    }
                     tag => {
                         return Err(DecodeError::BadTag {
                             what: "map slot value",

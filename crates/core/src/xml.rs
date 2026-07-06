@@ -79,8 +79,7 @@ impl XmlElement {
 
     /// Merge `src` (the same element) into this one — attrs and children each
     /// reconcile through their own engine. The `tag` is identity, not state, so
-    /// it is left untouched. Takes `&self`: the halves mutate behind their own
-    /// `RefCell`s, as the shared registry handles require.
+    /// it is left untouched.
     pub fn merge(&self, src: &Self) {
         self.attrs.borrow_mut().merge(&src.attrs.borrow());
         self.children.borrow_mut().merge(&src.children.borrow());

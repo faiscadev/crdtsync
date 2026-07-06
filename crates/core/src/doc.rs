@@ -1345,8 +1345,8 @@ fn resolve_ref(
         ElementKind::List => lists.get(&id).map(|l| Element::List(Rc::clone(l))),
         ElementKind::Text => texts.get(&id).map(|t| Element::Text(Rc::clone(t))),
         ElementKind::Map => maps.get(&id).map(|m| Element::Map(Rc::clone(m))),
-        // XmlElement / XmlFragment gain their registries with the state codec;
-        // until then a slot reference to one is a dangling ref, not resolvable.
+        // A leaf has no registered handle to reference; the tree kinds are not
+        // resolved through this seam.
         ElementKind::Scalar
         | ElementKind::Register
         | ElementKind::XmlElement
