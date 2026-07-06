@@ -187,7 +187,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **XmlElement/marks — Unit 5a — schema XmlElement/XmlFragment type parse (core)** — the type kind the schema layer never had. `TypeDef::Xml { tag: Option<String>, children: Vec<String>, attrs: Vec<(String, String)>, marks: Vec<String>, orphan_inline: Option<String> }`; `kind: "xml"` (element, `tag` required) / `kind: "fragment"` (tagless root, no attrs/marks). `children` = allowlist of child type names, `attrs` = key→value type, `marks` = allowlist of mark names, `repair.orphanInline` = default block type. Reference closure extends: child/attr/orphan types must be declared (`UnknownTypeRef`), marks must be in the top-level `marks` block (new `UnknownMarkRef`). Parse-only, enforcement-inert (`validate::expected_kind` gains the two xml kinds; no xml constraint checked yet). Total-decode. `tests/schema.rs` +17. Design in DECISIONS (2026-07-06). → *Schema / CRDT Model*.
 
 ---
 

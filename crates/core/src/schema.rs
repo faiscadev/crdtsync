@@ -251,6 +251,19 @@ pub enum TypeDef {
     Register { min: Option<i64>, max: Option<i64> },
     /// A counter with optional numeric bounds.
     Counter { min: Option<i64>, max: Option<i64> },
+    /// An XmlElement (`tag: Some`) or a tagless XmlFragment (`tag: None`, the
+    /// document tree's root container). `children` is the allowlist of child
+    /// type names (elements or text); `attrs` maps each declared attribute key to
+    /// its value type; `marks` is the allowlist of mark names this element may
+    /// carry; `orphan_inline` names the default block type that repair wraps loose
+    /// inline content in. A fragment carries no `tag`, `attrs`, or `marks`.
+    Xml {
+        tag: Option<String>,
+        children: Vec<String>,
+        attrs: Vec<(String, String)>,
+        marks: Vec<String>,
+        orphan_inline: Option<String>,
+    },
 }
 
 /// Why a schema failed to parse or validate.
@@ -307,6 +320,9 @@ pub enum SchemaErrorKind {
     UnknownFlavor,
     /// A mark declared an `expand` outside `none` / `before` / `after` / `both`.
     UnknownExpand,
+    /// An xml type's `marks` allowlist named a mark not declared in the top-level
+    /// `marks` block.
+    UnknownMarkRef,
 }
 
 /// A schema failure: a [`SchemaErrorKind`] plus the field or type name it
@@ -353,6 +369,7 @@ impl std::fmt::Display for SchemaError {
             SchemaErrorKind::EmptyName => "empty autoVersion name template",
             SchemaErrorKind::UnknownFlavor => "unknown mark flavor",
             SchemaErrorKind::UnknownExpand => "unknown mark expand direction",
+            SchemaErrorKind::UnknownMarkRef => "reference to an undeclared mark",
         };
         write!(f, "{what}: {}", self.at)
     }
@@ -524,6 +541,17 @@ impl Schema {
                 ))
             }
         };
+        let declared_marks: HashSet<&str> = self.marks.iter().map(|(n, _)| n.as_str()).collect();
+        let require_mark = |name: &str| -> Result<(), SchemaError> {
+            if declared_marks.contains(name) {
+                Ok(())
+            } else {
+                Err(SchemaError::new(
+                    SchemaErrorKind::UnknownMarkRef,
+                    name.to_string(),
+                ))
+            }
+        };
         match self.type_def(&self.root) {
             None => {
                 return Err(SchemaError::new(
@@ -547,6 +575,26 @@ impl Schema {
                     }
                 }
                 TypeDef::List { items, .. } => require(items)?,
+                TypeDef::Xml {
+                    children,
+                    attrs,
+                    marks,
+                    orphan_inline,
+                    ..
+                } => {
+                    for ty in children {
+                        require(ty)?;
+                    }
+                    for (_, ty) in attrs {
+                        require(ty)?;
+                    }
+                    for name in marks {
+                        require_mark(name)?;
+                    }
+                    if let Some(block) = orphan_inline {
+                        require(block)?;
+                    }
+                }
                 TypeDef::Text { .. } | TypeDef::Register { .. } | TypeDef::Counter { .. } => {}
             }
         }
@@ -617,6 +665,30 @@ pub(crate) fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, Sc
             reject_unknown_fields(obj, &["kind", "min", "max"], type_name)?;
             let (min, max) = bounds(json, type_name)?;
             Ok(TypeDef::Counter { min, max })
+        }
+        "xml" => {
+            reject_unknown_fields(
+                obj,
+                &["kind", "tag", "children", "attrs", "marks", "repair"],
+                type_name,
+            )?;
+            Ok(TypeDef::Xml {
+                tag: Some(required_str(json, "tag", type_name)?.to_string()),
+                children: parse_type_name_array(json, "children", type_name)?,
+                attrs: parse_attrs(json, type_name)?,
+                marks: parse_type_name_array(json, "marks", type_name)?,
+                orphan_inline: parse_orphan_inline(json, type_name)?,
+            })
+        }
+        "fragment" => {
+            reject_unknown_fields(obj, &["kind", "children", "repair"], type_name)?;
+            Ok(TypeDef::Xml {
+                tag: None,
+                children: parse_type_name_array(json, "children", type_name)?,
+                attrs: Vec::new(),
+                marks: Vec::new(),
+                orphan_inline: parse_orphan_inline(json, type_name)?,
+            })
         }
         _ => Err(SchemaError::new(
             SchemaErrorKind::UnknownKind,
@@ -970,6 +1042,70 @@ fn parse_children(json: &Json, ctx: &str) -> Result<Vec<(String, String)>, Schem
         out.push((slot.clone(), type_name.to_string()));
     }
     Ok(out)
+}
+
+/// An optional array-of-type-names allowlist (an xml type's `children` or
+/// `marks`). Absent → empty; a non-array or a non-string element is rejected.
+fn parse_type_name_array(json: &Json, key: &str, ctx: &str) -> Result<Vec<String>, SchemaError> {
+    let Some(v) = json.get(key) else {
+        return Ok(Vec::new());
+    };
+    let ctx = at(ctx, key);
+    let arr = v
+        .as_array()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, ctx.clone()))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let name = item
+            .as_str()
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, ctx.clone()))?;
+        out.push(name.to_string());
+    }
+    Ok(out)
+}
+
+/// An xml type's `attrs` allowlist: each attribute key → the type its value
+/// holds. Absent → empty; a non-object, or a non-string type name, is rejected.
+fn parse_attrs(json: &Json, ctx: &str) -> Result<Vec<(String, String)>, SchemaError> {
+    let Some(attrs) = json.get("attrs") else {
+        return Ok(Vec::new());
+    };
+    let ctx = at(ctx, "attrs");
+    let obj = attrs
+        .as_object()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, ctx.clone()))?;
+    let mut out = Vec::with_capacity(obj.len());
+    for (key, ty) in obj {
+        let type_name = ty
+            .as_str()
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, key)))?;
+        out.push((key.clone(), type_name.to_string()));
+    }
+    Ok(out)
+}
+
+/// An xml type's `repair.orphanInline` — the default block type that repair
+/// wraps loose inline content in. Absent `repair` or absent key → `None`; an
+/// unknown key under `repair` fails loud.
+fn parse_orphan_inline(json: &Json, ctx: &str) -> Result<Option<String>, SchemaError> {
+    let Some(repair) = json.get("repair") else {
+        return Ok(None);
+    };
+    let ctx = at(ctx, "repair");
+    let obj = repair
+        .as_object()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, ctx.clone()))?;
+    reject_unknown_fields(obj, &["orphanInline"], &ctx)?;
+    match repair.get("orphanInline") {
+        None => Ok(None),
+        Some(v) => Ok(Some(
+            v.as_str()
+                .ok_or_else(|| {
+                    SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, "orphanInline"))
+                })?
+                .to_string(),
+        )),
+    }
 }
 
 /// The `min`/`max` of a register or counter — full-range `i64` bounds.

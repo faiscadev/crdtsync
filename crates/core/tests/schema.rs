@@ -353,6 +353,186 @@ fn a_non_object_marks_block_is_rejected() {
     assert_eq!(err(&src), SchemaErrorKind::NotAnObject);
 }
 
+// --- xml element / fragment types ---
+
+// A prose schema: a fragment root holding block elements, an element with attrs
+// + a marks allowlist, and the leaf/attr types + marks all resolve.
+fn with_xml_types(types_body: &str) -> String {
+    format!(
+        r#"{{ "schema": "prose", "version": 1, "root": "Doc",
+            "types": {{ "Doc": {{ "kind": "map", "children": {{ "body": "Article" }} }},
+                        {types_body} }},
+            "marks": {{ "bold": {{ "flavor": "boolean" }}, "link": {{ "flavor": "value" }} }} }}"#
+    )
+}
+
+const XML_TYPES: &str = r#"
+    "Article": { "kind": "fragment", "children": ["Para", "Heading"], "repair": { "orphanInline": "Para" } },
+    "Para":    { "kind": "xml", "tag": "p", "children": ["Span"], "marks": ["bold", "link"] },
+    "Heading": { "kind": "xml", "tag": "h1", "attrs": { "level": "Level" }, "children": ["Span"] },
+    "Span":    { "kind": "text", "max": 10000 },
+    "Level":   { "kind": "register", "min": 1, "max": 6 }
+"#;
+
+#[test]
+fn parses_an_xml_element_type_with_all_fields() {
+    let s = parse(&with_xml_types(XML_TYPES));
+    assert_eq!(
+        s.type_def("Para"),
+        Some(&TypeDef::Xml {
+            tag: Some("p".into()),
+            children: vec!["Span".into()],
+            attrs: vec![],
+            marks: vec!["bold".into(), "link".into()],
+            orphan_inline: None,
+        })
+    );
+    assert_eq!(
+        s.type_def("Heading"),
+        Some(&TypeDef::Xml {
+            tag: Some("h1".into()),
+            children: vec!["Span".into()],
+            attrs: vec![("level".into(), "Level".into())],
+            marks: vec![],
+            orphan_inline: None,
+        })
+    );
+}
+
+#[test]
+fn parses_a_tagless_fragment_type() {
+    let s = parse(&with_xml_types(XML_TYPES));
+    assert_eq!(
+        s.type_def("Article"),
+        Some(&TypeDef::Xml {
+            tag: None,
+            children: vec!["Para".into(), "Heading".into()],
+            attrs: vec![],
+            marks: vec![],
+            orphan_inline: Some("Para".into()),
+        })
+    );
+}
+
+#[test]
+fn an_xml_type_defaults_its_allowlists_to_empty() {
+    let s = parse(&with_xml_types(
+        r#""Article": { "kind": "fragment" }, "Br": { "kind": "xml", "tag": "br" }"#,
+    ));
+    assert_eq!(
+        s.type_def("Br"),
+        Some(&TypeDef::Xml {
+            tag: Some("br".into()),
+            children: vec![],
+            attrs: vec![],
+            marks: vec![],
+            orphan_inline: None,
+        })
+    );
+}
+
+#[test]
+fn xml_children_attrs_and_marks_keep_declaration_order() {
+    let s = parse(&with_xml_types(
+        r#""Article": { "kind": "xml", "tag": "x", "children": ["Span", "Para", "Heading"],
+                       "attrs": { "z": "Level", "a": "Level", "m": "Level" }, "marks": ["link", "bold"] },
+           "Para": { "kind": "xml", "tag": "p" }, "Heading": { "kind": "xml", "tag": "h1" },
+           "Span": { "kind": "text" }, "Level": { "kind": "register" }"#,
+    ));
+    let TypeDef::Xml {
+        children,
+        attrs,
+        marks,
+        ..
+    } = s.type_def("Article").unwrap()
+    else {
+        panic!("expected an xml type");
+    };
+    assert_eq!(children, &["Span", "Para", "Heading"]);
+    let keys: Vec<&str> = attrs.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, ["z", "a", "m"]);
+    assert_eq!(marks, &["link", "bold"]);
+}
+
+#[test]
+fn an_xml_child_referencing_an_undeclared_type_is_rejected() {
+    let src = with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "children": ["Ghost"] }"#);
+    assert_eq!(err(&src), SchemaErrorKind::UnknownTypeRef);
+}
+
+#[test]
+fn an_xml_attr_referencing_an_undeclared_type_is_rejected() {
+    let src = with_xml_types(
+        r#""Article": { "kind": "xml", "tag": "x", "attrs": { "level": "Ghost" } }"#,
+    );
+    assert_eq!(err(&src), SchemaErrorKind::UnknownTypeRef);
+}
+
+#[test]
+fn an_orphan_inline_referencing_an_undeclared_type_is_rejected() {
+    let src = with_xml_types(
+        r#""Article": { "kind": "fragment", "repair": { "orphanInline": "Ghost" } }"#,
+    );
+    assert_eq!(err(&src), SchemaErrorKind::UnknownTypeRef);
+}
+
+#[test]
+fn an_xml_marks_allowlist_referencing_an_undeclared_mark_is_rejected() {
+    let src =
+        with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "marks": ["bold", "strike"] }"#);
+    assert_eq!(err(&src), SchemaErrorKind::UnknownMarkRef);
+}
+
+#[test]
+fn an_xml_element_without_a_tag_is_rejected() {
+    let src = with_xml_types(r#""Article": { "kind": "xml" }"#);
+    assert_eq!(err(&src), SchemaErrorKind::MissingField);
+}
+
+#[test]
+fn an_unknown_field_on_an_xml_type_is_rejected() {
+    let src = with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "color": "red" }"#);
+    assert_eq!(err(&src), SchemaErrorKind::UnknownField);
+}
+
+#[test]
+fn a_fragment_may_not_declare_a_tag_attrs_or_marks() {
+    for field in [r#""tag": "x""#, r#""attrs": {}"#, r#""marks": []"#] {
+        let src = with_xml_types(&format!(r#""Article": {{ "kind": "fragment", {field} }}"#));
+        assert_eq!(
+            err(&src),
+            SchemaErrorKind::UnknownField,
+            "fragment must reject {field}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_field_under_repair_is_rejected() {
+    let src = with_xml_types(
+        r#""Article": { "kind": "fragment", "repair": { "orphanBlock": "Para" } }, "Para": { "kind": "xml", "tag": "p" }"#,
+    );
+    assert_eq!(err(&src), SchemaErrorKind::UnknownField);
+}
+
+#[test]
+fn a_non_array_children_allowlist_is_rejected() {
+    let src = with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "children": "Span" }"#);
+    assert_eq!(err(&src), SchemaErrorKind::WrongType);
+}
+
+#[test]
+fn a_non_string_child_type_name_is_rejected() {
+    let src = with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "children": [7] }"#);
+    assert_eq!(err(&src), SchemaErrorKind::WrongType);
+}
+
+#[test]
+fn a_non_object_attrs_allowlist_is_rejected() {
+    let src = with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "attrs": [] }"#);
+    assert_eq!(err(&src), SchemaErrorKind::NotAnObject);
+}
+
 // --- autoVersion ---
 
 fn with_auto_version(body: &str) -> String {
