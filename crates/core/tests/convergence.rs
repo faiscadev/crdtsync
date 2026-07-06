@@ -76,7 +76,7 @@ fn text_len(d: &Document, k: &[u8]) -> usize {
 /// real removals; on the peers the same op waits for its target to arrive.
 fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
     let k = key(rng);
-    match rng.below(17) {
+    match rng.below(18) {
         0 => d.transact(|tx| tx.register(k, Scalar::Int(rng_val(rng)))),
         1 => d.transact(|tx| tx.inc(k, 1 + rng.below(4) as u32)),
         2 => d.transact(|tx| tx.dec(k, 1 + rng.below(4) as u32)),
@@ -136,6 +136,24 @@ fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
         15 => d.transact(|tx| {
             tx.xml_fragment(k);
         }),
+        16 => {
+            // Create an xml element and insert one child — an element or a text
+            // run — into its children sequence.
+            let tag = TAGS[rng.below(TAGS.len())];
+            if rng.below(2) == 0 {
+                let ctag = TAGS[rng.below(TAGS.len())];
+                d.transact(|tx| {
+                    tx.xml_element(k, tag).children().insert_element(0, ctag);
+                })
+            } else {
+                d.transact(|tx| {
+                    tx.xml_element(k, tag)
+                        .children()
+                        .insert_text(0)
+                        .insert(0, "z");
+                })
+            }
+        }
         _ => d.transact(|tx| tx.map(k).set(subkey(rng), Scalar::Bool(true))),
     }
 }

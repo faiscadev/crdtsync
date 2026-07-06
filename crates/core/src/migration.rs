@@ -150,7 +150,8 @@ fn op_key(op: &Op) -> Option<&[u8]> {
         OpKind::ListInsert { .. }
         | OpKind::ListDelete { .. }
         | OpKind::TextInsert { .. }
-        | OpKind::TextDelete { .. } => None,
+        | OpKind::TextDelete { .. }
+        | OpKind::XmlInsertChild { .. } => None,
     }
 }
 

@@ -225,6 +225,17 @@ fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
             put_u8(out, 13);
             put_bytes(out, key);
         }
+        OpKind::XmlInsertChild { tag, anchor } => {
+            put_u8(out, 14);
+            match tag {
+                Some(t) => {
+                    put_u8(out, 1);
+                    put_bytes(out, t);
+                }
+                None => put_u8(out, 0),
+            }
+            put_anchor(out, anchor);
+        }
     }
 }
 
@@ -444,6 +455,22 @@ impl<'a> Cursor<'a> {
                 tag: self.bytes()?,
             },
             13 => OpKind::XmlFragmentCreate { key: self.bytes()? },
+            14 => {
+                let tag = match self.u8()? {
+                    0 => None,
+                    1 => Some(self.bytes()?),
+                    other => {
+                        return Err(DecodeError::BadTag {
+                            what: "xml child tag present-flag",
+                            tag: other,
+                        })
+                    }
+                };
+                OpKind::XmlInsertChild {
+                    tag,
+                    anchor: self.anchor()?,
+                }
+            }
             tag => {
                 return Err(DecodeError::BadTag {
                     what: "opkind",

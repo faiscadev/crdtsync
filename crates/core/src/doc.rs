@@ -19,7 +19,7 @@ use crate::codec::{
 use crate::counter::Counter;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
-use crate::list::List;
+use crate::list::{Anchor, List, Side};
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
 use crate::repair::{keyed_repairs, Repair, RepairId};
@@ -903,6 +903,23 @@ impl Document {
                     let node = XmlFragment::node_id(op.target, key);
                     created.insert(XmlFragment::children_id(node));
                 }
+                OpKind::XmlInsertChild { tag, .. } => {
+                    // The node stamp so a later delete finds it, plus the child's
+                    // targetable ids so a later member editing it is satisfied.
+                    inserted.insert(op.stamp);
+                    let kind = if tag.is_some() {
+                        ElementKind::XmlElement
+                    } else {
+                        ElementKind::Text
+                    };
+                    let child = ElementId::derive(op.target, &stamp_key(op.stamp), kind);
+                    if tag.is_some() {
+                        created.insert(XmlElement::attrs_id(child));
+                        created.insert(XmlElement::children_id(child));
+                    } else {
+                        created.insert(child);
+                    }
+                }
                 OpKind::ListInsert { .. } => {
                     inserted.insert(op.stamp);
                 }
@@ -945,6 +962,13 @@ impl Document {
     /// Mint identity + causal position for a local edit, apply it, and record
     /// the op on the in-progress transact.
     fn emit(&mut self, target: ElementId, kind: OpKind) {
+        let _ = self.emit_stamped(target, kind);
+    }
+
+    /// Like [`emit`](Self::emit), returning the stamp minted for the op — so a
+    /// caller that creates a stamp-keyed child (an XML sequence child) can derive
+    /// its id without re-minting.
+    fn emit_stamped(&mut self, target: ElementId, kind: OpKind) -> Stamp {
         self.lamport += 1;
         let stamp = Stamp {
             lamport: self.lamport,
@@ -961,6 +985,7 @@ impl Document {
         let author = self.client;
         self.apply_kind(target, &kind, stamp, author);
         self.pending.push(Op::new(id, stamp, target, kind));
+        stamp
     }
 
     /// A target is reachable when it names a materialised container that is
@@ -1035,6 +1060,10 @@ impl Document {
                 if let Some(list) = self.live_list(target) {
                     list.borrow_mut().delete_id(*id);
                 }
+                return;
+            }
+            OpKind::XmlInsertChild { tag, anchor } => {
+                self.insert_xml_child(target, tag.clone(), *anchor, stamp);
                 return;
             }
             OpKind::TextInsert { s, anchor } => {
@@ -1154,6 +1183,31 @@ impl Document {
         if let Some(o) = orphan {
             self.orphans.push(o);
         }
+    }
+
+    /// Install a child in an XML children List: materialise the child container
+    /// (an `XmlElement` when `tag` is present, else a `Text` run), register it,
+    /// and insert its handle as a sequence node keyed by the op's stamp. The
+    /// child's element id derives from that stamp, so every replica builds the
+    /// same child; `insert_at` is idempotent on the stamp, so a replay is inert.
+    fn insert_xml_child(
+        &mut self,
+        list_id: ElementId,
+        tag: Option<Vec<u8>>,
+        anchor: Anchor,
+        stamp: Stamp,
+    ) {
+        let Some(list) = self.live_list(list_id) else {
+            return;
+        };
+        let (kind, container) = match tag {
+            Some(t) => (ElementKind::XmlElement, Container::XmlElement(t)),
+            None => (ElementKind::Text, Container::Text),
+        };
+        let child_id = ElementId::derive(list_id, &stamp_key(stamp), kind);
+        let element = self.registered_handle(child_id, container);
+        self.parents.insert(child_id, list_id);
+        list.borrow_mut().insert_at(stamp, element, anchor);
     }
 
     /// Fold a counter delta into the counter at `key` in `map_id`. The counter
@@ -1312,6 +1366,15 @@ fn handles_eq(a: &Element, b: &Element) -> bool {
         (Element::XmlFragment(x), Element::XmlFragment(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
+}
+
+/// A stamp rendered as derivation-key bytes, so a sequence child's element id
+/// derives deterministically from its node stamp.
+fn stamp_key(stamp: Stamp) -> [u8; 24] {
+    let mut b = [0u8; 24];
+    b[..8].copy_from_slice(&stamp.lamport.to_le_bytes());
+    b[8..].copy_from_slice(&stamp.client.as_bytes());
+    b
 }
 
 /// How many consecutive char_ids an op consumes from its stamp. A text run
@@ -1598,7 +1661,7 @@ impl<'a> MapCursor<'a> {
         );
         XmlCursor {
             doc: self.doc,
-            attrs_id: XmlElement::attrs_id(XmlElement::node_id(self.map_id, key, tag)),
+            xml_id: XmlElement::node_id(self.map_id, key, tag),
         }
     }
 
@@ -1607,15 +1670,18 @@ impl<'a> MapCursor<'a> {
     pub fn xml_fragment(&mut self, key: &[u8]) -> XmlFragmentCursor<'_> {
         self.doc
             .emit(self.map_id, OpKind::XmlFragmentCreate { key: key.to_vec() });
-        XmlFragmentCursor { doc: self.doc }
+        XmlFragmentCursor {
+            doc: self.doc,
+            children_id: XmlFragment::children_id(XmlFragment::node_id(self.map_id, key)),
+        }
     }
 }
 
 /// A cursor over one `XmlElement`. [`attrs`](Self::attrs) descends into its attrs
-/// Map; the children sequence arrives in a later slice.
+/// Map, [`children`](Self::children) into its children sequence.
 pub struct XmlCursor<'a> {
     doc: &'a mut Document,
-    attrs_id: ElementId,
+    xml_id: ElementId,
 }
 
 impl XmlCursor<'_> {
@@ -1623,16 +1689,112 @@ impl XmlCursor<'_> {
     pub fn attrs(&mut self) -> MapCursor<'_> {
         MapCursor {
             doc: self.doc,
-            map_id: self.attrs_id,
+            map_id: XmlElement::attrs_id(self.xml_id),
+        }
+    }
+
+    /// A cursor over this element's children sequence.
+    pub fn children(&mut self) -> XmlChildrenCursor<'_> {
+        XmlChildrenCursor {
+            doc: self.doc,
+            list_id: XmlElement::children_id(self.xml_id),
         }
     }
 }
 
-/// A cursor over one `XmlFragment`. A fragment is tagless and attr-less — only a
-/// children sequence, which arrives in a later slice, so exposing no `attrs`
-/// here makes a mistaken attr write a compile error, not silent data loss.
+/// A cursor over one `XmlFragment` — tagless and attr-less, so it exposes only a
+/// children sequence. No `attrs` method: a mistaken attr write is a compile
+/// error, not silent data loss.
 pub struct XmlFragmentCursor<'a> {
     doc: &'a mut Document,
+    children_id: ElementId,
+}
+
+impl XmlFragmentCursor<'_> {
+    /// A cursor over this fragment's children sequence.
+    pub fn children(&mut self) -> XmlChildrenCursor<'_> {
+        XmlChildrenCursor {
+            doc: self.doc,
+            list_id: self.children_id,
+        }
+    }
+}
+
+/// A cursor over an XML children sequence — the ordered `XmlElement`/`Text` runs
+/// under an element or fragment.
+pub struct XmlChildrenCursor<'a> {
+    doc: &'a mut Document,
+    list_id: ElementId,
+}
+
+impl XmlChildrenCursor<'_> {
+    /// The Fugue placement for inserting a child at live `index`. Falls back to
+    /// the sequence head when the children List is not materialised (a losing
+    /// parent), so the returned cursor is well-formed even when the insert no-ops.
+    fn place(&self, index: usize) -> Anchor {
+        self.doc
+            .lists
+            .get(&self.list_id)
+            .map(|l| l.borrow().place(index))
+            .unwrap_or(Anchor {
+                parent: None,
+                side: Side::Right,
+            })
+    }
+
+    /// Insert an `XmlElement` child with `tag` at `index`, returning a cursor over
+    /// the new child.
+    pub fn insert_element(&mut self, index: usize, tag: &[u8]) -> XmlCursor<'_> {
+        let anchor = self.place(index);
+        let stamp = self.doc.emit_stamped(
+            self.list_id,
+            OpKind::XmlInsertChild {
+                tag: Some(tag.to_vec()),
+                anchor,
+            },
+        );
+        XmlCursor {
+            doc: self.doc,
+            xml_id: ElementId::derive(self.list_id, &stamp_key(stamp), ElementKind::XmlElement),
+        }
+    }
+
+    /// Insert a `Text` child (a text run) at `index`, returning a cursor over it.
+    pub fn insert_text(&mut self, index: usize) -> TextCursor<'_> {
+        let anchor = self.place(index);
+        let stamp = self
+            .doc
+            .emit_stamped(self.list_id, OpKind::XmlInsertChild { tag: None, anchor });
+        TextCursor {
+            doc: self.doc,
+            text_id: ElementId::derive(self.list_id, &stamp_key(stamp), ElementKind::Text),
+        }
+    }
+
+    /// Tombstone the live child at `index`. Reuses the List delete on the same
+    /// children sequence.
+    pub fn delete(&mut self, index: usize) {
+        let id = match self.doc.lists.get(&self.list_id) {
+            Some(list) => list.borrow().node_at(index),
+            None => return,
+        };
+        if let Some(id) = id {
+            self.doc.emit(self.list_id, OpKind::ListDelete { id });
+        }
+    }
+
+    /// The number of live children.
+    pub fn len(&self) -> usize {
+        self.doc
+            .lists
+            .get(&self.list_id)
+            .map_or(0, |l| l.borrow().len())
+    }
+
+    /// Whether the sequence has no live children.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A cursor over one List in the tree.

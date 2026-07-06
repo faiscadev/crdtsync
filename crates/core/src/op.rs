@@ -107,6 +107,16 @@ pub enum OpKind {
     XmlFragmentCreate {
         key: Vec<u8>,
     },
+    /// Insert a child into the target XML children List. `tag` present installs
+    /// an `XmlElement` child; absent installs a `Text` child (a text run). The
+    /// new node's id is the op's stamp, and the child's element id derives from
+    /// it, so every replica builds the same child; `anchor` fixes its Fugue
+    /// position. Deleting a child reuses [`ListDelete`](Self::ListDelete) on the
+    /// same children List.
+    XmlInsertChild {
+        tag: Option<Vec<u8>>,
+        anchor: Anchor,
+    },
 }
 
 impl OpKind {
@@ -124,7 +134,8 @@ impl OpKind {
             | OpKind::ListCreate { .. }
             | OpKind::TextCreate { .. }
             | OpKind::XmlElementCreate { .. }
-            | OpKind::XmlFragmentCreate { .. } => true,
+            | OpKind::XmlFragmentCreate { .. }
+            | OpKind::XmlInsertChild { .. } => true,
             OpKind::RegisterSet { .. }
             | OpKind::CounterInc { .. }
             | OpKind::CounterDec { .. }
