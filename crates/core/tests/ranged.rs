@@ -227,6 +227,48 @@ fn a_payload_change_waits_for_its_create() {
 }
 
 #[test]
+fn a_local_change_to_an_unseen_range_emits_nothing() {
+    // A payload change or delete for an id whose create this replica has not yet
+    // applied must emit no op: a local apply would no-op (nothing to mutate) while
+    // still broadcasting, so the author would keep the old reading while a peer
+    // that applied the change against the present entry moves on — a divergence
+    // that never heals.
+    let mut src = Document::new(cid(1));
+    let build = build_text(&mut src, b"t", "x");
+    let seq = text_id(&src, b"t");
+    let mut rid = ElementId::from_bytes([0u8; 16]);
+    let create = src.transact(|tx| {
+        rid = tx.ranged().create(
+            at(seq, RelativePosition::Start),
+            at(seq, RelativePosition::End),
+            Scalar::Int(1),
+        );
+    });
+
+    // A second replica has never seen the create; a set/delete for that id
+    // (obtained out of band) must produce no ops.
+    let mut other = Document::new(cid(2));
+    apply_all(&mut other, &build);
+    let setp = other.transact(|tx| tx.ranged().set_payload(rid, Scalar::Int(2)));
+    let del = other.transact(|tx| tx.ranged().delete(rid));
+    assert!(setp.is_empty(), "set on an unseen range emits nothing");
+    assert!(del.is_empty(), "delete on an unseen range emits nothing");
+
+    // Once the create is applied, the change is a real op again and converges.
+    apply_all(&mut other, &create);
+    let setp2 = other.transact(|tx| tx.ranged().set_payload(rid, Scalar::Int(9)));
+    assert!(!setp2.is_empty(), "set on a materialised range emits");
+    let mut peer = Document::new(cid(3));
+    apply_all(&mut peer, &build);
+    apply_all(&mut peer, &create);
+    apply_all(&mut peer, &setp2);
+    assert_eq!(
+        peer.ranged_element(rid).unwrap().payload,
+        other.ranged_element(rid).unwrap().payload,
+    );
+}
+
+#[test]
 fn a_snapshot_round_trips_the_annotation_set() {
     let mut d = Document::new(cid(1));
     build_text(&mut d, b"t", "hello");

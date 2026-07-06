@@ -262,29 +262,28 @@ impl Document {
     /// Every live RangedElement, ordered by id so the sequence is identical on
     /// every replica.
     pub fn ranged_elements(&self) -> Vec<RangedElement> {
-        self.live_ranged().map(|(id, e)| e.view(id)).collect()
+        self.sorted_view(|e| !e.tombstone)
     }
 
     /// Every live RangedElement with an endpoint in sequence `seq` — "the ranges
     /// annotating this element". A cross-element range is returned for either of
     /// its sequences.
     pub fn ranged_on(&self, seq: ElementId) -> Vec<RangedElement> {
-        self.live_ranged()
-            .filter(|(_, e)| e.start.seq == seq || e.end.seq == seq)
-            .map(|(id, e)| e.view(id))
-            .collect()
+        self.sorted_view(|e| !e.tombstone && (e.start.seq == seq || e.end.seq == seq))
     }
 
-    /// The live entries in id order — the shared basis for every ranged query.
-    fn live_ranged(&self) -> impl Iterator<Item = (ElementId, &RangedEntry)> {
-        let mut live: Vec<(ElementId, &RangedEntry)> = self
+    /// The live entries a predicate selects, viewed and ordered by id so the
+    /// sequence is identical on every replica. Filters before sorting, so a
+    /// selective query pays only for its matches.
+    fn sorted_view(&self, keep: impl Fn(&RangedEntry) -> bool) -> Vec<RangedElement> {
+        let mut out: Vec<RangedElement> = self
             .ranged
             .iter()
-            .filter(|(_, e)| !e.tombstone)
-            .map(|(id, e)| (*id, e))
+            .filter(|(_, e)| keep(e))
+            .map(|(id, e)| e.view(*id))
             .collect();
-        live.sort_by_key(|(id, _)| id.as_bytes());
-        live.into_iter()
+        out.sort_by_key(|r| r.id.as_bytes());
+        out
     }
 
     /// Whether `key` in `map_id` ever named a container — the registry retains a
@@ -2488,16 +2487,26 @@ impl RangedCursor<'_> {
         ranged_id(stamp)
     }
 
-    /// Replace a RangedElement's payload (last-writer-wins). A no-op on a deleted
-    /// or unknown id.
+    /// Replace a RangedElement's payload (last-writer-wins). Emits nothing for an
+    /// id this replica has not yet materialised: a local apply would no-op while
+    /// still broadcasting, so the author would diverge from a peer that applied
+    /// the change against the present entry.
     pub fn set_payload(&mut self, id: ElementId, payload: Scalar) {
+        if !self.doc.ranged.contains_key(&id) {
+            return;
+        }
         let root = self.doc.root_id();
         self.doc
             .emit(root, OpKind::RangedSetPayload { id, payload });
     }
 
     /// Delete a RangedElement. Delete wins over a concurrent payload change.
+    /// Emits nothing for an id this replica has not yet materialised (see
+    /// [`set_payload`](Self::set_payload)).
     pub fn delete(&mut self, id: ElementId) {
+        if !self.doc.ranged.contains_key(&id) {
+            return;
+        }
         let root = self.doc.root_id();
         self.doc.emit(root, OpKind::RangedDelete { id });
     }
