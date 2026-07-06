@@ -27,8 +27,18 @@ use crate::scalar::Scalar;
 use crate::schema::Schema;
 use crate::stamp::Stamp;
 use crate::text::Text;
+use crate::treemove::TreeMoves;
 use crate::validate::Step;
 use crate::xml::{XmlElement, XmlFragment};
+
+/// One placement of a movable XML node: a Fugue node in some children `list`,
+/// keyed by its node `stamp`. A node moved N times has N+1 placements (birth plus
+/// one per move); the move-log fold marks all but the governing one moved-away.
+#[derive(Clone, Copy)]
+struct Placement {
+    list: ElementId,
+    stamp: Stamp,
+}
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -113,8 +123,22 @@ pub struct Document {
     /// node with its attrs and children intact.
     xml_elements: HashMap<ElementId, Rc<RefCell<XmlElement>>>,
     xml_fragments: HashMap<ElementId, Rc<RefCell<XmlFragment>>>,
-    /// Each container's parent map, for walking reachability up to the root.
+    /// Each container's parent map, for walking reachability up to the root. For
+    /// a movable XML node this tracks its *live* placement's list, so reachability
+    /// follows a moved subtree to its new parent.
     parents: HashMap<ElementId, ElementId>,
+    /// The lamport-ordered tree-move log (Kleppmann 2021): the effective parent of
+    /// every moved node, resolved by undo-and-replay so arrival order never
+    /// matters.
+    moves: TreeMoves,
+    /// Every children-list placement of a movable node, keyed by the node's
+    /// element id: `(list, node stamp)` pairs. A node has one per list it was ever
+    /// inserted or moved into; the move-log fold picks which is live.
+    placements: HashMap<ElementId, Vec<Placement>>,
+    /// The `(list, stamp)` of every placement, so a delete can tell in O(1)
+    /// whether it tombstoned a movable node — and re-fold only then, not on every
+    /// plain-list delete.
+    placement_index: HashSet<(ElementId, Stamp)>,
     lamport: u64,
     seq: u64,
     /// The next atomic-transaction id to mint; namespaced by this replica's
@@ -145,10 +169,18 @@ impl Drop for Document {
         // Break every parent→child link first, via the flat registry, so a
         // deeply nested tree frees iteratively instead of recursing through the
         // chain of Rc drops (which a caller-supplied path depth could overflow).
+        // Lists are cleared too: a composite sequence node holds its child, and a
+        // tree move can place a node's own subtree back into it, closing an Rc
+        // cycle that clearing the maps alone would leak.
         // Skip a handle a caller is still borrowing rather than panic in drop.
         for map in self.maps.values() {
             if let Ok(mut map) = map.try_borrow_mut() {
                 map.clear();
+            }
+        }
+        for list in self.lists.values() {
+            if let Ok(mut list) = list.try_borrow_mut() {
+                list.clear();
             }
         }
     }
@@ -169,6 +201,9 @@ impl Document {
             xml_elements: HashMap::new(),
             xml_fragments: HashMap::new(),
             parents: HashMap::new(),
+            moves: TreeMoves::new(),
+            placements: HashMap::new(),
+            placement_index: HashSet::new(),
             lamport: 0,
             seq: 0,
             next_tx: 0,
@@ -697,6 +732,11 @@ impl Document {
             xml_elements,
             xml_fragments,
             parents,
+            // A snapshot carries no move log yet (the tree-move state codec is a
+            // later slice), so a restored replica starts with none.
+            moves: TreeMoves::new(),
+            placements: HashMap::new(),
+            placement_index: HashSet::new(),
             lamport,
             seq,
             // Tx ids scope only the buffering of remote partial transactions,
@@ -894,6 +934,9 @@ impl Document {
                 let t = t.borrow();
                 ids.iter().all(|id| t.contains(*id))
             }),
+            // A move waits until the node it relocates has been materialised — its
+            // create may still be in flight — so the relocation is never lost.
+            OpKind::XmlMove { node, .. } => self.placements.contains_key(node),
             _ => true,
         }
     }
@@ -929,6 +972,10 @@ impl Document {
         ordered.sort_by_key(|op| op.id.seq);
         let mut created: HashSet<ElementId> = HashSet::new();
         let mut inserted: HashSet<Stamp> = HashSet::new();
+        // Movable node ids a member inserts, so a later member's move of one is
+        // judged ready — a move whose node has not yet been materialised must
+        // wait, or apply_move drops it silently.
+        let mut movable: HashSet<ElementId> = HashSet::new();
         for op in &ordered {
             let target_ok = self.resolvable(op.target) || created.contains(&op.target);
             if !target_ok {
@@ -967,6 +1014,7 @@ impl Document {
                         ElementKind::Text
                     };
                     let child = xml_child_id(op.target, op.stamp, kind);
+                    movable.insert(child);
                     if tag.is_some() {
                         created.insert(XmlElement::attrs_id(child));
                         created.insert(XmlElement::children_id(child));
@@ -1004,6 +1052,14 @@ impl Document {
                                 .is_some_and(|t| t.borrow().contains(*id))
                     });
                     if !present {
+                        return false;
+                    }
+                }
+                OpKind::XmlMove { node, .. } => {
+                    // The moved node must already exist or be inserted by an
+                    // earlier member — else the group would commit and apply_move
+                    // would drop the move against a not-yet-materialised node.
+                    if !self.placements.contains_key(node) && !movable.contains(node) {
                         return false;
                     }
                 }
@@ -1114,10 +1170,21 @@ impl Document {
                 if let Some(list) = self.live_list(target) {
                     list.borrow_mut().delete_id(*id);
                 }
+                // A delete of a moved node's placement makes the delete win over a
+                // concurrent move, so re-fold to hide every placement of that
+                // node. Only a delete that tombstoned a real placement can change
+                // the fold, so a plain-list delete skips the O(placements) work.
+                if self.placement_index.contains(&(target, *id)) {
+                    self.refold_moves();
+                }
                 return;
             }
             OpKind::XmlInsertChild { tag, anchor } => {
                 self.insert_xml_child(target, tag.clone(), *anchor, stamp);
+                return;
+            }
+            OpKind::XmlMove { node, anchor } => {
+                self.apply_move(target, *node, *anchor, stamp);
                 return;
             }
             OpKind::TextInsert { s, anchor } => {
@@ -1262,6 +1329,122 @@ impl Document {
         let element = self.registered_handle(child_id, container);
         self.parents.insert(child_id, list_id);
         list.borrow_mut().insert_at(stamp, element, anchor);
+        // Record the birth placement so a later move can pick the live one of the
+        // node's placements.
+        self.placements
+            .entry(child_id)
+            .or_default()
+            .push(Placement {
+                list: list_id,
+                stamp,
+            });
+        self.placement_index.insert((list_id, stamp));
+        // The created-under parent anchors cycle detection and is the fallback
+        // parent (via the move log's base map) when no move governs this node.
+        if let Some(&owner) = self.parents.get(&list_id) {
+            self.moves.set_base(child_id, owner);
+        }
+    }
+
+    /// Relocate `node` under the destination children `dest_list` at `anchor`.
+    /// Inserts a placement referencing the node's stable element id, records the
+    /// move in the lamport-ordered log, then re-folds so exactly one placement of
+    /// the node renders — Kleppmann convergence, a cycle move left inert.
+    fn apply_move(&mut self, dest_list: ElementId, node: ElementId, anchor: Anchor, stamp: Stamp) {
+        // Only a node that lives in a children sequence is movable: it must
+        // already hold a placement. A node created straight into a map slot (a
+        // document root) is keyed, not positioned, so a move of it is a no-op —
+        // and the same no-op on every replica, since the local emit path reaches
+        // here directly, bypassing the `ready` gate remotes apply.
+        if !self.placements.contains_key(&node) {
+            return;
+        }
+        let Some(list) = self.live_list(dest_list) else {
+            return;
+        };
+        let Some(&owner) = self.parents.get(&dest_list) else {
+            return;
+        };
+        let Some(element) = self.node_element(node) else {
+            return;
+        };
+        list.borrow_mut().insert_at(stamp, element, anchor);
+        self.placements.entry(node).or_default().push(Placement {
+            list: dest_list,
+            stamp,
+        });
+        self.placement_index.insert((dest_list, stamp));
+        self.moves.apply(stamp, node, owner);
+        self.refold_moves();
+    }
+
+    /// Re-derive, for every movable node, which of its placements renders: the
+    /// highest-stamped placement in the node's effective-parent list (`parent_of`
+    /// falls back to the created-under parent, so a never-moved node resolves to
+    /// its birth list). Every other placement is suppressed, and reachability is
+    /// re-pointed at the live placement's list so a moved subtree resolves through
+    /// its new parent. A node whose placement was tombstoned by a `ListDelete` is
+    /// deleted — every placement is hidden, so a concurrent delete wins over a
+    /// concurrent move rather than resurrecting the node under the new parent.
+    ///
+    /// This re-folds every placement on each move. Correct but not minimal: one
+    /// move's undo-and-replay can shift several nodes' effective parents, so a
+    /// scoped refold would need the move log to report exactly which nodes moved.
+    fn refold_moves(&mut self) {
+        let mut suppress: Vec<(ElementId, Stamp, bool)> = Vec::new();
+        let mut reparent: Vec<(ElementId, ElementId)> = Vec::new();
+        for (node, places) in &self.placements {
+            let Some(owner) = self.moves.parent_of(*node) else {
+                continue;
+            };
+            let eff_list = XmlElement::children_id(owner);
+            let deleted = places
+                .iter()
+                .any(|p| self.is_tombstoned_node(p.list, p.stamp));
+            let live = if deleted {
+                None
+            } else {
+                places
+                    .iter()
+                    .filter(|p| p.list == eff_list)
+                    .map(|p| p.stamp)
+                    .max()
+            };
+            for p in places {
+                let away = deleted || !(p.list == eff_list && Some(p.stamp) == live);
+                suppress.push((p.list, p.stamp, away));
+            }
+            if !deleted {
+                reparent.push((*node, eff_list));
+            }
+        }
+        for (list, stamp, away) in suppress {
+            if let Some(list) = self.lists.get(&list) {
+                list.borrow_mut().set_moved_away(stamp, away);
+            }
+        }
+        for (node, eff_list) in reparent {
+            self.parents.insert(node, eff_list);
+        }
+    }
+
+    /// Whether the placement `(list, stamp)` has been tombstoned by a delete.
+    fn is_tombstoned_node(&self, list: ElementId, stamp: Stamp) -> bool {
+        self.lists
+            .get(&list)
+            .is_some_and(|l| l.borrow().is_tombstoned(stamp))
+    }
+
+    /// The registered handle for a movable node — an `XmlElement` or a `Text` run
+    /// — wrapped as an Element to place in a children list.
+    fn node_element(&self, node: ElementId) -> Option<Element> {
+        if let Some(x) = self.xml_elements.get(&node) {
+            return Some(Element::XmlElement(Rc::clone(x)));
+        }
+        if let Some(t) = self.texts.get(&node) {
+            return Some(Element::Text(Rc::clone(t)));
+        }
+        None
     }
 
     /// Fold a counter delta into the counter at `key` in `map_id`. The counter
@@ -1889,6 +2072,35 @@ impl<'a> MapCursor<'a> {
             children_id: XmlFragment::children_id(XmlFragment::node_id(self.map_id, key)),
         }
     }
+
+    /// Move the XML node `node` under `new_parent` (an element or fragment id) at
+    /// live `index` in its children. The node keeps its identity and subtree;
+    /// concurrent moves converge to one parent (Kleppmann 2021). A move under the
+    /// node's own descendant is a cycle and is dropped. Addresses by id, so it is
+    /// not tied to this cursor's map.
+    pub fn move_xml(&mut self, node: ElementId, new_parent: ElementId, index: usize) {
+        // A move is only defined for a node that lives in a children sequence; a
+        // map-slot root has no placement to relocate, so emit nothing rather than
+        // an op no replica can apply.
+        if !self.doc.placements.contains_key(&node) {
+            return;
+        }
+        let dest_list = XmlElement::children_id(new_parent);
+        // A reorder within the same parent re-places a node that still occupies a
+        // slot in this list; discount that slot so the target index is read
+        // against the sequence as it will be once the node leaves it.
+        let self_slot = self.doc.placements.get(&node).and_then(|ps| {
+            ps.iter()
+                .filter(|p| p.list == dest_list)
+                .map(|p| p.stamp)
+                .max()
+        });
+        let anchor = match self.doc.lists.get(&dest_list) {
+            Some(list) => list.borrow().place_excluding(index, self_slot),
+            None => return,
+        };
+        self.doc.emit(dest_list, OpKind::XmlMove { node, anchor });
+    }
 }
 
 /// A cursor over one `XmlElement`. [`attrs`](Self::attrs) descends into its attrs
@@ -1899,6 +2111,11 @@ pub struct XmlCursor<'a> {
 }
 
 impl XmlCursor<'_> {
+    /// This element's stable id — the handle to move it or address it later.
+    pub fn id(&self) -> ElementId {
+        self.xml_id
+    }
+
     /// A cursor over this element's attrs Map, holding any CRDT values.
     pub fn attrs(&mut self) -> MapCursor<'_> {
         MapCursor {

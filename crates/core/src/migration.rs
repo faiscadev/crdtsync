@@ -151,7 +151,8 @@ fn op_key(op: &Op) -> Option<&[u8]> {
         | OpKind::ListDelete { .. }
         | OpKind::TextInsert { .. }
         | OpKind::TextDelete { .. }
-        | OpKind::XmlInsertChild { .. } => None,
+        | OpKind::XmlInsertChild { .. }
+        | OpKind::XmlMove { .. } => None,
     }
 }
 

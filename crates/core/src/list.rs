@@ -82,9 +82,20 @@ struct Node {
     parent: Option<Stamp>,
     side: Side,
     tombstone: bool,
+    /// Suppressed by a tree move: the node still anchors the Fugue tree but a live
+    /// read skips it, because the element it holds now renders under a different
+    /// parent. Unlike a tombstone this is reversible — the document sets it from
+    /// the move-log fold, so an undo-and-replay can re-instate the placement.
+    moved_away: bool,
 }
 
 impl Node {
+    /// Whether a live read skips this node — deleted, or moved under another
+    /// parent. Fugue positioning still keeps it (it anchors later inserts).
+    fn hidden(&self) -> bool {
+        self.tombstone || self.moved_away
+    }
+
     fn deep_clone(&self) -> Self {
         Self {
             id: self.id,
@@ -92,6 +103,7 @@ impl Node {
             parent: self.parent,
             side: self.side,
             tombstone: self.tombstone,
+            moved_away: self.moved_away,
         }
     }
 }
@@ -285,6 +297,7 @@ impl List {
                 parent: anchor.parent,
                 side: anchor.side,
                 tombstone: false,
+                moved_away: false,
             };
             if nodes.insert(node_id, node).is_some() {
                 return Err(DecodeError::BadTag {
@@ -347,6 +360,7 @@ impl List {
                     parent,
                     side,
                     tombstone: true,
+                    moved_away: false,
                 };
                 if nodes.insert(node_id, node).is_some() {
                     return Err(DecodeError::BadTag {
@@ -403,7 +417,7 @@ impl List {
     }
 
     pub fn len(&self) -> usize {
-        self.nodes.values().filter(|n| !n.tombstone).count()
+        self.nodes.values().filter(|n| !n.hidden()).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -432,7 +446,7 @@ impl List {
     pub(crate) fn live_values(&self) -> impl Iterator<Item = &Element> {
         self.nodes
             .values()
-            .filter(|n| !n.tombstone)
+            .filter(|n| !n.hidden())
             .map(|n| &n.value)
     }
 
@@ -450,8 +464,16 @@ impl List {
     /// mutating. Feed it to [`insert_at`](Self::insert_at) to reproduce the
     /// insert on any replica.
     pub fn place(&self, index: usize) -> Anchor {
+        self.place_excluding(index, None)
+    }
+
+    /// The Fugue placement for live `index`, counting one existing node (if given)
+    /// as absent. A same-parent tree move re-places a node that is still live in
+    /// this list, so its own slot must be discounted or a forward reorder lands
+    /// one position too early.
+    pub fn place_excluding(&self, index: usize, exclude: Option<Stamp>) -> Anchor {
         let order = self.tree_order();
-        let (left, right) = self.gap(&order, index);
+        let (left, right) = self.gap_excluding(&order, index, exclude);
         let (parent, side) = self.placement(left, right);
         Anchor { parent, side }
     }
@@ -470,8 +492,18 @@ impl List {
                 parent: anchor.parent,
                 side: anchor.side,
                 tombstone: false,
+                moved_away: false,
             },
         );
+    }
+
+    /// Suppress or re-instate a node's placement under a tree move. Idempotent and
+    /// reversible — the document recomputes it from the move-log fold; positioning
+    /// is untouched.
+    pub(crate) fn set_moved_away(&mut self, id: Stamp, away: bool) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.moved_away = away;
+        }
     }
 
     /// The id of the live node at `index`, if any.
@@ -490,7 +522,8 @@ impl List {
             .collect()
     }
 
-    /// The live position of node `id`, if it is present and not tombstoned.
+    /// The live position of node `id`, if it is present and rendered — neither
+    /// tombstoned nor moved under another parent.
     pub fn live_index(&self, id: Stamp) -> Option<usize> {
         self.live_order().iter().position(|s| *s == id)
     }
@@ -538,9 +571,9 @@ impl List {
         let mut before = 0;
         for s in self.tree_order() {
             if s == id {
-                return Some((before, !self.nodes[&s].tombstone));
+                return Some((before, !self.nodes[&s].hidden()));
             }
-            if !self.nodes[&s].tombstone {
+            if !self.nodes[&s].hidden() {
                 before += 1;
             }
         }
@@ -576,6 +609,11 @@ impl List {
     /// Whether the node `id` is present (live or tombstoned).
     pub fn contains(&self, id: Stamp) -> bool {
         self.nodes.contains_key(&id)
+    }
+
+    /// Whether the node `id` is present and tombstoned (deleted).
+    pub(crate) fn is_tombstoned(&self, id: Stamp) -> bool {
+        self.nodes.get(&id).is_some_and(|n| n.tombstone)
     }
 
     /// Tombstone the node with `id`. Idempotent: a no-op if absent or already
@@ -616,6 +654,14 @@ impl List {
                 .collect(),
             displaced: Cell::new(false),
         }
+    }
+
+    /// Drop every node. Used at document teardown to break the child links a
+    /// sequence holds — a composite node references its child, and a tree move can
+    /// place a node's own subtree back into it, so a list can close an `Rc` cycle
+    /// that clearing the maps alone would not free.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
     }
 
     pub fn displace(&self) {
@@ -679,16 +725,27 @@ impl List {
         out
     }
 
-    /// Live nodes in sequence order.
+    /// Live nodes in sequence order — tombstoned and moved-away nodes skipped.
     fn live_order(&self) -> Vec<Stamp> {
         self.tree_order()
             .into_iter()
-            .filter(|s| !self.nodes[s].tombstone)
+            .filter(|s| !self.nodes[s].hidden())
             .collect()
     }
 
     /// The nodes bracketing the gap before live position `index`.
     fn gap(&self, order: &[Stamp], index: usize) -> (Option<Stamp>, Option<Stamp>) {
+        self.gap_excluding(order, index, None)
+    }
+
+    /// [`gap`](Self::gap), counting `exclude` (if present) as not live — so a node
+    /// being re-placed within its own list does not shift the target index.
+    fn gap_excluding(
+        &self,
+        order: &[Stamp],
+        index: usize,
+        exclude: Option<Stamp>,
+    ) -> (Option<Stamp>, Option<Stamp>) {
         let mut live = 0;
         let mut boundary = order.len();
         for (k, s) in order.iter().enumerate() {
@@ -696,7 +753,7 @@ impl List {
                 boundary = k;
                 break;
             }
-            if !self.nodes[s].tombstone {
+            if !self.nodes[s].hidden() && Some(*s) != exclude {
                 live += 1;
             }
         }

@@ -236,6 +236,11 @@ fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
             }
             put_anchor(out, anchor);
         }
+        OpKind::XmlMove { node, anchor } => {
+            put_u8(out, 15);
+            out.extend_from_slice(&node.as_bytes());
+            put_anchor(out, anchor);
+        }
     }
 }
 
@@ -471,6 +476,10 @@ impl<'a> Cursor<'a> {
                     anchor: self.anchor()?,
                 }
             }
+            15 => OpKind::XmlMove {
+                node: self.element_id()?,
+                anchor: self.anchor()?,
+            },
             tag => {
                 return Err(DecodeError::BadTag {
                     what: "opkind",

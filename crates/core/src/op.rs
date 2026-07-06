@@ -117,6 +117,16 @@ pub enum OpKind {
         tag: Option<Vec<u8>>,
         anchor: Anchor,
     },
+    /// Move the node `node` under the target children List at `anchor`. The
+    /// target addresses the destination sequence; `node` keeps its element id, so
+    /// its attrs and descendants ride along — only which sequence renders it
+    /// changes. Ordered by the op's stamp (Kleppmann 2021): a concurrent move of
+    /// the same node resolves to one parent, a move under the node's own
+    /// descendant is dropped as a cycle.
+    XmlMove {
+        node: ElementId,
+        anchor: Anchor,
+    },
 }
 
 impl OpKind {
@@ -144,7 +154,8 @@ impl OpKind {
             | OpKind::ListInsert { .. }
             | OpKind::ListDelete { .. }
             | OpKind::TextInsert { .. }
-            | OpKind::TextDelete { .. } => false,
+            | OpKind::TextDelete { .. }
+            | OpKind::XmlMove { .. } => false,
         }
     }
 }
