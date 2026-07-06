@@ -28,6 +28,7 @@ pub mod counter;
 pub mod element;
 pub mod list;
 pub mod map;
+pub mod ranged;
 pub mod register;
 pub mod text;
 pub mod treemove;
@@ -59,6 +60,7 @@ pub use protocol::{
     decode_header, decode_message, encode_header, encode_message, Channel, ErrorCode, Message,
     ProtocolError,
 };
+pub use ranged::{RangeAnchor, RangedElement};
 pub use register::Register;
 pub use scalar::{BlobRef, Scalar};
 pub use schema::{

@@ -15,7 +15,7 @@
 //! is deleted, resolution walks the retained tombstones to the nearest live
 //! neighbour on that side.
 
-use crate::codec::{put_stamp, put_u8, Cursor, DecodeError};
+use crate::codec::{put_rel_position, Cursor, DecodeError};
 use crate::stamp::Stamp;
 
 /// A stable position in a List or Text sequence.
@@ -33,21 +33,11 @@ pub enum RelativePosition {
 
 impl RelativePosition {
     /// Encode to bytes so a position can cross the wire (an awareness cursor
-    /// carries one).
+    /// carries one). The tag scheme lives once in [`put_rel_position`], shared
+    /// with the range-anchor codec.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        match self {
-            RelativePosition::Start => put_u8(&mut out, 0),
-            RelativePosition::End => put_u8(&mut out, 1),
-            RelativePosition::Before(s) => {
-                put_u8(&mut out, 2);
-                put_stamp(&mut out, s);
-            }
-            RelativePosition::After(s) => {
-                put_u8(&mut out, 3);
-                put_stamp(&mut out, s);
-            }
-        }
+        put_rel_position(&mut out, self);
         out
     }
 
@@ -55,18 +45,7 @@ impl RelativePosition {
     /// input yields a value or a [`DecodeError`], never a panic.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut cur = Cursor::new(bytes);
-        let pos = match cur.u8()? {
-            0 => RelativePosition::Start,
-            1 => RelativePosition::End,
-            2 => RelativePosition::Before(cur.stamp()?),
-            3 => RelativePosition::After(cur.stamp()?),
-            tag => {
-                return Err(DecodeError::BadTag {
-                    what: "relative position",
-                    tag,
-                })
-            }
-        };
+        let pos = cur.rel_position()?;
         if !cur.at_end() {
             return Err(DecodeError::TrailingBytes);
         }

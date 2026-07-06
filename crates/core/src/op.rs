@@ -10,6 +10,7 @@
 use crate::clientid::ClientId;
 use crate::elementid::ElementId;
 use crate::list::Anchor;
+use crate::ranged::RangeAnchor;
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 
@@ -127,6 +128,24 @@ pub enum OpKind {
         node: ElementId,
         anchor: Anchor,
     },
+    /// Create a [`RangedElement`](crate::ranged::RangedElement) in the document's
+    /// annotation set. The new element's id derives from the op's stamp, so every
+    /// replica agrees and concurrent creates are distinct entries. `start`/`end`
+    /// are fixed at create; `payload` is the initial LWW value.
+    RangedCreate {
+        start: RangeAnchor,
+        end: RangeAnchor,
+        payload: Scalar,
+    },
+    /// Replace a RangedElement's payload, last-writer-wins by the op's stamp.
+    RangedSetPayload {
+        id: ElementId,
+        payload: Scalar,
+    },
+    /// Tombstone a RangedElement. Delete wins over a concurrent payload change.
+    RangedDelete {
+        id: ElementId,
+    },
 }
 
 impl OpKind {
@@ -155,7 +174,10 @@ impl OpKind {
             | OpKind::ListDelete { .. }
             | OpKind::TextInsert { .. }
             | OpKind::TextDelete { .. }
-            | OpKind::XmlMove { .. } => false,
+            | OpKind::XmlMove { .. }
+            | OpKind::RangedCreate { .. }
+            | OpKind::RangedSetPayload { .. }
+            | OpKind::RangedDelete { .. } => false,
         }
     }
 }
