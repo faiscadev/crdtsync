@@ -10,8 +10,8 @@
 
 use crdtsync_core::json::JsonErrorKind;
 use crdtsync_core::schema::{
-    Action, AutoVersion, AwarenessEntry, Effect, Schema, SchemaErrorKind, Subject, SubjectClass,
-    TemplateVar, Trigger, TriggerEvent, TypeDef,
+    Action, AutoVersion, AwarenessEntry, Effect, MarkDef, MarkExpand, MarkFlavor, Schema,
+    SchemaErrorKind, Subject, SubjectClass, TemplateVar, Trigger, TriggerEvent, TypeDef,
 };
 
 fn parse(s: &str) -> Schema {
@@ -228,6 +228,131 @@ fn awareness_kinds_keep_declaration_order() {
     assert_eq!(kinds, ["cursor", "selection", "presence"]);
 }
 
+// --- marks ---
+
+fn with_marks(body: &str) -> String {
+    format!(
+        r#"{{ "schema": "s", "version": 1, "root": "R",
+            "types": {{ "R": {{ "kind": "map" }} }},
+            "marks": {body} }}"#
+    )
+}
+
+#[test]
+fn a_schema_without_marks_has_no_declarations() {
+    let s = parse(FULL);
+    assert!(s.marks().is_empty());
+    assert_eq!(s.mark("bold"), None);
+}
+
+#[test]
+fn parses_mark_flavors_and_expansion() {
+    let s = parse(&with_marks(
+        r#"{
+            "bold":    { "flavor": "boolean", "expand": "both" },
+            "link":    { "flavor": "value" },
+            "comment": { "flavor": "object", "expand": "none" }
+        }"#,
+    ));
+    assert_eq!(
+        s.mark("bold"),
+        Some(&MarkDef {
+            flavor: MarkFlavor::Boolean,
+            expand: MarkExpand::Both,
+        })
+    );
+    assert_eq!(
+        s.mark("link"),
+        Some(&MarkDef {
+            flavor: MarkFlavor::Value,
+            expand: MarkExpand::None,
+        })
+    );
+    assert_eq!(
+        s.mark("comment"),
+        Some(&MarkDef {
+            flavor: MarkFlavor::Object,
+            expand: MarkExpand::None,
+        })
+    );
+    assert_eq!(s.mark("missing"), None);
+}
+
+#[test]
+fn mark_expand_defaults_to_none() {
+    // A mark with no `expand` neither grows at insertion boundary — the
+    // conservative default (link-like), overridden per mark that should grow.
+    let s = parse(&with_marks(r#"{ "italic": { "flavor": "boolean" } }"#));
+    assert_eq!(s.mark("italic").unwrap().expand, MarkExpand::None);
+}
+
+#[test]
+fn every_expand_direction_parses() {
+    let s = parse(&with_marks(
+        r#"{
+            "a": { "flavor": "boolean", "expand": "none" },
+            "b": { "flavor": "boolean", "expand": "before" },
+            "c": { "flavor": "boolean", "expand": "after" },
+            "d": { "flavor": "boolean", "expand": "both" }
+        }"#,
+    ));
+    assert_eq!(s.mark("a").unwrap().expand, MarkExpand::None);
+    assert_eq!(s.mark("b").unwrap().expand, MarkExpand::Before);
+    assert_eq!(s.mark("c").unwrap().expand, MarkExpand::After);
+    assert_eq!(s.mark("d").unwrap().expand, MarkExpand::Both);
+}
+
+#[test]
+fn marks_keep_declaration_order() {
+    let s = parse(&with_marks(
+        r#"{ "bold": { "flavor": "boolean" }, "link": { "flavor": "value" }, "comment": { "flavor": "object" } }"#,
+    ));
+    let names: Vec<&str> = s.marks().iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["bold", "link", "comment"]);
+}
+
+#[test]
+fn an_unknown_flavor_is_rejected() {
+    let src = with_marks(r#"{ "bold": { "flavor": "wibble" } }"#);
+    assert_eq!(err(&src), SchemaErrorKind::UnknownFlavor);
+}
+
+#[test]
+fn an_unknown_expand_is_rejected() {
+    let src = with_marks(r#"{ "bold": { "flavor": "boolean", "expand": "sideways" } }"#);
+    assert_eq!(err(&src), SchemaErrorKind::UnknownExpand);
+}
+
+#[test]
+fn a_mark_without_a_flavor_is_rejected() {
+    let src = with_marks(r#"{ "bold": { "expand": "both" } }"#);
+    assert_eq!(err(&src), SchemaErrorKind::MissingField);
+}
+
+#[test]
+fn a_flavor_of_the_wrong_json_type_is_rejected() {
+    let src = with_marks(r#"{ "bold": { "flavor": 7 } }"#);
+    assert_eq!(err(&src), SchemaErrorKind::WrongType);
+}
+
+#[test]
+fn an_unknown_mark_field_is_rejected() {
+    let src = with_marks(r#"{ "bold": { "flavor": "boolean", "color": "red" } }"#);
+    assert_eq!(err(&src), SchemaErrorKind::UnknownField);
+}
+
+#[test]
+fn a_non_object_mark_def_is_rejected() {
+    let src = with_marks(r#"{ "bold": 3 }"#);
+    assert_eq!(err(&src), SchemaErrorKind::NotAnObject);
+}
+
+#[test]
+fn a_non_object_marks_block_is_rejected() {
+    let src = with_marks(r#"[]"#);
+    assert_eq!(err(&src), SchemaErrorKind::NotAnObject);
+}
+
 // --- autoVersion ---
 
 fn with_auto_version(body: &str) -> String {
@@ -437,17 +562,17 @@ fn an_unknown_field_inside_an_awareness_entry_is_rejected() {
 
 #[test]
 fn the_language_defined_top_level_keys_are_accepted() {
-    // `marks` is declared by the language (not yet modelled here), so a schema
-    // using it still parses; `awareness` and `auth` are modelled and must be
-    // well-formed.
+    // Every modelled top-level block parses together — `marks`, `awareness`, and
+    // `auth` each well-formed.
     let s = parse(
         r#"{ "schema": "s", "version": 1, "root": "R",
             "types": { "R": { "kind": "map" } },
-            "marks": { "bold": {} },
+            "marks": { "bold": { "flavor": "boolean" } },
             "awareness": { "cursor": {} },
             "auth": { "roles": ["editor"] } }"#,
     );
     assert_eq!(s.name(), "s");
+    assert_eq!(s.mark("bold").map(|d| d.flavor), Some(MarkFlavor::Boolean));
     assert_eq!(s.awareness_entry("cursor").map(|_| ()), Some(()));
 }
 
@@ -737,6 +862,11 @@ fn hostile_inputs_never_panic() {
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "every": "€", "name": "n" } ] }"#,
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "every": "999999999999999999999d", "name": "n" } ] }"#,
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "autoVersion": [ { "on": 7, "name": "n" } ] }"#,
+        // marks shapes
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "marks": 3 }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "marks": { "b": 3 } }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "marks": { "b": { "flavor": "nope" } } }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "marks": { "b": { "flavor": "boolean", "expand": "€" } } }"#,
     ];
     for s in inputs {
         // The contract is only that it returns — Ok or Err, never a panic.

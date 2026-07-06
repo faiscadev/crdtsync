@@ -183,7 +183,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **XmlElement — Unit 4a — schema `marks` parse (core)** — model the top-level `marks` block (was declared-but-ignored). `core::schema` `MarkDef { flavor: MarkFlavor(Boolean|Value|Object), expand: MarkExpand(None|Before|After|Both) }`; per mark name, required `flavor` + optional `expand` (default None). `Schema.marks: Vec<(name, MarkDef)>` (declaration order) + `marks()`/`mark(name)` accessors; `parse_marks` mirrors `parse_awareness`, total-decode (`UnknownFlavor`/`UnknownExpand`/MissingField/WrongType/NotAnObject, in `hostile_inputs_never_panic`). Value-shape deferred (like grant value-shape). `tests/schema.rs` marks block. First slice of Unit 4 (marks); 4b = the read model. → *Marks / Schema*.
 
 ---
 

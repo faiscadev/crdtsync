@@ -64,8 +64,8 @@ pub use ranged::{RangeAnchor, RangedElement, RangedInit, RangedPayload};
 pub use register::Register;
 pub use scalar::{BlobRef, Scalar};
 pub use schema::{
-    Action, Auth, AwarenessEntry, Effect, Grant, Schema, SchemaError, SchemaErrorKind, Subject,
-    SubjectClass, TemplateVar, TypeDef,
+    Action, Auth, AwarenessEntry, Effect, Grant, MarkDef, MarkExpand, MarkFlavor, Schema,
+    SchemaError, SchemaErrorKind, Subject, SubjectClass, TemplateVar, TypeDef,
 };
 pub use stamp::Stamp;
 pub use text::Text;
