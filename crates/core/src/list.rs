@@ -450,6 +450,17 @@ impl List {
             .map(|n| &n.value)
     }
 
+    /// Every non-tombstoned composite node as `(stamp, value)` — what the
+    /// document reconstructs a never-moved node's birth placement from after
+    /// decode, when `moved_away` is not yet set so a moved node's suppressed
+    /// birth placement is still visible here too.
+    pub(crate) fn composite_nodes(&self) -> impl Iterator<Item = (Stamp, &Element)> {
+        self.nodes
+            .iter()
+            .filter(|(_, n)| !n.tombstone && n.value.is_container())
+            .map(|(stamp, n)| (*stamp, &n.value))
+    }
+
     /// Insert `value` at live `index`, identified by `stamp`. A stamp already
     /// seen is a replay and leaves the node untouched.
     pub fn insert(&mut self, index: usize, value: Element, stamp: Stamp) {

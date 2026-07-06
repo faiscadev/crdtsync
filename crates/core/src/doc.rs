@@ -14,7 +14,8 @@
 
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, len_u32, put_bytes, put_u32, put_u64, put_u8, Cursor, DecodeError,
+    decode_ops, encode_ops, len_u32, put_bytes, put_stamp, put_u32, put_u64, put_u8, Cursor,
+    DecodeError,
 };
 use crate::counter::Counter;
 use crate::element::Element;
@@ -49,7 +50,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 3;
+const STATE_VERSION: u8 = 4;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -504,6 +505,43 @@ impl Document {
             out.extend_from_slice(&f.borrow().id().as_bytes());
         }
 
+        // The tree-move log, in stamp order — moves only. A reloaded replica
+        // replays it to restore the effective tree and the `moved_away` overlay;
+        // the base edges are re-derived from the placements, not stored.
+        put_u32(&mut out, len_u32(self.moves.len()));
+        for (stamp, node, parent) in self.moves.log() {
+            put_stamp(&mut out, &stamp);
+            out.extend_from_slice(&node.as_bytes());
+            out.extend_from_slice(&parent.as_bytes());
+        }
+
+        // A placement is stored only when it can't be recovered from the list
+        // nodes on decode: a moved node (more than the one birth placement) whose
+        // extra placements aren't derivable, or any node with a tombstoned
+        // placement, whose composite value is dropped by tombstone compression. A
+        // node with a single live placement — created, never moved, not deleted —
+        // keeps it live in its list, so decode reconstructs it from there.
+        let mut placed: Vec<(&ElementId, &Vec<Placement>)> = self
+            .placements
+            .iter()
+            .filter(|(_, places)| {
+                places.len() > 1
+                    || places
+                        .iter()
+                        .any(|p| self.is_tombstoned_node(p.list, p.stamp))
+            })
+            .collect();
+        placed.sort_by_key(|(node, _)| node.as_bytes());
+        put_u32(&mut out, len_u32(placed.len()));
+        for (node, places) in placed {
+            out.extend_from_slice(&node.as_bytes());
+            put_u32(&mut out, len_u32(places.len()));
+            for p in places {
+                out.extend_from_slice(&p.list.as_bytes());
+                put_stamp(&mut out, &p.stamp);
+            }
+        }
+
         let mut parents: Vec<(&ElementId, &ElementId)> = self.parents.iter().collect();
         parents.sort_by_key(|(child, _)| child.as_bytes());
         put_u32(&mut out, len_u32(parents.len()));
@@ -606,6 +644,45 @@ impl Document {
         // ids, so they must be built before any slot or node reference resolves.
         let xml_elements = decode_xml_element_registry(cur, &maps, &lists)?;
         let xml_fragments = decode_xml_fragment_registry(cur, &lists)?;
+
+        // The tree-move log and the placement set ride here, after the XML
+        // registries their nodes reference. Read raw now; replay after the
+        // document is built (it needs the resolved lists + parent links).
+        let log_count = cur.u32()?;
+        let mut move_log: Vec<(Stamp, ElementId, ElementId)> =
+            Vec::with_capacity((log_count as usize).min(1024));
+        for _ in 0..log_count {
+            let stamp = cur.stamp()?;
+            let node = cur.element_id()?;
+            let parent = cur.element_id()?;
+            move_log.push((stamp, node, parent));
+        }
+        let placed_count = cur.u32()?;
+        let mut placements: HashMap<ElementId, Vec<Placement>> =
+            HashMap::with_capacity((placed_count as usize).min(1024));
+        let mut placement_index: HashSet<(ElementId, Stamp)> = HashSet::new();
+        for _ in 0..placed_count {
+            let node = cur.element_id()?;
+            let n = cur.u32()?;
+            let mut places = Vec::with_capacity((n as usize).min(1024));
+            for _ in 0..n {
+                let list = cur.element_id()?;
+                let stamp = cur.stamp()?;
+                if !placement_index.insert((list, stamp)) {
+                    return Err(DecodeError::BadTag {
+                        what: "document: duplicate placement",
+                        tag: 0,
+                    });
+                }
+                places.push(Placement { list, stamp });
+            }
+            if placements.insert(node, places).is_some() {
+                return Err(DecodeError::BadTag {
+                    what: "document: duplicate placement node",
+                    tag: 0,
+                });
+            }
+        }
 
         // Resolve each slot: leaves inline, composites cloned from the matching
         // registry handle by id, so the whole tree shares the registry Rcs.
@@ -732,11 +809,12 @@ impl Document {
             xml_elements,
             xml_fragments,
             parents,
-            // A snapshot carries no move log yet (the tree-move state codec is a
-            // later slice), so a restored replica starts with none.
+            // The move log is replayed after construction (below); the explicit
+            // placements of moved nodes come off the snapshot, never-moved nodes'
+            // birth placements are reconstructed there from their list nodes.
             moves: TreeMoves::new(),
-            placements: HashMap::new(),
-            placement_index: HashSet::new(),
+            placements,
+            placement_index,
             lamport,
             seq,
             // Tx ids scope only the buffering of remote partial transactions,
@@ -753,12 +831,107 @@ impl Document {
             schema: None,
             repair_baseline: Vec::new(),
         };
+        // Rebuild the tree-move state: the created-under parent of each placed
+        // node (for the cycle check + fallback parent), then replay the move log,
+        // then re-fold so `moved_away` reflects the effective tree.
+        doc.restore_moves(&move_log)?;
+
         // The buffer holds only ops still waiting on their target; a well-formed
         // snapshot already satisfies that, so this is a no-op there. Draining
         // restores the invariant for any op decoded as already reachable rather
         // than leaving it stuck until an unrelated mutation.
         doc.drain_buffer();
         Ok(doc)
+    }
+
+    /// Restore the tree-move overlay from a decoded snapshot: reconstruct the
+    /// birth placement of every never-moved node from its live children-list
+    /// node (only moved nodes are stored explicitly), re-derive each placed
+    /// node's base (created-under) parent from its birth placement — the one
+    /// whose `(list, stamp)` re-derives the node's own id — then replay the move
+    /// log and re-fold. Finally re-check the parent relation for a cycle: replay
+    /// and re-fold mutate `parents` after decode's first check, so a crafted
+    /// snapshot whose moves fold into a cycle is rejected here rather than
+    /// hanging a later `resolvable` walk.
+    fn restore_moves(&mut self, log: &[(Stamp, ElementId, ElementId)]) -> Result<(), DecodeError> {
+        self.reconstruct_births();
+        let bases: Vec<(ElementId, ElementId)> = self
+            .placements
+            .iter()
+            .filter_map(|(node, places)| {
+                let kind = self.node_kind(*node)?;
+                let birth = places
+                    .iter()
+                    .find(|p| xml_child_id(p.list, p.stamp, kind) == *node)?;
+                let owner = self.parents.get(&birth.list)?;
+                Some((*node, *owner))
+            })
+            .collect();
+        for (node, owner) in bases {
+            self.moves.set_base(node, owner);
+        }
+        for &(stamp, node, parent) in log {
+            self.moves.apply(stamp, node, parent);
+        }
+        self.refold_moves();
+        reject_parent_cycles(&self.parents, ElementId::from_bytes(ROOT_ID))
+    }
+
+    /// Rebuild the birth placement of each movable node the snapshot did not
+    /// store explicitly. Only moved nodes are persisted (their extra and
+    /// tombstoned placements can't be recovered); a never-moved node keeps its
+    /// single birth placement live in its owner's children list, so scan those
+    /// lists and register any `XmlElement`/`Text` node not already placed. At
+    /// this point `moved_away` is unset, so a moved node's suppressed birth
+    /// placement is still visible here — it is skipped because the node is
+    /// already present from the explicit records.
+    fn reconstruct_births(&mut self) {
+        // Each element/fragment id derives a distinct children-list id, so the
+        // registry keys enumerate every children list once with no duplicates.
+        let mut births: Vec<(ElementId, ElementId, Stamp)> = Vec::new();
+        for list_id in self
+            .xml_elements
+            .keys()
+            .map(|&e| XmlElement::children_id(e))
+            .chain(
+                self.xml_fragments
+                    .keys()
+                    .map(|&f| XmlFragment::children_id(f)),
+            )
+        {
+            let Some(list) = self.lists.get(&list_id) else {
+                continue;
+            };
+            for (stamp, value) in list.borrow().composite_nodes() {
+                if matches!(value.kind(), ElementKind::XmlElement | ElementKind::Text) {
+                    let node = value.id();
+                    if !self.placements.contains_key(&node) {
+                        births.push((node, list_id, stamp));
+                    }
+                }
+            }
+        }
+        for (node, list, stamp) in births {
+            if self.placements.contains_key(&node) {
+                continue;
+            }
+            self.placements
+                .entry(node)
+                .or_default()
+                .push(Placement { list, stamp });
+            self.placement_index.insert((list, stamp));
+        }
+    }
+
+    /// The kind of a materialised movable node — `XmlElement` or `Text`.
+    fn node_kind(&self, node: ElementId) -> Option<ElementKind> {
+        if self.xml_elements.contains_key(&node) {
+            Some(ElementKind::XmlElement)
+        } else if self.texts.contains_key(&node) {
+            Some(ElementKind::Text)
+        } else {
+            None
+        }
     }
 
     /// Gather local edits into ops, applying each as it is emitted.
@@ -2313,5 +2486,65 @@ impl TextCursor<'_> {
             self.doc
                 .emit(self.text_id, OpKind::TextDelete { ids: ids.to_vec() });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cid(first: u8) -> ClientId {
+        let mut b = [0u8; 16];
+        b[0] = first;
+        ClientId::from_bytes(b)
+    }
+
+    /// A snapshot whose move log folds the parent relation into a cycle is
+    /// rejected at decode, not left to hang a later `resolvable` walk. Replay and
+    /// re-fold mutate `parents` after decode's first cycle check, so `restore_moves`
+    /// re-checks; here a placement is corrupted so one node's base can't derive —
+    /// the move guard's ancestor walk misses the loop through it, but the recheck
+    /// on the folded relation catches it. This state is unreachable through honest
+    /// ops (the move guard never records a cycle), so the test builds it directly.
+    #[test]
+    fn a_move_log_that_folds_into_a_parent_cycle_is_rejected() {
+        let mut d = Document::new(cid(1));
+        let mut a_id = ElementId::from_bytes([0u8; 16]);
+        let mut x_id = a_id;
+        let mut grand_id = a_id;
+        d.transact(|tx| {
+            let mut frag = tx.xml_fragment(b"doc");
+            let mut kids = frag.children();
+            let mut a = kids.insert_element(0, b"a");
+            a_id = a.id();
+            let mut ac = a.children();
+            let mut x = ac.insert_element(0, b"x");
+            x_id = x.id();
+            let mut xc = x.children();
+            grand_id = xc.insert_element(0, b"grand").id();
+        });
+
+        // Break x's base: repoint its stored placement at a's children list, where
+        // `(list, stamp)` no longer re-derives x, so `restore_moves` finds no birth
+        // placement for x and sets no base for it.
+        let a_list = d.placements[&a_id][0].list;
+        let x_stamp = d.placements[&x_id][0].stamp;
+        d.moves = TreeMoves::new();
+        d.placements.insert(
+            x_id,
+            vec![Placement {
+                list: a_list,
+                stamp: x_stamp,
+            }],
+        );
+
+        // Move a under grand. With x's base missing the guard's walk grand → x
+        // stops short of a, so the move is applied; the fold then points
+        // a → children(grand) → grand → children(x) → x → children(a) → a.
+        let mv = Stamp {
+            lamport: 1_000,
+            client: cid(1),
+        };
+        assert!(d.restore_moves(&[(mv, a_id, grand_id)]).is_err());
     }
 }
