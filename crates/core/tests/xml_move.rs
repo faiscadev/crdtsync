@@ -158,6 +158,23 @@ fn the_move_op_can_arrive_before_the_subtree_it_moves() {
 }
 
 #[test]
+fn an_atomic_move_waits_for_its_node_to_materialise() {
+    // A move shipped as an atomic transaction must not commit before the node it
+    // relocates exists — the transaction readiness gate must mirror the single-op
+    // one, or the group commits and the move is dropped against a missing node.
+    let mut src = Document::new(cid(1));
+    let (build, _a, b_id, x_id) = frag_with_a_x_b(&mut src);
+    let mv = src.atomic_transact(|tx| tx.move_xml(x_id, b_id, 0));
+    assert!(!mv.is_empty(), "the move should emit an op");
+
+    let mut dst = Document::new(cid(2));
+    apply_all(&mut dst, &mv); // atomic move first — x does not exist yet
+    apply_all(&mut dst, &build); // x arrives; the buffered move must commit
+    assert_eq!(tree(&dst, b"doc"), tree(&src, b"doc"));
+    assert_eq!(tree(&dst, b"doc"), "frag(a(),b(x(grand())))");
+}
+
+#[test]
 fn concurrent_moves_of_the_same_node_converge_to_one_parent() {
     // Two replicas move x to different parents concurrently. The move log picks
     // one winner by stamp; both converge, x has exactly one parent.

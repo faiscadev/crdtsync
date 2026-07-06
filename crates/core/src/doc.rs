@@ -135,6 +135,10 @@ pub struct Document {
     /// element id: `(list, node stamp)` pairs. A node has one per list it was ever
     /// inserted or moved into; the move-log fold picks which is live.
     placements: HashMap<ElementId, Vec<Placement>>,
+    /// The `(list, stamp)` of every placement, so a delete can tell in O(1)
+    /// whether it tombstoned a movable node — and re-fold only then, not on every
+    /// plain-list delete.
+    placement_index: HashSet<(ElementId, Stamp)>,
     lamport: u64,
     seq: u64,
     /// The next atomic-transaction id to mint; namespaced by this replica's
@@ -199,6 +203,7 @@ impl Document {
             parents: HashMap::new(),
             moves: TreeMoves::new(),
             placements: HashMap::new(),
+            placement_index: HashSet::new(),
             lamport: 0,
             seq: 0,
             next_tx: 0,
@@ -731,6 +736,7 @@ impl Document {
             // later slice), so a restored replica starts with none.
             moves: TreeMoves::new(),
             placements: HashMap::new(),
+            placement_index: HashSet::new(),
             lamport,
             seq,
             // Tx ids scope only the buffering of remote partial transactions,
@@ -966,6 +972,10 @@ impl Document {
         ordered.sort_by_key(|op| op.id.seq);
         let mut created: HashSet<ElementId> = HashSet::new();
         let mut inserted: HashSet<Stamp> = HashSet::new();
+        // Movable node ids a member inserts, so a later member's move of one is
+        // judged ready — a move whose node has not yet been materialised must
+        // wait, or apply_move drops it silently.
+        let mut movable: HashSet<ElementId> = HashSet::new();
         for op in &ordered {
             let target_ok = self.resolvable(op.target) || created.contains(&op.target);
             if !target_ok {
@@ -1004,6 +1014,7 @@ impl Document {
                         ElementKind::Text
                     };
                     let child = xml_child_id(op.target, op.stamp, kind);
+                    movable.insert(child);
                     if tag.is_some() {
                         created.insert(XmlElement::attrs_id(child));
                         created.insert(XmlElement::children_id(child));
@@ -1041,6 +1052,14 @@ impl Document {
                                 .is_some_and(|t| t.borrow().contains(*id))
                     });
                     if !present {
+                        return false;
+                    }
+                }
+                OpKind::XmlMove { node, .. } => {
+                    // The moved node must already exist or be inserted by an
+                    // earlier member — else the group would commit and apply_move
+                    // would drop the move against a not-yet-materialised node.
+                    if !self.placements.contains_key(node) && !movable.contains(node) {
                         return false;
                     }
                 }
@@ -1152,9 +1171,12 @@ impl Document {
                     list.borrow_mut().delete_id(*id);
                 }
                 // A delete of a moved node's placement makes the delete win over a
-                // concurrent move, so re-fold to hide every placement of a node
-                // whose placement was just tombstoned.
-                self.refold_moves();
+                // concurrent move, so re-fold to hide every placement of that
+                // node. Only a delete that tombstoned a real placement can change
+                // the fold, so a plain-list delete skips the O(placements) work.
+                if self.placement_index.contains(&(target, *id)) {
+                    self.refold_moves();
+                }
                 return;
             }
             OpKind::XmlInsertChild { tag, anchor } => {
@@ -1316,6 +1338,7 @@ impl Document {
                 list: list_id,
                 stamp,
             });
+        self.placement_index.insert((list_id, stamp));
         // The created-under parent anchors cycle detection and is the fallback
         // parent (via the move log's base map) when no move governs this node.
         if let Some(&owner) = self.parents.get(&list_id) {
@@ -1350,6 +1373,7 @@ impl Document {
             list: dest_list,
             stamp,
         });
+        self.placement_index.insert((dest_list, stamp));
         self.moves.apply(stamp, node, owner);
         self.refold_moves();
     }

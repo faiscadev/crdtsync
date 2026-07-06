@@ -514,7 +514,8 @@ impl List {
             .collect()
     }
 
-    /// The live position of node `id`, if it is present and not tombstoned.
+    /// The live position of node `id`, if it is present and rendered — neither
+    /// tombstoned nor moved under another parent.
     pub fn live_index(&self, id: Stamp) -> Option<usize> {
         self.live_order().iter().position(|s| *s == id)
     }
