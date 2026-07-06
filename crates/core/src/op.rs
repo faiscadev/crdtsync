@@ -10,7 +10,7 @@
 use crate::clientid::ClientId;
 use crate::elementid::ElementId;
 use crate::list::Anchor;
-use crate::ranged::RangeAnchor;
+use crate::ranged::{RangeAnchor, RangedInit};
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 
@@ -131,13 +131,17 @@ pub enum OpKind {
     /// Create a [`RangedElement`](crate::ranged::RangedElement) in the document's
     /// annotation set. The new element's id derives from the op's stamp, so every
     /// replica agrees and concurrent creates are distinct entries. `start`/`end`
-    /// are fixed at create; `payload` is the initial LWW value.
+    /// are fixed at create; `payload` is the initial payload — a leaf
+    /// [`Scalar`](RangedInit::Scalar) or a nested
+    /// [`Composite`](RangedInit::Composite) container installed at a derived id.
     RangedCreate {
         start: RangeAnchor,
         end: RangeAnchor,
-        payload: Scalar,
+        payload: RangedInit,
     },
-    /// Replace a RangedElement's payload, last-writer-wins by the op's stamp.
+    /// Replace a RangedElement's scalar payload, last-writer-wins by the op's
+    /// stamp. A composite payload is edited through its container, not replaced,
+    /// so this is inert against one.
     RangedSetPayload {
         id: ElementId,
         payload: Scalar,
@@ -165,6 +169,10 @@ impl OpKind {
             | OpKind::XmlElementCreate { .. }
             | OpKind::XmlFragmentCreate { .. }
             | OpKind::XmlInsertChild { .. } => true,
+            // A composite RangedElement create installs its payload container at a
+            // derived id later ops target keylessly; a scalar create installs no
+            // container.
+            OpKind::RangedCreate { payload, .. } => matches!(payload, RangedInit::Composite(_)),
             OpKind::RegisterSet { .. }
             | OpKind::CounterInc { .. }
             | OpKind::CounterDec { .. }
@@ -175,7 +183,6 @@ impl OpKind {
             | OpKind::TextInsert { .. }
             | OpKind::TextDelete { .. }
             | OpKind::XmlMove { .. }
-            | OpKind::RangedCreate { .. }
             | OpKind::RangedSetPayload { .. }
             | OpKind::RangedDelete { .. } => false,
         }

@@ -181,7 +181,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **RangedElement — Unit 3b — composite (Element) payload (core)** — generalize a RangedElement's payload from `Scalar` to a nested container (Map / List / Text), edited through the ordinary container ops. `op::RangedInit { Scalar | Composite(ElementKind) }` on `RangedCreate`; the payload container installs at `payload_id = derive(range_id, "payload", kind)`, parent = the range, registered in the existing maps/lists/texts registries + retention. A RangedElement is a virtual container (`resolvable`/`displaced_container` treat it as present-unless-tombstoned, parent = root), so a payload resolves through its range and a delete hides it (delete-wins). `RangedPayload { Scalar | Composite { id, kind } }` read view + `Document::ranged_payload(id)` handle + `RangedCursor::create_map/list/text` + `payload_map/list/text`. `STATE_VERSION` 5→6. `tests/ranged_payload.rs` (11). → *CRDT Model / Marks*.
 
 ---
 
