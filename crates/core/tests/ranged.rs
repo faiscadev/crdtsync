@@ -61,7 +61,7 @@ fn a_ranged_element_records_its_endpoints_and_payload() {
     assert_eq!(r.id, rid);
     assert_eq!(r.start, at(seq, RelativePosition::Start));
     assert_eq!(r.end, at(seq, RelativePosition::End));
-    assert_eq!(r.payload, Scalar::Bool(true));
+    assert_eq!(r.scalar(), Some(&Scalar::Bool(true)));
     assert_eq!(d.ranged_elements().len(), 1);
 }
 
@@ -121,7 +121,10 @@ fn a_payload_change_is_last_writer_wins() {
         r2.ranged_element(rid).unwrap().payload,
         "replicas converge on one payload",
     );
-    assert_eq!(r1.ranged_element(rid).unwrap().payload, Scalar::Int(2));
+    assert_eq!(
+        r1.ranged_element(rid).unwrap().scalar(),
+        Some(&Scalar::Int(2))
+    );
 }
 
 #[test]
@@ -220,8 +223,8 @@ fn a_payload_change_waits_for_its_create() {
     );
     apply_all(&mut dst, &create); // create lands; the buffered change replays after it
     assert_eq!(
-        dst.ranged_element(rid).unwrap().payload,
-        Scalar::Int(2),
+        dst.ranged_element(rid).unwrap().scalar(),
+        Some(&Scalar::Int(2)),
         "the buffered payload change is not lost",
     );
 }
@@ -360,8 +363,8 @@ fn an_atomic_payload_change_waits_for_an_external_create() {
     );
     apply_all(&mut dst, &create); // create arrives; the buffered group commits
     assert_eq!(
-        dst.ranged_element(rid).unwrap().payload,
-        Scalar::Int(2),
+        dst.ranged_element(rid).unwrap().scalar(),
+        Some(&Scalar::Int(2)),
         "the atomic payload change is not lost",
     );
 }

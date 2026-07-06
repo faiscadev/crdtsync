@@ -60,7 +60,7 @@ pub use protocol::{
     decode_header, decode_message, encode_header, encode_message, Channel, ErrorCode, Message,
     ProtocolError,
 };
-pub use ranged::{RangeAnchor, RangedElement};
+pub use ranged::{RangeAnchor, RangedElement, RangedInit, RangedPayload};
 pub use register::Register;
 pub use scalar::{BlobRef, Scalar};
 pub use schema::{

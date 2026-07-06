@@ -23,7 +23,9 @@ use crate::elementid::{ElementId, ElementKind};
 use crate::list::{Anchor, List};
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
-use crate::ranged::{RangeAnchor, RangedElement};
+use crate::ranged::{
+    is_composite_payload_kind, RangeAnchor, RangedElement, RangedInit, RangedPayload,
+};
 use crate::repair::{keyed_repairs, Repair, RepairId};
 use crate::scalar::Scalar;
 use crate::schema::Schema;
@@ -51,7 +53,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 5;
+const STATE_VERSION: u8 = 6;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -257,6 +259,32 @@ impl Document {
             .get(&id)
             .filter(|e| !e.tombstone)
             .map(|e| e.view(id))
+    }
+
+    /// The composite payload container of a live RangedElement, as a read/edit
+    /// handle — `None` when the range is absent, deleted, or its payload is a
+    /// leaf scalar (read that from [`ranged_element`](Self::ranged_element)).
+    pub fn ranged_payload(&self, id: ElementId) -> Option<Element> {
+        let e = self.ranged.get(&id).filter(|e| !e.tombstone)?;
+        let Payload::Composite { kind } = e.payload else {
+            return None;
+        };
+        self.container_element(payload_id(id, kind))
+    }
+
+    /// The registered container handle for `id`, wrapped as an Element, or `None`
+    /// if no map/list/text is registered there.
+    fn container_element(&self, id: ElementId) -> Option<Element> {
+        if let Some(m) = self.maps.get(&id) {
+            return Some(Element::Map(Rc::clone(m)));
+        }
+        if let Some(l) = self.lists.get(&id) {
+            return Some(Element::List(Rc::clone(l)));
+        }
+        if let Some(t) = self.texts.get(&id) {
+            return Some(Element::Text(Rc::clone(t)));
+        }
+        None
     }
 
     /// Every live RangedElement, ordered by id so the sequence is identical on
@@ -593,8 +621,19 @@ impl Document {
             out.extend_from_slice(&id.as_bytes());
             put_range_anchor(&mut out, &e.start);
             put_range_anchor(&mut out, &e.end);
-            put_scalar(&mut out, &e.payload);
-            put_stamp(&mut out, &e.payload_stamp);
+            match &e.payload {
+                Payload::Scalar { value, stamp } => {
+                    put_u8(&mut out, 0);
+                    put_scalar(&mut out, value);
+                    put_stamp(&mut out, stamp);
+                }
+                // The composite's data rides the map/list/text registries; the
+                // entry stores only its kind, the id being derived.
+                Payload::Composite { kind } => {
+                    put_u8(&mut out, 1);
+                    put_u8(&mut out, *kind as u8);
+                }
+            }
             put_u8(&mut out, e.tombstone as u8);
         }
 
@@ -747,8 +786,27 @@ impl Document {
             let id = cur.element_id()?;
             let start = cur.range_anchor()?;
             let end = cur.range_anchor()?;
-            let payload = cur.scalar()?;
-            let payload_stamp = cur.stamp()?;
+            let payload = match cur.u8()? {
+                0 => Payload::Scalar {
+                    value: cur.scalar()?,
+                    stamp: cur.stamp()?,
+                },
+                1 => {
+                    let kind = ElementKind::from_tag(cur.u8()?)
+                        .filter(|k| is_composite_payload_kind(*k))
+                        .ok_or(DecodeError::BadTag {
+                            what: "ranged element composite kind",
+                            tag: 1,
+                        })?;
+                    Payload::Composite { kind }
+                }
+                tag => {
+                    return Err(DecodeError::BadTag {
+                        what: "ranged element payload flavor",
+                        tag,
+                    })
+                }
+            };
             let tombstone = match cur.u8()? {
                 0 => false,
                 1 => true,
@@ -766,7 +824,6 @@ impl Document {
                         start,
                         end,
                         payload,
-                        payload_stamp,
                         tombstone,
                     },
                 )
@@ -891,6 +948,7 @@ impl Document {
             &counters,
             &xml_elements,
             &xml_fragments,
+            &ranged,
             root_id,
         );
 
@@ -1344,8 +1402,14 @@ impl Document {
                         return false;
                     }
                 }
-                OpKind::RangedCreate { .. } => {
-                    created_ranged.insert(ranged_id(op.stamp));
+                OpKind::RangedCreate { payload, .. } => {
+                    let rid = ranged_id(op.stamp);
+                    created_ranged.insert(rid);
+                    // A composite create installs the payload container a later
+                    // member may target — mark it reachable within the group.
+                    if let RangedInit::Composite(kind) = payload {
+                        created.insert(payload_id(rid, *kind));
+                    }
                 }
                 OpKind::RangedSetPayload { id, .. } | OpKind::RangedDelete { id } => {
                     if !self.ranged.contains_key(id) && !created_ranged.contains(id) {
@@ -1401,6 +1465,10 @@ impl Document {
             }
             match self.parents.get(&cur) {
                 Some(&parent) => cur = parent,
+                // A RangedElement is a virtual container the annotation set holds
+                // directly under the document, so its parent is the root — a
+                // composite payload resolves through the range it hangs off.
+                None if self.ranged.contains_key(&cur) => cur = self.root_id(),
                 None => return false,
             }
         }
@@ -1423,6 +1491,12 @@ impl Document {
         }
         if let Some(f) = self.xml_fragments.get(&id) {
             return Some(f.borrow().is_displaced());
+        }
+        // A RangedElement is a virtual container: present unless tombstoned, so a
+        // delete of the range makes its composite payload unreachable — delete
+        // wins, the payload subtree kept but hidden.
+        if let Some(e) = self.ranged.get(&id) {
+            return Some(e.tombstone);
         }
         None
     }
@@ -1482,20 +1556,43 @@ impl Document {
                 end,
                 payload,
             } => {
-                self.ranged.entry(ranged_id(stamp)).or_insert(RangedEntry {
-                    start: *start,
-                    end: *end,
-                    payload: payload.clone(),
-                    payload_stamp: stamp,
-                    tombstone: false,
-                });
+                let rid = ranged_id(stamp);
+                // Idempotent: a replayed create must not reinstall the payload or
+                // reset the entry. First sight installs the composite container (so
+                // its parent link is present before any op resolves against it),
+                // then records the entry.
+                if !self.ranged.contains_key(&rid) {
+                    let stored = match payload {
+                        RangedInit::Scalar(value) => Payload::Scalar {
+                            value: value.clone(),
+                            stamp,
+                        },
+                        RangedInit::Composite(kind) => {
+                            self.install_payload(rid, *kind);
+                            Payload::Composite { kind: *kind }
+                        }
+                    };
+                    self.ranged.insert(
+                        rid,
+                        RangedEntry {
+                            start: *start,
+                            end: *end,
+                            payload: stored,
+                            tombstone: false,
+                        },
+                    );
+                }
                 return;
             }
             OpKind::RangedSetPayload { id, payload } => {
+                // LWW replace, scalar payloads only — a composite is edited through
+                // its container, never replaced wholesale.
                 if let Some(e) = self.ranged.get_mut(id) {
-                    if stamp > e.payload_stamp {
-                        e.payload = payload.clone();
-                        e.payload_stamp = stamp;
+                    if let Payload::Scalar { value, stamp: last } = &mut e.payload {
+                        if stamp > *last {
+                            *value = payload.clone();
+                            *last = stamp;
+                        }
                     }
                 }
                 return;
@@ -1824,6 +1921,26 @@ impl Document {
         }
     }
 
+    /// Install a RangedElement's composite payload: materialise + register the
+    /// container at its derived id and link it to the RangedElement, so an op
+    /// targeting the payload resolves (reachability walks payload → range → root)
+    /// and it rides the by-id registry through a snapshot. A fresh container is
+    /// installed, not displaced — the payload owns its slot outright, so there is
+    /// no LWW contention to lose.
+    fn install_payload(&mut self, ranged: ElementId, kind: ElementKind) {
+        let container = match kind {
+            ElementKind::Map => Container::Map,
+            ElementKind::List => Container::List,
+            ElementKind::Text => Container::Text,
+            // Only the three sequence/record containers are valid payloads; a
+            // non-container kind is rejected at decode, never reaching here.
+            _ => return,
+        };
+        let pid = payload_id(ranged, kind);
+        self.registered_handle(pid, container);
+        self.parents.insert(pid, ranged);
+    }
+
     /// The registered container handle for `id`, wrapped as an Element,
     /// materialising and registering a fresh one on first sight.
     fn registered_handle(&mut self, id: ElementId, kind: Container) -> Element {
@@ -1888,27 +2005,48 @@ enum CounterDelta {
     Dec(u32),
 }
 
-/// A stored `RangedElement`: fixed endpoints, an LWW payload with the stamp that
-/// last set it, and a tombstone that a delete raises (delete wins over a
-/// concurrent payload change).
+/// A stored `RangedElement`: fixed endpoints, a payload, and a tombstone that a
+/// delete raises (delete wins over a concurrent payload change).
 struct RangedEntry {
     start: RangeAnchor,
     end: RangeAnchor,
-    payload: Scalar,
-    payload_stamp: Stamp,
+    payload: Payload,
     tombstone: bool,
+}
+
+/// A RangedElement's stored payload. A `Scalar` is LWW, carrying the stamp that
+/// last set it. A `Composite` names the kind of a nested container installed at
+/// [`payload_id`]; its data lives in the matching by-id registry, edited through
+/// the normal container ops, so the entry holds only the kind.
+enum Payload {
+    Scalar { value: Scalar, stamp: Stamp },
+    Composite { kind: ElementKind },
 }
 
 impl RangedEntry {
     /// The public read view of this entry under its id.
     fn view(&self, id: ElementId) -> RangedElement {
+        let payload = match &self.payload {
+            Payload::Scalar { value, .. } => RangedPayload::Scalar(value.clone()),
+            Payload::Composite { kind } => RangedPayload::Composite {
+                id: payload_id(id, *kind),
+                kind: *kind,
+            },
+        };
         RangedElement {
             id,
             start: self.start,
             end: self.end,
-            payload: self.payload.clone(),
+            payload,
         }
     }
+}
+
+/// The id a RangedElement's composite payload container derives to — under the
+/// RangedElement id as namespace, so it cannot collide with a user map slot
+/// (whose parent is a user map, never a stamp-derived RangedElement id).
+fn payload_id(ranged: ElementId, kind: ElementKind) -> ElementId {
+    ElementId::derive(ranged, b"payload", kind)
 }
 
 /// The container kinds a create op installs. An `XmlElement` carries its tag,
@@ -2222,6 +2360,7 @@ fn mark_displaced(
     counters: &HashMap<ElementId, Rc<RefCell<Counter>>>,
     xml_elements: &HashMap<ElementId, Rc<RefCell<XmlElement>>>,
     xml_fragments: &HashMap<ElementId, Rc<RefCell<XmlFragment>>>,
+    ranged: &HashMap<ElementId, RangedEntry>,
     root_id: ElementId,
 ) {
     // A container is installed iff some parent holds it live *now* — the root, a
@@ -2230,6 +2369,17 @@ fn mark_displaced(
     // later re-win of the ancestor restores the whole subtree).
     let mut installed: HashSet<ElementId> = HashSet::new();
     installed.insert(root_id);
+    // A live RangedElement's composite payload is held by the range, not a slot,
+    // so seed it here; its own nested containers are picked up by the map/list
+    // scans below. A tombstoned range's payload is left out — delete keeps it
+    // hidden and displaced.
+    for (id, e) in ranged {
+        if !e.tombstone {
+            if let Payload::Composite { kind } = &e.payload {
+                installed.insert(payload_id(*id, *kind));
+            }
+        }
+    }
     for m in maps.values() {
         for value in m.borrow().live_values() {
             if value.kind() != ElementKind::Scalar {
@@ -2475,6 +2625,32 @@ impl RangedCursor<'_> {
     /// `payload`. Returns its stable id — the handle to change its payload or
     /// delete it.
     pub fn create(&mut self, start: RangeAnchor, end: RangeAnchor, payload: Scalar) -> ElementId {
+        self.create_with(start, end, RangedInit::Scalar(payload))
+    }
+
+    /// Create a RangedElement whose payload is a nested Map — a structured comment
+    /// body, an object-mark value. Returns the RangedElement id; edit the payload
+    /// through [`payload_map`](Self::payload_map).
+    pub fn create_map(&mut self, start: RangeAnchor, end: RangeAnchor) -> ElementId {
+        self.create_with(start, end, RangedInit::Composite(ElementKind::Map))
+    }
+
+    /// Create a RangedElement whose payload is a nested List.
+    pub fn create_list(&mut self, start: RangeAnchor, end: RangeAnchor) -> ElementId {
+        self.create_with(start, end, RangedInit::Composite(ElementKind::List))
+    }
+
+    /// Create a RangedElement whose payload is a nested Text.
+    pub fn create_text(&mut self, start: RangeAnchor, end: RangeAnchor) -> ElementId {
+        self.create_with(start, end, RangedInit::Composite(ElementKind::Text))
+    }
+
+    fn create_with(
+        &mut self,
+        start: RangeAnchor,
+        end: RangeAnchor,
+        payload: RangedInit,
+    ) -> ElementId {
         let root = self.doc.root_id();
         let stamp = self.doc.emit_stamped(
             root,
@@ -2485,6 +2661,44 @@ impl RangedCursor<'_> {
             },
         );
         ranged_id(stamp)
+    }
+
+    /// A cursor over the Map payload of the live RangedElement `id`, or `None`
+    /// when it is absent, deleted, or its payload is not a Map.
+    pub fn payload_map(&mut self, id: ElementId) -> Option<MapCursor<'_>> {
+        self.payload_cursor(id, ElementKind::Map)
+            .map(|map_id| MapCursor {
+                doc: self.doc,
+                map_id,
+            })
+    }
+
+    /// A cursor over the List payload of the live RangedElement `id`, or `None`
+    /// when it is absent, deleted, or its payload is not a List.
+    pub fn payload_list(&mut self, id: ElementId) -> Option<ListCursor<'_>> {
+        self.payload_cursor(id, ElementKind::List)
+            .map(|list_id| ListCursor {
+                doc: self.doc,
+                list_id,
+            })
+    }
+
+    /// A cursor over the Text payload of the live RangedElement `id`, or `None`
+    /// when it is absent, deleted, or its payload is not a Text.
+    pub fn payload_text(&mut self, id: ElementId) -> Option<TextCursor<'_>> {
+        self.payload_cursor(id, ElementKind::Text)
+            .map(|text_id| TextCursor {
+                doc: self.doc,
+                text_id,
+            })
+    }
+
+    /// The payload container id for a live RangedElement whose payload is exactly
+    /// `kind` — the gate every payload cursor shares.
+    fn payload_cursor(&self, id: ElementId, kind: ElementKind) -> Option<ElementId> {
+        let e = self.doc.ranged.get(&id).filter(|e| !e.tombstone)?;
+        matches!(&e.payload, Payload::Composite { kind: k } if *k == kind)
+            .then(|| payload_id(id, kind))
     }
 
     /// Replace a RangedElement's payload (last-writer-wins). Emits nothing for an
