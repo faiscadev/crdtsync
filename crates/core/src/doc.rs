@@ -168,10 +168,18 @@ impl Drop for Document {
         // Break every parent→child link first, via the flat registry, so a
         // deeply nested tree frees iteratively instead of recursing through the
         // chain of Rc drops (which a caller-supplied path depth could overflow).
+        // Lists are cleared too: a composite sequence node holds its child, and a
+        // tree move can place a node's own subtree back into it, closing an Rc
+        // cycle that clearing the maps alone would leak.
         // Skip a handle a caller is still borrowing rather than panic in drop.
         for map in self.maps.values() {
             if let Ok(mut map) = map.try_borrow_mut() {
                 map.clear();
+            }
+        }
+        for list in self.lists.values() {
+            if let Ok(mut list) = list.try_borrow_mut() {
+                list.clear();
             }
         }
     }

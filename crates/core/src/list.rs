@@ -642,6 +642,14 @@ impl List {
         }
     }
 
+    /// Drop every node. Used at document teardown to break the child links a
+    /// sequence holds — a composite node references its child, and a tree move can
+    /// place a node's own subtree back into it, so a list can close an `Rc` cycle
+    /// that clearing the maps alone would not free.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+    }
+
     pub fn displace(&self) {
         self.displaced.set(true);
     }
