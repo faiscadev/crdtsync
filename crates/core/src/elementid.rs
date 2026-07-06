@@ -16,6 +16,8 @@ pub enum ElementKind {
     Map,
     List,
     Text,
+    XmlElement,
+    XmlFragment,
 }
 
 impl ElementId {
@@ -45,6 +47,8 @@ impl ElementKind {
             3 => Some(Self::Map),
             4 => Some(Self::List),
             5 => Some(Self::Text),
+            6 => Some(Self::XmlElement),
+            7 => Some(Self::XmlFragment),
             _ => None,
         }
     }

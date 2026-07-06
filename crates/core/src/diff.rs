@@ -368,6 +368,8 @@ fn kind_name(kind: ElementKind) -> &'static str {
         ElementKind::Map => "map",
         ElementKind::List => "list",
         ElementKind::Text => "text",
+        ElementKind::XmlElement => "xmlElement",
+        ElementKind::XmlFragment => "xmlFragment",
     }
 }
 

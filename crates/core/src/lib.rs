@@ -30,6 +30,7 @@ pub mod list;
 pub mod map;
 pub mod register;
 pub mod text;
+pub mod xml;
 
 pub mod client;
 pub mod codec;
@@ -66,3 +67,4 @@ pub use schema::{
 pub use stamp::Stamp;
 pub use text::Text;
 pub use undo::UndoManager;
+pub use xml::{XmlElement, XmlFragment};

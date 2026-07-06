@@ -1225,6 +1225,8 @@ fn handles_eq(a: &Element, b: &Element) -> bool {
         (Element::List(x), Element::List(y)) => Rc::ptr_eq(x, y),
         (Element::Text(x), Element::Text(y)) => Rc::ptr_eq(x, y),
         (Element::Counter(x), Element::Counter(y)) => Rc::ptr_eq(x, y),
+        (Element::XmlElement(x), Element::XmlElement(y)) => Rc::ptr_eq(x, y),
+        (Element::XmlFragment(x), Element::XmlFragment(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -1343,7 +1345,12 @@ fn resolve_ref(
         ElementKind::List => lists.get(&id).map(|l| Element::List(Rc::clone(l))),
         ElementKind::Text => texts.get(&id).map(|t| Element::Text(Rc::clone(t))),
         ElementKind::Map => maps.get(&id).map(|m| Element::Map(Rc::clone(m))),
-        ElementKind::Scalar | ElementKind::Register => None,
+        // A leaf has no registered handle to reference; the tree kinds are not
+        // resolved through this seam.
+        ElementKind::Scalar
+        | ElementKind::Register
+        | ElementKind::XmlElement
+        | ElementKind::XmlFragment => None,
     };
     element.ok_or(DecodeError::BadTag {
         what: "document: dangling slot reference",
