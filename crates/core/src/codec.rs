@@ -6,10 +6,12 @@
 //! bytes, text is UTF-8, bytes and strings are length-prefixed. Decoding is
 //! total — malformed input yields a [`DecodeError`], never a panic.
 
+use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::elementid::ElementId;
 use crate::list::{Anchor, Side};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
+use crate::ranged::RangeAnchor;
 use crate::scalar::{BlobRef, Scalar};
 use crate::stamp::Stamp;
 
@@ -157,6 +159,29 @@ fn side_tag(side: Side) -> u8 {
     }
 }
 
+/// A `RelativePosition`, tag-prefixed and self-delimiting: a bare boundary, or an
+/// item edge carrying its bound stamp.
+pub(crate) fn put_rel_position(out: &mut Vec<u8>, pos: &RelativePosition) {
+    match pos {
+        RelativePosition::Start => put_u8(out, 0),
+        RelativePosition::End => put_u8(out, 1),
+        RelativePosition::Before(s) => {
+            put_u8(out, 2);
+            put_stamp(out, s);
+        }
+        RelativePosition::After(s) => {
+            put_u8(out, 3);
+            put_stamp(out, s);
+        }
+    }
+}
+
+/// A range endpoint: the sequence id it lives in, then its position within.
+pub(crate) fn put_range_anchor(out: &mut Vec<u8>, a: &RangeAnchor) {
+    out.extend_from_slice(&a.seq.as_bytes());
+    put_rel_position(out, &a.pos);
+}
+
 fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
     match kind {
         OpKind::RegisterSet { key, value } => {
@@ -240,6 +265,25 @@ fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
             put_u8(out, 15);
             out.extend_from_slice(&node.as_bytes());
             put_anchor(out, anchor);
+        }
+        OpKind::RangedCreate {
+            start,
+            end,
+            payload,
+        } => {
+            put_u8(out, 16);
+            put_range_anchor(out, start);
+            put_range_anchor(out, end);
+            put_scalar(out, payload);
+        }
+        OpKind::RangedSetPayload { id, payload } => {
+            put_u8(out, 17);
+            out.extend_from_slice(&id.as_bytes());
+            put_scalar(out, payload);
+        }
+        OpKind::RangedDelete { id } => {
+            put_u8(out, 18);
+            out.extend_from_slice(&id.as_bytes());
         }
     }
 }
@@ -416,6 +460,28 @@ impl<'a> Cursor<'a> {
         Ok(Anchor { parent, side })
     }
 
+    pub(crate) fn rel_position(&mut self) -> Result<RelativePosition, DecodeError> {
+        Ok(match self.u8()? {
+            0 => RelativePosition::Start,
+            1 => RelativePosition::End,
+            2 => RelativePosition::Before(self.stamp()?),
+            3 => RelativePosition::After(self.stamp()?),
+            tag => {
+                return Err(DecodeError::BadTag {
+                    what: "relative position",
+                    tag,
+                })
+            }
+        })
+    }
+
+    pub(crate) fn range_anchor(&mut self) -> Result<RangeAnchor, DecodeError> {
+        Ok(RangeAnchor {
+            seq: self.element_id()?,
+            pos: self.rel_position()?,
+        })
+    }
+
     fn opkind(&mut self) -> Result<OpKind, DecodeError> {
         Ok(match self.u8()? {
             0 => OpKind::RegisterSet {
@@ -479,6 +545,18 @@ impl<'a> Cursor<'a> {
             15 => OpKind::XmlMove {
                 node: self.element_id()?,
                 anchor: self.anchor()?,
+            },
+            16 => OpKind::RangedCreate {
+                start: self.range_anchor()?,
+                end: self.range_anchor()?,
+                payload: self.scalar()?,
+            },
+            17 => OpKind::RangedSetPayload {
+                id: self.element_id()?,
+                payload: self.scalar()?,
+            },
+            18 => OpKind::RangedDelete {
+                id: self.element_id()?,
             },
             tag => {
                 return Err(DecodeError::BadTag {

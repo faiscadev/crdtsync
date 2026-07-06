@@ -14,8 +14,8 @@
 
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, len_u32, put_bytes, put_stamp, put_u32, put_u64, put_u8, Cursor,
-    DecodeError,
+    decode_ops, encode_ops, len_u32, put_bytes, put_range_anchor, put_scalar, put_stamp, put_u32,
+    put_u64, put_u8, Cursor, DecodeError,
 };
 use crate::counter::Counter;
 use crate::element::Element;
@@ -23,6 +23,7 @@ use crate::elementid::{ElementId, ElementKind};
 use crate::list::{Anchor, List};
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
+use crate::ranged::{RangeAnchor, RangedElement};
 use crate::repair::{keyed_repairs, Repair, RepairId};
 use crate::scalar::Scalar;
 use crate::schema::Schema;
@@ -50,7 +51,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 4;
+const STATE_VERSION: u8 = 5;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -140,6 +141,11 @@ pub struct Document {
     /// whether it tombstoned a movable node — and re-fold only then, not on every
     /// plain-list delete.
     placement_index: HashSet<(ElementId, Stamp)>,
+    /// The document-level annotation set: every `RangedElement` keyed by its id.
+    /// Endpoints are fixed at create; the payload is LWW-by-stamp; a tombstoned
+    /// entry is retained so delete wins over a concurrent payload change and
+    /// survives a snapshot reload.
+    ranged: HashMap<ElementId, RangedEntry>,
     lamport: u64,
     seq: u64,
     /// The next atomic-transaction id to mint; namespaced by this replica's
@@ -205,6 +211,7 @@ impl Document {
             moves: TreeMoves::new(),
             placements: HashMap::new(),
             placement_index: HashSet::new(),
+            ranged: HashMap::new(),
             lamport: 0,
             seq: 0,
             next_tx: 0,
@@ -242,6 +249,42 @@ impl Document {
     /// Read a live slot of the root map.
     pub fn get(&self, key: &[u8]) -> Option<Element> {
         self.root.borrow().get(key)
+    }
+
+    /// A live (non-tombstoned) RangedElement by id, or `None` if absent or deleted.
+    pub fn ranged_element(&self, id: ElementId) -> Option<RangedElement> {
+        self.ranged
+            .get(&id)
+            .filter(|e| !e.tombstone)
+            .map(|e| e.view(id))
+    }
+
+    /// Every live RangedElement, ordered by id so the sequence is identical on
+    /// every replica.
+    pub fn ranged_elements(&self) -> Vec<RangedElement> {
+        self.live_ranged().map(|(id, e)| e.view(id)).collect()
+    }
+
+    /// Every live RangedElement with an endpoint in sequence `seq` — "the ranges
+    /// annotating this element". A cross-element range is returned for either of
+    /// its sequences.
+    pub fn ranged_on(&self, seq: ElementId) -> Vec<RangedElement> {
+        self.live_ranged()
+            .filter(|(_, e)| e.start.seq == seq || e.end.seq == seq)
+            .map(|(id, e)| e.view(id))
+            .collect()
+    }
+
+    /// The live entries in id order — the shared basis for every ranged query.
+    fn live_ranged(&self) -> impl Iterator<Item = (ElementId, &RangedEntry)> {
+        let mut live: Vec<(ElementId, &RangedEntry)> = self
+            .ranged
+            .iter()
+            .filter(|(_, e)| !e.tombstone)
+            .map(|(id, e)| (*id, e))
+            .collect();
+        live.sort_by_key(|(id, _)| id.as_bytes());
+        live.into_iter()
     }
 
     /// Whether `key` in `map_id` ever named a container — the registry retains a
@@ -542,6 +585,20 @@ impl Document {
             }
         }
 
+        // The annotation set — every RangedElement, tombstoned ones included so a
+        // delete survives the reload. Ordered by id for a deterministic encoding.
+        let mut ranged: Vec<(&ElementId, &RangedEntry)> = self.ranged.iter().collect();
+        ranged.sort_by_key(|(id, _)| id.as_bytes());
+        put_u32(&mut out, len_u32(ranged.len()));
+        for (id, e) in ranged {
+            out.extend_from_slice(&id.as_bytes());
+            put_range_anchor(&mut out, &e.start);
+            put_range_anchor(&mut out, &e.end);
+            put_scalar(&mut out, &e.payload);
+            put_stamp(&mut out, &e.payload_stamp);
+            put_u8(&mut out, e.tombstone as u8);
+        }
+
         let mut parents: Vec<(&ElementId, &ElementId)> = self.parents.iter().collect();
         parents.sort_by_key(|(child, _)| child.as_bytes());
         put_u32(&mut out, len_u32(parents.len()));
@@ -684,6 +741,45 @@ impl Document {
             }
         }
 
+        let ranged_count = cur.u32()?;
+        let mut ranged: HashMap<ElementId, RangedEntry> =
+            HashMap::with_capacity((ranged_count as usize).min(1024));
+        for _ in 0..ranged_count {
+            let id = cur.element_id()?;
+            let start = cur.range_anchor()?;
+            let end = cur.range_anchor()?;
+            let payload = cur.scalar()?;
+            let payload_stamp = cur.stamp()?;
+            let tombstone = match cur.u8()? {
+                0 => false,
+                1 => true,
+                tag => {
+                    return Err(DecodeError::BadTag {
+                        what: "ranged element tombstone flag",
+                        tag,
+                    })
+                }
+            };
+            if ranged
+                .insert(
+                    id,
+                    RangedEntry {
+                        start,
+                        end,
+                        payload,
+                        payload_stamp,
+                        tombstone,
+                    },
+                )
+                .is_some()
+            {
+                return Err(DecodeError::BadTag {
+                    what: "document: duplicate ranged element",
+                    tag: 0,
+                });
+            }
+        }
+
         // Resolve each slot: leaves inline, composites cloned from the matching
         // registry handle by id, so the whole tree shares the registry Rcs.
         for dm in decoded {
@@ -815,6 +911,7 @@ impl Document {
             moves: TreeMoves::new(),
             placements,
             placement_index,
+            ranged,
             lamport,
             seq,
             // Tx ids scope only the buffering of remote partial transactions,
@@ -1110,6 +1207,14 @@ impl Document {
             // A move waits until the node it relocates has been materialised — its
             // create may still be in flight — so the relocation is never lost.
             OpKind::XmlMove { node, .. } => self.placements.contains_key(node),
+            // A payload change or delete waits for the RangedElement's create — a
+            // create carries the entry, a set/delete only mutate it, so applied
+            // against a missing entry they would be silently lost. A create itself
+            // has no such dependency: it stores an opaque anchor, never touching
+            // the sequence it names.
+            OpKind::RangedSetPayload { id, .. } | OpKind::RangedDelete { id } => {
+                self.ranged.contains_key(id)
+            }
             _ => true,
         }
     }
@@ -1149,6 +1254,10 @@ impl Document {
         // judged ready — a move whose node has not yet been materialised must
         // wait, or apply_move drops it silently.
         let mut movable: HashSet<ElementId> = HashSet::new();
+        // RangedElement ids a member creates, so a later member's payload change or
+        // delete of one is judged ready — else the group would commit and the
+        // change would apply against a missing entry and be lost.
+        let mut created_ranged: HashSet<ElementId> = HashSet::new();
         for op in &ordered {
             let target_ok = self.resolvable(op.target) || created.contains(&op.target);
             if !target_ok {
@@ -1233,6 +1342,14 @@ impl Document {
                     // earlier member — else the group would commit and apply_move
                     // would drop the move against a not-yet-materialised node.
                     if !self.placements.contains_key(node) && !movable.contains(node) {
+                        return false;
+                    }
+                }
+                OpKind::RangedCreate { .. } => {
+                    created_ranged.insert(ranged_id(op.stamp));
+                }
+                OpKind::RangedSetPayload { id, .. } | OpKind::RangedDelete { id } => {
+                    if !self.ranged.contains_key(id) && !created_ranged.contains(id) {
                         return false;
                     }
                 }
@@ -1358,6 +1475,36 @@ impl Document {
             }
             OpKind::XmlMove { node, anchor } => {
                 self.apply_move(target, *node, *anchor, stamp);
+                return;
+            }
+            // RangedElements live in a document-level set, not under `target`.
+            OpKind::RangedCreate {
+                start,
+                end,
+                payload,
+            } => {
+                self.ranged.entry(ranged_id(stamp)).or_insert(RangedEntry {
+                    start: *start,
+                    end: *end,
+                    payload: payload.clone(),
+                    payload_stamp: stamp,
+                    tombstone: false,
+                });
+                return;
+            }
+            OpKind::RangedSetPayload { id, payload } => {
+                if let Some(e) = self.ranged.get_mut(id) {
+                    if stamp > e.payload_stamp {
+                        e.payload = payload.clone();
+                        e.payload_stamp = stamp;
+                    }
+                }
+                return;
+            }
+            OpKind::RangedDelete { id } => {
+                if let Some(e) = self.ranged.get_mut(id) {
+                    e.tombstone = true;
+                }
                 return;
             }
             OpKind::TextInsert { s, anchor } => {
@@ -1742,6 +1889,29 @@ enum CounterDelta {
     Dec(u32),
 }
 
+/// A stored `RangedElement`: fixed endpoints, an LWW payload with the stamp that
+/// last set it, and a tombstone that a delete raises (delete wins over a
+/// concurrent payload change).
+struct RangedEntry {
+    start: RangeAnchor,
+    end: RangeAnchor,
+    payload: Scalar,
+    payload_stamp: Stamp,
+    tombstone: bool,
+}
+
+impl RangedEntry {
+    /// The public read view of this entry under its id.
+    fn view(&self, id: ElementId) -> RangedElement {
+        RangedElement {
+            id,
+            start: self.start,
+            end: self.end,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
 /// The container kinds a create op installs. An `XmlElement` carries its tag,
 /// which folds into the child's derived id.
 #[derive(Clone)]
@@ -1795,6 +1965,14 @@ fn stamp_key(stamp: Stamp) -> [u8; 24] {
 /// agree. `kind` is `XmlElement` for an element child, `Text` for a text run.
 fn xml_child_id(list_id: ElementId, stamp: Stamp, kind: ElementKind) -> ElementId {
     ElementId::derive(list_id, &stamp_key(stamp), kind)
+}
+
+/// The id of the RangedElement a create at `stamp` mints. Derived under a fixed
+/// annotation namespace so it never collides with a user's map slot, and from the
+/// globally-unique op stamp so every replica agrees and concurrent creates differ.
+fn ranged_id(stamp: Stamp) -> ElementId {
+    let ns = ElementId::from_bytes(*b"crdtsync\0ranged\0");
+    ElementId::derive(ns, &stamp_key(stamp), ElementKind::Scalar)
 }
 
 /// How many consecutive char_ids an op consumes from its stamp. A text run
@@ -2273,6 +2451,43 @@ impl<'a> MapCursor<'a> {
             None => return,
         };
         self.doc.emit(dest_list, OpKind::XmlMove { node, anchor });
+    }
+
+    /// Create a `RangedElement` in the document-level annotation set, spanning
+    /// `start`..`end` (each a `(sequence, RelativePosition)` anchor; the two may
+    /// name different sequences) with `payload`. Returns its stable id — the handle
+    /// to change its payload or delete it. Addresses the document, not this cursor's
+    /// map.
+    pub fn create_ranged(
+        &mut self,
+        start: RangeAnchor,
+        end: RangeAnchor,
+        payload: Scalar,
+    ) -> ElementId {
+        let root = self.doc.root_id();
+        let stamp = self.doc.emit_stamped(
+            root,
+            OpKind::RangedCreate {
+                start,
+                end,
+                payload,
+            },
+        );
+        ranged_id(stamp)
+    }
+
+    /// Replace a RangedElement's payload (last-writer-wins). A no-op on a deleted
+    /// or unknown id.
+    pub fn set_ranged_payload(&mut self, id: ElementId, payload: Scalar) {
+        let root = self.doc.root_id();
+        self.doc
+            .emit(root, OpKind::RangedSetPayload { id, payload });
+    }
+
+    /// Delete a RangedElement. Delete wins over a concurrent payload change.
+    pub fn delete_ranged(&mut self, id: ElementId) {
+        let root = self.doc.root_id();
+        self.doc.emit(root, OpKind::RangedDelete { id });
     }
 }
 
