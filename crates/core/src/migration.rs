@@ -197,6 +197,11 @@ fn with_key(op: &Op, new_key: Vec<u8>) -> Op {
         OpKind::MapCreate { .. } => OpKind::MapCreate { key: new_key },
         OpKind::ListCreate { .. } => OpKind::ListCreate { key: new_key },
         OpKind::TextCreate { .. } => OpKind::TextCreate { key: new_key },
+        OpKind::XmlElementCreate { tag, .. } => OpKind::XmlElementCreate {
+            key: new_key,
+            tag: tag.clone(),
+        },
+        OpKind::XmlFragmentCreate { .. } => OpKind::XmlFragmentCreate { key: new_key },
         other => other.clone(),
     };
     Op { kind, ..op.clone() }

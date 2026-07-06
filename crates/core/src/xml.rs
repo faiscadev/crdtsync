@@ -50,6 +50,15 @@ impl XmlElement {
         }
     }
 
+    /// The id an element takes when created at `key` in a parent map with `tag`.
+    /// The tag folds into the id, so a concurrent same-key create with a
+    /// different tag is a distinct identity the slot's LWW resolves — a retag is
+    /// a replace, never an in-place mutation.
+    pub fn node_id(parent: ElementId, key: &[u8], tag: &[u8]) -> ElementId {
+        let slot = ElementId::derive(parent, key, ElementKind::XmlElement);
+        ElementId::derive(slot, tag, ElementKind::XmlElement)
+    }
+
     /// The id of the attrs Map an element with id `id` owns — derived, so every
     /// replica agrees on it without storing it.
     pub fn attrs_id(id: ElementId) -> ElementId {
@@ -127,6 +136,12 @@ pub struct XmlFragment {
 }
 
 impl XmlFragment {
+    /// The id a fragment takes when created at `key` in a parent map. A fragment
+    /// is tagless, so nothing folds into the derivation.
+    pub fn node_id(parent: ElementId, key: &[u8]) -> ElementId {
+        ElementId::derive(parent, key, ElementKind::XmlFragment)
+    }
+
     /// A fresh, empty fragment. Its children List id derives from `id`.
     pub fn new(id: ElementId) -> Self {
         Self {

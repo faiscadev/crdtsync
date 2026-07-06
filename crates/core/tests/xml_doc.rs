@@ -112,11 +112,18 @@ fn a_concurrent_different_tag_create_converges() {
     let mut a = Document::new(cid(1));
     let mut b = Document::new(cid(2));
 
+    // Each also sets an attr on its own element, so the retag-is-replace split
+    // is checked on the attr side too: the winning tag's attrs must converge and
+    // the losing element's attrs must not leak into the reading.
     let a_ops = a.transact(|tx| {
-        tx.xml_element(b"body", b"div");
+        tx.xml_element(b"body", b"div")
+            .attrs()
+            .register(b"class", Scalar::Int(1));
     });
     let b_ops = b.transact(|tx| {
-        tx.xml_element(b"body", b"span");
+        tx.xml_element(b"body", b"span")
+            .attrs()
+            .register(b"class", Scalar::Int(2));
     });
 
     for op in &b_ops {
@@ -130,6 +137,17 @@ fn a_concurrent_different_tag_create_converges() {
     assert_eq!(tag_at(&a, b"body"), tag_at(&b, b"body"));
     let winner = tag_at(&a, b"body").unwrap();
     assert!(winner == b"div".to_vec() || winner == b"span".to_vec());
+    // And both converge on the winner's attr — the loser's is displaced with it.
+    assert_eq!(
+        attr_at(&a, b"body", b"class"),
+        attr_at(&b, b"body", b"class")
+    );
+    let want = if winner == b"div".to_vec() {
+        Scalar::Int(1)
+    } else {
+        Scalar::Int(2)
+    };
+    assert_eq!(attr_at(&a, b"body", b"class"), Some(want));
 }
 
 #[test]
@@ -184,6 +202,31 @@ fn a_fresh_replica_converges_from_ops() {
     assert_eq!(tag_at(&dst, b"body"), Some(b"section".to_vec()));
     assert_eq!(attr_at(&dst, b"body", b"id"), Some(Scalar::Int(42)));
     assert_eq!(attr_at(&dst, b"body", b"open"), Some(Scalar::Bool(true)));
+}
+
+#[test]
+fn an_atomic_create_and_attr_commits_on_a_remote_replica() {
+    // A transaction that creates an XML element and sets an attr on it ships as
+    // one group. On a remote replica every member buffers until the group is
+    // complete and its dependencies resolve; the attr targets the node's derived
+    // attrs id, which only the create makes reachable — so the readiness gate
+    // must count the create's node as satisfying it, or the group deadlocks.
+    let mut src = Document::new(cid(1));
+    let ops = src.atomic_transact(|tx| {
+        tx.xml_element(b"body", b"div")
+            .attrs()
+            .register(b"class", Scalar::Int(5));
+    });
+    assert!(ops.len() >= 2, "expected a create + an attr op");
+
+    // Deliver reversed, so the attr member arrives before its create.
+    let mut dst = Document::new(cid(2));
+    for op in ops.iter().rev() {
+        dst.apply(op);
+    }
+
+    assert_eq!(tag_at(&dst, b"body"), Some(b"div".to_vec()));
+    assert_eq!(attr_at(&dst, b"body", b"class"), Some(Scalar::Int(5)));
 }
 
 fn scalar(e: &Element) -> Option<Scalar> {

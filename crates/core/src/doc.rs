@@ -890,6 +890,19 @@ impl Document {
                 OpKind::TextCreate { key } => {
                     created.insert(ElementId::derive(op.target, key, ElementKind::Text));
                 }
+                // An XML create installs a node whose attrs Map and children List
+                // are the containers a later member of the same transaction
+                // targets, so mark those reachable — not the node id itself,
+                // which no op addresses directly.
+                OpKind::XmlElementCreate { key, tag } => {
+                    let node = XmlElement::node_id(op.target, key, tag);
+                    created.insert(XmlElement::attrs_id(node));
+                    created.insert(XmlElement::children_id(node));
+                }
+                OpKind::XmlFragmentCreate { key } => {
+                    let node = XmlFragment::node_id(op.target, key);
+                    created.insert(XmlFragment::children_id(node));
+                }
                 OpKind::ListInsert { .. } => {
                     inserted.insert(op.stamp);
                 }
@@ -1116,14 +1129,9 @@ impl Document {
         if map.borrow().is_displaced() {
             return;
         }
-        // An element folds its tag into the child id: a concurrent same-key
-        // create with a different tag is a distinct identity the slot's LWW
-        // resolves, so a retag is a replace, not an in-place mutation.
         let child_id = match &kind {
-            Container::XmlElement(tag) => {
-                let slot = ElementId::derive(map_id, key, ElementKind::XmlElement);
-                ElementId::derive(slot, tag, ElementKind::XmlElement)
-            }
+            Container::XmlElement(tag) => XmlElement::node_id(map_id, key, tag),
+            Container::XmlFragment => XmlFragment::node_id(map_id, key),
             _ => ElementId::derive(map_id, key, kind.element_kind()),
         };
         let element = self.registered_handle(child_id, kind);
@@ -1588,47 +1596,43 @@ impl<'a> MapCursor<'a> {
                 tag: tag.to_vec(),
             },
         );
-        let slot = ElementId::derive(self.map_id, key, ElementKind::XmlElement);
-        let xml_id = ElementId::derive(slot, tag, ElementKind::XmlElement);
         XmlCursor {
             doc: self.doc,
-            attrs_id: XmlElement::attrs_id(xml_id),
+            attrs_id: XmlElement::attrs_id(XmlElement::node_id(self.map_id, key, tag)),
         }
     }
 
     /// Descend into an `XmlFragment` at `key`, creating it if absent. A fragment
     /// is tagless and has no attrs — only a children sequence.
-    pub fn xml_fragment(&mut self, key: &[u8]) -> XmlCursor<'_> {
+    pub fn xml_fragment(&mut self, key: &[u8]) -> XmlFragmentCursor<'_> {
         self.doc
             .emit(self.map_id, OpKind::XmlFragmentCreate { key: key.to_vec() });
-        // A fragment has no attrs Map; the cursor still names its (unused) attrs
-        // id so the shape matches an element's — children ops arrive in a later
-        // slice.
-        let xml_id = ElementId::derive(self.map_id, key, ElementKind::XmlFragment);
-        XmlCursor {
-            doc: self.doc,
-            attrs_id: xml_id,
-        }
+        XmlFragmentCursor { doc: self.doc }
     }
 }
 
-/// A cursor over one XML tree node. For an element, [`attrs`](Self::attrs)
-/// descends into its attrs Map; a fragment has none. The children sequence
-/// arrives in a later slice.
+/// A cursor over one `XmlElement`. [`attrs`](Self::attrs) descends into its attrs
+/// Map; the children sequence arrives in a later slice.
 pub struct XmlCursor<'a> {
     doc: &'a mut Document,
     attrs_id: ElementId,
 }
 
 impl XmlCursor<'_> {
-    /// A cursor over this element's attrs Map, holding any CRDT values. On a
-    /// fragment this names a map that is never installed, so its edits no-op.
+    /// A cursor over this element's attrs Map, holding any CRDT values.
     pub fn attrs(&mut self) -> MapCursor<'_> {
         MapCursor {
             doc: self.doc,
             map_id: self.attrs_id,
         }
     }
+}
+
+/// A cursor over one `XmlFragment`. A fragment is tagless and attr-less — only a
+/// children sequence, which arrives in a later slice, so exposing no `attrs`
+/// here makes a mistaken attr write a compile error, not silent data loss.
+pub struct XmlFragmentCursor<'a> {
+    doc: &'a mut Document,
 }
 
 /// A cursor over one List in the tree.
