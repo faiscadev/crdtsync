@@ -223,6 +223,72 @@ fn a_move_that_would_create_a_cycle_is_rejected() {
     assert_eq!(tree(&dst, b"doc"), "frag(p(c()))");
 }
 
+#[test]
+fn moving_a_map_slot_root_is_a_no_op() {
+    // A node created straight into a map slot (a document root) has no children
+    // placement, so a move of it does nothing — the same on every replica, not a
+    // local-only duplication that diverges a peer.
+    let mut src = Document::new(cid(1));
+    let mut root_id = zero_id();
+    let mut host_id = zero_id();
+    let build = src.transact(|tx| {
+        let e = tx.xml_element(b"root", b"div");
+        root_id = e.id();
+        let host = tx.xml_element(b"host", b"section");
+        host_id = host.id();
+    });
+    // Attempt to move the map-slot root under host: no-op, no op emitted.
+    let mv = src.transact(|tx| tx.move_xml(root_id, host_id, 0));
+    assert!(mv.is_empty(), "a map-root move must emit no op");
+    assert_eq!(tree(&src, b"root"), "div()");
+    assert_eq!(tree(&src, b"host"), "section()");
+
+    let mut dst = Document::new(cid(2));
+    apply_all(&mut dst, &build);
+    apply_all(&mut dst, &mv);
+    assert_eq!(tree(&dst, b"root"), tree(&src, b"root"));
+    assert_eq!(tree(&dst, b"host"), tree(&src, b"host"));
+}
+
+#[test]
+fn a_concurrent_delete_wins_over_a_move() {
+    // One replica deletes a child; another concurrently moves it. The delete must
+    // win — the node stays gone, not resurrected under the new parent — and both
+    // replicas converge. Fixture: frag(x, b) with x a direct fragment child so it
+    // can be deleted by index.
+    let mut src = Document::new(cid(1));
+    let mut x_id = zero_id();
+    let mut b_id = zero_id();
+    let build = src.transact(|tx| {
+        let mut frag = tx.xml_fragment(b"doc");
+        let mut kids = frag.children();
+        let x = kids.insert_element(0, b"x");
+        x_id = x.id();
+        let b = kids.insert_element(1, b"b");
+        b_id = b.id();
+    });
+
+    let mut r1 = Document::new(cid(2));
+    let mut r2 = Document::new(cid(3));
+    apply_all(&mut r1, &build);
+    apply_all(&mut r2, &build);
+
+    // r1 deletes x (fragment child 0); r2 concurrently moves x under b.
+    let del = r1.transact(|tx| tx.xml_fragment(b"doc").children().delete(0));
+    let mv = r2.transact(|tx| tx.move_xml(x_id, b_id, 0));
+
+    apply_all(&mut r1, &mv);
+    apply_all(&mut r2, &del);
+
+    assert_eq!(tree(&r1, b"doc"), tree(&r2, b"doc"), "replicas diverged");
+    let t = tree(&r1, b"doc");
+    assert!(
+        !t.contains("x("),
+        "deleted x resurrected under the move: {t}"
+    );
+    assert_eq!(t, "frag(b())", "only b should remain");
+}
+
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {

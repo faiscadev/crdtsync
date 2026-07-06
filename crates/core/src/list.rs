@@ -562,9 +562,9 @@ impl List {
         let mut before = 0;
         for s in self.tree_order() {
             if s == id {
-                return Some((before, !self.nodes[&s].tombstone));
+                return Some((before, !self.nodes[&s].hidden()));
             }
-            if !self.nodes[&s].tombstone {
+            if !self.nodes[&s].hidden() {
                 before += 1;
             }
         }
@@ -600,6 +600,11 @@ impl List {
     /// Whether the node `id` is present (live or tombstoned).
     pub fn contains(&self, id: Stamp) -> bool {
         self.nodes.contains_key(&id)
+    }
+
+    /// Whether the node `id` is present and tombstoned (deleted).
+    pub(crate) fn is_tombstoned(&self, id: Stamp) -> bool {
+        self.nodes.get(&id).is_some_and(|n| n.tombstone)
     }
 
     /// Tombstone the node with `id`. Idempotent: a no-op if absent or already
