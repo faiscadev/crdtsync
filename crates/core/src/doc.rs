@@ -37,11 +37,8 @@ use std::rc::Rc;
 /// same parent.
 const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
-/// The snapshot format version, bumped when the encoding changes so an old
-/// reader rejects a newer stream rather than misreading it. v2 compresses
-/// sequence tombstones into run records and drops their dead values; v3 tags
-/// every sequence node value (scalar inline, composite by reference) and adds
-/// the XML node registries.
+/// The snapshot format version: a reader rejects any stream not stamped with it,
+/// so a format change can never be misread as the current one.
 const STATE_VERSION: u8 = 3;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
@@ -1679,9 +1676,11 @@ fn resolve_ref(
 }
 
 /// Restore displacement flags a snapshot doesn't store: a container is installed
-/// iff it is reachable from the root through live edges — a live map slot, an XML
-/// node's attrs/children, or a live sequence node. Every unreachable one lost its
-/// place and decodes displaced, so reachability and op emission stay correct.
+/// iff it currently occupies its own slot or node — a live map slot, a live
+/// sequence node, or the attrs/children an installed XML node owns — regardless
+/// of whether an ancestor is displaced. Displacement is per-slot and never
+/// propagates to descendants, so a container losing its own slot is the only
+/// thing that displaces it; every such one decodes displaced.
 #[allow(clippy::too_many_arguments)]
 fn mark_displaced(
     maps: &HashMap<ElementId, Rc<RefCell<Map>>>,
@@ -1692,38 +1691,40 @@ fn mark_displaced(
     xml_fragments: &HashMap<ElementId, Rc<RefCell<XmlFragment>>>,
     root_id: ElementId,
 ) {
-    // Walk the live tree from the root, following every container edge. A node
-    // is entered once; a leaf (text/counter/scalar) has no outgoing edges.
+    // A container is installed iff some parent holds it live *now* — the root, a
+    // live map slot, or a live sequence node — independent of that parent's own
+    // reachability (a child of a displaced map keeps its own flag clear, so a
+    // later re-win of the ancestor restores the whole subtree).
     let mut installed: HashSet<ElementId> = HashSet::new();
-    let mut stack = vec![root_id];
     installed.insert(root_id);
-    while let Some(id) = stack.pop() {
-        let mut reach = |child: ElementId, stack: &mut Vec<ElementId>| {
-            if installed.insert(child) {
-                stack.push(child);
-            }
-        };
-        if let Some(m) = maps.get(&id) {
-            for value in m.borrow().live_values() {
-                if value.kind() != ElementKind::Scalar {
-                    reach(value.id(), &mut stack);
-                }
+    for m in maps.values() {
+        for value in m.borrow().live_values() {
+            if value.kind() != ElementKind::Scalar {
+                installed.insert(value.id());
             }
         }
-        if let Some(l) = lists.get(&id) {
-            for value in l.borrow().live_values() {
-                if value.kind() != ElementKind::Scalar {
-                    reach(value.id(), &mut stack);
-                }
+    }
+    for l in lists.values() {
+        for value in l.borrow().live_values() {
+            if value.kind() != ElementKind::Scalar {
+                installed.insert(value.id());
             }
         }
-        if let Some(x) = xml_elements.get(&id) {
+    }
+    // An installed XML node's attrs Map and children List are intrinsic to it —
+    // never held by a slot — so they follow its flag (the halves are only ever
+    // displaced with their node). The scans above already settled every node's
+    // own installed status, so one pass suffices.
+    for (id, x) in xml_elements {
+        if installed.contains(id) {
             let x = x.borrow();
-            reach(x.attrs().borrow().id(), &mut stack);
-            reach(x.children().borrow().id(), &mut stack);
+            installed.insert(x.attrs().borrow().id());
+            installed.insert(x.children().borrow().id());
         }
-        if let Some(f) = xml_fragments.get(&id) {
-            reach(f.borrow().children().borrow().id(), &mut stack);
+    }
+    for (id, f) in xml_fragments {
+        if installed.contains(id) {
+            installed.insert(f.borrow().children().borrow().id());
         }
     }
     for (id, c) in counters {

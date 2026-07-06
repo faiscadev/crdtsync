@@ -9,7 +9,7 @@
 //! converges with a concurrent replica. The encoding is canonical.
 
 use crdtsync_core::doc::Document;
-use crdtsync_core::{DecodeError, Element, Scalar};
+use crdtsync_core::{DecodeError, Element, Op, OpKind, Scalar};
 
 mod common;
 use common::cid;
@@ -269,6 +269,80 @@ fn a_displaced_xml_node_survives_a_snapshot() {
         }
         _ => panic!("body did not restore to an element"),
     }
+}
+
+/// The int at `a.b.x`, or `None` if that path isn't a live register.
+fn nested_x(d: &Document) -> Option<i64> {
+    let a = match d.get(b"a") {
+        Some(Element::Map(a)) => a,
+        _ => return None,
+    };
+    let b = match a.borrow().get(b"b") {
+        Some(Element::Map(b)) => b,
+        _ => return None,
+    };
+    let x = b.borrow().get(b"x");
+    match x {
+        Some(Element::Register(r)) => match r.borrow().read() {
+            Scalar::Int(n) => Some(*n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[test]
+fn a_nested_container_under_a_displaced_one_reconverges_after_a_snapshot() {
+    // A container displaced only because an ancestor lost its slot keeps its own
+    // flag clear, so re-winning the ancestor restores the whole subtree. A
+    // snapshot must preserve that: displacement is per-slot, not inherited.
+    let mut author = doc(1);
+    let mut log: Vec<Op> = Vec::new();
+    // root.a = map A, A.b = map B, B.x = 7.
+    log.extend(author.transact(|tx| {
+        tx.map(b"a").map(b"b").register(b"x", Scalar::Int(7));
+    }));
+    // Overwrite slot "a" with a scalar: A is displaced, B is hidden under it but
+    // never lost its own slot in A.
+    log.extend(author.transact(|tx| tx.set(b"a", Scalar::Int(0))));
+
+    // Snapshot with A displaced.
+    let mut back = Document::decode_state(&author.encode_state()).unwrap();
+
+    // Re-win A (a bare MapCreate, not re-creating B), then a bare register on B
+    // whose create is not re-carried — the delta-sync shape that exposes a
+    // wrongly-inherited displaced flag.
+    let rewin = author.transact(|tx| {
+        tx.map(b"a");
+    });
+    log.extend(rewin.iter().cloned());
+    let full = author.transact(|tx| {
+        tx.map(b"a").map(b"b").register(b"x", Scalar::Int(8));
+    });
+    let reg_op = full
+        .iter()
+        .find(|o| matches!(o.kind, OpKind::RegisterSet { .. }))
+        .cloned()
+        .expect("a register op on B");
+    log.push(reg_op.clone());
+
+    // A reference replica that never snapshotted, from the same op stream.
+    let mut reference = doc(2);
+    for op in &log {
+        reference.apply(op);
+    }
+    assert_eq!(nested_x(&reference), Some(8));
+
+    // The reloaded replica applies only the post-snapshot delta.
+    for op in &rewin {
+        back.apply(op);
+    }
+    back.apply(&reg_op);
+    assert_eq!(
+        nested_x(&back),
+        Some(8),
+        "a nested container was wrongly displaced by the snapshot"
+    );
 }
 
 #[test]
