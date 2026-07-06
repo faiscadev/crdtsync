@@ -464,8 +464,16 @@ impl List {
     /// mutating. Feed it to [`insert_at`](Self::insert_at) to reproduce the
     /// insert on any replica.
     pub fn place(&self, index: usize) -> Anchor {
+        self.place_excluding(index, None)
+    }
+
+    /// The Fugue placement for live `index`, counting one existing node (if given)
+    /// as absent. A same-parent tree move re-places a node that is still live in
+    /// this list, so its own slot must be discounted or a forward reorder lands
+    /// one position too early.
+    pub fn place_excluding(&self, index: usize, exclude: Option<Stamp>) -> Anchor {
         let order = self.tree_order();
-        let (left, right) = self.gap(&order, index);
+        let (left, right) = self.gap_excluding(&order, index, exclude);
         let (parent, side) = self.placement(left, right);
         Anchor { parent, side }
     }
@@ -727,6 +735,17 @@ impl List {
 
     /// The nodes bracketing the gap before live position `index`.
     fn gap(&self, order: &[Stamp], index: usize) -> (Option<Stamp>, Option<Stamp>) {
+        self.gap_excluding(order, index, None)
+    }
+
+    /// [`gap`](Self::gap), counting `exclude` (if present) as not live — so a node
+    /// being re-placed within its own list does not shift the target index.
+    fn gap_excluding(
+        &self,
+        order: &[Stamp],
+        index: usize,
+        exclude: Option<Stamp>,
+    ) -> (Option<Stamp>, Option<Stamp>) {
         let mut live = 0;
         let mut boundary = order.len();
         for (k, s) in order.iter().enumerate() {
@@ -734,7 +753,7 @@ impl List {
                 boundary = k;
                 break;
             }
-            if !self.nodes[s].hidden() {
+            if !self.nodes[s].hidden() && Some(*s) != exclude {
                 live += 1;
             }
         }

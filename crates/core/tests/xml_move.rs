@@ -202,6 +202,46 @@ fn concurrent_moves_of_the_same_node_converge_to_one_parent() {
 }
 
 #[test]
+fn a_same_parent_reorder_lands_at_the_requested_index() {
+    // Reordering a child within its own parent must not be off by one: the node's
+    // own slot is discounted when reading the target index.
+    let mut src = Document::new(cid(1));
+    let mut ids = [zero_id(); 3];
+    let build = src.transact(|tx| {
+        let mut frag = tx.xml_fragment(b"doc");
+        let mut kids = frag.children();
+        for (i, slot) in ids.iter_mut().enumerate() {
+            let e = kids.insert_element(i, &[b'a' + i as u8]);
+            *slot = e.id();
+        }
+    });
+    let frag_id = frag_node_id(&src);
+    assert_eq!(tree(&src, b"doc"), "frag(a(),b(),c())");
+
+    // Move a (index 0) to index 1 → expect b, a, c.
+    let mv = src.transact(|tx| tx.move_xml(ids[0], frag_id, 1));
+    assert_eq!(tree(&src, b"doc"), "frag(b(),a(),c())");
+
+    // Converges on a fresh replica.
+    let mut dst = Document::new(cid(2));
+    apply_all(&mut dst, &build);
+    apply_all(&mut dst, &mv);
+    assert_eq!(tree(&dst, b"doc"), "frag(b(),a(),c())");
+
+    // Move a to the end (index 2) → b, c, a.
+    src.transact(|tx| tx.move_xml(ids[0], frag_id, 2));
+    assert_eq!(tree(&src, b"doc"), "frag(b(),c(),a())");
+}
+
+/// The fragment's node id for slot `doc` — the owner used as a move destination.
+fn frag_node_id(d: &Document) -> ElementId {
+    match d.get(b"doc") {
+        Some(Element::XmlFragment(f)) => f.borrow().id(),
+        _ => panic!("doc is not a fragment"),
+    }
+}
+
+#[test]
 fn a_move_that_would_create_a_cycle_is_rejected() {
     // Build frag(p(c())): c under p. Concurrently move p under c (a cycle) while
     // the other replica does the reverse-safe move; the cycle move must be

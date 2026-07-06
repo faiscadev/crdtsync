@@ -2086,8 +2086,17 @@ impl<'a> MapCursor<'a> {
             return;
         }
         let dest_list = XmlElement::children_id(new_parent);
+        // A reorder within the same parent re-places a node that still occupies a
+        // slot in this list; discount that slot so the target index is read
+        // against the sequence as it will be once the node leaves it.
+        let self_slot = self.doc.placements.get(&node).and_then(|ps| {
+            ps.iter()
+                .filter(|p| p.list == dest_list)
+                .map(|p| p.stamp)
+                .max()
+        });
         let anchor = match self.doc.lists.get(&dest_list) {
-            Some(list) => list.borrow().place(index),
+            Some(list) => list.borrow().place_excluding(index, self_slot),
             None => return,
         };
         self.doc.emit(dest_list, OpKind::XmlMove { node, anchor });
