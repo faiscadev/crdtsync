@@ -53,7 +53,7 @@ fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<crdtsync_core::Op> {
     let k = KEYS[rng.below(KEYS.len())];
     let sk = SUBKEYS[rng.below(SUBKEYS.len())];
     let v = rng.below(100) as i64;
-    match rng.below(9) {
+    match rng.below(11) {
         0 => d.transact(|tx| tx.register(k, Scalar::Int(v))),
         1 => d.transact(|tx| tx.inc(k, 1 + rng.below(4) as u32)),
         2 => d.transact(|tx| tx.dec(k, 1 + rng.below(4) as u32)),
@@ -62,7 +62,17 @@ fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<crdtsync_core::Op> {
         5 => d.transact(|tx| tx.map(k).register(sk, Scalar::Int(v))),
         6 => d.transact(|tx| tx.map(k).inc(sk, 1 + rng.below(4) as u32)),
         7 => d.transact(|tx| tx.list(k).insert(0, Scalar::Int(v))),
-        _ => d.transact(|tx| tx.text(k).insert(0, "z")),
+        8 => d.transact(|tx| tx.text(k).insert(0, "z")),
+        9 => d.transact(|tx| {
+            tx.xml_element(k, b"div")
+                .attrs()
+                .register(sk, Scalar::Int(v))
+        }),
+        _ => d.transact(|tx| {
+            tx.xml_element(k, b"p")
+                .children()
+                .insert_element(0, b"span");
+        }),
     }
 }
 
