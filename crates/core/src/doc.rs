@@ -14,7 +14,7 @@
 
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, len_u32, put_u32, put_u64, put_u8, Cursor, DecodeError,
+    decode_ops, encode_ops, len_u32, put_bytes, put_u32, put_u64, put_u8, Cursor, DecodeError,
 };
 use crate::counter::Counter;
 use crate::element::Element;
@@ -39,8 +39,10 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version, bumped when the encoding changes so an old
 /// reader rejects a newer stream rather than misreading it. v2 compresses
-/// sequence tombstones into run records and drops their dead values.
-const STATE_VERSION: u8 = 2;
+/// sequence tombstones into run records and drops their dead values; v3 tags
+/// every sequence node value (scalar inline, composite by reference) and adds
+/// the XML node registries.
+const STATE_VERSION: u8 = 3;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -453,6 +455,23 @@ impl Document {
         });
         encode_registry(&mut out, &self.maps, |m, o| m.borrow().encode_state_into(o));
 
+        // XML nodes ride after the map/list registries their attrs/children live
+        // in: an element as its id + tag, a fragment as its id alone.
+        let mut xes: Vec<&Rc<RefCell<XmlElement>>> = self.xml_elements.values().collect();
+        xes.sort_by_key(|x| x.borrow().id().as_bytes());
+        put_u32(&mut out, len_u32(xes.len()));
+        for x in xes {
+            let x = x.borrow();
+            out.extend_from_slice(&x.id().as_bytes());
+            put_bytes(&mut out, x.tag());
+        }
+        let mut xfs: Vec<&Rc<RefCell<XmlFragment>>> = self.xml_fragments.values().collect();
+        xfs.sort_by_key(|f| f.borrow().id().as_bytes());
+        put_u32(&mut out, len_u32(xfs.len()));
+        for f in xfs {
+            out.extend_from_slice(&f.borrow().id().as_bytes());
+        }
+
         let mut parents: Vec<(&ElementId, &ElementId)> = self.parents.iter().collect();
         parents.sort_by_key(|(child, _)| child.as_bytes());
         put_u32(&mut out, len_u32(parents.len()));
@@ -524,7 +543,9 @@ impl Document {
         let seq = cur.u64()?;
 
         let counters = decode_registry(cur, |c| Counter::decode_state_from(c), |c| c.id())?;
-        let lists = decode_registry(cur, |c| List::decode_state_from(c), |l| l.id())?;
+        // Lists decode into shells with composite nodes still unresolved (like map
+        // slots), collected as `list_refs` and wired once every registry exists.
+        let (lists, list_refs) = decode_list_registry(cur)?;
         let texts = decode_registry(cur, |c| Text::decode_state_from(c), |t| t.id())?;
 
         // Maps decode in two phases: read each map as an id plus unresolved
@@ -548,6 +569,12 @@ impl Document {
             decoded.push(dm);
         }
 
+        // XML nodes pair the map/list shells already decoded (an element's attrs
+        // Map + children List, a fragment's children List) under their derived
+        // ids, so they must be built before any slot or node reference resolves.
+        let xml_elements = decode_xml_element_registry(cur, &maps, &lists)?;
+        let xml_fragments = decode_xml_fragment_registry(cur, &lists)?;
+
         // Resolve each slot: leaves inline, composites cloned from the matching
         // registry handle by id, so the whole tree shares the registry Rcs.
         for dm in decoded {
@@ -560,9 +587,16 @@ impl Document {
                     Some(SlotValue::Register(r)) => {
                         Some(Element::Register(Rc::new(RefCell::new(r))))
                     }
-                    Some(SlotValue::Ref(kind, id)) => {
-                        Some(resolve_ref(kind, id, &counters, &lists, &texts, &maps)?)
-                    }
+                    Some(SlotValue::Ref(kind, id)) => Some(resolve_ref(
+                        kind,
+                        id,
+                        &counters,
+                        &lists,
+                        &texts,
+                        &maps,
+                        &xml_elements,
+                        &xml_fragments,
+                    )?),
                 };
                 if m.insert_decoded(slot.key, slot.stamp, value, slot.tombstone) {
                     return Err(DecodeError::BadTag {
@@ -570,6 +604,23 @@ impl Document {
                         tag: 0,
                     });
                 }
+            }
+        }
+
+        // Resolve composite sequence nodes against the same registries.
+        for (list_id, stamp, kind, ref_id) in list_refs {
+            let element = resolve_ref(
+                kind,
+                ref_id,
+                &counters,
+                &lists,
+                &texts,
+                &maps,
+                &xml_elements,
+                &xml_fragments,
+            )?;
+            if let Some(list) = lists.get(&list_id) {
+                list.borrow_mut().resolve_node(stamp, element);
             }
         }
 
@@ -627,9 +678,17 @@ impl Document {
             tag: 0,
         })?;
 
-        // Displacement isn't stored: a registered container is installed iff a
-        // live slot still holds its handle, so mark every other one displaced.
-        mark_displaced(&maps, &lists, &texts, &counters, root_id);
+        // Displacement isn't stored: a container is installed iff it is reachable
+        // from the root through live edges, so mark every other one displaced.
+        mark_displaced(
+            &maps,
+            &lists,
+            &texts,
+            &counters,
+            &xml_elements,
+            &xml_fragments,
+            root_id,
+        );
 
         let mut doc = Document {
             client,
@@ -638,10 +697,8 @@ impl Document {
             lists,
             texts,
             counters,
-            // No XML value reaches the state codec yet; the tree registries decode
-            // empty until the XML state codec slice wires them.
-            xml_elements: HashMap::new(),
-            xml_fragments: HashMap::new(),
+            xml_elements,
+            xml_fragments,
             parents,
             lamport,
             seq,
@@ -1449,6 +1506,107 @@ fn decode_registry<T>(
     Ok(reg)
 }
 
+/// Decode the list registry into shells, returning the composite sequence-node
+/// references (tagged with their owning list id) for the document to resolve once
+/// every registry exists.
+#[allow(clippy::type_complexity)]
+fn decode_list_registry(
+    cur: &mut Cursor,
+) -> Result<
+    (
+        HashMap<ElementId, Rc<RefCell<List>>>,
+        Vec<(ElementId, Stamp, ElementKind, ElementId)>,
+    ),
+    DecodeError,
+> {
+    let count = cur.u32()?;
+    let mut reg = HashMap::with_capacity((count as usize).min(1024));
+    let mut refs = Vec::new();
+    for _ in 0..count {
+        let (list, node_refs) = List::decode_state_from(cur)?;
+        let id = list.id();
+        for (stamp, kind, ref_id) in node_refs {
+            refs.push((id, stamp, kind, ref_id));
+        }
+        if reg.insert(id, Rc::new(RefCell::new(list))).is_some() {
+            return Err(DecodeError::BadTag {
+                what: "document: duplicate list id",
+                tag: 0,
+            });
+        }
+    }
+    Ok((reg, refs))
+}
+
+/// Decode the XmlElement registry, pairing each element with the attrs Map and
+/// children List already decoded under its derived ids.
+fn decode_xml_element_registry(
+    cur: &mut Cursor,
+    maps: &HashMap<ElementId, Rc<RefCell<Map>>>,
+    lists: &HashMap<ElementId, Rc<RefCell<List>>>,
+) -> Result<HashMap<ElementId, Rc<RefCell<XmlElement>>>, DecodeError> {
+    let count = cur.u32()?;
+    let mut reg = HashMap::with_capacity((count as usize).min(1024));
+    for _ in 0..count {
+        let id = cur.element_id()?;
+        let tag = cur.bytes()?;
+        let attrs = maps
+            .get(&XmlElement::attrs_id(id))
+            .cloned()
+            .ok_or(DecodeError::BadTag {
+                what: "xml element: missing attrs map",
+                tag: 0,
+            })?;
+        let children =
+            lists
+                .get(&XmlElement::children_id(id))
+                .cloned()
+                .ok_or(DecodeError::BadTag {
+                    what: "xml element: missing children list",
+                    tag: 0,
+                })?;
+        let handle = Rc::new(RefCell::new(XmlElement::from_registry(
+            id, tag, attrs, children,
+        )));
+        if reg.insert(id, handle).is_some() {
+            return Err(DecodeError::BadTag {
+                what: "document: duplicate xml element id",
+                tag: 0,
+            });
+        }
+    }
+    Ok(reg)
+}
+
+/// Decode the XmlFragment registry, pairing each fragment with its decoded
+/// children List.
+fn decode_xml_fragment_registry(
+    cur: &mut Cursor,
+    lists: &HashMap<ElementId, Rc<RefCell<List>>>,
+) -> Result<HashMap<ElementId, Rc<RefCell<XmlFragment>>>, DecodeError> {
+    let count = cur.u32()?;
+    let mut reg = HashMap::with_capacity((count as usize).min(1024));
+    for _ in 0..count {
+        let id = cur.element_id()?;
+        let children =
+            lists
+                .get(&XmlFragment::children_id(id))
+                .cloned()
+                .ok_or(DecodeError::BadTag {
+                    what: "xml fragment: missing children list",
+                    tag: 0,
+                })?;
+        let handle = Rc::new(RefCell::new(XmlFragment::from_registry(id, children)));
+        if reg.insert(id, handle).is_some() {
+            return Err(DecodeError::BadTag {
+                what: "document: duplicate xml fragment id",
+                tag: 0,
+            });
+        }
+    }
+    Ok(reg)
+}
+
 /// Reject a decoded parent graph that doesn't terminate: every chain of parent
 /// links must reach the root (or a container with no recorded parent) without
 /// revisiting a node. A cycle would spin `resolvable` forever on a later op.
@@ -1487,7 +1645,9 @@ fn reject_parent_cycles(
     Ok(())
 }
 
-/// Resolve a decoded slot reference to the registered handle it names.
+/// Resolve a decoded slot or sequence-node reference to the registered handle it
+/// names.
+#[allow(clippy::too_many_arguments)]
 fn resolve_ref(
     kind: ElementKind,
     id: ElementId,
@@ -1495,42 +1655,75 @@ fn resolve_ref(
     lists: &HashMap<ElementId, Rc<RefCell<List>>>,
     texts: &HashMap<ElementId, Rc<RefCell<Text>>>,
     maps: &HashMap<ElementId, Rc<RefCell<Map>>>,
+    xml_elements: &HashMap<ElementId, Rc<RefCell<XmlElement>>>,
+    xml_fragments: &HashMap<ElementId, Rc<RefCell<XmlFragment>>>,
 ) -> Result<Element, DecodeError> {
     let element = match kind {
         ElementKind::Counter => counters.get(&id).map(|c| Element::Counter(Rc::clone(c))),
         ElementKind::List => lists.get(&id).map(|l| Element::List(Rc::clone(l))),
         ElementKind::Text => texts.get(&id).map(|t| Element::Text(Rc::clone(t))),
         ElementKind::Map => maps.get(&id).map(|m| Element::Map(Rc::clone(m))),
-        // A leaf has no registered handle to reference; the tree kinds are not
-        // resolved through this seam.
-        ElementKind::Scalar
-        | ElementKind::Register
-        | ElementKind::XmlElement
-        | ElementKind::XmlFragment => None,
+        ElementKind::XmlElement => xml_elements
+            .get(&id)
+            .map(|x| Element::XmlElement(Rc::clone(x))),
+        ElementKind::XmlFragment => xml_fragments
+            .get(&id)
+            .map(|f| Element::XmlFragment(Rc::clone(f))),
+        // A leaf has no registered handle to reference.
+        ElementKind::Scalar | ElementKind::Register => None,
     };
     element.ok_or(DecodeError::BadTag {
-        what: "document: dangling slot reference",
+        what: "document: dangling reference",
         tag: 0,
     })
 }
 
-/// Restore displacement flags a snapshot doesn't store: a registered container
-/// is installed iff a live slot still holds it; every other one lost its slot
-/// and decodes displaced, so reachability and op emission stay correct.
+/// Restore displacement flags a snapshot doesn't store: a container is installed
+/// iff it is reachable from the root through live edges — a live map slot, an XML
+/// node's attrs/children, or a live sequence node. Every unreachable one lost its
+/// place and decodes displaced, so reachability and op emission stay correct.
+#[allow(clippy::too_many_arguments)]
 fn mark_displaced(
     maps: &HashMap<ElementId, Rc<RefCell<Map>>>,
     lists: &HashMap<ElementId, Rc<RefCell<List>>>,
     texts: &HashMap<ElementId, Rc<RefCell<Text>>>,
     counters: &HashMap<ElementId, Rc<RefCell<Counter>>>,
+    xml_elements: &HashMap<ElementId, Rc<RefCell<XmlElement>>>,
+    xml_fragments: &HashMap<ElementId, Rc<RefCell<XmlFragment>>>,
     root_id: ElementId,
 ) {
+    // Walk the live tree from the root, following every container edge. A node
+    // is entered once; a leaf (text/counter/scalar) has no outgoing edges.
     let mut installed: HashSet<ElementId> = HashSet::new();
+    let mut stack = vec![root_id];
     installed.insert(root_id);
-    for m in maps.values() {
-        for value in m.borrow().live_values() {
-            if value.kind() != ElementKind::Scalar {
-                installed.insert(value.id());
+    while let Some(id) = stack.pop() {
+        let mut reach = |child: ElementId, stack: &mut Vec<ElementId>| {
+            if installed.insert(child) {
+                stack.push(child);
             }
+        };
+        if let Some(m) = maps.get(&id) {
+            for value in m.borrow().live_values() {
+                if value.kind() != ElementKind::Scalar {
+                    reach(value.id(), &mut stack);
+                }
+            }
+        }
+        if let Some(l) = lists.get(&id) {
+            for value in l.borrow().live_values() {
+                if value.kind() != ElementKind::Scalar {
+                    reach(value.id(), &mut stack);
+                }
+            }
+        }
+        if let Some(x) = xml_elements.get(&id) {
+            let x = x.borrow();
+            reach(x.attrs().borrow().id(), &mut stack);
+            reach(x.children().borrow().id(), &mut stack);
+        }
+        if let Some(f) = xml_fragments.get(&id) {
+            reach(f.borrow().children().borrow().id(), &mut stack);
         }
     }
     for (id, c) in counters {
@@ -1546,6 +1739,16 @@ fn mark_displaced(
     for (id, t) in texts {
         if !installed.contains(id) {
             t.borrow().displace();
+        }
+    }
+    for (id, x) in xml_elements {
+        if !installed.contains(id) {
+            x.borrow().displace();
+        }
+    }
+    for (id, f) in xml_fragments {
+        if !installed.contains(id) {
+            f.borrow().displace();
         }
     }
     for (id, m) in maps {

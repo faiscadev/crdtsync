@@ -18,7 +18,7 @@ fn doc(first: u8) -> Document {
     Document::new(cid(first))
 }
 
-const KEYS: &[&[u8]] = &[b"reg", b"cnt", b"m", b"lst", b"txt"];
+const KEYS: &[&[u8]] = &[b"reg", b"cnt", b"m", b"lst", b"txt", b"body", b"frag"];
 const SUBKEYS: &[&[u8]] = &[b"r", b"c"];
 
 fn fp_element(e: &Element) -> String {
@@ -109,6 +109,17 @@ fn populated() -> Document {
         l.insert(0, Scalar::Int(1));
         l.insert(1, Scalar::Int(2));
         tx.text(b"txt").insert(0, "hi");
+        // An XML tree: an element with an attr and two children (a nested
+        // element carrying its own text run, and a top-level text run), plus a
+        // bare fragment — so the round-trip covers map-slot XML refs, sequence
+        // composite nodes, attrs, and nested text.
+        let mut body = tx.xml_element(b"body", b"div");
+        body.attrs().register(b"class", Scalar::Int(1));
+        let mut kids = body.children();
+        let mut h1 = kids.insert_element(0, b"h1");
+        h1.children().insert_text(0).insert(0, "Title");
+        kids.insert_text(1).insert(0, "tail");
+        tx.xml_fragment(b"frag");
     });
     // Displace the counter with a scalar, then re-win it — the counter's tally
     // must be retained through the snapshot.
@@ -223,6 +234,41 @@ fn a_displaced_counter_survives_a_snapshot() {
     let d = populated();
     let back = Document::decode_state(&d.encode_state()).unwrap();
     assert_eq!(fp_element(&back.get(b"cnt").unwrap()), "C4");
+}
+
+#[test]
+fn a_displaced_xml_node_survives_a_snapshot() {
+    // An XML element displaced by a later scalar is retained in the registry; the
+    // snapshot must carry it (and its attrs) so re-creating it restores the tree.
+    let mut d = doc(1);
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"div")
+            .attrs()
+            .register(b"class", Scalar::Int(7));
+    });
+    d.transact(|tx| tx.set(b"body", Scalar::Int(9)));
+
+    let mut back = Document::decode_state(&d.encode_state()).unwrap();
+    // The slot reads the scalar; the XML element is displaced but retained.
+    assert!(matches!(
+        back.get(b"body"),
+        Some(Element::Scalar(Scalar::Int(9)))
+    ));
+    // Re-creating the same element re-installs it with its attr intact.
+    back.transact(|tx| {
+        tx.xml_element(b"body", b"div");
+    });
+    match back.get(b"body") {
+        Some(Element::XmlElement(x)) => {
+            let x = x.borrow();
+            assert_eq!(x.tag(), b"div");
+            match x.attrs().borrow().get(b"class") {
+                Some(Element::Register(r)) => assert_eq!(r.borrow().read().clone(), Scalar::Int(7)),
+                _ => panic!("attr class lost across the snapshot"),
+            }
+        }
+        _ => panic!("body did not restore to an element"),
+    }
 }
 
 #[test]

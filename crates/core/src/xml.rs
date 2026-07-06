@@ -70,6 +70,24 @@ impl XmlElement {
         ElementId::derive(id, CHILDREN_KEY, ElementKind::List)
     }
 
+    /// Rebuild an element from a decoded snapshot, sharing the attrs Map and
+    /// children List handles the document already materialised under their
+    /// derived ids — so ops targeting the halves reach the same containers.
+    pub(crate) fn from_registry(
+        id: ElementId,
+        tag: Vec<u8>,
+        attrs: Rc<RefCell<Map>>,
+        children: Rc<RefCell<List>>,
+    ) -> Self {
+        Self {
+            id,
+            tag,
+            attrs,
+            children,
+            displaced: Cell::new(false),
+        }
+    }
+
     pub fn id(&self) -> ElementId {
         self.id
     }
@@ -140,6 +158,16 @@ impl XmlFragment {
     /// is tagless, so nothing folds into the derivation.
     pub fn node_id(parent: ElementId, key: &[u8]) -> ElementId {
         ElementId::derive(parent, key, ElementKind::XmlFragment)
+    }
+
+    /// Rebuild a fragment from a decoded snapshot, sharing the children List
+    /// handle the document already materialised under its derived id.
+    pub(crate) fn from_registry(id: ElementId, children: Rc<RefCell<List>>) -> Self {
+        Self {
+            id,
+            children,
+            displaced: Cell::new(false),
+        }
     }
 
     /// A fresh, empty fragment. Its children List id derives from `id`.

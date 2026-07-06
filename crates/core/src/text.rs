@@ -41,7 +41,13 @@ impl Text {
     /// are compressed away in the encoding and never rendered), so only the live
     /// codepoints are checked.
     pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<Text, DecodeError> {
-        let inner = List::decode_state_from(cur)?;
+        let (inner, refs) = List::decode_state_from(cur)?;
+        if !refs.is_empty() {
+            return Err(DecodeError::BadTag {
+                what: "text: composite node reference",
+                tag: 0,
+            });
+        }
         for value in inner.live_values() {
             match value {
                 Element::Scalar(Scalar::Int(cp)) if char::from_u32(*cp as u32).is_some() => {}

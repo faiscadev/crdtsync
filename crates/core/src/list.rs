@@ -8,7 +8,7 @@
 //! Text.
 
 use crate::anchor::RelativePosition;
-use crate::codec::{len_u32, put_anchor, put_stamp, put_u32, Cursor, DecodeError};
+use crate::codec::{len_u32, put_anchor, put_stamp, put_u32, put_u8, Cursor, DecodeError};
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
 use crate::scalar::Scalar;
@@ -34,6 +34,37 @@ const MAX_TOMBSTONE_TOTAL: u64 = 1 << 22;
 pub enum Side {
     Left,
     Right,
+}
+
+/// A decoded live node whose value is a composite reference — its Fugue stamp
+/// plus the kind + id to resolve against the document's registries. Scalar nodes
+/// are inlined and need no second pass; only these are returned for resolution.
+pub(crate) type NodeRef = (Stamp, ElementKind, ElementId);
+
+/// Encode a live node's value: a scalar inline, any composite as a kind-tagged
+/// reference to its child's id. The first byte is the [`ElementKind`] tag, so a
+/// scalar (tag 0) is told from a reference (tags 2..=7) with no extra
+/// discriminant — the sequence codec mirrors the map slot codec.
+fn put_node_value(out: &mut Vec<u8>, value: &Element) {
+    match value {
+        Element::Scalar(s) => {
+            put_u8(out, ElementKind::Scalar as u8);
+            s.encode_state_into(out);
+        }
+        Element::Counter(c) => put_node_ref(out, ElementKind::Counter, c.borrow().id()),
+        Element::Map(m) => put_node_ref(out, ElementKind::Map, m.borrow().id()),
+        Element::List(l) => put_node_ref(out, ElementKind::List, l.borrow().id()),
+        Element::Text(t) => put_node_ref(out, ElementKind::Text, t.borrow().id()),
+        Element::XmlElement(x) => put_node_ref(out, ElementKind::XmlElement, x.borrow().id()),
+        Element::XmlFragment(f) => put_node_ref(out, ElementKind::XmlFragment, f.borrow().id()),
+        // A register only ever lives inline in a map slot, never as a sequence node.
+        Element::Register(_) => unreachable!("a sequence node never holds a bare register"),
+    }
+}
+
+fn put_node_ref(out: &mut Vec<u8>, kind: ElementKind, id: ElementId) {
+    put_u8(out, kind as u8);
+    out.extend_from_slice(&id.as_bytes());
 }
 
 /// Where a new node attaches in the Fugue tree: a parent node (or the root
@@ -105,11 +136,7 @@ impl List {
         put_u32(out, len_u32(live.len()));
         for node in live {
             put_stamp(out, &node.id);
-            match &node.value {
-                // List inserts and Text codepoints always store scalars.
-                Element::Scalar(s) => s.encode_state_into(out),
-                _ => unreachable!("a sequence node holds a scalar"),
-            }
+            put_node_value(out, &node.value);
             put_anchor(
                 out,
                 &Anchor {
@@ -213,16 +240,44 @@ impl List {
 
     /// Read a list from `cur`, advancing it. Mirrors [`encode_state_into`]: the
     /// live section in full, then the tombstone runs expanded back to nodes.
-    pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<List, DecodeError> {
+    /// Composite live nodes come back holding a placeholder value with their
+    /// reference returned alongside, for the document to resolve against its
+    /// registries in a second pass (as map slots resolve).
+    pub(crate) fn decode_state_from(cur: &mut Cursor) -> Result<(List, Vec<NodeRef>), DecodeError> {
         let id = cur.element_id()?;
         // Grow the map as records are read rather than trusting a count to size
         // the reservation, so a bogus length fails on the missing bytes.
         let mut nodes: HashMap<Stamp, Node> = HashMap::new();
+        let mut refs: Vec<NodeRef> = Vec::new();
 
         let live_count = cur.u32()?;
         for _ in 0..live_count {
             let node_id = cur.stamp()?;
-            let value = Element::Scalar(cur.scalar()?);
+            let value = match cur.u8()? {
+                // ElementKind::Scalar tag: an inline scalar.
+                0 => Element::Scalar(cur.scalar()?),
+                tag => {
+                    let kind = match ElementKind::from_tag(tag) {
+                        Some(
+                            k @ (ElementKind::Counter
+                            | ElementKind::Map
+                            | ElementKind::List
+                            | ElementKind::Text
+                            | ElementKind::XmlElement
+                            | ElementKind::XmlFragment),
+                        ) => k,
+                        _ => {
+                            return Err(DecodeError::BadTag {
+                                what: "list node value",
+                                tag,
+                            })
+                        }
+                    };
+                    refs.push((node_id, kind, cur.element_id()?));
+                    // A placeholder until the document resolves the reference.
+                    Element::Scalar(Scalar::Null)
+                }
+            };
             let anchor = cur.anchor()?;
             let node = Node {
                 id: node_id,
@@ -304,11 +359,22 @@ impl List {
             }
         }
 
-        Ok(List {
-            id,
-            nodes,
-            displaced: Cell::new(false),
-        })
+        Ok((
+            List {
+                id,
+                nodes,
+                displaced: Cell::new(false),
+            },
+            refs,
+        ))
+    }
+
+    /// Set the value of an already-decoded node, wiring a composite reference to
+    /// its resolved handle in the document's second decode pass.
+    pub(crate) fn resolve_node(&mut self, id: Stamp, value: Element) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.value = value;
+        }
     }
 
     /// Serialize this list's state to self-contained bytes.
@@ -318,10 +384,17 @@ impl List {
         out
     }
 
-    /// Read a list from a complete byte slice, rejecting trailing bytes.
+    /// Read a list from a complete byte slice, rejecting trailing bytes. A bare
+    /// list holds only scalars, so a composite reference is rejected.
     pub fn decode_state(bytes: &[u8]) -> Result<List, DecodeError> {
         let mut cur = Cursor::new(bytes);
-        let list = List::decode_state_from(&mut cur)?;
+        let (list, refs) = List::decode_state_from(&mut cur)?;
+        if !refs.is_empty() {
+            return Err(DecodeError::BadTag {
+                what: "bare list: composite node reference",
+                tag: 0,
+            });
+        }
         if cur.at_end() {
             Ok(list)
         } else {
