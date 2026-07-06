@@ -95,6 +95,18 @@ pub enum OpKind {
     TextDelete {
         ids: Vec<Stamp>,
     },
+    /// Install an `XmlElement` child at `key` in the target map. The `tag`
+    /// participates in the child's derived id, so a concurrent create of the
+    /// same key with a different tag is a distinct identity the slot's LWW
+    /// resolves — a retag is a replace, never an in-place mutation.
+    XmlElementCreate {
+        key: Vec<u8>,
+        tag: Vec<u8>,
+    },
+    /// Install a tagless `XmlFragment` child at `key` in the target map.
+    XmlFragmentCreate {
+        key: Vec<u8>,
+    },
 }
 
 impl OpKind {
@@ -108,9 +120,11 @@ impl OpKind {
         // Exhaustive with no catch-all: a new container kind must be classified
         // here or the crate does not compile — the source of truth cannot drift.
         match self {
-            OpKind::MapCreate { .. } | OpKind::ListCreate { .. } | OpKind::TextCreate { .. } => {
-                true
-            }
+            OpKind::MapCreate { .. }
+            | OpKind::ListCreate { .. }
+            | OpKind::TextCreate { .. }
+            | OpKind::XmlElementCreate { .. }
+            | OpKind::XmlFragmentCreate { .. } => true,
             OpKind::RegisterSet { .. }
             | OpKind::CounterInc { .. }
             | OpKind::CounterDec { .. }

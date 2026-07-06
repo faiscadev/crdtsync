@@ -28,6 +28,7 @@ use crate::schema::Schema;
 use crate::stamp::Stamp;
 use crate::text::Text;
 use crate::validate::Step;
+use crate::xml::{XmlElement, XmlFragment};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -106,6 +107,13 @@ pub struct Document {
     /// here across displacement: a slot re-won by a later increment resumes the
     /// same total.
     counters: HashMap<ElementId, Rc<RefCell<Counter>>>,
+    /// Every XML tree node the replica has materialised, keyed by id. An element
+    /// owns an attrs Map and a children List (also registered above under their
+    /// derived ids); a fragment owns only a children List. Retained across
+    /// displacement like every other container, so a re-won slot resumes the same
+    /// node with its attrs and children intact.
+    xml_elements: HashMap<ElementId, Rc<RefCell<XmlElement>>>,
+    xml_fragments: HashMap<ElementId, Rc<RefCell<XmlFragment>>>,
     /// Each container's parent map, for walking reachability up to the root.
     parents: HashMap<ElementId, ElementId>,
     lamport: u64,
@@ -159,6 +167,8 @@ impl Document {
             lists: HashMap::new(),
             texts: HashMap::new(),
             counters: HashMap::new(),
+            xml_elements: HashMap::new(),
+            xml_fragments: HashMap::new(),
             parents: HashMap::new(),
             lamport: 0,
             seq: 0,
@@ -628,6 +638,10 @@ impl Document {
             lists,
             texts,
             counters,
+            // No XML value reaches the state codec yet; the tree registries decode
+            // empty until the XML state codec slice wires them.
+            xml_elements: HashMap::new(),
+            xml_fragments: HashMap::new(),
             parents,
             lamport,
             seq,
@@ -876,6 +890,19 @@ impl Document {
                 OpKind::TextCreate { key } => {
                     created.insert(ElementId::derive(op.target, key, ElementKind::Text));
                 }
+                // An XML create installs a node whose attrs Map and children List
+                // are the containers a later member of the same transaction
+                // targets, so mark those reachable — not the node id itself,
+                // which no op addresses directly.
+                OpKind::XmlElementCreate { key, tag } => {
+                    let node = XmlElement::node_id(op.target, key, tag);
+                    created.insert(XmlElement::attrs_id(node));
+                    created.insert(XmlElement::children_id(node));
+                }
+                OpKind::XmlFragmentCreate { key } => {
+                    let node = XmlFragment::node_id(op.target, key);
+                    created.insert(XmlFragment::children_id(node));
+                }
                 OpKind::ListInsert { .. } => {
                     inserted.insert(op.stamp);
                 }
@@ -967,6 +994,12 @@ impl Document {
         if let Some(t) = self.texts.get(&id) {
             return Some(t.borrow().is_displaced());
         }
+        if let Some(x) = self.xml_elements.get(&id) {
+            return Some(x.borrow().is_displaced());
+        }
+        if let Some(f) = self.xml_fragments.get(&id) {
+            return Some(f.borrow().is_displaced());
+        }
         None
     }
 
@@ -1029,6 +1062,14 @@ impl Document {
                 self.create_container(target, key, stamp, Container::Text);
                 return;
             }
+            OpKind::XmlElementCreate { key, tag } => {
+                self.create_container(target, key, stamp, Container::XmlElement(tag.clone()));
+                return;
+            }
+            OpKind::XmlFragmentCreate { key } => {
+                self.create_container(target, key, stamp, Container::XmlFragment);
+                return;
+            }
             // Counter ops go through the persistent registry too, so a
             // displaced counter keeps accumulating toward its total.
             OpKind::CounterInc { key, amount } => {
@@ -1088,7 +1129,11 @@ impl Document {
         if map.borrow().is_displaced() {
             return;
         }
-        let child_id = ElementId::derive(map_id, key, kind.element_kind());
+        let child_id = match &kind {
+            Container::XmlElement(tag) => XmlElement::node_id(map_id, key, tag),
+            Container::XmlFragment => XmlFragment::node_id(map_id, key),
+            _ => ElementId::derive(map_id, key, kind.element_kind()),
+        };
         let element = self.registered_handle(child_id, kind);
         let (won, orphan) = {
             let mut m = map.borrow_mut();
@@ -1188,6 +1233,39 @@ impl Document {
                     .entry(id)
                     .or_insert_with(|| Rc::new(RefCell::new(Text::new(id)))),
             )),
+            Container::XmlElement(tag) => {
+                let handle = Rc::clone(
+                    self.xml_elements
+                        .entry(id)
+                        .or_insert_with(|| Rc::new(RefCell::new(XmlElement::new(id, tag)))),
+                );
+                // The node's attrs Map and children List are containers in their
+                // own right — register them so ops targeting them resolve, and
+                // link them to the node so reachability walks up through it.
+                let (attrs, children) = {
+                    let h = handle.borrow();
+                    (h.attrs(), h.children())
+                };
+                let attrs_id = XmlElement::attrs_id(id);
+                let children_id = XmlElement::children_id(id);
+                self.maps.entry(attrs_id).or_insert(attrs);
+                self.lists.entry(children_id).or_insert(children);
+                self.parents.insert(attrs_id, id);
+                self.parents.insert(children_id, id);
+                Element::XmlElement(handle)
+            }
+            Container::XmlFragment => {
+                let handle = Rc::clone(
+                    self.xml_fragments
+                        .entry(id)
+                        .or_insert_with(|| Rc::new(RefCell::new(XmlFragment::new(id)))),
+                );
+                let children = handle.borrow().children();
+                let children_id = XmlFragment::children_id(id);
+                self.lists.entry(children_id).or_insert(children);
+                self.parents.insert(children_id, id);
+                Element::XmlFragment(handle)
+            }
         }
     }
 }
@@ -1200,20 +1278,25 @@ enum CounterDelta {
     Dec(u32),
 }
 
-/// The container kinds a create op installs.
-#[derive(Clone, Copy)]
+/// The container kinds a create op installs. An `XmlElement` carries its tag,
+/// which folds into the child's derived id.
+#[derive(Clone)]
 enum Container {
     Map,
     List,
     Text,
+    XmlElement(Vec<u8>),
+    XmlFragment,
 }
 
 impl Container {
-    fn element_kind(self) -> ElementKind {
+    fn element_kind(&self) -> ElementKind {
         match self {
             Container::Map => ElementKind::Map,
             Container::List => ElementKind::List,
             Container::Text => ElementKind::Text,
+            Container::XmlElement(_) => ElementKind::XmlElement,
+            Container::XmlFragment => ElementKind::XmlFragment,
         }
     }
 }
@@ -1501,6 +1584,55 @@ impl<'a> MapCursor<'a> {
             text_id,
         }
     }
+
+    /// Descend into an `XmlElement` at `key` with `tag`, creating it if absent.
+    /// The tag is part of the node's identity, so a different tag at the same key
+    /// is a different element.
+    pub fn xml_element(&mut self, key: &[u8], tag: &[u8]) -> XmlCursor<'_> {
+        self.doc.emit(
+            self.map_id,
+            OpKind::XmlElementCreate {
+                key: key.to_vec(),
+                tag: tag.to_vec(),
+            },
+        );
+        XmlCursor {
+            doc: self.doc,
+            attrs_id: XmlElement::attrs_id(XmlElement::node_id(self.map_id, key, tag)),
+        }
+    }
+
+    /// Descend into an `XmlFragment` at `key`, creating it if absent. A fragment
+    /// is tagless and has no attrs — only a children sequence.
+    pub fn xml_fragment(&mut self, key: &[u8]) -> XmlFragmentCursor<'_> {
+        self.doc
+            .emit(self.map_id, OpKind::XmlFragmentCreate { key: key.to_vec() });
+        XmlFragmentCursor { doc: self.doc }
+    }
+}
+
+/// A cursor over one `XmlElement`. [`attrs`](Self::attrs) descends into its attrs
+/// Map; the children sequence arrives in a later slice.
+pub struct XmlCursor<'a> {
+    doc: &'a mut Document,
+    attrs_id: ElementId,
+}
+
+impl XmlCursor<'_> {
+    /// A cursor over this element's attrs Map, holding any CRDT values.
+    pub fn attrs(&mut self) -> MapCursor<'_> {
+        MapCursor {
+            doc: self.doc,
+            map_id: self.attrs_id,
+        }
+    }
+}
+
+/// A cursor over one `XmlFragment`. A fragment is tagless and attr-less — only a
+/// children sequence, which arrives in a later slice, so exposing no `attrs`
+/// here makes a mistaken attr write a compile error, not silent data loss.
+pub struct XmlFragmentCursor<'a> {
+    doc: &'a mut Document,
 }
 
 /// A cursor over one List in the tree.

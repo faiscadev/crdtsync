@@ -523,6 +523,11 @@ fn key_bearing_ops(key: &str) -> Vec<Op> {
         mk_op(OpKind::MapCreate { key: k() }),
         mk_op(OpKind::ListCreate { key: k() }),
         mk_op(OpKind::TextCreate { key: k() }),
+        mk_op(OpKind::XmlElementCreate {
+            key: k(),
+            tag: b"div".to_vec(),
+        }),
+        mk_op(OpKind::XmlFragmentCreate { key: k() }),
     ]
 }
 

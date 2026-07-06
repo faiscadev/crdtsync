@@ -44,18 +44,30 @@ impl XmlElement {
         Self {
             id,
             tag,
-            attrs: Rc::new(RefCell::new(Map::new(ElementId::derive(
-                id,
-                ATTRS_KEY,
-                ElementKind::Map,
-            )))),
-            children: Rc::new(RefCell::new(List::new(ElementId::derive(
-                id,
-                CHILDREN_KEY,
-                ElementKind::List,
-            )))),
+            attrs: Rc::new(RefCell::new(Map::new(Self::attrs_id(id)))),
+            children: Rc::new(RefCell::new(List::new(Self::children_id(id)))),
             displaced: Cell::new(false),
         }
+    }
+
+    /// The id an element takes when created at `key` in a parent map with `tag`.
+    /// The tag folds into the id, so a concurrent same-key create with a
+    /// different tag is a distinct identity the slot's LWW resolves — a retag is
+    /// a replace, never an in-place mutation.
+    pub fn node_id(parent: ElementId, key: &[u8], tag: &[u8]) -> ElementId {
+        let slot = ElementId::derive(parent, key, ElementKind::XmlElement);
+        ElementId::derive(slot, tag, ElementKind::XmlElement)
+    }
+
+    /// The id of the attrs Map an element with id `id` owns — derived, so every
+    /// replica agrees on it without storing it.
+    pub fn attrs_id(id: ElementId) -> ElementId {
+        ElementId::derive(id, ATTRS_KEY, ElementKind::Map)
+    }
+
+    /// The id of the children List an element with id `id` owns.
+    pub fn children_id(id: ElementId) -> ElementId {
+        ElementId::derive(id, CHILDREN_KEY, ElementKind::List)
     }
 
     pub fn id(&self) -> ElementId {
@@ -96,12 +108,19 @@ impl XmlElement {
         }
     }
 
+    /// Displace the node and its halves together — a displaced subtree's attrs
+    /// Map and children List read displaced too, so reachability through the
+    /// shared registry handles stays consistent.
     pub fn displace(&self) {
         self.displaced.set(true);
+        self.attrs.borrow().displace();
+        self.children.borrow().displace();
     }
 
     pub fn reinstate(&self) {
         self.displaced.set(false);
+        self.attrs.borrow().reinstate();
+        self.children.borrow().reinstate();
     }
 
     pub fn is_displaced(&self) -> bool {
@@ -117,17 +136,24 @@ pub struct XmlFragment {
 }
 
 impl XmlFragment {
+    /// The id a fragment takes when created at `key` in a parent map. A fragment
+    /// is tagless, so nothing folds into the derivation.
+    pub fn node_id(parent: ElementId, key: &[u8]) -> ElementId {
+        ElementId::derive(parent, key, ElementKind::XmlFragment)
+    }
+
     /// A fresh, empty fragment. Its children List id derives from `id`.
     pub fn new(id: ElementId) -> Self {
         Self {
             id,
-            children: Rc::new(RefCell::new(List::new(ElementId::derive(
-                id,
-                CHILDREN_KEY,
-                ElementKind::List,
-            )))),
+            children: Rc::new(RefCell::new(List::new(Self::children_id(id)))),
             displaced: Cell::new(false),
         }
+    }
+
+    /// The id of the children List a fragment with id `id` owns.
+    pub fn children_id(id: ElementId) -> ElementId {
+        ElementId::derive(id, CHILDREN_KEY, ElementKind::List)
     }
 
     pub fn id(&self) -> ElementId {
@@ -153,10 +179,12 @@ impl XmlFragment {
 
     pub fn displace(&self) {
         self.displaced.set(true);
+        self.children.borrow().displace();
     }
 
     pub fn reinstate(&self) {
         self.displaced.set(false);
+        self.children.borrow().reinstate();
     }
 
     pub fn is_displaced(&self) -> bool {

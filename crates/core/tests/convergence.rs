@@ -43,6 +43,9 @@ impl Rng {
 const KEYS: &[&[u8]] = &[b"a", b"b", b"c"];
 /// Sub-slots inside a nested map.
 const SUBKEYS: &[&[u8]] = &[b"x", b"y"];
+/// Tags an xml-element edit picks from — a small set so concurrent creates at
+/// one key collide on tag, exercising the retag-is-replace identity split.
+const TAGS: &[&[u8]] = &[b"div", b"span"];
 
 fn key(rng: &mut Rng) -> &'static [u8] {
     KEYS[rng.below(KEYS.len())]
@@ -73,7 +76,7 @@ fn text_len(d: &Document, k: &[u8]) -> usize {
 /// real removals; on the peers the same op waits for its target to arrive.
 fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
     let k = key(rng);
-    match rng.below(15) {
+    match rng.below(17) {
         0 => d.transact(|tx| tx.register(k, Scalar::Int(rng_val(rng)))),
         1 => d.transact(|tx| tx.inc(k, 1 + rng.below(4) as u32)),
         2 => d.transact(|tx| tx.dec(k, 1 + rng.below(4) as u32)),
@@ -123,6 +126,16 @@ fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
             let ssk = subkey(rng);
             d.transact(|tx| tx.map(k).map(sk).inc(ssk, 1 + rng.below(4) as u32))
         }
+        14 => {
+            // Create an xml element and set one attr through its reused Map.
+            let tag = TAGS[rng.below(TAGS.len())];
+            let sk = subkey(rng);
+            let v = rng_val(rng);
+            d.transact(|tx| tx.xml_element(k, tag).attrs().register(sk, Scalar::Int(v)))
+        }
+        15 => d.transact(|tx| {
+            tx.xml_fragment(k);
+        }),
         _ => d.transact(|tx| tx.map(k).set(subkey(rng), Scalar::Bool(true))),
     }
 }
