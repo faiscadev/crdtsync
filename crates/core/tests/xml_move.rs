@@ -346,6 +346,61 @@ fn a_concurrent_delete_wins_over_a_move() {
     assert_eq!(t, "frag(b())", "only b should remain");
 }
 
+#[test]
+fn a_moved_tree_survives_a_snapshot() {
+    // The move log persists: a replica rebuilt from a snapshot renders the moved
+    // tree, not the pre-move one, and a further move still converges.
+    let mut src = Document::new(cid(1));
+    let (_build, _a, b_id, x_id) = frag_with_a_x_b(&mut src);
+    src.transact(|tx| tx.move_xml(x_id, b_id, 0));
+    assert_eq!(tree(&src, b"doc"), "frag(a(),b(x(grand())))");
+
+    let bytes = src.encode_state();
+    let restored = Document::decode_state(&bytes).unwrap();
+    assert_eq!(tree(&restored, b"doc"), "frag(a(),b(x(grand())))");
+
+    // The reloaded replica encodes identically (settled state round-trips).
+    assert_eq!(restored.encode_state(), bytes, "re-encode diverged");
+}
+
+#[test]
+fn a_snapshot_of_a_deleted_moved_node_stays_deleted() {
+    // A node moved on one replica and deleted on another converges to gone; a
+    // snapshot of that state must stay gone — the deleted node's tombstoned
+    // placement (stamp retained, value dropped) is stored explicitly, so the fold
+    // still hides every placement after a reload.
+    let mut base = Document::new(cid(1));
+    let mut x_id = zero_id();
+    let mut b_id = zero_id();
+    let build = base.transact(|tx| {
+        let mut frag = tx.xml_fragment(b"doc");
+        let mut kids = frag.children();
+        let x = kids.insert_element(0, b"x");
+        x_id = x.id();
+        let b = kids.insert_element(1, b"b");
+        b_id = b.id();
+    });
+
+    let mut r1 = Document::new(cid(2));
+    let mut r2 = Document::new(cid(3));
+    apply_all(&mut r1, &build);
+    apply_all(&mut r2, &build);
+    let del = r1.transact(|tx| tx.xml_fragment(b"doc").children().delete(0)); // delete x
+    let mv = r2.transact(|tx| tx.move_xml(x_id, b_id, 0)); // move x under b
+    apply_all(&mut r1, &mv);
+    apply_all(&mut r2, &del);
+    assert_eq!(tree(&r1, b"doc"), "frag(b())");
+
+    let bytes = r1.encode_state();
+    let restored = Document::decode_state(&bytes).unwrap();
+    assert_eq!(
+        tree(&restored, b"doc"),
+        "frag(b())",
+        "deleted move resurrected"
+    );
+    assert_eq!(restored.encode_state(), bytes, "re-encode diverged");
+}
+
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {

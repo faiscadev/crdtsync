@@ -106,6 +106,13 @@ impl TreeMoves {
         self.log.len()
     }
 
+    /// Every recorded move as `(stamp, child, parent)`, in stamp order — what the
+    /// state codec persists so a reloaded replica replays the same log (the base
+    /// edges are re-derived from the creates, not stored).
+    pub fn log(&self) -> impl Iterator<Item = (Stamp, ElementId, ElementId)> + '_ {
+        self.log.iter().map(|op| (op.stamp, op.child, op.parent))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.log.is_empty()
     }
