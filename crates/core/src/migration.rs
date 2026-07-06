@@ -144,7 +144,9 @@ fn op_key(op: &Op) -> Option<&[u8]> {
         | OpKind::MapDelete { key }
         | OpKind::MapCreate { key }
         | OpKind::ListCreate { key }
-        | OpKind::TextCreate { key } => Some(key),
+        | OpKind::TextCreate { key }
+        | OpKind::XmlElementCreate { key, .. }
+        | OpKind::XmlFragmentCreate { key } => Some(key),
         OpKind::ListInsert { .. }
         | OpKind::ListDelete { .. }
         | OpKind::TextInsert { .. }

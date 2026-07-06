@@ -44,18 +44,21 @@ impl XmlElement {
         Self {
             id,
             tag,
-            attrs: Rc::new(RefCell::new(Map::new(ElementId::derive(
-                id,
-                ATTRS_KEY,
-                ElementKind::Map,
-            )))),
-            children: Rc::new(RefCell::new(List::new(ElementId::derive(
-                id,
-                CHILDREN_KEY,
-                ElementKind::List,
-            )))),
+            attrs: Rc::new(RefCell::new(Map::new(Self::attrs_id(id)))),
+            children: Rc::new(RefCell::new(List::new(Self::children_id(id)))),
             displaced: Cell::new(false),
         }
+    }
+
+    /// The id of the attrs Map an element with id `id` owns — derived, so every
+    /// replica agrees on it without storing it.
+    pub fn attrs_id(id: ElementId) -> ElementId {
+        ElementId::derive(id, ATTRS_KEY, ElementKind::Map)
+    }
+
+    /// The id of the children List an element with id `id` owns.
+    pub fn children_id(id: ElementId) -> ElementId {
+        ElementId::derive(id, CHILDREN_KEY, ElementKind::List)
     }
 
     pub fn id(&self) -> ElementId {
@@ -96,12 +99,19 @@ impl XmlElement {
         }
     }
 
+    /// Displace the node and its halves together — a displaced subtree's attrs
+    /// Map and children List read displaced too, so reachability through the
+    /// shared registry handles stays consistent.
     pub fn displace(&self) {
         self.displaced.set(true);
+        self.attrs.borrow().displace();
+        self.children.borrow().displace();
     }
 
     pub fn reinstate(&self) {
         self.displaced.set(false);
+        self.attrs.borrow().reinstate();
+        self.children.borrow().reinstate();
     }
 
     pub fn is_displaced(&self) -> bool {
@@ -121,13 +131,14 @@ impl XmlFragment {
     pub fn new(id: ElementId) -> Self {
         Self {
             id,
-            children: Rc::new(RefCell::new(List::new(ElementId::derive(
-                id,
-                CHILDREN_KEY,
-                ElementKind::List,
-            )))),
+            children: Rc::new(RefCell::new(List::new(Self::children_id(id)))),
             displaced: Cell::new(false),
         }
+    }
+
+    /// The id of the children List a fragment with id `id` owns.
+    pub fn children_id(id: ElementId) -> ElementId {
+        ElementId::derive(id, CHILDREN_KEY, ElementKind::List)
     }
 
     pub fn id(&self) -> ElementId {
@@ -153,10 +164,12 @@ impl XmlFragment {
 
     pub fn displace(&self) {
         self.displaced.set(true);
+        self.children.borrow().displace();
     }
 
     pub fn reinstate(&self) {
         self.displaced.set(false);
+        self.children.borrow().reinstate();
     }
 
     pub fn is_displaced(&self) -> bool {

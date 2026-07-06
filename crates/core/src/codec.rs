@@ -216,6 +216,15 @@ fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
                 put_stamp(out, id);
             }
         }
+        OpKind::XmlElementCreate { key, tag } => {
+            put_u8(out, 12);
+            put_bytes(out, key);
+            put_bytes(out, tag);
+        }
+        OpKind::XmlFragmentCreate { key } => {
+            put_u8(out, 13);
+            put_bytes(out, key);
+        }
     }
 }
 
@@ -430,6 +439,11 @@ impl<'a> Cursor<'a> {
                 }
                 OpKind::TextDelete { ids }
             }
+            12 => OpKind::XmlElementCreate {
+                key: self.bytes()?,
+                tag: self.bytes()?,
+            },
+            13 => OpKind::XmlFragmentCreate { key: self.bytes()? },
             tag => {
                 return Err(DecodeError::BadTag {
                     what: "opkind",
