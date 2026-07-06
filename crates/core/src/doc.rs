@@ -19,7 +19,7 @@ use crate::codec::{
 use crate::counter::Counter;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
-use crate::list::{Anchor, List, Side};
+use crate::list::{Anchor, List};
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
 use crate::repair::{keyed_repairs, Repair, RepairId};
@@ -912,7 +912,7 @@ impl Document {
                     } else {
                         ElementKind::Text
                     };
-                    let child = ElementId::derive(op.target, &stamp_key(op.stamp), kind);
+                    let child = xml_child_id(op.target, op.stamp, kind);
                     if tag.is_some() {
                         created.insert(XmlElement::attrs_id(child));
                         created.insert(XmlElement::children_id(child));
@@ -1204,7 +1204,7 @@ impl Document {
             Some(t) => (ElementKind::XmlElement, Container::XmlElement(t)),
             None => (ElementKind::Text, Container::Text),
         };
-        let child_id = ElementId::derive(list_id, &stamp_key(stamp), kind);
+        let child_id = xml_child_id(list_id, stamp, kind);
         let element = self.registered_handle(child_id, container);
         self.parents.insert(child_id, list_id);
         list.borrow_mut().insert_at(stamp, element, anchor);
@@ -1375,6 +1375,13 @@ fn stamp_key(stamp: Stamp) -> [u8; 24] {
     b[..8].copy_from_slice(&stamp.lamport.to_le_bytes());
     b[8..].copy_from_slice(&stamp.client.as_bytes());
     b
+}
+
+/// The element id an XML sequence child takes: derived from its children List
+/// and its node stamp, so the apply path, the readiness gate, and the cursor all
+/// agree. `kind` is `XmlElement` for an element child, `Text` for a text run.
+fn xml_child_id(list_id: ElementId, stamp: Stamp, kind: ElementKind) -> ElementId {
+    ElementId::derive(list_id, &stamp_key(stamp), kind)
 }
 
 /// How many consecutive char_ids an op consumes from its stamp. A text run
@@ -1731,43 +1738,43 @@ impl XmlChildrenCursor<'_> {
     /// The Fugue placement for inserting a child at live `index`. Falls back to
     /// the sequence head when the children List is not materialised (a losing
     /// parent), so the returned cursor is well-formed even when the insert no-ops.
-    fn place(&self, index: usize) -> Anchor {
-        self.doc
-            .lists
-            .get(&self.list_id)
-            .map(|l| l.borrow().place(index))
-            .unwrap_or(Anchor {
-                parent: None,
-                side: Side::Right,
-            })
+    /// Emit an `XmlInsertChild` for a child of `kind` at live `index`, returning
+    /// the child's derived id. Emits nothing when the children List is not
+    /// materialised — an op the author never applied would diverge a peer that
+    /// has the List — so a would-be child id is returned with no op behind it.
+    fn insert_child(&mut self, index: usize, tag: Option<Vec<u8>>, kind: ElementKind) -> ElementId {
+        let anchor = match self.doc.lists.get(&self.list_id) {
+            Some(list) => list.borrow().place(index),
+            None => {
+                let zero = Stamp {
+                    lamport: 0,
+                    client: ClientId::from_bytes([0u8; 16]),
+                };
+                return xml_child_id(self.list_id, zero, kind);
+            }
+        };
+        let stamp = self
+            .doc
+            .emit_stamped(self.list_id, OpKind::XmlInsertChild { tag, anchor });
+        xml_child_id(self.list_id, stamp, kind)
     }
 
     /// Insert an `XmlElement` child with `tag` at `index`, returning a cursor over
     /// the new child.
     pub fn insert_element(&mut self, index: usize, tag: &[u8]) -> XmlCursor<'_> {
-        let anchor = self.place(index);
-        let stamp = self.doc.emit_stamped(
-            self.list_id,
-            OpKind::XmlInsertChild {
-                tag: Some(tag.to_vec()),
-                anchor,
-            },
-        );
+        let xml_id = self.insert_child(index, Some(tag.to_vec()), ElementKind::XmlElement);
         XmlCursor {
             doc: self.doc,
-            xml_id: ElementId::derive(self.list_id, &stamp_key(stamp), ElementKind::XmlElement),
+            xml_id,
         }
     }
 
     /// Insert a `Text` child (a text run) at `index`, returning a cursor over it.
     pub fn insert_text(&mut self, index: usize) -> TextCursor<'_> {
-        let anchor = self.place(index);
-        let stamp = self
-            .doc
-            .emit_stamped(self.list_id, OpKind::XmlInsertChild { tag: None, anchor });
+        let text_id = self.insert_child(index, None, ElementKind::Text);
         TextCursor {
             doc: self.doc,
-            text_id: ElementId::derive(self.list_id, &stamp_key(stamp), ElementKind::Text),
+            text_id,
         }
     }
 
