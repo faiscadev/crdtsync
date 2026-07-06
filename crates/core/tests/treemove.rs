@@ -170,6 +170,20 @@ fn concurrent_cycle_resolves_deterministically() {
 }
 
 #[test]
+fn edges_are_yielded_in_a_deterministic_order() {
+    // Insert several children out of id order; edges() must come back sorted by
+    // child so the document layer serializes identically on every replica.
+    let mut t = TreeMoves::new();
+    t.apply(stamp(1, 1), node(30), node(1));
+    t.apply(stamp(2, 1), node(10), node(1));
+    t.apply(stamp(3, 1), node(20), node(1));
+    let yielded: Vec<(ElementId, ElementId)> = t.edges().collect();
+    let mut sorted = yielded.clone();
+    sorted.sort_by_key(|(c, p)| (c.as_bytes(), p.as_bytes()));
+    assert_eq!(yielded, sorted, "edges() must be deterministically ordered");
+}
+
+#[test]
 fn reapplying_a_move_is_idempotent() {
     let mut once = TreeMoves::new();
     once.apply(stamp(1, 1), node(10), node(1));

@@ -16,7 +16,7 @@
 //! This module is pure edges — the position of a child among its siblings is a
 //! Fugue concern the document layers on top; it never reaches here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::elementid::ElementId;
 use crate::stamp::Stamp;
@@ -37,8 +37,6 @@ pub struct TreeMoves {
     tree: HashMap<ElementId, ElementId>,
     /// The log, kept sorted ascending by `stamp`.
     log: Vec<LogOp>,
-    /// Applied move stamps, for idempotent replay.
-    seen: HashSet<Stamp>,
 }
 
 impl TreeMoves {
@@ -49,13 +47,15 @@ impl TreeMoves {
     /// Record a move. Returns `false` (a no-op) if this exact stamp was already
     /// applied; otherwise absorbs it in stamp order and returns `true`.
     pub fn apply(&mut self, stamp: Stamp, child: ElementId, parent: ElementId) -> bool {
-        if !self.seen.insert(stamp) {
+        // The insertion point in the stamp-ordered log doubles as the dedup
+        // probe: a stamp already present sits exactly here (stamps are unique).
+        let at = self.log.partition_point(|op| op.stamp < stamp);
+        if self.log.get(at).is_some_and(|op| op.stamp == stamp) {
             return false;
         }
         // Undo every later move, splice this one into stamp order, redo the rest.
         // The redo re-derives each move against the new intermediate tree, so a
         // move that now (or no longer) cycles is resolved consistently.
-        let at = self.log.partition_point(|op| op.stamp < stamp);
         let later: Vec<LogOp> = self.log.split_off(at);
         for op in later.iter().rev() {
             self.undo(op);
@@ -74,13 +74,17 @@ impl TreeMoves {
         self.tree.get(&child).copied()
     }
 
-    /// Every `(child, parent)` edge in the current relation, in arbitrary order.
-    pub fn edges(&self) -> impl Iterator<Item = (ElementId, ElementId)> + '_ {
-        self.tree.iter().map(|(&c, &p)| (c, p))
+    /// Every `(child, parent)` edge in the current relation, ordered by child id
+    /// so a consumer sees the same sequence on every replica — the underlying map
+    /// iterates nondeterministically.
+    pub fn edges(&self) -> impl Iterator<Item = (ElementId, ElementId)> {
+        let mut edges: Vec<(ElementId, ElementId)> =
+            self.tree.iter().map(|(&c, &p)| (c, p)).collect();
+        edges.sort_by_key(|(child, _)| child.as_bytes());
+        edges.into_iter()
     }
 
-    /// The number of recorded moves — the undo log's length, which the state
-    /// codec persists and a bound would cap.
+    /// The number of recorded moves.
     pub fn len(&self) -> usize {
         self.log.len()
     }
