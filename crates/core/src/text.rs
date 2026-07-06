@@ -157,6 +157,13 @@ impl Text {
         self.inner.resolve_position(pos)
     }
 
+    /// The live codepoint index of a [`RelativePosition`], or `None` when it is
+    /// bound to a codepoint absent from the text — an anchor whose referent has
+    /// not arrived yet — instead of clamping to a boundary.
+    pub fn resolve_position_present(&self, pos: &RelativePosition) -> Option<usize> {
+        self.inner.resolve_position_present(pos)
+    }
+
     /// Tombstone the codepoints with these char_ids. Idempotent.
     pub fn delete_ids(&mut self, ids: &[Stamp]) {
         for id in ids {

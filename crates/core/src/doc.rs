@@ -307,9 +307,9 @@ impl Document {
     /// the presence of the highest-stamped covering mark (LWW), **value** → that
     /// mark's value, **object** → the ids of every covering instance. A name the
     /// schema does not declare defaults to object (each instance kept, nothing
-    /// merged away). The result is a deterministic function of the merged set, so
-    /// it converges by construction. One [`ResolvedMark`] per covering name, name
-    /// order.
+    /// merged away). One [`ResolvedMark`] per covering name (a boolean that
+    /// resolves to off is omitted — the set holds only the marks actually on the
+    /// character), in name order.
     pub fn marks_at(&self, seq: ElementId, index: usize) -> Vec<ResolvedMark> {
         // Group the covering marks by name, keeping each one's id and payload.
         let mut by_name: HashMap<&[u8], Vec<(ElementId, &RangedEntry)>> = HashMap::new();
@@ -326,9 +326,17 @@ impl Document {
         }
         let mut out: Vec<ResolvedMark> = by_name
             .into_iter()
-            .map(|(name, covering)| ResolvedMark {
-                name: name.to_vec(),
-                state: self.combine_mark(name, &covering),
+            .filter_map(|(name, covering)| {
+                let state = self.combine_mark(name, &covering);
+                // A boolean mark resolved to off is not an active mark — omit it,
+                // so the result holds only the marks on the character.
+                if state == MarkState::Boolean(false) {
+                    return None;
+                }
+                Some(ResolvedMark {
+                    name: name.to_vec(),
+                    state,
+                })
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -362,7 +370,9 @@ impl Document {
     /// Whether the mark `e`'s span covers character `index` of sequence `seq`. A
     /// single-sequence range covers `[resolve(start), resolve(end))`; a
     /// cross-element range (its two anchors naming different sequences) is out of
-    /// scope for this read and covers nothing.
+    /// scope for this read and covers nothing. An anchor bound to a codepoint not
+    /// yet arrived (the mark applied before its span's inserts) covers nothing
+    /// until the codepoint is present — it does not collapse onto a boundary.
     fn covers(&self, e: &RangedEntry, seq: ElementId, index: usize) -> bool {
         if e.start.seq != seq || e.end.seq != seq {
             return false;
@@ -377,14 +387,15 @@ impl Document {
     }
 
     /// The live index a [`RelativePosition`] resolves to in sequence `seq`, or
-    /// `None` if `seq` names no present Text or List (an anchor whose sequence
-    /// hasn't arrived yet resolves to nothing).
+    /// `None` if `seq` names no present Text or List, or the position is bound to
+    /// a codepoint not yet in that sequence — an anchor whose sequence or referent
+    /// hasn't arrived resolves to nothing rather than a boundary.
     fn resolve_index(&self, seq: ElementId, pos: &RelativePosition) -> Option<usize> {
         if let Some(t) = self.texts.get(&seq) {
-            return Some(t.borrow().resolve_position(pos));
+            return t.borrow().resolve_position_present(pos);
         }
         if let Some(l) = self.lists.get(&seq) {
-            return Some(l.borrow().resolve_position(pos));
+            return l.borrow().resolve_position_present(pos);
         }
         None
     }

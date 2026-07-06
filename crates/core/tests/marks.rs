@@ -386,3 +386,75 @@ fn random_orderings_converge() {
         assert_eq!(fingerprint(&d), expect, "seed {seed} diverged");
     }
 }
+
+#[test]
+fn a_mark_whose_anchor_chars_have_not_arrived_covers_nothing() {
+    // A RangedCreate is accept-and-store — a mark can apply before the inserts
+    // that carry its span's codepoints. Until those codepoints arrive its anchors
+    // cannot resolve, so it covers nothing; it must not collapse onto a boundary
+    // and paint the whole current text.
+    let mut author = Document::new(cid(1));
+    author.set_schema(crdtsync_core::schema::Schema::parse(SCHEMA).unwrap());
+    let ins_hello = author.transact(|tx| {
+        tx.text(b"body").insert(0, "hello");
+    });
+    let ins_world = author.transact(|tx| {
+        tx.text(b"body").insert(5, " world");
+    });
+    // Bold "world" — anchors bind to codepoints inserted by ins_world.
+    let (s, e) = span(&author, 6, 11);
+    let mark = author.transact(|tx| {
+        tx.ranged().mark(b"bold", s, e, Scalar::Bool(true));
+    });
+
+    // A replica with only "hello" plus the mark: its anchor codepoints are absent.
+    let mut r = Document::new(cid(2));
+    r.set_schema(crdtsync_core::schema::Schema::parse(SCHEMA).unwrap());
+    apply_all(&mut r, &ins_hello);
+    apply_all(&mut r, &mark);
+    for i in 0..5 {
+        assert!(
+            !is_bold(&r, i, b"bold"),
+            "char {i} not bold — the mark's span has not arrived"
+        );
+    }
+
+    // Once " world" arrives the mark resolves and covers exactly "world".
+    apply_all(&mut r, &ins_world);
+    for i in 0..6 {
+        assert!(!is_bold(&r, i, b"bold"), "char {i} still not bold");
+    }
+    for i in 6..11 {
+        assert!(is_bold(&r, i, b"bold"), "char {i} now bold");
+    }
+}
+
+#[test]
+fn a_removed_boolean_mark_is_absent_from_the_active_set() {
+    // marks_at yields only the marks on a character: a boolean whose winning
+    // range is a remove is omitted entirely, not surfaced as Boolean(false), so a
+    // consumer keying on the name's presence never renders removed formatting.
+    let (base, build) = doc_with_body(1, "hello world");
+    let (s, e) = span(&base, 0, 5);
+    let (s2, e2) = span(&base, 0, 5);
+
+    let mut r = Document::new(cid(2));
+    r.set_schema(crdtsync_core::schema::Schema::parse(SCHEMA).unwrap());
+    apply_all(&mut r, &build);
+
+    let add = r.transact(|tx| {
+        tx.ranged().mark(b"bold", s, e, Scalar::Bool(true));
+    });
+    apply_all(&mut r, &add);
+    assert!(is_bold(&r, 2, b"bold"), "bold on before the remove");
+
+    // A later remove out-stamps the add on the same replica.
+    let remove = r.transact(|tx| {
+        tx.ranged().mark(b"bold", s2, e2, Scalar::Bool(false));
+    });
+    apply_all(&mut r, &remove);
+    assert!(
+        r.marks_at(text_id(&r), 2).iter().all(|m| m.name != b"bold"),
+        "a removed boolean mark is absent from the active set, not present-as-false"
+    );
+}
