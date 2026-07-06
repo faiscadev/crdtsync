@@ -30,6 +30,7 @@ pub mod list;
 pub mod map;
 pub mod register;
 pub mod text;
+pub mod treemove;
 pub mod xml;
 
 pub mod client;
