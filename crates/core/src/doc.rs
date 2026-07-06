@@ -1369,7 +1369,10 @@ fn handles_eq(a: &Element, b: &Element) -> bool {
 }
 
 /// A stamp rendered as derivation-key bytes, so a sequence child's element id
-/// derives deterministically from its node stamp.
+/// derives deterministically from its node stamp. This is a hash input for
+/// [`ElementId::derive`], not a wire encoding — it only has to be a stable
+/// injective function of the stamp, so it is deliberately independent of the
+/// codec's stamp layout and need not track it.
 fn stamp_key(stamp: Stamp) -> [u8; 24] {
     let mut b = [0u8; 24];
     b[..8].copy_from_slice(&stamp.lamport.to_le_bytes());
@@ -1735,13 +1738,13 @@ pub struct XmlChildrenCursor<'a> {
 }
 
 impl XmlChildrenCursor<'_> {
-    /// The Fugue placement for inserting a child at live `index`. Falls back to
-    /// the sequence head when the children List is not materialised (a losing
-    /// parent), so the returned cursor is well-formed even when the insert no-ops.
     /// Emit an `XmlInsertChild` for a child of `kind` at live `index`, returning
     /// the child's derived id. Emits nothing when the children List is not
     /// materialised — an op the author never applied would diverge a peer that
     /// has the List — so a would-be child id is returned with no op behind it.
+    /// (That branch is unreachable through the public API: a cursor is only
+    /// handed out for a List a create already registered; it is a defensive
+    /// placeholder, not a live path.)
     fn insert_child(&mut self, index: usize, tag: Option<Vec<u8>>, kind: ElementKind) -> ElementId {
         let anchor = match self.doc.lists.get(&self.list_id) {
             Some(list) => list.borrow().place(index),
