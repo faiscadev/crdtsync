@@ -33,15 +33,28 @@ struct LogOp {
 /// The lamport-ordered move log and the parent relation it folds to.
 #[derive(Default)]
 pub struct TreeMoves {
-    /// Every node's current parent. A node absent here is a root (or unmoved).
+    /// A moved node's overriding parent — an entry only while a move governs it.
     tree: HashMap<ElementId, ElementId>,
-    /// The log, kept sorted ascending by `stamp`.
+    /// The static parent every node was *created* under. It never changes (a
+    /// create is permanent), so it is not in the log; it is the fallback parent
+    /// when no move governs a node, and it lets the cycle check see the whole
+    /// tree, not only the moved edges. A node absent from both maps is a root.
+    base: HashMap<ElementId, ElementId>,
+    /// The log, kept sorted ascending by `stamp`. Holds moves only — base edges
+    /// are re-derived from the creates on the way in.
     log: Vec<LogOp>,
 }
 
 impl TreeMoves {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the parent a node was created under. Idempotent — a node's birth
+    /// parent is fixed — and never undone, so it anchors the tree that both the
+    /// fallback parent and the cycle check walk.
+    pub fn set_base(&mut self, child: ElementId, parent: ElementId) {
+        self.base.entry(child).or_insert(parent);
     }
 
     /// Record a move. Returns `false` (a no-op) if this exact stamp was already
@@ -69,9 +82,13 @@ impl TreeMoves {
         true
     }
 
-    /// The current parent of `child`, or `None` if it is a root / never moved.
+    /// The current effective parent of `child`: its move-overriding parent if one
+    /// governs it, else the parent it was created under, else `None` (a root).
     pub fn parent_of(&self, child: ElementId) -> Option<ElementId> {
-        self.tree.get(&child).copied()
+        self.tree
+            .get(&child)
+            .or_else(|| self.base.get(&child))
+            .copied()
     }
 
     /// Every `(child, parent)` edge in the current relation, ordered by child id
@@ -122,15 +139,17 @@ impl TreeMoves {
         }
     }
 
-    /// Whether `a` is an ancestor of `b` in the current tree — walk `b` upward.
-    /// The tree is an invariant-acyclic forest, so the walk terminates; a length
-    /// guard makes it total even against a corrupt relation.
+    /// Whether `a` is an ancestor of `b` in the effective tree — walk `b` upward
+    /// through move-overriding and created parents alike, so a move under a node's
+    /// *created* descendant is caught as a cycle, not only a move under a moved
+    /// one. The tree is an invariant-acyclic forest, so the walk terminates; a
+    /// length guard over the node count makes it total against a corrupt relation.
     fn is_ancestor(&self, a: ElementId, b: ElementId) -> bool {
         let mut cur = b;
-        for _ in 0..=self.tree.len() {
-            match self.tree.get(&cur) {
-                Some(&p) if p == a => return true,
-                Some(&p) => cur = p,
+        for _ in 0..=self.tree.len() + self.base.len() {
+            match self.parent_of(cur) {
+                Some(p) if p == a => return true,
+                Some(p) => cur = p,
                 None => return false,
             }
         }

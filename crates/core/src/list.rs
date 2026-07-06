@@ -82,9 +82,20 @@ struct Node {
     parent: Option<Stamp>,
     side: Side,
     tombstone: bool,
+    /// Suppressed by a tree move: the node still anchors the Fugue tree but a live
+    /// read skips it, because the element it holds now renders under a different
+    /// parent. Unlike a tombstone this is reversible — the document sets it from
+    /// the move-log fold, so an undo-and-replay can re-instate the placement.
+    moved_away: bool,
 }
 
 impl Node {
+    /// Whether a live read skips this node — deleted, or moved under another
+    /// parent. Fugue positioning still keeps it (it anchors later inserts).
+    fn hidden(&self) -> bool {
+        self.tombstone || self.moved_away
+    }
+
     fn deep_clone(&self) -> Self {
         Self {
             id: self.id,
@@ -92,6 +103,7 @@ impl Node {
             parent: self.parent,
             side: self.side,
             tombstone: self.tombstone,
+            moved_away: self.moved_away,
         }
     }
 }
@@ -285,6 +297,7 @@ impl List {
                 parent: anchor.parent,
                 side: anchor.side,
                 tombstone: false,
+                moved_away: false,
             };
             if nodes.insert(node_id, node).is_some() {
                 return Err(DecodeError::BadTag {
@@ -347,6 +360,7 @@ impl List {
                     parent,
                     side,
                     tombstone: true,
+                    moved_away: false,
                 };
                 if nodes.insert(node_id, node).is_some() {
                     return Err(DecodeError::BadTag {
@@ -403,7 +417,7 @@ impl List {
     }
 
     pub fn len(&self) -> usize {
-        self.nodes.values().filter(|n| !n.tombstone).count()
+        self.nodes.values().filter(|n| !n.hidden()).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -432,7 +446,7 @@ impl List {
     pub(crate) fn live_values(&self) -> impl Iterator<Item = &Element> {
         self.nodes
             .values()
-            .filter(|n| !n.tombstone)
+            .filter(|n| !n.hidden())
             .map(|n| &n.value)
     }
 
@@ -470,8 +484,18 @@ impl List {
                 parent: anchor.parent,
                 side: anchor.side,
                 tombstone: false,
+                moved_away: false,
             },
         );
+    }
+
+    /// Suppress or re-instate a node's placement under a tree move. Idempotent and
+    /// reversible — the document recomputes it from the move-log fold; positioning
+    /// is untouched.
+    pub(crate) fn set_moved_away(&mut self, id: Stamp, away: bool) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.moved_away = away;
+        }
     }
 
     /// The id of the live node at `index`, if any.
@@ -679,11 +703,11 @@ impl List {
         out
     }
 
-    /// Live nodes in sequence order.
+    /// Live nodes in sequence order — tombstoned and moved-away nodes skipped.
     fn live_order(&self) -> Vec<Stamp> {
         self.tree_order()
             .into_iter()
-            .filter(|s| !self.nodes[s].tombstone)
+            .filter(|s| !self.nodes[s].hidden())
             .collect()
     }
 
@@ -696,7 +720,7 @@ impl List {
                 boundary = k;
                 break;
             }
-            if !self.nodes[s].tombstone {
+            if !self.nodes[s].hidden() {
                 live += 1;
             }
         }
