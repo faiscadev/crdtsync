@@ -28,6 +28,7 @@ pub struct Schema {
     version: i64,
     root: String,
     types: Vec<(String, TypeDef)>,
+    marks: Vec<(String, MarkDef)>,
     awareness: Vec<(String, AwarenessEntry)>,
     auth: Auth,
     auto_version: Vec<AutoVersion>,
@@ -127,6 +128,42 @@ pub struct AwarenessEntry {
     /// Coalesce inbound updates arriving within this many milliseconds,
     /// keeping only the latest. `None` means no server-side throttle.
     pub throttle: Option<u64>,
+}
+
+/// The declared merge semantics of one mark name. A mark is a convention over a
+/// `RangedElement`; this declaration tells the read model how concurrent marks of
+/// this name combine over a character, and whether the mark grows when text is
+/// inserted at its boundary (the read model applies `expand` as the gravity of the
+/// range's anchors). The value shape a `Value` / `Object` mark carries is a later
+/// check-time concern, not modelled here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkDef {
+    pub flavor: MarkFlavor,
+    pub expand: MarkExpand,
+}
+
+/// How concurrent marks of one name merge over a character.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkFlavor {
+    /// Presence only: concurrent add + add is present; add + remove on the same
+    /// span resolves last-writer-wins by stamp (bold, italic).
+    Boolean,
+    /// A carried value, last-writer-wins on conflict (a link's href).
+    Value,
+    /// Each instance independent — no merging across instances, overlapping marks
+    /// all coexist (comments).
+    Object,
+}
+
+/// Whether a mark grows to include text inserted at its boundary — the gravity of
+/// its start / end anchor. `Both` grows either side (bold), `None` neither (link),
+/// `Before` / `After` one side only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkExpand {
+    None,
+    Before,
+    After,
+    Both,
 }
 
 /// One declarative version trigger: an event or a schedule that fires a version
@@ -266,6 +303,10 @@ pub enum SchemaErrorKind {
     BadDuration,
     /// An `autoVersion` `name` template was empty.
     EmptyName,
+    /// A mark declared a `flavor` outside `boolean` / `value` / `object`.
+    UnknownFlavor,
+    /// A mark declared an `expand` outside `none` / `before` / `after` / `both`.
+    UnknownExpand,
 }
 
 /// A schema failure: a [`SchemaErrorKind`] plus the field or type name it
@@ -310,6 +351,8 @@ impl std::fmt::Display for SchemaError {
             SchemaErrorKind::UnknownEvent => "unknown autoVersion trigger event",
             SchemaErrorKind::BadDuration => "malformed autoVersion schedule duration",
             SchemaErrorKind::EmptyName => "empty autoVersion name template",
+            SchemaErrorKind::UnknownFlavor => "unknown mark flavor",
+            SchemaErrorKind::UnknownExpand => "unknown mark expand direction",
         };
         write!(f, "{what}: {}", self.at)
     }
@@ -357,6 +400,16 @@ impl Schema {
             .iter()
             .find(|(k, _)| k == kind)
             .map(|(_, e)| e)
+    }
+
+    /// The declared mark names and their merge semantics, in declaration order.
+    pub fn marks(&self) -> &[(String, MarkDef)] {
+        &self.marks
+    }
+
+    /// The merge semantics declared for mark `name`, if any.
+    pub fn mark(&self, name: &str) -> Option<&MarkDef> {
+        self.marks.iter().find(|(n, _)| n == name).map(|(_, d)| d)
     }
 
     /// The static role-based access defaults (`@auth`).
@@ -421,6 +474,11 @@ impl Schema {
             types.push((type_name.clone(), parse_type_def(def, type_name)?));
         }
 
+        let marks = match json.get("marks") {
+            None => Vec::new(),
+            Some(m) => parse_marks(m)?,
+        };
+
         let awareness = match json.get("awareness") {
             None => Vec::new(),
             Some(a) => parse_awareness(a)?,
@@ -441,6 +499,7 @@ impl Schema {
             version,
             root,
             types,
+            marks,
             awareness,
             auth,
             auto_version,
@@ -580,6 +639,59 @@ fn parse_awareness(json: &Json) -> Result<Vec<(String, AwarenessEntry)>, SchemaE
         let ttl = count_field(entry, "ttl", &ctx)?;
         let throttle = count_field(entry, "throttle", &ctx)?;
         out.push((kind.clone(), AwarenessEntry { ttl, throttle }));
+    }
+    Ok(out)
+}
+
+/// Parse the `marks` block: an object mapping each mark name to its merge
+/// `flavor` (required) and anchor `expand` (optional, `none` by default). Order is
+/// preserved. A mark's value shape is a later check-time concern, not parsed here.
+fn parse_marks(json: &Json) -> Result<Vec<(String, MarkDef)>, SchemaError> {
+    let obj = json
+        .as_object()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, "marks"))?;
+    let mut out = Vec::with_capacity(obj.len());
+    for (name, def) in obj {
+        let ctx = at("marks", name);
+        let def_obj = def
+            .as_object()
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, ctx.clone()))?;
+        reject_unknown_fields(def_obj, &["flavor", "expand"], &ctx)?;
+
+        let flavor = match required_str(def, "flavor", &ctx)? {
+            "boolean" => MarkFlavor::Boolean,
+            "value" => MarkFlavor::Value,
+            "object" => MarkFlavor::Object,
+            _ => {
+                return Err(SchemaError::new(
+                    SchemaErrorKind::UnknownFlavor,
+                    at(&ctx, "flavor"),
+                ))
+            }
+        };
+
+        let expand = match def.get("expand") {
+            None => MarkExpand::None,
+            Some(e) => {
+                let s = e.as_str().ok_or_else(|| {
+                    SchemaError::new(SchemaErrorKind::WrongType, at(&ctx, "expand"))
+                })?;
+                match s {
+                    "none" => MarkExpand::None,
+                    "before" => MarkExpand::Before,
+                    "after" => MarkExpand::After,
+                    "both" => MarkExpand::Both,
+                    _ => {
+                        return Err(SchemaError::new(
+                            SchemaErrorKind::UnknownExpand,
+                            at(&ctx, "expand"),
+                        ))
+                    }
+                }
+            }
+        };
+
+        out.push((name.clone(), MarkDef { flavor, expand }));
     }
     Ok(out)
 }
