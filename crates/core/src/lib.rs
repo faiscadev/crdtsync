@@ -28,6 +28,7 @@ pub mod counter;
 pub mod element;
 pub mod list;
 pub mod map;
+pub mod marks;
 pub mod ranged;
 pub mod register;
 pub mod text;
@@ -55,6 +56,7 @@ pub use host::Host;
 pub use json::Json;
 pub use list::{Anchor, List, Side};
 pub use map::Map;
+pub use marks::{MarkState, ResolvedMark};
 pub use op::{Op, OpId, OpKind, Tx, TxId};
 pub use protocol::{
     decode_header, decode_message, encode_header, encode_message, Channel, ErrorCode, Message,

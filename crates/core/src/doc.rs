@@ -12,21 +12,23 @@
 //! and replays once a create restores reachability, so out-of-order delivery
 //! converges.
 
+use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, len_u32, put_bytes, put_range_anchor, put_scalar, put_stamp, put_u32,
-    put_u64, put_u8, Cursor, DecodeError,
+    decode_ops, encode_ops, len_u32, put_bytes, put_opt_bytes, put_range_anchor, put_scalar,
+    put_stamp, put_u32, put_u64, put_u8, Cursor, DecodeError,
 };
 use crate::counter::Counter;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
 use crate::list::{Anchor, List};
 use crate::map::{DecodedMap, Map, SlotValue};
+use crate::marks::{MarkState, ResolvedMark};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
 use crate::ranged::{RangeAnchor, RangedElement, RangedInit, RangedPayload};
 use crate::repair::{keyed_repairs, Repair, RepairId};
 use crate::scalar::Scalar;
-use crate::schema::Schema;
+use crate::schema::{MarkFlavor, Schema};
 use crate::stamp::Stamp;
 use crate::text::Text;
 use crate::treemove::TreeMoves;
@@ -51,7 +53,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 6;
+const STATE_VERSION: u8 = 7;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -296,6 +298,95 @@ impl Document {
     /// its sequences.
     pub fn ranged_on(&self, seq: ElementId) -> Vec<RangedElement> {
         self.sorted_view(|e| !e.tombstone && (e.start.seq == seq || e.end.seq == seq))
+    }
+
+    /// The active marks on character `index` of sequence `seq` — a read-time
+    /// computation over the annotation set, never stored. Gathers every live
+    /// same-named mark whose span covers the character and combines each name per
+    /// its schema-declared [`MarkFlavor`](crate::schema::MarkFlavor): **boolean** →
+    /// the presence of the highest-stamped covering mark (LWW), **value** → that
+    /// mark's value, **object** → the ids of every covering instance. A name the
+    /// schema does not declare defaults to object (each instance kept, nothing
+    /// merged away). The result is a deterministic function of the merged set, so
+    /// it converges by construction. One [`ResolvedMark`] per covering name, name
+    /// order.
+    pub fn marks_at(&self, seq: ElementId, index: usize) -> Vec<ResolvedMark> {
+        // Group the covering marks by name, keeping each one's id and payload.
+        let mut by_name: HashMap<&[u8], Vec<(ElementId, &RangedEntry)>> = HashMap::new();
+        for (id, e) in &self.ranged {
+            if e.tombstone {
+                continue;
+            }
+            let Some(name) = &e.name else {
+                continue;
+            };
+            if self.covers(e, seq, index) {
+                by_name.entry(name).or_default().push((*id, e));
+            }
+        }
+        let mut out: Vec<ResolvedMark> = by_name
+            .into_iter()
+            .map(|(name, covering)| ResolvedMark {
+                name: name.to_vec(),
+                state: self.combine_mark(name, &covering),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Combine the marks of one name covering a character, per the schema flavor.
+    fn combine_mark(&self, name: &[u8], covering: &[(ElementId, &RangedEntry)]) -> MarkState {
+        let flavor = std::str::from_utf8(name)
+            .ok()
+            .and_then(|n| self.schema.as_ref()?.mark(n))
+            .map(|d| d.flavor);
+        match flavor {
+            Some(MarkFlavor::Boolean) => {
+                MarkState::Boolean(lww_scalar(covering).map_or(true, scalar_is_present))
+            }
+            Some(MarkFlavor::Value) => match lww_scalar(covering) {
+                Some(value) => MarkState::Value(value.clone()),
+                None => MarkState::Value(Scalar::Null),
+            },
+            // Object, and any name the schema does not declare: every covering
+            // instance is independent, so keep the whole set (id-sorted).
+            Some(MarkFlavor::Object) | None => {
+                let mut ids: Vec<ElementId> = covering.iter().map(|(id, _)| *id).collect();
+                ids.sort_by_key(|id| id.as_bytes());
+                MarkState::Object(ids)
+            }
+        }
+    }
+
+    /// Whether the mark `e`'s span covers character `index` of sequence `seq`. A
+    /// single-sequence range covers `[resolve(start), resolve(end))`; a
+    /// cross-element range (its two anchors naming different sequences) is out of
+    /// scope for this read and covers nothing.
+    fn covers(&self, e: &RangedEntry, seq: ElementId, index: usize) -> bool {
+        if e.start.seq != seq || e.end.seq != seq {
+            return false;
+        }
+        let (Some(start), Some(end)) = (
+            self.resolve_index(seq, &e.start.pos),
+            self.resolve_index(seq, &e.end.pos),
+        ) else {
+            return false;
+        };
+        start <= index && index < end
+    }
+
+    /// The live index a [`RelativePosition`] resolves to in sequence `seq`, or
+    /// `None` if `seq` names no present Text or List (an anchor whose sequence
+    /// hasn't arrived yet resolves to nothing).
+    fn resolve_index(&self, seq: ElementId, pos: &RelativePosition) -> Option<usize> {
+        if let Some(t) = self.texts.get(&seq) {
+            return Some(t.borrow().resolve_position(pos));
+        }
+        if let Some(l) = self.lists.get(&seq) {
+            return Some(l.borrow().resolve_position(pos));
+        }
+        None
     }
 
     /// The live entries a predicate selects, viewed and ordered by id so the
@@ -632,6 +723,7 @@ impl Document {
                     put_u8(&mut out, *kind as u8);
                 }
             }
+            put_opt_bytes(&mut out, e.name.as_deref());
             put_u8(&mut out, e.tombstone as u8);
         }
 
@@ -817,6 +909,7 @@ impl Document {
                     })
                 }
             };
+            let name = cur.opt_bytes()?;
             let tombstone = match cur.u8()? {
                 0 => false,
                 1 => true,
@@ -834,6 +927,7 @@ impl Document {
                         start,
                         end,
                         payload,
+                        name,
                         tombstone,
                     },
                 )
@@ -1569,6 +1663,7 @@ impl Document {
                 start,
                 end,
                 payload,
+                name,
             } => {
                 let rid = ranged_id(stamp);
                 // Idempotent: a replayed create must not reinstall the payload or
@@ -1592,6 +1687,7 @@ impl Document {
                             start: *start,
                             end: *end,
                             payload: stored,
+                            name: name.clone(),
                             tombstone: false,
                         },
                     );
@@ -2025,6 +2121,7 @@ struct RangedEntry {
     start: RangeAnchor,
     end: RangeAnchor,
     payload: Payload,
+    name: Option<Vec<u8>>,
     tombstone: bool,
 }
 
@@ -2052,7 +2149,31 @@ impl RangedEntry {
             start: self.start,
             end: self.end,
             payload,
+            name: self.name.clone(),
         }
+    }
+}
+
+/// The scalar payload of the highest-stamped covering mark — the LWW winner for a
+/// boolean/value flavor. A covering mark with a composite payload carries no LWW
+/// stamp and is skipped (boolean/value marks author a scalar).
+fn lww_scalar<'a>(covering: &[(ElementId, &'a RangedEntry)]) -> Option<&'a Scalar> {
+    covering
+        .iter()
+        .filter_map(|(_, e)| match &e.payload {
+            Payload::Scalar { value, stamp } => Some((*stamp, value)),
+            Payload::Composite { .. } => None,
+        })
+        .max_by_key(|(stamp, _)| *stamp)
+        .map(|(_, value)| value)
+}
+
+/// A boolean mark's presence from its payload: an explicit `Bool` decides, any
+/// other scalar counts as present (the covering mark still marks the character).
+fn scalar_is_present(s: &Scalar) -> bool {
+    match s {
+        Scalar::Bool(b) => *b,
+        _ => true,
     }
 }
 
@@ -2638,24 +2759,39 @@ impl RangedCursor<'_> {
     /// `payload`. Returns its stable id — the handle to change its payload or
     /// delete it.
     pub fn create(&mut self, start: RangeAnchor, end: RangeAnchor, payload: Scalar) -> ElementId {
-        self.create_with(start, end, RangedInit::Scalar(payload))
+        self.create_with(start, end, RangedInit::Scalar(payload), None)
+    }
+
+    /// Author a mark named `name` over `start`..`end` carrying `value` — a
+    /// convention over the annotation set. A boolean mark passes `Scalar::Bool` for
+    /// presence; a value mark its value (a link's href). The read model
+    /// ([`Document::marks_at`](Document::marks_at)) combines same-named marks per
+    /// the schema's declared flavor. Returns the mark's RangedElement id.
+    pub fn mark(
+        &mut self,
+        name: &[u8],
+        start: RangeAnchor,
+        end: RangeAnchor,
+        value: Scalar,
+    ) -> ElementId {
+        self.create_with(start, end, RangedInit::Scalar(value), Some(name.to_vec()))
     }
 
     /// Create a RangedElement whose payload is a nested Map — a structured comment
     /// body, an object-mark value. Returns the RangedElement id; edit the payload
     /// through [`payload_map`](Self::payload_map).
     pub fn create_map(&mut self, start: RangeAnchor, end: RangeAnchor) -> ElementId {
-        self.create_with(start, end, RangedInit::Composite(ElementKind::Map))
+        self.create_with(start, end, RangedInit::Composite(ElementKind::Map), None)
     }
 
     /// Create a RangedElement whose payload is a nested List.
     pub fn create_list(&mut self, start: RangeAnchor, end: RangeAnchor) -> ElementId {
-        self.create_with(start, end, RangedInit::Composite(ElementKind::List))
+        self.create_with(start, end, RangedInit::Composite(ElementKind::List), None)
     }
 
     /// Create a RangedElement whose payload is a nested Text.
     pub fn create_text(&mut self, start: RangeAnchor, end: RangeAnchor) -> ElementId {
-        self.create_with(start, end, RangedInit::Composite(ElementKind::Text))
+        self.create_with(start, end, RangedInit::Composite(ElementKind::Text), None)
     }
 
     fn create_with(
@@ -2663,6 +2799,7 @@ impl RangedCursor<'_> {
         start: RangeAnchor,
         end: RangeAnchor,
         payload: RangedInit,
+        name: Option<Vec<u8>>,
     ) -> ElementId {
         let root = self.doc.root_id();
         let stamp = self.doc.emit_stamped(
@@ -2671,6 +2808,7 @@ impl RangedCursor<'_> {
                 start,
                 end,
                 payload,
+                name,
             },
         );
         ranged_id(stamp)

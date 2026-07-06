@@ -185,7 +185,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **Marks — Unit 4b — the mark read model (core)** — marks as a read-time convention over the RangedElement set (no new op, no per-char storage). A mark = a RangedElement with a `name` (new `Option<Vec<u8>>` on `RangedCreate`/`RangedElement`/`RangedEntry`; STATE_VERSION 6→7). `Document::marks_at(seq, index) -> Vec<ResolvedMark>` gathers live same-named ranges covering the char and combines per the schema flavor: **boolean** → LWW presence (by `payload_stamp`), **value** → LWW value, **object** → the id-set of covering instances (default for an unschema'd name). Span coverage resolves each anchor via `resolve_position` (`resolve(start) <= i < resolve(end)`, same-sequence); anchor gravity (Before/After) IS the expansion. `RangedCursor::mark(name, start, end, value)` authors a mark; `core::marks::{MarkState, ResolvedMark}`. `tests/marks.rs` (10): cover, LWW, object-coexist, grow/no-grow, insert-shift, snapshot, fuzz. Deferred (4b-ii): cross-element span; object composite ergonomics. Completes Unit 4. → *Marks*.
 
 ---
 

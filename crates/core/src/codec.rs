@@ -96,6 +96,17 @@ pub(crate) fn len_u32(n: usize) -> u32 {
     u32::try_from(n).expect("codec: length exceeds 4 GiB")
 }
 
+/// An optional byte string: a present-flag byte then the bytes when `Some`.
+pub(crate) fn put_opt_bytes(out: &mut Vec<u8>, b: Option<&[u8]>) {
+    match b {
+        None => put_u8(out, 0),
+        Some(b) => {
+            put_u8(out, 1);
+            put_bytes(out, b);
+        }
+    }
+}
+
 pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_u32(out, len_u32(b.len()));
     out.extend_from_slice(b);
@@ -285,11 +296,13 @@ fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
             start,
             end,
             payload,
+            name,
         } => {
             put_u8(out, 16);
             put_range_anchor(out, start);
             put_range_anchor(out, end);
             put_ranged_init(out, payload);
+            put_opt_bytes(out, name.as_deref());
         }
         OpKind::RangedSetPayload { id, payload } => {
             put_u8(out, 17);
@@ -388,6 +401,18 @@ impl<'a> Cursor<'a> {
     pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
         let len = self.u32()? as usize;
         Ok(self.take(len)?.to_vec())
+    }
+
+    /// An optional byte string written by [`put_opt_bytes`].
+    pub(crate) fn opt_bytes(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.bytes()?)),
+            tag => Err(DecodeError::BadTag {
+                what: "optional bytes present-flag",
+                tag,
+            }),
+        }
     }
 
     pub(crate) fn string(&mut self) -> Result<String, DecodeError> {
@@ -589,6 +614,7 @@ impl<'a> Cursor<'a> {
                 start: self.range_anchor()?,
                 end: self.range_anchor()?,
                 payload: self.ranged_init()?,
+                name: self.opt_bytes()?,
             },
             17 => OpKind::RangedSetPayload {
                 id: self.element_id()?,

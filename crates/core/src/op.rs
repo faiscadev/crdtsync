@@ -134,10 +134,14 @@ pub enum OpKind {
     /// are fixed at create; `payload` is the initial payload — a leaf
     /// [`Scalar`](RangedInit::Scalar) or a nested
     /// [`Composite`](RangedInit::Composite) container installed at a derived id.
+    /// `name` tags the range as a mark of that name (a convention over the
+    /// annotation set — the read model combines same-named marks per the schema
+    /// flavor); `None` is a plain, unnamed annotation.
     RangedCreate {
         start: RangeAnchor,
         end: RangeAnchor,
         payload: RangedInit,
+        name: Option<Vec<u8>>,
     },
     /// Replace a RangedElement's scalar payload, last-writer-wins by the op's
     /// stamp. A composite payload is edited through its container, not replaced,
