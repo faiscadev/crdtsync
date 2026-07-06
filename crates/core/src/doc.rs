@@ -2453,17 +2453,29 @@ impl<'a> MapCursor<'a> {
         self.doc.emit(dest_list, OpKind::XmlMove { node, anchor });
     }
 
-    /// Create a `RangedElement` in the document-level annotation set, spanning
-    /// `start`..`end` (each a `(sequence, RelativePosition)` anchor; the two may
-    /// name different sequences) with `payload`. Returns its stable id — the handle
-    /// to change its payload or delete it. Addresses the document, not this cursor's
-    /// map.
-    pub fn create_ranged(
-        &mut self,
-        start: RangeAnchor,
-        end: RangeAnchor,
-        payload: Scalar,
-    ) -> ElementId {
+    /// A cursor over the document-level RangedElement annotation set. The set is
+    /// the document's, not this map's — reachable from any cursor, it addresses
+    /// the same annotations. Kept off the map value API because a range is not a
+    /// map slot.
+    pub fn ranged(&mut self) -> RangedCursor<'_> {
+        RangedCursor { doc: self.doc }
+    }
+}
+
+/// A cursor over the document-level RangedElement annotation set: create a range,
+/// change its payload, or delete it. Its edits address the document, independent
+/// of any map — a range lives in the document's annotation set, not in the
+/// sequence it annotates.
+pub struct RangedCursor<'a> {
+    doc: &'a mut Document,
+}
+
+impl RangedCursor<'_> {
+    /// Create a `RangedElement` spanning `start`..`end` (each a `(sequence,
+    /// RelativePosition)` anchor; the two may name different sequences) with
+    /// `payload`. Returns its stable id — the handle to change its payload or
+    /// delete it.
+    pub fn create(&mut self, start: RangeAnchor, end: RangeAnchor, payload: Scalar) -> ElementId {
         let root = self.doc.root_id();
         let stamp = self.doc.emit_stamped(
             root,
@@ -2478,14 +2490,14 @@ impl<'a> MapCursor<'a> {
 
     /// Replace a RangedElement's payload (last-writer-wins). A no-op on a deleted
     /// or unknown id.
-    pub fn set_ranged_payload(&mut self, id: ElementId, payload: Scalar) {
+    pub fn set_payload(&mut self, id: ElementId, payload: Scalar) {
         let root = self.doc.root_id();
         self.doc
             .emit(root, OpKind::RangedSetPayload { id, payload });
     }
 
     /// Delete a RangedElement. Delete wins over a concurrent payload change.
-    pub fn delete_ranged(&mut self, id: ElementId) {
+    pub fn delete(&mut self, id: ElementId) {
         let root = self.doc.root_id();
         self.doc.emit(root, OpKind::RangedDelete { id });
     }

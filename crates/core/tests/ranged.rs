@@ -50,7 +50,7 @@ fn a_ranged_element_records_its_endpoints_and_payload() {
 
     let mut rid = ElementId::from_bytes([0u8; 16]);
     d.transact(|tx| {
-        rid = tx.create_ranged(
+        rid = tx.ranged().create(
             at(seq, RelativePosition::Start),
             at(seq, RelativePosition::End),
             Scalar::Bool(true),
@@ -75,7 +75,7 @@ fn a_range_may_span_two_elements() {
 
     let mut rid = ElementId::from_bytes([0u8; 16]);
     d.transact(|tx| {
-        rid = tx.create_ranged(
+        rid = tx.ranged().create(
             at(a, RelativePosition::Start),
             at(b, RelativePosition::End),
             Scalar::Null,
@@ -95,7 +95,7 @@ fn a_payload_change_is_last_writer_wins() {
     let seq = text_id(&base, b"t");
     let mut rid = ElementId::from_bytes([0u8; 16]);
     let create = base.transact(|tx| {
-        rid = tx.create_ranged(
+        rid = tx.ranged().create(
             at(seq, RelativePosition::Start),
             at(seq, RelativePosition::End),
             Scalar::Int(0),
@@ -111,8 +111,8 @@ fn a_payload_change_is_last_writer_wins() {
 
     // Concurrent payload writes off identical history: equal lamports, so the
     // higher client id (r2 = cid 3) wins the LWW tiebreak.
-    let p1 = r1.transact(|tx| tx.set_ranged_payload(rid, Scalar::Int(1)));
-    let p2 = r2.transact(|tx| tx.set_ranged_payload(rid, Scalar::Int(2)));
+    let p1 = r1.transact(|tx| tx.ranged().set_payload(rid, Scalar::Int(1)));
+    let p2 = r2.transact(|tx| tx.ranged().set_payload(rid, Scalar::Int(2)));
     apply_all(&mut r1, &p2);
     apply_all(&mut r2, &p1);
 
@@ -138,14 +138,14 @@ fn concurrent_creates_union_to_distinct_ids() {
     let mut a = ElementId::from_bytes([0u8; 16]);
     let mut b = ElementId::from_bytes([0u8; 16]);
     let c1 = r1.transact(|tx| {
-        a = tx.create_ranged(
+        a = tx.ranged().create(
             at(seq, RelativePosition::Start),
             at(seq, RelativePosition::End),
             Scalar::Int(1),
         );
     });
     let c2 = r2.transact(|tx| {
-        b = tx.create_ranged(
+        b = tx.ranged().create(
             at(seq, RelativePosition::Start),
             at(seq, RelativePosition::End),
             Scalar::Int(2),
@@ -168,7 +168,7 @@ fn a_delete_wins_over_a_concurrent_payload_change() {
     let seq = text_id(&base, b"t");
     let mut rid = ElementId::from_bytes([0u8; 16]);
     let create = base.transact(|tx| {
-        rid = tx.create_ranged(
+        rid = tx.ranged().create(
             at(seq, RelativePosition::Start),
             at(seq, RelativePosition::End),
             Scalar::Int(0),
@@ -182,8 +182,8 @@ fn a_delete_wins_over_a_concurrent_payload_change() {
         apply_all(r, &create);
     }
 
-    let del = r1.transact(|tx| tx.delete_ranged(rid));
-    let setp = r2.transact(|tx| tx.set_ranged_payload(rid, Scalar::Int(9)));
+    let del = r1.transact(|tx| tx.ranged().delete(rid));
+    let setp = r2.transact(|tx| tx.ranged().set_payload(rid, Scalar::Int(9)));
     apply_all(&mut r1, &setp);
     apply_all(&mut r2, &del);
 
@@ -203,13 +203,13 @@ fn a_payload_change_waits_for_its_create() {
     let seq = text_id(&src, b"t");
     let mut rid = ElementId::from_bytes([0u8; 16]);
     let create = src.transact(|tx| {
-        rid = tx.create_ranged(
+        rid = tx.ranged().create(
             at(seq, RelativePosition::Start),
             at(seq, RelativePosition::End),
             Scalar::Int(1),
         );
     });
-    let setp = src.transact(|tx| tx.set_ranged_payload(rid, Scalar::Int(2)));
+    let setp = src.transact(|tx| tx.ranged().set_payload(rid, Scalar::Int(2)));
 
     let mut dst = Document::new(cid(2));
     apply_all(&mut dst, &build);
@@ -235,18 +235,18 @@ fn a_snapshot_round_trips_the_annotation_set() {
     let mut keep = ElementId::from_bytes([0u8; 16]);
     let mut gone = ElementId::from_bytes([0u8; 16]);
     d.transact(|tx| {
-        keep = tx.create_ranged(
+        keep = tx.ranged().create(
             at(seq, RelativePosition::Start),
             at(seq, RelativePosition::End),
             Scalar::Int(7),
         );
-        gone = tx.create_ranged(
+        gone = tx.ranged().create(
             at(seq, RelativePosition::Start),
             at(seq, RelativePosition::End),
             Scalar::Int(8),
         );
     });
-    d.transact(|tx| tx.delete_ranged(gone));
+    d.transact(|tx| tx.ranged().delete(gone));
 
     let bytes = d.encode_state();
     let restored = Document::decode_state(&bytes).unwrap();
@@ -268,18 +268,18 @@ fn ranged_on_filters_by_sequence() {
     let b = text_id(&d, b"b");
 
     d.transact(|tx| {
-        tx.create_ranged(
+        tx.ranged().create(
             at(a, RelativePosition::Start),
             at(a, RelativePosition::End),
             Scalar::Int(1),
         );
         // A cross-element range touches both a and b.
-        tx.create_ranged(
+        tx.ranged().create(
             at(a, RelativePosition::Start),
             at(b, RelativePosition::End),
             Scalar::Int(2),
         );
-        tx.create_ranged(
+        tx.ranged().create(
             at(b, RelativePosition::Start),
             at(b, RelativePosition::End),
             Scalar::Int(3),
@@ -300,13 +300,13 @@ fn an_atomic_payload_change_waits_for_an_external_create() {
     let seq = text_id(&src, b"t");
     let mut rid = ElementId::from_bytes([0u8; 16]);
     let create = src.transact(|tx| {
-        rid = tx.create_ranged(
+        rid = tx.ranged().create(
             at(seq, RelativePosition::Start),
             at(seq, RelativePosition::End),
             Scalar::Int(1),
         );
     });
-    let setp = src.atomic_transact(|tx| tx.set_ranged_payload(rid, Scalar::Int(2)));
+    let setp = src.atomic_transact(|tx| tx.ranged().set_payload(rid, Scalar::Int(2)));
     assert!(!setp.is_empty(), "the payload change should emit an op");
 
     let mut dst = Document::new(cid(2));
@@ -360,7 +360,7 @@ fn random_orderings_converge() {
     let mut ops: Vec<Op> = Vec::new();
     for (i, d) in r.iter_mut().enumerate() {
         ops.extend(d.transact(|tx| {
-            ids[i] = tx.create_ranged(
+            ids[i] = tx.ranged().create(
                 at(seq, RelativePosition::Start),
                 at(seq, RelativePosition::End),
                 Scalar::Int(i as i64),
@@ -370,9 +370,9 @@ fn random_orderings_converge() {
     // Cross-mutations: replica 0 repays id1, replica 1 deletes id2, replica 2
     // repays id0. Authored after each replica has only its own create, so they
     // buffer against the missing ranged ids until those creates arrive.
-    ops.extend(r[0].transact(|tx| tx.set_ranged_payload(ids[1], Scalar::Int(100))));
-    ops.extend(r[1].transact(|tx| tx.delete_ranged(ids[2])));
-    ops.extend(r[2].transact(|tx| tx.set_ranged_payload(ids[0], Scalar::Int(200))));
+    ops.extend(r[0].transact(|tx| tx.ranged().set_payload(ids[1], Scalar::Int(100))));
+    ops.extend(r[1].transact(|tx| tx.ranged().delete(ids[2])));
+    ops.extend(r[2].transact(|tx| tx.ranged().set_payload(ids[0], Scalar::Int(200))));
 
     // A reference replica gets them in author order.
     let mut reference = Document::new(cid(9));
