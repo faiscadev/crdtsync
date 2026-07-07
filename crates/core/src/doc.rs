@@ -2609,16 +2609,6 @@ pub struct MapCursor<'a> {
     map_id: ElementId,
 }
 
-/// How a keyed slot descends for the path façade's contextual navigation.
-enum ChildTarget {
-    /// An `XmlElement`'s attrs Map, at the given id (the element already exists).
-    Attrs(ElementId),
-    /// A nested Map, created if absent.
-    Map,
-    /// A dead end — the slot holds an `XmlFragment`, which has no attrs.
-    DeadEnd,
-}
-
 impl<'a> MapCursor<'a> {
     /// Set a scalar directly in this map's slot.
     pub fn set(&mut self, key: &[u8], value: Scalar) {
@@ -2693,51 +2683,43 @@ impl<'a> MapCursor<'a> {
         }
     }
 
-    /// Descend into the keyed sub-namespace at `key`, or `None` if the slot is a
-    /// dead end. An existing `XmlElement` yields its attrs Map (no op — the
-    /// element already exists); an `XmlFragment` is a dead end (it has no attrs);
-    /// a Map, scalar, or absent slot yields a nested Map, created if absent (the
-    /// create-through the façade already does for plain paths). An element's
-    /// attrs and a Map are both keyed slot-holders, so the path façade descends
-    /// them uniformly — naming an element then an attr key reaches the attr
-    /// through the ordinary map value API.
-    pub fn child(&mut self, key: &[u8]) -> Option<MapCursor<'_>> {
-        match self.child_target(key) {
-            ChildTarget::Attrs(map_id) => Some(MapCursor {
+    /// Descend into the keyed sub-namespace at `key`: an existing `XmlElement`'s
+    /// attrs Map when the slot holds one (no op — the element already exists),
+    /// else a nested Map (created if absent). An element's attrs and a Map are
+    /// both keyed slot-holders, so the path façade descends them uniformly —
+    /// naming an element then an attr key reaches the attr through the ordinary
+    /// map value API. A fragment slot has no attrs; the façade filters that dead
+    /// end before descending (`path::writable`), so it never reaches here.
+    pub fn child(&mut self, key: &[u8]) -> MapCursor<'_> {
+        match self.xml_attrs_id(key) {
+            Some(map_id) => MapCursor {
                 doc: self.doc,
                 map_id,
-            }),
-            ChildTarget::Map => Some(self.map(key)),
-            ChildTarget::DeadEnd => None,
+            },
+            None => self.map(key),
         }
     }
 
     /// As [`child`](Self::child), consuming this cursor to chain a runtime-length
     /// path without nesting borrows.
-    pub fn into_child(self, key: &[u8]) -> Option<MapCursor<'a>> {
-        match self.child_target(key) {
-            ChildTarget::Attrs(map_id) => Some(MapCursor {
+    pub fn into_child(self, key: &[u8]) -> MapCursor<'a> {
+        match self.xml_attrs_id(key) {
+            Some(map_id) => MapCursor {
                 doc: self.doc,
                 map_id,
-            }),
-            ChildTarget::Map => Some(self.into_map(key)),
-            ChildTarget::DeadEnd => None,
+            },
+            None => self.into_map(key),
         }
     }
 
-    /// How the slot at `key` in this map descends — the one classification the
-    /// contextual descent branches on.
-    fn child_target(&self, key: &[u8]) -> ChildTarget {
-        let Some(map) = self.doc.maps.get(&self.map_id) else {
-            return ChildTarget::Map;
-        };
+    /// The attrs Map id of a live `XmlElement` occupying `key` in this map, if
+    /// the slot holds one — the seam the contextual descent branches on.
+    fn xml_attrs_id(&self, key: &[u8]) -> Option<ElementId> {
+        let map = self.doc.maps.get(&self.map_id)?;
         let value = map.borrow().get(key);
         match value {
-            Some(Element::XmlElement(x)) => {
-                ChildTarget::Attrs(XmlElement::attrs_id(x.borrow().id()))
-            }
-            Some(Element::XmlFragment(_)) => ChildTarget::DeadEnd,
-            _ => ChildTarget::Map,
+            Some(Element::XmlElement(x)) => Some(XmlElement::attrs_id(x.borrow().id())),
+            _ => None,
         }
     }
 
