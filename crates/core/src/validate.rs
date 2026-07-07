@@ -212,6 +212,92 @@ fn resolve_child_type<'a>(
     })
 }
 
+/// The `marks` allowlist of the XmlElement that directly contains sequence
+/// `target`, resolved by the same contextual, tag-matched descent [`validate`]
+/// walks from the root. `None` when `target` is not directly held by a
+/// schema-typed XmlElement — it sits in a map slot, a plain list, or a tagless
+/// fragment — in which case no per-type restriction applies and every mark is
+/// kept. Only an XmlElement (`tag: Some`) declares a marks allowlist; a fragment
+/// (`tag: None`) does not restrict the marks on its inline text.
+pub(crate) fn marks_allowlist<'a>(
+    doc: &Document,
+    schema: &'a Schema,
+    target: ElementId,
+) -> Option<&'a [String]> {
+    let mut visited = HashSet::new();
+    let mut stack: Vec<(Element, &'a str)> = vec![(Element::Map(doc.root()), schema.root())];
+    while let Some((element, type_name)) = stack.pop() {
+        let Some(td) = schema.type_def(type_name) else {
+            continue;
+        };
+        if matches!(element, Element::Scalar(_))
+            || expected_kind(td) != element.kind()
+            || !visited.insert(element.id())
+        {
+            continue;
+        }
+        match (td, &element) {
+            (TypeDef::Map { children }, Element::Map(m)) => {
+                let allow: HashMap<&[u8], &str> = children
+                    .iter()
+                    .map(|(s, t)| (s.as_bytes(), t.as_str()))
+                    .collect();
+                for (key, child) in m.borrow().entries() {
+                    if is_target(&child, target) {
+                        return None;
+                    }
+                    if let Some(&child_type) = allow.get(key.as_slice()) {
+                        stack.push((child, child_type));
+                    }
+                }
+            }
+            (TypeDef::List { items, .. }, Element::List(l)) => {
+                for item in l.borrow().values() {
+                    if is_target(&item, target) {
+                        return None;
+                    }
+                    stack.push((item, items));
+                }
+            }
+            (
+                TypeDef::Xml {
+                    children, marks, ..
+                },
+                Element::XmlElement(x),
+            ) => {
+                let list = x.borrow().children();
+                for child in list.borrow().values() {
+                    if is_target(&child, target) {
+                        return Some(marks);
+                    }
+                    if let Some(child_type) = resolve_child_type(schema, &child, children) {
+                        stack.push((child, child_type));
+                    }
+                }
+            }
+            (TypeDef::Xml { children, .. }, Element::XmlFragment(f)) => {
+                let list = f.borrow().children();
+                for child in list.borrow().values() {
+                    if is_target(&child, target) {
+                        return None;
+                    }
+                    if let Some(child_type) = resolve_child_type(schema, &child, children) {
+                        stack.push((child, child_type));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `element` is the sequence `target`. A scalar has no id, so it is never
+/// a mark's target sequence.
+fn is_target(element: &Element, target: ElementId) -> bool {
+    !matches!(element, Element::Scalar(_)) && element.id() == target
+}
+
 impl<'a> Validator<'a> {
     fn run(mut self) -> Vec<Violation> {
         while let Some(work) = self.stack.pop() {
