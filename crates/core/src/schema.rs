@@ -31,6 +31,7 @@ pub struct Schema {
     marks: Vec<(String, MarkDef)>,
     awareness: Vec<(String, AwarenessEntry)>,
     auth: Auth,
+    zones: Vec<(String, String)>,
     auto_version: Vec<AutoVersion>,
 }
 
@@ -435,6 +436,20 @@ impl Schema {
         &self.auth
     }
 
+    /// The declared zones — each a name → its subtree root path — in declaration
+    /// order.
+    pub fn zones(&self) -> &[(String, String)] {
+        &self.zones
+    }
+
+    /// The subtree root path declared for zone `name`, if any.
+    pub fn zone(&self, name: &str) -> Option<&str> {
+        self.zones
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, p)| p.as_str())
+    }
+
     /// The declarative version triggers (`autoVersion`), in declaration order.
     pub fn auto_version(&self) -> &[AutoVersion] {
         &self.auto_version
@@ -453,7 +468,7 @@ impl Schema {
     /// and is rejected. `marks` is declared by the language but not yet modelled
     /// here; it is accepted structurally so a spec-valid schema parses, and
     /// modelled by its own unit.
-    const TOP_LEVEL_KEYS: [&'static str; 8] = [
+    const TOP_LEVEL_KEYS: [&'static str; 9] = [
         "schema",
         "version",
         "root",
@@ -461,6 +476,7 @@ impl Schema {
         "marks",
         "awareness",
         "auth",
+        "zones",
         "autoVersion",
     ];
 
@@ -507,6 +523,11 @@ impl Schema {
             Some(a) => parse_auth(a)?,
         };
 
+        let zones = match json.get("zones") {
+            None => Vec::new(),
+            Some(z) => parse_zones(z)?,
+        };
+
         let auto_version = match json.get("autoVersion") {
             None => Vec::new(),
             Some(a) => parse_auto_version(a)?,
@@ -520,6 +541,7 @@ impl Schema {
             marks,
             awareness,
             auth,
+            zones,
             auto_version,
         };
         schema.validate_references()?;
@@ -769,6 +791,27 @@ fn parse_marks(json: &Json) -> Result<Vec<(String, MarkDef)>, SchemaError> {
     Ok(out)
 }
 
+/// Parse the `zones` block: an object mapping each zone name to its subtree
+/// root path — an absolute path from the doc root. Order is preserved. The path
+/// is validated syntactically (same grammar as an auth grant's `on:` path);
+/// membership resolution and cross-zone enforcement are later concerns. A
+/// repeated zone name is a duplicate object key, caught by the JSON layer.
+fn parse_zones(json: &Json) -> Result<Vec<(String, String)>, SchemaError> {
+    let obj = json
+        .as_object()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, "zones"))?;
+    let mut out = Vec::with_capacity(obj.len());
+    for (name, root) in obj {
+        let ctx = at("zones", name);
+        let path = root
+            .as_str()
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::WrongType, ctx.clone()))?;
+        validate_path(path, &ctx)?;
+        out.push((name.clone(), path.to_string()));
+    }
+    Ok(out)
+}
+
 /// Parse the `autoVersion` block: an array of triggers, each an event or a
 /// schedule with a name template and an optional retention count. Order is
 /// preserved.
@@ -962,7 +1005,7 @@ fn parse_grant(json: &Json, index: usize, roles: &HashSet<&str>) -> Result<Grant
 
     let subject = parse_subject(required_str(json, "to", &ctx)?, roles, &ctx)?;
     let path = required_str(json, "on", &ctx)?.to_string();
-    validate_path(&path, &ctx)?;
+    validate_path(&path, &at(&ctx, "on"))?;
 
     Ok(Grant {
         effect,
@@ -1011,18 +1054,19 @@ fn parse_subject(raw: &str, roles: &HashSet<&str>, ctx: &str) -> Result<Subject,
     }
 }
 
-/// A grant path is absolute (`/` or `/seg/seg…`) with no empty segment. Path
-/// inheritance is by segment at check time, so a malformed path is rejected here
-/// rather than mis-matching later.
-fn validate_path(path: &str, ctx: &str) -> Result<(), SchemaError> {
+/// An absolute schema path (`/` or `/seg/seg…`) with no empty segment. Grant
+/// path inheritance and zone subtree rooting both match by segment at check
+/// time, so a malformed path is rejected here rather than mis-matching later.
+/// `loc` is the full field location the error reports.
+fn validate_path(path: &str, loc: &str) -> Result<(), SchemaError> {
     if path == "/" {
         return Ok(());
     }
     let Some(rest) = path.strip_prefix('/') else {
-        return Err(SchemaError::new(SchemaErrorKind::BadPath, at(ctx, "on")));
+        return Err(SchemaError::new(SchemaErrorKind::BadPath, loc.to_string()));
     };
     if rest.split('/').any(str::is_empty) {
-        return Err(SchemaError::new(SchemaErrorKind::BadPath, at(ctx, "on")));
+        return Err(SchemaError::new(SchemaErrorKind::BadPath, loc.to_string()));
     }
     Ok(())
 }
