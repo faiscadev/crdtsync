@@ -198,14 +198,14 @@ fn expected_kind(td: &TypeDef) -> ElementKind {
 fn resolve_child_type<'a>(
     schema: &'a Schema,
     child: &Element,
-    allowed: &'a [String],
+    allowed: &'a [(String, Option<u64>)],
 ) -> Option<&'a str> {
     let child_kind = child.kind();
     let child_tag = match child {
         Element::XmlElement(x) => Some(x.borrow().tag().to_vec()),
         _ => None,
     };
-    allowed.iter().find_map(|name| {
+    allowed.iter().find_map(|(name, _)| {
         let td = schema.type_def(name)?;
         let fits = match td {
             TypeDef::Xml { tag: Some(t), .. } => {
@@ -479,7 +479,7 @@ impl<'a> Validator<'a> {
     /// and anything else is a `DisallowedChild` (it drops).
     fn queue_xml_children(
         &mut self,
-        children: &'a [String],
+        children: &'a [(String, Option<u64>)],
         orphan_inline: Option<&'a str>,
         list: &Rc<RefCell<List>>,
         path: &Rc<PathNode>,

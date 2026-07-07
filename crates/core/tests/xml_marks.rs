@@ -29,7 +29,7 @@ const SCHEMA: &str = r#"{
     "schema": "prose", "version": 1, "root": "Doc",
     "types": {
         "Doc":  { "kind": "map", "children": { "body": "Para", "note": "Free" } },
-        "Para": { "kind": "xml", "tag": "p", "children": ["Span"], "marks": ["bold"] },
+        "Para": { "kind": "xml", "tag": "p", "children": { "Span": {} }, "marks": ["bold"] },
         "Span": { "kind": "text" },
         "Free": { "kind": "text" }
     },
@@ -45,7 +45,7 @@ const FRAGMENT_SCHEMA: &str = r#"{
     "schema": "prose", "version": 1, "root": "Doc",
     "types": {
         "Doc":     { "kind": "map", "children": { "body": "Article" } },
-        "Article": { "kind": "fragment", "children": ["Span"] },
+        "Article": { "kind": "fragment", "children": { "Span": {} } },
         "Span":    { "kind": "text" }
     },
     "marks": {
@@ -207,7 +207,7 @@ const DISALLOWED_CHILD: &str = r#"{
     "schema": "prose", "version": 1, "root": "Doc",
     "types": {
         "Doc":  { "kind": "map", "children": { "body": "Para" } },
-        "Para": { "kind": "xml", "tag": "p", "children": ["Span"], "marks": ["bold"] },
+        "Para": { "kind": "xml", "tag": "p", "children": { "Span": {} }, "marks": ["bold"] },
         "Span": { "kind": "text" }
     },
     "marks": { "bold": { "flavor": "boolean" }, "comment": { "flavor": "object" } }
