@@ -367,9 +367,9 @@ fn with_xml_types(types_body: &str) -> String {
 }
 
 const XML_TYPES: &str = r#"
-    "Article": { "kind": "fragment", "children": ["Para", "Heading"], "repair": { "orphanInline": "Para" } },
-    "Para":    { "kind": "xml", "tag": "p", "children": ["Span"], "marks": ["bold", "link"] },
-    "Heading": { "kind": "xml", "tag": "h1", "attrs": { "level": "Level" }, "children": ["Span"] },
+    "Article": { "kind": "fragment", "children": { "Para": {}, "Heading": { "max": 1 } }, "repair": { "orphanInline": "Para" } },
+    "Para":    { "kind": "xml", "tag": "p", "children": { "Span": {} }, "marks": ["bold", "link"] },
+    "Heading": { "kind": "xml", "tag": "h1", "attrs": { "level": "Level" }, "children": { "Span": {} } },
     "Span":    { "kind": "text", "max": 10000 },
     "Level":   { "kind": "register", "min": 1, "max": 6 }
 "#;
@@ -381,7 +381,7 @@ fn parses_an_xml_element_type_with_all_fields() {
         s.type_def("Para"),
         Some(&TypeDef::Xml {
             tag: Some("p".into()),
-            children: vec!["Span".into()],
+            children: vec![("Span".into(), None)],
             attrs: vec![],
             marks: vec!["bold".into(), "link".into()],
             orphan_inline: None,
@@ -391,7 +391,7 @@ fn parses_an_xml_element_type_with_all_fields() {
         s.type_def("Heading"),
         Some(&TypeDef::Xml {
             tag: Some("h1".into()),
-            children: vec!["Span".into()],
+            children: vec![("Span".into(), None)],
             attrs: vec![("level".into(), "Level".into())],
             marks: vec![],
             orphan_inline: None,
@@ -406,7 +406,7 @@ fn parses_a_tagless_fragment_type() {
         s.type_def("Article"),
         Some(&TypeDef::Xml {
             tag: None,
-            children: vec!["Para".into(), "Heading".into()],
+            children: vec![("Para".into(), None), ("Heading".into(), Some(1))],
             attrs: vec![],
             marks: vec![],
             orphan_inline: Some("Para".into()),
@@ -434,7 +434,7 @@ fn an_xml_type_defaults_its_allowlists_to_empty() {
 #[test]
 fn xml_children_attrs_and_marks_keep_declaration_order() {
     let s = parse(&with_xml_types(
-        r#""Article": { "kind": "xml", "tag": "x", "children": ["Span", "Para", "Heading"],
+        r#""Article": { "kind": "xml", "tag": "x", "children": { "Span": {}, "Para": {}, "Heading": {} },
                        "attrs": { "z": "Level", "a": "Level", "m": "Level" }, "marks": ["link", "bold"] },
            "Para": { "kind": "xml", "tag": "p" }, "Heading": { "kind": "xml", "tag": "h1" },
            "Span": { "kind": "text" }, "Level": { "kind": "register" }"#,
@@ -448,7 +448,8 @@ fn xml_children_attrs_and_marks_keep_declaration_order() {
     else {
         panic!("expected an xml type");
     };
-    assert_eq!(children, &["Span", "Para", "Heading"]);
+    let child_names: Vec<&str> = children.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(child_names, ["Span", "Para", "Heading"]);
     let keys: Vec<&str> = attrs.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(keys, ["z", "a", "m"]);
     assert_eq!(marks, &["link", "bold"]);
@@ -456,7 +457,8 @@ fn xml_children_attrs_and_marks_keep_declaration_order() {
 
 #[test]
 fn an_xml_child_referencing_an_undeclared_type_is_rejected() {
-    let src = with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "children": ["Ghost"] }"#);
+    let src =
+        with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "children": { "Ghost": {} } }"#);
     assert_eq!(err(&src), SchemaErrorKind::UnknownTypeRef);
 }
 
@@ -516,15 +518,48 @@ fn an_unknown_field_under_repair_is_rejected() {
 }
 
 #[test]
-fn a_non_array_children_allowlist_is_rejected() {
+fn a_non_object_children_allowlist_is_rejected() {
     let src = with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "children": "Span" }"#);
-    assert_eq!(err(&src), SchemaErrorKind::WrongType);
+    assert_eq!(err(&src), SchemaErrorKind::NotAnObject);
 }
 
 #[test]
-fn a_non_string_child_type_name_is_rejected() {
-    let src = with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "children": [7] }"#);
-    assert_eq!(err(&src), SchemaErrorKind::WrongType);
+fn a_non_object_child_constraint_is_rejected() {
+    // A child value must be a (possibly empty) constraints object, not a bare
+    // value.
+    let src =
+        with_xml_types(r#""Article": { "kind": "xml", "tag": "x", "children": { "Span": 7 } }"#);
+    assert_eq!(err(&src), SchemaErrorKind::NotAnObject);
+}
+
+#[test]
+fn a_per_child_max_is_parsed() {
+    let s = parse(&with_xml_types(
+        r#""Article": { "kind": "xml", "tag": "x", "children": { "Span": { "max": 1 } } },
+           "Span": { "kind": "text" }"#,
+    ));
+    let TypeDef::Xml { children, .. } = s.type_def("Article").unwrap() else {
+        panic!("expected an xml type");
+    };
+    assert_eq!(children, &[("Span".to_string(), Some(1))]);
+}
+
+#[test]
+fn a_negative_child_max_is_rejected() {
+    let src = with_xml_types(
+        r#""Article": { "kind": "xml", "tag": "x", "children": { "Span": { "max": -1 } } },
+           "Span": { "kind": "text" }"#,
+    );
+    assert_eq!(err(&src), SchemaErrorKind::BadRange);
+}
+
+#[test]
+fn an_unknown_field_under_a_child_constraint_is_rejected() {
+    let src = with_xml_types(
+        r#""Article": { "kind": "xml", "tag": "x", "children": { "Span": { "min": 1 } } },
+           "Span": { "kind": "text" }"#,
+    );
+    assert_eq!(err(&src), SchemaErrorKind::UnknownField);
 }
 
 #[test]

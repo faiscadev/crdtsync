@@ -252,14 +252,15 @@ pub enum TypeDef {
     /// A counter with optional numeric bounds.
     Counter { min: Option<i64>, max: Option<i64> },
     /// An XmlElement (`tag: Some`) or a tagless XmlFragment (`tag: None`, the
-    /// document tree's root container). `children` is the allowlist of child
-    /// type names (elements or text); `attrs` maps each declared attribute key to
-    /// its value type; `marks` is the allowlist of mark names this element may
-    /// carry; `orphan_inline` names the default block type that repair wraps loose
-    /// inline content in. A fragment carries no `tag`, `attrs`, or `marks`.
+    /// document tree's root container). `children` maps each allowed child type
+    /// name (element or text) to its optional per-type cardinality cap (`max` — the
+    /// exclusivity constraint, e.g. one heading); `attrs` maps each declared
+    /// attribute key to its value type; `marks` is the allowlist of mark names this
+    /// element may carry; `orphan_inline` names the default block type that repair
+    /// wraps loose inline content in. A fragment carries no `tag`, `attrs`, `marks`.
     Xml {
         tag: Option<String>,
-        children: Vec<String>,
+        children: Vec<(String, Option<u64>)>,
         attrs: Vec<(String, String)>,
         marks: Vec<String>,
         orphan_inline: Option<String>,
@@ -582,7 +583,7 @@ impl Schema {
                     orphan_inline,
                     ..
                 } => {
-                    for ty in children {
+                    for (ty, _) in children {
                         require(ty)?;
                     }
                     for (_, ty) in attrs {
@@ -674,7 +675,7 @@ pub(crate) fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, Sc
             )?;
             Ok(TypeDef::Xml {
                 tag: Some(required_str(json, "tag", type_name)?.to_string()),
-                children: parse_type_name_array(json, "children", type_name)?,
+                children: parse_xml_children(json, type_name)?,
                 attrs: parse_attrs(json, type_name)?,
                 marks: parse_type_name_array(json, "marks", type_name)?,
                 orphan_inline: parse_orphan_inline(json, type_name)?,
@@ -684,7 +685,7 @@ pub(crate) fn parse_type_def(json: &Json, type_name: &str) -> Result<TypeDef, Sc
             reject_unknown_fields(obj, &["kind", "children", "repair"], type_name)?;
             Ok(TypeDef::Xml {
                 tag: None,
-                children: parse_type_name_array(json, "children", type_name)?,
+                children: parse_xml_children(json, type_name)?,
                 attrs: Vec::new(),
                 marks: Vec::new(),
                 orphan_inline: parse_orphan_inline(json, type_name)?,
@@ -1044,8 +1045,33 @@ fn parse_children(json: &Json, ctx: &str) -> Result<Vec<(String, String)>, Schem
     Ok(out)
 }
 
-/// An optional array-of-type-names allowlist (an xml type's `children` or
-/// `marks`). Absent → empty; a non-array or a non-string element is rejected.
+/// An xml type's `children` allowlist: each allowed child type name → its
+/// optional per-type cardinality cap (`max`, the exclusivity constraint). Absent
+/// → empty; a non-object, a non-object child value, an unknown field under a
+/// child, or a negative `max` is rejected.
+fn parse_xml_children(json: &Json, ctx: &str) -> Result<Vec<(String, Option<u64>)>, SchemaError> {
+    let Some(children) = json.get("children") else {
+        return Ok(Vec::new());
+    };
+    let ctx = at(ctx, "children");
+    let obj = children
+        .as_object()
+        .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, ctx.clone()))?;
+    let mut out = Vec::with_capacity(obj.len());
+    for (name, constraints) in obj {
+        let child_ctx = at(&ctx, name);
+        let cobj = constraints
+            .as_object()
+            .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, child_ctx.clone()))?;
+        reject_unknown_fields(cobj, &["max"], &child_ctx)?;
+        let max = count_field(constraints, "max", &child_ctx)?;
+        out.push((name.clone(), max));
+    }
+    Ok(out)
+}
+
+/// An optional array-of-type-names allowlist (an xml type's `marks`). Absent →
+/// empty; a non-array or a non-string element is rejected.
 fn parse_type_name_array(json: &Json, key: &str, ctx: &str) -> Result<Vec<String>, SchemaError> {
     let Some(v) = json.get(key) else {
         return Ok(Vec::new());

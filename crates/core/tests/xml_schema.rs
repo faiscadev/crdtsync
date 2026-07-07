@@ -26,7 +26,7 @@ const FLAT: &str = r#"{
     "schema": "prose", "version": 1, "root": "Doc",
     "types": {
         "Doc":  { "kind": "map", "children": { "body": "Para" } },
-        "Para": { "kind": "xml", "tag": "p", "children": ["Span"], "attrs": { "align": "Align" } },
+        "Para": { "kind": "xml", "tag": "p", "children": { "Span": {} }, "attrs": { "align": "Align" } },
         "Span": { "kind": "text", "max": 1000 },
         "Align": { "kind": "register", "min": 0, "max": 2 }
     }
@@ -38,8 +38,8 @@ const NESTED: &str = r#"{
     "schema": "prose", "version": 1, "root": "Doc",
     "types": {
         "Doc":     { "kind": "map", "children": { "body": "Article" } },
-        "Article": { "kind": "fragment", "children": ["Para"] },
-        "Para":    { "kind": "xml", "tag": "p", "children": ["Span"], "attrs": { "align": "Align" } },
+        "Article": { "kind": "fragment", "children": { "Para": {} } },
+        "Para":    { "kind": "xml", "tag": "p", "children": { "Span": {} }, "attrs": { "align": "Align" } },
         "Span":    { "kind": "text", "max": 1000 },
         "Align":   { "kind": "register", "min": 0, "max": 2 }
     }
@@ -240,8 +240,8 @@ const ORPHAN_INLINE: &str = r#"{
     "schema": "prose", "version": 1, "root": "Doc",
     "types": {
         "Doc":  { "kind": "map", "children": { "body": "Sect" } },
-        "Sect": { "kind": "xml", "tag": "section", "children": ["Para"], "repair": { "orphanInline": "Para" } },
-        "Para": { "kind": "xml", "tag": "p", "children": ["Span"] },
+        "Sect": { "kind": "xml", "tag": "section", "children": { "Para": {} }, "repair": { "orphanInline": "Para" } },
+        "Para": { "kind": "xml", "tag": "p", "children": { "Span": {} } },
         "Span": { "kind": "text" }
     }
 }"#;
@@ -435,8 +435,8 @@ const NESTED_TEXT_MAX: &str = r#"{
     "schema": "prose", "version": 1, "root": "Doc",
     "types": {
         "Doc":     { "kind": "map", "children": { "body": "Article" } },
-        "Article": { "kind": "fragment", "children": ["Para"] },
-        "Para":    { "kind": "xml", "tag": "p", "children": ["Span"], "attrs": { "align": "Align" } },
+        "Article": { "kind": "fragment", "children": { "Para": {} } },
+        "Para":    { "kind": "xml", "tag": "p", "children": { "Span": {} }, "attrs": { "align": "Align" } },
         "Span":    { "kind": "text", "max": 3 },
         "Align":   { "kind": "register", "min": 0, "max": 2 }
     }
