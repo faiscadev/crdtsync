@@ -2683,6 +2683,44 @@ impl<'a> MapCursor<'a> {
         }
     }
 
+    /// Descend into the keyed sub-namespace at `key`: an existing `XmlElement`'s
+    /// attrs Map when the slot holds one, else a nested Map (created if absent).
+    /// An element's attrs and a Map are both keyed slot-holders, so the path
+    /// façade descends them uniformly — naming an element then an attr key
+    /// reaches the attr through the ordinary map value API.
+    pub fn child(&mut self, key: &[u8]) -> MapCursor<'_> {
+        match self.xml_attrs_id(key) {
+            Some(attrs_id) => MapCursor {
+                doc: self.doc,
+                map_id: attrs_id,
+            },
+            None => self.map(key),
+        }
+    }
+
+    /// As [`child`](Self::child), consuming this cursor to chain a runtime-length
+    /// path without nesting borrows.
+    pub fn into_child(self, key: &[u8]) -> MapCursor<'a> {
+        match self.xml_attrs_id(key) {
+            Some(attrs_id) => MapCursor {
+                doc: self.doc,
+                map_id: attrs_id,
+            },
+            None => self.into_map(key),
+        }
+    }
+
+    /// The attrs Map id of a live `XmlElement` occupying `key` in this map, if
+    /// the slot holds one — the seam the contextual descent branches on.
+    fn xml_attrs_id(&self, key: &[u8]) -> Option<ElementId> {
+        let map = self.doc.maps.get(&self.map_id)?;
+        let value = map.borrow().get(key);
+        match value {
+            Some(Element::XmlElement(x)) => Some(XmlElement::attrs_id(x.borrow().id())),
+            _ => None,
+        }
+    }
+
     /// Descend into a List at `key`, creating it if absent.
     pub fn list(&mut self, key: &[u8]) -> ListCursor<'_> {
         self.doc

@@ -79,6 +79,32 @@ pub fn delete(doc: &mut Document, path: &[u8]) -> Vec<Op> {
     emit(doc, path, |cur, key| cur.delete(key))
 }
 
+/// Install an `XmlElement` with `tag` at a map-slot path. Its attrs are then
+/// addressed by extending the path with the attr key (they descend as an
+/// ordinary keyed Map); its children are a later slice.
+pub fn xml_element(doc: &mut Document, path: &[u8], tag: &[u8]) -> Vec<Op> {
+    let tag = tag.to_vec();
+    emit(doc, path, move |cur, key| {
+        cur.xml_element(key, &tag);
+    })
+}
+
+/// Install a tagless `XmlFragment` at a map-slot path. A fragment has no attrs.
+pub fn xml_fragment(doc: &mut Document, path: &[u8]) -> Vec<Op> {
+    emit(doc, path, |cur, key| {
+        cur.xml_fragment(key);
+    })
+}
+
+/// The tag of the live `XmlElement` at a path, or `None` if the path is not a
+/// live element (a fragment is tagless, so it too reads `None`).
+pub fn xml_tag(doc: &Document, path: &[u8]) -> Option<Vec<u8>> {
+    match slot(doc, path)? {
+        Element::XmlElement(x) => Some(x.borrow().tag().to_vec()),
+        _ => None,
+    }
+}
+
 /// Insert a bytes item at a live index in the List at a path.
 pub fn list_insert(doc: &mut Document, path: &[u8], index: usize, value: &[u8]) -> Vec<Op> {
     let value = value.to_vec();
@@ -284,6 +310,9 @@ where
     let Some((leaf_key, parents)) = keys.split_last() else {
         return Vec::new();
     };
+    if !writable(doc, parents) {
+        return Vec::new();
+    }
     doc.transact(|tx| descend(tx, parents, |cur| leaf(cur, leaf_key)))
 }
 
@@ -298,9 +327,9 @@ where
         f(cur);
         return;
     };
-    let mut child = cur.map(first);
+    let mut child = cur.child(first);
     for key in rest {
-        child = child.into_map(key);
+        child = child.into_child(key);
     }
     f(&mut child);
 }
@@ -323,15 +352,38 @@ where
     slot(doc, path).as_ref().map(ok).unwrap_or(false)
 }
 
-/// Walk `parents` from the root, following nested maps.
+/// Walk `parents` from the root, following nested maps and descending into an
+/// `XmlElement`'s attrs Map when a parent key holds one — so an attr is
+/// addressed by naming its element then the attr key. A fragment carries no
+/// attrs, so a key past it is unresolved.
 fn resolve_map(doc: &Document, parents: &[Vec<u8>]) -> Option<Rc<RefCell<Map>>> {
     let mut cur = doc.root();
     for key in parents {
         let next = match cur.borrow().get(key) {
             Some(Element::Map(m)) => m,
+            Some(Element::XmlElement(x)) => x.borrow().attrs(),
             _ => return None,
         };
         cur = next;
     }
     Some(cur)
+}
+
+/// Whether the write path `parents` can be descended: a key holding an
+/// `XmlFragment` is a dead end (a fragment has no attrs), so a write past it
+/// emits nothing rather than materialising a phantom Map that would diverge
+/// from the fragment slot. A Map or `XmlElement` is descendable; an absent slot
+/// is create-through (nothing live can lurk below it).
+fn writable(doc: &Document, parents: &[Vec<u8>]) -> bool {
+    let mut cur = doc.root();
+    for key in parents {
+        let next = match cur.borrow().get(key) {
+            Some(Element::Map(m)) => m,
+            Some(Element::XmlElement(x)) => x.borrow().attrs(),
+            Some(Element::XmlFragment(_)) => return false,
+            _ => return true,
+        };
+        cur = next;
+    }
+    true
 }
