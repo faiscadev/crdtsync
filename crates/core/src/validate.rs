@@ -61,6 +61,9 @@ pub enum ViolationKind {
     /// An xml child whose tag matches no child type the governing type allows — a
     /// disallowed child drops from a conformant read of the children sequence.
     DisallowedChild,
+    /// Loose inline text under a type that declares `repair.orphanInline`: it reads
+    /// wrapped in a synthesized block of this declared type rather than dropped.
+    OrphanInline { block: String },
     /// An attribute whose value is the wrong kind for its declared attr type — a
     /// mistyped attr is dropped, not clamped, so it is distinct from an
     /// out-of-range (right-kind) attr value.
@@ -469,13 +472,11 @@ impl<'a> Validator<'a> {
     }
 
     /// Queue each child of an xml element / fragment against the type its tag
-    /// resolves to in `children`. A child whose tag matches no allowed type is a
-    /// `DisallowedChild` reported at its position and not descended — it drops from
-    /// the read, so its own subtree is not validated; a child that resolves is
-    /// checked, reaching its nested attrs and children. The one exception is loose
-    /// inline text under a type that declares `orphan_inline`: the schema asks for
-    /// it to be wrapped in that block type, not dropped, so it is left untouched
-    /// here for the orphan-inline wrap (5c-ii) rather than reported as disallowed.
+    /// resolves to in `children`. A child that resolves is checked, reaching its
+    /// nested attrs and children. A child that resolves to no allowed type is
+    /// reported and not descended: loose inline **text** under a type that declares
+    /// `orphan_inline` is an `OrphanInline` (it reads wrapped in that block type),
+    /// and anything else is a `DisallowedChild` (it drops).
     fn queue_xml_children(
         &mut self,
         children: &'a [String],
@@ -485,22 +486,27 @@ impl<'a> Validator<'a> {
     ) {
         let mut queued = Vec::new();
         for (i, child) in list.borrow().values().into_iter().enumerate().rev() {
-            let child_type = resolve_child_type(self.schema, &child, children);
-            if child_type.is_none() && orphan_inline.is_some() && matches!(child, Element::Text(_))
-            {
-                continue;
-            }
             let child_path = Rc::new(PathNode::Step(Step::Index(i), Some(path.clone())));
-            match child_type {
+            match resolve_child_type(self.schema, &child, children) {
                 Some(child_type) => queued.push(Work::Check {
                     element: child,
                     type_name: child_type,
                     path: child_path,
                 }),
-                None => queued.push(Work::Report {
-                    path: child_path,
-                    kind: ViolationKind::DisallowedChild,
-                }),
+                None => {
+                    let kind = match orphan_inline {
+                        Some(block) if matches!(child, Element::Text(_)) => {
+                            ViolationKind::OrphanInline {
+                                block: block.to_string(),
+                            }
+                        }
+                        _ => ViolationKind::DisallowedChild,
+                    };
+                    queued.push(Work::Report {
+                        path: child_path,
+                        kind,
+                    });
+                }
             }
         }
         self.stack.extend(queued);

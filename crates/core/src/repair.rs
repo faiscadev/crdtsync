@@ -3,10 +3,12 @@
 //! [`repairs`] turns the [`validate`] violation set into the normalization a
 //! schema-conformant read applies over merged state: a register/counter integer
 //! clamped into its declared bounds, a list/text truncated to its `max` by
-//! dropping the lamport-newest excess, or a disallowed / mistyped attr or
-//! disallowed xml child dropped from the element. It is a pure read — the stored
-//! ops are never touched — and every input is a value already in state, so a
-//! repair mints nothing and needs no clock.
+//! dropping the lamport-newest excess, a disallowed / mistyped attr or disallowed
+//! xml child dropped from the element, or loose inline text wrapped in a
+//! synthesized default block. It is a pure read — the stored ops are never touched
+//! — and every input is a value already in state, so a repair mints nothing and
+//! needs no clock: even the wrap introduces no op, its wrapper id derived from the
+//! orphan so every replica synthesizes the same one.
 //!
 //! The drop-newest order comes from the stamps in state, total-ordered by
 //! `(lamport, client)`, so replicas that merged the same ops truncate to the same
@@ -16,6 +18,7 @@
 
 use crate::doc::Document;
 use crate::element::Element;
+use crate::elementid::{ElementId, ElementKind};
 use crate::schema::Schema;
 use crate::stamp::Stamp;
 use crate::validate::{validate, Step, ViolationKind};
@@ -31,6 +34,12 @@ pub enum RepairKind {
     /// A node read as absent — a disallowed / mistyped attr, or an xml child whose
     /// tag no allowed type matches, drops from a conformant read of the element.
     Dropped,
+    /// Loose inline text read wrapped in a synthesized block element of declared
+    /// type `block`. The wrapper's `id` is derived from the orphan's own element id
+    /// (so every replica synthesizes the same wrapper, and a later op can target
+    /// it); the orphan reads as its sole child. This is the one element-creating
+    /// repair — the reading introduces a node rather than hiding or clamping one.
+    Wrapped { block: String, id: ElementId },
 }
 
 /// The repaired reading of one located element.
@@ -51,11 +60,13 @@ pub struct Repair {
 /// The `path` completes the identity. It is all `Step::Key` — and so fully
 /// index-stable — for a repair under map slots (the common case). A repair under
 /// a *sequence* position carries a `Step::Index` (a bounded register list item, or
-/// now an xml child of a bounded type): such a repair's identity shifts if a
-/// preceding item is inserted or removed, which can churn an `onRepaired` report
-/// even though the reading is unchanged. Keying a sequence-positioned repair by a
-/// stable node stamp instead is a follow-up (it needs the same node-stamp handle
-/// the truncation survivors use, extended to a leaf register item).
+/// an xml child of a bounded type, or a dropped disallowed child): such a repair's
+/// identity shifts if a preceding item is inserted or removed, which can churn an
+/// `onRepaired` report even though the reading is unchanged. Keying a
+/// sequence-positioned repair by a stable node stamp instead is a follow-up (it
+/// needs the same node-stamp handle the truncation survivors use, extended to a
+/// leaf register item). The wrap is already stable this way — its id derives from
+/// the orphan's own element id, so it keys by that id, not the sequence position.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum RepairId {
     Clamp {
@@ -71,6 +82,13 @@ pub(crate) enum RepairId {
     /// location is in violation, so the path is the identity.
     Drop {
         path: Vec<Step>,
+    },
+    /// An orphan inline text read wrapped in a synthesized block. Keyed by the
+    /// wrapper's derived `id`, not the orphan's sequence position — the id derives
+    /// from the orphan's own (position-independent) element id, so a preceding
+    /// insert that shifts the index does not churn the `onRepaired` report.
+    Wrap {
+        id: ElementId,
     },
 }
 
@@ -123,6 +141,12 @@ pub(crate) fn keyed_repairs(doc: &Document, schema: &Schema) -> Vec<(Repair, Rep
                 | ViolationKind::MistypedAttr { .. }
                 | ViolationKind::DisallowedChild => {
                     (RepairKind::Dropped, RepairId::Drop { path: path.clone() })
+                }
+                ViolationKind::OrphanInline { block } => {
+                    let orphan = element_at(doc, &path)?;
+                    let id =
+                        ElementId::derive(orphan.id(), block.as_bytes(), ElementKind::XmlElement);
+                    (RepairKind::Wrapped { block, id }, RepairId::Wrap { id })
                 }
                 ViolationKind::KindMismatch { .. } | ViolationKind::UnknownSlot => return None,
             };
