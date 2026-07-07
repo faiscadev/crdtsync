@@ -58,6 +58,9 @@ pub enum ViolationKind {
     TooLong { len: u64, max: u64 },
     /// An attribute key an xml element's declared type does not list in `attrs`.
     DisallowedAttr,
+    /// An xml child whose tag matches no child type the governing type allows — a
+    /// disallowed child drops from a conformant read of the children sequence.
+    DisallowedChild,
     /// An attribute whose value is the wrong kind for its declared attr type — a
     /// mistyped attr is dropped, not clamped, so it is distinct from an
     /// out-of-range (right-kind) attr value.
@@ -455,11 +458,11 @@ impl<'a> Validator<'a> {
         self.stack.extend(queued);
     }
 
-    /// Queue each child of an xml element / fragment that resolves to an allowed
-    /// child type (its tag matched against `children`). A child that resolves to no
-    /// allowed type is a disallowed child — left to structural repair (5c); here it
-    /// is simply not descended, so a nested element's own attrs are still reached
-    /// through the children that do resolve.
+    /// Queue each child of an xml element / fragment against the type its tag
+    /// resolves to in `children`. A child whose tag matches no allowed type is a
+    /// `DisallowedChild` reported at its position and not descended — it drops from
+    /// the read, so its own subtree is not validated; a child that resolves is
+    /// checked, reaching its nested attrs and children.
     fn queue_xml_children(
         &mut self,
         children: &'a [String],
@@ -468,13 +471,17 @@ impl<'a> Validator<'a> {
     ) {
         let mut queued = Vec::new();
         for (i, child) in list.borrow().values().into_iter().enumerate().rev() {
-            if let Some(child_type) = resolve_child_type(self.schema, &child, children) {
-                let child_path = Rc::new(PathNode::Step(Step::Index(i), Some(path.clone())));
-                queued.push(Work::Check {
+            let child_path = Rc::new(PathNode::Step(Step::Index(i), Some(path.clone())));
+            match resolve_child_type(self.schema, &child, children) {
+                Some(child_type) => queued.push(Work::Check {
                     element: child,
                     type_name: child_type,
                     path: child_path,
-                });
+                }),
+                None => queued.push(Work::Report {
+                    path: child_path,
+                    kind: ViolationKind::DisallowedChild,
+                }),
             }
         }
         self.stack.extend(queued);

@@ -157,6 +157,99 @@ fn a_conforming_nested_element_has_no_violations() {
     assert!(validate(&d, &schema(NESTED)).is_empty());
 }
 
+// --- validate: disallowed children ---
+
+#[test]
+fn a_disallowed_child_element_is_reported() {
+    // Para allows only Span text children; a <b> element child matches no allowed
+    // child type, so it is a disallowed child at its sequence position.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .children()
+            .insert_element(0, b"b");
+    });
+    let v = validate(&d, &schema(FLAT));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(0)],
+        &ViolationKind::DisallowedChild
+    ));
+}
+
+#[test]
+fn a_nested_disallowed_child_is_reported_through_recursion() {
+    // Under the Article fragment a Para is allowed, but a <b> inside that Para is
+    // not (Para allows only Span) — reached only by descending the conforming Para.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut body = tx.xml_fragment(b"body");
+        let mut kids = body.children();
+        let mut para = kids.insert_element(0, b"p");
+        para.children().insert_element(0, b"b");
+    });
+    let v = validate(&d, &schema(NESTED));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(0), Step::Index(0)],
+        &ViolationKind::DisallowedChild
+    ));
+}
+
+#[test]
+fn a_conforming_child_is_not_reported() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .children()
+            .insert_text(0)
+            .insert(0, "hi");
+    });
+    assert!(validate(&d, &schema(FLAT)).is_empty());
+}
+
+#[test]
+fn disallowed_children_emit_in_sequence_order() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut el = tx.xml_element(b"body", b"p");
+        let mut kids = el.children();
+        kids.insert_element(0, b"b");
+        kids.insert_element(1, b"i");
+    });
+    let v = validate(&d, &schema(FLAT));
+    let children: Vec<&Vec<Step>> = v
+        .iter()
+        .filter(|x| x.kind == ViolationKind::DisallowedChild)
+        .map(|x| &x.path)
+        .collect();
+    assert_eq!(
+        children,
+        vec![
+            &vec![key("body"), Step::Index(0)],
+            &vec![key("body"), Step::Index(1)],
+        ],
+        "disallowed children emit in sequence order"
+    );
+}
+
+// --- repair: disallowed children ---
+
+#[test]
+fn a_disallowed_child_reads_dropped() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .children()
+            .insert_element(0, b"b");
+    });
+    let r = repairs(&d, &schema(FLAT));
+    assert!(r.contains(&Repair {
+        path: vec![key("body"), Step::Index(0)],
+        kind: RepairKind::Dropped,
+    }));
+}
+
 // --- repair: attrs ---
 
 #[test]
