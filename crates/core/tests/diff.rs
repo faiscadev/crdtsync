@@ -11,8 +11,11 @@
 use crdtsync_core::diff::{diff, Change, SeqItem};
 use crdtsync_core::doc::Document;
 use crdtsync_core::element::ElementKind;
+use crdtsync_core::elementid::ElementId;
+use crdtsync_core::list::Side;
 use crdtsync_core::path::encode_path;
-use crdtsync_core::{ClientId, Scalar};
+use crdtsync_core::ranged::RangeAnchor;
+use crdtsync_core::{ClientId, Element, Scalar};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -22,6 +25,36 @@ fn cid(first: u8) -> ClientId {
 
 fn doc() -> Document {
     Document::new(cid(1))
+}
+
+/// A fresh doc with a "body" Text holding `s` — the sequence marks anchor to.
+fn doc_with_body(s: &str) -> Document {
+    let mut d = doc();
+    d.transact(|tx| tx.text(b"body").insert(0, s));
+    d
+}
+
+/// The stable id of the "body" Text — the sequence a mark over it names.
+fn body_seq(d: &Document) -> ElementId {
+    ElementId::derive(d.root_id(), b"body", ElementKind::Text)
+}
+
+/// A non-growing span `[i, j)` over the body Text.
+fn body_span(d: &Document, i: usize, j: usize) -> (RangeAnchor, RangeAnchor) {
+    let t = match d.get(b"body") {
+        Some(Element::Text(t)) => t,
+        _ => panic!("no body text"),
+    };
+    let seq = body_seq(d);
+    let start = RangeAnchor {
+        seq,
+        pos: t.borrow().relative_position(i, Side::Right),
+    };
+    let end = RangeAnchor {
+        seq,
+        pos: t.borrow().relative_position(j, Side::Left),
+    };
+    (start, end)
 }
 
 /// A snapshot copy of `d` — the same replica, same identities, at this instant.
@@ -635,5 +668,141 @@ fn xml_attr_changes_emit_in_sorted_key_order() {
     assert_eq!(
         paths,
         vec![p(&[b"body", b"align"]), p(&[b"body", b"width"])]
+    );
+}
+
+// --- marks (named RangedElement annotations) ---
+
+#[test]
+fn a_mark_added_is_reported() {
+    let mut d = doc_with_body("hello world");
+    let old = snapshot(&d);
+    let (s, e) = body_span(&d, 0, 5);
+    let mut id = None;
+    d.transact(|tx| id = Some(tx.ranged().mark(b"bold", s, e, Scalar::Bool(true))));
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::MarkAdded {
+            id: id.unwrap(),
+            seq: body_seq(&d),
+            name: b"bold".to_vec(),
+            value: Scalar::Bool(true),
+        }]
+    );
+}
+
+#[test]
+fn a_mark_removed_is_reported() {
+    let mut d = doc_with_body("hello world");
+    let (s, e) = body_span(&d, 0, 5);
+    let mut id = None;
+    d.transact(|tx| id = Some(tx.ranged().mark(b"bold", s, e, Scalar::Bool(true))));
+    let old = snapshot(&d);
+    let mark = id.unwrap();
+    d.transact(|tx| tx.ranged().delete(mark));
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::MarkRemoved {
+            id: mark,
+            seq: body_seq(&d),
+            name: b"bold".to_vec(),
+            value: Scalar::Bool(true),
+        }]
+    );
+}
+
+#[test]
+fn a_mark_value_change_is_reported() {
+    let mut d = doc_with_body("hello world");
+    let (s, e) = body_span(&d, 0, 5);
+    let mut id = None;
+    d.transact(|tx| {
+        id = Some(
+            tx.ranged()
+                .mark(b"link", s, e, Scalar::Bytes(b"http://a".to_vec())),
+        )
+    });
+    let old = snapshot(&d);
+    let mark = id.unwrap();
+    d.transact(|tx| {
+        tx.ranged()
+            .set_payload(mark, Scalar::Bytes(b"http://b".to_vec()))
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::MarkChanged {
+            id: mark,
+            seq: body_seq(&d),
+            name: b"link".to_vec(),
+            old: Scalar::Bytes(b"http://a".to_vec()),
+            new: Scalar::Bytes(b"http://b".to_vec()),
+        }]
+    );
+}
+
+#[test]
+fn an_unchanged_mark_set_is_silent() {
+    let mut d = doc_with_body("hello world");
+    let (s, e) = body_span(&d, 0, 5);
+    d.transact(|tx| {
+        tx.ranged().mark(b"bold", s, e, Scalar::Bool(true));
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| tx.register(b"other", Scalar::Int(1)));
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::Added {
+            path: p(&[b"other"]),
+            kind: ElementKind::Register,
+        }]
+    );
+}
+
+#[test]
+fn mark_changes_follow_tree_changes() {
+    // A combined edit: a tree change (a new register) and a mark added. Tree
+    // changes come first, mark changes after.
+    let mut d = doc_with_body("hello world");
+    let old = snapshot(&d);
+    let (s, e) = body_span(&d, 0, 5);
+    let mut id = None;
+    d.transact(|tx| {
+        tx.register(b"age", Scalar::Int(1));
+        id = Some(tx.ranged().mark(b"bold", s, e, Scalar::Bool(true)));
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![
+            Change::Added {
+                path: p(&[b"age"]),
+                kind: ElementKind::Register,
+            },
+            Change::MarkAdded {
+                id: id.unwrap(),
+                seq: body_seq(&d),
+                name: b"bold".to_vec(),
+                value: Scalar::Bool(true),
+            },
+        ]
+    );
+}
+
+#[test]
+fn the_mark_diff_is_deterministic() {
+    let mut d = doc_with_body("hello world");
+    let old = snapshot(&d);
+    let (s1, e1) = body_span(&d, 0, 3);
+    let (s2, e2) = body_span(&d, 4, 7);
+    d.transact(|tx| {
+        tx.ranged().mark(b"bold", s1, e1, Scalar::Bool(true));
+        tx.ranged().mark(b"italic", s2, e2, Scalar::Bool(true));
+    });
+    let a = diff(&old, &d);
+    assert_eq!(a, diff(&old, &d), "same pair diffs identically");
+    assert_eq!(
+        a.iter()
+            .filter(|c| matches!(c, Change::MarkAdded { .. }))
+            .count(),
+        2
     );
 }

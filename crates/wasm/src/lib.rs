@@ -9,6 +9,7 @@
 
 use crdtsync_core::diff::{diff as core_diff, Change, SeqItem};
 use crdtsync_core::element::ElementKind;
+use crdtsync_core::elementid::ElementId;
 use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
@@ -750,6 +751,46 @@ fn change_to_js(change: &Change) -> JsValue {
             set(&obj, "index", &JsValue::from_f64(*index as f64));
             set(&obj, "text", &JsValue::from_str(text));
         }
+        Change::MarkAdded {
+            id,
+            seq,
+            name,
+            value,
+        } => {
+            set(&obj, "op", &JsValue::from_str("markAdd"));
+            set_mark_head(&obj, id, seq, name);
+            set(&obj, "value", &scalar_to_js(value));
+        }
+        Change::MarkRemoved {
+            id,
+            seq,
+            name,
+            value,
+        } => {
+            set(&obj, "op", &JsValue::from_str("markRemove"));
+            set_mark_head(&obj, id, seq, name);
+            set(&obj, "value", &scalar_to_js(value));
+        }
+        Change::MarkChanged {
+            id,
+            seq,
+            name,
+            old,
+            new,
+        } => {
+            set(&obj, "op", &JsValue::from_str("markChange"));
+            set_mark_head(&obj, id, seq, name);
+            set(&obj, "old", &scalar_to_js(old));
+            set(&obj, "new", &scalar_to_js(new));
+        }
     }
     obj.into()
+}
+
+/// The common head of a mark change as JS fields: the mark id, its target
+/// sequence, and its name (each a `Uint8Array`).
+fn set_mark_head(obj: &js_sys::Object, id: &ElementId, seq: &ElementId, name: &[u8]) {
+    set(obj, "id", &js_sys::Uint8Array::from(&id.as_bytes()[..]).into());
+    set(obj, "seq", &js_sys::Uint8Array::from(&seq.as_bytes()[..]).into());
+    set(obj, "name", &js_sys::Uint8Array::from(name).into());
 }

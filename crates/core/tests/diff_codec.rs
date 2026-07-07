@@ -10,8 +10,13 @@ use crdtsync_core::codec::DecodeError;
 use crdtsync_core::diff::{decode_changes, diff, encode_changes, Change, SeqItem};
 use crdtsync_core::doc::Document;
 use crdtsync_core::element::ElementKind;
+use crdtsync_core::elementid::ElementId;
 use crdtsync_core::path::encode_path;
 use crdtsync_core::{ClientId, Scalar};
+
+fn eid(n: u8) -> ElementId {
+    ElementId::from_bytes([n; 16])
+}
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -77,6 +82,25 @@ fn every_variant_round_trips() {
             index: 0,
             text: "x".to_string(),
         },
+        Change::MarkAdded {
+            id: eid(1),
+            seq: eid(2),
+            name: b"bold".to_vec(),
+            value: Scalar::Bool(true),
+        },
+        Change::MarkRemoved {
+            id: eid(3),
+            seq: eid(4),
+            name: b"link".to_vec(),
+            value: Scalar::Bytes(b"http://a".to_vec()),
+        },
+        Change::MarkChanged {
+            id: eid(5),
+            seq: eid(6),
+            name: b"link".to_vec(),
+            old: Scalar::Bytes(b"a".to_vec()),
+            new: Scalar::Bytes(b"b".to_vec()),
+        },
     ]);
 }
 
@@ -113,6 +137,13 @@ fn a_truncated_change_list_is_an_error_not_a_panic() {
             path: p(&[b"body"]),
             index: 2,
             text: "hello".to_string(),
+        },
+        Change::MarkChanged {
+            id: eid(1),
+            seq: eid(2),
+            name: b"bold".to_vec(),
+            old: Scalar::Bool(false),
+            new: Scalar::Bool(true),
         },
     ]);
     for cut in 0..bytes.len() {
