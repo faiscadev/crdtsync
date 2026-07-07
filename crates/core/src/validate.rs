@@ -21,12 +21,15 @@
 //! bounded by the number of slot edges and the walk can neither loop on a cycle
 //! nor blow up on a shared subtree.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::doc::Document;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
+use crate::list::List;
+use crate::map::Map;
 use crate::scalar::Scalar;
 use crate::schema::{Schema, TypeDef};
 
@@ -53,6 +56,15 @@ pub enum ViolationKind {
     AboveMax { value: i64, max: i64 },
     /// A list or text longer than its declared maximum.
     TooLong { len: u64, max: u64 },
+    /// An attribute key an xml element's declared type does not list in `attrs`.
+    DisallowedAttr,
+    /// An attribute whose value is the wrong kind for its declared attr type — a
+    /// mistyped attr is dropped, not clamped, so it is distinct from an
+    /// out-of-range (right-kind) attr value.
+    MistypedAttr {
+        expected: ElementKind,
+        found: ElementKind,
+    },
 }
 
 /// A single constraint violation at a located element.
@@ -122,6 +134,13 @@ enum Work<'a> {
     UnknownSlot {
         path: Rc<PathNode>,
     },
+    /// A violation to record when this work item is reached, so a violation found
+    /// while queueing children (an attr key, a mistyped attr) still emits in tree
+    /// order rather than ahead of the descent.
+    Report {
+        path: Rc<PathNode>,
+        kind: ViolationKind,
+    },
 }
 
 /// Every way `doc`'s current state violates `schema`, in deterministic tree
@@ -166,6 +185,33 @@ fn expected_kind(td: &TypeDef) -> ElementKind {
     }
 }
 
+/// The declared type of an xml child, resolved against the parent type's
+/// `children` allowlist: an element child matches the allowed xml type whose tag
+/// equals its own, a text child matches the allowed text type. `None` if no
+/// allowed type fits (a disallowed child — structural repair's concern, 5c).
+fn resolve_child_type<'a>(
+    schema: &'a Schema,
+    child: &Element,
+    allowed: &'a [String],
+) -> Option<&'a str> {
+    let child_kind = child.kind();
+    let child_tag = match child {
+        Element::XmlElement(x) => Some(x.borrow().tag().to_vec()),
+        _ => None,
+    };
+    allowed.iter().find_map(|name| {
+        let td = schema.type_def(name)?;
+        let fits = match td {
+            TypeDef::Xml { tag: Some(t), .. } => {
+                child_kind == ElementKind::XmlElement && child_tag.as_deref() == Some(t.as_bytes())
+            }
+            TypeDef::Xml { tag: None, .. } => child_kind == ElementKind::XmlFragment,
+            other => expected_kind(other) == child_kind,
+        };
+        fits.then_some(name.as_str())
+    })
+}
+
 impl<'a> Validator<'a> {
     fn run(mut self) -> Vec<Violation> {
         while let Some(work) = self.stack.pop() {
@@ -173,6 +219,10 @@ impl<'a> Validator<'a> {
                 Work::UnknownSlot { path } => self.out.push(Violation {
                     path: path.steps(),
                     kind: ViolationKind::UnknownSlot,
+                }),
+                Work::Report { path, kind } => self.out.push(Violation {
+                    path: path.steps(),
+                    kind,
                 }),
                 Work::Check {
                     element,
@@ -259,8 +309,89 @@ impl<'a> Validator<'a> {
                     });
                 }
             }
+            (
+                TypeDef::Xml {
+                    attrs, children, ..
+                },
+                Element::XmlElement(x),
+            ) => {
+                let (attrs_map, children_list) = {
+                    let x = x.borrow();
+                    (x.attrs(), x.children())
+                };
+                // Queue children first, then attrs on top, so attrs (sorted keys)
+                // emit before children (sequence order) in the popped tree order.
+                self.queue_xml_children(children, &children_list, &path);
+                self.check_xml_attrs(attrs, &attrs_map, &path);
+            }
+            (TypeDef::Xml { children, .. }, Element::XmlFragment(f)) => {
+                let children_list = f.borrow().children();
+                self.queue_xml_children(children, &children_list, &path);
+            }
             _ => {}
         }
+    }
+
+    /// Validate an xml element's attrs Map against its type's `attrs` allowlist: an
+    /// undeclared key is a `DisallowedAttr`, a declared key whose value is the
+    /// wrong kind is a `MistypedAttr`, and a right-kind value recurses to its
+    /// declared attr type (so an out-of-range value falls into the bounds rule).
+    fn check_xml_attrs(
+        &mut self,
+        attrs: &'a [(String, String)],
+        map: &Rc<RefCell<Map>>,
+        path: &Rc<PathNode>,
+    ) {
+        let mut queued = Vec::new();
+        for (key, child) in map.borrow().entries().into_iter().rev() {
+            let child_path = Rc::new(PathNode::Step(Step::Key(key.clone()), Some(path.clone())));
+            match attrs.iter().find(|(k, _)| k.as_bytes() == key.as_slice()) {
+                None => queued.push(Work::Report {
+                    path: child_path,
+                    kind: ViolationKind::DisallowedAttr,
+                }),
+                Some((_, ty)) => {
+                    let found = child.kind();
+                    match self.schema.type_def(ty).map(expected_kind) {
+                        Some(expected) if expected != found => queued.push(Work::Report {
+                            path: child_path,
+                            kind: ViolationKind::MistypedAttr { expected, found },
+                        }),
+                        _ => queued.push(Work::Check {
+                            element: child,
+                            type_name: ty.as_str(),
+                            path: child_path,
+                        }),
+                    }
+                }
+            }
+        }
+        self.stack.extend(queued);
+    }
+
+    /// Queue each child of an xml element / fragment that resolves to an allowed
+    /// child type (its tag matched against `children`). A child that resolves to no
+    /// allowed type is a disallowed child — left to structural repair (5c); here it
+    /// is simply not descended, so a nested element's own attrs are still reached
+    /// through the children that do resolve.
+    fn queue_xml_children(
+        &mut self,
+        children: &'a [String],
+        list: &Rc<RefCell<List>>,
+        path: &Rc<PathNode>,
+    ) {
+        let mut queued = Vec::new();
+        for (i, child) in list.borrow().values().into_iter().enumerate().rev() {
+            if let Some(child_type) = resolve_child_type(self.schema, &child, children) {
+                let child_path = Rc::new(PathNode::Step(Step::Index(i), Some(path.clone())));
+                queued.push(Work::Check {
+                    element: child,
+                    type_name: child_type,
+                    path: child_path,
+                });
+            }
+        }
+        self.stack.extend(queued);
     }
 
     /// Record a `TooLong` violation for a sequence of `len` over its `max`.
