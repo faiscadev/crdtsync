@@ -61,6 +61,10 @@ pub enum ViolationKind {
     /// An xml child whose tag matches no child type the governing type allows — a
     /// disallowed child drops from a conformant read of the children sequence.
     DisallowedChild,
+    /// An xml child of an allowed type that exceeds that type's per-type `max`
+    /// cardinality cap: the lamport-newest instances beyond `max` drop, keeping the
+    /// oldest, so an exclusive type (`max` 1) collapses to a single instance.
+    ExcessChild { max: u64 },
     /// Loose inline text under a type that declares `repair.orphanInline`: it reads
     /// wrapped in a synthesized block of this declared type rather than dropped.
     OrphanInline { block: String },
@@ -472,11 +476,15 @@ impl<'a> Validator<'a> {
     }
 
     /// Queue each child of an xml element / fragment against the type its tag
-    /// resolves to in `children`. A child that resolves is checked, reaching its
-    /// nested attrs and children. A child that resolves to no allowed type is
-    /// reported and not descended: loose inline **text** under a type that declares
-    /// `orphan_inline` is an `OrphanInline` (it reads wrapped in that block type),
-    /// and anything else is a `DisallowedChild` (it drops).
+    /// resolves to in `children`. A child that resolves and is within its type's
+    /// cardinality cap is checked, reaching its nested attrs and children. A child
+    /// that resolves to no allowed type is reported and not descended: loose inline
+    /// **text** under a type that declares `orphan_inline` is an `OrphanInline` (it
+    /// reads wrapped in that block type), and anything else is a `DisallowedChild`
+    /// (it drops). A child of an allowed type declared with a per-type `max` that is
+    /// over the cap is an `ExcessChild` — the lamport-newest instances beyond `max`
+    /// drop (keeping the oldest), the same drop-newest order a sequence `max` uses,
+    /// so replicas that merged the same ops keep the same instances.
     fn queue_xml_children(
         &mut self,
         children: &'a [(String, Option<u64>)],
@@ -484,10 +492,42 @@ impl<'a> Validator<'a> {
         list: &Rc<RefCell<List>>,
         path: &Rc<PathNode>,
     ) {
+        let values = list.borrow().values();
+        let resolved: Vec<Option<&'a str>> = values
+            .iter()
+            .map(|child| resolve_child_type(self.schema, child, children))
+            .collect();
+        // The excess: for each child type capped at `max`, drop the lamport-newest
+        // instances beyond `max`, keeping the oldest. Stamps total-order by
+        // `(lamport, client)`, so the survivors are the same across replicas. Caps
+        // are rare, so the stamp walk is paid only when a child type declares one.
+        let mut excess: HashMap<usize, u64> = HashMap::new();
+        if children.iter().any(|(_, max)| max.is_some()) {
+            let stamps = list.borrow().node_ids(0, values.len());
+            for (name, max) in children {
+                let Some(max) = *max else { continue };
+                let mut idxs: Vec<usize> = (0..values.len())
+                    .filter(|&i| resolved[i] == Some(name.as_str()))
+                    .collect();
+                if idxs.len() as u64 > max {
+                    idxs.sort_by(|&a, &b| stamps[b].cmp(&stamps[a]));
+                    for &i in &idxs[..idxs.len() - max as usize] {
+                        excess.insert(i, max);
+                    }
+                }
+            }
+        }
         let mut queued = Vec::new();
-        for (i, child) in list.borrow().values().into_iter().enumerate().rev() {
+        for (i, child) in values.into_iter().enumerate().rev() {
             let child_path = Rc::new(PathNode::Step(Step::Index(i), Some(path.clone())));
-            match resolve_child_type(self.schema, &child, children) {
+            if let Some(&max) = excess.get(&i) {
+                queued.push(Work::Report {
+                    path: child_path,
+                    kind: ViolationKind::ExcessChild { max },
+                });
+                continue;
+            }
+            match resolved[i] {
                 Some(child_type) => queued.push(Work::Check {
                     element: child,
                     type_name: child_type,
