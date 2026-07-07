@@ -583,6 +583,37 @@ fn an_unchanged_xml_element_is_silent() {
 }
 
 #[test]
+fn a_child_change_emits_before_an_attr_change_on_the_same_element() {
+    // A child change is at the element's own path (`body`); an attr change is at a
+    // deeper path (`body/align`). Path order puts the shallower first, so children
+    // must emit before attrs to keep the change list ordered by path.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        let mut el = tx.xml_element(b"body", b"p");
+        el.attrs().register(b"align", Scalar::Int(1));
+        el.children().insert_element(0, b"b");
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![
+            Change::ListInsert {
+                path: p(&[b"body"]),
+                index: 0,
+                items: vec![SeqItem::Composite(ElementKind::XmlElement)],
+            },
+            Change::Added {
+                path: p(&[b"body", b"align"]),
+                kind: ElementKind::Register,
+            },
+        ]
+    );
+}
+
+#[test]
 fn xml_attr_changes_emit_in_sorted_key_order() {
     let mut d = doc();
     d.transact(|tx| {

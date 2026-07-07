@@ -8,10 +8,11 @@
 //! deep edit surfaces at its own path. Sequences diff to runs by stable id — a
 //! List to item inserts/deletes, a Text to codepoint inserts/deletes. The
 //! change list is ordered by path, so diffing the same pair is deterministic.
-//! An XmlElement diffs as its attrs (a keyed Map, value diffs) then its children
-//! (a sequence, structural inserts/deletes); a fragment as its children alone. A
-//! tag is part of an element's identity, so a changed tag at a slot reads as a
-//! replace.
+//! An XmlElement diffs as its children (a sequence, structural inserts/deletes at
+//! the element's own path) then its attrs (a keyed Map, value diffs at the deeper
+//! attr-key paths) — that order keeps the change list path-sorted; a fragment as
+//! its children alone. A tag is part of an element's identity, so a changed tag at
+//! a slot reads as a replace.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
@@ -166,25 +167,18 @@ fn diff_elem(a: &Element, b: &Element, prefix: &mut Vec<Vec<u8>>, out: &mut Vec<
     }
 }
 
-/// Diff two XmlElement snapshots at the same slot: attrs (a keyed Map → value
-/// diffs) then children (an ordered sequence → structural inserts/deletes). A
-/// tag is part of an element's identity, so a different tag at the same slot is
-/// a different element — a structural replace, not a field diff.
+/// Diff two XmlElement snapshots at the same slot: children (an ordered sequence
+/// → structural inserts/deletes at the element's own path) then attrs (a keyed
+/// Map → value diffs at the deeper attr-key paths), so the change list stays
+/// ordered by path. A tag is part of an element's identity, so a different tag at
+/// the same slot is a different element — a structural replace, not a field diff.
 fn diff_xml_element(
     a: &Rc<RefCell<XmlElement>>,
     b: &Rc<RefCell<XmlElement>>,
     prefix: &mut Vec<Vec<u8>>,
     out: &mut Vec<Change>,
 ) {
-    let (a_tag, a_attrs, a_children) = {
-        let x = a.borrow();
-        (x.tag().to_vec(), x.attrs(), x.children())
-    };
-    let (b_tag, b_attrs, b_children) = {
-        let x = b.borrow();
-        (x.tag().to_vec(), x.attrs(), x.children())
-    };
-    if a_tag != b_tag {
+    if a.borrow().tag() != b.borrow().tag() {
         out.push(Change::Removed {
             path: path_of(prefix),
             kind: ElementKind::XmlElement,
@@ -195,8 +189,16 @@ fn diff_xml_element(
         });
         return;
     }
-    diff_map(&a_attrs.borrow(), &b_attrs.borrow(), prefix, out);
+    let (a_attrs, a_children) = {
+        let x = a.borrow();
+        (x.attrs(), x.children())
+    };
+    let (b_attrs, b_children) = {
+        let x = b.borrow();
+        (x.attrs(), x.children())
+    };
     diff_list(&a_children.borrow(), &b_children.borrow(), prefix, out);
+    diff_map(&a_attrs.borrow(), &b_attrs.borrow(), prefix, out);
 }
 
 /// The scalar a leaf slot reads — inline or through a Register.
