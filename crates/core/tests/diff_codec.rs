@@ -138,6 +138,13 @@ fn a_truncated_change_list_is_an_error_not_a_panic() {
             index: 2,
             text: "hello".to_string(),
         },
+        Change::MarkChanged {
+            id: eid(1),
+            seq: eid(2),
+            name: b"bold".to_vec(),
+            old: Scalar::Bool(false),
+            new: Scalar::Bool(true),
+        },
     ]);
     for cut in 0..bytes.len() {
         assert!(

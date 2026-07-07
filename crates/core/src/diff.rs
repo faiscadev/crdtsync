@@ -17,7 +17,8 @@
 //! changed) and their changes append after the tree changes.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashSet};
 use std::rc::Rc;
 
 use crate::codec::{put_bytes, put_scalar, put_u32, put_u64, put_u8, Cursor, DecodeError};
@@ -159,57 +160,66 @@ fn mark_views(doc: &Document) -> Vec<(ElementId, MarkView)> {
         .collect()
 }
 
-/// Diff the two snapshots' mark sets by stable id: a mark id in new-not-old is an
-/// add, old-not-new a remove (its last value), in-both with a changed value a
-/// change. Emitted in id order so the same pair diffs identically.
+/// Diff the two snapshots' mark sets by stable id. Both `mark_views` lists come
+/// from `ranged_elements()`, which is sorted by id, so a merge-join emits add
+/// (new-only) / change (in-both, value differs) / remove (old-only, its last
+/// value) in id order — deterministic, so replicas that merged the same ops
+/// produce the same mark diff.
 fn diff_marks(old: &Document, new: &Document, out: &mut Vec<Change>) {
     let old_marks = mark_views(old);
-    let new_marks: Vec<(ElementId, MarkView)> = mark_views(new);
-    let old_by_id: HashMap<ElementId, &MarkView> =
-        old_marks.iter().map(|(id, v)| (*id, v)).collect();
-    let new_by_id: HashMap<ElementId, &MarkView> =
-        new_marks.iter().map(|(id, v)| (*id, v)).collect();
+    let new_marks = mark_views(new);
+    let (mut i, mut j) = (0, 0);
+    while i < old_marks.len() && j < new_marks.len() {
+        let (old_id, old_v) = &old_marks[i];
+        let (new_id, new_v) = &new_marks[j];
+        match old_id.as_bytes().cmp(&new_id.as_bytes()) {
+            Ordering::Less => {
+                out.push(mark_removed(*old_id, old_v));
+                i += 1;
+            }
+            Ordering::Greater => {
+                out.push(mark_added(*new_id, new_v));
+                j += 1;
+            }
+            Ordering::Equal => {
+                if old_v.value != new_v.value {
+                    out.push(Change::MarkChanged {
+                        id: *new_id,
+                        seq: new_v.seq,
+                        name: new_v.name.clone(),
+                        old: old_v.value.clone(),
+                        new: new_v.value.clone(),
+                    });
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    for (id, v) in &old_marks[i..] {
+        out.push(mark_removed(*id, v));
+    }
+    for (id, v) in &new_marks[j..] {
+        out.push(mark_added(*id, v));
+    }
+}
 
-    let mut changes: Vec<(ElementId, Change)> = Vec::new();
-    for (id, new_v) in &new_marks {
-        match old_by_id.get(id) {
-            None => changes.push((
-                *id,
-                Change::MarkAdded {
-                    id: *id,
-                    seq: new_v.seq,
-                    name: new_v.name.clone(),
-                    value: new_v.value.clone(),
-                },
-            )),
-            Some(old_v) if old_v.value != new_v.value => changes.push((
-                *id,
-                Change::MarkChanged {
-                    id: *id,
-                    seq: new_v.seq,
-                    name: new_v.name.clone(),
-                    old: old_v.value.clone(),
-                    new: new_v.value.clone(),
-                },
-            )),
-            Some(_) => {}
-        }
+fn mark_added(id: ElementId, v: &MarkView) -> Change {
+    Change::MarkAdded {
+        id,
+        seq: v.seq,
+        name: v.name.clone(),
+        value: v.value.clone(),
     }
-    for (id, old_v) in &old_marks {
-        if !new_by_id.contains_key(id) {
-            changes.push((
-                *id,
-                Change::MarkRemoved {
-                    id: *id,
-                    seq: old_v.seq,
-                    name: old_v.name.clone(),
-                    value: old_v.value.clone(),
-                },
-            ));
-        }
+}
+
+fn mark_removed(id: ElementId, v: &MarkView) -> Change {
+    Change::MarkRemoved {
+        id,
+        seq: v.seq,
+        name: v.name.clone(),
+        value: v.value.clone(),
     }
-    changes.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(&b.as_bytes()));
-    out.extend(changes.into_iter().map(|(_, c)| c));
 }
 
 /// Walk two maps in lockstep over the union of their live keys, sorted.
