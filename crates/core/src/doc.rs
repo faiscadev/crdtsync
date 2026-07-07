@@ -311,6 +311,11 @@ impl Document {
     /// resolves to off is omitted — the set holds only the marks actually on the
     /// character), in name order.
     pub fn marks_at(&self, seq: ElementId, index: usize) -> Vec<ResolvedMark> {
+        // When the sequence is a text child of a schema-typed XmlElement, only the
+        // marks its type declares read as active. The allowlist is a function of
+        // the enclosing element, so it is resolved once for the whole read, on the
+        // first named mark.
+        let mut allow: Option<Option<&[String]>> = None;
         // Group the covering marks by name, keeping each one's id and payload.
         let mut by_name: HashMap<&[u8], Vec<(ElementId, &RangedEntry)>> = HashMap::new();
         for (id, e) in &self.ranged {
@@ -320,6 +325,16 @@ impl Document {
             let Some(name) = &e.name else {
                 continue;
             };
+            let allowlist = *allow.get_or_insert_with(|| {
+                self.schema
+                    .as_ref()
+                    .and_then(|s| crate::validate::marks_allowlist(self, s, seq))
+            });
+            if let Some(allowlist) = allowlist {
+                if !allowlist.iter().any(|a| a.as_bytes() == name.as_slice()) {
+                    continue;
+                }
+            }
             if self.covers(e, seq, index) {
                 by_name.entry(name).or_default().push((*id, e));
             }
