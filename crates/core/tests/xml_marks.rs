@@ -201,6 +201,61 @@ fn a_mark_on_a_text_under_a_fragment_is_kept() {
     assert_eq!(mark_names(&d, &t, 2), vec![b"comment".to_vec()]);
 }
 
+// Para (tag "p") allows only Span text children — no element children. An xml
+// element child (tag "blink") is therefore disallowed.
+const DISALLOWED_CHILD: &str = r#"{
+    "schema": "prose", "version": 1, "root": "Doc",
+    "types": {
+        "Doc":  { "kind": "map", "children": { "body": "Para" } },
+        "Para": { "kind": "xml", "tag": "p", "children": ["Span"], "marks": ["bold"] },
+        "Span": { "kind": "text" }
+    },
+    "marks": { "bold": { "flavor": "boolean" }, "comment": { "flavor": "object" } }
+}"#;
+
+#[test]
+fn a_mark_under_a_disallowed_tag_element_is_kept() {
+    // A <blink> element is not in Para's `children`, so the type walk never
+    // descends it — its text has no resolved marks allowlist and keeps every
+    // mark. The disallowed element itself is structural repair's concern (5c),
+    // which drops it (and its text with it); until then no per-type mark
+    // restriction applies under it.
+    let mut d = Document::new(cid(1));
+    d.set_schema(schema(DISALLOWED_CHILD));
+    d.transact(|tx| {
+        let mut para = tx.xml_element(b"body", b"p");
+        let mut kids = para.children();
+        kids.insert_element(0, b"blink")
+            .children()
+            .insert_text(0)
+            .insert(0, "hello");
+    });
+    let blink = match d.get(b"body") {
+        Some(Element::XmlElement(x)) => {
+            let c = x.borrow().children();
+            let child = c.borrow().get(0);
+            match child {
+                Some(Element::XmlElement(b)) => b,
+                _ => panic!("no blink element"),
+            }
+        }
+        _ => panic!("no para"),
+    };
+    let t = {
+        let c = blink.borrow().children();
+        let child = c.borrow().get(0);
+        match child {
+            Some(Element::Text(t)) => t,
+            _ => panic!("no text under blink"),
+        }
+    };
+    let (s, e) = span(&t, 0, 5);
+    d.transact(|tx| {
+        tx.ranged().mark(b"comment", s, e, Scalar::Bool(true));
+    });
+    assert_eq!(mark_names(&d, &t, 2), vec![b"comment".to_vec()]);
+}
+
 #[test]
 fn the_disallowed_mark_stays_in_the_raw_annotation_set() {
     // The filter is read-only: marks_at drops it, but the RangedElement is still

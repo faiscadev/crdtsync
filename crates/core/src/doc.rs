@@ -312,12 +312,11 @@ impl Document {
     /// character), in name order.
     pub fn marks_at(&self, seq: ElementId, index: usize) -> Vec<ResolvedMark> {
         // When the sequence is a text child of a schema-typed XmlElement, only the
-        // marks its type declares read as active — resolved once, since it depends
-        // on the enclosing element, not the character.
-        let allow = self
-            .schema
-            .as_ref()
-            .and_then(|s| crate::validate::marks_allowlist(self, s, seq));
+        // marks its type declares read as active. The allowlist depends on the
+        // enclosing element, not the character, so it is resolved at most once —
+        // and lazily, on the first named mark, so a set with no marks pays nothing
+        // for the tree walk. The outer `None` is "not yet resolved".
+        let mut allow: Option<Option<&[String]>> = None;
         // Group the covering marks by name, keeping each one's id and payload.
         let mut by_name: HashMap<&[u8], Vec<(ElementId, &RangedEntry)>> = HashMap::new();
         for (id, e) in &self.ranged {
@@ -327,8 +326,13 @@ impl Document {
             let Some(name) = &e.name else {
                 continue;
             };
-            if let Some(allow) = allow {
-                if !allow.iter().any(|a| a.as_bytes() == name.as_slice()) {
+            let allowlist = *allow.get_or_insert_with(|| {
+                self.schema
+                    .as_ref()
+                    .and_then(|s| crate::validate::marks_allowlist(self, s, seq))
+            });
+            if let Some(allowlist) = allowlist {
+                if !allowlist.iter().any(|a| a.as_bytes() == name.as_slice()) {
                     continue;
                 }
             }
