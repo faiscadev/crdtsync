@@ -466,6 +466,196 @@ fn an_over_max_text_child_reads_truncated_through_xml() {
     );
 }
 
+// --- validate + repair: per-type cardinality (exclusive collision) ---
+
+// A schema whose Body element caps Heading (tag "h1") at one instance via a
+// per-child-type `max`, while Para (tag "p") is unbounded. A second Heading is an
+// exclusive collision: the lamport-newest excess drops, keeping the oldest.
+const EXCLUSIVE: &str = r#"{
+    "schema": "prose", "version": 1, "root": "Doc",
+    "types": {
+        "Doc":     { "kind": "map", "children": { "body": "Body" } },
+        "Body":    { "kind": "xml", "tag": "body", "children": { "Heading": { "max": 1 }, "Para": {} } },
+        "Heading": { "kind": "xml", "tag": "h1", "children": { "Span": {} } },
+        "Para":    { "kind": "xml", "tag": "p", "children": { "Span": {} } },
+        "Span":    { "kind": "text" }
+    }
+}"#;
+
+#[test]
+fn a_single_child_of_an_exclusive_type_conforms() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"body")
+            .children()
+            .insert_element(0, b"h1");
+    });
+    assert!(validate(&d, &schema(EXCLUSIVE)).is_empty());
+}
+
+#[test]
+fn a_second_child_of_an_exclusive_type_is_reported() {
+    // Body caps Heading at one; the second-inserted h1 (index 1) has the newer
+    // stamp, so it is the excess while the lamport-oldest (index 0) survives.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut body = tx.xml_element(b"body", b"body");
+        let mut kids = body.children();
+        kids.insert_element(0, b"h1");
+        kids.insert_element(1, b"h1");
+    });
+    let v = validate(&d, &schema(EXCLUSIVE));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(1)],
+        &ViolationKind::ExcessChild { max: 1 }
+    ));
+    assert!(!has(
+        &v,
+        &[key("body"), Step::Index(0)],
+        &ViolationKind::ExcessChild { max: 1 }
+    ));
+}
+
+#[test]
+fn the_dropped_excess_is_the_lamport_newest_not_the_last_in_sequence() {
+    // Insert the newer heading at the front so sequence order and stamp order
+    // disagree: index 0 is the newer stamp, index 1 the older. Keep-oldest drops
+    // index 0, proving the drop is by stamp, not sequence position.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut body = tx.xml_element(b"body", b"body");
+        let mut kids = body.children();
+        kids.insert_element(0, b"h1");
+        kids.insert_element(0, b"h1");
+    });
+    let v = validate(&d, &schema(EXCLUSIVE));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(0)],
+        &ViolationKind::ExcessChild { max: 1 }
+    ));
+    assert!(!has(
+        &v,
+        &[key("body"), Step::Index(1)],
+        &ViolationKind::ExcessChild { max: 1 }
+    ));
+}
+
+#[test]
+fn an_unbounded_child_type_never_excesses() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut body = tx.xml_element(b"body", b"body");
+        let mut kids = body.children();
+        kids.insert_element(0, b"p");
+        kids.insert_element(1, b"p");
+        kids.insert_element(2, b"p");
+    });
+    let v = validate(&d, &schema(EXCLUSIVE));
+    assert!(
+        v.iter()
+            .all(|x| !matches!(x.kind, ViolationKind::ExcessChild { .. })),
+        "unbounded Para never excesses, got {v:?}"
+    );
+}
+
+#[test]
+fn all_but_the_oldest_drop_when_the_cap_is_one() {
+    // Three headings under a max-1 cap: the two newest drop in sequence order, the
+    // lamport-oldest (index 0) survives.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut body = tx.xml_element(b"body", b"body");
+        let mut kids = body.children();
+        kids.insert_element(0, b"h1");
+        kids.insert_element(1, b"h1");
+        kids.insert_element(2, b"h1");
+    });
+    let v = validate(&d, &schema(EXCLUSIVE));
+    let excess: Vec<&Vec<Step>> = v
+        .iter()
+        .filter(|x| matches!(x.kind, ViolationKind::ExcessChild { .. }))
+        .map(|x| &x.path)
+        .collect();
+    assert_eq!(
+        excess,
+        vec![
+            &vec![key("body"), Step::Index(1)],
+            &vec![key("body"), Step::Index(2)],
+        ],
+        "the two newest of three drop, the oldest survives"
+    );
+}
+
+#[test]
+fn an_excess_child_reads_dropped() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut body = tx.xml_element(b"body", b"body");
+        let mut kids = body.children();
+        kids.insert_element(0, b"h1");
+        kids.insert_element(1, b"h1");
+    });
+    let r = repairs(&d, &schema(EXCLUSIVE));
+    assert!(r.contains(&Repair {
+        path: vec![key("body"), Step::Index(1)],
+        kind: RepairKind::Dropped,
+    }));
+}
+
+// A cap of zero: the type is declared allowed but permits no instances, so every
+// child of it drops.
+const NO_HEADINGS: &str = r#"{
+    "schema": "prose", "version": 1, "root": "Doc",
+    "types": {
+        "Doc":     { "kind": "map", "children": { "body": "Body" } },
+        "Body":    { "kind": "xml", "tag": "body", "children": { "Heading": { "max": 0 }, "Para": {} } },
+        "Heading": { "kind": "xml", "tag": "h1", "children": {} },
+        "Para":    { "kind": "xml", "tag": "p", "children": {} }
+    }
+}"#;
+
+#[test]
+fn a_zero_cap_drops_every_child_of_that_type() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"body")
+            .children()
+            .insert_element(0, b"h1");
+    });
+    let v = validate(&d, &schema(NO_HEADINGS));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(0)],
+        &ViolationKind::ExcessChild { max: 0 }
+    ));
+    let r = repairs(&d, &schema(NO_HEADINGS));
+    assert!(r.contains(&Repair {
+        path: vec![key("body"), Step::Index(0)],
+        kind: RepairKind::Dropped,
+    }));
+}
+
+#[test]
+fn two_replicas_produce_the_same_exclusive_violations() {
+    let mut a = Document::new(cid(1));
+    let ops = a.transact(|tx| {
+        let mut body = tx.xml_element(b"body", b"body");
+        let mut kids = body.children();
+        kids.insert_element(0, b"h1");
+        kids.insert_element(1, b"h1");
+    });
+    let mut b = Document::new(cid(2));
+    for op in &ops {
+        b.apply(op);
+    }
+    assert_eq!(
+        validate(&a, &schema(EXCLUSIVE)),
+        validate(&b, &schema(EXCLUSIVE))
+    );
+}
+
 // --- determinism ---
 
 #[test]

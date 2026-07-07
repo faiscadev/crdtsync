@@ -4,8 +4,9 @@
 //! schema-conformant read applies over merged state: a register/counter integer
 //! clamped into its declared bounds, a list/text truncated to its `max` by
 //! dropping the lamport-newest excess, a disallowed / mistyped attr or disallowed
-//! xml child dropped from the element, or loose inline text wrapped in a
-//! synthesized default block. It is a pure read — the stored ops are never touched
+//! xml child dropped from the element, an xml child over its type's per-type `max`
+//! cardinality cap dropped keeping the lamport-oldest, or loose inline text wrapped
+//! in a synthesized default block. It is a pure read — the stored ops are never touched
 //! — and every input is a value already in state, so a repair mints nothing and
 //! needs no clock: even the wrap introduces no op, its wrapper id derived from the
 //! orphan so every replica synthesizes the same one.
@@ -139,7 +140,8 @@ pub(crate) fn keyed_repairs(doc: &Document, schema: &Schema) -> Vec<(Repair, Rep
                 }
                 ViolationKind::DisallowedAttr
                 | ViolationKind::MistypedAttr { .. }
-                | ViolationKind::DisallowedChild => {
+                | ViolationKind::DisallowedChild
+                | ViolationKind::ExcessChild { .. } => {
                     (RepairKind::Dropped, RepairId::Drop { path: path.clone() })
                 }
                 ViolationKind::OrphanInline { block } => {
