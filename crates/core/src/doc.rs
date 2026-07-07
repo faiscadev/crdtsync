@@ -312,10 +312,9 @@ impl Document {
     /// character), in name order.
     pub fn marks_at(&self, seq: ElementId, index: usize) -> Vec<ResolvedMark> {
         // When the sequence is a text child of a schema-typed XmlElement, only the
-        // marks its type declares read as active. The allowlist depends on the
-        // enclosing element, not the character, so it is resolved at most once —
-        // and lazily, on the first named mark, so a set with no marks pays nothing
-        // for the tree walk. The outer `None` is "not yet resolved".
+        // marks its type declares read as active. The allowlist is a function of
+        // the enclosing element, so it is resolved once for the whole read, on the
+        // first named mark.
         let mut allow: Option<Option<&[String]>> = None;
         // Group the covering marks by name, keeping each one's id and payload.
         let mut by_name: HashMap<&[u8], Vec<(ElementId, &RangedEntry)>> = HashMap::new();
