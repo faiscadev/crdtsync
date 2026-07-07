@@ -161,6 +161,8 @@ fn expected_kind(td: &TypeDef) -> ElementKind {
         TypeDef::Text { .. } => ElementKind::Text,
         TypeDef::Register { .. } => ElementKind::Register,
         TypeDef::Counter { .. } => ElementKind::Counter,
+        TypeDef::Xml { tag: Some(_), .. } => ElementKind::XmlElement,
+        TypeDef::Xml { tag: None, .. } => ElementKind::XmlFragment,
     }
 }
 
