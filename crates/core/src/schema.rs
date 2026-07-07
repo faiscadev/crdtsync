@@ -1064,16 +1064,7 @@ fn parse_xml_children(json: &Json, ctx: &str) -> Result<Vec<(String, Option<u64>
             .as_object()
             .ok_or_else(|| SchemaError::new(SchemaErrorKind::NotAnObject, child_ctx.clone()))?;
         reject_unknown_fields(cobj, &["max"], &child_ctx)?;
-        let max = match int_field(constraints, "max", &child_ctx)? {
-            None => None,
-            Some(m) if m >= 0 => Some(m as u64),
-            Some(_) => {
-                return Err(SchemaError::new(
-                    SchemaErrorKind::BadRange,
-                    at(&child_ctx, "max"),
-                ))
-            }
-        };
+        let max = count_field(constraints, "max", &child_ctx)?;
         out.push((name.clone(), max));
     }
     Ok(out)
