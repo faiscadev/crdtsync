@@ -334,3 +334,275 @@ fn changes_are_ordered_by_path() {
         .collect();
     assert_eq!(paths, vec![p(&[b"a"]), p(&[b"b"]), p(&[b"c"])]);
 }
+
+// --- xml elements and fragments ---
+
+#[test]
+fn an_xml_document_diffs_without_panicking() {
+    // An xml element in a slot must not fall through to the scalar branch — that
+    // was an `unreachable!` panic before the xml arms existed.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .attrs()
+            .register(b"align", Scalar::Int(1));
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .attrs()
+            .register(b"align", Scalar::Int(2));
+    });
+    let _ = diff(&old, &d); // no panic
+}
+
+#[test]
+fn an_added_xml_attr_is_reported_at_its_keyed_path() {
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .attrs()
+            .register(b"align", Scalar::Int(1));
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::Added {
+            path: p(&[b"body", b"align"]),
+            kind: ElementKind::Register,
+        }]
+    );
+}
+
+#[test]
+fn a_changed_xml_attr_reports_a_value_diff() {
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .attrs()
+            .register(b"align", Scalar::Int(1));
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .attrs()
+            .register(b"align", Scalar::Int(2));
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::Value {
+            path: p(&[b"body", b"align"]),
+            old: Scalar::Int(1),
+            new: Scalar::Int(2),
+        }]
+    );
+}
+
+#[test]
+fn a_removed_xml_attr_is_reported() {
+    let mut d = doc();
+    d.transact(|tx| {
+        let mut el = tx.xml_element(b"body", b"p");
+        el.attrs().register(b"align", Scalar::Int(1));
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p").attrs().delete(b"align");
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::Removed {
+            path: p(&[b"body", b"align"]),
+            kind: ElementKind::Register,
+        }]
+    );
+}
+
+#[test]
+fn an_inserted_child_element_is_a_structural_change() {
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .children()
+            .insert_element(0, b"b");
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::ListInsert {
+            path: p(&[b"body"]),
+            index: 0,
+            items: vec![SeqItem::Composite(ElementKind::XmlElement)],
+        }]
+    );
+}
+
+#[test]
+fn an_inserted_text_child_is_a_structural_change() {
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .children()
+            .insert_text(0)
+            .insert(0, "hi");
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::ListInsert {
+            path: p(&[b"body"]),
+            index: 0,
+            items: vec![SeqItem::Composite(ElementKind::Text)],
+        }]
+    );
+}
+
+#[test]
+fn a_deleted_child_is_a_structural_change() {
+    let mut d = doc();
+    d.transact(|tx| {
+        let mut el = tx.xml_element(b"body", b"p");
+        let mut kids = el.children();
+        kids.insert_element(0, b"b");
+        kids.insert_element(1, b"i");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p").children().delete(0);
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::ListDelete {
+            path: p(&[b"body"]),
+            index: 0,
+            items: vec![SeqItem::Composite(ElementKind::XmlElement)],
+        }]
+    );
+}
+
+#[test]
+fn a_fragment_child_insert_is_reported() {
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_fragment(b"body");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        tx.xml_fragment(b"body").children().insert_element(0, b"p");
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::ListInsert {
+            path: p(&[b"body"]),
+            index: 0,
+            items: vec![SeqItem::Composite(ElementKind::XmlElement)],
+        }]
+    );
+}
+
+#[test]
+fn an_xml_element_whose_tag_changes_is_a_replace() {
+    // The tag is part of an element's identity, so a different tag at the same
+    // slot is a different element — a structural replace, not a field diff.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| tx.delete(b"body"));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"div");
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![
+            Change::Removed {
+                path: p(&[b"body"]),
+                kind: ElementKind::XmlElement,
+            },
+            Change::Added {
+                path: p(&[b"body"]),
+                kind: ElementKind::XmlElement,
+            },
+        ]
+    );
+}
+
+#[test]
+fn an_element_replaced_by_a_fragment_is_a_kind_replace() {
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| tx.delete(b"body"));
+    d.transact(|tx| {
+        tx.xml_fragment(b"body");
+    });
+    assert_eq!(
+        diff(&old, &d),
+        vec![
+            Change::Removed {
+                path: p(&[b"body"]),
+                kind: ElementKind::XmlElement,
+            },
+            Change::Added {
+                path: p(&[b"body"]),
+                kind: ElementKind::XmlFragment,
+            },
+        ]
+    );
+}
+
+#[test]
+fn an_unchanged_xml_element_is_silent() {
+    let mut d = doc();
+    d.transact(|tx| {
+        let mut el = tx.xml_element(b"body", b"p");
+        el.attrs().register(b"align", Scalar::Int(1));
+        el.children().insert_element(0, b"b");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| tx.register(b"other", Scalar::Int(9)));
+    assert_eq!(
+        diff(&old, &d),
+        vec![Change::Added {
+            path: p(&[b"other"]),
+            kind: ElementKind::Register,
+        }]
+    );
+}
+
+#[test]
+fn xml_attr_changes_emit_in_sorted_key_order() {
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p");
+    });
+    let old = snapshot(&d);
+    d.transact(|tx| {
+        let mut attrs = tx.xml_element(b"body", b"p");
+        attrs.attrs().register(b"width", Scalar::Int(1));
+        attrs.attrs().register(b"align", Scalar::Int(1));
+    });
+    let paths: Vec<Vec<u8>> = diff(&old, &d)
+        .into_iter()
+        .map(|c| match c {
+            Change::Added { path, .. } => path,
+            other => panic!("expected an add, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        vec![p(&[b"body", b"align"]), p(&[b"body", b"width"])]
+    );
+}
