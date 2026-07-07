@@ -150,6 +150,17 @@ fn a_key_past_a_fragment_does_not_resolve() {
     assert_eq!(path::get_int(&d, &p(&["root", "class"])), None);
 }
 
+#[test]
+fn a_fragment_nested_in_a_map_is_still_a_dead_end() {
+    // The dead end holds one level down too: a fragment under a map has no attrs,
+    // so a write past it never lands on the fragment slot.
+    let mut d = doc(1);
+    path::xml_fragment(&mut d, &p(&["outer", "frag"]));
+    path::register_int(&mut d, &p(&["outer", "frag", "class"]), 1);
+    assert_eq!(path::get_int(&d, &p(&["outer", "frag", "class"])), None);
+    assert_eq!(path::xml_tag(&d, &p(&["outer", "frag"])), None);
+}
+
 // --- convergence ---
 
 #[test]

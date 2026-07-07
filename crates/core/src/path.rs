@@ -310,15 +310,16 @@ where
     let Some((leaf_key, parents)) = keys.split_last() else {
         return Vec::new();
     };
-    if !writable(doc, parents) {
-        return Vec::new();
-    }
-    doc.transact(|tx| descend(tx, parents, |cur| leaf(cur, leaf_key)))
+    doc.transact(|tx| {
+        descend(tx, parents, |cur| leaf(cur, leaf_key));
+    })
 }
 
-/// Descend `parents` from `cur`, creating maps as needed, then run `f` on the
-/// map that holds the leaf. Iterative — path depth is caller-supplied, so a
-/// recursive walk could overflow the stack.
+/// Descend `parents` from `cur`, creating maps as needed and descending into an
+/// element's attrs, then run `f` on the map that holds the leaf. A parent that
+/// is a dead end (an `XmlFragment`, which has no attrs) stops the walk before
+/// `f` runs, so the write leaves nothing at an unreachable path. Iterative —
+/// path depth is caller-supplied, so a recursive walk could overflow the stack.
 fn descend<F>(cur: &mut MapCursor, parents: &[Vec<u8>], f: F)
 where
     F: FnOnce(&mut MapCursor),
@@ -327,9 +328,14 @@ where
         f(cur);
         return;
     };
-    let mut child = cur.child(first);
+    let Some(mut child) = cur.child(first) else {
+        return;
+    };
     for key in rest {
-        child = child.into_child(key);
+        let Some(next) = child.into_child(key) else {
+            return;
+        };
+        child = next;
     }
     f(&mut child);
 }
@@ -367,23 +373,4 @@ fn resolve_map(doc: &Document, parents: &[Vec<u8>]) -> Option<Rc<RefCell<Map>>> 
         cur = next;
     }
     Some(cur)
-}
-
-/// Whether the write path `parents` can be descended: a key holding an
-/// `XmlFragment` is a dead end (a fragment has no attrs), so a write past it
-/// emits nothing rather than materialising a phantom Map that would diverge
-/// from the fragment slot. A Map or `XmlElement` is descendable; an absent slot
-/// is create-through (nothing live can lurk below it).
-fn writable(doc: &Document, parents: &[Vec<u8>]) -> bool {
-    let mut cur = doc.root();
-    for key in parents {
-        let next = match cur.borrow().get(key) {
-            Some(Element::Map(m)) => m,
-            Some(Element::XmlElement(x)) => x.borrow().attrs(),
-            Some(Element::XmlFragment(_)) => return false,
-            _ => return true,
-        };
-        cur = next;
-    }
-    true
 }
