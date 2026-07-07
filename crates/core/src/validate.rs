@@ -400,7 +400,10 @@ impl<'a> Validator<'a> {
             }
             (
                 TypeDef::Xml {
-                    attrs, children, ..
+                    attrs,
+                    children,
+                    orphan_inline,
+                    ..
                 },
                 Element::XmlElement(x),
             ) => {
@@ -410,12 +413,19 @@ impl<'a> Validator<'a> {
                 };
                 // Queue children first, then attrs on top, so attrs (sorted keys)
                 // emit before children (sequence order) in the popped tree order.
-                self.queue_xml_children(children, &children_list, &path);
+                self.queue_xml_children(children, orphan_inline.as_deref(), &children_list, &path);
                 self.check_xml_attrs(attrs, &attrs_map, &path);
             }
-            (TypeDef::Xml { children, .. }, Element::XmlFragment(f)) => {
+            (
+                TypeDef::Xml {
+                    children,
+                    orphan_inline,
+                    ..
+                },
+                Element::XmlFragment(f),
+            ) => {
                 let children_list = f.borrow().children();
-                self.queue_xml_children(children, &children_list, &path);
+                self.queue_xml_children(children, orphan_inline.as_deref(), &children_list, &path);
             }
             _ => {}
         }
@@ -462,17 +472,28 @@ impl<'a> Validator<'a> {
     /// resolves to in `children`. A child whose tag matches no allowed type is a
     /// `DisallowedChild` reported at its position and not descended — it drops from
     /// the read, so its own subtree is not validated; a child that resolves is
-    /// checked, reaching its nested attrs and children.
+    /// checked, reaching its nested attrs and children. The one exception is loose
+    /// inline text under a type that declares `orphan_inline`: the schema asks for
+    /// it to be wrapped in that block type, not dropped, so it is left untouched
+    /// here for the orphan-inline wrap (5c-ii) rather than reported as disallowed.
     fn queue_xml_children(
         &mut self,
         children: &'a [String],
+        orphan_inline: Option<&'a str>,
         list: &Rc<RefCell<List>>,
         path: &Rc<PathNode>,
     ) {
         let mut queued = Vec::new();
         for (i, child) in list.borrow().values().into_iter().enumerate().rev() {
+            let child_type = resolve_child_type(self.schema, &child, children);
+            // Loose inline text under an orphan_inline type is the wrap's concern,
+            // not a disallowed child — leave it for 5c-ii.
+            if child_type.is_none() && orphan_inline.is_some() && matches!(child, Element::Text(_))
+            {
+                continue;
+            }
             let child_path = Rc::new(PathNode::Step(Step::Index(i), Some(path.clone())));
-            match resolve_child_type(self.schema, &child, children) {
+            match child_type {
                 Some(child_type) => queued.push(Work::Check {
                     element: child,
                     type_name: child_type,

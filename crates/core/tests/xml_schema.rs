@@ -233,6 +233,61 @@ fn disallowed_children_emit_in_sequence_order() {
     );
 }
 
+// A schema whose Para block declares an orphan-inline wrap target: loose inline
+// text under it is to be wrapped (5c-ii), not dropped as a disallowed child.
+const ORPHAN_INLINE: &str = r#"{
+    "schema": "prose", "version": 1, "root": "Doc",
+    "types": {
+        "Doc":  { "kind": "map", "children": { "body": "Sect" } },
+        "Sect": { "kind": "xml", "tag": "section", "children": ["Para"], "repair": { "orphanInline": "Para" } },
+        "Para": { "kind": "xml", "tag": "p", "children": ["Span"] },
+        "Span": { "kind": "text" }
+    }
+}"#;
+
+#[test]
+fn loose_inline_text_under_an_orphan_inline_type_is_not_dropped() {
+    // Sect allows only Para children and declares repair.orphanInline, so a bare
+    // text child is an orphan to be wrapped (5c-ii), not a disallowed child — it
+    // must not be reported/dropped here, or the wrap loses the content.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"section")
+            .children()
+            .insert_text(0)
+            .insert(0, "hello");
+    });
+    let v = validate(&d, &schema(ORPHAN_INLINE));
+    assert!(
+        !v.iter().any(|x| x.kind == ViolationKind::DisallowedChild),
+        "orphan inline text is not a disallowed child, got {v:?}"
+    );
+    assert!(
+        repairs(&d, &schema(ORPHAN_INLINE))
+            .iter()
+            .all(|r| r.kind != RepairKind::Dropped),
+        "orphan inline text is not dropped"
+    );
+}
+
+#[test]
+fn a_disallowed_element_child_under_an_orphan_inline_type_still_drops() {
+    // The orphan-inline carve-out is for inline *text* only; a disallowed element
+    // child (a <b> where only Para is allowed) is still a disallowed child.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"section")
+            .children()
+            .insert_element(0, b"b");
+    });
+    let v = validate(&d, &schema(ORPHAN_INLINE));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(0)],
+        &ViolationKind::DisallowedChild
+    ));
+}
+
 // --- repair: disallowed children ---
 
 #[test]

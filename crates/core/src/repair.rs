@@ -66,8 +66,9 @@ pub(crate) enum RepairId {
         path: Vec<Step>,
         survivors: Vec<Stamp>,
     },
-    /// A dropped attribute, identified by its location — the reading (absent) is
-    /// the same whenever the location is in violation, so the path is the identity.
+    /// A dropped node — a disallowed / mistyped attr, or a disallowed xml child —
+    /// identified by its location; the reading (absent) is the same whenever the
+    /// location is in violation, so the path is the identity.
     Drop {
         path: Vec<Step>,
     },
