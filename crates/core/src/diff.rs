@@ -214,8 +214,11 @@ fn scalar_of(e: &Element) -> Scalar {
 /// its stable id (a `Stamp`) that is live in one snapshot and not the other is
 /// an exact insert or delete; consecutive same-op items coalesce into a run,
 /// deletes (at their index in the old list) before inserts (at their index in
-/// the new list). A node still live in both is unchanged in position; a change
-/// to a composite item's own contents surfaces at that item's path.
+/// the new list). A node live in both keeps its position and is not descended
+/// into: a scalar item is immutable, so its content cannot change; a composite
+/// item's own inner edits are not reported here (recursing into a surviving
+/// sequence composite by its index path is a follow-up — no editing path reaches
+/// such a state yet, so there is nothing to diff).
 fn diff_list(old: &List, new: &List, prefix: &[Vec<u8>], out: &mut Vec<Change>) {
     let old_seq = list_seq(old);
     let new_seq = list_seq(new);
