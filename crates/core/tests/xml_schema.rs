@@ -157,6 +157,154 @@ fn a_conforming_nested_element_has_no_violations() {
     assert!(validate(&d, &schema(NESTED)).is_empty());
 }
 
+// --- validate: disallowed children ---
+
+#[test]
+fn a_disallowed_child_element_is_reported() {
+    // Para allows only Span text children; a <b> element child matches no allowed
+    // child type, so it is a disallowed child at its sequence position.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .children()
+            .insert_element(0, b"b");
+    });
+    let v = validate(&d, &schema(FLAT));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(0)],
+        &ViolationKind::DisallowedChild
+    ));
+}
+
+#[test]
+fn a_nested_disallowed_child_is_reported_through_recursion() {
+    // Under the Article fragment a Para is allowed, but a <b> inside that Para is
+    // not (Para allows only Span) — reached only by descending the conforming Para.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut body = tx.xml_fragment(b"body");
+        let mut kids = body.children();
+        let mut para = kids.insert_element(0, b"p");
+        para.children().insert_element(0, b"b");
+    });
+    let v = validate(&d, &schema(NESTED));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(0), Step::Index(0)],
+        &ViolationKind::DisallowedChild
+    ));
+}
+
+#[test]
+fn a_conforming_child_is_not_reported() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .children()
+            .insert_text(0)
+            .insert(0, "hi");
+    });
+    assert!(validate(&d, &schema(FLAT)).is_empty());
+}
+
+#[test]
+fn disallowed_children_emit_in_sequence_order() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut el = tx.xml_element(b"body", b"p");
+        let mut kids = el.children();
+        kids.insert_element(0, b"b");
+        kids.insert_element(1, b"i");
+    });
+    let v = validate(&d, &schema(FLAT));
+    let children: Vec<&Vec<Step>> = v
+        .iter()
+        .filter(|x| x.kind == ViolationKind::DisallowedChild)
+        .map(|x| &x.path)
+        .collect();
+    assert_eq!(
+        children,
+        vec![
+            &vec![key("body"), Step::Index(0)],
+            &vec![key("body"), Step::Index(1)],
+        ],
+        "disallowed children emit in sequence order"
+    );
+}
+
+// A schema whose Para block declares an orphan-inline wrap target: loose inline
+// text under it is to be wrapped (5c-ii), not dropped as a disallowed child.
+const ORPHAN_INLINE: &str = r#"{
+    "schema": "prose", "version": 1, "root": "Doc",
+    "types": {
+        "Doc":  { "kind": "map", "children": { "body": "Sect" } },
+        "Sect": { "kind": "xml", "tag": "section", "children": ["Para"], "repair": { "orphanInline": "Para" } },
+        "Para": { "kind": "xml", "tag": "p", "children": ["Span"] },
+        "Span": { "kind": "text" }
+    }
+}"#;
+
+#[test]
+fn loose_inline_text_under_an_orphan_inline_type_is_not_dropped() {
+    // Sect allows only Para children and declares repair.orphanInline, so a bare
+    // text child is an orphan to be wrapped (5c-ii), not a disallowed child — it
+    // must not be reported/dropped here, or the wrap loses the content.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"section")
+            .children()
+            .insert_text(0)
+            .insert(0, "hello");
+    });
+    let v = validate(&d, &schema(ORPHAN_INLINE));
+    assert!(
+        !v.iter().any(|x| x.kind == ViolationKind::DisallowedChild),
+        "orphan inline text is not a disallowed child, got {v:?}"
+    );
+    assert!(
+        repairs(&d, &schema(ORPHAN_INLINE))
+            .iter()
+            .all(|r| r.kind != RepairKind::Dropped),
+        "orphan inline text is not dropped"
+    );
+}
+
+#[test]
+fn a_disallowed_element_child_under_an_orphan_inline_type_still_drops() {
+    // The orphan-inline carve-out is for inline *text* only; a disallowed element
+    // child (a <b> where only Para is allowed) is still a disallowed child.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"section")
+            .children()
+            .insert_element(0, b"b");
+    });
+    let v = validate(&d, &schema(ORPHAN_INLINE));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(0)],
+        &ViolationKind::DisallowedChild
+    ));
+}
+
+// --- repair: disallowed children ---
+
+#[test]
+fn a_disallowed_child_reads_dropped() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"p")
+            .children()
+            .insert_element(0, b"b");
+    });
+    let r = repairs(&d, &schema(FLAT));
+    assert!(r.contains(&Repair {
+        path: vec![key("body"), Step::Index(0)],
+        kind: RepairKind::Dropped,
+    }));
+}
+
 // --- repair: attrs ---
 
 #[test]

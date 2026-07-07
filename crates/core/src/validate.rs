@@ -58,6 +58,9 @@ pub enum ViolationKind {
     TooLong { len: u64, max: u64 },
     /// An attribute key an xml element's declared type does not list in `attrs`.
     DisallowedAttr,
+    /// An xml child whose tag matches no child type the governing type allows — a
+    /// disallowed child drops from a conformant read of the children sequence.
+    DisallowedChild,
     /// An attribute whose value is the wrong kind for its declared attr type — a
     /// mistyped attr is dropped, not clamped, so it is distinct from an
     /// out-of-range (right-kind) attr value.
@@ -397,7 +400,10 @@ impl<'a> Validator<'a> {
             }
             (
                 TypeDef::Xml {
-                    attrs, children, ..
+                    attrs,
+                    children,
+                    orphan_inline,
+                    ..
                 },
                 Element::XmlElement(x),
             ) => {
@@ -407,12 +413,19 @@ impl<'a> Validator<'a> {
                 };
                 // Queue children first, then attrs on top, so attrs (sorted keys)
                 // emit before children (sequence order) in the popped tree order.
-                self.queue_xml_children(children, &children_list, &path);
+                self.queue_xml_children(children, orphan_inline.as_deref(), &children_list, &path);
                 self.check_xml_attrs(attrs, &attrs_map, &path);
             }
-            (TypeDef::Xml { children, .. }, Element::XmlFragment(f)) => {
+            (
+                TypeDef::Xml {
+                    children,
+                    orphan_inline,
+                    ..
+                },
+                Element::XmlFragment(f),
+            ) => {
                 let children_list = f.borrow().children();
-                self.queue_xml_children(children, &children_list, &path);
+                self.queue_xml_children(children, orphan_inline.as_deref(), &children_list, &path);
             }
             _ => {}
         }
@@ -455,26 +468,39 @@ impl<'a> Validator<'a> {
         self.stack.extend(queued);
     }
 
-    /// Queue each child of an xml element / fragment that resolves to an allowed
-    /// child type (its tag matched against `children`). A child that resolves to no
-    /// allowed type is a disallowed child — left to structural repair (5c); here it
-    /// is simply not descended, so a nested element's own attrs are still reached
-    /// through the children that do resolve.
+    /// Queue each child of an xml element / fragment against the type its tag
+    /// resolves to in `children`. A child whose tag matches no allowed type is a
+    /// `DisallowedChild` reported at its position and not descended — it drops from
+    /// the read, so its own subtree is not validated; a child that resolves is
+    /// checked, reaching its nested attrs and children. The one exception is loose
+    /// inline text under a type that declares `orphan_inline`: the schema asks for
+    /// it to be wrapped in that block type, not dropped, so it is left untouched
+    /// here for the orphan-inline wrap (5c-ii) rather than reported as disallowed.
     fn queue_xml_children(
         &mut self,
         children: &'a [String],
+        orphan_inline: Option<&'a str>,
         list: &Rc<RefCell<List>>,
         path: &Rc<PathNode>,
     ) {
         let mut queued = Vec::new();
         for (i, child) in list.borrow().values().into_iter().enumerate().rev() {
-            if let Some(child_type) = resolve_child_type(self.schema, &child, children) {
-                let child_path = Rc::new(PathNode::Step(Step::Index(i), Some(path.clone())));
-                queued.push(Work::Check {
+            let child_type = resolve_child_type(self.schema, &child, children);
+            if child_type.is_none() && orphan_inline.is_some() && matches!(child, Element::Text(_))
+            {
+                continue;
+            }
+            let child_path = Rc::new(PathNode::Step(Step::Index(i), Some(path.clone())));
+            match child_type {
+                Some(child_type) => queued.push(Work::Check {
                     element: child,
                     type_name: child_type,
                     path: child_path,
-                });
+                }),
+                None => queued.push(Work::Report {
+                    path: child_path,
+                    kind: ViolationKind::DisallowedChild,
+                }),
             }
         }
         self.stack.extend(queued);

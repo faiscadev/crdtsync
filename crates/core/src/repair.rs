@@ -2,16 +2,17 @@
 //!
 //! [`repairs`] turns the [`validate`] violation set into the normalization a
 //! schema-conformant read applies over merged state: a register/counter integer
-//! clamped into its declared bounds, or a list/text truncated to its `max` by
-//! dropping the lamport-newest excess. It is a pure read — the stored ops are
-//! never touched — and every input is a value already in state, so a repair mints
-//! nothing and needs no clock.
+//! clamped into its declared bounds, a list/text truncated to its `max` by
+//! dropping the lamport-newest excess, or a disallowed / mistyped attr or
+//! disallowed xml child dropped from the element. It is a pure read — the stored
+//! ops are never touched — and every input is a value already in state, so a
+//! repair mints nothing and needs no clock.
 //!
 //! The drop-newest order comes from the stamps in state, total-ordered by
 //! `(lamport, client)`, so replicas that merged the same ops truncate to the same
-//! surviving items. Only the two model-expressible constraints with a defined
-//! normalization are repaired; a kind mismatch or an unknown slot has no value to
-//! read repaired, so [`repairs`] omits it.
+//! surviving items. Only a violation with a defined normalization is repaired; a
+//! kind mismatch or an unknown slot has no value to read repaired, so [`repairs`]
+//! omits it.
 
 use crate::doc::Document;
 use crate::element::Element;
@@ -27,8 +28,8 @@ pub enum RepairKind {
     /// A list/text read as only these sequence indices — the survivors, in
     /// sequence order, after dropping the lamport-newest items over `max`.
     Truncated { keep: Vec<usize> },
-    /// An attribute read as absent — a disallowed key or a mistyped value drops
-    /// from a conformant read of the element's attrs.
+    /// A node read as absent — a disallowed / mistyped attr, or an xml child whose
+    /// tag no allowed type matches, drops from a conformant read of the element.
     Dropped,
 }
 
@@ -65,8 +66,9 @@ pub(crate) enum RepairId {
         path: Vec<Step>,
         survivors: Vec<Stamp>,
     },
-    /// A dropped attribute, identified by its location — the reading (absent) is
-    /// the same whenever the location is in violation, so the path is the identity.
+    /// A dropped node — a disallowed / mistyped attr, or a disallowed xml child —
+    /// identified by its location; the reading (absent) is the same whenever the
+    /// location is in violation, so the path is the identity.
     Drop {
         path: Vec<Step>,
     },
@@ -117,7 +119,9 @@ pub(crate) fn keyed_repairs(doc: &Document, schema: &Schema) -> Vec<(Repair, Rep
                         },
                     )
                 }
-                ViolationKind::DisallowedAttr | ViolationKind::MistypedAttr { .. } => {
+                ViolationKind::DisallowedAttr
+                | ViolationKind::MistypedAttr { .. }
+                | ViolationKind::DisallowedChild => {
                     (RepairKind::Dropped, RepairId::Drop { path: path.clone() })
                 }
                 ViolationKind::KindMismatch { .. } | ViolationKind::UnknownSlot => return None,
