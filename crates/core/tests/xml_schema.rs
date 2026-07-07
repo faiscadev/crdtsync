@@ -14,10 +14,11 @@ mod common;
 
 use common::cid;
 use crdtsync_core::doc::Document;
+use crdtsync_core::elementid::ElementId;
 use crdtsync_core::repair::{repairs, Repair, RepairKind};
 use crdtsync_core::schema::Schema;
 use crdtsync_core::validate::{validate, Step, Violation, ViolationKind};
-use crdtsync_core::{ElementKind, Scalar};
+use crdtsync_core::{Element, ElementKind, Scalar};
 
 // A flat schema: the "body" slot holds a Para element (tag "p") whose only
 // allowed attribute is a bounded "align" register.
@@ -267,6 +268,81 @@ fn loose_inline_text_under_an_orphan_inline_type_is_not_dropped() {
             .iter()
             .all(|r| r.kind != RepairKind::Dropped),
         "orphan inline text is not dropped"
+    );
+}
+
+/// The id of the loose text child at index 0 of the section in slot "body".
+fn orphan_text_id(d: &Document) -> ElementId {
+    match d.get(b"body") {
+        Some(Element::XmlElement(x)) => {
+            let c = x.borrow().children();
+            let child = c.borrow().get(0);
+            match child {
+                Some(Element::Text(t)) => t.borrow().id(),
+                _ => panic!("no text child"),
+            }
+        }
+        _ => panic!("no section"),
+    }
+}
+
+#[test]
+fn an_orphan_inline_text_is_reported() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"section")
+            .children()
+            .insert_text(0)
+            .insert(0, "hello");
+    });
+    let v = validate(&d, &schema(ORPHAN_INLINE));
+    assert!(has(
+        &v,
+        &[key("body"), Step::Index(0)],
+        &ViolationKind::OrphanInline {
+            block: "Para".to_string(),
+        },
+    ));
+}
+
+#[test]
+fn an_orphan_inline_text_reads_wrapped_in_the_derived_block() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_element(b"body", b"section")
+            .children()
+            .insert_text(0)
+            .insert(0, "hello");
+    });
+    // The wrapper id derives from the orphan's own element id, so a later op can
+    // target it and every replica synthesizes the same one.
+    let want = ElementId::derive(orphan_text_id(&d), b"Para", ElementKind::XmlElement);
+    let r = repairs(&d, &schema(ORPHAN_INLINE));
+    assert!(r.contains(&Repair {
+        path: vec![key("body"), Step::Index(0)],
+        kind: RepairKind::Wrapped {
+            block: "Para".to_string(),
+            id: want,
+        },
+    }));
+}
+
+#[test]
+fn the_orphan_wrapper_id_is_deterministic_across_replicas() {
+    let mut a = Document::new(cid(1));
+    let ops = a.transact(|tx| {
+        tx.xml_element(b"body", b"section")
+            .children()
+            .insert_text(0)
+            .insert(0, "hello");
+    });
+    let mut b = Document::new(cid(2));
+    for op in &ops {
+        b.apply(op);
+    }
+    assert_eq!(
+        repairs(&a, &schema(ORPHAN_INLINE)),
+        repairs(&b, &schema(ORPHAN_INLINE))
     );
 }
 
