@@ -9,6 +9,7 @@
 use crdtsync_core::diff::{diff, render, Change, SeqItem};
 use crdtsync_core::doc::Document;
 use crdtsync_core::element::ElementKind;
+use crdtsync_core::elementid::ElementId;
 use crdtsync_core::path::encode_path;
 use crdtsync_core::{ClientId, Scalar};
 
@@ -16,6 +17,10 @@ fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
     b[0] = first;
     ClientId::from_bytes(b)
+}
+
+fn eid(n: u8) -> ElementId {
+    ElementId::from_bytes([n; 16])
 }
 
 fn p(keys: &[&[u8]]) -> Vec<u8> {
@@ -118,6 +123,39 @@ fn renders_text_runs_quoted() {
         vec![
             "+ /body[2]: \"hi\"".to_string(),
             "- /body[0]: \"x\"".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn renders_mark_changes() {
+    let changes = vec![
+        Change::MarkAdded {
+            id: eid(1),
+            seq: eid(2),
+            name: b"bold".to_vec(),
+            value: Scalar::Bool(true),
+        },
+        Change::MarkRemoved {
+            id: eid(3),
+            seq: eid(4),
+            name: b"bold".to_vec(),
+            value: Scalar::Bool(true),
+        },
+        Change::MarkChanged {
+            id: eid(5),
+            seq: eid(6),
+            name: b"link".to_vec(),
+            old: Scalar::Bytes(b"a".to_vec()),
+            new: Scalar::Bytes(b"b".to_vec()),
+        },
+    ];
+    assert_eq!(
+        render(&changes),
+        vec![
+            "+ mark bold: true".to_string(),
+            "- mark bold: true".to_string(),
+            "~ mark link: <1 bytes> -> <1 bytes>".to_string(),
         ]
     );
 }

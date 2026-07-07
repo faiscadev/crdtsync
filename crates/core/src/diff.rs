@@ -12,18 +12,22 @@
 //! the element's own path) then its attrs (a keyed Map, value diffs at the deeper
 //! attr-key paths) — that order keeps the change list path-sorted; a fragment as
 //! its children alone. A tag is part of an element's identity, so a changed tag at
-//! a slot reads as a replace.
+//! a slot reads as a replace. Marks — named RangedElement annotations — live
+//! outside the tree, so they diff as a set by stable id (added / removed / value
+//! changed) and their changes append after the tree changes.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::codec::{put_bytes, put_scalar, put_u32, put_u64, put_u8, Cursor, DecodeError};
 use crate::doc::Document;
 use crate::element::{Element, ElementKind};
+use crate::elementid::ElementId;
 use crate::list::List;
 use crate::map::Map;
 use crate::path::{encode_path, parse_path};
+use crate::ranged::{RangedElement, RangedPayload};
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 use crate::text::Text;
@@ -68,6 +72,31 @@ pub enum Change {
         index: usize,
         text: String,
     },
+    /// A mark (a named RangedElement) added to the annotation set, over sequence
+    /// `seq`, carrying its scalar value. Marks live outside the element tree, so a
+    /// mark change is addressed by its own id and target sequence, not a path.
+    MarkAdded {
+        id: ElementId,
+        seq: ElementId,
+        name: Vec<u8>,
+        value: Scalar,
+    },
+    /// A mark removed (tombstoned) from the annotation set; `value` is its last
+    /// value in the old snapshot.
+    MarkRemoved {
+        id: ElementId,
+        seq: ElementId,
+        name: Vec<u8>,
+        value: Scalar,
+    },
+    /// A mark whose scalar value changed (a last-writer-wins payload replace).
+    MarkChanged {
+        id: ElementId,
+        seq: ElementId,
+        name: Vec<u8>,
+        old: Scalar,
+        new: Scalar,
+    },
 }
 
 /// A List item in a diff: an inline scalar value, or the kind of a composite
@@ -88,7 +117,99 @@ pub fn diff(old: &Document, new: &Document) -> Vec<Change> {
         &mut prefix,
         &mut out,
     );
+    diff_marks(old, new, &mut out);
     out
+}
+
+/// One mark's diff-relevant view: the sequence it annotates, its name, and its
+/// scalar value. Keyed by the mark's stable id in the caller.
+struct MarkView {
+    seq: ElementId,
+    name: Vec<u8>,
+    value: Scalar,
+}
+
+/// The marks (named, scalar-payload RangedElements) of a snapshot, keyed by id.
+/// An object-flavored mark (a named composite payload) is not yet constructible
+/// and its structured body diffs like a nested container — deferred — so only
+/// scalar marks participate here.
+fn mark_views(doc: &Document) -> Vec<(ElementId, MarkView)> {
+    doc.ranged_elements()
+        .into_iter()
+        .filter_map(|r| {
+            let RangedElement {
+                id,
+                start,
+                payload: RangedPayload::Scalar(value),
+                name: Some(name),
+                ..
+            } = r
+            else {
+                return None;
+            };
+            Some((
+                id,
+                MarkView {
+                    seq: start.seq,
+                    name,
+                    value,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Diff the two snapshots' mark sets by stable id: a mark id in new-not-old is an
+/// add, old-not-new a remove (its last value), in-both with a changed value a
+/// change. Emitted in id order so the same pair diffs identically.
+fn diff_marks(old: &Document, new: &Document, out: &mut Vec<Change>) {
+    let old_marks = mark_views(old);
+    let new_marks: Vec<(ElementId, MarkView)> = mark_views(new);
+    let old_by_id: HashMap<ElementId, &MarkView> =
+        old_marks.iter().map(|(id, v)| (*id, v)).collect();
+    let new_by_id: HashMap<ElementId, &MarkView> =
+        new_marks.iter().map(|(id, v)| (*id, v)).collect();
+
+    let mut changes: Vec<(ElementId, Change)> = Vec::new();
+    for (id, new_v) in &new_marks {
+        match old_by_id.get(id) {
+            None => changes.push((
+                *id,
+                Change::MarkAdded {
+                    id: *id,
+                    seq: new_v.seq,
+                    name: new_v.name.clone(),
+                    value: new_v.value.clone(),
+                },
+            )),
+            Some(old_v) if old_v.value != new_v.value => changes.push((
+                *id,
+                Change::MarkChanged {
+                    id: *id,
+                    seq: new_v.seq,
+                    name: new_v.name.clone(),
+                    old: old_v.value.clone(),
+                    new: new_v.value.clone(),
+                },
+            )),
+            Some(_) => {}
+        }
+    }
+    for (id, old_v) in &old_marks {
+        if !new_by_id.contains_key(id) {
+            changes.push((
+                *id,
+                Change::MarkRemoved {
+                    id: *id,
+                    seq: old_v.seq,
+                    name: old_v.name.clone(),
+                    value: old_v.value.clone(),
+                },
+            ));
+        }
+    }
+    changes.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(&b.as_bytes()));
+    out.extend(changes.into_iter().map(|(_, c)| c));
 }
 
 /// Walk two maps in lockstep over the union of their live keys, sorted.
@@ -372,7 +493,26 @@ fn render_change(change: &Change) -> String {
         Change::TextDelete { path, index, text } => {
             format!("- {}[{index}]: {text:?}", show_path(path))
         }
+        Change::MarkAdded { name, value, .. } => {
+            format!("+ mark {}: {}", show_name(name), show_scalar(value))
+        }
+        Change::MarkRemoved { name, value, .. } => {
+            format!("- mark {}: {}", show_name(name), show_scalar(value))
+        }
+        Change::MarkChanged { name, old, new, .. } => {
+            format!(
+                "~ mark {}: {} -> {}",
+                show_name(name),
+                show_scalar(old),
+                show_scalar(new)
+            )
+        }
     }
+}
+
+/// A mark name shown as UTF-8 (lossy for a non-text name).
+fn show_name(name: &[u8]) -> String {
+    String::from_utf8_lossy(name).into_owned()
 }
 
 /// A path as `/key/key`, each key shown as UTF-8 (lossy for non-text keys).
@@ -501,7 +641,47 @@ fn put_change(out: &mut Vec<u8>, change: &Change) {
             put_u64(out, *index as u64);
             put_bytes(out, text.as_bytes());
         }
+        Change::MarkAdded {
+            id,
+            seq,
+            name,
+            value,
+        } => {
+            put_u8(out, 8);
+            put_mark_head(out, id, seq, name);
+            put_scalar(out, value);
+        }
+        Change::MarkRemoved {
+            id,
+            seq,
+            name,
+            value,
+        } => {
+            put_u8(out, 9);
+            put_mark_head(out, id, seq, name);
+            put_scalar(out, value);
+        }
+        Change::MarkChanged {
+            id,
+            seq,
+            name,
+            old,
+            new,
+        } => {
+            put_u8(out, 10);
+            put_mark_head(out, id, seq, name);
+            put_scalar(out, old);
+            put_scalar(out, new);
+        }
     }
+}
+
+/// The common head of a mark change: the mark id, its target sequence, and its
+/// name.
+fn put_mark_head(out: &mut Vec<u8>, id: &ElementId, seq: &ElementId, name: &[u8]) {
+    out.extend_from_slice(&id.as_bytes());
+    out.extend_from_slice(&seq.as_bytes());
+    put_bytes(out, name);
 }
 
 fn put_items(out: &mut Vec<u8>, items: &[SeqItem]) {
@@ -559,6 +739,25 @@ fn read_change(cur: &mut Cursor) -> Result<Change, DecodeError> {
             path: cur.bytes()?,
             index: cur.u64()? as usize,
             text: cur.string()?,
+        },
+        8 => Change::MarkAdded {
+            id: cur.element_id()?,
+            seq: cur.element_id()?,
+            name: cur.bytes()?,
+            value: cur.scalar()?,
+        },
+        9 => Change::MarkRemoved {
+            id: cur.element_id()?,
+            seq: cur.element_id()?,
+            name: cur.bytes()?,
+            value: cur.scalar()?,
+        },
+        10 => Change::MarkChanged {
+            id: cur.element_id()?,
+            seq: cur.element_id()?,
+            name: cur.bytes()?,
+            old: cur.scalar()?,
+            new: cur.scalar()?,
         },
         tag => {
             return Err(DecodeError::BadTag {
