@@ -205,7 +205,68 @@ fn an_out_of_range_attr_reads_clamped() {
     }));
 }
 
+// A nested schema whose text leaf is tightly bounded, so an over-long text child
+// produces a TooLong violation located *through* an xml element.
+const NESTED_TEXT_MAX: &str = r#"{
+    "schema": "prose", "version": 1, "root": "Doc",
+    "types": {
+        "Doc":     { "kind": "map", "children": { "body": "Article" } },
+        "Article": { "kind": "fragment", "children": ["Para"] },
+        "Para":    { "kind": "xml", "tag": "p", "children": ["Span"], "attrs": { "align": "Align" } },
+        "Span":    { "kind": "text", "max": 3 },
+        "Align":   { "kind": "register", "min": 0, "max": 2 }
+    }
+}"#;
+
+#[test]
+fn an_over_max_text_child_reads_truncated_through_xml() {
+    // The bounded Span is a text child nested under a Para under the fragment, so
+    // its repair path traverses two xml elements — element_at must walk them, or
+    // the closure guarantee (every violation has a repair) breaks.
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        tx.xml_fragment(b"body")
+            .children()
+            .insert_element(0, b"p")
+            .children()
+            .insert_text(0)
+            .insert(0, "hello");
+    });
+    let r = repairs(&d, &schema(NESTED_TEXT_MAX));
+    assert!(
+        r.iter().any(
+            |rep| rep.path == vec![key("body"), Step::Index(0), Step::Index(0)]
+                && matches!(rep.kind, RepairKind::Truncated { .. })
+        ),
+        "an over-max text child nested in xml gets a truncation repair, got {r:?}"
+    );
+}
+
 // --- determinism ---
+
+#[test]
+fn disallowed_attrs_emit_in_sorted_key_order() {
+    let mut d = Document::new(cid(1));
+    d.transact(|tx| {
+        let mut el = tx.xml_element(b"body", b"p");
+        el.attrs().register(b"size", Scalar::Int(1));
+        el.attrs().register(b"color", Scalar::Int(1));
+    });
+    let v = validate(&d, &schema(FLAT));
+    let attrs: Vec<&Vec<Step>> = v
+        .iter()
+        .filter(|x| x.kind == ViolationKind::DisallowedAttr)
+        .map(|x| &x.path)
+        .collect();
+    assert_eq!(
+        attrs,
+        vec![
+            &vec![key("body"), key("color")],
+            &vec![key("body"), key("size")],
+        ],
+        "disallowed attrs emit in sorted key order"
+    );
+}
 
 #[test]
 fn two_replicas_that_merged_the_same_ops_produce_the_same_violations() {

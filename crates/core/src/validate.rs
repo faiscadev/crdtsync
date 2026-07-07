@@ -134,6 +134,13 @@ enum Work<'a> {
     UnknownSlot {
         path: Rc<PathNode>,
     },
+    /// A violation to record when this work item is reached, so a violation found
+    /// while queueing children (an attr key, a mistyped attr) still emits in tree
+    /// order rather than ahead of the descent.
+    Report {
+        path: Rc<PathNode>,
+        kind: ViolationKind,
+    },
 }
 
 /// Every way `doc`'s current state violates `schema`, in deterministic tree
@@ -212,6 +219,10 @@ impl<'a> Validator<'a> {
                 Work::UnknownSlot { path } => self.out.push(Violation {
                     path: path.steps(),
                     kind: ViolationKind::UnknownSlot,
+                }),
+                Work::Report { path, kind } => self.out.push(Violation {
+                    path: path.steps(),
+                    kind,
                 }),
                 Work::Check {
                     element,
@@ -308,8 +319,10 @@ impl<'a> Validator<'a> {
                     let x = x.borrow();
                     (x.attrs(), x.children())
                 };
-                self.check_xml_attrs(attrs, &attrs_map, &path);
+                // Queue children first, then attrs on top, so attrs (sorted keys)
+                // emit before children (sequence order) in the popped tree order.
                 self.queue_xml_children(children, &children_list, &path);
+                self.check_xml_attrs(attrs, &attrs_map, &path);
             }
             (TypeDef::Xml { children, .. }, Element::XmlFragment(f)) => {
                 let children_list = f.borrow().children();
@@ -333,15 +346,15 @@ impl<'a> Validator<'a> {
         for (key, child) in map.borrow().entries().into_iter().rev() {
             let child_path = Rc::new(PathNode::Step(Step::Key(key.clone()), Some(path.clone())));
             match attrs.iter().find(|(k, _)| k.as_bytes() == key.as_slice()) {
-                None => self.out.push(Violation {
-                    path: child_path.steps(),
+                None => queued.push(Work::Report {
+                    path: child_path,
                     kind: ViolationKind::DisallowedAttr,
                 }),
                 Some((_, ty)) => {
                     let found = child.kind();
                     match self.schema.type_def(ty).map(expected_kind) {
-                        Some(expected) if expected != found => self.out.push(Violation {
-                            path: child_path.steps(),
+                        Some(expected) if expected != found => queued.push(Work::Report {
+                            path: child_path,
                             kind: ViolationKind::MistypedAttr { expected, found },
                         }),
                         _ => queued.push(Work::Check {

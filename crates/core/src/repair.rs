@@ -47,11 +47,14 @@ pub struct Repair {
 /// sequence edit through normal reads), whereas a different surviving item, or a
 /// re-clamp to the other bound, is.
 ///
-/// The `path` completes the identity, and it is stable: a repairable element is a
-/// composite (register/counter for a clamp, list/text for a truncation), and a
-/// composite is only ever a map-slot value — a sequence node holds a scalar, so
-/// no composite is a list item — so a repair's path is all `Step::Key` and never
-/// carries a shifting `Step::Index`.
+/// The `path` completes the identity. It is all `Step::Key` — and so fully
+/// index-stable — for a repair under map slots (the common case). A repair under
+/// a *sequence* position carries a `Step::Index` (a bounded register list item, or
+/// now an xml child of a bounded type): such a repair's identity shifts if a
+/// preceding item is inserted or removed, which can churn an `onRepaired` report
+/// even though the reading is unchanged. Keying a sequence-positioned repair by a
+/// stable node stamp instead is a follow-up (it needs the same node-stamp handle
+/// the truncation survivors use, extended to a leaf register item).
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum RepairId {
     Clamp {
@@ -133,6 +136,11 @@ fn element_at(doc: &Document, path: &[Step]) -> Option<Element> {
         cur = match (step, &cur) {
             (Step::Key(k), Element::Map(m)) => m.borrow().get(k)?,
             (Step::Index(i), Element::List(l)) => l.borrow().get(*i)?,
+            // An xml element's attrs are keyed (its attrs Map), its children
+            // indexed (its children List); a fragment has only children.
+            (Step::Key(k), Element::XmlElement(x)) => x.borrow().attrs().borrow().get(k)?,
+            (Step::Index(i), Element::XmlElement(x)) => x.borrow().children().borrow().get(*i)?,
+            (Step::Index(i), Element::XmlFragment(f)) => f.borrow().children().borrow().get(*i)?,
             _ => return None,
         };
     }
