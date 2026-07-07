@@ -8,8 +8,15 @@
 //! deep edit surfaces at its own path. Sequences diff to runs by stable id — a
 //! List to item inserts/deletes, a Text to codepoint inserts/deletes. The
 //! change list is ordered by path, so diffing the same pair is deterministic.
+//! An XmlElement diffs as its children (a sequence, structural inserts/deletes at
+//! the element's own path) then its attrs (a keyed Map, value diffs at the deeper
+//! attr-key paths) — that order keeps the change list path-sorted; a fragment as
+//! its children alone. A tag is part of an element's identity, so a changed tag at
+//! a slot reads as a replace.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet};
+use std::rc::Rc;
 
 use crate::codec::{put_bytes, put_scalar, put_u32, put_u64, put_u8, Cursor, DecodeError};
 use crate::doc::Document;
@@ -20,6 +27,7 @@ use crate::path::{encode_path, parse_path};
 use crate::scalar::Scalar;
 use crate::stamp::Stamp;
 use crate::text::Text;
+use crate::xml::XmlElement;
 
 /// One structural change between two snapshots, addressed by its path.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -138,6 +146,13 @@ fn diff_elem(a: &Element, b: &Element, prefix: &mut Vec<Vec<u8>>, out: &mut Vec<
         (Element::Text(a), Element::Text(b)) => {
             diff_text(&a.borrow(), &b.borrow(), prefix, out);
         }
+        (Element::XmlElement(a), Element::XmlElement(b)) => {
+            diff_xml_element(a, b, prefix, out);
+        }
+        (Element::XmlFragment(a), Element::XmlFragment(b)) => {
+            let (a_children, b_children) = (a.borrow().children(), b.borrow().children());
+            diff_list(&a_children.borrow(), &b_children.borrow(), prefix, out);
+        }
         _ => {
             // Both are the same scalar-valued kind (inline Scalar or Register).
             let (old, new) = (scalar_of(a), scalar_of(b));
@@ -150,6 +165,40 @@ fn diff_elem(a: &Element, b: &Element, prefix: &mut Vec<Vec<u8>>, out: &mut Vec<
             }
         }
     }
+}
+
+/// Diff two XmlElement snapshots at the same slot: children (an ordered sequence
+/// → structural inserts/deletes at the element's own path) then attrs (a keyed
+/// Map → value diffs at the deeper attr-key paths), so the change list stays
+/// ordered by path. A tag is part of an element's identity, so a different tag at
+/// the same slot is a different element — a structural replace, not a field diff.
+fn diff_xml_element(
+    a: &Rc<RefCell<XmlElement>>,
+    b: &Rc<RefCell<XmlElement>>,
+    prefix: &mut Vec<Vec<u8>>,
+    out: &mut Vec<Change>,
+) {
+    if a.borrow().tag() != b.borrow().tag() {
+        out.push(Change::Removed {
+            path: path_of(prefix),
+            kind: ElementKind::XmlElement,
+        });
+        out.push(Change::Added {
+            path: path_of(prefix),
+            kind: ElementKind::XmlElement,
+        });
+        return;
+    }
+    let (a_attrs, a_children) = {
+        let x = a.borrow();
+        (x.attrs(), x.children())
+    };
+    let (b_attrs, b_children) = {
+        let x = b.borrow();
+        (x.attrs(), x.children())
+    };
+    diff_list(&a_children.borrow(), &b_children.borrow(), prefix, out);
+    diff_map(&a_attrs.borrow(), &b_attrs.borrow(), prefix, out);
 }
 
 /// The scalar a leaf slot reads — inline or through a Register.
@@ -165,8 +214,11 @@ fn scalar_of(e: &Element) -> Scalar {
 /// its stable id (a `Stamp`) that is live in one snapshot and not the other is
 /// an exact insert or delete; consecutive same-op items coalesce into a run,
 /// deletes (at their index in the old list) before inserts (at their index in
-/// the new list). A node still live in both is unchanged in position; a change
-/// to a composite item's own contents surfaces at that item's path.
+/// the new list). A node live in both keeps its position and is not descended
+/// into: a scalar item is immutable, so its content cannot change; a composite
+/// item's own inner edits are not reported here (recursing into a surviving
+/// sequence composite by its index path is a follow-up — no editing path reaches
+/// such a state yet, so there is nothing to diff).
 fn diff_list(old: &List, new: &List, prefix: &[Vec<u8>], out: &mut Vec<Change>) {
     let old_seq = list_seq(old);
     let new_seq = list_seq(new);
