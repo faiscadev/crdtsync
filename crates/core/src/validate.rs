@@ -486,8 +486,6 @@ impl<'a> Validator<'a> {
         let mut queued = Vec::new();
         for (i, child) in list.borrow().values().into_iter().enumerate().rev() {
             let child_type = resolve_child_type(self.schema, &child, children);
-            // Loose inline text under an orphan_inline type is the wrap's concern,
-            // not a disallowed child — leave it for 5c-ii.
             if child_type.is_none() && orphan_inline.is_some() && matches!(child, Element::Text(_))
             {
                 continue;
