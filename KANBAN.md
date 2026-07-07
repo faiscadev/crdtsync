@@ -189,7 +189,7 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight)_
+- **XmlElement/marks — Unit 5b-i — attrs schema enforcement (core)** — the validate/repair engine descends xml subtrees. New `(TypeDef::Xml, XmlElement)`/`(_, XmlFragment)` validator arms: attrs Map checked against the type's `attrs` allowlist (disallowed key → new `ViolationKind::DisallowedAttr`; wrong-kind value → `MistypedAttr { expected, found }`; right-kind value recurses → existing bounds rule), children resolved by tag against `children` (`resolve_child_type`) and recursed (reaching nested attrs; disallowed-child drop is 5c). New `RepairKind::Dropped` + `RepairId::Drop` — a disallowed/mistyped attr reads absent; an out-of-range attr value reuses `Clamped`. Contextual element→type comes from the walk (no id→type registry). `tests/xml_schema.rs` (10). Design in DECISIONS (2026-07-06). → *Schema / Invariant Repair*.
 
 ---
 

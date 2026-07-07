@@ -27,6 +27,9 @@ pub enum RepairKind {
     /// A list/text read as only these sequence indices — the survivors, in
     /// sequence order, after dropping the lamport-newest items over `max`.
     Truncated { keep: Vec<usize> },
+    /// An attribute read as absent — a disallowed key or a mistyped value drops
+    /// from a conformant read of the element's attrs.
+    Dropped,
 }
 
 /// The repaired reading of one located element.
@@ -58,6 +61,11 @@ pub(crate) enum RepairId {
     Keep {
         path: Vec<Step>,
         survivors: Vec<Stamp>,
+    },
+    /// A dropped attribute, identified by its location — the reading (absent) is
+    /// the same whenever the location is in violation, so the path is the identity.
+    Drop {
+        path: Vec<Step>,
     },
 }
 
@@ -105,6 +113,9 @@ pub(crate) fn keyed_repairs(doc: &Document, schema: &Schema) -> Vec<(Repair, Rep
                             survivors,
                         },
                     )
+                }
+                ViolationKind::DisallowedAttr | ViolationKind::MistypedAttr { .. } => {
+                    (RepairKind::Dropped, RepairId::Drop { path: path.clone() })
                 }
                 ViolationKind::KindMismatch { .. } | ViolationKind::UnknownSlot => return None,
             };
