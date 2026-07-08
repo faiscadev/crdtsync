@@ -15,7 +15,9 @@ use crate::doc::{Document, MapCursor, XmlChildrenCursor};
 use crate::elementid::ElementId;
 use crate::list::{List, Side};
 use crate::map::Map;
+use crate::marks::ResolvedMark;
 use crate::op::Op;
+use crate::ranged::RangeAnchor;
 use crate::stamp::Stamp;
 use crate::{Element, Scalar};
 
@@ -381,6 +383,110 @@ pub fn resolve_position(doc: &Document, path: &[u8], pos: &RelativePosition) -> 
         Element::Text(t) => Some(t.borrow().resolve_position(pos)),
         _ => None,
     })
+}
+
+/// Author a mark named `name` over the span `[start_index, end_index)` of the
+/// sequence (Text or List) at `seq_path`, capturing each endpoint as a
+/// RelativePosition (with the given gravity `Side`) so the span tracks its
+/// characters under concurrent edits. Returns the emitted ops and the mark's id
+/// as bytes — the handle a later [`mark_set_value`]/[`mark_delete`] names it by.
+/// Inert (empty ops, `None` handle) if `seq_path` is not a live sequence.
+///
+/// Both endpoints anchor into the *same* sequence: a single-sequence span is the
+/// in-scope case. A cross-element span (endpoints on different sequences), which
+/// the underlying RangeAnchor supports, is a deferred surface (Unit 4b-ii).
+#[allow(clippy::too_many_arguments)]
+pub fn mark(
+    doc: &mut Document,
+    seq_path: &[u8],
+    start_index: usize,
+    start_side: Side,
+    end_index: usize,
+    end_side: Side,
+    name: &[u8],
+    value: Scalar,
+) -> (Vec<Op>, Option<Vec<u8>>) {
+    let Some(start) = range_anchor(doc, seq_path, start_index, start_side) else {
+        return (Vec::new(), None);
+    };
+    let Some(end) = range_anchor(doc, seq_path, end_index, end_side) else {
+        return (Vec::new(), None);
+    };
+    let name = name.to_vec();
+    let mut id = None;
+    let ops = doc.transact(|tx| {
+        id = Some(tx.ranged().mark(&name, start, end, value));
+    });
+    (ops, id.map(|id| id.as_bytes().to_vec()))
+}
+
+/// Change the scalar payload of the mark handle `mark_id`. Inert (empty ops) if
+/// the handle does not decode to a live scalar mark.
+pub fn mark_set_value(doc: &mut Document, mark_id: &[u8], value: Scalar) -> Vec<Op> {
+    let Some(id) = element_id(mark_id) else {
+        return Vec::new();
+    };
+    doc.transact(|tx| tx.ranged().set_payload(id, value))
+}
+
+/// Tombstone the mark handle `mark_id`. Inert (empty ops) if the handle does not
+/// decode to a live mark.
+pub fn mark_delete(doc: &mut Document, mark_id: &[u8]) -> Vec<Op> {
+    let Some(id) = element_id(mark_id) else {
+        return Vec::new();
+    };
+    doc.transact(|tx| tx.ranged().delete(id))
+}
+
+/// The active marks covering character `index` of the sequence at `seq_path` —
+/// the [`Document::marks_at`](crate::doc::Document::marks_at) read model, each a
+/// [`ResolvedMark`] (name + resolved state). Empty if `seq_path` is not a live
+/// sequence.
+pub fn marks_at(doc: &Document, seq_path: &[u8], index: usize) -> Vec<ResolvedMark> {
+    match seq_id(doc, seq_path) {
+        Some(seq) => doc.marks_at(seq, index),
+        None => Vec::new(),
+    }
+}
+
+/// A range endpoint into the sequence at `path` at `index` with gravity `side`,
+/// or `None` if the path is not a live Text or List. Resolves the path once,
+/// pairing the sequence's stable id with a RelativePosition at the index.
+fn range_anchor(doc: &Document, path: &[u8], index: usize, side: Side) -> Option<RangeAnchor> {
+    match slot(doc, path)? {
+        Element::List(l) => {
+            let l = l.borrow();
+            Some(RangeAnchor {
+                seq: l.id(),
+                pos: l.relative_position(index, side),
+            })
+        }
+        Element::Text(t) => {
+            let t = t.borrow();
+            Some(RangeAnchor {
+                seq: t.id(),
+                pos: t.relative_position(index, side),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The stable id of the sequence (Text or List) at a path — the sequence a mark
+/// annotates. `None` if the path is not a live sequence.
+fn seq_id(doc: &Document, path: &[u8]) -> Option<ElementId> {
+    match slot(doc, path)? {
+        Element::List(l) => Some(l.borrow().id()),
+        Element::Text(t) => Some(t.borrow().id()),
+        _ => None,
+    }
+}
+
+/// Decode a mark handle back to an ElementId, or `None` if it is not the width of
+/// an id — a malformed handle names no mark.
+fn element_id(bytes: &[u8]) -> Option<ElementId> {
+    let arr: [u8; 16] = bytes.try_into().ok()?;
+    Some(ElementId::from_bytes(arr))
 }
 
 /// Whether an element is an XML node that owns a children sequence.
