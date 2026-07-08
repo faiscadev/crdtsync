@@ -977,6 +977,121 @@ pub unsafe extern "C" fn crdtsync_diff_decode(
     .unwrap_or(-1)
 }
 
+// --- schema + repair ---
+//
+// A schema binds to the local document as runtime state — it authors no op and
+// broadcasts nothing, so nothing crosses to enqueue. It crosses as opaque JSON
+// bytes the façade parses (total — malformed fails, never panics). `take_repairs`
+// is a read: it drains the `onRepaired` signal, the located paths whose repaired
+// reading newly changed against the bound schema, each an `encode_repair_path`
+// byte string. The drain reseeds the baseline, so a standing repair reports once;
+// the whole list crosses as one buffer with a `u32` count and per-path length
+// prefixes, the same list shape marks and diffs cross as.
+
+/// Serialize a repair-path list to one buffer the SDK decodes: a `u32` count, then
+/// per path a `u32`-length-prefixed `encode_repair_path` byte string. An empty list
+/// is a bare zero count, the no-repair signal.
+fn encode_repair_paths(paths: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    for p in paths {
+        out.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// Parse schema JSON bytes and bind the schema to the local document for
+/// `onRepaired` observation. A binding is runtime state, not a CRDT op — it
+/// authors and broadcasts nothing — so there is nothing to return but the outcome.
+/// Parsing is total: returns 1 when the schema bound, 0 when the bytes are not a
+/// valid schema (malformed JSON, non-UTF-8, or well-formed JSON that is not a
+/// schema — rejected cleanly, binding nothing), -1 on a bad handle or a null
+/// pointer. Binding takes the current state as the baseline, so a later
+/// [`crdtsync_doc_take_repairs`] surfaces only a repair the state comes to need.
+///
+/// # Safety
+/// `doc` is a live handle or null; `schema`/`schema_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_set_schema(
+    doc: *mut CrdtDoc,
+    schema: *const u8,
+    schema_len: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return -1;
+        }
+        let Some(bytes) = as_slice(schema, schema_len) else {
+            return -1;
+        };
+        if path::set_schema(&mut (*doc).doc, bytes) {
+            1
+        } else {
+            0
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Drain the `onRepaired` signal into `out`: the located paths whose repaired
+/// reading has newly changed against the bound schema since the last call, each an
+/// `encode_repair_path` byte string the SDK decodes with the repair-path reader (or
+/// [`crdtsync_repair_path_decode`]). Empty — a bare zero count — when no schema is
+/// bound or nothing newly needs repair; the drain reseeds the baseline, so a
+/// standing repair reports once (the settle-point contract). A reported path names
+/// a *location*, not a value: the repaired value is read separately. Returns 1 with
+/// the encoded list, -1 on a bad handle or a null `out`.
+///
+/// # Safety
+/// `doc` is a live handle or null; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_take_repairs(doc: *mut CrdtDoc, out: *mut CrdtBuf) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() || out.is_null() {
+            return -1;
+        }
+        let paths = path::take_repairs(&mut (*doc).doc);
+        *out = CrdtBuf::from_vec(encode_repair_paths(&paths));
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Decode a repair-path buffer from [`crdtsync_doc_take_repairs`] back into its
+/// canonical form, written to `out` — the boundary read that turns opaque repair
+/// bytes into the step path a binding walks, mirroring [`crdtsync_diff_decode`]. A
+/// repair path can cross an untrusted boundary, so the decode is total: an unknown
+/// step tag or a length past the end yields 0 with `out` left untouched, never a
+/// panic across the frame. Returns 1 with the canonical step path on a well-formed
+/// buffer, -1 on a null `out` or a panic.
+///
+/// # Safety
+/// `bytes`/`len` follow [`as_slice`]; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_repair_path_decode(
+    bytes: *const u8,
+    len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if out.is_null() {
+            return -1;
+        }
+        let Some(raw) = as_slice(bytes, len) else {
+            return 0;
+        };
+        match path::parse_repair_path(raw) {
+            Some(steps) => {
+                *out = CrdtBuf::from_vec(path::encode_repair_path(&steps));
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
 /// Marshal a path-addressed edit: delegate the navigation to `run`, encode the
 /// emitted ops, and never let a panic cross the C frame.
 unsafe fn edit<F>(doc: *mut CrdtDoc, path: *const u8, path_len: usize, run: F) -> CrdtBuf
