@@ -18,6 +18,7 @@ pub mod migration;
 pub mod repair;
 pub mod schema;
 pub mod validate;
+pub mod zone;
 
 pub mod clientid;
 pub mod elementid;
