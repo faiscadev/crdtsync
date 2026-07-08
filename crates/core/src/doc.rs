@@ -2723,6 +2723,24 @@ impl<'a> MapCursor<'a> {
         }
     }
 
+    /// A cursor over the children sequence of the live `XmlElement` or
+    /// `XmlFragment` occupying `key` in this map, or `None` if the slot holds
+    /// neither. The path façade names an element by its map slot, so it reaches an
+    /// existing element's children here rather than through a create cursor.
+    pub fn xml_children(&mut self, key: &[u8]) -> Option<XmlChildrenCursor<'_>> {
+        let map = self.doc.maps.get(&self.map_id)?;
+        let value = map.borrow().get(key);
+        let list_id = match value {
+            Some(Element::XmlElement(x)) => XmlElement::children_id(x.borrow().id()),
+            Some(Element::XmlFragment(f)) => XmlFragment::children_id(f.borrow().id()),
+            _ => return None,
+        };
+        Some(XmlChildrenCursor {
+            doc: self.doc,
+            list_id,
+        })
+    }
+
     /// Descend into a List at `key`, creating it if absent.
     pub fn list(&mut self, key: &[u8]) -> ListCursor<'_> {
         self.doc

@@ -4,12 +4,14 @@
 //! path façade descends into that attrs Map transparently, so the existing
 //! scalar/register/counter read+write fns address an element's attrs by naming
 //! the element then the attr key — no attr-specific op. A fragment carries no
-//! attrs, so a key past it does not resolve. Children/move/marks are later
-//! slices; this file is create + attrs + tag.
+//! attrs, so a key past it does not resolve. An element's/fragment's children
+//! are an index-addressed sequence: the path names the element, the child is an
+//! index within it. Move/marks are later slices; this file is create + attrs +
+//! tag + children.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::Op;
-use crdtsync_core::{path, Scalar};
+use crdtsync_core::{path, Element, Scalar};
 
 mod common;
 use common::cid;
@@ -27,6 +29,27 @@ fn replay(b: &mut Document, ops: &[Op]) {
     for op in ops {
         b.apply(op);
     }
+}
+
+/// The children of the top-level XML node in slot `key`, rendered in order: an
+/// element as `<tag>`, a text run as its quoted string. Reads the doc directly
+/// because a child has no stable path key — it is index-addressed, and the path
+/// façade addresses the children sequence, not a child's contents.
+fn children_of(d: &Document, key: &str) -> Vec<String> {
+    let el = d.get(key.as_bytes());
+    let children = match &el {
+        Some(Element::XmlElement(x)) => x.borrow().children(),
+        Some(Element::XmlFragment(f)) => f.borrow().children(),
+        _ => return Vec::new(),
+    };
+    let vals = children.borrow().values();
+    vals.iter()
+        .map(|e| match e {
+            Element::XmlElement(x) => format!("<{}>", String::from_utf8_lossy(x.borrow().tag())),
+            Element::Text(t) => format!("{:?}", t.borrow().as_string()),
+            _ => "?".to_string(),
+        })
+        .collect()
 }
 
 // --- create + tag read ---
@@ -193,4 +216,202 @@ fn a_plain_nested_map_still_resolves() {
         path::get_int(&d, &p(&["profile", "stats", "score"])),
         Some(7)
     );
+}
+
+// --- children: insert element ---
+
+#[test]
+fn an_element_child_is_inserted() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["body"]), b"div");
+    let ops = path::xml_insert_element(&mut d, &p(&["body"]), 0, b"h1");
+    assert!(!ops.is_empty());
+    assert_eq!(path::xml_children_len(&d, &p(&["body"])), Some(1));
+    assert_eq!(children_of(&d, "body"), vec!["<h1>"]);
+}
+
+#[test]
+fn element_children_keep_order() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["body"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["body"]), 0, b"h1");
+    path::xml_insert_element(&mut d, &p(&["body"]), 1, b"p");
+    assert_eq!(path::xml_children_len(&d, &p(&["body"])), Some(2));
+    assert_eq!(children_of(&d, "body"), vec!["<h1>", "<p>"]);
+}
+
+#[test]
+fn a_nested_element_holds_children() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["outer", "inner"]), b"span");
+    path::xml_insert_element(&mut d, &p(&["outer", "inner"]), 0, b"b");
+    assert_eq!(path::xml_children_len(&d, &p(&["outer", "inner"])), Some(1));
+}
+
+// --- children: insert text ---
+
+#[test]
+fn a_text_child_is_inserted_with_its_string() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["body"]), b"div");
+    path::xml_insert_text(&mut d, &p(&["body"]), 0, "hello");
+    assert_eq!(path::xml_children_len(&d, &p(&["body"])), Some(1));
+    assert_eq!(children_of(&d, "body"), vec!["\"hello\""]);
+}
+
+#[test]
+fn an_empty_text_child_is_inserted() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["body"]), b"div");
+    path::xml_insert_text(&mut d, &p(&["body"]), 0, "");
+    assert_eq!(path::xml_children_len(&d, &p(&["body"])), Some(1));
+    assert_eq!(children_of(&d, "body"), vec!["\"\""]);
+}
+
+#[test]
+fn mixed_element_and_text_children() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["body"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["body"]), 0, b"h1");
+    path::xml_insert_text(&mut d, &p(&["body"]), 1, "tail");
+    assert_eq!(children_of(&d, "body"), vec!["<h1>", "\"tail\""]);
+}
+
+// --- children on a fragment ---
+
+#[test]
+fn a_fragment_holds_children() {
+    let mut d = doc(1);
+    path::xml_fragment(&mut d, &p(&["root"]));
+    path::xml_insert_element(&mut d, &p(&["root"]), 0, b"item");
+    path::xml_insert_text(&mut d, &p(&["root"]), 1, "note");
+    assert_eq!(path::xml_children_len(&d, &p(&["root"])), Some(2));
+    assert_eq!(children_of(&d, "root"), vec!["<item>", "\"note\""]);
+}
+
+#[test]
+fn a_fresh_fragment_has_zero_children() {
+    let mut d = doc(1);
+    path::xml_fragment(&mut d, &p(&["root"]));
+    assert_eq!(path::xml_children_len(&d, &p(&["root"])), Some(0));
+}
+
+#[test]
+fn a_fresh_element_has_zero_children() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["body"]), b"div");
+    assert_eq!(path::xml_children_len(&d, &p(&["body"])), Some(0));
+}
+
+// --- children: delete ---
+
+#[test]
+fn a_child_is_deleted() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["body"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["body"]), 0, b"h1");
+    path::xml_insert_element(&mut d, &p(&["body"]), 1, b"p");
+    let ops = path::xml_child_delete(&mut d, &p(&["body"]), 0);
+    assert!(!ops.is_empty());
+    assert_eq!(path::xml_children_len(&d, &p(&["body"])), Some(1));
+    assert_eq!(children_of(&d, "body"), vec!["<p>"]);
+}
+
+#[test]
+fn an_out_of_range_delete_is_inert() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["body"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["body"]), 0, b"h1");
+    let ops = path::xml_child_delete(&mut d, &p(&["body"]), 5);
+    assert!(ops.is_empty(), "an out-of-range child delete emits nothing");
+    assert_eq!(path::xml_children_len(&d, &p(&["body"])), Some(1));
+}
+
+// --- non-element paths are inert ---
+
+#[test]
+fn children_len_on_a_non_element_is_none() {
+    let mut d = doc(1);
+    path::register_int(&mut d, &p(&["m", "x"]), 1);
+    assert_eq!(path::xml_children_len(&d, &p(&["m"])), None);
+    assert_eq!(path::xml_children_len(&d, &p(&["m", "x"])), None);
+}
+
+#[test]
+fn children_len_on_a_missing_path_is_none() {
+    let d = doc(1);
+    assert_eq!(path::xml_children_len(&d, &p(&["gone"])), None);
+}
+
+#[test]
+fn inserting_a_child_on_a_non_element_is_inert() {
+    let mut d = doc(1);
+    path::register_int(&mut d, &p(&["reg"]), 1);
+    let a = path::xml_insert_element(&mut d, &p(&["reg"]), 0, b"h1");
+    let b = path::xml_insert_text(&mut d, &p(&["reg"]), 0, "x");
+    assert!(
+        a.is_empty() && b.is_empty(),
+        "a non-element child write emits nothing"
+    );
+    assert_eq!(path::get_int(&d, &p(&["reg"])), Some(1));
+}
+
+#[test]
+fn inserting_a_child_on_a_missing_path_is_inert() {
+    let mut d = doc(1);
+    let ops = path::xml_insert_element(&mut d, &p(&["gone"]), 0, b"h1");
+    assert!(ops.is_empty());
+    assert_eq!(path::xml_children_len(&d, &p(&["gone"])), None);
+}
+
+#[test]
+fn deleting_a_child_on_a_non_element_is_inert() {
+    let mut d = doc(1);
+    path::register_int(&mut d, &p(&["reg"]), 1);
+    let ops = path::xml_child_delete(&mut d, &p(&["reg"]), 0);
+    assert!(ops.is_empty());
+}
+
+// --- convergence ---
+
+#[test]
+fn children_converge_on_a_peer() {
+    let mut a = doc(1);
+    let mut ops = path::xml_element(&mut a, &p(&["body"]), b"div");
+    ops.extend(path::xml_insert_element(&mut a, &p(&["body"]), 0, b"h1"));
+    ops.extend(path::xml_insert_text(&mut a, &p(&["body"]), 1, "world"));
+
+    let mut b = doc(2);
+    replay(&mut b, &ops);
+
+    assert_eq!(path::xml_children_len(&b, &p(&["body"])), Some(2));
+    assert_eq!(children_of(&b, "body"), vec!["<h1>", "\"world\""]);
+}
+
+#[test]
+fn fragment_children_converge_on_a_peer() {
+    let mut a = doc(1);
+    let mut ops = path::xml_fragment(&mut a, &p(&["root"]));
+    ops.extend(path::xml_insert_element(&mut a, &p(&["root"]), 0, b"item"));
+
+    let mut b = doc(2);
+    replay(&mut b, &ops);
+
+    assert_eq!(path::xml_children_len(&b, &p(&["root"])), Some(1));
+    assert_eq!(children_of(&b, "root"), vec!["<item>"]);
+}
+
+#[test]
+fn a_child_delete_converges_on_a_peer() {
+    let mut a = doc(1);
+    let mut ops = path::xml_element(&mut a, &p(&["body"]), b"div");
+    ops.extend(path::xml_insert_element(&mut a, &p(&["body"]), 0, b"h1"));
+    ops.extend(path::xml_insert_element(&mut a, &p(&["body"]), 1, b"p"));
+    ops.extend(path::xml_child_delete(&mut a, &p(&["body"]), 0));
+
+    let mut b = doc(2);
+    replay(&mut b, &ops);
+
+    assert_eq!(path::xml_children_len(&b, &p(&["body"])), Some(1));
+    assert_eq!(children_of(&b, "body"), vec!["<p>"]);
 }

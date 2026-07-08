@@ -11,8 +11,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::anchor::RelativePosition;
-use crate::doc::{Document, MapCursor};
-use crate::list::Side;
+use crate::doc::{Document, MapCursor, XmlChildrenCursor};
+use crate::list::{List, Side};
 use crate::map::Map;
 use crate::op::Op;
 use crate::stamp::Stamp;
@@ -103,6 +103,62 @@ pub fn xml_tag(doc: &Document, path: &[u8]) -> Option<Vec<u8>> {
         Element::XmlElement(x) => Some(x.borrow().tag().to_vec()),
         _ => None,
     }
+}
+
+/// Insert a nested `XmlElement` child with `tag` at live `index` in the children
+/// of the element/fragment at `elem_path`. Inert if `elem_path` is not a live
+/// XmlElement or XmlFragment. The new child is index-addressed and its index
+/// shifts under sibling edits, so it has no stable path key of its own — this
+/// slice addresses the children sequence, not a child's contents.
+pub fn xml_insert_element(
+    doc: &mut Document,
+    elem_path: &[u8],
+    index: usize,
+    tag: &[u8],
+) -> Vec<Op> {
+    if !slot_ok(doc, elem_path, is_xml_node) {
+        return Vec::new();
+    }
+    let tag = tag.to_vec();
+    xml_children_emit(doc, elem_path, move |kids| {
+        kids.insert_element(index, &tag);
+    })
+}
+
+/// Insert a `Text`-run child initialised with `s` at live `index` in the children
+/// of the element/fragment at `elem_path`. Inert if the target is not a live
+/// XmlElement or XmlFragment. The text child is born empty then filled in the same
+/// transaction.
+pub fn xml_insert_text(doc: &mut Document, elem_path: &[u8], index: usize, s: &str) -> Vec<Op> {
+    if !slot_ok(doc, elem_path, is_xml_node) {
+        return Vec::new();
+    }
+    let s = s.to_owned();
+    xml_children_emit(doc, elem_path, move |kids| {
+        let mut text = kids.insert_text(index);
+        if !s.is_empty() {
+            text.insert(0, &s);
+        }
+    })
+}
+
+/// Tombstone the child at live `index` in the children of the element/fragment at
+/// `elem_path`. Inert if the target is not a live XmlElement or XmlFragment, or
+/// `index` names no live child — a no-op delete must not create or re-stamp a
+/// container.
+pub fn xml_child_delete(doc: &mut Document, elem_path: &[u8], index: usize) -> Vec<Op> {
+    if !slot_ok(doc, elem_path, |e| {
+        xml_children_of(e).is_some_and(|l| index < l.borrow().len())
+    }) {
+        return Vec::new();
+    }
+    xml_children_emit(doc, elem_path, move |kids| kids.delete(index))
+}
+
+/// The count of live children of the element/fragment at `elem_path`, or `None`
+/// if the path is not a live XmlElement or XmlFragment.
+pub fn xml_children_len(doc: &Document, elem_path: &[u8]) -> Option<usize> {
+    xml_children_of(&slot(doc, elem_path)?).map(|l| l.borrow().len())
 }
 
 /// Insert a bytes item at a live index in the List at a path.
@@ -295,6 +351,44 @@ pub fn resolve_position(doc: &Document, path: &[u8], pos: &RelativePosition) -> 
         Element::List(l) => Some(l.borrow().resolve_position(pos)),
         Element::Text(t) => Some(t.borrow().resolve_position(pos)),
         _ => None,
+    })
+}
+
+/// Whether an element is an XML node that owns a children sequence.
+fn is_xml_node(e: &Element) -> bool {
+    matches!(e, Element::XmlElement(_) | Element::XmlFragment(_))
+}
+
+/// The children List of an XML node, or `None` if the element is neither an
+/// XmlElement nor an XmlFragment.
+fn xml_children_of(e: &Element) -> Option<Rc<RefCell<List>>> {
+    match e {
+        Element::XmlElement(x) => Some(x.borrow().children()),
+        Element::XmlFragment(f) => Some(f.borrow().children()),
+        _ => None,
+    }
+}
+
+/// Descend to the map holding the element/fragment named by `path`, reach its
+/// children cursor, and run `f`. The caller has already confirmed the leaf is a
+/// live XML node, so the descent creates no phantom map and the children cursor
+/// resolves.
+fn xml_children_emit<F>(doc: &mut Document, path: &[u8], f: F) -> Vec<Op>
+where
+    F: FnOnce(&mut XmlChildrenCursor),
+{
+    let Some(keys) = parse_path(path) else {
+        return Vec::new();
+    };
+    let Some((leaf_key, parents)) = keys.split_last() else {
+        return Vec::new();
+    };
+    doc.transact(|tx| {
+        descend(tx, parents, |cur| {
+            if let Some(mut kids) = cur.xml_children(leaf_key) {
+                f(&mut kids);
+            }
+        });
     })
 }
 
