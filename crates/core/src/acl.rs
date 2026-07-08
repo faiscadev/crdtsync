@@ -22,9 +22,11 @@
 //!
 //! Core stores every tuple faithfully and merges the set content-neutrally (any
 //! tuple that arrives is stored, every revoke tombstones), so authority is decided
-//! here over the merged view — never rejected at merge. Provenance-bounded deny
-//! (bounding a deny to the deny author's own subtree) and wiring a verdict into
-//! op-apply live outside this module (the server-side pipeline).
+//! here over the merged view — never rejected at merge. The authority layer also
+//! realises **provenance-bounded deny** — a deny suppresses a grant only within its
+//! author's authority (at or above the grant's grantor), so it cannot back-door around
+//! revocation. Wiring a verdict into op-apply lives outside this module (the
+//! server-side pipeline).
 //!
 //! [`Document`]: crate::doc::Document
 
@@ -274,22 +276,6 @@ pub struct AclRecord {
     pub revoked_by: Vec<ClientId>,
 }
 
-/// The synthetic tuple that realises **creator-auto-owns-`/`**: the doc creator
-/// implicitly holds `Own` at the root path, the bootstrap owner every grant chains
-/// from. Core hosts no identity provider, so the creator id is supplied by the
-/// caller (the `AclActor` precedent) rather than stored — the rule is pure. The id
-/// is unread by the evaluator.
-fn creator_owns_root(creator: ClientId) -> AclTuple {
-    AclTuple {
-        id: ElementId::from_bytes([0u8; 16]),
-        subject: AclSubject::Actor(creator),
-        grant: AclGrant::Capability(Capability::Own),
-        effect: AclEffect::Allow,
-        path: Vec::new(),
-        grantor: creator,
-    }
-}
-
 /// Whether `actor` holds an actor-id `Own` allow governing `target`, given the
 /// current `rooted`/`revoked` snapshot over `records` — the recursive ownership test
 /// that both grant-rooting and revoke-authority build on. The `creator` owns every
@@ -365,6 +351,117 @@ fn revoke_pass(
         .collect()
 }
 
+/// Whether `author` is at or above `grantor` in the delegation hierarchy — the
+/// authority a deny needs to bind a grant. True when `author` is the `creator` (above
+/// everyone), the `grantor` itself (same authority — slice-2 deny-overrides), or a
+/// delegation superior whose rooted `Own` grant `grantor`'s authority derives from,
+/// transitively up the grantor chain.
+///
+/// The superiority is scoped to `grant_path` (the path of the grant being bounded):
+/// only `Own` grants that govern `grant_path` are walked, so a superior in a disjoint
+/// subtree does not count. This keeps a deny from reaching a grant its author has no
+/// authority over — e.g. an actor who owns `/foo` but merely happens to be a delegation
+/// superior of a grantor that *also* owns `/bar` from the creator cannot deny that
+/// grantor's `/bar` grant, and no one below the creator can forge an `Own`-to-creator
+/// tuple to rise above the creator (such a forgery cannot govern the creator's root).
+///
+/// A subordinate or an unrelated peer is *not* at or above the grantor, so its deny
+/// cannot suppress the grant — the anti-backdoor property (a deny must not do what a
+/// revoke may not). Only rooted, unrevoked actor-id `Own` grants are walked, so forged
+/// or revoked ownership lends no superiority; the `seen` set bounds the walk on any
+/// grantor cycle, so it terminates and is order-independent.
+fn at_or_above(
+    records: &[AclRecord],
+    creator: ClientId,
+    author: ClientId,
+    grantor: ClientId,
+    grant_path: &[u8],
+    rooted: &[bool],
+    revoked: &[bool],
+) -> bool {
+    if author == creator || author == grantor {
+        return true;
+    }
+    // Walk up `grantor`'s ownership provenance over `grant_path`: the actors that
+    // delegated `Own` governing it, then their delegators, and so on. `author` is a
+    // superior iff it is reached.
+    let mut seen: Vec<ClientId> = vec![grantor];
+    let mut frontier: Vec<ClientId> = vec![grantor];
+    for _ in 0..=records.len() {
+        let mut next: Vec<ClientId> = Vec::new();
+        for &who in &frontier {
+            for (i, r) in records.iter().enumerate() {
+                if !rooted[i]
+                    || revoked[i]
+                    || r.tuple.effect != AclEffect::Allow
+                    || !matches!(r.tuple.grant, AclGrant::Capability(Capability::Own))
+                    || r.tuple.subject != AclSubject::Actor(who)
+                    || !governs(&r.tuple.path, grant_path)
+                {
+                    continue;
+                }
+                let up = r.tuple.grantor;
+                if up == author {
+                    return true;
+                }
+                if !seen.contains(&up) {
+                    seen.push(up);
+                    next.push(up);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    false
+}
+
+/// Whether an authorized deny suppresses an allow of `capability` to `actor` at `path`
+/// that was made by `granter` (conferring via the `Own` lattice when `via_own`). A
+/// deny suppresses only when its author is [at or above](at_or_above) `granter`
+/// (provenance-bounded); a `Deny(capability)` bounds a same-capability allow, while a
+/// `Deny(Own)` bounds only an `Own`-implied one (capability separation — a `Deny(Own)`
+/// strips ownership without touching a separately granted capability).
+#[allow(clippy::too_many_arguments)]
+fn deny_suppresses(
+    records: &[AclRecord],
+    creator: ClientId,
+    actor: &AclActor,
+    path: &[u8],
+    capability: Capability,
+    granter: ClientId,
+    granter_path: &[u8],
+    via_own: bool,
+    rooted: &[bool],
+    revoked: &[bool],
+) -> bool {
+    records.iter().enumerate().any(|(i, r)| {
+        if revoked[i]
+            || r.tuple.effect != AclEffect::Deny
+            || !r.tuple.subject.matches(actor)
+            || !governs(&r.tuple.path, path)
+        {
+            return false;
+        }
+        let AclGrant::Capability(dc) = r.tuple.grant else {
+            return false;
+        };
+        let relevant = dc == capability || (dc == Capability::Own && via_own);
+        relevant
+            && at_or_above(
+                records,
+                creator,
+                r.tuple.grantor,
+                granter,
+                granter_path,
+                rooted,
+                revoked,
+            )
+    })
+}
+
 /// The doc-level ACL tuple tier's verdict on whether `actor` holds `capability` at
 /// `path`, over the merged record set — the authority-aware form of
 /// [`decide_capability`]. It layers **attenuated recursive delegation** and
@@ -379,13 +476,20 @@ fn revoke_pass(
 ///   validly owned the grant's path (or an ancestor) — recursively, up to the creator.
 ///   An `Allow` whose chain does not root at the creator is inert (self-granted or
 ///   forged authority confers nothing), and a non-owner cannot delegate (only
-///   ownership confers granting power). A `Deny` is honored as-present — a deny must
-///   never fail open, and bounding a deny by its author's provenance is slice 3b-ii.
+///   ownership confers granting power).
+/// - **provenance-bounded deny** — a `Deny` suppresses a grant only when its author is
+///   [at or above](at_or_above) the grant's grantor: the creator, the grantor itself
+///   (slice-2 deny-overrides), or a delegation superior. A subordinate's or an
+///   unrelated peer's deny is disregarded, so a deny is not a backdoor around
+///   revocation; the synthetic creator-owns-`/` is immune to any deny but the
+///   creator's own. A deny still beats a static/default grant always, and it is never
+///   dropped for an unrooted grantor — only its power to re-open a superior's or a
+///   peer's grant is bounded.
 /// - **recursive provenance-based revocation** — a record is dropped only when a
 ///   revoker was authorized: the tuple's `grantor`, the `creator`, or a **currently
 ///   valid** owner of the tuple's path. Validity here is rooted-at-creator and not
 ///   itself authoritatively revoked, so an owner whose own `Own` was revoked no longer
-///   confers revoke authority (`Deny(Own)` stripping ownership is 3b-ii's deny work).
+///   confers revoke authority.
 ///
 /// Rooting and revocation are mutually recursive (a revoke's authority is an
 /// ownership, an ownership is a rooted-and-unrevoked grant), so both are solved as a
@@ -451,26 +555,74 @@ pub fn decide_capability_with_authority(
         }
     }
 
-    // The effective set: creator-owns, plus every live tuple an authorized revoke has
-    // not tombstoned. Rooting gates only positive grants — an `Allow` confers authority
-    // only when it roots at the creator (attenuated delegation). A `Deny` is honored
-    // as-present: a deny must never fail open, and bounding a deny by its author's
-    // provenance is slice 3b-ii.
-    let mut effective: Vec<AclTuple> = Vec::with_capacity(n + 1);
-    effective.push(creator_owns_root(creator));
-    for (i, r) in records.iter().enumerate() {
-        if revoked[i] {
-            continue;
-        }
-        let honored = match r.tuple.effect {
-            AclEffect::Allow => rooted[i],
-            AclEffect::Deny => true,
-        };
-        if honored {
-            effective.push(r.tuple.clone());
-        }
+    // Provenance-bounded decision. `capability` is allowed iff some rooted, live allow
+    // confers it (directly or via `Own`) and no *authorized* deny suppresses that allow —
+    // a deny binds only when its author is at or above the allow's grantor (see
+    // [`at_or_above`]). Creator-owns-`/` is the synthetic root allow: it confers every
+    // capability everywhere and is immune to any deny but the creator's own (creator-deny
+    // immunity). Rooting gates only positive grants; a deny is honored as-present up to
+    // this authority bound (it is never dropped for an unrooted grantor).
+    let creator_owns = actor.id == creator
+        && !deny_suppresses(
+            records,
+            creator,
+            actor,
+            path,
+            capability,
+            creator,
+            &[],
+            true,
+            &rooted,
+            &revoked,
+        );
+    let allowed = creator_owns
+        || records.iter().enumerate().any(|(i, r)| {
+            if revoked[i] || !rooted[i] || r.tuple.effect != AclEffect::Allow {
+                return false;
+            }
+            if !r.tuple.subject.matches(actor) || !governs(&r.tuple.path, path) {
+                return false;
+            }
+            let AclGrant::Capability(c) = r.tuple.grant else {
+                return false;
+            };
+            let via_own = c == Capability::Own;
+            if !via_own && c != capability {
+                return false;
+            }
+            !deny_suppresses(
+                records,
+                creator,
+                actor,
+                path,
+                capability,
+                r.tuple.grantor,
+                &r.tuple.path,
+                via_own,
+                &rooted,
+                &revoked,
+            )
+        });
+    if allowed {
+        return AclDecision::Allow;
     }
-    decide_capability(&effective, actor, path, capability)
+
+    // No allow survives. A matching same-capability deny still floors the verdict to
+    // `Deny` (deny beats static/default grants always) — the floor needs no authority,
+    // since with no standing grant there is nothing to suppress; authority gates only the
+    // re-opening of a superior's or a peer's grant, decided above.
+    let floored = records.iter().enumerate().any(|(i, r)| {
+        !revoked[i]
+            && r.tuple.effect == AclEffect::Deny
+            && r.tuple.subject.matches(actor)
+            && governs(&r.tuple.path, path)
+            && matches!(r.tuple.grant, AclGrant::Capability(c) if c == capability)
+    });
+    if floored {
+        AclDecision::Deny
+    } else {
+        AclDecision::Abstain
+    }
 }
 
 /// Whether `actor` holds `capability` at `path`, over the merged record set with the
