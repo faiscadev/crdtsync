@@ -452,3 +452,210 @@ fn diff_reports_a_list_insert_with_an_items_array() {
 fn diff_of_a_malformed_snapshot_throws() {
     assert!(WasmDocument::diff(&[1, 2, 3], &[1, 2, 3]).is_err());
 }
+
+#[wasm_bindgen_test]
+fn an_encoded_diff_round_trips_through_decode() {
+    let mut a = doc(1);
+    let p = path(&["age"]);
+    a.register_int(&p, 30);
+    let old = a.encode_state();
+    a.register_int(&p, 31);
+    let new = a.encode_state();
+
+    // The opaque buffer decodes to the same tagged changes the structural diff shapes.
+    let bytes = WasmDocument::diff_encoded(&old, &new).unwrap();
+    let changes = WasmDocument::decode_changes(&bytes).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(get_str(&changes[0], "op"), "value");
+    // A truncated buffer is a clean throw, never a panic.
+    assert!(WasmDocument::decode_changes(&[0xFF, 0xFF, 0xFF]).is_err());
+}
+
+// --- xml ---
+
+#[wasm_bindgen_test]
+fn an_xml_element_reads_its_tag() {
+    let mut a = doc(1);
+    let p = path(&["body"]);
+    a.xml_element(&p, b"section");
+    assert_eq!(a.xml_tag(&p), Some(b"section".to_vec()));
+    // A fragment is tagless, and a plain register is not an element.
+    let f = path(&["frag"]);
+    a.xml_fragment(&f);
+    assert_eq!(a.xml_tag(&f), None);
+    a.register_int(&path(&["n"]), 1);
+    assert_eq!(a.xml_tag(&path(&["n"])), None);
+    assert_eq!(a.xml_tag(&path(&["absent"])), None);
+}
+
+#[wasm_bindgen_test]
+fn xml_children_insert_count_delete_and_converge() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let p = path(&["body"]);
+    b.apply(&a.xml_element(&p, b"div"));
+    b.apply(&a.xml_insert_element(&p, 0, b"p"));
+    b.apply(&a.xml_insert_text(&p, 1, "hello"));
+    assert_eq!(a.xml_children_len(&p), Some(2));
+    assert_eq!(b.xml_children_len(&p), Some(2));
+
+    b.apply(&a.xml_child_delete(&p, 0));
+    assert_eq!(a.xml_children_len(&p), Some(1));
+    assert_eq!(b.xml_children_len(&p), Some(1));
+
+    // A non-node path has no child count and its edits are inert.
+    assert!(a.xml_insert_element(&path(&["ghost"]), 0, b"x").is_empty());
+    assert_eq!(a.xml_children_len(&path(&["ghost"])), None);
+}
+
+#[wasm_bindgen_test]
+fn an_xml_child_moves_to_a_new_parent_and_converges() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    // Two path-addressable fragments; the mover is a child of `src`.
+    let src = path(&["src"]);
+    let dst = path(&["dst"]);
+    b.apply(&a.xml_fragment(&src));
+    b.apply(&a.xml_fragment(&dst));
+    b.apply(&a.xml_insert_element(&src, 0, b"leaf"));
+    assert_eq!(a.xml_children_len(&src), Some(1));
+    assert_eq!(a.xml_children_len(&dst), Some(0));
+
+    // Relocate src's only child under dst — its identity and subtree ride along.
+    b.apply(&a.xml_move(&src, 0, &dst, 0));
+    assert_eq!(a.xml_children_len(&src), Some(0));
+    assert_eq!(a.xml_children_len(&dst), Some(1));
+    assert_eq!(b.xml_children_len(&src), Some(0));
+    assert_eq!(b.xml_children_len(&dst), Some(1));
+
+    // A move naming no live child is inert.
+    assert!(a.xml_move(&src, 5, &dst, 0).is_empty());
+}
+
+// --- marks ---
+
+use crdtsync_core::Scalar;
+
+fn get_bool(obj: &wasm_bindgen::JsValue, key: &str) -> bool {
+    js_sys::Reflect::get(obj, &wasm_bindgen::JsValue::from_str(key))
+        .unwrap()
+        .as_bool()
+        .unwrap()
+}
+
+fn get_bytes_field(obj: &wasm_bindgen::JsValue, key: &str) -> Vec<u8> {
+    let v = js_sys::Reflect::get(obj, &wasm_bindgen::JsValue::from_str(key)).unwrap();
+    js_sys::Uint8Array::new(&v).to_vec()
+}
+
+// A schema declaring the mark flavors over a top-level "body" text, so the read
+// model resolves boolean/value marks (an undeclared name defaults to object).
+const MARK_SCHEMA: &[u8] = br#"{
+    "schema": "doc", "version": 1, "root": "Doc",
+    "types": { "Doc": { "kind": "map", "children": { "body": "Body" } }, "Body": { "kind": "text" } },
+    "marks": { "bold": { "flavor": "boolean" }, "link": { "flavor": "value" } }
+}"#;
+
+#[wasm_bindgen_test]
+fn a_mark_is_authored_read_changed_and_deleted() {
+    let mut a = doc(1);
+    assert!(a.set_schema(MARK_SCHEMA));
+    let t = path(&["body"]);
+    a.text_insert(&t, 0, "hello world");
+    // A boolean mark over [0,5) — the mark id is the handle.
+    let on = Scalar::Bool(true).encode_state();
+    let id = a.mark(&t, 0, 0, 5, 1, b"bold", &on).expect("mark authored");
+    assert_eq!(id.len(), 16);
+
+    let marks = js_sys::Array::from(&a.marks_at(&t, 0));
+    assert_eq!(marks.length(), 1);
+    let m = marks.get(0);
+    assert_eq!(get_bytes_field(&m, "name"), b"bold".to_vec());
+    assert_eq!(get_str(&m, "kind"), "boolean");
+    assert!(get_bool(&m, "value"));
+
+    // The payload change and the delete each emit broadcastable ops.
+    let off = Scalar::Bool(false).encode_state();
+    assert!(!a.mark_set_value(&id, &off).is_empty());
+    assert!(!a.mark_delete(&id).is_empty());
+    assert_eq!(js_sys::Array::from(&a.marks_at(&t, 0)).length(), 0);
+
+    // A non-sequence path yields no handle, an unknown side is rejected, and a
+    // malformed value is rejected.
+    a.register_int(&path(&["n"]), 1);
+    assert!(a.mark(&path(&["n"]), 0, 0, 1, 1, b"x", &on).is_none());
+    assert!(a.mark(&t, 0, 9, 5, 1, b"x", &on).is_none());
+    assert!(a.mark(&t, 0, 0, 5, 1, b"x", &[0xFF, 0xFF]).is_none());
+    assert_eq!(
+        js_sys::Array::from(&a.marks_at(&path(&["n"]), 0)).length(),
+        0
+    );
+}
+
+#[wasm_bindgen_test]
+fn a_value_mark_reads_as_a_tagged_scalar() {
+    let mut a = doc(1);
+    assert!(a.set_schema(MARK_SCHEMA));
+    let t = path(&["body"]);
+    a.text_insert(&t, 0, "abc");
+    let payload = Scalar::Int(7).encode_state();
+    a.mark(&t, 0, 0, 3, 1, b"link", &payload).expect("authored");
+
+    let marks = js_sys::Array::from(&a.marks_at(&t, 1));
+    assert_eq!(marks.length(), 1);
+    let m = marks.get(0);
+    assert_eq!(get_str(&m, "kind"), "value");
+    let v = js_sys::Reflect::get(&m, &"value".into()).unwrap();
+    // The scalar rides the same tagged `{ t, v }` shape as change_to_js.
+    assert_eq!(get_str(&v, "t"), "int");
+}
+
+// --- schema / repair ---
+
+#[wasm_bindgen_test]
+fn a_schema_binds_or_is_rejected_and_repairs_drain() {
+    let mut a = doc(1);
+    // A malformed schema binds nothing.
+    assert!(!a.set_schema(b"not json"));
+    // A well-formed schema binds.
+    assert!(a.set_schema(MARK_SCHEMA));
+    // With the current state as baseline, nothing newly needs repair.
+    assert_eq!(js_sys::Array::from(&a.take_repairs()).length(), 0);
+}
+
+// --- client-routed xml / marks (outbox / resend) ---
+
+#[wasm_bindgen_test]
+fn a_client_xml_edit_rides_the_outbox_and_travels_to_a_peer() {
+    let mut a = wasm_client(1);
+    let mut b = wasm_client(2);
+    let sa = a.subscribe(b"room-1");
+    let sb = b.subscribe(b"room-1");
+    let p = path(&["body"]);
+    // Each edit enters the outbox — resent / acknowledged, not framed and forgotten.
+    let frame = a.xml_element(sa.channel(), &p, b"div");
+    assert!(!frame.is_empty());
+    assert_eq!(a.outbox_len(sa.channel()), 1);
+    assert!(a.resend(sa.channel()).is_some());
+    assert!(b.receive(&frame));
+
+    assert!(b.receive(&a.xml_insert_element(sa.channel(), &p, 0, b"p")));
+    assert_eq!(a.xml_tag(sa.channel(), &p), Some(b"div".to_vec()));
+    assert_eq!(b.xml_children_len(sb.channel(), &p), Some(1));
+}
+
+#[wasm_bindgen_test]
+fn a_client_mark_over_a_non_sequence_is_inert() {
+    let mut a = wasm_client(1);
+    let sa = a.subscribe(b"room-1");
+    // A fragment is not a sequence, so this author enqueues nothing and hands back
+    // no handle.
+    let t = path(&["body"]);
+    a.xml_fragment(sa.channel(), &t);
+    let outbox = a.outbox_len(sa.channel());
+    let on = Scalar::Bool(true).encode_state();
+    assert!(a.mark(sa.channel(), &t, 0, 0, 0, 1, b"c", &on).is_none());
+    assert_eq!(a.outbox_len(sa.channel()), outbox);
+    // An unheld channel is likewise inert.
+    assert!(a.mark(9, &t, 0, 0, 0, 1, b"c", &on).is_none());
+}

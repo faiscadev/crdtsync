@@ -1,3 +1,7 @@
+# Its own workspace root: the wasm SDK is excluded from the native workspace and
+# built standalone with wasm-pack, so it carries its own lockfile.
+[workspace]
+
 [package]
 name = "crdtsync-wasm"
 version = "0.0.0"
