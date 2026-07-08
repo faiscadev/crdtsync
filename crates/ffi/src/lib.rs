@@ -943,6 +943,40 @@ pub unsafe extern "C" fn crdtsync_diff(
     .unwrap_or_else(|_| CrdtBuf::empty())
 }
 
+/// Decode a change-list buffer from [`crdtsync_diff`] back into its canonical,
+/// SDK-marshalable form, written to `out` — the boundary read that turns opaque
+/// diff bytes into the structured change list a binding walks. A diff crosses an
+/// untrusted boundary (a wire message or a stored snapshot), so the decode is
+/// total: a truncated or garbage buffer yields 0 with `out` left untouched, never
+/// a panic across the frame. Returns 1 with the canonical change list on a
+/// well-formed buffer, -1 on a null `out` or a panic.
+///
+/// # Safety
+/// `bytes`/`len` follow [`as_slice`]; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_diff_decode(
+    bytes: *const u8,
+    len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if out.is_null() {
+            return -1;
+        }
+        let Some(raw) = as_slice(bytes, len) else {
+            return 0;
+        };
+        match path::decode_changes(raw) {
+            Ok(changes) => {
+                *out = CrdtBuf::from_vec(encode_changes(&changes));
+                1
+            }
+            Err(_) => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
 /// Marshal a path-addressed edit: delegate the navigation to `run`, encode the
 /// emitted ops, and never let a panic cross the C frame.
 unsafe fn edit<F>(doc: *mut CrdtDoc, path: *const u8, path_len: usize, run: F) -> CrdtBuf
