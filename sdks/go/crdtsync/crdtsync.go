@@ -673,10 +673,11 @@ func (c *Client) VersionState(channel uint32, name []byte) ([]byte, bool) {
 
 // --- schema-aware diff ---
 
-// Scalar is a diff's tagged scalar value: T names the kind and the matching
-// field holds it. Bytes also carries a BlobRef's opaque encoded bytes.
+// Scalar is a tagged scalar value: T names the kind and the matching field
+// holds it. It crosses both as a diff leaf value and as a mark's payload. Bytes
+// also carries a BlobRef's opaque encoded bytes, or an ElementRef's 16-byte id.
 type Scalar struct {
-	T     string // "null" | "bool" | "int" | "bytes" | "blobref"
+	T     string // "null" | "bool" | "int" | "bytes" | "blobref" | "elementref"
 	Bool  bool
 	Int   int64
 	Bytes []byte
@@ -691,7 +692,10 @@ type Item struct {
 // Change is one structural change between two snapshots. Op names the variant;
 // which fields it populates follows Op — "add"/"remove": Kind; "value": Old/New;
 // "counter": OldInt/NewInt; "listInsert"/"listDelete": Index/Items;
-// "textInsert"/"textDelete": Index/Text.
+// "textInsert"/"textDelete": Index/Text. A mark change is addressed by its own
+// id and target sequence, not a Path: "markAdded" carries ID/Seq/Name and New,
+// "markRemoved" ID/Seq/Name and Old (its last value), "markChanged" ID/Seq/Name
+// and Old/New.
 type Change struct {
 	Op     string
 	Path   []byte
@@ -703,6 +707,9 @@ type Change struct {
 	Index  uint
 	Items  []Item
 	Text   string
+	ID     []byte
+	Seq    []byte
+	Name   []byte
 }
 
 var kindNames = [...]string{"scalar", "register", "counter", "map", "list", "text"}
@@ -755,6 +762,11 @@ func (r *changeReader) blob() []byte {
 	return append([]byte(nil), r.take(int(r.u32()))...)
 }
 
+// id16 reads a 16-byte element id (a mark id or its target sequence id).
+func (r *changeReader) id16() []byte {
+	return append([]byte(nil), r.take(16)...)
+}
+
 func (r *changeReader) kind() string {
 	t := r.u8()
 	if int(t) >= len(kindNames) {
@@ -785,6 +797,8 @@ func (r *changeReader) scalar() *Scalar {
 			r.blob() // inline
 		}
 		return &Scalar{T: "blobref", Bytes: append([]byte(nil), r.d[start:r.i]...)}
+	case 5:
+		return &Scalar{T: "elementref", Bytes: append([]byte(nil), r.take(16)...)}
 	default:
 		if r.err == nil {
 			r.err = errors.New("bad scalar tag")
@@ -834,6 +848,12 @@ func decodeChanges(data []byte) ([]Change, error) {
 			ch = Change{Op: "textInsert", Path: r.blob(), Index: uint(r.u64()), Text: string(r.blob())}
 		case 7:
 			ch = Change{Op: "textDelete", Path: r.blob(), Index: uint(r.u64()), Text: string(r.blob())}
+		case 8:
+			ch = Change{Op: "markAdded", ID: r.id16(), Seq: r.id16(), Name: r.blob(), New: r.scalar()}
+		case 9:
+			ch = Change{Op: "markRemoved", ID: r.id16(), Seq: r.id16(), Name: r.blob(), Old: r.scalar()}
+		case 10:
+			ch = Change{Op: "markChanged", ID: r.id16(), Seq: r.id16(), Name: r.blob(), Old: r.scalar(), New: r.scalar()}
 		default:
 			r.err = errors.New("bad change tag")
 		}
@@ -847,16 +867,403 @@ func decodeChanges(data []byte) ([]Change, error) {
 	return out, nil
 }
 
-// Diff computes the structural changes turning oldState into newState — each a
-// snapshot from EncodeState, a named version, or an exported room. Each Change
-// carries an Op tag, a Path, and its variant's fields. Returns an error on a
+// DiffEncode computes the opaque change-list bytes turning oldState into
+// newState — the buffer a peer decodes with DiffDecode. Each snapshot is a
+// snapshot from EncodeState, a named version, or an exported room. Empty on a
 // malformed snapshot.
-func Diff(oldState, newState []byte) ([]Change, error) {
+func DiffEncode(oldState, newState []byte) []byte {
 	op, ol := bytesArg(oldState)
 	np, nl := bytesArg(newState)
-	data := takeBuf(C.crdtsync_diff(op, ol, np, nl))
+	return takeBuf(C.crdtsync_diff(op, ol, np, nl))
+}
+
+// Diff computes the structural changes turning oldState into newState — each a
+// snapshot from EncodeState, a named version, or an exported room. Each Change
+// carries an Op tag and its variant's fields. Returns an error on a malformed
+// snapshot.
+func Diff(oldState, newState []byte) ([]Change, error) {
+	data := DiffEncode(oldState, newState)
 	if len(data) == 0 {
 		return nil, errors.New("malformed snapshot")
 	}
 	return decodeChanges(data)
+}
+
+// DiffDecode decodes an opaque change-list buffer from DiffEncode back into its
+// structural changes, validating the framing through the core's total boundary
+// decoder — the read a peer runs on a diff that crossed a wire or a snapshot
+// store. Returns an error on a truncated or malformed buffer.
+func DiffDecode(data []byte) ([]Change, error) {
+	dp, dl := bytesArg(data)
+	var out C.CrdtBuf
+	if C.crdtsync_diff_decode(dp, dl, &out) != 1 {
+		return nil, errors.New("malformed diff buffer")
+	}
+	return decodeChanges(takeBuf(out))
+}
+
+// --- xml (document surface) ---
+//
+// An XmlElement/XmlFragment is a node in an ordered tree of element and text
+// children. Reads (XmlTag, XmlChildrenLen) resolve the live node; edits emit
+// ops like any other document edit. XmlMove is a Kleppmann tree move that keeps
+// the child's identity and subtree.
+
+// XmlElement installs a tagged XmlElement at path. Returns the ops to broadcast.
+func (d *Document) XmlElement(path [][]byte, tag []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	tp, tl := bytesArg(tag)
+	return takeBuf(C.crdtsync_doc_xml_element(d.h, pp, pl, tp, tl))
+}
+
+// XmlFragment installs a tagless XmlFragment at path. Returns the ops.
+func (d *Document) XmlFragment(path [][]byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_doc_xml_fragment(d.h, pp, pl))
+}
+
+// XmlTag reads the tag of the live XmlElement at path. The bool is false when
+// the path is absent or a tagless fragment.
+func (d *Document) XmlTag(path [][]byte) ([]byte, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_doc_xml_tag(d.h, pp, pl, &out) != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// XmlInsertElement inserts a nested XmlElement tagged tag at live index in the
+// children of the node at path. Returns the ops.
+func (d *Document) XmlInsertElement(path [][]byte, index uint, tag []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	tp, tl := bytesArg(tag)
+	return takeBuf(C.crdtsync_doc_xml_insert_element(d.h, pp, pl, C.uintptr_t(index), tp, tl))
+}
+
+// XmlInsertText inserts a Text-run child holding text at live index in the
+// children of the node at path. Returns the ops.
+func (d *Document) XmlInsertText(path [][]byte, index uint, text string) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	tp, tl := bytesArg([]byte(text))
+	return takeBuf(C.crdtsync_doc_xml_insert_text(d.h, pp, pl, C.uintptr_t(index), tp, tl))
+}
+
+// XmlChildDelete tombstones the child at live index in the children of the node
+// at path. Returns the ops.
+func (d *Document) XmlChildDelete(path [][]byte, index uint) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_doc_xml_child_delete(d.h, pp, pl, C.uintptr_t(index)))
+}
+
+// XmlChildrenLen reads the count of live children of the node at path.
+func (d *Document) XmlChildrenLen(path [][]byte) (uint, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.uintptr_t
+	rc := C.crdtsync_doc_xml_children_len(d.h, pp, pl, &out)
+	return uint(out), rc == 1
+}
+
+// XmlMove relocates the live child at childIndex under parentPath to destIndex
+// in the children of newParentPath — a Kleppmann tree move that keeps the
+// child's identity and subtree. Returns the ops.
+func (d *Document) XmlMove(parentPath [][]byte, childIndex uint, newParentPath [][]byte, destIndex uint) []byte {
+	pp, pl := bytesArg(EncodePath(parentPath))
+	np, nl := bytesArg(EncodePath(newParentPath))
+	return takeBuf(C.crdtsync_doc_xml_move(d.h, pp, pl, C.uintptr_t(childIndex), np, nl, C.uintptr_t(destIndex)))
+}
+
+// --- xml (client surface) ---
+//
+// The same edits on a subscribed room's replica; their ops route through the
+// outbox, so they are resent / acknowledged rather than framed and forgotten.
+
+// XmlElement installs a tagged XmlElement at path in channel's room. Returns
+// the Ops frame to send.
+func (c *Client) XmlElement(channel uint32, path [][]byte, tag []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	tp, tl := bytesArg(tag)
+	return takeBuf(C.crdtsync_client_xml_element(c.h, C.uint32_t(channel), pp, pl, tp, tl))
+}
+
+// XmlFragment installs a tagless XmlFragment at path in channel's room. Returns
+// the Ops frame.
+func (c *Client) XmlFragment(channel uint32, path [][]byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_client_xml_fragment(c.h, C.uint32_t(channel), pp, pl))
+}
+
+// XmlInsertElement inserts a nested XmlElement tagged tag at live index in the
+// children of the node at path in channel's room. Returns the Ops frame.
+func (c *Client) XmlInsertElement(channel uint32, path [][]byte, index uint, tag []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	tp, tl := bytesArg(tag)
+	return takeBuf(C.crdtsync_client_xml_insert_element(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index), tp, tl))
+}
+
+// XmlInsertText inserts a Text-run child holding text at live index in the
+// children of the node at path in channel's room. Returns the Ops frame.
+func (c *Client) XmlInsertText(channel uint32, path [][]byte, index uint, text string) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	tp, tl := bytesArg([]byte(text))
+	return takeBuf(C.crdtsync_client_xml_insert_text(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index), tp, tl))
+}
+
+// XmlChildDelete tombstones the child at live index in the children of the node
+// at path in channel's room. Returns the Ops frame.
+func (c *Client) XmlChildDelete(channel uint32, path [][]byte, index uint) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_client_xml_child_delete(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index)))
+}
+
+// XmlMove relocates the live child at childIndex under parentPath to destIndex
+// in the children of newParentPath, in channel's room. Returns the Ops frame.
+func (c *Client) XmlMove(channel uint32, parentPath [][]byte, childIndex uint, newParentPath [][]byte, destIndex uint) []byte {
+	pp, pl := bytesArg(EncodePath(parentPath))
+	np, nl := bytesArg(EncodePath(newParentPath))
+	return takeBuf(C.crdtsync_client_xml_move(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(childIndex), np, nl, C.uintptr_t(destIndex)))
+}
+
+// --- marks ---
+//
+// A mark is a named range over a sequence (a Text or List), authored with two
+// (index, side) endpoints and a scalar payload, and read back per its resolved
+// state at a character. Authoring returns the mark's 16-byte id — the handle a
+// later MarkSetValue / MarkDelete names it by — alongside the ops to broadcast.
+
+// Mark is a resolved mark on a character: Name and, by Flavor, its payload —
+// "bool" a boolean in Bool, "value" a scalar in Value, "object" a set of
+// element ids in IDs.
+type Mark struct {
+	Name   []byte
+	Flavor string
+	Bool   bool
+	Value  *Scalar
+	IDs    [][]byte
+}
+
+// encodeScalar serializes a Scalar to the core's canonical value bytes — the
+// shape a mark payload crosses as. A "blobref"/"elementref" carries its already
+// encoded bytes verbatim.
+func encodeScalar(s Scalar) []byte {
+	switch s.T {
+	case "null":
+		return []byte{0}
+	case "bool":
+		b := byte(0)
+		if s.Bool {
+			b = 1
+		}
+		return []byte{1, b}
+	case "int":
+		out := make([]byte, 9)
+		out[0] = 2
+		binary.LittleEndian.PutUint64(out[1:], uint64(s.Int))
+		return out
+	case "bytes":
+		out := make([]byte, 5+len(s.Bytes))
+		out[0] = 3
+		binary.LittleEndian.PutUint32(out[1:], uint32(len(s.Bytes)))
+		copy(out[5:], s.Bytes)
+		return out
+	case "elementref":
+		out := make([]byte, 1+len(s.Bytes))
+		out[0] = 5
+		copy(out[1:], s.Bytes)
+		return out
+	case "blobref":
+		return append([]byte(nil), s.Bytes...)
+	default:
+		panic("crdtsync: unknown scalar kind " + s.T)
+	}
+}
+
+// decodeMarks reads the resolved-marks buffer crdtsync_doc_marks_at emits: a
+// u32 count, then per mark a length-prefixed name, a one-byte flavor tag, and
+// that tag's payload.
+func decodeMarks(data []byte) []Mark {
+	r := &changeReader{d: data}
+	n := int(r.u32())
+	marks := make([]Mark, 0, n)
+	for k := 0; k < n && r.err == nil; k++ {
+		name := r.blob()
+		switch r.u8() {
+		case 0:
+			marks = append(marks, Mark{Name: name, Flavor: "bool", Bool: r.u8() != 0})
+		case 1:
+			r.u32() // scalar byte length; the scalar reader self-delimits
+			marks = append(marks, Mark{Name: name, Flavor: "value", Value: r.scalar()})
+		case 2:
+			c := int(r.u32())
+			ids := make([][]byte, 0, c)
+			for j := 0; j < c && r.err == nil; j++ {
+				ids = append(ids, r.id16())
+			}
+			marks = append(marks, Mark{Name: name, Flavor: "object", IDs: ids})
+		default:
+			if r.err == nil {
+				r.err = errors.New("bad mark flavor")
+			}
+		}
+	}
+	if r.err != nil {
+		return nil
+	}
+	return marks
+}
+
+// Mark authors a named mark over [start, end) of the sequence at seqPath, each
+// endpoint an (index, side) pair, carrying the scalar value. Returns the mark's
+// 16-byte id handle and the ops to broadcast. The id is nil on an inert author
+// (a bad handle, a non-sequence path, or a malformed value).
+func (d *Document) Mark(seqPath [][]byte, startIndex uint, startSide Side, endIndex uint, endSide Side, name []byte, value Scalar) (markID []byte, ops []byte) {
+	pp, pl := bytesArg(EncodePath(seqPath))
+	np, nl := bytesArg(name)
+	vp, vl := bytesArg(encodeScalar(value))
+	var mid C.CrdtBuf
+	ops = takeBuf(C.crdtsync_doc_mark(d.h, pp, pl, C.uintptr_t(startIndex), C.uint32_t(startSide), C.uintptr_t(endIndex), C.uint32_t(endSide), np, nl, vp, vl, &mid))
+	id := takeBuf(mid)
+	if len(id) == 0 {
+		return nil, ops
+	}
+	return id, ops
+}
+
+// MarkSetValue changes the scalar payload of the mark handle markID. Returns
+// the ops to broadcast.
+func (d *Document) MarkSetValue(markID []byte, value Scalar) []byte {
+	mp, ml := bytesArg(markID)
+	vp, vl := bytesArg(encodeScalar(value))
+	return takeBuf(C.crdtsync_doc_mark_set_value(d.h, mp, ml, vp, vl))
+}
+
+// MarkDelete tombstones the mark handle markID. Returns the ops to broadcast.
+func (d *Document) MarkDelete(markID []byte) []byte {
+	mp, ml := bytesArg(markID)
+	return takeBuf(C.crdtsync_doc_mark_delete(d.h, mp, ml))
+}
+
+// MarksAt reads the marks active on character index of the sequence at seqPath.
+func (d *Document) MarksAt(seqPath [][]byte, index uint) []Mark {
+	pp, pl := bytesArg(EncodePath(seqPath))
+	var out C.CrdtBuf
+	if C.crdtsync_doc_marks_at(d.h, pp, pl, C.uintptr_t(index), &out) != 1 {
+		return nil
+	}
+	return decodeMarks(takeBuf(out))
+}
+
+// Mark authors a named mark over [start, end) of the sequence at seqPath in
+// channel's room, routed through the outbox. Returns the mark's 16-byte id
+// handle and the Ops frame to send; the id is nil on an inert author.
+func (c *Client) Mark(channel uint32, seqPath [][]byte, startIndex uint, startSide Side, endIndex uint, endSide Side, name []byte, value Scalar) (markID []byte, frame []byte) {
+	pp, pl := bytesArg(EncodePath(seqPath))
+	np, nl := bytesArg(name)
+	vp, vl := bytesArg(encodeScalar(value))
+	var mid C.CrdtBuf
+	frame = takeBuf(C.crdtsync_client_mark(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(startIndex), C.uint32_t(startSide), C.uintptr_t(endIndex), C.uint32_t(endSide), np, nl, vp, vl, &mid))
+	id := takeBuf(mid)
+	if len(id) == 0 {
+		return nil, frame
+	}
+	return id, frame
+}
+
+// MarkSetValue changes the payload of the mark handle markID in channel's room,
+// routed through the outbox. Returns the Ops frame to send.
+func (c *Client) MarkSetValue(channel uint32, markID []byte, value Scalar) []byte {
+	mp, ml := bytesArg(markID)
+	vp, vl := bytesArg(encodeScalar(value))
+	return takeBuf(C.crdtsync_client_mark_set_value(c.h, C.uint32_t(channel), mp, ml, vp, vl))
+}
+
+// MarkDelete tombstones the mark handle markID in channel's room, routed
+// through the outbox. Returns the Ops frame to send.
+func (c *Client) MarkDelete(channel uint32, markID []byte) []byte {
+	mp, ml := bytesArg(markID)
+	return takeBuf(C.crdtsync_client_mark_delete(c.h, C.uint32_t(channel), mp, ml))
+}
+
+// --- schema + repair ---
+//
+// A schema binds to the local document as runtime state — it authors no op and
+// broadcasts nothing. TakeRepairs drains the located paths whose repaired
+// reading newly changed against the bound schema since the last call.
+
+// Step is one hop of a repair path: a map-slot Key or a sequence Index,
+// discriminated by IsIndex. A repair path can descend a sequence index (a
+// bounded list item, an xml child), which a bare key path cannot express.
+type Step struct {
+	Key     []byte
+	Index   uint
+	IsIndex bool
+}
+
+// SetSchema parses schema JSON bytes and binds the schema to the document for
+// repair observation. Reports true when the schema bound, false when the bytes
+// are not a valid schema. Binding takes the current state as the baseline.
+func (d *Document) SetSchema(schema []byte) bool {
+	sp, sl := bytesArg(schema)
+	return C.crdtsync_doc_set_schema(d.h, sp, sl) == 1
+}
+
+// TakeRepairs drains the repair signal: the located paths whose repaired
+// reading has newly changed against the bound schema since the last call. The
+// drain reseeds the baseline, so a standing repair reports once. Each path is
+// a sequence of Steps naming a location, not a value.
+func (d *Document) TakeRepairs() [][]Step {
+	var out C.CrdtBuf
+	if C.crdtsync_doc_take_repairs(d.h, &out) != 1 {
+		return nil
+	}
+	return decodeRepairPaths(takeBuf(out))
+}
+
+// decodeRepairPaths reads the repair-path list crdtsync_doc_take_repairs emits:
+// a u32 count, then per path a length-prefixed encoded repair-path byte string.
+func decodeRepairPaths(data []byte) [][]Step {
+	r := &changeReader{d: data}
+	n := int(r.u32())
+	paths := make([][]Step, 0, n)
+	for k := 0; k < n && r.err == nil; k++ {
+		paths = append(paths, parseRepairPath(r.blob()))
+	}
+	if r.err != nil {
+		return nil
+	}
+	return paths
+}
+
+// parseRepairPath decodes one repair-path byte string into its Steps: each step
+// a one-byte tag then its payload — a key a u32 length then its bytes, an index
+// a u64. Total over any bytes: a bad tag or a length past the end truncates.
+func parseRepairPath(b []byte) []Step {
+	var steps []Step
+	i := 0
+	for i < len(b) {
+		tag := b[i]
+		i++
+		switch tag {
+		case 0: // key
+			if i+4 > len(b) {
+				return steps
+			}
+			klen := int(binary.LittleEndian.Uint32(b[i:]))
+			i += 4
+			if i+klen > len(b) {
+				return steps
+			}
+			steps = append(steps, Step{Key: append([]byte(nil), b[i:i+klen]...)})
+			i += klen
+		case 1: // index
+			if i+8 > len(b) {
+				return steps
+			}
+			steps = append(steps, Step{Index: uint(binary.LittleEndian.Uint64(b[i:])), IsIndex: true})
+			i += 8
+		default:
+			return steps
+		}
+	}
+	return steps
 }
