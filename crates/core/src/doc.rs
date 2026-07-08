@@ -12,11 +12,13 @@
 //! and replays once a create restores reachability, so out-of-order delivery
 //! converges.
 
+use crate::acl::{AclEffect, AclGrant, AclSubject, AclTuple};
 use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, len_u32, put_bytes, put_opt_bytes, put_range_anchor, put_scalar,
-    put_stamp, put_u32, put_u64, put_u8, Cursor, DecodeError,
+    decode_ops, encode_ops, len_u32, put_acl_effect, put_acl_grant, put_acl_subject, put_bytes,
+    put_opt_bytes, put_range_anchor, put_scalar, put_stamp, put_u32, put_u64, put_u8, Cursor,
+    DecodeError,
 };
 use crate::counter::Counter;
 use crate::element::Element;
@@ -53,7 +55,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 7;
+const STATE_VERSION: u8 = 8;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -148,6 +150,11 @@ pub struct Document {
     /// entry is retained so delete wins over a concurrent payload change and
     /// survives a snapshot reload.
     ranged: HashMap<ElementId, RangedEntry>,
+    /// The document-level authorization set: every ACL tuple keyed by its id.
+    /// Tuples are immutable; a revoked one is retained as a tombstone so the
+    /// revoke wins on merge and survives a snapshot reload. Storage only — core
+    /// merges the set but enforces no authority (see [`crate::acl`]).
+    acl: HashMap<ElementId, AclEntry>,
     lamport: u64,
     seq: u64,
     /// The next atomic-transaction id to mint; namespaced by this replica's
@@ -214,6 +221,7 @@ impl Document {
             placements: HashMap::new(),
             placement_index: HashSet::new(),
             ranged: HashMap::new(),
+            acl: HashMap::new(),
             lamport: 0,
             seq: 0,
             next_tx: 0,
@@ -298,6 +306,39 @@ impl Document {
     /// its sequences.
     pub fn ranged_on(&self, seq: ElementId) -> Vec<RangedElement> {
         self.sorted_view(|e| !e.tombstone && (e.start.seq == seq || e.end.seq == seq))
+    }
+
+    /// A live (non-revoked) ACL tuple by id, or `None` if absent or revoked.
+    pub fn acl_tuple(&self, id: ElementId) -> Option<AclTuple> {
+        self.acl
+            .get(&id)
+            .filter(|e| !e.tombstone)
+            .map(|e| e.view(id))
+    }
+
+    /// Every live ACL tuple, ordered by id so the sequence is identical on every
+    /// replica.
+    pub fn acl_tuples(&self) -> Vec<AclTuple> {
+        self.acl_view(|_| true)
+    }
+
+    /// Every live ACL tuple whose `path` matches `path` exactly. A content-neutral
+    /// storage filter — ancestor/prefix resolution is the evaluator's concern, not
+    /// this set's.
+    pub fn acl_on(&self, path: &[u8]) -> Vec<AclTuple> {
+        self.acl_view(|e| e.path == path)
+    }
+
+    /// The live ACL tuples satisfying `keep`, id-sorted.
+    fn acl_view(&self, keep: impl Fn(&AclEntry) -> bool) -> Vec<AclTuple> {
+        let mut out: Vec<AclTuple> = self
+            .acl
+            .iter()
+            .filter(|(_, e)| !e.tombstone && keep(e))
+            .map(|(id, e)| e.view(*id))
+            .collect();
+        out.sort_by_key(|t| t.id.as_bytes());
+        out
     }
 
     /// The active marks on character `index` of sequence `seq` — a read-time
@@ -753,6 +794,21 @@ impl Document {
             put_u8(&mut out, e.tombstone as u8);
         }
 
+        // The authorization set — every ACL tuple, revoked ones included so a
+        // revoke survives the reload. Ordered by id for a deterministic encoding.
+        let mut acl: Vec<(&ElementId, &AclEntry)> = self.acl.iter().collect();
+        acl.sort_by_key(|(id, _)| id.as_bytes());
+        put_u32(&mut out, len_u32(acl.len()));
+        for (id, e) in acl {
+            out.extend_from_slice(&id.as_bytes());
+            put_acl_subject(&mut out, &e.subject);
+            put_acl_grant(&mut out, &e.grant);
+            put_acl_effect(&mut out, e.effect);
+            put_bytes(&mut out, &e.path);
+            out.extend_from_slice(&e.grantor.as_bytes());
+            put_u8(&mut out, e.tombstone as u8);
+        }
+
         let mut parents: Vec<(&ElementId, &ElementId)> = self.parents.iter().collect();
         parents.sort_by_key(|(child, _)| child.as_bytes());
         put_u32(&mut out, len_u32(parents.len()));
@@ -966,6 +1022,47 @@ impl Document {
             }
         }
 
+        let acl_count = cur.u32()?;
+        let mut acl: HashMap<ElementId, AclEntry> =
+            HashMap::with_capacity((acl_count as usize).min(1024));
+        for _ in 0..acl_count {
+            let id = cur.element_id()?;
+            let subject = cur.acl_subject()?;
+            let grant = cur.acl_grant()?;
+            let effect = cur.acl_effect()?;
+            let path = cur.bytes()?;
+            let grantor = cur.client()?;
+            let tombstone = match cur.u8()? {
+                0 => false,
+                1 => true,
+                tag => {
+                    return Err(DecodeError::BadTag {
+                        what: "acl tuple tombstone flag",
+                        tag,
+                    })
+                }
+            };
+            if acl
+                .insert(
+                    id,
+                    AclEntry {
+                        subject,
+                        grant,
+                        effect,
+                        path,
+                        grantor,
+                        tombstone,
+                    },
+                )
+                .is_some()
+            {
+                return Err(DecodeError::BadTag {
+                    what: "document: duplicate acl tuple",
+                    tag: 0,
+                });
+            }
+        }
+
         // Resolve each slot: leaves inline, composites cloned from the matching
         // registry handle by id, so the whole tree shares the registry Rcs.
         for dm in decoded {
@@ -1099,6 +1196,7 @@ impl Document {
             placements,
             placement_index,
             ranged,
+            acl,
             lamport,
             seq,
             // Tx ids scope only the buffering of remote partial transactions,
@@ -1402,6 +1500,10 @@ impl Document {
             OpKind::RangedSetPayload { id, .. } | OpKind::RangedDelete { id } => {
                 self.ranged.contains_key(id)
             }
+            // A revoke waits for the tuple's grant — the grant carries the entry,
+            // the revoke only tombstones it, so applied against a missing entry it
+            // would be silently lost. A grant has no such dependency.
+            OpKind::AclRevoke { id } => self.acl.contains_key(id),
             _ => true,
         }
     }
@@ -1445,6 +1547,10 @@ impl Document {
         // delete of one is judged ready — else the group would commit and the
         // change would apply against a missing entry and be lost.
         let mut created_ranged: HashSet<ElementId> = HashSet::new();
+        // ACL tuple ids a member grants, so a later member's revoke of one is
+        // judged ready — else the group commits and the revoke applies against a
+        // missing entry and is lost.
+        let mut created_acl: HashSet<ElementId> = HashSet::new();
         for op in &ordered {
             let target_ok = self.resolvable(op.target) || created.contains(&op.target);
             if !target_ok {
@@ -1543,6 +1649,14 @@ impl Document {
                 }
                 OpKind::RangedSetPayload { id, .. } | OpKind::RangedDelete { id } => {
                     if !self.ranged.contains_key(id) && !created_ranged.contains(id) {
+                        return false;
+                    }
+                }
+                OpKind::AclGrant { .. } => {
+                    created_acl.insert(acl_id(op.stamp));
+                }
+                OpKind::AclRevoke { id } => {
+                    if !self.acl.contains_key(id) && !created_acl.contains(id) {
                         return false;
                     }
                 }
@@ -1735,6 +1849,33 @@ impl Document {
             }
             OpKind::RangedDelete { id } => {
                 if let Some(e) = self.ranged.get_mut(id) {
+                    e.tombstone = true;
+                }
+                return;
+            }
+            // ACL tuples live in a document-level set, not under `target`.
+            OpKind::AclGrant {
+                subject,
+                grant,
+                effect,
+                path,
+                grantor,
+            } => {
+                let id = acl_id(stamp);
+                // Idempotent: a tuple is immutable, so a replayed grant must not
+                // reset it. First sight records the entry.
+                self.acl.entry(id).or_insert_with(|| AclEntry {
+                    subject: subject.clone(),
+                    grant: grant.clone(),
+                    effect: *effect,
+                    path: path.clone(),
+                    grantor: *grantor,
+                    tombstone: false,
+                });
+                return;
+            }
+            OpKind::AclRevoke { id } => {
+                if let Some(e) = self.acl.get_mut(id) {
                     e.tombstone = true;
                 }
                 return;
@@ -2180,6 +2321,31 @@ impl RangedEntry {
     }
 }
 
+/// A stored ACL tuple: the immutable grant fields plus a tombstone a revoke
+/// raises (a tuple is immutable, so revoke is the only mutation and it wins).
+struct AclEntry {
+    subject: AclSubject,
+    grant: AclGrant,
+    effect: AclEffect,
+    path: Vec<u8>,
+    grantor: ClientId,
+    tombstone: bool,
+}
+
+impl AclEntry {
+    /// The public read view of this tuple under its id.
+    fn view(&self, id: ElementId) -> AclTuple {
+        AclTuple {
+            id,
+            subject: self.subject.clone(),
+            grant: self.grant.clone(),
+            effect: self.effect,
+            path: self.path.clone(),
+            grantor: self.grantor,
+        }
+    }
+}
+
 /// The scalar payload of the highest-stamped covering mark — the LWW winner for a
 /// boolean/value flavor. A covering mark with a composite payload carries no LWW
 /// stamp and is skipped (boolean/value marks author a scalar).
@@ -2270,6 +2436,15 @@ fn xml_child_id(list_id: ElementId, stamp: Stamp, kind: ElementKind) -> ElementI
 /// globally-unique op stamp so every replica agrees and concurrent creates differ.
 fn ranged_id(stamp: Stamp) -> ElementId {
     let ns = ElementId::from_bytes(*b"crdtsync\0ranged\0");
+    ElementId::derive(ns, &stamp_key(stamp), ElementKind::Scalar)
+}
+
+/// The id of the ACL tuple a grant at `stamp` mints. Derived under a fixed
+/// authorization namespace so it never collides with a user's map slot, and from
+/// the globally-unique op stamp so every replica agrees and concurrent grants
+/// differ.
+fn acl_id(stamp: Stamp) -> ElementId {
+    let ns = ElementId::from_bytes(*b"crdtsync\0acl\0\0\0\0");
     ElementId::derive(ns, &stamp_key(stamp), ElementKind::Scalar)
 }
 
@@ -2827,6 +3002,13 @@ impl<'a> MapCursor<'a> {
     pub fn ranged(&mut self) -> RangedCursor<'_> {
         RangedCursor { doc: self.doc }
     }
+
+    /// A cursor over the document-level ACL tuple set. Like [`ranged`](Self::ranged),
+    /// the set is the document's, addressed the same from any cursor — an ACL
+    /// tuple is not a map slot.
+    pub fn acl(&mut self) -> AclCursor<'_> {
+        AclCursor { doc: self.doc }
+    }
 }
 
 /// A cursor over the document-level RangedElement annotation set: create a range,
@@ -2961,6 +3143,54 @@ impl RangedCursor<'_> {
         }
         let root = self.doc.root_id();
         self.doc.emit(root, OpKind::RangedDelete { id });
+    }
+}
+
+/// A cursor over the document-level ACL tuple set: grant a tuple or revoke one.
+/// Its edits address the document's authorization set, independent of any map.
+/// Storage only — it records what the caller passes and never checks authority
+/// (who may grant or revoke is the server's concern, in a later slice).
+pub struct AclCursor<'a> {
+    doc: &'a mut Document,
+}
+
+impl AclCursor<'_> {
+    /// Grant an ACL tuple: an allow/deny of `grant` (a capability or role) to
+    /// `subject`, on `path`, recorded with `grantor` (the authoring actor, passed
+    /// explicitly). Returns its stable id — the handle to revoke it. Core stores
+    /// the tuple faithfully; it enforces no authority over the grantor here.
+    pub fn grant(
+        &mut self,
+        subject: AclSubject,
+        grant: AclGrant,
+        effect: AclEffect,
+        path: Vec<u8>,
+        grantor: ClientId,
+    ) -> ElementId {
+        let root = self.doc.root_id();
+        let stamp = self.doc.emit_stamped(
+            root,
+            OpKind::AclGrant {
+                subject,
+                grant,
+                effect,
+                path,
+                grantor,
+            },
+        );
+        acl_id(stamp)
+    }
+
+    /// Revoke an ACL tuple, tombstoning it. Emits nothing for an id this replica
+    /// has not yet materialised (a local apply would no-op while still
+    /// broadcasting, diverging the author from a peer that applied it against the
+    /// present entry).
+    pub fn revoke(&mut self, id: ElementId) {
+        if !self.doc.acl.contains_key(&id) {
+            return;
+        }
+        let root = self.doc.root_id();
+        self.doc.emit(root, OpKind::AclRevoke { id });
     }
 }
 

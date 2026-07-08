@@ -155,7 +155,9 @@ fn op_key(op: &Op) -> Option<&[u8]> {
         | OpKind::XmlMove { .. }
         | OpKind::RangedCreate { .. }
         | OpKind::RangedSetPayload { .. }
-        | OpKind::RangedDelete { .. } => None,
+        | OpKind::RangedDelete { .. }
+        | OpKind::AclGrant { .. }
+        | OpKind::AclRevoke { .. } => None,
     }
 }
 

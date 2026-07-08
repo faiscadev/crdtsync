@@ -6,6 +6,7 @@
 //! bytes, text is UTF-8, bytes and strings are length-prefixed. Decoding is
 //! total — malformed input yields a [`DecodeError`], never a panic.
 
+use crate::acl::{AclEffect, AclGrant, AclSubject, Capability};
 use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::elementid::{ElementId, ElementKind};
@@ -208,6 +209,57 @@ pub(crate) fn put_ranged_init(out: &mut Vec<u8>, init: &RangedInit) {
     }
 }
 
+/// An ACL subject, tag-prefixed: the two carrying a payload (actor id, group
+/// name) then their data, the three well-known classes bare.
+pub(crate) fn put_acl_subject(out: &mut Vec<u8>, subject: &AclSubject) {
+    match subject {
+        AclSubject::Actor(id) => {
+            put_u8(out, 0);
+            out.extend_from_slice(&id.as_bytes());
+        }
+        AclSubject::Group(name) => {
+            put_u8(out, 1);
+            put_bytes(out, name);
+        }
+        AclSubject::Authenticated => put_u8(out, 2),
+        AclSubject::Anonymous => put_u8(out, 3),
+        AclSubject::Anyone => put_u8(out, 4),
+    }
+}
+
+/// An ACL grant: tag `0` a capability (its own tag byte), tag `1` a role name.
+pub(crate) fn put_acl_grant(out: &mut Vec<u8>, grant: &AclGrant) {
+    match grant {
+        AclGrant::Capability(cap) => {
+            put_u8(out, 0);
+            put_u8(out, capability_tag(*cap));
+        }
+        AclGrant::Role(name) => {
+            put_u8(out, 1);
+            put_bytes(out, name);
+        }
+    }
+}
+
+fn capability_tag(cap: Capability) -> u8 {
+    match cap {
+        Capability::Read => 0,
+        Capability::Write => 1,
+        Capability::PublishAwareness => 2,
+        Capability::Own => 3,
+    }
+}
+
+pub(crate) fn put_acl_effect(out: &mut Vec<u8>, effect: AclEffect) {
+    put_u8(
+        out,
+        match effect {
+            AclEffect::Allow => 0,
+            AclEffect::Deny => 1,
+        },
+    );
+}
+
 fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
     match kind {
         OpKind::RegisterSet { key, value } => {
@@ -311,6 +363,24 @@ fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
         }
         OpKind::RangedDelete { id } => {
             put_u8(out, 18);
+            out.extend_from_slice(&id.as_bytes());
+        }
+        OpKind::AclGrant {
+            subject,
+            grant,
+            effect,
+            path,
+            grantor,
+        } => {
+            put_u8(out, 19);
+            put_acl_subject(out, subject);
+            put_acl_grant(out, grant);
+            put_acl_effect(out, *effect);
+            put_bytes(out, path);
+            out.extend_from_slice(&grantor.as_bytes());
+        }
+        OpKind::AclRevoke { id } => {
+            put_u8(out, 20);
             out.extend_from_slice(&id.as_bytes());
         }
     }
@@ -546,6 +616,63 @@ impl<'a> Cursor<'a> {
             })
     }
 
+    pub(crate) fn acl_subject(&mut self) -> Result<AclSubject, DecodeError> {
+        Ok(match self.u8()? {
+            0 => AclSubject::Actor(self.client()?),
+            1 => AclSubject::Group(self.bytes()?),
+            2 => AclSubject::Authenticated,
+            3 => AclSubject::Anonymous,
+            4 => AclSubject::Anyone,
+            tag => {
+                return Err(DecodeError::BadTag {
+                    what: "acl subject",
+                    tag,
+                })
+            }
+        })
+    }
+
+    pub(crate) fn acl_grant(&mut self) -> Result<AclGrant, DecodeError> {
+        Ok(match self.u8()? {
+            0 => AclGrant::Capability(self.capability()?),
+            1 => AclGrant::Role(self.bytes()?),
+            tag => {
+                return Err(DecodeError::BadTag {
+                    what: "acl grant",
+                    tag,
+                })
+            }
+        })
+    }
+
+    fn capability(&mut self) -> Result<Capability, DecodeError> {
+        Ok(match self.u8()? {
+            0 => Capability::Read,
+            1 => Capability::Write,
+            2 => Capability::PublishAwareness,
+            3 => Capability::Own,
+            tag => {
+                return Err(DecodeError::BadTag {
+                    what: "acl capability",
+                    tag,
+                })
+            }
+        })
+    }
+
+    pub(crate) fn acl_effect(&mut self) -> Result<AclEffect, DecodeError> {
+        Ok(match self.u8()? {
+            0 => AclEffect::Allow,
+            1 => AclEffect::Deny,
+            tag => {
+                return Err(DecodeError::BadTag {
+                    what: "acl effect",
+                    tag,
+                })
+            }
+        })
+    }
+
     fn opkind(&mut self) -> Result<OpKind, DecodeError> {
         Ok(match self.u8()? {
             0 => OpKind::RegisterSet {
@@ -621,6 +748,16 @@ impl<'a> Cursor<'a> {
                 payload: self.scalar()?,
             },
             18 => OpKind::RangedDelete {
+                id: self.element_id()?,
+            },
+            19 => OpKind::AclGrant {
+                subject: self.acl_subject()?,
+                grant: self.acl_grant()?,
+                effect: self.acl_effect()?,
+                path: self.bytes()?,
+                grantor: self.client()?,
+            },
+            20 => OpKind::AclRevoke {
                 id: self.element_id()?,
             },
             tag => {

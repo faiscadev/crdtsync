@@ -5,6 +5,7 @@
 //! log converges with the original. Decoding is total: malformed bytes yield a
 //! `DecodeError`, never a panic.
 
+use crdtsync_core::acl::{AclEffect, AclGrant, AclSubject, Capability};
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::{Op, OpId, OpKind};
 use crdtsync_core::{
@@ -95,6 +96,45 @@ fn one_of_each() -> Vec<Op> {
         }),
         op(OpKind::TextDelete {
             ids: vec![stmp(1, 1), stmp(2, 2), stmp(3, 3)],
+        }),
+        // Every ACL subject variant, both grant flavors, both effects.
+        op(OpKind::AclGrant {
+            subject: AclSubject::Actor(cid(2)),
+            grant: AclGrant::Capability(Capability::Read),
+            effect: AclEffect::Allow,
+            path: b"\x03\0\0\0doc".to_vec(),
+            grantor: cid(9),
+        }),
+        op(OpKind::AclGrant {
+            subject: AclSubject::Group(b"designers".to_vec()),
+            grant: AclGrant::Capability(Capability::Write),
+            effect: AclEffect::Deny,
+            path: Vec::new(),
+            grantor: cid(9),
+        }),
+        op(OpKind::AclGrant {
+            subject: AclSubject::Authenticated,
+            grant: AclGrant::Capability(Capability::PublishAwareness),
+            effect: AclEffect::Allow,
+            path: b"p".to_vec(),
+            grantor: cid(1),
+        }),
+        op(OpKind::AclGrant {
+            subject: AclSubject::Anonymous,
+            grant: AclGrant::Capability(Capability::Own),
+            effect: AclEffect::Deny,
+            path: b"p".to_vec(),
+            grantor: cid(1),
+        }),
+        op(OpKind::AclGrant {
+            subject: AclSubject::Anyone,
+            grant: AclGrant::Role(b"editor".to_vec()),
+            effect: AclEffect::Allow,
+            path: b"p".to_vec(),
+            grantor: cid(1),
+        }),
+        op(OpKind::AclRevoke {
+            id: eid(0x11, 0x22),
         }),
     ]
 }

@@ -24,6 +24,7 @@ pub mod elementid;
 pub mod scalar;
 pub mod stamp;
 
+pub mod acl;
 pub mod counter;
 pub mod element;
 pub mod list;
@@ -44,6 +45,7 @@ pub mod path;
 pub mod protocol;
 pub mod undo;
 
+pub use acl::{AclEffect, AclGrant, AclSubject, AclTuple, Capability};
 pub use anchor::RelativePosition;
 pub use client::{ClientError, ClientSession};
 pub use clientid::ClientId;
