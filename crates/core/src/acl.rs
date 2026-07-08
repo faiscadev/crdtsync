@@ -357,6 +357,14 @@ fn revoke_pass(
 /// delegation superior whose rooted `Own` grant `grantor`'s authority derives from,
 /// transitively up the grantor chain.
 ///
+/// The superiority is scoped to `grant_path` (the path of the grant being bounded):
+/// only `Own` grants that govern `grant_path` are walked, so a superior in a disjoint
+/// subtree does not count. This keeps a deny from reaching a grant its author has no
+/// authority over — e.g. an actor who owns `/foo` but merely happens to be a delegation
+/// superior of a grantor that *also* owns `/bar` from the creator cannot deny that
+/// grantor's `/bar` grant, and no one below the creator can forge an `Own`-to-creator
+/// tuple to rise above the creator (such a forgery cannot govern the creator's root).
+///
 /// A subordinate or an unrelated peer is *not* at or above the grantor, so its deny
 /// cannot suppress the grant — the anti-backdoor property (a deny must not do what a
 /// revoke may not). Only rooted, unrevoked actor-id `Own` grants are walked, so forged
@@ -367,14 +375,16 @@ fn at_or_above(
     creator: ClientId,
     author: ClientId,
     grantor: ClientId,
+    grant_path: &[u8],
     rooted: &[bool],
     revoked: &[bool],
 ) -> bool {
     if author == creator || author == grantor {
         return true;
     }
-    // Walk up `grantor`'s ownership provenance: the actors that delegated `Own` to it,
-    // then their delegators, and so on. `author` is a superior iff it is reached.
+    // Walk up `grantor`'s ownership provenance over `grant_path`: the actors that
+    // delegated `Own` governing it, then their delegators, and so on. `author` is a
+    // superior iff it is reached.
     let mut seen: Vec<ClientId> = vec![grantor];
     let mut frontier: Vec<ClientId> = vec![grantor];
     for _ in 0..=records.len() {
@@ -386,6 +396,7 @@ fn at_or_above(
                     || r.tuple.effect != AclEffect::Allow
                     || !matches!(r.tuple.grant, AclGrant::Capability(Capability::Own))
                     || r.tuple.subject != AclSubject::Actor(who)
+                    || !governs(&r.tuple.path, grant_path)
                 {
                     continue;
                 }
@@ -421,6 +432,7 @@ fn deny_suppresses(
     path: &[u8],
     capability: Capability,
     granter: ClientId,
+    granter_path: &[u8],
     via_own: bool,
     rooted: &[bool],
     revoked: &[bool],
@@ -437,7 +449,16 @@ fn deny_suppresses(
             return false;
         };
         let relevant = dc == capability || (dc == Capability::Own && via_own);
-        relevant && at_or_above(records, creator, r.tuple.grantor, granter, rooted, revoked)
+        relevant
+            && at_or_above(
+                records,
+                creator,
+                r.tuple.grantor,
+                granter,
+                granter_path,
+                rooted,
+                revoked,
+            )
     })
 }
 
@@ -543,7 +564,16 @@ pub fn decide_capability_with_authority(
     // this authority bound (it is never dropped for an unrooted grantor).
     let creator_owns = actor.id == creator
         && !deny_suppresses(
-            records, creator, actor, path, capability, creator, true, &rooted, &revoked,
+            records,
+            creator,
+            actor,
+            path,
+            capability,
+            creator,
+            &[],
+            true,
+            &rooted,
+            &revoked,
         );
     let allowed = creator_owns
         || records.iter().enumerate().any(|(i, r)| {
@@ -567,6 +597,7 @@ pub fn decide_capability_with_authority(
                 path,
                 capability,
                 r.tuple.grantor,
+                &r.tuple.path,
                 via_own,
                 &rooted,
                 &revoked,

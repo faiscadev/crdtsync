@@ -413,6 +413,106 @@ fn a_subordinate_cannot_deny_the_creator_any_capability() {
     ));
 }
 
+#[test]
+fn a_forged_own_to_the_creator_cannot_deny_the_creator() {
+    // Superiority is path-scoped, so a subordinate cannot forge its way above the
+    // creator. S (a creator-appointed owner of /doc) writes a bogus `Own` grant *to*
+    // the creator on /doc and then denies the creator's read. The forgery does not
+    // govern the creator's root authority, so S is not at-or-above the creator and the
+    // deny is disregarded — the creator keeps the read.
+    let creator = cid(1);
+    let set = vec![
+        live(allow(
+            AclSubject::Actor(cid(2)), // S, a real owner of /doc
+            cap(Capability::Own),
+            doc(),
+            creator,
+        )),
+        live(allow(
+            AclSubject::Actor(creator), // "S grants the creator Own of /doc"
+            cap(Capability::Own),
+            doc(),
+            cid(2),
+        )),
+        live(deny(
+            AclSubject::Actor(creator),
+            cap(Capability::Read),
+            doc(),
+            cid(2),
+        )),
+    ];
+    assert!(
+        evaluate_with_authority(&set, creator, &actor(1), &doc(), Capability::Read),
+        "a forged Own-to-creator lends no authority over the creator's root"
+    );
+}
+
+// ---- path-scoped authority (a disjoint-subtree superior is not above) ------
+
+#[test]
+fn a_disjoint_subtree_superior_cannot_deny_an_unrelated_grant() {
+    // A is B's delegation superior in /foo, but B *also* owns /bar straight from the
+    // creator and grants X read there. A is above B in /foo yet has no authority over
+    // /bar, so A's deny of the /bar grant is disregarded — a deny must not reach a grant
+    // its author could not revoke.
+    let creator = cid(1);
+    let foo = encode_path(&[b"foo"]);
+    let bar = encode_path(&[b"bar"]);
+    let base = vec![
+        live(allow(
+            AclSubject::Actor(cid(2)), // A owns /foo
+            cap(Capability::Own),
+            foo.clone(),
+            creator,
+        )),
+        live(allow(
+            AclSubject::Actor(cid(3)), // B owns /foo, delegated by A
+            cap(Capability::Own),
+            foo.clone(),
+            cid(2),
+        )),
+        live(allow(
+            AclSubject::Actor(cid(3)), // B *also* owns /bar, straight from the creator
+            cap(Capability::Own),
+            bar.clone(),
+            creator,
+        )),
+        live(allow(
+            AclSubject::Actor(cid(4)), // X reads /bar, granted by B
+            cap(Capability::Read),
+            bar.clone(),
+            cid(3),
+        )),
+    ];
+    let mut a_denies = base.clone();
+    a_denies.push(live(deny(
+        AclSubject::Actor(cid(4)),
+        cap(Capability::Read),
+        bar.clone(),
+        cid(2), // A, a superior of B only in the disjoint /foo subtree
+    )));
+    assert!(
+        evaluate_with_authority(&a_denies, creator, &actor(4), &bar, Capability::Read),
+        "a superior in a disjoint subtree cannot deny an unrelated grant"
+    );
+
+    // Control: the creator, genuinely above the /bar grant, can deny it.
+    let mut creator_denies = base;
+    creator_denies.push(live(deny(
+        AclSubject::Actor(cid(4)),
+        cap(Capability::Read),
+        bar.clone(),
+        creator,
+    )));
+    assert!(!evaluate_with_authority(
+        &creator_denies,
+        creator,
+        &actor(4),
+        &bar,
+        Capability::Read
+    ));
+}
+
 // ---- superior carve-out (deny own on a subpath) ---------------------------
 
 #[test]
