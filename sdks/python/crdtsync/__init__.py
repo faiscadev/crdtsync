@@ -18,7 +18,7 @@ import platform
 import struct
 from typing import List, Optional, Tuple
 
-__all__ = ["Client", "Document", "Side", "Undo", "diff", "encode_path"]
+__all__ = ["Client", "Document", "Side", "Undo", "diff", "diff_decode", "encode_path"]
 
 Path = List[bytes]
 
@@ -98,6 +98,31 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_begin_atomic, [doc], None)
     sig(lib.crdtsync_doc_commit_atomic, [doc], buf)
     sig(lib.crdtsync_diff, [cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_diff_decode, [cbytes, size, c.POINTER(buf)], c.c_int32)
+
+    # xml navigation (doc)
+    sig(lib.crdtsync_doc_xml_element, [doc, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_doc_xml_fragment, [doc, cbytes, size], buf)
+    sig(lib.crdtsync_doc_xml_tag, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_doc_xml_insert_element, [doc, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_doc_xml_insert_text, [doc, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_doc_xml_child_delete, [doc, cbytes, size, size], buf)
+    sig(lib.crdtsync_doc_xml_children_len, [doc, cbytes, size, c.POINTER(size)], c.c_int32)
+    sig(lib.crdtsync_doc_xml_move, [doc, cbytes, size, size, cbytes, size, size], buf)
+
+    # marks (doc)
+    sig(
+        lib.crdtsync_doc_mark,
+        [doc, cbytes, size, size, c.c_uint32, size, c.c_uint32, cbytes, size, cbytes, size, c.POINTER(buf)],
+        buf,
+    )
+    sig(lib.crdtsync_doc_mark_set_value, [doc, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_doc_mark_delete, [doc, cbytes, size], buf)
+    sig(lib.crdtsync_doc_marks_at, [doc, cbytes, size, size, c.POINTER(buf)], c.c_int32)
+
+    # schema + repair (doc)
+    sig(lib.crdtsync_doc_set_schema, [doc, cbytes, size], c.c_int32)
+    sig(lib.crdtsync_doc_take_repairs, [doc, c.POINTER(buf)], c.c_int32)
 
     # undo / redo
     undo = c.c_void_p
@@ -138,6 +163,21 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_dec, [doc, ch, cbytes, size, c.c_uint32], buf)
     sig(lib.crdtsync_client_set_bytes, [doc, ch, cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_client_delete, [doc, ch, cbytes, size], buf)
+    # xml navigation (client)
+    sig(lib.crdtsync_client_xml_element, [doc, ch, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_xml_fragment, [doc, ch, cbytes, size], buf)
+    sig(lib.crdtsync_client_xml_insert_element, [doc, ch, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_xml_insert_text, [doc, ch, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_xml_child_delete, [doc, ch, cbytes, size, size], buf)
+    sig(lib.crdtsync_client_xml_move, [doc, ch, cbytes, size, size, cbytes, size, size], buf)
+    # marks (client)
+    sig(
+        lib.crdtsync_client_mark,
+        [doc, ch, cbytes, size, size, c.c_uint32, size, c.c_uint32, cbytes, size, cbytes, size, c.POINTER(buf)],
+        buf,
+    )
+    sig(lib.crdtsync_client_mark_set_value, [doc, ch, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_mark_delete, [doc, ch, cbytes, size], buf)
     sig(lib.crdtsync_client_begin_atomic, [doc, ch], None)
     sig(lib.crdtsync_client_commit_atomic, [doc, ch], buf)
     sig(lib.crdtsync_client_get_int, [doc, ch, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
@@ -223,6 +263,9 @@ class _Reader:
         self._i = end
         return chunk
 
+    def at_end(self) -> bool:
+        return self._i >= len(self._d)
+
     def u8(self) -> int:
         return self._take(1)[0]
 
@@ -263,6 +306,8 @@ class _Reader:
             if self.u8() == 1:
                 self.blob()  # inline bytes
             return {"t": "blobref", "v": self._d[start : self._i]}
+        if tag == 5:
+            return {"t": "elementRef", "v": self._take(16)}
         raise ValueError(f"bad scalar tag {tag}")
 
     def items(self) -> list:
@@ -303,9 +348,100 @@ def _decode_changes(data: bytes) -> list:
             out.append(
                 {"op": "textDelete", "path": r.blob(), "index": r.u64(), "text": r.blob().decode("utf-8")}
             )
+        elif tag == 8:
+            out.append(
+                {"op": "markAdded", "id": r._take(16), "seq": r._take(16), "name": r.blob(), "value": r.scalar()}
+            )
+        elif tag == 9:
+            out.append(
+                {"op": "markRemoved", "id": r._take(16), "seq": r._take(16), "name": r.blob(), "value": r.scalar()}
+            )
+        elif tag == 10:
+            out.append(
+                {
+                    "op": "markChanged",
+                    "id": r._take(16),
+                    "seq": r._take(16),
+                    "name": r.blob(),
+                    "old": r.scalar(),
+                    "new": r.scalar(),
+                }
+            )
         else:
             raise ValueError(f"bad change tag {tag}")
     return out
+
+
+def _encode_scalar(value) -> bytes:
+    """Encode a Python value as the tagged ``Scalar`` bytes the ABI marshals: the
+    same tags :meth:`_Reader.scalar` reads back — ``None`` a null, a ``bool`` a
+    boolean, an ``int`` a signed 64-bit int, ``bytes`` a byte string."""
+    if value is None:
+        return b"\x00"
+    if isinstance(value, bool):
+        return b"\x01" + (b"\x01" if value else b"\x00")
+    if isinstance(value, int):
+        _i64("value", value)
+        return b"\x02" + struct.pack("<q", value)
+    if isinstance(value, (bytes, bytearray)):
+        b = bytes(value)
+        return b"\x03" + struct.pack("<I", len(b)) + b
+    raise ValueError(f"unsupported scalar value: {value!r}")
+
+
+def _decode_marks(data: bytes) -> list:
+    """Decode the ``marks_at`` buffer: a ``u32`` count, then per mark a name, a
+    flavor tag, and its payload — ``0`` a boolean, ``1`` a scalar value, ``2`` the
+    covering element ids. Each mark is a dict with ``name``, ``flavor``, and the
+    flavor's field (``value`` or ``ids``)."""
+    r = _Reader(data)
+    out = []
+    for _ in range(r.u32()):
+        name = r.blob()
+        flavor = r.u8()
+        if flavor == 0:
+            out.append({"name": name, "flavor": "boolean", "value": r.u8() != 0})
+        elif flavor == 1:
+            # The value flavor frames its Scalar with a u32 length prefix.
+            out.append({"name": name, "flavor": "value", "value": _Reader(r.blob()).scalar()})
+        elif flavor == 2:
+            out.append({"name": name, "flavor": "object", "ids": [r._take(16) for _ in range(r.u32())]})
+        else:
+            raise ValueError(f"bad mark flavor {flavor}")
+    return out
+
+
+def _decode_repair_path(data: bytes) -> list:
+    """Decode one repair path into its steps: each a ``{"key": bytes}`` map-slot key
+    or a ``{"index": int}`` sequence index."""
+    r = _Reader(data)
+    steps = []
+    while not r.at_end():
+        tag = r.u8()
+        if tag == 0x00:
+            steps.append({"key": r.blob()})
+        elif tag == 0x01:
+            steps.append({"index": r.u64()})
+        else:
+            raise ValueError(f"bad repair step tag {tag}")
+    return steps
+
+
+def _decode_repair_paths(data: bytes) -> list:
+    """Decode the ``take_repairs`` buffer: a ``u32`` count, then per path a
+    length-prefixed repair-path byte string, each decoded to its steps."""
+    if not data:
+        return []
+    r = _Reader(data)
+    return [_decode_repair_path(r.blob()) for _ in range(r.u32())]
+
+
+def _diff_raw(old_state: bytes, new_state: bytes) -> bytes:
+    """The raw encoded change list turning ``old_state`` into ``new_state`` — the
+    canonical buffer :func:`diff_decode` reads. Empty on a malformed snapshot."""
+    return _take_buf(
+        _LIB.crdtsync_diff(old_state, len(old_state), new_state, len(new_state))
+    )
 
 
 def diff(old_state: bytes, new_state: bytes) -> list:
@@ -314,12 +450,22 @@ def diff(old_state: bytes, new_state: bytes) -> list:
     turning the old state into the new. Each change has an ``op`` tag, a ``path``
     (bytes), and its variant's fields; a scalar is a tagged ``{"t", "v"}`` dict.
     Raises ``ValueError`` on a malformed snapshot."""
-    data = _take_buf(
-        _LIB.crdtsync_diff(old_state, len(old_state), new_state, len(new_state))
-    )
+    data = _diff_raw(old_state, new_state)
     if not data:
         raise ValueError("malformed snapshot")
     return _decode_changes(data)
+
+
+def diff_decode(data: bytes) -> list:
+    """Decode a change-list buffer (as produced by the diff over the wire or a
+    stored snapshot) into the same structural change dicts :func:`diff` returns —
+    the boundary read that validates opaque diff bytes through the core's total
+    decoder. Raises ``ValueError`` on a truncated or garbage buffer."""
+    out = _CrdtBuf()
+    rc = _LIB.crdtsync_diff_decode(data, len(data), ctypes.byref(out))
+    if rc != 1:
+        raise ValueError("malformed change list")
+    return _decode_changes(_take_buf(out))
 
 
 class Document:
@@ -430,6 +576,163 @@ class Document:
     def text_get(self, path: Path) -> Optional[str]:
         raw = self._read_buf(_LIB.crdtsync_doc_text_get, path)
         return None if raw is None else raw.decode("utf-8")
+
+    # --- xml ---
+
+    def xml_element(self, path: Path, tag: bytes) -> bytes:
+        """Install an ``XmlElement`` tagged ``tag`` at a map-slot path; return the
+        ops to broadcast (empty on a bad path or a null tag)."""
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_doc_xml_element(self._handle, p, len(p), tag, len(tag))
+        )
+
+    def xml_fragment(self, path: Path) -> bytes:
+        """Install a tagless ``XmlFragment`` at a map-slot path; return the ops."""
+        p = encode_path(path)
+        return _take_buf(_LIB.crdtsync_doc_xml_fragment(self._handle, p, len(p)))
+
+    def xml_tag(self, path: Path) -> Optional[bytes]:
+        """The tag of the live ``XmlElement`` at ``path``, or ``None`` when absent
+        or not a tagged element (a fragment is tagless)."""
+        return self._read_buf(_LIB.crdtsync_doc_xml_tag, path)
+
+    def xml_insert_element(self, elem_path: Path, index: int, tag: bytes) -> bytes:
+        """Insert a nested ``XmlElement`` child tagged ``tag`` at live ``index`` in
+        the children of the node at ``elem_path``; return the ops (empty if inert)."""
+        _usize("index", index)
+        p = encode_path(elem_path)
+        return _take_buf(
+            _LIB.crdtsync_doc_xml_insert_element(self._handle, p, len(p), index, tag, len(tag))
+        )
+
+    def xml_insert_text(self, elem_path: Path, index: int, text: str) -> bytes:
+        """Insert a ``Text``-run child holding ``text`` at live ``index`` in the
+        children of the node at ``elem_path``; return the ops (empty if inert)."""
+        _usize("index", index)
+        p = encode_path(elem_path)
+        s = text.encode("utf-8")
+        return _take_buf(
+            _LIB.crdtsync_doc_xml_insert_text(self._handle, p, len(p), index, s, len(s))
+        )
+
+    def xml_child_delete(self, elem_path: Path, index: int) -> bytes:
+        """Tombstone the child at live ``index`` in the children of the node at
+        ``elem_path``; return the ops (empty if inert)."""
+        _usize("index", index)
+        p = encode_path(elem_path)
+        return _take_buf(
+            _LIB.crdtsync_doc_xml_child_delete(self._handle, p, len(p), index)
+        )
+
+    def xml_children_len(self, elem_path: Path) -> Optional[int]:
+        """The count of live children of the node at ``elem_path``, or ``None`` when
+        the path is not a live ``XmlElement`` or ``XmlFragment``."""
+        return self._read_usize(_LIB.crdtsync_doc_xml_children_len, elem_path)
+
+    def xml_move(
+        self, parent_path: Path, child_index: int, new_parent_path: Path, dest_index: int
+    ) -> bytes:
+        """Relocate the live child at ``child_index`` under ``parent_path`` to
+        ``dest_index`` in the children of ``new_parent_path`` — a Kleppmann tree
+        move keeping the child's identity and subtree. Ops (empty if inert)."""
+        _usize("child_index", child_index)
+        _usize("dest_index", dest_index)
+        pp = encode_path(parent_path)
+        np = encode_path(new_parent_path)
+        return _take_buf(
+            _LIB.crdtsync_doc_xml_move(
+                self._handle, pp, len(pp), child_index, np, len(np), dest_index
+            )
+        )
+
+    # --- marks ---
+
+    def mark(
+        self,
+        seq_path: Path,
+        start_index: int,
+        start_side: Side,
+        end_index: int,
+        end_side: Side,
+        name: bytes,
+        value,
+    ) -> Tuple[Optional[bytes], bytes]:
+        """Author a named mark over ``[start, end)`` of the sequence at
+        ``seq_path``, each endpoint an ``(index, Side)`` pair and ``value`` a
+        scalar payload. Returns ``(mark_id, ops)``: the mark's 16-byte id — the
+        handle a later :meth:`mark_set_value`/:meth:`mark_delete` names it by — and
+        the ops to broadcast. ``mark_id`` is ``None`` and ``ops`` empty when the
+        author was inert (a non-sequence path, an unknown side, or a bad value)."""
+        _usize("start_index", start_index)
+        _usize("end_index", end_index)
+        _u32("start_side", int(start_side))
+        _u32("end_side", int(end_side))
+        p = encode_path(seq_path)
+        v = _encode_scalar(value)
+        out = _CrdtBuf()
+        ops = _take_buf(
+            _LIB.crdtsync_doc_mark(
+                self._handle,
+                p,
+                len(p),
+                start_index,
+                int(start_side),
+                end_index,
+                int(end_side),
+                name,
+                len(name),
+                v,
+                len(v),
+                ctypes.byref(out),
+            )
+        )
+        mark_id = _take_buf(out)
+        return (mark_id if mark_id else None), ops
+
+    def mark_set_value(self, mark_id: bytes, value) -> bytes:
+        """Change the scalar payload of the mark handle ``mark_id`` to ``value``;
+        return the ops (empty if the handle names no live mark or the value is bad)."""
+        v = _encode_scalar(value)
+        return _take_buf(
+            _LIB.crdtsync_doc_mark_set_value(self._handle, mark_id, len(mark_id), v, len(v))
+        )
+
+    def mark_delete(self, mark_id: bytes) -> bytes:
+        """Tombstone the mark handle ``mark_id``; return the ops (empty if it names
+        no live mark)."""
+        return _take_buf(
+            _LIB.crdtsync_doc_mark_delete(self._handle, mark_id, len(mark_id))
+        )
+
+    def marks_at(self, seq_path: Path, index: int) -> list:
+        """The marks active on character ``index`` of the sequence at ``seq_path``,
+        each a dict with ``name``, ``flavor`` (``boolean``/``value``/``object``),
+        and the flavor's field. Empty for a non-sequence path or an uncovered
+        index."""
+        _usize("index", index)
+        p = encode_path(seq_path)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_doc_marks_at(self._handle, p, len(p), index, ctypes.byref(out))
+        return _decode_marks(_take_buf(out)) if rc == 1 else []
+
+    # --- schema + repair ---
+
+    def set_schema(self, schema: bytes) -> bool:
+        """Parse schema JSON bytes and bind the schema for ``onRepaired``
+        observation. Returns ``True`` when it bound, ``False`` when the bytes are
+        not a valid schema. Binding authors nothing; it takes the current state as
+        the baseline for :meth:`take_repairs`."""
+        return _LIB.crdtsync_doc_set_schema(self._handle, schema, len(schema)) == 1
+
+    def take_repairs(self) -> list:
+        """Drain the ``onRepaired`` signal: the located paths whose repaired reading
+        newly changed against the bound schema since the last call, each a list of
+        steps (``{"key": bytes}`` or ``{"index": int}``). The drain reseeds the
+        baseline, so a standing repair reports once."""
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_doc_take_repairs(self._handle, ctypes.byref(out))
+        return _decode_repair_paths(_take_buf(out)) if rc == 1 else []
 
     # --- relative positions (anchors) ---
 
@@ -758,6 +1061,147 @@ class Client:
         _u32("channel", channel)
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_client_delete(self._handle, channel, p, len(p)))
+
+    # --- per-channel xml ---
+
+    def xml_element(self, channel: int, path: Path, tag: bytes) -> bytes:
+        """Install an ``XmlElement`` tagged ``tag`` at a path in ``channel``'s room;
+        return the Ops frame to send."""
+        _u32("channel", channel)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_xml_element(self._handle, channel, p, len(p), tag, len(tag))
+        )
+
+    def xml_fragment(self, channel: int, path: Path) -> bytes:
+        """Install a tagless ``XmlFragment`` at a path in ``channel``'s room; return
+        the Ops frame."""
+        _u32("channel", channel)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_xml_fragment(self._handle, channel, p, len(p))
+        )
+
+    def xml_insert_element(self, channel: int, elem_path: Path, index: int, tag: bytes) -> bytes:
+        """Insert a nested ``XmlElement`` child tagged ``tag`` at live ``index`` in
+        the children of the node at ``elem_path`` in ``channel``'s room; Ops frame."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(elem_path)
+        return _take_buf(
+            _LIB.crdtsync_client_xml_insert_element(
+                self._handle, channel, p, len(p), index, tag, len(tag)
+            )
+        )
+
+    def xml_insert_text(self, channel: int, elem_path: Path, index: int, text: str) -> bytes:
+        """Insert a ``Text``-run child holding ``text`` at live ``index`` in the
+        children of the node at ``elem_path`` in ``channel``'s room; Ops frame."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(elem_path)
+        s = text.encode("utf-8")
+        return _take_buf(
+            _LIB.crdtsync_client_xml_insert_text(
+                self._handle, channel, p, len(p), index, s, len(s)
+            )
+        )
+
+    def xml_child_delete(self, channel: int, elem_path: Path, index: int) -> bytes:
+        """Tombstone the child at live ``index`` in the children of the node at
+        ``elem_path`` in ``channel``'s room; Ops frame."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(elem_path)
+        return _take_buf(
+            _LIB.crdtsync_client_xml_child_delete(self._handle, channel, p, len(p), index)
+        )
+
+    def xml_move(
+        self,
+        channel: int,
+        parent_path: Path,
+        child_index: int,
+        new_parent_path: Path,
+        dest_index: int,
+    ) -> bytes:
+        """Relocate the live child at ``child_index`` under ``parent_path`` to
+        ``dest_index`` in the children of ``new_parent_path`` in ``channel``'s room —
+        the tree move routed through the outbox; Ops frame."""
+        _u32("channel", channel)
+        _usize("child_index", child_index)
+        _usize("dest_index", dest_index)
+        pp = encode_path(parent_path)
+        np = encode_path(new_parent_path)
+        return _take_buf(
+            _LIB.crdtsync_client_xml_move(
+                self._handle, channel, pp, len(pp), child_index, np, len(np), dest_index
+            )
+        )
+
+    # --- per-channel marks ---
+
+    def mark(
+        self,
+        channel: int,
+        seq_path: Path,
+        start_index: int,
+        start_side: Side,
+        end_index: int,
+        end_side: Side,
+        name: bytes,
+        value,
+    ) -> Tuple[Optional[bytes], bytes]:
+        """Author a named mark over ``[start, end)`` of the sequence at ``seq_path``
+        in ``channel``'s room, routed through the outbox. Returns
+        ``(mark_id, frame)``: the mark's 16-byte id and the Ops frame to send.
+        ``mark_id`` is ``None`` and ``frame`` empty when the author was inert."""
+        _u32("channel", channel)
+        _usize("start_index", start_index)
+        _usize("end_index", end_index)
+        _u32("start_side", int(start_side))
+        _u32("end_side", int(end_side))
+        p = encode_path(seq_path)
+        v = _encode_scalar(value)
+        out = _CrdtBuf()
+        frame = _take_buf(
+            _LIB.crdtsync_client_mark(
+                self._handle,
+                channel,
+                p,
+                len(p),
+                start_index,
+                int(start_side),
+                end_index,
+                int(end_side),
+                name,
+                len(name),
+                v,
+                len(v),
+                ctypes.byref(out),
+            )
+        )
+        mark_id = _take_buf(out)
+        return (mark_id if mark_id else None), frame
+
+    def mark_set_value(self, channel: int, mark_id: bytes, value) -> bytes:
+        """Change the payload of the mark handle ``mark_id`` to ``value`` in
+        ``channel``'s room; Ops frame (empty if inert)."""
+        _u32("channel", channel)
+        v = _encode_scalar(value)
+        return _take_buf(
+            _LIB.crdtsync_client_mark_set_value(
+                self._handle, channel, mark_id, len(mark_id), v, len(v)
+            )
+        )
+
+    def mark_delete(self, channel: int, mark_id: bytes) -> bytes:
+        """Tombstone the mark handle ``mark_id`` in ``channel``'s room; Ops frame
+        (empty if it names no live mark)."""
+        _u32("channel", channel)
+        return _take_buf(
+            _LIB.crdtsync_client_mark_delete(self._handle, channel, mark_id, len(mark_id))
+        )
 
     def begin_atomic(self, channel: int) -> None:
         """Start an atomic transaction on ``channel``; edits accumulate until commit."""

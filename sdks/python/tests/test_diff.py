@@ -3,7 +3,7 @@ mirroring the wasm change shape."""
 
 import pytest
 
-from crdtsync import Document, diff, encode_path
+from crdtsync import Document, Side, diff, diff_decode, encode_path
 
 
 def cid(first: int) -> bytes:
@@ -75,3 +75,46 @@ def test_identical_snapshots_have_no_changes():
 def test_malformed_snapshot_raises():
     with pytest.raises(ValueError):
         diff(b"\xff\xff\xff\xff", b"\xff\xff\xff\xff")
+
+
+def test_diff_decode_round_trips_a_change_list_buffer():
+    from crdtsync import _diff_raw
+
+    with Document(cid(1)) as a:
+        a.register_int([b"age"], 30)
+        old = a.encode_state()
+        a.register_int([b"age"], 31)
+        new = a.encode_state()
+
+    encoded = _diff_raw(old, new)
+    assert diff_decode(encoded) == diff(old, new)
+
+
+def test_diff_decode_carries_an_xml_attr_and_a_mark_change():
+    from crdtsync import _diff_raw
+
+    with Document(cid(1)) as a:
+        a.xml_element([b"doc"], b"section")
+        a.set_bytes([b"doc", b"class"], b"a")
+        a.text_insert([b"body"], 0, "hello world")
+        old = a.encode_state()
+        a.set_bytes([b"doc", b"class"], b"b")
+        a.mark([b"body"], 0, Side.RIGHT, 5, Side.LEFT, b"bold", True)
+        new = a.encode_state()
+
+    changes = diff_decode(_diff_raw(old, new))
+    # The attr change surfaces as a value at its path; the mark as markAdded.
+    assert any(
+        c["op"] == "value" and c["path"] == encode_path([b"doc", b"class"])
+        for c in changes
+    )
+    assert any(c["op"] == "markAdded" and c["name"] == b"bold" for c in changes)
+
+
+def test_diff_decode_of_an_empty_change_list_is_empty():
+    assert diff_decode(b"\x00\x00\x00\x00") == []
+
+
+def test_diff_decode_rejects_a_malformed_buffer():
+    with pytest.raises(ValueError):
+        diff_decode(b"\xff\xff\xff\xff")
