@@ -757,3 +757,350 @@ func TestRelativePositionOnNonSequenceIsAbsent(t *testing.T) {
 		t.Fatal("resolve of malformed bytes must fail")
 	}
 }
+
+// acceptedThrough builds an Accepted frame for channel acknowledging every op
+// through frontier: tag 18, u32 channel, u64 frontier.
+func acceptedThrough(channel uint32, frontier uint64) []byte {
+	frame := make([]byte, 13)
+	frame[0] = 18
+	binary.LittleEndian.PutUint32(frame[1:], channel)
+	binary.LittleEndian.PutUint64(frame[5:], frontier)
+	return frame
+}
+
+// hasMarkNamed reports whether any resolved mark carries name.
+func hasMarkNamed(marks []Mark, name string) bool {
+	for _, m := range marks {
+		if bytes.Equal(m.Name, []byte(name)) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestXmlElementReadsBackChildrenAndConverges(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	b := newDoc(t, 2)
+	defer b.Close()
+	p := path("doc", "body")
+
+	root := a.XmlElement(p, key("body"))
+	e := a.XmlInsertElement(p, 0, key("p"))
+	txt := a.XmlInsertText(p, 1, "hi")
+	if len(e) == 0 || len(txt) == 0 {
+		t.Fatal("child inserts emit ops")
+	}
+	if tag, ok := a.XmlTag(p); !ok || !bytes.Equal(tag, key("body")) {
+		t.Fatalf("tag: got %q ok=%v, want body true", tag, ok)
+	}
+	if n, ok := a.XmlChildrenLen(p); !ok || n != 2 {
+		t.Fatalf("children: got %d ok=%v, want 2 true", n, ok)
+	}
+
+	for _, ops := range [][]byte{root, e, txt} {
+		if n := b.Apply(ops); n < 1 {
+			t.Fatalf("apply: got %d", n)
+		}
+	}
+	if tag, ok := b.XmlTag(p); !ok || !bytes.Equal(tag, key("body")) {
+		t.Fatalf("peer tag: got %q ok=%v", tag, ok)
+	}
+	if n, ok := b.XmlChildrenLen(p); !ok || n != 2 {
+		t.Fatalf("peer children converge: got %d ok=%v", n, ok)
+	}
+
+	// Deleting a child drops the live count on both replicas.
+	del := a.XmlChildDelete(p, 1)
+	if len(del) == 0 {
+		t.Fatal("delete emits ops")
+	}
+	b.Apply(del)
+	if n, _ := a.XmlChildrenLen(p); n != 1 {
+		t.Fatalf("author child count after delete: %d", n)
+	}
+	if n, _ := b.XmlChildrenLen(p); n != 1 {
+		t.Fatalf("peer child count after delete: %d", n)
+	}
+}
+
+func TestXmlMoveRelocatesChildAndConverges(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	b := newDoc(t, 2)
+	defer b.Close()
+	src := path("a")
+	dst := path("b")
+
+	fa := a.XmlFragment(src)
+	fb := a.XmlFragment(dst)
+	kid := a.XmlInsertElement(src, 0, key("li"))
+	if n, _ := a.XmlChildrenLen(src); n != 1 {
+		t.Fatalf("src children before move: %d", n)
+	}
+
+	mv := a.XmlMove(src, 0, dst, 0)
+	if len(mv) == 0 {
+		t.Fatal("move emits ops")
+	}
+	if n, _ := a.XmlChildrenLen(src); n != 0 {
+		t.Fatalf("child left the source: src has %d", n)
+	}
+	if n, _ := a.XmlChildrenLen(dst); n != 1 {
+		t.Fatalf("child arrived at dest: dst has %d", n)
+	}
+
+	for _, ops := range [][]byte{fa, fb, kid, mv} {
+		b.Apply(ops)
+	}
+	if n, _ := b.XmlChildrenLen(src); n != 0 {
+		t.Fatalf("move converges at src: %d", n)
+	}
+	if n, _ := b.XmlChildrenLen(dst); n != 1 {
+		t.Fatalf("move converges at dest: %d", n)
+	}
+}
+
+func TestXmlReadsOnANonNodeAreAbsent(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	a.RegisterInt(path("age"), 30)
+	if _, ok := a.XmlTag(path("age")); ok {
+		t.Fatal("a register has no tag")
+	}
+	if _, ok := a.XmlChildrenLen(path("age")); ok {
+		t.Fatal("a register has no children")
+	}
+	if ins := a.XmlInsertElement(path("age"), 0, key("p")); len(ins) != 0 {
+		t.Fatal("insert into a non-node is inert")
+	}
+}
+
+func TestMarkReadsBackAndChangesAndDeletes(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	b := newDoc(t, 2)
+	defer b.Close()
+	body := path("body")
+
+	text := a.TextInsert(body, 0, "hello world")
+	id, ops := a.Mark(body, 0, Right, 5, Left, key("bold"), Scalar{T: "bool", Bool: true})
+	if len(id) != 16 {
+		t.Fatalf("a live mark yields a 16-byte id, got %d", len(id))
+	}
+	if len(ops) == 0 {
+		t.Fatal("authoring a mark emits ops")
+	}
+	if !hasMarkNamed(a.MarksAt(body, 2), "bold") {
+		t.Fatal("the covering mark reads back inside its span")
+	}
+	if hasMarkNamed(a.MarksAt(body, 7), "bold") {
+		t.Fatal("no mark past the span")
+	}
+
+	// The mark converges onto a peer.
+	b.Apply(text)
+	b.Apply(ops)
+	if !hasMarkNamed(b.MarksAt(body, 2), "bold") {
+		t.Fatal("the mark converges")
+	}
+
+	// A value change keeps the mark live.
+	set := a.MarkSetValue(id, Scalar{T: "int", Int: 9})
+	if len(set) == 0 {
+		t.Fatal("changing a live mark's value emits ops")
+	}
+	b.Apply(set)
+	if !hasMarkNamed(a.MarksAt(body, 2), "bold") {
+		t.Fatal("the mark stays live through a value change")
+	}
+
+	// Deleting drops it from the active set on both replicas.
+	del := a.MarkDelete(id)
+	if len(del) == 0 {
+		t.Fatal("deleting a live mark emits ops")
+	}
+	b.Apply(del)
+	if hasMarkNamed(a.MarksAt(body, 2), "bold") {
+		t.Fatal("the mark is gone from the author")
+	}
+	if hasMarkNamed(b.MarksAt(body, 2), "bold") {
+		t.Fatal("the delete converges")
+	}
+}
+
+func TestMarkOnANonSequenceIsInert(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+	a.RegisterInt(path("age"), 30)
+	id, ops := a.Mark(path("age"), 0, Left, 1, Right, key("x"), Scalar{T: "bool", Bool: true})
+	if id != nil || len(ops) != 0 {
+		t.Fatalf("a mark on a non-sequence is inert: id=%v ops=%d", id, len(ops))
+	}
+}
+
+func TestClientXmlEditRoutesThroughTheOutbox(t *testing.T) {
+	a := newClient(t, 1)
+	defer a.Close()
+	b := newClient(t, 2)
+	defer b.Close()
+	ca, _ := a.Subscribe(key("room-1"))
+	cb, _ := b.Subscribe(key("room-1"))
+	_ = cb
+	doc := path("doc")
+
+	frag := a.XmlFragment(ca, doc)
+	ins := a.XmlInsertElement(ca, doc, 0, key("p"))
+	if len(frag) == 0 || len(ins) == 0 {
+		t.Fatal("client xml edits frame ops")
+	}
+	if n := a.OutboxLen(ca); n != 2 {
+		t.Fatalf("both edits enqueued, got %d", n)
+	}
+
+	// The unacknowledged tail replays as one frame and folds into the peer.
+	tail := a.Resend(ca)
+	if len(tail) == 0 {
+		t.Fatal("the tail replays")
+	}
+	if rc := b.Receive(tail); rc < 1 {
+		t.Fatalf("peer applies the replayed xml edits: rc=%d", rc)
+	}
+
+	// An ack through the tip drains the outbox.
+	accepted := acceptedThrough(ca, math.MaxUint64)
+	if rc := a.Receive(accepted); rc != 1 {
+		t.Fatalf("ack applied: rc=%d", rc)
+	}
+	if n := a.OutboxLen(ca); n != 0 {
+		t.Fatalf("ack drained the outbox, got %d", n)
+	}
+}
+
+func TestClientMarkOnAFreshRoomIsInert(t *testing.T) {
+	a := newClient(t, 1)
+	defer a.Close()
+	ca, _ := a.Subscribe(key("room-1"))
+
+	// No sequence exists at the path yet, so the mark author yields no id handle
+	// and enqueues nothing to resend.
+	id, _ := a.Mark(ca, path("body"), 0, Right, 5, Left, key("bold"), Scalar{T: "bool", Bool: true})
+	if id != nil {
+		t.Fatalf("a mark over an absent sequence yields no id, got %v", id)
+	}
+	if n := a.OutboxLen(ca); n != 0 {
+		t.Fatalf("nothing enqueued, got %d", n)
+	}
+	// A set-value / delete on an unknown handle enqueues nothing either.
+	a.MarkSetValue(ca, make([]byte, 16), Scalar{T: "int", Int: 1})
+	a.MarkDelete(ca, make([]byte, 16))
+	if n := a.OutboxLen(ca); n != 0 {
+		t.Fatalf("edits on an unknown mark enqueue nothing, got %d", n)
+	}
+}
+
+func TestDiffRoundTripsThroughDecode(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+
+	// An XmlElement with an attr, plus a Text to annotate.
+	a.XmlElement(path("doc"), key("section"))
+	a.SetBytes(path("doc", "class"), key("a"))
+	a.TextInsert(path("body"), 0, "hello world")
+	old := a.EncodeState()
+
+	// Change the attr and add a mark over the text.
+	a.SetBytes(path("doc", "class"), key("b"))
+	if id, _ := a.Mark(path("body"), 0, Right, 5, Left, key("bold"), Scalar{T: "bool", Bool: true}); len(id) != 16 {
+		t.Fatal("the mark authored")
+	}
+	newState := a.EncodeState()
+
+	// The opaque diff decodes both directly and through the boundary decoder to
+	// the same change list — the mark-change variants cross intact.
+	raw := DiffEncode(old, newState)
+	if len(raw) == 0 {
+		t.Fatal("DiffEncode produced no bytes")
+	}
+	direct, err := Diff(old, newState)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	decoded, err := DiffDecode(raw)
+	if err != nil {
+		t.Fatalf("DiffDecode: %v", err)
+	}
+	if len(direct) != len(decoded) {
+		t.Fatalf("round-trip length mismatch: %d vs %d", len(direct), len(decoded))
+	}
+
+	var sawAttr, sawMark bool
+	for _, c := range decoded {
+		if c.Op == "value" && bytes.Equal(c.Path, EncodePath(path("doc", "class"))) {
+			if c.New != nil && c.New.T == "bytes" && bytes.Equal(c.New.Bytes, key("b")) {
+				sawAttr = true
+			}
+		}
+		if c.Op == "markAdded" && bytes.Equal(c.Name, key("bold")) {
+			if len(c.ID) != 16 || len(c.Seq) != 16 {
+				t.Fatalf("mark change missing ids: %+v", c)
+			}
+			sawMark = true
+		}
+	}
+	if !sawAttr {
+		t.Fatal("the xml attr change did not round-trip as a Value")
+	}
+	if !sawMark {
+		t.Fatal("the mark did not round-trip as a markAdded")
+	}
+}
+
+func TestDiffDecodeRejectsGarbage(t *testing.T) {
+	if _, err := DiffDecode([]byte{0xff, 0xff, 0xff, 0xff}); err == nil {
+		t.Fatal("want an error for a malformed diff buffer")
+	}
+}
+
+const testSchema = `{
+    "schema": "notes", "version": 1, "root": "Doc",
+    "types": {
+        "Doc": { "kind": "map", "children": { "title": "Title" } },
+        "Title": { "kind": "register", "min": 0, "max": 280 }
+    }
+}`
+
+func TestSchemaBindsAndReportsARepairOnce(t *testing.T) {
+	a := newDoc(t, 1)
+	defer a.Close()
+
+	if !a.SetSchema([]byte(testSchema)) {
+		t.Fatal("a valid schema binds")
+	}
+	// Malformed schema bytes reject cleanly.
+	if a.SetSchema([]byte("not json {")) {
+		t.Fatal("malformed schema must not bind")
+	}
+
+	// A conforming edit reports nothing.
+	a.RegisterInt(path("title"), 42)
+	if r := a.TakeRepairs(); len(r) != 0 {
+		t.Fatalf("a conforming edit reports nothing, got %d", len(r))
+	}
+
+	// An out-of-range write reports its located path once.
+	a.RegisterInt(path("title"), 999)
+	reported := a.TakeRepairs()
+	if len(reported) != 1 || len(reported[0]) != 1 {
+		t.Fatalf("want one one-step repair path, got %+v", reported)
+	}
+	step := reported[0][0]
+	if step.IsIndex || !bytes.Equal(step.Key, key("title")) {
+		t.Fatalf("repair step: got %+v, want Key(title)", step)
+	}
+
+	// The settle-point contract: a second drain is empty.
+	if again := a.TakeRepairs(); len(again) != 0 {
+		t.Fatalf("a settled repair does not report twice, got %d", len(again))
+	}
+}
