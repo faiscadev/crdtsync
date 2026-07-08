@@ -444,6 +444,44 @@ CrdtBuf crdtsync_diff(const uint8_t *old,
 // `bytes`/`len` follow [`as_slice`]; `out` points to a writable `CrdtBuf`.
 int32_t crdtsync_diff_decode(const uint8_t *bytes, uintptr_t len, CrdtBuf *out);
 
+// Parse schema JSON bytes and bind the schema to the local document for
+// `onRepaired` observation. A binding is runtime state, not a CRDT op — it
+// authors and broadcasts nothing — so there is nothing to return but the outcome.
+// Parsing is total: returns 1 when the schema bound, 0 when the bytes are not a
+// valid schema (malformed JSON, non-UTF-8, or well-formed JSON that is not a
+// schema — rejected cleanly, binding nothing), -1 on a bad handle or a null
+// pointer. Binding takes the current state as the baseline, so a later
+// [`crdtsync_doc_take_repairs`] surfaces only a repair the state comes to need.
+//
+// # Safety
+// `doc` is a live handle or null; `schema`/`schema_len` follow [`as_slice`].
+int32_t crdtsync_doc_set_schema(CrdtDoc *doc, const uint8_t *schema, uintptr_t schema_len);
+
+// Drain the `onRepaired` signal into `out`: the located paths whose repaired
+// reading has newly changed against the bound schema since the last call, each an
+// `encode_repair_path` byte string the SDK decodes with the repair-path reader (or
+// [`crdtsync_repair_path_decode`]). Empty — a bare zero count — when no schema is
+// bound or nothing newly needs repair; the drain reseeds the baseline, so a
+// standing repair reports once (the settle-point contract). A reported path names
+// a *location*, not a value: the repaired value is read separately. Returns 1 with
+// the encoded list, -1 on a bad handle or a null `out`.
+//
+// # Safety
+// `doc` is a live handle or null; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_doc_take_repairs(CrdtDoc *doc, CrdtBuf *out);
+
+// Decode a repair-path buffer from [`crdtsync_doc_take_repairs`] back into its
+// canonical form, written to `out` — the boundary read that turns opaque repair
+// bytes into the step path a binding walks, mirroring [`crdtsync_diff_decode`]. A
+// repair path can cross an untrusted boundary, so the decode is total: an unknown
+// step tag or a length past the end yields 0 with `out` left untouched, never a
+// panic across the frame. Returns 1 with the canonical step path on a well-formed
+// buffer, -1 on a null `out` or a panic.
+//
+// # Safety
+// `bytes`/`len` follow [`as_slice`]; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_repair_path_decode(const uint8_t *bytes, uintptr_t len, CrdtBuf *out);
+
 // Open an undo manager. It drives whichever document is passed to each call.
 //
 // # Safety

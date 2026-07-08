@@ -56,6 +56,10 @@ fn the_header_declares_every_exported_symbol() {
         // diff
         "crdtsync_diff",
         "crdtsync_diff_decode",
+        // schema-bind + repair observation
+        "crdtsync_doc_set_schema",
+        "crdtsync_doc_take_repairs",
+        "crdtsync_repair_path_decode",
         // atomic transactions
         "crdtsync_doc_begin_atomic",
         "crdtsync_doc_commit_atomic",

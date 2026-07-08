@@ -381,6 +381,260 @@ fn diff_decode_round_trips_an_xml_attr_and_a_mark_change() {
     }
 }
 
+// --- schema + repair ---
+//
+// A schema binds to the local document by opaque JSON bytes (total parse —
+// malformed fails, never panics), authoring nothing. `take_repairs` drains the
+// `onRepaired` signal as one buffer: a `u32` count, then per path a
+// `u32`-length-prefixed `encode_repair_path` byte string the SDK decodes. The
+// drain reseeds the baseline, so a standing repair reports once.
+
+const SCHEMA: &str = r#"{
+    "schema": "notes", "version": 1, "root": "Doc",
+    "types": {
+        "Doc": { "kind": "map", "children": { "title": "Title" } },
+        "Title": { "kind": "register", "min": 0, "max": 280 }
+    }
+}"#;
+
+unsafe fn set_schema(doc: *mut CrdtDoc, bytes: &[u8]) -> i32 {
+    crdtsync_doc_set_schema(doc, bytes.as_ptr(), bytes.len())
+}
+
+/// Drain `take_repairs` through the C ABI into `out`, decoding the buffer's `u32`
+/// count then each `u32`-length-prefixed repair-path byte string into an owned Vec.
+unsafe fn take_repairs(doc: *mut CrdtDoc) -> (i32, Vec<Vec<u8>>) {
+    let mut out = CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let rc = crdtsync_doc_take_repairs(doc, &mut out);
+    let mut paths = Vec::new();
+    if rc == 1 {
+        let raw = std::slice::from_raw_parts(out.ptr, out.len);
+        let count = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+        let mut i = 4;
+        for _ in 0..count {
+            let len = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            paths.push(raw[i..i + len].to_vec());
+            i += len;
+        }
+    }
+    crdtsync_buf_free(out);
+    (rc, paths)
+}
+
+#[test]
+fn binding_a_valid_schema_by_bytes_reports_bound() {
+    unsafe {
+        let c = client(1);
+        let d = crdtsync_doc_new(c.as_ptr());
+        assert_eq!(set_schema(d, SCHEMA.as_bytes()), 1, "a valid schema binds");
+        crdtsync_doc_free(d);
+    }
+}
+
+#[test]
+fn binding_malformed_schema_bytes_is_rejected_without_panicking() {
+    unsafe {
+        let c = client(1);
+        let d = crdtsync_doc_new(c.as_ptr());
+        // Not JSON, a well-formed JSON that is not a schema, and non-UTF-8 bytes
+        // each reject cleanly with status 0 rather than panicking across the frame.
+        assert_eq!(set_schema(d, b"not json {"), 0);
+        assert_eq!(set_schema(d, br#"{ "schema": "x" }"#), 0);
+        assert_eq!(set_schema(d, &[0xff, 0xfe, 0x00]), 0);
+        crdtsync_doc_free(d);
+    }
+}
+
+#[test]
+fn set_schema_rejects_a_null_handle_or_pointer() {
+    unsafe {
+        // A null handle is a caller error, distinct from a malformed-schema 0.
+        assert_eq!(
+            crdtsync_doc_set_schema(ptr::null_mut(), SCHEMA.as_ptr(), SCHEMA.len()),
+            -1,
+            "a null handle is -1"
+        );
+        let c = client(1);
+        let d = crdtsync_doc_new(c.as_ptr());
+        // A null pointer with a nonzero length is rejected, not dereferenced.
+        assert_eq!(crdtsync_doc_set_schema(d, ptr::null(), 8), -1);
+        crdtsync_doc_free(d);
+    }
+}
+
+#[test]
+fn no_schema_bound_reports_no_repairs() {
+    unsafe {
+        let c = client(1);
+        let d = crdtsync_doc_new(c.as_ptr());
+        // An out-of-range write with no schema bound surfaces nothing.
+        let reg = register_int(d, &path(&[b"title"]), 999);
+        let (rc, paths) = take_repairs(d);
+        assert_eq!(rc, 1);
+        assert!(paths.is_empty(), "no schema bound reports nothing");
+        crdtsync_buf_free(reg);
+        crdtsync_doc_free(d);
+    }
+}
+
+#[test]
+fn an_out_of_range_write_reports_its_path_once_through_the_abi() {
+    use crdtsync_core::path::{encode_repair_path, parse_repair_path};
+    use crdtsync_core::validate::Step;
+    unsafe {
+        let c = client(1);
+        let d = crdtsync_doc_new(c.as_ptr());
+        assert_eq!(set_schema(d, SCHEMA.as_bytes()), 1);
+
+        // A conforming edit reports nothing.
+        let ok = register_int(d, &path(&[b"title"]), 42);
+        let (_, none) = take_repairs(d);
+        assert!(none.is_empty(), "a conforming edit reports nothing");
+
+        // An out-of-range write reports its located path once.
+        let bad = register_int(d, &path(&[b"title"]), 999);
+        let (rc, reported) = take_repairs(d);
+        assert_eq!(rc, 1);
+        let want = encode_repair_path(&[Step::Key(b"title".to_vec())]);
+        assert_eq!(
+            reported,
+            vec![want.clone()],
+            "the located path reports once"
+        );
+        // The reported path round-trips the façade encoding.
+        assert_eq!(
+            parse_repair_path(&reported[0]),
+            Some(vec![Step::Key(b"title".to_vec())])
+        );
+
+        // Settle-point contract preserved through the FFI: a second drain is empty.
+        let (rc2, again) = take_repairs(d);
+        assert_eq!(rc2, 1);
+        assert!(again.is_empty(), "a settled repair does not report twice");
+
+        crdtsync_buf_free(ok);
+        crdtsync_buf_free(bad);
+        crdtsync_doc_free(d);
+    }
+}
+
+#[test]
+fn take_repairs_rejects_a_null_handle_or_out() {
+    unsafe {
+        let mut out = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            crdtsync_doc_take_repairs(ptr::null_mut(), &mut out),
+            -1,
+            "a null handle is -1"
+        );
+        assert_eq!(out.len, 0, "the out buffer is untouched on a bad handle");
+        let c = client(1);
+        let d = crdtsync_doc_new(c.as_ptr());
+        assert_eq!(
+            crdtsync_doc_take_repairs(d, ptr::null_mut()),
+            -1,
+            "a null out is -1"
+        );
+        crdtsync_doc_free(d);
+    }
+}
+
+/// Decode a repair-path buffer through the C ABI into `out`, returning the status
+/// and the freshly-owned canonical bytes the caller frees.
+unsafe fn repair_path_decode(bytes: &[u8]) -> (i32, CrdtBuf) {
+    let mut out = CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let rc = crdtsync_repair_path_decode(bytes.as_ptr(), bytes.len(), &mut out);
+    (rc, out)
+}
+
+#[test]
+fn a_reported_repair_path_decodes_to_its_keys_through_the_abi() {
+    use crdtsync_core::path::{encode_repair_path, parse_repair_path};
+    use crdtsync_core::validate::Step;
+    unsafe {
+        let c = client(1);
+        let d = crdtsync_doc_new(c.as_ptr());
+        assert_eq!(set_schema(d, SCHEMA.as_bytes()), 1);
+        let bad = register_int(d, &path(&[b"title"]), 999);
+        let (_, reported) = take_repairs(d);
+        assert_eq!(reported.len(), 1);
+
+        // The boundary decode validates the buffer and hands back its canonical
+        // step path, byte-identical to the reported path, decoding to the key.
+        let (rc, out) = repair_path_decode(&reported[0]);
+        assert_eq!(rc, 1, "a well-formed repair path decodes");
+        let canonical = std::slice::from_raw_parts(out.ptr, out.len);
+        assert_eq!(
+            canonical,
+            reported[0].as_slice(),
+            "the canonical form is identity"
+        );
+        assert_eq!(
+            parse_repair_path(canonical),
+            Some(vec![Step::Key(b"title".to_vec())])
+        );
+
+        // An index step round-trips through the boundary too, not just keys.
+        let indexed = encode_repair_path(&[
+            Step::Key(b"body".to_vec()),
+            Step::Index(3),
+            Step::Key(b"href".to_vec()),
+        ]);
+        let (rc_i, out_i) = repair_path_decode(&indexed);
+        assert_eq!(rc_i, 1);
+        assert_eq!(
+            std::slice::from_raw_parts(out_i.ptr, out_i.len),
+            indexed.as_slice()
+        );
+
+        crdtsync_buf_free(out);
+        crdtsync_buf_free(out_i);
+        crdtsync_buf_free(bad);
+        crdtsync_doc_free(d);
+    }
+}
+
+#[test]
+fn repair_path_decode_of_a_malformed_buffer_is_a_clean_error() {
+    unsafe {
+        // An unknown step tag, a key length past the end, and a truncated index all
+        // decode to 0 with `out` left empty — the boundary never trusts its framing.
+        let (rc_tag, out_tag) = repair_path_decode(&[0x7f]);
+        assert_eq!(rc_tag, 0, "an unknown tag is a decode error");
+        assert_eq!(out_tag.len, 0);
+
+        let (rc_len, out_len) = repair_path_decode(&[0x00, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(rc_len, 0, "a key length past the end is a decode error");
+        assert_eq!(out_len.len, 0);
+
+        let (rc_idx, out_idx) = repair_path_decode(&[0x01, 0x00, 0x00]);
+        assert_eq!(rc_idx, 0, "a truncated index is a decode error");
+        assert_eq!(out_idx.len, 0);
+
+        // A null out is a caller error, distinct from a decode error.
+        let bytes = [0x7fu8];
+        assert_eq!(
+            crdtsync_repair_path_decode(bytes.as_ptr(), bytes.len(), ptr::null_mut()),
+            -1,
+            "a null out is -1"
+        );
+
+        for b in [out_tag, out_len, out_idx] {
+            crdtsync_buf_free(b);
+        }
+    }
+}
+
 #[test]
 fn a_decoded_snapshot_still_dedups_and_converges() {
     unsafe {
