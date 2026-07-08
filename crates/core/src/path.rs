@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 use crate::anchor::RelativePosition;
 use crate::doc::{Document, MapCursor, XmlChildrenCursor};
+use crate::elementid::ElementId;
 use crate::list::{List, Side};
 use crate::map::Map;
 use crate::op::Op;
@@ -159,6 +160,34 @@ pub fn xml_child_delete(doc: &mut Document, elem_path: &[u8], index: usize) -> V
 /// if the path is not a live XmlElement or XmlFragment.
 pub fn xml_children_len(doc: &Document, elem_path: &[u8]) -> Option<usize> {
     xml_children_of(&slot(doc, elem_path)?).map(|l| l.borrow().len())
+}
+
+/// Relocate the live child at `child_index` under the XML node at `parent_path`
+/// to `dest_index` in the children of the XML node at `new_parent_path` — a
+/// Kleppmann tree move that keeps the child's identity and subtree, converging to
+/// one parent under concurrent moves. Inert if either path is not a live
+/// XmlElement/XmlFragment or `child_index` names no live child.
+///
+/// A child is index-addressed, so the mover is named by its parent path and its
+/// live index. A map-slot root — an element or fragment installed straight into a
+/// map — is never a child and has no placement, so it is unaddressable as a mover
+/// and thus never moved; a fragment is a valid destination (it owns children).
+/// The destination is always a map-slot-addressable node, never inside the
+/// mover's subtree, so this surface cannot express a cycle.
+pub fn xml_move_child(
+    doc: &mut Document,
+    parent_path: &[u8],
+    child_index: usize,
+    new_parent_path: &[u8],
+    dest_index: usize,
+) -> Vec<Op> {
+    let Some(node) = xml_child_id(doc, parent_path, child_index) else {
+        return Vec::new();
+    };
+    let Some(new_parent) = xml_node_id(doc, new_parent_path) else {
+        return Vec::new();
+    };
+    doc.transact(|tx| tx.move_xml(node, new_parent, dest_index))
 }
 
 /// Insert a bytes item at a live index in the List at a path.
@@ -365,6 +394,35 @@ fn xml_children_of(e: &Element) -> Option<Rc<RefCell<List>>> {
     match e {
         Element::XmlElement(x) => Some(x.borrow().children()),
         Element::XmlFragment(f) => Some(f.borrow().children()),
+        _ => None,
+    }
+}
+
+/// The stable id of the live child at `index` under the XML node at `path`, or
+/// `None` if the path is not a live XML node or `index` names no live child. A
+/// child (element or text run) holds a placement, so it is the movable target of
+/// a tree move.
+fn xml_child_id(doc: &Document, path: &[u8], index: usize) -> Option<ElementId> {
+    let kids = xml_children_of(&slot(doc, path)?)?;
+    let child = kids.borrow().get(index)?;
+    xml_child_element_id(&child)
+}
+
+/// The stable id of the live XmlElement/XmlFragment at `path` — a move's
+/// destination parent. A fragment is a valid parent: it owns a children sequence.
+fn xml_node_id(doc: &Document, path: &[u8]) -> Option<ElementId> {
+    match slot(doc, path)? {
+        Element::XmlElement(x) => Some(x.borrow().id()),
+        Element::XmlFragment(f) => Some(f.borrow().id()),
+        _ => None,
+    }
+}
+
+/// The stable id of an XmlElement or Text child, or `None` for any other value.
+fn xml_child_element_id(e: &Element) -> Option<ElementId> {
+    match e {
+        Element::XmlElement(x) => Some(x.borrow().id()),
+        Element::Text(t) => Some(t.borrow().id()),
         _ => None,
     }
 }

@@ -415,3 +415,213 @@ fn a_child_delete_converges_on_a_peer() {
     assert_eq!(path::xml_children_len(&b, &p(&["body"])), Some(1));
     assert_eq!(children_of(&b, "body"), vec!["<p>"]);
 }
+
+// --- move: a child relocates by (parent_path, index) ---
+//
+// A child lives in an index-addressed sequence, so the mover is named by its
+// parent path and its live index; the destination is a path-addressed XML node.
+// A map-slot root / fragment is never a child, so it is unaddressable as a mover
+// — and a destination is always a map-slot node, never inside a mover's subtree,
+// so this surface cannot express a cycle. Both no-op conditions are structural.
+
+#[test]
+fn a_child_moves_to_another_parent() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["a"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["a"]), 0, b"h1");
+    path::xml_insert_element(&mut d, &p(&["a"]), 1, b"p");
+    path::xml_element(&mut d, &p(&["b"]), b"section");
+
+    let ops = path::xml_move_child(&mut d, &p(&["a"]), 0, &p(&["b"]), 0);
+    assert!(!ops.is_empty(), "a move should emit an op");
+    assert_eq!(children_of(&d, "a"), vec!["<p>"]);
+    assert_eq!(children_of(&d, "b"), vec!["<h1>"]);
+}
+
+#[test]
+fn a_move_converges_on_a_peer() {
+    let mut a = doc(1);
+    let mut ops = path::xml_element(&mut a, &p(&["a"]), b"div");
+    ops.extend(path::xml_insert_element(&mut a, &p(&["a"]), 0, b"h1"));
+    ops.extend(path::xml_insert_element(&mut a, &p(&["a"]), 1, b"p"));
+    ops.extend(path::xml_element(&mut a, &p(&["b"]), b"section"));
+    ops.extend(path::xml_move_child(&mut a, &p(&["a"]), 0, &p(&["b"]), 0));
+
+    let mut b = doc(2);
+    replay(&mut b, &ops);
+
+    assert_eq!(children_of(&b, "a"), children_of(&a, "a"));
+    assert_eq!(children_of(&b, "b"), children_of(&a, "b"));
+    assert_eq!(children_of(&b, "a"), vec!["<p>"]);
+    assert_eq!(children_of(&b, "b"), vec!["<h1>"]);
+}
+
+#[test]
+fn a_same_parent_reorder_changes_order() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["a"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["a"]), 0, b"h1");
+    path::xml_insert_element(&mut d, &p(&["a"]), 1, b"p");
+    path::xml_insert_element(&mut d, &p(&["a"]), 2, b"span");
+
+    // Move h1 (index 0) to index 1 → p, h1, span. The node's own slot is
+    // discounted when reading the target index, so the reorder is not off by one.
+    let ops = path::xml_move_child(&mut d, &p(&["a"]), 0, &p(&["a"]), 1);
+    assert!(!ops.is_empty());
+    assert_eq!(children_of(&d, "a"), vec!["<p>", "<h1>", "<span>"]);
+}
+
+#[test]
+fn a_reorder_converges_on_a_peer() {
+    let mut a = doc(1);
+    let mut ops = path::xml_element(&mut a, &p(&["a"]), b"div");
+    ops.extend(path::xml_insert_element(&mut a, &p(&["a"]), 0, b"h1"));
+    ops.extend(path::xml_insert_element(&mut a, &p(&["a"]), 1, b"p"));
+    ops.extend(path::xml_insert_element(&mut a, &p(&["a"]), 2, b"span"));
+    ops.extend(path::xml_move_child(&mut a, &p(&["a"]), 0, &p(&["a"]), 1));
+
+    let mut b = doc(2);
+    replay(&mut b, &ops);
+    assert_eq!(children_of(&b, "a"), vec!["<p>", "<h1>", "<span>"]);
+}
+
+#[test]
+fn a_child_moves_into_a_fragment() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["a"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["a"]), 0, b"h1");
+    path::xml_fragment(&mut d, &p(&["frag"]));
+
+    let ops = path::xml_move_child(&mut d, &p(&["a"]), 0, &p(&["frag"]), 0);
+    assert!(!ops.is_empty());
+    assert!(children_of(&d, "a").is_empty());
+    assert_eq!(children_of(&d, "frag"), vec!["<h1>"]);
+}
+
+#[test]
+fn a_child_moves_from_a_fragment() {
+    let mut d = doc(1);
+    path::xml_fragment(&mut d, &p(&["frag"]));
+    path::xml_insert_element(&mut d, &p(&["frag"]), 0, b"item");
+    path::xml_element(&mut d, &p(&["b"]), b"section");
+
+    let ops = path::xml_move_child(&mut d, &p(&["frag"]), 0, &p(&["b"]), 0);
+    assert!(!ops.is_empty());
+    assert!(children_of(&d, "frag").is_empty());
+    assert_eq!(children_of(&d, "b"), vec!["<item>"]);
+}
+
+#[test]
+fn a_text_child_moves() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["a"]), b"div");
+    path::xml_insert_text(&mut d, &p(&["a"]), 0, "hi");
+    path::xml_element(&mut d, &p(&["b"]), b"section");
+
+    let ops = path::xml_move_child(&mut d, &p(&["a"]), 0, &p(&["b"]), 0);
+    assert!(!ops.is_empty());
+    assert!(children_of(&d, "a").is_empty());
+    assert_eq!(children_of(&d, "b"), vec!["\"hi\""]);
+}
+
+#[test]
+fn concurrent_moves_of_a_child_converge() {
+    let mut base = doc(1);
+    let mut build = path::xml_element(&mut base, &p(&["a"]), b"div");
+    build.extend(path::xml_insert_element(&mut base, &p(&["a"]), 0, b"x"));
+    build.extend(path::xml_element(&mut base, &p(&["b"]), b"section"));
+    build.extend(path::xml_element(&mut base, &p(&["c"]), b"aside"));
+
+    let mut r1 = doc(2);
+    let mut r2 = doc(3);
+    replay(&mut r1, &build);
+    replay(&mut r2, &build);
+
+    // r1 moves x under b; r2 concurrently moves x under c.
+    let m1 = path::xml_move_child(&mut r1, &p(&["a"]), 0, &p(&["b"]), 0);
+    let m2 = path::xml_move_child(&mut r2, &p(&["a"]), 0, &p(&["c"]), 0);
+    replay(&mut r1, &m2);
+    replay(&mut r2, &m1);
+
+    assert_eq!(children_of(&r1, "b"), children_of(&r2, "b"), "b diverged");
+    assert_eq!(children_of(&r1, "c"), children_of(&r2, "c"), "c diverged");
+    let under_b = children_of(&r1, "b") == vec!["<x>"];
+    let under_c = children_of(&r1, "c") == vec!["<x>"];
+    assert!(under_b ^ under_c, "x must have exactly one parent");
+    assert!(children_of(&r1, "a").is_empty(), "x left its old parent");
+}
+
+#[test]
+fn a_move_is_deterministic() {
+    let build = |d: &mut Document| {
+        let mut ops = path::xml_element(d, &p(&["a"]), b"div");
+        ops.extend(path::xml_insert_element(d, &p(&["a"]), 0, b"h1"));
+        ops.extend(path::xml_insert_element(d, &p(&["a"]), 1, b"p"));
+        ops.extend(path::xml_element(d, &p(&["b"]), b"section"));
+        ops.extend(path::xml_move_child(d, &p(&["a"]), 0, &p(&["b"]), 0));
+        ops
+    };
+    let mut d1 = doc(1);
+    let mut d2 = doc(1);
+    assert_eq!(build(&mut d1), build(&mut d2));
+}
+
+// --- move: inert guards ---
+
+#[test]
+fn moving_from_a_non_element_parent_is_inert() {
+    let mut d = doc(1);
+    path::register_int(&mut d, &p(&["reg"]), 1);
+    path::xml_element(&mut d, &p(&["b"]), b"section");
+    let ops = path::xml_move_child(&mut d, &p(&["reg"]), 0, &p(&["b"]), 0);
+    assert!(
+        ops.is_empty(),
+        "a move from a non-element parent emits nothing"
+    );
+    assert!(children_of(&d, "b").is_empty());
+}
+
+#[test]
+fn moving_from_a_missing_parent_is_inert() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["b"]), b"section");
+    let ops = path::xml_move_child(&mut d, &p(&["gone"]), 0, &p(&["b"]), 0);
+    assert!(ops.is_empty());
+    assert!(children_of(&d, "b").is_empty());
+}
+
+#[test]
+fn moving_an_out_of_range_child_is_inert() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["a"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["a"]), 0, b"h1");
+    path::xml_element(&mut d, &p(&["b"]), b"section");
+    let ops = path::xml_move_child(&mut d, &p(&["a"]), 5, &p(&["b"]), 0);
+    assert!(ops.is_empty(), "an out-of-range mover emits nothing");
+    assert_eq!(children_of(&d, "a"), vec!["<h1>"]);
+    assert!(children_of(&d, "b").is_empty());
+}
+
+#[test]
+fn moving_to_a_non_element_destination_is_inert() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["a"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["a"]), 0, b"h1");
+    path::register_int(&mut d, &p(&["reg"]), 1);
+    let ops = path::xml_move_child(&mut d, &p(&["a"]), 0, &p(&["reg"]), 0);
+    assert!(
+        ops.is_empty(),
+        "a move to a non-element destination emits nothing"
+    );
+    assert_eq!(children_of(&d, "a"), vec!["<h1>"]);
+}
+
+#[test]
+fn moving_to_a_missing_destination_is_inert() {
+    let mut d = doc(1);
+    path::xml_element(&mut d, &p(&["a"]), b"div");
+    path::xml_insert_element(&mut d, &p(&["a"]), 0, b"h1");
+    let ops = path::xml_move_child(&mut d, &p(&["a"]), 0, &p(&["gone"]), 0);
+    assert!(ops.is_empty());
+    assert_eq!(children_of(&d, "a"), vec!["<h1>"]);
+}
