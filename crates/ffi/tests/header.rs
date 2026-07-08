@@ -43,6 +43,11 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_doc_xml_child_delete",
         "crdtsync_doc_xml_children_len",
         "crdtsync_doc_xml_move",
+        // marks
+        "crdtsync_doc_mark",
+        "crdtsync_doc_mark_set_value",
+        "crdtsync_doc_mark_delete",
+        "crdtsync_doc_marks_at",
         // relative positions (anchors)
         "crdtsync_doc_relative_position",
         "crdtsync_doc_resolve_position",
@@ -88,6 +93,9 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_xml_insert_text",
         "crdtsync_client_xml_child_delete",
         "crdtsync_client_xml_move",
+        "crdtsync_client_mark",
+        "crdtsync_client_mark_set_value",
+        "crdtsync_client_mark_delete",
         "crdtsync_client_begin_atomic",
         "crdtsync_client_commit_atomic",
         "crdtsync_client_get_int",

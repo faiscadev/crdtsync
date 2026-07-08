@@ -6,7 +6,7 @@
 //! channel the client assigned at subscribe. Every buffer and handle is freed so
 //! the round trip is leak-clean under Miri.
 
-use crdtsync_core::{decode_message, encode_message, Channel, Message};
+use crdtsync_core::{decode_message, decode_ops, encode_message, Channel, Message, Scalar};
 use crdtsync_ffi::*;
 use std::ptr;
 
@@ -540,5 +540,149 @@ fn an_atomic_transaction_travels_over_the_wire_client() {
         crdtsync_buf_free(frame);
         crdtsync_client_free(a);
         crdtsync_client_free(b);
+    }
+}
+
+/// Fold a "body" text into `channel`'s replica by applying the ops a scratch doc
+/// author produced — the client surface has no text insert, so a mark's sequence
+/// is seeded from a peer frame.
+unsafe fn seed_body_text(c: *mut CrdtClient, channel: u32, p: &[u8], s: &str) {
+    let scratch = crdtsync_doc_new(client_id(9).as_ptr());
+    let ops_buf = crdtsync_doc_text_insert(scratch, p.as_ptr(), p.len(), 0, s.as_ptr(), s.len());
+    let ops = decode_ops(std::slice::from_raw_parts(ops_buf.ptr, ops_buf.len)).unwrap();
+    let frame = encode_message(&Message::Ops {
+        channel: Channel(channel),
+        ops,
+    });
+    assert!(
+        crdtsync_client_receive(c, frame.as_ptr(), frame.len()) >= 1,
+        "the seeded text applies to the replica"
+    );
+    crdtsync_buf_free(ops_buf);
+    crdtsync_doc_free(scratch);
+}
+
+#[test]
+fn a_mark_enqueues_and_resends_over_the_wire_client() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (ca, sub_a) = subscribe(a, b"room-1");
+        let (cb, sub_b) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sub_a);
+        crdtsync_buf_free(sub_b);
+        let body = path(&[b"body"]);
+
+        // Both replicas hold the text the mark annotates.
+        seed_body_text(a, ca, &body, "hello world");
+        seed_body_text(b, cb, &body, "hello world");
+
+        // Authoring a mark routes its ops through the outbox so they are resent /
+        // acknowledged rather than framed and forgotten.
+        let value = Scalar::Bool(true).encode_state();
+        let mut mid = out_buf();
+        let frame = crdtsync_client_mark(
+            a,
+            ca,
+            body.as_ptr(),
+            body.len(),
+            0,
+            1,
+            5,
+            0,
+            b"bold".as_ptr(),
+            4,
+            value.as_ptr(),
+            value.len(),
+            &mut mid,
+        );
+        assert!(frame.len > 0, "the mark frames ops to send");
+        assert_eq!(mid.len, 16, "the author returns the mark id");
+
+        let mut n: usize = 0;
+        assert_eq!(crdtsync_client_outbox_len(a, ca, &mut n), 1);
+        assert!(n >= 1, "the mark entered the outbox, got {n}");
+
+        // The unacknowledged tail replays as one frame and folds into the peer.
+        let tail = crdtsync_client_resend(a, ca);
+        assert!(tail.len > 0);
+        assert!(receive(b, &tail) >= 1, "the peer applies the replayed mark");
+        crdtsync_buf_free(tail);
+
+        // A value change and a delete on the handle enqueue too.
+        let value2 = Scalar::Int(3).encode_state();
+        let set =
+            crdtsync_client_mark_set_value(a, ca, mid.ptr, mid.len, value2.as_ptr(), value2.len());
+        assert!(set.len > 0, "the value change frames ops");
+        let del = crdtsync_client_mark_delete(a, ca, mid.ptr, mid.len);
+        assert!(del.len > 0, "the delete frames ops");
+        assert_eq!(crdtsync_client_outbox_len(a, ca, &mut n), 1);
+        assert!(
+            n >= 3,
+            "the mark, value change, and delete all enqueued, got {n}"
+        );
+
+        // An ack through u64::MAX drains the outbox.
+        let accepted = encode_message(&Message::Accepted {
+            channel: Channel(ca),
+            through: u64::MAX,
+        });
+        assert_eq!(
+            crdtsync_client_receive(a, accepted.as_ptr(), accepted.len()),
+            1
+        );
+        assert_eq!(crdtsync_client_outbox_len(a, ca, &mut n), 1);
+        assert_eq!(n, 0, "the ack drained the mark edits");
+
+        let _ = cb;
+        crdtsync_buf_free(frame);
+        crdtsync_buf_free(set);
+        crdtsync_buf_free(del);
+        crdtsync_buf_free(mid);
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}
+
+#[test]
+fn a_mark_on_a_bad_client_handle_is_inert() {
+    unsafe {
+        let value = Scalar::Bool(true).encode_state();
+        let body = path(&[b"body"]);
+        let mut mid = out_buf();
+        // A null handle never emits, yields no id, and never dereferences.
+        let frame = crdtsync_client_mark(
+            ptr::null_mut(),
+            0,
+            body.as_ptr(),
+            body.len(),
+            0,
+            1,
+            5,
+            0,
+            b"bold".as_ptr(),
+            4,
+            value.as_ptr(),
+            value.len(),
+            &mut mid,
+        );
+        assert_eq!(frame.len, 0, "null handle frames nothing");
+        assert_eq!(mid.len, 0, "null handle yields no id");
+        crdtsync_buf_free(frame);
+
+        let id = [0u8; 16];
+        let set = crdtsync_client_mark_set_value(
+            ptr::null_mut(),
+            0,
+            id.as_ptr(),
+            16,
+            value.as_ptr(),
+            value.len(),
+        );
+        assert_eq!(set.len, 0, "null handle sets nothing");
+        crdtsync_buf_free(set);
+        let del = crdtsync_client_mark_delete(ptr::null_mut(), 0, id.as_ptr(), 16);
+        assert_eq!(del.len, 0, "null handle deletes nothing");
+        crdtsync_buf_free(del);
     }
 }

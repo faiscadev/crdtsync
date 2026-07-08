@@ -7,6 +7,7 @@
 //! exchange those bytes converge. Every entry point isolates panics rather than
 //! unwinding across the boundary.
 
+use crdtsync_core::Scalar;
 use crdtsync_ffi::*;
 use std::ptr;
 
@@ -1038,5 +1039,237 @@ fn a_position_on_a_bad_or_non_sequence_path_is_reported() {
         );
 
         crdtsync_doc_free(a);
+    }
+}
+
+// --- marks ---
+
+/// The name and (for an object-flavored mark) covering ids of each resolved mark
+/// in a `crdtsync_doc_marks_at` buffer — the encoding the SDK marks reader decodes.
+fn parse_marks(buf: &[u8]) -> Vec<(Vec<u8>, Vec<[u8; 16]>)> {
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+    let mut c = 0usize;
+    let count = u32_at(buf, c);
+    c += 4;
+    let mut marks = Vec::new();
+    for _ in 0..count {
+        let nl = u32_at(buf, c);
+        c += 4;
+        let name = buf[c..c + nl].to_vec();
+        c += nl;
+        let tag = buf[c];
+        c += 1;
+        let mut ids = Vec::new();
+        match tag {
+            0 => c += 1,
+            1 => {
+                let vl = u32_at(buf, c);
+                c += 4 + vl;
+            }
+            2 => {
+                let n = u32_at(buf, c);
+                c += 4;
+                for _ in 0..n {
+                    ids.push(buf[c..c + 16].try_into().unwrap());
+                    c += 16;
+                }
+            }
+            _ => panic!("unknown mark flavor tag {tag}"),
+        }
+        marks.push((name, ids));
+    }
+    marks
+}
+
+unsafe fn marks_at(doc: *const CrdtDoc, p: &[u8], index: usize) -> Vec<(Vec<u8>, Vec<[u8; 16]>)> {
+    let mut out = CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let rc = crdtsync_doc_marks_at(doc, p.as_ptr(), p.len(), index, &mut out);
+    assert_eq!(rc, 1, "a live handle reads its marks");
+    let buf = std::slice::from_raw_parts(out.ptr, out.len).to_vec();
+    crdtsync_buf_free(out);
+    parse_marks(&buf)
+}
+
+#[test]
+fn a_mark_reads_back_over_its_span_and_converges() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let body = path(&[b"body"]);
+
+        // A "body" text to annotate — the mark spans [0,5) of "hello world".
+        let text =
+            crdtsync_doc_text_insert(a, body.as_ptr(), body.len(), 0, b"hello world".as_ptr(), 11);
+        let value = Scalar::Bool(true).encode_state();
+        let mut mid = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let ops = crdtsync_doc_mark(
+            a,
+            body.as_ptr(),
+            body.len(),
+            0,
+            1, // start side: right of index 0
+            5,
+            0, // end side: left of index 5
+            b"bold".as_ptr(),
+            4,
+            value.as_ptr(),
+            value.len(),
+            &mut mid,
+        );
+        assert!(ops.len > 0, "authoring a mark emits ops");
+        assert_eq!(mid.len, 16, "a live mark yields a 16-byte id");
+        let mid_bytes: [u8; 16] = std::slice::from_raw_parts(mid.ptr, mid.len)
+            .try_into()
+            .unwrap();
+
+        // Covered inside the span, absent outside it.
+        let inside = marks_at(a, &body, 2);
+        assert!(
+            inside
+                .iter()
+                .any(|(name, ids)| name == b"bold" && ids.contains(&mid_bytes)),
+            "the covering mark reads back with its id"
+        );
+        assert!(marks_at(a, &body, 7).is_empty(), "no mark past the span");
+
+        // The mark converges onto a peer.
+        exchange(b, &text);
+        exchange(b, &ops);
+        assert!(
+            marks_at(b, &body, 2)
+                .iter()
+                .any(|(name, _)| name == b"bold"),
+            "the mark converges"
+        );
+
+        // Changing the value re-emits ops and keeps the mark live.
+        let value2 = Scalar::Int(9).encode_state();
+        let set = crdtsync_doc_mark_set_value(a, mid.ptr, mid.len, value2.as_ptr(), value2.len());
+        assert!(set.len > 0, "changing a live mark's value emits ops");
+        exchange(b, &set);
+        assert!(
+            marks_at(a, &body, 2)
+                .iter()
+                .any(|(name, _)| name == b"bold"),
+            "the mark stays live through a value change"
+        );
+
+        // Deleting drops it from the active set on both replicas.
+        let del = crdtsync_doc_mark_delete(a, mid.ptr, mid.len);
+        assert!(del.len > 0, "deleting a live mark emits ops");
+        exchange(b, &del);
+        assert!(
+            marks_at(a, &body, 2)
+                .iter()
+                .all(|(name, _)| name != b"bold"),
+            "the mark is gone from the author"
+        );
+        assert!(
+            marks_at(b, &body, 2)
+                .iter()
+                .all(|(name, _)| name != b"bold"),
+            "the delete converges"
+        );
+
+        for o in [text, ops, set, del] {
+            crdtsync_buf_free(o);
+        }
+        crdtsync_buf_free(mid);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn marks_on_a_bad_handle_or_non_sequence_are_inert() {
+    unsafe {
+        let value = Scalar::Bool(true).encode_state();
+
+        // A null handle never emits, yields no id, and never dereferences.
+        let mut mid = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let o = crdtsync_doc_mark(
+            ptr::null_mut(),
+            ptr::null(),
+            0,
+            0,
+            1,
+            1,
+            0,
+            b"x".as_ptr(),
+            1,
+            value.as_ptr(),
+            value.len(),
+            &mut mid,
+        );
+        assert_eq!(o.len, 0, "null handle emits nothing");
+        assert_eq!(mid.len, 0, "null handle yields no id");
+        crdtsync_buf_free(o);
+
+        // A null handle read is -1, isolated from a null out pointer by a live out.
+        let mut out = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            crdtsync_doc_marks_at(ptr::null(), ptr::null(), 0, 0, &mut out),
+            -1,
+            "null handle reads -1"
+        );
+
+        // A register is not a sequence: authoring is inert and the read is empty.
+        let doc = crdtsync_doc_new(client(1).as_ptr());
+        let reg = path(&[b"age"]);
+        let r = register_int(doc, &reg, 30);
+        crdtsync_buf_free(r);
+        let mut mid2 = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let o = crdtsync_doc_mark(
+            doc,
+            reg.as_ptr(),
+            reg.len(),
+            0,
+            1,
+            1,
+            0,
+            b"bold".as_ptr(),
+            4,
+            value.as_ptr(),
+            value.len(),
+            &mut mid2,
+        );
+        assert_eq!(o.len, 0, "a mark on a non-sequence emits nothing");
+        assert_eq!(mid2.len, 0, "no id on a non-sequence");
+        crdtsync_buf_free(o);
+        assert!(
+            marks_at(doc, &reg, 0).is_empty(),
+            "no marks on a non-sequence"
+        );
+
+        // A malformed or absent handle mutates nothing.
+        let stale = [0u8; 3];
+        let sv = crdtsync_doc_mark_set_value(doc, stale.as_ptr(), 3, value.as_ptr(), value.len());
+        assert_eq!(sv.len, 0, "a bad-width handle sets nothing");
+        crdtsync_buf_free(sv);
+        let absent = [9u8; 16];
+        let del = crdtsync_doc_mark_delete(doc, absent.as_ptr(), 16);
+        assert_eq!(del.len, 0, "an absent handle deletes nothing");
+        crdtsync_buf_free(del);
+
+        // The register slot was never clobbered into a sequence.
+        assert_eq!(get_int(doc, &reg), (1, 30));
+
+        crdtsync_doc_free(doc);
     }
 }

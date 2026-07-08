@@ -293,6 +293,67 @@ CrdtBuf crdtsync_doc_xml_move(CrdtDoc *doc,
                               uintptr_t new_parent_path_len,
                               uintptr_t dest_index);
 
+// Author a named mark over `[start, end)` of the sequence at `seq_path`, each
+// endpoint an `(index, side)` pair (`side` 0 left of the index, 1 right) and
+// `value` an encoded [`Scalar`] payload. Returns the ops to broadcast and writes
+// the mark's 16-byte id into `out_mark_id` (a fresh buffer the caller frees).
+// Inert — empty ops, `out_mark_id` left empty — on a bad handle, a non-sequence
+// path, an unknown `side`, or a malformed value.
+//
+// # Safety
+// `doc` is a live handle; `seq_path`/`seq_path_len`, `name`/`name_len`, and
+// `value`/`value_len` each follow [`as_slice`]; `out_mark_id`, when non-null,
+// points to a writable `CrdtBuf`.
+CrdtBuf crdtsync_doc_mark(CrdtDoc *doc,
+                          const uint8_t *seq_path,
+                          uintptr_t seq_path_len,
+                          uintptr_t start_index,
+                          uint32_t start_side,
+                          uintptr_t end_index,
+                          uint32_t end_side,
+                          const uint8_t *name,
+                          uintptr_t name_len,
+                          const uint8_t *value,
+                          uintptr_t value_len,
+                          CrdtBuf *out_mark_id);
+
+// Change the scalar payload of the mark handle `mark_id` (16 bytes from
+// [`crdtsync_doc_mark`]) to the encoded [`Scalar`] `value`. Returns the ops to
+// broadcast; inert (empty) on a bad handle, a handle that names no live mark, or
+// a malformed value.
+//
+// # Safety
+// `doc` is a live handle; `mark_id`/`mark_id_len` and `value`/`value_len` follow
+// [`as_slice`].
+CrdtBuf crdtsync_doc_mark_set_value(CrdtDoc *doc,
+                                    const uint8_t *mark_id,
+                                    uintptr_t mark_id_len,
+                                    const uint8_t *value,
+                                    uintptr_t value_len);
+
+// Tombstone the mark handle `mark_id` (16 bytes from [`crdtsync_doc_mark`]).
+// Returns the ops to broadcast; inert (empty) on a bad handle or a handle that
+// names no live mark.
+//
+// # Safety
+// `doc` is a live handle; `mark_id`/`mark_id_len` follow [`as_slice`].
+CrdtBuf crdtsync_doc_mark_delete(CrdtDoc *doc, const uint8_t *mark_id, uintptr_t mark_id_len);
+
+// Read the marks active on character `index` of the sequence at `seq_path` into
+// `out` — the [`encode_resolved_marks`] buffer the caller frees, decoded with the
+// SDK's marks reader. Returns 1 with the encoded list (a non-sequence path or an
+// uncovered index encodes zero marks), 0 on a malformed `seq_path`, -1 on a bad
+// handle or a null `out`.
+//
+// # Safety
+// `doc` is a live handle or null; `seq_path`/`seq_path_len` follow [`as_slice`];
+// `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_doc_marks_at(const CrdtDoc *doc,
+                              const uint8_t *seq_path,
+                              uintptr_t seq_path_len,
+                              uintptr_t index,
+                              CrdtBuf *out);
+
 // Capture a stable position in the List or Text at a path — the encoded
 // [`RelativePosition`] bytes, resolved later with
 // [`crdtsync_doc_resolve_position`]. `side` is 0 (left of `index`) or 1 (right).
@@ -704,6 +765,57 @@ CrdtBuf crdtsync_client_xml_move(CrdtClient *client,
                                  const uint8_t *new_parent_path,
                                  uintptr_t new_parent_path_len,
                                  uintptr_t dest_index);
+
+// Author a named mark over `[start, end)` of the sequence at `seq_path` in
+// `channel`'s room, routed through the outbox. Endpoints and `value` cross as for
+// [`crdtsync_doc_mark`]; the mark's 16-byte id is written into `out_mark_id` (a
+// fresh buffer the caller frees). Empty on a bad handle, an unheld channel, an
+// unknown `side`, or a malformed value; a non-sequence path enqueues nothing and
+// leaves `out_mark_id` empty.
+//
+// # Safety
+// `client` is a live handle; `seq_path`/`seq_path_len`, `name`/`name_len`, and
+// `value`/`value_len` each follow [`as_slice`]; `out_mark_id`, when non-null,
+// points to a writable `CrdtBuf`.
+CrdtBuf crdtsync_client_mark(CrdtClient *client,
+                             uint32_t channel,
+                             const uint8_t *seq_path,
+                             uintptr_t seq_path_len,
+                             uintptr_t start_index,
+                             uint32_t start_side,
+                             uintptr_t end_index,
+                             uint32_t end_side,
+                             const uint8_t *name,
+                             uintptr_t name_len,
+                             const uint8_t *value,
+                             uintptr_t value_len,
+                             CrdtBuf *out_mark_id);
+
+// Change the payload of the mark handle `mark_id` (16 bytes from
+// [`crdtsync_client_mark`]) to the encoded [`Scalar`] `value`, in `channel`'s
+// room, routed through the outbox. Empty on a bad handle, an unheld channel, a
+// malformed value, or a handle that names no live mark.
+//
+// # Safety
+// `client` is a live handle; `mark_id`/`mark_id_len` and `value`/`value_len`
+// follow [`as_slice`].
+CrdtBuf crdtsync_client_mark_set_value(CrdtClient *client,
+                                       uint32_t channel,
+                                       const uint8_t *mark_id,
+                                       uintptr_t mark_id_len,
+                                       const uint8_t *value,
+                                       uintptr_t value_len);
+
+// Tombstone the mark handle `mark_id` (16 bytes from [`crdtsync_client_mark`]) in
+// `channel`'s room, routed through the outbox. Empty on a bad handle, an unheld
+// channel, or a handle that names no live mark.
+//
+// # Safety
+// `client` is a live handle; `mark_id`/`mark_id_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_mark_delete(CrdtClient *client,
+                                    uint32_t channel,
+                                    const uint8_t *mark_id,
+                                    uintptr_t mark_id_len);
 
 // Read an integer Register at a path in `channel`'s room into `out`. Returns 1
 // on success, 0 if absent or the channel isn't held, -1 on a bad handle.

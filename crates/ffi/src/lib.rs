@@ -23,7 +23,7 @@ use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, encode_message, encode_ops, path, Channel, ClientId, ClientSession, Document,
-    Message, RelativePosition, Scalar, UndoManager,
+    MarkState, Message, RelativePosition, ResolvedMark, Scalar, UndoManager,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
@@ -555,6 +555,198 @@ fn side_from_u32(side: u32) -> Option<Side> {
         0 => Some(Side::Left),
         1 => Some(Side::Right),
         _ => None,
+    }
+}
+
+// --- marks ---
+//
+// A mark is a named range over a sequence (a Text or List), authored with the two
+// endpoints as `(index, side)` pairs and a scalar payload, and read back per its
+// resolved state at a character. Authoring emits ops like any edit; the create
+// returns the mark's 16-byte id — the handle a later set-value/delete names it by
+// — through an out buffer the caller frees, empty when the author was inert. The
+// scalar payload crosses as its canonical [`Scalar::encode_state`] bytes and the
+// id as its raw 16 bytes, the same shapes those values cross elsewhere in the ABI.
+
+/// Serialize the resolved marks on a character to one buffer the SDK decodes: a
+/// `u32` count, then per mark a `u32`-length-prefixed name, a one-byte flavor tag,
+/// and that tag's payload — `0` a boolean byte, `1` a `u32`-length-prefixed encoded
+/// [`Scalar`], `2` a `u32` count of raw 16-byte element ids.
+fn encode_resolved_marks(marks: &[ResolvedMark]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(marks.len() as u32).to_le_bytes());
+    for m in marks {
+        out.extend_from_slice(&(m.name.len() as u32).to_le_bytes());
+        out.extend_from_slice(&m.name);
+        match &m.state {
+            MarkState::Boolean(b) => {
+                out.push(0);
+                out.push(*b as u8);
+            }
+            MarkState::Value(v) => {
+                out.push(1);
+                let bytes = v.encode_state();
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(&bytes);
+            }
+            MarkState::Object(ids) => {
+                out.push(2);
+                out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+                for id in ids {
+                    out.extend_from_slice(&id.as_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Author a named mark over `[start, end)` of the sequence at `seq_path`, each
+/// endpoint an `(index, side)` pair (`side` 0 left of the index, 1 right) and
+/// `value` an encoded [`Scalar`] payload. Returns the ops to broadcast and writes
+/// the mark's 16-byte id into `out_mark_id` (a fresh buffer the caller frees).
+/// Inert — empty ops, `out_mark_id` left empty — on a bad handle, a non-sequence
+/// path, an unknown `side`, or a malformed value.
+///
+/// # Safety
+/// `doc` is a live handle; `seq_path`/`seq_path_len`, `name`/`name_len`, and
+/// `value`/`value_len` each follow [`as_slice`]; `out_mark_id`, when non-null,
+/// points to a writable `CrdtBuf`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn crdtsync_doc_mark(
+    doc: *mut CrdtDoc,
+    seq_path: *const u8,
+    seq_path_len: usize,
+    start_index: usize,
+    start_side: u32,
+    end_index: usize,
+    end_side: u32,
+    name: *const u8,
+    name_len: usize,
+    value: *const u8,
+    value_len: usize,
+    out_mark_id: *mut CrdtBuf,
+) -> CrdtBuf {
+    let Some(m) = mark_endpoints(start_side, end_side, name, name_len, value, value_len) else {
+        return CrdtBuf::empty();
+    };
+    edit(doc, seq_path, seq_path_len, |d, p| {
+        let (ops, id) = path::mark(
+            d,
+            p,
+            start_index,
+            m.start_side,
+            end_index,
+            m.end_side,
+            m.name,
+            m.value,
+        );
+        unsafe { write_mark_id(out_mark_id, id) };
+        ops
+    })
+}
+
+/// Change the scalar payload of the mark handle `mark_id` (16 bytes from
+/// [`crdtsync_doc_mark`]) to the encoded [`Scalar`] `value`. Returns the ops to
+/// broadcast; inert (empty) on a bad handle, a handle that names no live mark, or
+/// a malformed value.
+///
+/// # Safety
+/// `doc` is a live handle; `mark_id`/`mark_id_len` and `value`/`value_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_mark_set_value(
+    doc: *mut CrdtDoc,
+    mark_id: *const u8,
+    mark_id_len: usize,
+    value: *const u8,
+    value_len: usize,
+) -> CrdtBuf {
+    let Some(scalar) = decode_scalar(value, value_len) else {
+        return CrdtBuf::empty();
+    };
+    edit(doc, mark_id, mark_id_len, |d, id| {
+        path::mark_set_value(d, id, scalar)
+    })
+}
+
+/// Tombstone the mark handle `mark_id` (16 bytes from [`crdtsync_doc_mark`]).
+/// Returns the ops to broadcast; inert (empty) on a bad handle or a handle that
+/// names no live mark.
+///
+/// # Safety
+/// `doc` is a live handle; `mark_id`/`mark_id_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_mark_delete(
+    doc: *mut CrdtDoc,
+    mark_id: *const u8,
+    mark_id_len: usize,
+) -> CrdtBuf {
+    edit(doc, mark_id, mark_id_len, path::mark_delete)
+}
+
+/// Read the marks active on character `index` of the sequence at `seq_path` into
+/// `out` — the [`encode_resolved_marks`] buffer the caller frees, decoded with the
+/// SDK's marks reader. Returns 1 with the encoded list (a non-sequence path or an
+/// uncovered index encodes zero marks), 0 on a malformed `seq_path`, -1 on a bad
+/// handle or a null `out`.
+///
+/// # Safety
+/// `doc` is a live handle or null; `seq_path`/`seq_path_len` follow [`as_slice`];
+/// `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_marks_at(
+    doc: *const CrdtDoc,
+    seq_path: *const u8,
+    seq_path_len: usize,
+    index: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    read_buf(doc, seq_path, seq_path_len, out, |d, p| {
+        Some(encode_resolved_marks(&path::marks_at(d, p, index)))
+    })
+}
+
+/// The validated endpoints of a mark author, shared by the doc and client
+/// surfaces; the sequence path is validated by the surface's edit helper.
+struct MarkEndpoints<'a> {
+    start_side: Side,
+    end_side: Side,
+    name: &'a [u8],
+    value: Scalar,
+}
+
+/// Borrow and validate a mark author's sides, name, and encoded value. `None` if a
+/// side is unknown, the name pointer is rejected, or the value is malformed.
+unsafe fn mark_endpoints<'a>(
+    start_side: u32,
+    end_side: u32,
+    name: *const u8,
+    name_len: usize,
+    value: *const u8,
+    value_len: usize,
+) -> Option<MarkEndpoints<'a>> {
+    Some(MarkEndpoints {
+        start_side: side_from_u32(start_side)?,
+        end_side: side_from_u32(end_side)?,
+        name: as_slice(name, name_len)?,
+        value: decode_scalar(value, value_len)?,
+    })
+}
+
+/// Decode a mark's [`Scalar`] payload from `value`/`value_len`. `None` if the
+/// pointer is rejected or the bytes are not a canonical scalar encoding.
+unsafe fn decode_scalar(value: *const u8, value_len: usize) -> Option<Scalar> {
+    Scalar::decode_state(as_slice(value, value_len)?).ok()
+}
+
+/// Write a freshly-authored mark's id into `out` (a caller-freed buffer), when the
+/// author yielded one and `out` is non-null. An inert author leaves `out` untouched
+/// — the caller's nulled buffer stays empty, its len-0 the absent signal.
+unsafe fn write_mark_id(out: *mut CrdtBuf, id: Option<Vec<u8>>) {
+    if let (Some(id), false) = (id, out.is_null()) {
+        *out = CrdtBuf::from_vec(id);
     }
 }
 
@@ -1602,6 +1794,100 @@ pub unsafe extern "C" fn crdtsync_client_xml_move(
         }
     }))
     .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+// --- client marks ---
+//
+// Marks authored on a subscribed room route through the outbox like every other
+// client edit, so they are resent and acknowledged rather than framed and
+// forgotten. The read (`marks_at`) is a doc-surface entry point.
+
+/// Author a named mark over `[start, end)` of the sequence at `seq_path` in
+/// `channel`'s room, routed through the outbox. Endpoints and `value` cross as for
+/// [`crdtsync_doc_mark`]; the mark's 16-byte id is written into `out_mark_id` (a
+/// fresh buffer the caller frees). Empty on a bad handle, an unheld channel, an
+/// unknown `side`, or a malformed value; a non-sequence path enqueues nothing and
+/// leaves `out_mark_id` empty.
+///
+/// # Safety
+/// `client` is a live handle; `seq_path`/`seq_path_len`, `name`/`name_len`, and
+/// `value`/`value_len` each follow [`as_slice`]; `out_mark_id`, when non-null,
+/// points to a writable `CrdtBuf`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn crdtsync_client_mark(
+    client: *mut CrdtClient,
+    channel: u32,
+    seq_path: *const u8,
+    seq_path_len: usize,
+    start_index: usize,
+    start_side: u32,
+    end_index: usize,
+    end_side: u32,
+    name: *const u8,
+    name_len: usize,
+    value: *const u8,
+    value_len: usize,
+    out_mark_id: *mut CrdtBuf,
+) -> CrdtBuf {
+    let Some(m) = mark_endpoints(start_side, end_side, name, name_len, value, value_len) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, seq_path, seq_path_len, |d, p| {
+        let (ops, id) = path::mark(
+            d,
+            p,
+            start_index,
+            m.start_side,
+            end_index,
+            m.end_side,
+            m.name,
+            m.value,
+        );
+        unsafe { write_mark_id(out_mark_id, id) };
+        ops
+    })
+}
+
+/// Change the payload of the mark handle `mark_id` (16 bytes from
+/// [`crdtsync_client_mark`]) to the encoded [`Scalar`] `value`, in `channel`'s
+/// room, routed through the outbox. Empty on a bad handle, an unheld channel, a
+/// malformed value, or a handle that names no live mark.
+///
+/// # Safety
+/// `client` is a live handle; `mark_id`/`mark_id_len` and `value`/`value_len`
+/// follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_mark_set_value(
+    client: *mut CrdtClient,
+    channel: u32,
+    mark_id: *const u8,
+    mark_id_len: usize,
+    value: *const u8,
+    value_len: usize,
+) -> CrdtBuf {
+    let Some(scalar) = decode_scalar(value, value_len) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, mark_id, mark_id_len, |d, id| {
+        path::mark_set_value(d, id, scalar)
+    })
+}
+
+/// Tombstone the mark handle `mark_id` (16 bytes from [`crdtsync_client_mark`]) in
+/// `channel`'s room, routed through the outbox. Empty on a bad handle, an unheld
+/// channel, or a handle that names no live mark.
+///
+/// # Safety
+/// `client` is a live handle; `mark_id`/`mark_id_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_mark_delete(
+    client: *mut CrdtClient,
+    channel: u32,
+    mark_id: *const u8,
+    mark_id_len: usize,
+) -> CrdtBuf {
+    client_edit(client, channel, mark_id, mark_id_len, path::mark_delete)
 }
 
 /// Read an integer Register at a path in `channel`'s room into `out`. Returns 1
