@@ -20,6 +20,11 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 - **Inert edits frame a zero-op `Ops` frame, not nothing.** A held-channel inert client edit sends a zero-op frame, consistent with the shipped atomic-transaction empty-frame convention — the boundary stays uniform rather than special-casing "no ops" as "no frame."
 - **`xml_move` is the sole multi-path C ABI fn** (two paths + two indices), null-checking both — the C ABI otherwise addresses one path per call. The core façade fn is `xml_move_child`.
 
+## 2026-07-08 · SDK Unit 6b-iii · FFI diff — `crdtsync_diff` pre-existed, the slice's real deliverable is the boundary decode
+**Changed:** third slice of Unit 6b. No new diff surface — reconciles the 6a-v façade with the already-shipped diff FFI. No scope change.
+- **Don't duplicate `crdtsync_diff`.** The Schema-Aware-Diff work (#113) already exposed `crdtsync_diff(old, new) -> CrdtBuf`, which is exactly `diff_encoded`. So 6b-iii adds only the missing inverse: `crdtsync_diff_decode` — the boundary read of `core::path::decode_changes`, turning encoded diff bytes back into the structured change list the language bindings marshal. The new capability 6a-v added over the old diff FFI was the decode, and that is the whole slice.
+- **Decode is total across the FFI frame.** A diff crosses an untrusted boundary, so `crdtsync_diff_decode` wraps the decode in `catch_unwind` and maps truncated/garbage/empty → status 0 + empty out, null out → -1 — never a panic across the C frame, matching the crate's existing 1/0/-1 out-param idiom.
+
 ## 2026-07-08 · SDK Unit 6b-ii · FFI marks follow the doc+client split — authoring rides the client/enqueue surface, `marks_at` the doc surface
 **Changed:** second slice of Unit 6b; forwards the marks façade over the C ABI. No scope change — applies 6b-i's established pattern.
 - **Marks split by read-vs-write, per 6b-i's rule.** Mark authoring (`mark`/`mark_set_value`/`mark_delete`) emits ops, so it rides the client surface (`crdtsync_client_mark_*`) through `enqueue_ops` — the #124 ack/resend guarantee. `marks_at` is a read → the doc surface. This is the general rule 6b-i set: edits → client/enqueue, reads → doc.
