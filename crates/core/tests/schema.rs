@@ -353,6 +353,86 @@ fn a_non_object_marks_block_is_rejected() {
     assert_eq!(err(&src), SchemaErrorKind::NotAnObject);
 }
 
+// --- zones: static subtree-rooted partitions ---
+
+fn with_zones(body: &str) -> String {
+    format!(
+        r#"{{ "schema": "s", "version": 1, "root": "R",
+            "types": {{ "R": {{ "kind": "map" }} }},
+            "zones": {body} }}"#
+    )
+}
+
+#[test]
+fn a_schema_without_zones_has_no_declarations() {
+    let s = parse(FULL);
+    assert!(s.zones().is_empty());
+    assert_eq!(s.zone("private"), None);
+}
+
+#[test]
+fn parses_zones_as_name_to_root_path() {
+    let s = parse(&with_zones(
+        r#"{ "private": "/comments", "canvas": "/board", "whole": "/" }"#,
+    ));
+    assert_eq!(s.zone("private"), Some("/comments"));
+    assert_eq!(s.zone("canvas"), Some("/board"));
+    assert_eq!(s.zone("whole"), Some("/"));
+    assert_eq!(s.zone("missing"), None);
+}
+
+#[test]
+fn zones_keep_declaration_order() {
+    let s = parse(&with_zones(r#"{ "a": "/x", "b": "/y", "c": "/z" }"#));
+    let names: Vec<&str> = s.zones().iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["a", "b", "c"]);
+}
+
+#[test]
+fn a_zone_root_path_must_be_a_well_formed_absolute_path() {
+    // Same path grammar the auth `on:` field uses — absolute, no empty segment.
+    for bad in ["board", "/a//b", "/board/", ""] {
+        let src = with_zones(&format!(r#"{{ "z": "{bad}" }}"#));
+        assert_eq!(err(&src), SchemaErrorKind::BadPath, "{bad}");
+    }
+}
+
+#[test]
+fn a_non_string_zone_root_is_rejected() {
+    assert_eq!(
+        err(&with_zones(r#"{ "z": 7 }"#)),
+        SchemaErrorKind::WrongType
+    );
+    assert_eq!(
+        err(&with_zones(r#"{ "z": { "root": "/x" } }"#)),
+        SchemaErrorKind::WrongType
+    );
+}
+
+#[test]
+fn a_non_object_zones_block_is_rejected() {
+    assert_eq!(err(&with_zones(r#"[]"#)), SchemaErrorKind::NotAnObject);
+    assert_eq!(err(&with_zones(r#"3"#)), SchemaErrorKind::NotAnObject);
+}
+
+#[test]
+fn a_duplicate_zone_name_is_a_json_error() {
+    // A zone name is an object key, so a repeat is caught by the JSON layer
+    // (a duplicate key is a parse error) — no schema-level dedup needed.
+    let src = with_zones(r#"{ "z": "/a", "z": "/b" }"#);
+    assert_eq!(
+        err(&src),
+        SchemaErrorKind::Json(JsonErrorKind::DuplicateKey)
+    );
+}
+
+#[test]
+fn a_zone_error_names_the_zone() {
+    let e = Schema::parse(&with_zones(r#"{ "board": "nope" }"#)).unwrap_err();
+    assert_eq!(e.kind, SchemaErrorKind::BadPath);
+    assert_eq!(e.at, "zones.board", "the error names the zone");
+}
+
 // --- xml element / fragment types ---
 
 // A prose schema: a fragment root holding block elements, an element with attrs
@@ -777,18 +857,20 @@ fn an_unknown_field_inside_an_awareness_entry_is_rejected() {
 
 #[test]
 fn the_language_defined_top_level_keys_are_accepted() {
-    // Every modelled top-level block parses together — `marks`, `awareness`, and
-    // `auth` each well-formed.
+    // Every modelled top-level block parses together — `marks`, `awareness`,
+    // `auth`, and `zones` each well-formed.
     let s = parse(
         r#"{ "schema": "s", "version": 1, "root": "R",
             "types": { "R": { "kind": "map" } },
             "marks": { "bold": { "flavor": "boolean" } },
             "awareness": { "cursor": {} },
-            "auth": { "roles": ["editor"] } }"#,
+            "auth": { "roles": ["editor"] },
+            "zones": { "private": "/comments" } }"#,
     );
     assert_eq!(s.name(), "s");
     assert_eq!(s.mark("bold").map(|d| d.flavor), Some(MarkFlavor::Boolean));
     assert_eq!(s.awareness_entry("cursor").map(|_| ()), Some(()));
+    assert_eq!(s.zone("private"), Some("/comments"));
 }
 
 // --- errors: each a distinct kind, none a panic ---
@@ -1082,6 +1164,10 @@ fn hostile_inputs_never_panic() {
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "marks": { "b": 3 } }"#,
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "marks": { "b": { "flavor": "nope" } } }"#,
         r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "marks": { "b": { "flavor": "boolean", "expand": "€" } } }"#,
+        // zones shapes
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "zones": 3 }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "zones": { "z": 7 } }"#,
+        r#"{ "schema": "s", "version": 1, "root": "R", "types": { "R": { "kind": "map" } }, "zones": { "z": "€/a//b" } }"#,
     ];
     for s in inputs {
         // The contract is only that it returns — Ok or Err, never a panic.
