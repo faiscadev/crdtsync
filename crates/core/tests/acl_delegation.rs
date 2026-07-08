@@ -506,24 +506,22 @@ fn a_long_forged_chain_terminates() {
     }
 }
 
-// ---- denies are honored as-present (rooting gates only positive grants) ----
+// ---- denies bind only within their author's authority (slice 3b-ii) --------
 
 #[test]
-fn a_deny_is_honored_as_present_not_dropped_by_rooting() {
-    // Rooting gates positive grants; a deny is honored as-present (deny provenance is
-    // slice 3b-ii). A deny must never be silently dropped for lacking a rooted
-    // grantor — that would fail open, opening access a deny was meant to close.
+fn an_out_of_authority_deny_no_longer_strips_a_rooted_grant() {
+    // 3b-i honored this deny as-present; 3b-ii bounds it. Bob reads /doc from a
+    // creator-rooted allow. A deny by cid(9) — who owns nothing and is not at-or-above
+    // the grant's grantor (the creator) — is disregarded, the same rule an unauthorized
+    // revoke gets. The full bounded-deny suite lives in `acl_bounded_deny`.
     let creator = cid(1);
     let set = vec![
-        // Bob reads /doc — a creator-rooted allow.
         live(tup(
             AclSubject::Actor(cid(2)),
             cap(Capability::Read),
             doc(),
             creator,
         )),
-        // A deny of Bob's read whose grantor is not a rooted actor-id owner. It must
-        // still take effect (fail closed) — rooting does not gate it.
         AclRecord {
             tuple: AclTuple {
                 id: ElementId::from_bytes([0u8; 16]),
@@ -537,8 +535,8 @@ fn a_deny_is_honored_as_present_not_dropped_by_rooting() {
         },
     ];
     assert!(
-        !evaluate_with_authority(&set, creator, &actor(2), &doc(), Capability::Read),
-        "a deny is honored as-present, not dropped for an unrooted grantor"
+        evaluate_with_authority(&set, creator, &actor(2), &doc(), Capability::Read),
+        "an out-of-authority deny does not strip a rooted grant"
     );
 }
 
