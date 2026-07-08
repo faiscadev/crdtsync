@@ -55,6 +55,7 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_doc_apply",
         // diff
         "crdtsync_diff",
+        "crdtsync_diff_decode",
         // atomic transactions
         "crdtsync_doc_begin_atomic",
         "crdtsync_doc_commit_atomic",

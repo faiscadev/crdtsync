@@ -224,6 +224,163 @@ fn diff_of_malformed_input_is_empty() {
     }
 }
 
+/// Decode an encoded diff buffer through the C ABI into `out`, returning the
+/// status and the freshly-owned canonical bytes the caller frees.
+unsafe fn diff_decode(bytes: &[u8]) -> (i32, CrdtBuf) {
+    let mut out = CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let rc = crdtsync_diff_decode(bytes.as_ptr(), bytes.len(), &mut out);
+    (rc, out)
+}
+
+#[test]
+fn diff_decode_round_trips_the_change_list() {
+    use crdtsync_core::diff::{decode_changes, Change};
+    unsafe {
+        let c = client(1);
+        let a = crdtsync_doc_new(c.as_ptr());
+        let reg = register_int(a, &path(&[b"age"]), 30);
+        let old = crdtsync_doc_encode_state(a);
+        let reg2 = register_int(a, &path(&[b"age"]), 31);
+        let new = crdtsync_doc_encode_state(a);
+
+        let buf = crdtsync_diff(old.ptr, old.len, new.ptr, new.len);
+        let encoded = std::slice::from_raw_parts(buf.ptr, buf.len);
+
+        // The boundary decode validates the buffer and hands back its canonical
+        // change list, which decodes to the same structural change.
+        let (rc, out) = diff_decode(encoded);
+        assert_eq!(rc, 1, "a well-formed diff decodes");
+        assert!(!out.ptr.is_null() && out.len > 0);
+        let canonical = std::slice::from_raw_parts(out.ptr, out.len);
+        let changes = decode_changes(canonical).expect("the canonical change list decodes");
+        assert!(matches!(changes.as_slice(), [Change::Value { .. }]));
+        // Decoding is an identity on an already-canonical buffer.
+        assert_eq!(
+            canonical, encoded,
+            "the canonical form round-trips byte-for-byte"
+        );
+
+        for b in [reg, reg2, old, new, buf, out] {
+            crdtsync_buf_free(b);
+        }
+        crdtsync_doc_free(a);
+    }
+}
+
+#[test]
+fn diff_decode_of_a_truncated_or_garbage_buffer_is_a_clean_error() {
+    unsafe {
+        let c = client(1);
+        let a = crdtsync_doc_new(c.as_ptr());
+        let reg = register_int(a, &path(&[b"age"]), 30);
+        let old = crdtsync_doc_encode_state(a);
+        let reg2 = register_int(a, &path(&[b"age"]), 31);
+        let new = crdtsync_doc_encode_state(a);
+        let buf = crdtsync_diff(old.ptr, old.len, new.ptr, new.len);
+        let encoded = std::slice::from_raw_parts(buf.ptr, buf.len);
+
+        // A prefix of a valid diff is truncated: a clean error, no panic, out empty.
+        let (rc, out) = diff_decode(&encoded[..encoded.len() - 1]);
+        assert_eq!(rc, 0, "a truncated buffer is a decode error");
+        assert_eq!(out.len, 0, "the out buffer is left empty on error");
+
+        // Pure garbage is rejected the same way.
+        let (rc_junk, out_junk) = diff_decode(&[0xff, 0xff, 0xff, 0xff, 0x7f]);
+        assert_eq!(rc_junk, 0, "garbage is a decode error");
+        assert_eq!(out_junk.len, 0);
+
+        // An empty buffer has no count header: a decode error, not a panic.
+        let (rc_empty, out_empty) = diff_decode(&[]);
+        assert_eq!(rc_empty, 0, "an empty buffer is a decode error");
+        assert_eq!(out_empty.len, 0);
+
+        // A null out is -1, isolated from the error status by a live out above.
+        assert_eq!(
+            crdtsync_diff_decode(encoded.as_ptr(), encoded.len(), ptr::null_mut()),
+            -1,
+            "a null out is a caller error"
+        );
+
+        for b in [reg, reg2, old, new, buf, out, out_junk, out_empty] {
+            crdtsync_buf_free(b);
+        }
+        crdtsync_doc_free(a);
+    }
+}
+
+#[test]
+fn diff_decode_round_trips_an_xml_attr_and_a_mark_change() {
+    use crdtsync_core::diff::{decode_changes, Change};
+    unsafe {
+        let c = client(1);
+        let a = crdtsync_doc_new(c.as_ptr());
+        let doc_p = path(&[b"doc"]);
+        let attr_p = path(&[b"doc", b"class"]);
+        let body = path(&[b"body"]);
+
+        // An XmlElement with an attr, plus a Text to annotate.
+        let elem = crdtsync_doc_xml_element(a, doc_p.as_ptr(), doc_p.len(), b"section".as_ptr(), 7);
+        let attr0 = crdtsync_doc_set_bytes(a, attr_p.as_ptr(), attr_p.len(), b"a".as_ptr(), 1);
+        let text =
+            crdtsync_doc_text_insert(a, body.as_ptr(), body.len(), 0, b"hello world".as_ptr(), 11);
+        let old = crdtsync_doc_encode_state(a);
+
+        // Change the attr value and add a mark over the text.
+        let attr1 = crdtsync_doc_set_bytes(a, attr_p.as_ptr(), attr_p.len(), b"b".as_ptr(), 1);
+        let value = Scalar::Bool(true).encode_state();
+        let mut mid = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let mark = crdtsync_doc_mark(
+            a,
+            body.as_ptr(),
+            body.len(),
+            0,
+            1,
+            5,
+            0,
+            b"bold".as_ptr(),
+            4,
+            value.as_ptr(),
+            value.len(),
+            &mut mid,
+        );
+        let new = crdtsync_doc_encode_state(a);
+
+        let buf = crdtsync_diff(old.ptr, old.len, new.ptr, new.len);
+        let encoded = std::slice::from_raw_parts(buf.ptr, buf.len);
+        let (rc, out) = diff_decode(encoded);
+        assert_eq!(rc, 1, "the mixed xml+mark diff decodes");
+        let changes =
+            decode_changes(std::slice::from_raw_parts(out.ptr, out.len)).expect("decodes");
+
+        // The attr change surfaces as a Value at the attr path, the mark as a
+        // MarkAdded — the 5d Change variants cross the boundary intact.
+        assert!(
+            changes.iter().any(|ch| matches!(
+                ch,
+                Change::Value { path, new, .. } if *path == attr_p && *new == Scalar::Bytes(b"b".to_vec())
+            )),
+            "the xml attr change round-trips as a Value at its path: {changes:?}"
+        );
+        assert!(
+            changes.iter().any(|ch| matches!(
+                ch, Change::MarkAdded { name, .. } if name == b"bold"
+            )),
+            "the mark change round-trips as a MarkAdded: {changes:?}"
+        );
+
+        for b in [elem, attr0, text, attr1, mark, mid, old, new, buf, out] {
+            crdtsync_buf_free(b);
+        }
+        crdtsync_doc_free(a);
+    }
+}
+
 #[test]
 fn a_decoded_snapshot_still_dedups_and_converges() {
     unsafe {

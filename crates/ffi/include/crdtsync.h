@@ -432,6 +432,18 @@ CrdtBuf crdtsync_diff(const uint8_t *old,
                       const uint8_t *new_,
                       uintptr_t new_len);
 
+// Decode a change-list buffer from [`crdtsync_diff`] back into its canonical,
+// SDK-marshalable form, written to `out` — the boundary read that turns opaque
+// diff bytes into the structured change list a binding walks. A diff crosses an
+// untrusted boundary (a wire message or a stored snapshot), so the decode is
+// total: a truncated or garbage buffer yields 0 with `out` left untouched, never
+// a panic across the frame. Returns 1 with the canonical change list on a
+// well-formed buffer, -1 on a null `out` or a panic.
+//
+// # Safety
+// `bytes`/`len` follow [`as_slice`]; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_diff_decode(const uint8_t *bytes, uintptr_t len, CrdtBuf *out);
+
 // Open an undo manager. It drives whichever document is passed to each call.
 //
 // # Safety
