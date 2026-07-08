@@ -373,6 +373,182 @@ pub unsafe extern "C" fn crdtsync_doc_text_get(
     })
 }
 
+// --- xml navigation ---
+//
+// An XmlElement/XmlFragment is a container installed at a map-slot path like any
+// other; its children are an index-addressed sequence a child has no stable path
+// key of its own, so a child edit names its parent path plus a live index. Edits
+// return the ops to broadcast; reads follow the present/absent status idiom.
+
+/// Install an `XmlElement` tagged `tag` at a map-slot path. Returns the ops to
+/// broadcast; empty on a bad handle/path or a null tag.
+///
+/// # Safety
+/// `doc` is a live handle; `path`/`path_len` and `tag`/`tag_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_xml_element(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    tag: *const u8,
+    tag_len: usize,
+) -> CrdtBuf {
+    let Some(t) = as_slice(tag, tag_len) else {
+        return CrdtBuf::empty();
+    };
+    edit(doc, path, path_len, |d, p| path::xml_element(d, p, t))
+}
+
+/// Install a tagless `XmlFragment` at a map-slot path. Returns the ops to
+/// broadcast.
+///
+/// # Safety
+/// As [`crdtsync_doc_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_xml_fragment(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+) -> CrdtBuf {
+    edit(doc, path, path_len, path::xml_fragment)
+}
+
+/// Read the tag of the live `XmlElement` at a path into `out`. Returns 1 when
+/// found, 0 when absent or not a tagged element (a fragment is tagless), -1 on a
+/// bad handle.
+///
+/// # Safety
+/// As [`crdtsync_doc_get_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_xml_tag(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    read_buf(doc, path, path_len, out, path::xml_tag)
+}
+
+/// Insert a nested `XmlElement` child tagged `tag` at live `index` in the children
+/// of the element/fragment at `elem_path`. Inert (empty ops) if `elem_path` is not
+/// a live xml node or `tag` is null.
+///
+/// # Safety
+/// `doc` is a live handle; `elem_path`/`elem_path_len` and `tag`/`tag_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_xml_insert_element(
+    doc: *mut CrdtDoc,
+    elem_path: *const u8,
+    elem_path_len: usize,
+    index: usize,
+    tag: *const u8,
+    tag_len: usize,
+) -> CrdtBuf {
+    let Some(t) = as_slice(tag, tag_len) else {
+        return CrdtBuf::empty();
+    };
+    edit(doc, elem_path, elem_path_len, |d, p| {
+        path::xml_insert_element(d, p, index, t)
+    })
+}
+
+/// Insert a `Text`-run child initialised with UTF-8 `s` at live `index` in the
+/// children of the element/fragment at `elem_path`. Inert if the target is not a
+/// live xml node or `s` is non-UTF-8.
+///
+/// # Safety
+/// `doc` is a live handle; `elem_path`/`elem_path_len` and `s`/`s_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_xml_insert_text(
+    doc: *mut CrdtDoc,
+    elem_path: *const u8,
+    elem_path_len: usize,
+    index: usize,
+    s: *const u8,
+    s_len: usize,
+) -> CrdtBuf {
+    let Some(raw) = as_slice(s, s_len) else {
+        return CrdtBuf::empty();
+    };
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return CrdtBuf::empty();
+    };
+    edit(doc, elem_path, elem_path_len, |d, p| {
+        path::xml_insert_text(d, p, index, text)
+    })
+}
+
+/// Tombstone the child at live `index` in the children of the element/fragment at
+/// `elem_path`. Inert if the target is not a live xml node or `index` names no
+/// live child.
+///
+/// # Safety
+/// As [`crdtsync_doc_register_int`], with `elem_path` the parent's path.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_xml_child_delete(
+    doc: *mut CrdtDoc,
+    elem_path: *const u8,
+    elem_path_len: usize,
+    index: usize,
+) -> CrdtBuf {
+    edit(doc, elem_path, elem_path_len, |d, p| {
+        path::xml_child_delete(d, p, index)
+    })
+}
+
+/// Read the count of live children of the element/fragment at `elem_path` into
+/// `out`. Returns 1 when found, 0 when the path is not a live xml node, -1 on a
+/// bad handle.
+///
+/// # Safety
+/// As [`crdtsync_doc_list_len`], with `elem_path` the node's path.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_xml_children_len(
+    doc: *const CrdtDoc,
+    elem_path: *const u8,
+    elem_path_len: usize,
+    out: *mut usize,
+) -> i32 {
+    read_usize(doc, elem_path, elem_path_len, out, path::xml_children_len)
+}
+
+/// Relocate the live child at `child_index` under the xml node at `parent_path` to
+/// `dest_index` in the children of the xml node at `new_parent_path` — a Kleppmann
+/// tree move that keeps the child's identity and subtree. Inert if either path is
+/// not a live xml node or `child_index` names no live child.
+///
+/// # Safety
+/// `doc` is a live handle; `parent_path`/`parent_path_len` and
+/// `new_parent_path`/`new_parent_path_len` each follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_xml_move(
+    doc: *mut CrdtDoc,
+    parent_path: *const u8,
+    parent_path_len: usize,
+    child_index: usize,
+    new_parent_path: *const u8,
+    new_parent_path_len: usize,
+    dest_index: usize,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return CrdtBuf::empty();
+        }
+        let (Some(pp), Some(np)) = (
+            as_slice(parent_path, parent_path_len),
+            as_slice(new_parent_path, new_parent_path_len),
+        ) else {
+            return CrdtBuf::empty();
+        };
+        let ops = path::xml_move_child(&mut (*doc).doc, pp, child_index, np, dest_index);
+        CrdtBuf::from_vec(encode_ops(&ops))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
 /// Map the C `side` argument to a [`Side`]: 0 is left of the index, 1 is right.
 fn side_from_u32(side: u32) -> Option<Side> {
     match side {
@@ -1263,6 +1439,169 @@ pub unsafe extern "C" fn crdtsync_client_delete(
     path_len: usize,
 ) -> CrdtBuf {
     client_edit(client, channel, path, path_len, |d, p| path::delete(d, p))
+}
+
+// --- client xml navigation ---
+//
+// The xml edits mirror the doc surface but on a subscribed room's replica, so
+// their ops route through the outbox (like every routed edit) and are resent /
+// acknowledged rather than framed and forgotten.
+
+/// Install an `XmlElement` tagged `tag` at a path in `channel`'s room. Returns the
+/// Ops frame to send; empty on a bad handle, path, tag, or unheld channel.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` and `tag`/`tag_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_xml_element(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    tag: *const u8,
+    tag_len: usize,
+) -> CrdtBuf {
+    let Some(t) = as_slice(tag, tag_len) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::xml_element(d, p, t)
+    })
+}
+
+/// Install a tagless `XmlFragment` at a path in `channel`'s room. Returns the Ops
+/// frame to send.
+///
+/// # Safety
+/// As [`crdtsync_client_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_xml_fragment(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+) -> CrdtBuf {
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::xml_fragment(d, p)
+    })
+}
+
+/// Insert a nested `XmlElement` child tagged `tag` at live `index` in the children
+/// of the element/fragment at `elem_path` in `channel`'s room. Returns the Ops
+/// frame; empty on a bad handle, an unheld channel, or a null tag. An insert into
+/// a non-node target is inert — the frame it returns carries no ops.
+///
+/// # Safety
+/// `client` is a live handle; `elem_path`/`elem_path_len` and `tag`/`tag_len`
+/// follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_xml_insert_element(
+    client: *mut CrdtClient,
+    channel: u32,
+    elem_path: *const u8,
+    elem_path_len: usize,
+    index: usize,
+    tag: *const u8,
+    tag_len: usize,
+) -> CrdtBuf {
+    let Some(t) = as_slice(tag, tag_len) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, elem_path, elem_path_len, |d, p| {
+        path::xml_insert_element(d, p, index, t)
+    })
+}
+
+/// Insert a `Text`-run child initialised with UTF-8 `s` at live `index` in the
+/// children of the element/fragment at `elem_path` in `channel`'s room. Returns
+/// the Ops frame; empty on a bad handle, an unheld channel, or non-UTF-8 input. An
+/// insert into a non-node target is inert — the frame it returns carries no ops.
+///
+/// # Safety
+/// `client` is a live handle; `elem_path`/`elem_path_len` and `s`/`s_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_xml_insert_text(
+    client: *mut CrdtClient,
+    channel: u32,
+    elem_path: *const u8,
+    elem_path_len: usize,
+    index: usize,
+    s: *const u8,
+    s_len: usize,
+) -> CrdtBuf {
+    let Some(raw) = as_slice(s, s_len) else {
+        return CrdtBuf::empty();
+    };
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, elem_path, elem_path_len, |d, p| {
+        path::xml_insert_text(d, p, index, text)
+    })
+}
+
+/// Tombstone the child at live `index` in the children of the element/fragment at
+/// `elem_path` in `channel`'s room. Returns the Ops frame; empty on a bad handle
+/// or an unheld channel. A delete on a non-node target or an `index` naming no
+/// live child is inert — the frame it returns carries no ops.
+///
+/// # Safety
+/// As [`crdtsync_client_register_int`], with `elem_path` the parent's path.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_xml_child_delete(
+    client: *mut CrdtClient,
+    channel: u32,
+    elem_path: *const u8,
+    elem_path_len: usize,
+    index: usize,
+) -> CrdtBuf {
+    client_edit(client, channel, elem_path, elem_path_len, |d, p| {
+        path::xml_child_delete(d, p, index)
+    })
+}
+
+/// Relocate the live child at `child_index` under the xml node at `parent_path` to
+/// `dest_index` in the children of the xml node at `new_parent_path`, in
+/// `channel`'s room — the tree move routed through the outbox. Empty on a bad
+/// handle or an unheld channel; a move naming a non-node path or a child index
+/// naming no live child is inert — the frame it returns carries no ops.
+///
+/// # Safety
+/// `client` is a live handle; `parent_path`/`parent_path_len` and
+/// `new_parent_path`/`new_parent_path_len` each follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_xml_move(
+    client: *mut CrdtClient,
+    channel: u32,
+    parent_path: *const u8,
+    parent_path_len: usize,
+    child_index: usize,
+    new_parent_path: *const u8,
+    new_parent_path_len: usize,
+    dest_index: usize,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        let (Some(pp), Some(np)) = (
+            as_slice(parent_path, parent_path_len),
+            as_slice(new_parent_path, new_parent_path_len),
+        ) else {
+            return CrdtBuf::empty();
+        };
+        let Some(doc) = (*client).session.document_mut(Channel(channel)) else {
+            return CrdtBuf::empty();
+        };
+        let ops = path::xml_move_child(doc, pp, child_index, np, dest_index);
+        match (*client).session.enqueue_ops(Channel(channel), ops) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
 }
 
 /// Read an integer Register at a path in `channel`'s room into `out`. Returns 1

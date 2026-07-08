@@ -457,6 +457,60 @@ fn the_outbox_drains_against_an_ack_over_the_wire_client() {
 }
 
 #[test]
+fn an_xml_edit_enqueues_and_resends_over_the_wire_client() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (ca, sub_a) = subscribe(a, b"room-1");
+        let (cb, sub_b) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sub_a);
+        crdtsync_buf_free(sub_b);
+        let p = path(&[b"doc", b"body"]);
+
+        // An xml install routes through the outbox like every other edit, so it
+        // can be resent and acknowledged rather than framed and forgotten.
+        let root = crdtsync_client_xml_element(a, ca, p.as_ptr(), p.len(), b"body".as_ptr(), 4);
+        let kid =
+            crdtsync_client_xml_insert_element(a, ca, p.as_ptr(), p.len(), 0, b"p".as_ptr(), 1);
+        assert!(root.len > 0 && kid.len > 0, "the edits frame ops to send");
+
+        // Each xml edit emits several ops (a container install plus its child
+        // placement); every one enters the outbox rather than being framed and
+        // forgotten.
+        let mut n: usize = 0;
+        assert_eq!(crdtsync_client_outbox_len(a, ca, &mut n), 1);
+        assert!(n >= 2, "the xml edits entered the outbox, got {n}");
+
+        // The unacknowledged tail replays as one Ops frame and folds into the peer.
+        let tail = crdtsync_client_resend(a, ca);
+        assert!(tail.len > 0);
+        assert!(
+            receive(b, &tail) >= 1,
+            "the peer applies the replayed xml ops"
+        );
+        crdtsync_buf_free(tail);
+
+        // An ack drains the queue.
+        let accepted = encode_message(&Message::Accepted {
+            channel: Channel(ca),
+            through: u64::MAX,
+        });
+        assert_eq!(
+            crdtsync_client_receive(a, accepted.as_ptr(), accepted.len()),
+            1
+        );
+        assert_eq!(crdtsync_client_outbox_len(a, ca, &mut n), 1);
+        assert_eq!(n, 0, "the ack drained the xml edits");
+
+        let _ = cb;
+        crdtsync_buf_free(root);
+        crdtsync_buf_free(kid);
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}
+
+#[test]
 fn an_atomic_transaction_travels_over_the_wire_client() {
     unsafe {
         let a = crdtsync_client_new(client_id(1).as_ptr());

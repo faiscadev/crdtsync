@@ -197,6 +197,102 @@ int32_t crdtsync_doc_text_get(const CrdtDoc *doc,
                               uintptr_t path_len,
                               CrdtBuf *out);
 
+// Install an `XmlElement` tagged `tag` at a map-slot path. Returns the ops to
+// broadcast; empty on a bad handle/path or a null tag.
+//
+// # Safety
+// `doc` is a live handle; `path`/`path_len` and `tag`/`tag_len` follow
+// [`as_slice`].
+CrdtBuf crdtsync_doc_xml_element(CrdtDoc *doc,
+                                 const uint8_t *path,
+                                 uintptr_t path_len,
+                                 const uint8_t *tag,
+                                 uintptr_t tag_len);
+
+// Install a tagless `XmlFragment` at a map-slot path. Returns the ops to
+// broadcast.
+//
+// # Safety
+// As [`crdtsync_doc_register_int`].
+CrdtBuf crdtsync_doc_xml_fragment(CrdtDoc *doc, const uint8_t *path, uintptr_t path_len);
+
+// Read the tag of the live `XmlElement` at a path into `out`. Returns 1 when
+// found, 0 when absent or not a tagged element (a fragment is tagless), -1 on a
+// bad handle.
+//
+// # Safety
+// As [`crdtsync_doc_get_bytes`].
+int32_t crdtsync_doc_xml_tag(const CrdtDoc *doc,
+                             const uint8_t *path,
+                             uintptr_t path_len,
+                             CrdtBuf *out);
+
+// Insert a nested `XmlElement` child tagged `tag` at live `index` in the children
+// of the element/fragment at `elem_path`. Inert (empty ops) if `elem_path` is not
+// a live xml node or `tag` is null.
+//
+// # Safety
+// `doc` is a live handle; `elem_path`/`elem_path_len` and `tag`/`tag_len` follow
+// [`as_slice`].
+CrdtBuf crdtsync_doc_xml_insert_element(CrdtDoc *doc,
+                                        const uint8_t *elem_path,
+                                        uintptr_t elem_path_len,
+                                        uintptr_t index,
+                                        const uint8_t *tag,
+                                        uintptr_t tag_len);
+
+// Insert a `Text`-run child initialised with UTF-8 `s` at live `index` in the
+// children of the element/fragment at `elem_path`. Inert if the target is not a
+// live xml node or `s` is non-UTF-8.
+//
+// # Safety
+// `doc` is a live handle; `elem_path`/`elem_path_len` and `s`/`s_len` follow
+// [`as_slice`].
+CrdtBuf crdtsync_doc_xml_insert_text(CrdtDoc *doc,
+                                     const uint8_t *elem_path,
+                                     uintptr_t elem_path_len,
+                                     uintptr_t index,
+                                     const uint8_t *s,
+                                     uintptr_t s_len);
+
+// Tombstone the child at live `index` in the children of the element/fragment at
+// `elem_path`. Inert if the target is not a live xml node or `index` names no
+// live child.
+//
+// # Safety
+// As [`crdtsync_doc_register_int`], with `elem_path` the parent's path.
+CrdtBuf crdtsync_doc_xml_child_delete(CrdtDoc *doc,
+                                      const uint8_t *elem_path,
+                                      uintptr_t elem_path_len,
+                                      uintptr_t index);
+
+// Read the count of live children of the element/fragment at `elem_path` into
+// `out`. Returns 1 when found, 0 when the path is not a live xml node, -1 on a
+// bad handle.
+//
+// # Safety
+// As [`crdtsync_doc_list_len`], with `elem_path` the node's path.
+int32_t crdtsync_doc_xml_children_len(const CrdtDoc *doc,
+                                      const uint8_t *elem_path,
+                                      uintptr_t elem_path_len,
+                                      uintptr_t *out);
+
+// Relocate the live child at `child_index` under the xml node at `parent_path` to
+// `dest_index` in the children of the xml node at `new_parent_path` — a Kleppmann
+// tree move that keeps the child's identity and subtree. Inert if either path is
+// not a live xml node or `child_index` names no live child.
+//
+// # Safety
+// `doc` is a live handle; `parent_path`/`parent_path_len` and
+// `new_parent_path`/`new_parent_path_len` each follow [`as_slice`].
+CrdtBuf crdtsync_doc_xml_move(CrdtDoc *doc,
+                              const uint8_t *parent_path,
+                              uintptr_t parent_path_len,
+                              uintptr_t child_index,
+                              const uint8_t *new_parent_path,
+                              uintptr_t new_parent_path_len,
+                              uintptr_t dest_index);
+
 // Capture a stable position in the List or Text at a path — the encoded
 // [`RelativePosition`] bytes, resolved later with
 // [`crdtsync_doc_resolve_position`]. `side` is 0 (left of `index`) or 1 (right).
@@ -522,6 +618,92 @@ CrdtBuf crdtsync_client_delete(CrdtClient *client,
                                uint32_t channel,
                                const uint8_t *path,
                                uintptr_t path_len);
+
+// Install an `XmlElement` tagged `tag` at a path in `channel`'s room. Returns the
+// Ops frame to send; empty on a bad handle, path, tag, or unheld channel.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` and `tag`/`tag_len` follow
+// [`as_slice`].
+CrdtBuf crdtsync_client_xml_element(CrdtClient *client,
+                                    uint32_t channel,
+                                    const uint8_t *path,
+                                    uintptr_t path_len,
+                                    const uint8_t *tag,
+                                    uintptr_t tag_len);
+
+// Install a tagless `XmlFragment` at a path in `channel`'s room. Returns the Ops
+// frame to send.
+//
+// # Safety
+// As [`crdtsync_client_register_int`].
+CrdtBuf crdtsync_client_xml_fragment(CrdtClient *client,
+                                     uint32_t channel,
+                                     const uint8_t *path,
+                                     uintptr_t path_len);
+
+// Insert a nested `XmlElement` child tagged `tag` at live `index` in the children
+// of the element/fragment at `elem_path` in `channel`'s room. Returns the Ops
+// frame; empty on a bad handle, an unheld channel, or a null tag. An insert into
+// a non-node target is inert — the frame it returns carries no ops.
+//
+// # Safety
+// `client` is a live handle; `elem_path`/`elem_path_len` and `tag`/`tag_len`
+// follow [`as_slice`].
+CrdtBuf crdtsync_client_xml_insert_element(CrdtClient *client,
+                                           uint32_t channel,
+                                           const uint8_t *elem_path,
+                                           uintptr_t elem_path_len,
+                                           uintptr_t index,
+                                           const uint8_t *tag,
+                                           uintptr_t tag_len);
+
+// Insert a `Text`-run child initialised with UTF-8 `s` at live `index` in the
+// children of the element/fragment at `elem_path` in `channel`'s room. Returns
+// the Ops frame; empty on a bad handle, an unheld channel, or non-UTF-8 input. An
+// insert into a non-node target is inert — the frame it returns carries no ops.
+//
+// # Safety
+// `client` is a live handle; `elem_path`/`elem_path_len` and `s`/`s_len` follow
+// [`as_slice`].
+CrdtBuf crdtsync_client_xml_insert_text(CrdtClient *client,
+                                        uint32_t channel,
+                                        const uint8_t *elem_path,
+                                        uintptr_t elem_path_len,
+                                        uintptr_t index,
+                                        const uint8_t *s,
+                                        uintptr_t s_len);
+
+// Tombstone the child at live `index` in the children of the element/fragment at
+// `elem_path` in `channel`'s room. Returns the Ops frame; empty on a bad handle
+// or an unheld channel. A delete on a non-node target or an `index` naming no
+// live child is inert — the frame it returns carries no ops.
+//
+// # Safety
+// As [`crdtsync_client_register_int`], with `elem_path` the parent's path.
+CrdtBuf crdtsync_client_xml_child_delete(CrdtClient *client,
+                                         uint32_t channel,
+                                         const uint8_t *elem_path,
+                                         uintptr_t elem_path_len,
+                                         uintptr_t index);
+
+// Relocate the live child at `child_index` under the xml node at `parent_path` to
+// `dest_index` in the children of the xml node at `new_parent_path`, in
+// `channel`'s room — the tree move routed through the outbox. Empty on a bad
+// handle or an unheld channel; a move naming a non-node path or a child index
+// naming no live child is inert — the frame it returns carries no ops.
+//
+// # Safety
+// `client` is a live handle; `parent_path`/`parent_path_len` and
+// `new_parent_path`/`new_parent_path_len` each follow [`as_slice`].
+CrdtBuf crdtsync_client_xml_move(CrdtClient *client,
+                                 uint32_t channel,
+                                 const uint8_t *parent_path,
+                                 uintptr_t parent_path_len,
+                                 uintptr_t child_index,
+                                 const uint8_t *new_parent_path,
+                                 uintptr_t new_parent_path_len,
+                                 uintptr_t dest_index);
 
 // Read an integer Register at a path in `channel`'s room into `out`. Returns 1
 // on success, 0 if absent or the channel isn't held, -1 on a bad handle.
