@@ -11,6 +11,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::anchor::RelativePosition;
+use crate::codec::DecodeError;
+use crate::diff::{self, Change};
 use crate::doc::{Document, MapCursor, XmlChildrenCursor};
 use crate::elementid::ElementId;
 use crate::list::{List, Side};
@@ -447,6 +449,30 @@ pub fn marks_at(doc: &Document, seq_path: &[u8], index: usize) -> Vec<ResolvedMa
         Some(seq) => doc.marks_at(seq, index),
         None => Vec::new(),
     }
+}
+
+/// The structural diff of two snapshots as an ordered [`Change`] list — the
+/// façade's read model of what turned `old` into `new`. A binding that renders
+/// changes structurally, building its own per-change value, reads this; one that
+/// forwards an opaque buffer across the SDK boundary uses [`diff_encoded`].
+pub fn diff(old: &Document, new: &Document) -> Vec<Change> {
+    diff::diff(old, new)
+}
+
+/// The structural diff of two snapshots serialized to one buffer, so a diff
+/// computed in the core crosses the language-SDK boundary as opaque bytes the
+/// binding forwards and later reads with [`decode_changes`] — mirroring how a
+/// captured sequence position crosses as bytes. Runs the diff engine then encodes
+/// in one call.
+pub fn diff_encoded(old: &Document, new: &Document) -> Vec<u8> {
+    diff::encode_changes(&diff::diff(old, new))
+}
+
+/// Decode a diff buffer from [`diff_encoded`] back into its [`Change`]s. Total: a
+/// truncated or malformed buffer yields a `DecodeError`, never a panic — a diff
+/// crosses an untrusted boundary, so the decode never trusts its length headers.
+pub fn decode_changes(bytes: &[u8]) -> Result<Vec<Change>, DecodeError> {
+    diff::decode_changes(bytes)
 }
 
 /// A range endpoint into the sequence at `path` at `index` with gravity `side`,
