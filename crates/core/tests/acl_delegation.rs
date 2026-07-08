@@ -506,6 +506,114 @@ fn a_long_forged_chain_terminates() {
     }
 }
 
+// ---- denies are honored as-present (rooting gates only positive grants) ----
+
+#[test]
+fn a_deny_is_honored_as_present_not_dropped_by_rooting() {
+    // Rooting gates positive grants; a deny is honored as-present (deny provenance is
+    // slice 3b-ii). A deny must never be silently dropped for lacking a rooted
+    // grantor — that would fail open, opening access a deny was meant to close.
+    let creator = cid(1);
+    let set = vec![
+        // Bob reads /doc — a creator-rooted allow.
+        live(tup(
+            AclSubject::Actor(cid(2)),
+            cap(Capability::Read),
+            doc(),
+            creator,
+        )),
+        // A deny of Bob's read whose grantor is not a rooted actor-id owner. It must
+        // still take effect (fail closed) — rooting does not gate it.
+        AclRecord {
+            tuple: AclTuple {
+                id: ElementId::from_bytes([0u8; 16]),
+                subject: AclSubject::Actor(cid(2)),
+                grant: cap(Capability::Read),
+                effect: AclEffect::Deny,
+                path: doc(),
+                grantor: cid(9),
+            },
+            revoked_by: Vec::new(),
+        },
+    ];
+    assert!(
+        !evaluate_with_authority(&set, creator, &actor(2), &doc(), Capability::Read),
+        "a deny is honored as-present, not dropped for an unrooted grantor"
+    );
+}
+
+// ---- delegation+revocation cycles resolve fail-closed ----------------------
+
+#[test]
+fn a_derived_owner_cannot_revoke_the_owner_it_derives_from() {
+    // creator → D(Own); D → C(Own); C revokes D's Own. C's authority to revoke derives
+    // from D through the very grant it severs — a self-undermining cycle. The revoke is
+    // disregarded (fail closed): D stays an owner, and C, derived from D, stays one too.
+    let creator = cid(1);
+    let set = vec![
+        revoked(
+            tup(
+                AclSubject::Actor(cid(2)), // D
+                cap(Capability::Own),
+                doc(),
+                creator,
+            ),
+            &[cid(3)], // revoked by C
+        ),
+        live(tup(
+            AclSubject::Actor(cid(3)), // C
+            cap(Capability::Own),
+            doc(),
+            cid(2), // granted by D
+        )),
+    ];
+    assert!(
+        evaluate_with_authority(&set, creator, &actor(2), &doc(), Capability::Own),
+        "D's creator-rooted ownership survives its subordinate's self-undermining revoke"
+    );
+    assert!(evaluate_with_authority(
+        &set,
+        creator,
+        &actor(3),
+        &doc(),
+        Capability::Own
+    ));
+}
+
+#[test]
+fn co_owners_cannot_revoke_each_other() {
+    // A and B are both independently creator-appointed owners of /doc; each revokes the
+    // other. Neither is above the other in the chain, so the mutual revocation cannot
+    // be grounded — both revokes are disregarded and both keep ownership.
+    let creator = cid(1);
+    let set = vec![
+        revoked(
+            tup(
+                AclSubject::Actor(cid(2)), // A
+                cap(Capability::Own),
+                doc(),
+                creator,
+            ),
+            &[cid(3)], // revoked by B
+        ),
+        revoked(
+            tup(
+                AclSubject::Actor(cid(3)), // B
+                cap(Capability::Own),
+                doc(),
+                creator,
+            ),
+            &[cid(2)], // revoked by A
+        ),
+    ];
+    for a in [2u8, 3] {
+        assert!(
+            evaluate_with_authority(&set, creator, &actor(a), &doc(), Capability::Own),
+            "co-owner {a} keeps ownership — peers cannot revoke each other"
+        );
+    }
+}
+
 // ---- determinism + convergence --------------------------------------------
 
 #[test]

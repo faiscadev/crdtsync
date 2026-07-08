@@ -320,6 +320,51 @@ fn owns_path(
     })
 }
 
+/// Each record's rooting under a `rooted`/`revoked` snapshot: a grant roots iff its
+/// grantor validly owned the grant's path (or an ancestor) — recursively, via
+/// [`owns_path`], up to the creator.
+fn root_pass(
+    records: &[AclRecord],
+    creator: ClientId,
+    rooted: &[bool],
+    revoked: &[bool],
+) -> Vec<bool> {
+    records
+        .iter()
+        .map(|r| {
+            owns_path(
+                records,
+                creator,
+                r.tuple.grantor,
+                &r.tuple.path,
+                rooted,
+                revoked,
+            )
+        })
+        .collect()
+}
+
+/// Each record's effective revocation under a `rooted`/`revoked` snapshot: a revoke
+/// counts iff its author is the grant's `grantor`, the `creator`, or a currently valid
+/// owner of the grant's path.
+fn revoke_pass(
+    records: &[AclRecord],
+    creator: ClientId,
+    rooted: &[bool],
+    revoked: &[bool],
+) -> Vec<bool> {
+    records
+        .iter()
+        .map(|r| {
+            r.revoked_by.iter().any(|&who| {
+                who == creator
+                    || who == r.tuple.grantor
+                    || owns_path(records, creator, who, &r.tuple.path, rooted, revoked)
+            })
+        })
+        .collect()
+}
+
 /// The doc-level ACL tuple tier's verdict on whether `actor` holds `capability` at
 /// `path`, over the merged record set — the authority-aware form of
 /// [`decide_capability`]. It layers **attenuated recursive delegation** and
@@ -329,24 +374,29 @@ fn owns_path(
 /// - **creator-auto-owns-`/`** — `creator` holds `Own` at the root (and, by the
 ///   lattice, every capability over every path) with no explicit tuple: the
 ///   un-granted root of all authority.
-/// - **attenuated recursive delegation** — a grant confers authority only if its
-///   grantor validly held it. A tuple *roots* iff its grantor validly owned the
-///   tuple's path (or an ancestor) — recursively, up to the creator. A grant whose
-///   chain does not root at the creator is inert (self-granted or forged authority
-///   confers nothing), and a non-owner cannot delegate (only ownership confers
-///   granting power). An unrooted tuple is dropped from the effective set.
+/// - **attenuated recursive delegation** — a positive (`Allow`) grant confers
+///   authority only if its grantor validly held it. A grant *roots* iff its grantor
+///   validly owned the grant's path (or an ancestor) — recursively, up to the creator.
+///   An `Allow` whose chain does not root at the creator is inert (self-granted or
+///   forged authority confers nothing), and a non-owner cannot delegate (only
+///   ownership confers granting power). A `Deny` is honored as-present — a deny must
+///   never fail open, and bounding a deny by its author's provenance is slice 3b-ii.
 /// - **recursive provenance-based revocation** — a record is dropped only when a
 ///   revoker was authorized: the tuple's `grantor`, the `creator`, or a **currently
-///   valid** owner of the tuple's path. An owner whose own `Own` was authoritatively
-///   revoked no longer confers revoke authority.
+///   valid** owner of the tuple's path. Validity here is rooted-at-creator and not
+///   itself authoritatively revoked, so an owner whose own `Own` was revoked no longer
+///   confers revoke authority (`Deny(Own)` stripping ownership is 3b-ii's deny work).
 ///
 /// Rooting and revocation are mutually recursive (a revoke's authority is an
 /// ownership, an ownership is a rooted-and-unrevoked grant), so both are solved as a
-/// fixpoint: each pass recomputes `rooted`/`revoked` from the previous snapshot only,
-/// which makes the result independent of record order, and the pass count is bounded
-/// so the walk terminates on any tuple graph — a forged cycle roots at no creator and
-/// simply stops changing. The verdict is a pure function of the merged record set, so
-/// replicas holding the same set decide identically.
+/// bounded fixpoint: each pass recomputes `rooted`/`revoked` from the previous snapshot
+/// only, which makes the result independent of record order, and the walk terminates
+/// on any tuple graph. A forged granting cycle roots at no creator and simply confers
+/// nothing. A delegation-plus-revocation cycle (only reachable with forged,
+/// self-referential provenance) is non-monotone and may oscillate; it is resolved
+/// fail-closed and deterministically — an ambiguous revoke is disregarded — so the
+/// verdict is always a pure function of the merged record set, and replicas holding the
+/// same set decide identically.
 pub fn decide_capability_with_authority(
     records: &[AclRecord],
     creator: ClientId,
@@ -358,42 +408,65 @@ pub fn decide_capability_with_authority(
     let mut rooted = vec![false; n];
     let mut revoked = vec![false; n];
 
-    // Solve the mutually-recursive rooting/revocation fixpoint. A well-founded chain
-    // stabilises in at most its depth; the bound (twice the record count, since a
-    // rooting and a revocation edge can alternate) guarantees termination even on a
-    // pathological mutual-revocation cycle. The loop exits early once a pass changes
-    // nothing — the common case settles in a couple of passes.
-    for _ in 0..(2 * n + 2) {
-        let mut next_rooted = vec![false; n];
-        let mut next_revoked = vec![false; n];
-        for (i, r) in records.iter().enumerate() {
-            next_rooted[i] = owns_path(
-                records,
-                creator,
-                r.tuple.grantor,
-                &r.tuple.path,
-                &rooted,
-                &revoked,
-            );
-            next_revoked[i] = r.revoked_by.iter().any(|&who| {
-                who == creator
-                    || who == r.tuple.grantor
-                    || owns_path(records, creator, who, &r.tuple.path, &rooted, &revoked)
-            });
-        }
+    // Solve the mutually-recursive rooting/revocation relation by iterating from the
+    // empty (all-false) seed. Each pass reads only the previous snapshot, so the result
+    // is independent of record order; the loop exits as soon as a pass changes nothing.
+    // Every well-founded (acyclic) grant graph converges here to its exact least
+    // fixpoint — the depth of any alternating rooting/revocation chain is at most `2n`.
+    let bound = 2 * n + 2;
+    let mut converged = false;
+    for _ in 0..bound {
+        let next_rooted = root_pass(records, creator, &rooted, &revoked);
+        let next_revoked = revoke_pass(records, creator, &rooted, &revoked);
         if next_rooted == rooted && next_revoked == revoked {
+            converged = true;
             break;
         }
         rooted = next_rooted;
         revoked = next_revoked;
     }
 
-    // The effective set: creator-owns, plus every tuple that rooted at the creator and
-    // no authorized revoke tombstoned.
+    // Revoke-authority is a *negative* dependency (an owner counts only while not
+    // revoked), so a delegation-plus-revocation cycle — reachable only with forged,
+    // self-referential provenance — is non-monotone and can leave the relation
+    // oscillating rather than settling. Resolve it deterministically and fail-closed:
+    // a revoke still in flux is **disregarded** (an ambiguous revoke never strips a
+    // grant — the same rule an unauthorized revoke already gets), then rooting is
+    // settled with those revokes pinned (rooting alone is monotone, so it converges).
+    // This makes the verdict a stable function of the merged set, never an artifact of
+    // the pass count.
+    if !converged {
+        let flux = revoke_pass(records, creator, &rooted, &revoked);
+        for i in 0..n {
+            if flux[i] != revoked[i] {
+                revoked[i] = false;
+            }
+        }
+        for _ in 0..(n + 1) {
+            let next_rooted = root_pass(records, creator, &rooted, &revoked);
+            if next_rooted == rooted {
+                break;
+            }
+            rooted = next_rooted;
+        }
+    }
+
+    // The effective set: creator-owns, plus every live tuple an authorized revoke has
+    // not tombstoned. Rooting gates only positive grants — an `Allow` confers authority
+    // only when it roots at the creator (attenuated delegation). A `Deny` is honored
+    // as-present: a deny must never fail open, and bounding a deny by its author's
+    // provenance is slice 3b-ii.
     let mut effective: Vec<AclTuple> = Vec::with_capacity(n + 1);
     effective.push(creator_owns_root(creator));
     for (i, r) in records.iter().enumerate() {
-        if rooted[i] && !revoked[i] {
+        if revoked[i] {
+            continue;
+        }
+        let honored = match r.tuple.effect {
+            AclEffect::Allow => rooted[i],
+            AclEffect::Deny => true,
+        };
+        if honored {
             effective.push(r.tuple.clone());
         }
     }
