@@ -12,7 +12,7 @@
 //! and replays once a create restores reachability, so out-of-order delivery
 //! converges.
 
-use crate::acl::{AclEffect, AclGrant, AclSubject, AclTuple};
+use crate::acl::{AclEffect, AclGrant, AclRecord, AclSubject, AclTuple};
 use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::codec::{
@@ -46,7 +46,7 @@ struct Placement {
     stamp: Stamp,
 }
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 /// The well-known root slot every replica shares, so children derive under the
@@ -312,8 +312,20 @@ impl Document {
     pub fn acl_tuple(&self, id: ElementId) -> Option<AclTuple> {
         self.acl
             .get(&id)
-            .filter(|e| !e.tombstone)
+            .filter(|e| !e.is_revoked())
             .map(|e| e.view(id))
+    }
+
+    /// Every ACL tuple with its revoke provenance, **revoked ones included** —
+    /// id-sorted, so the sequence is identical on every replica. The authority
+    /// evaluator's input ([`crate::acl::decide_capability_with_authority`]): it needs
+    /// the tombstoned tuples and their revokers to decide whether each revoke was
+    /// authorized. The live read views ([`acl_tuples`](Self::acl_tuples)) drop
+    /// revoked tuples content-neutrally, so they cannot serve provenance.
+    pub fn acl_records(&self) -> Vec<AclRecord> {
+        let mut out: Vec<AclRecord> = self.acl.iter().map(|(id, e)| e.record(*id)).collect();
+        out.sort_by_key(|r| r.tuple.id.as_bytes());
+        out
     }
 
     /// Every live ACL tuple, ordered by id so the sequence is identical on every
@@ -334,7 +346,7 @@ impl Document {
         let mut out: Vec<AclTuple> = self
             .acl
             .iter()
-            .filter(|(_, e)| !e.tombstone && keep(e))
+            .filter(|(_, e)| !e.is_revoked() && keep(e))
             .map(|(id, e)| e.view(*id))
             .collect();
         out.sort_by_key(|t| t.id.as_bytes());
@@ -806,7 +818,11 @@ impl Document {
             put_acl_effect(&mut out, e.effect);
             put_bytes(&mut out, &e.path);
             out.extend_from_slice(&e.grantor.as_bytes());
-            put_u8(&mut out, e.tombstone as u8);
+            // The revokers, sorted (BTreeSet order) for a deterministic encoding.
+            put_u32(&mut out, len_u32(e.revokers.len()));
+            for r in &e.revokers {
+                out.extend_from_slice(&r.as_bytes());
+            }
         }
 
         let mut parents: Vec<(&ElementId, &ElementId)> = self.parents.iter().collect();
@@ -1032,16 +1048,11 @@ impl Document {
             let effect = cur.acl_effect()?;
             let path = cur.bytes()?;
             let grantor = cur.client()?;
-            let tombstone = match cur.u8()? {
-                0 => false,
-                1 => true,
-                tag => {
-                    return Err(DecodeError::BadTag {
-                        what: "acl tuple tombstone flag",
-                        tag,
-                    })
-                }
-            };
+            let revoker_count = cur.u32()?;
+            let mut revokers = BTreeSet::new();
+            for _ in 0..revoker_count {
+                revokers.insert(cur.client()?);
+            }
             if acl
                 .insert(
                     id,
@@ -1051,7 +1062,7 @@ impl Document {
                         effect,
                         path,
                         grantor,
-                        tombstone,
+                        revokers,
                     },
                 )
                 .is_some()
@@ -1870,13 +1881,16 @@ impl Document {
                     effect: *effect,
                     path: path.clone(),
                     grantor: *grantor,
-                    tombstone: false,
+                    revokers: BTreeSet::new(),
                 });
                 return;
             }
             OpKind::AclRevoke { id } => {
+                // Record the revoke's author (provenance). The tombstone is
+                // content-neutral — every revoke lands; whether it carries authority
+                // to strip the grant is the evaluator's call.
                 if let Some(e) = self.acl.get_mut(id) {
-                    e.tombstone = true;
+                    e.revokers.insert(author);
                 }
                 return;
             }
@@ -2321,18 +2335,28 @@ impl RangedEntry {
     }
 }
 
-/// A stored ACL tuple: the immutable grant fields plus a tombstone a revoke
-/// raises (a tuple is immutable, so revoke is the only mutation and it wins).
+/// A stored ACL tuple: the immutable grant fields plus the set of actors that have
+/// revoked it (a tuple is immutable, so a revoke is the only mutation). The set is
+/// grow-only, merged by union — order-independent and idempotent — and any revoke
+/// tombstones the tuple content-neutrally; *which* revokes carry authority is the
+/// evaluator's ([`crate::acl`]) concern, recorded here as the revokers' identities.
 struct AclEntry {
     subject: AclSubject,
     grant: AclGrant,
     effect: AclEffect,
     path: Vec<u8>,
     grantor: ClientId,
-    tombstone: bool,
+    revokers: BTreeSet<ClientId>,
 }
 
 impl AclEntry {
+    /// Whether any revoke has tombstoned this tuple — it drops from the live read
+    /// views regardless of the revoker's authority (a storage filter; provenance is
+    /// the evaluator's job).
+    fn is_revoked(&self) -> bool {
+        !self.revokers.is_empty()
+    }
+
     /// The public read view of this tuple under its id.
     fn view(&self, id: ElementId) -> AclTuple {
         AclTuple {
@@ -2342,6 +2366,15 @@ impl AclEntry {
             effect: self.effect,
             path: self.path.clone(),
             grantor: self.grantor,
+        }
+    }
+
+    /// The public record of this tuple under its id: the grant plus its revoke
+    /// provenance, the authority evaluator's input.
+    fn record(&self, id: ElementId) -> AclRecord {
+        AclRecord {
+            tuple: self.view(id),
+            revoked_by: self.revokers.iter().copied().collect(),
         }
     }
 }

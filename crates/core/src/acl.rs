@@ -6,14 +6,22 @@
 //! the annotation set and merged by the same laws (concurrent creates union to
 //! distinct ids, a revoke tombstones, delete wins).
 //!
-//! The set is storage; this module also holds the **evaluator** — a pure decision
-//! over the stored tuples ([`evaluate`] / [`decide_capability`] /
-//! [`effective_roles`]). Core stores every tuple faithfully and merges the set
-//! content-neutrally (any tuple that arrives is stored), and the evaluator reads
-//! it as present: it does not check a grantor's authority to grant, bound a deny
-//! by provenance, or apply a decision to an op. Who may emit a tuple, provenance-
-//! bounded deny, and wiring a verdict into op-apply are the server's and later
-//! slices' concerns.
+//! The set is storage; this module also holds the **evaluator**. Two layers:
+//!
+//! - the pure as-present decision ([`evaluate`] / [`decide_capability`] /
+//!   [`effective_roles`]) — reads tuples as stored, checking no authority; and
+//! - the **authority** layer ([`evaluate_with_authority`] /
+//!   [`decide_capability_with_authority`]) — realises creator-auto-owns-`/` (the
+//!   doc creator implicitly owns the root, the bootstrap authority) and
+//!   provenance-based revocation (a revoke tombstone is honored only when its
+//!   author is the grant's grantor or a superior; an unauthorized revoke is
+//!   disregarded and the grant stays effective).
+//!
+//! Core stores every tuple faithfully and merges the set content-neutrally (any
+//! tuple that arrives is stored, every revoke tombstones), so authority is decided
+//! here over the merged view — never rejected at merge. Provenance-bounded deny,
+//! attenuated recursive delegation, and wiring a verdict into op-apply live outside
+//! this module (the server-side pipeline).
 //!
 //! [`Document`]: crate::doc::Document
 
@@ -248,6 +256,134 @@ pub fn evaluate(
 /// assignment targets a role — the role graph has no role→role edge, nothing to
 /// recurse, and no cycle to guard against. The result is sorted and deduplicated,
 /// so it is identical regardless of tuple order.
+/// A stored ACL tuple together with the revoke provenance the authority layer
+/// needs: the actors that have tombstoned it. An empty `revoked_by` is a live
+/// grant; a non-empty one is a revoke whose *effect* the evaluator still decides,
+/// since the set tombstones every revoke content-neutrally and authority is an
+/// evaluation-layer rule, not a merge-time rejection. Obtain the records from
+/// [`Document::acl_records`](crate::doc::Document::acl_records).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AclRecord {
+    pub tuple: AclTuple,
+    /// The actors that have revoked `tuple`. A revoke counts only when its author
+    /// is [authorized](decide_capability_with_authority); an unauthorized author's
+    /// tombstone is disregarded.
+    pub revoked_by: Vec<ClientId>,
+}
+
+/// The synthetic tuple that realises **creator-auto-owns-`/`**: the doc creator
+/// implicitly holds `Own` at the root path, the bootstrap owner every grant chains
+/// from. Core hosts no identity provider, so the creator id is supplied by the
+/// caller (the `AclActor` precedent) rather than stored — the rule is pure. The id
+/// is unread by the evaluator.
+fn creator_owns_root(creator: ClientId) -> AclTuple {
+    AclTuple {
+        id: ElementId::from_bytes([0u8; 16]),
+        subject: AclSubject::Actor(creator),
+        grant: AclGrant::Capability(Capability::Own),
+        effect: AclEffect::Allow,
+        path: Vec::new(),
+        grantor: creator,
+    }
+}
+
+/// Whether `revoker` had the authority to revoke `tuple`, given the as-present grant
+/// set `as_present`. **Provenance, not path-ancestry:** a revoke is honored iff its
+/// author is the tuple's `grantor`, the doc `creator` (who owns `/`), or an owner of
+/// the tuple's path.
+///
+/// Path-ownership that confers revoke authority is resolved from the revoker's own
+/// **actor-id** `Own` grants alone: core knows the revoker's id (the op author) but
+/// not its group or class membership, so an `Own` granted to a `Group` or a subject
+/// class must not let an arbitrary actor inherit revoke power. Membership-derived
+/// ownership therefore does not confer revoke authority here — a revoke it would
+/// justify is disregarded (fail-closed, the grant stays effective). The ownership
+/// test reads `as_present` as it stands and does **not** re-check whether those
+/// `Own` grants were themselves revoked: the chain here is shallow — the grantor, or
+/// a root/path owner directly above.
+fn revoke_authorized(
+    tuple: &AclTuple,
+    revoker: ClientId,
+    creator: ClientId,
+    as_present: &[AclTuple],
+) -> bool {
+    if revoker == creator || revoker == tuple.grantor {
+        return true;
+    }
+    let owned: Vec<AclTuple> = as_present
+        .iter()
+        .filter(|t| t.subject == AclSubject::Actor(revoker))
+        .cloned()
+        .collect();
+    evaluate(
+        &owned,
+        &AclActor::new(revoker),
+        &tuple.path,
+        Capability::Own,
+    )
+}
+
+/// The doc-level ACL tuple tier's verdict on whether `actor` holds `capability` at
+/// `path`, over the merged record set — the authority-aware form of
+/// [`decide_capability`]. It layers the two authority rules on top of the
+/// deny-overrides / own-implies-lattice decision:
+///
+/// - **creator-auto-owns-`/`** — `creator` holds `Own` at the root (and, by the
+///   lattice, every capability over every path) with no explicit tuple.
+/// - **provenance-based revocation** — a record is dropped from the live set only
+///   when one of its revokers was [authorized](revoke_authorized) to revoke it; an
+///   unauthorized revoke is disregarded and the grant stays effective.
+///
+/// The verdict depends only on which records match and their provenance, never on
+/// their order, so replicas holding the same merged record set decide identically.
+pub fn decide_capability_with_authority(
+    records: &[AclRecord],
+    creator: ClientId,
+    actor: &AclActor,
+    path: &[u8],
+    capability: Capability,
+) -> AclDecision {
+    // The as-present grants backing the ownership check for revoke authority. Only
+    // an actual revoke needs adjudicating, so build it only when one exists — the
+    // no-revocation path (the common case) clones nothing extra.
+    let as_present: Vec<AclTuple> = if records.iter().any(|r| !r.revoked_by.is_empty()) {
+        records.iter().map(|r| r.tuple.clone()).collect()
+    } else {
+        Vec::new()
+    };
+
+    // The effective set: creator-owns, plus every tuple no *authorized* revoke has
+    // tombstoned.
+    let mut effective: Vec<AclTuple> = Vec::with_capacity(records.len() + 1);
+    effective.push(creator_owns_root(creator));
+    for r in records {
+        let revoked = r
+            .revoked_by
+            .iter()
+            .any(|&who| revoke_authorized(&r.tuple, who, creator, &as_present));
+        if !revoked {
+            effective.push(r.tuple.clone());
+        }
+    }
+    decide_capability(&effective, actor, path, capability)
+}
+
+/// Whether `actor` holds `capability` at `path`, over the merged record set with the
+/// authority rules applied — the total, deny-by-default entrypoint. The
+/// authority-aware form of [`evaluate`]: [`Abstain`](AclDecision::Abstain) denies.
+pub fn evaluate_with_authority(
+    records: &[AclRecord],
+    creator: ClientId,
+    actor: &AclActor,
+    path: &[u8],
+    capability: Capability,
+) -> bool {
+    matches!(
+        decide_capability_with_authority(records, creator, actor, path, capability),
+        AclDecision::Allow
+    )
+}
+
 pub fn effective_roles(tuples: &[AclTuple], actor: &AclActor, path: &[u8]) -> Vec<Vec<u8>> {
     let mut allowed: BTreeSet<Vec<u8>> = actor.roles.iter().cloned().collect();
     let mut denied: BTreeSet<Vec<u8>> = BTreeSet::new();
