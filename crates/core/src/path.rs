@@ -20,7 +20,9 @@ use crate::map::Map;
 use crate::marks::ResolvedMark;
 use crate::op::Op;
 use crate::ranged::RangeAnchor;
+use crate::schema::Schema;
 use crate::stamp::Stamp;
+use crate::validate::Step;
 use crate::{Element, Scalar};
 
 /// Encode a path from its keys.
@@ -473,6 +475,102 @@ pub fn diff_encoded(old: &Document, new: &Document) -> Vec<u8> {
 /// crosses an untrusted boundary, so the decode never trusts its length headers.
 pub fn decode_changes(bytes: &[u8]) -> Result<Vec<Change>, DecodeError> {
     diff::decode_changes(bytes)
+}
+
+/// Parse schema JSON bytes and bind the schema to the document for `onRepaired`
+/// observation, returning whether it bound. A binding crosses schema JSON as
+/// bytes, so the façade parses them here; parsing is total — non-UTF-8 or JSON
+/// that is not a valid schema fails cleanly (returns `false`, binding nothing)
+/// rather than panicking, mirroring the other total-decode boundaries. On success
+/// the current state is taken as the baseline, so a later [`take_repairs`] surfaces
+/// only a repair the state comes to need after binding.
+pub fn set_schema(doc: &mut Document, schema_bytes: &[u8]) -> bool {
+    let Ok(src) = std::str::from_utf8(schema_bytes) else {
+        return false;
+    };
+    let Ok(schema) = Schema::parse(src) else {
+        return false;
+    };
+    doc.set_schema(schema);
+    true
+}
+
+/// The located paths whose repaired reading has newly changed against the bound
+/// schema since the last call — the `onRepaired` signal, each encoded with
+/// [`encode_repair_path`] so a binding forwards it as bytes. Empty when no schema
+/// is bound or nothing newly needs repair (and while an atomic transaction is
+/// open); a drain reseeds the baseline, so a standing repair reports once.
+///
+/// A reported path names a *location*, not a value: the repaired value is produced
+/// by a read ([`repairs`](crate::repair::repairs)), while a normal `get_*` at the
+/// location returns the raw stored value. A consumer reacts to the signal by
+/// reading the fresh repaired reading, never caching a stale one.
+pub fn take_repairs(doc: &mut Document) -> Vec<Vec<u8>> {
+    doc.take_repairs()
+        .iter()
+        .map(|steps| encode_repair_path(steps))
+        .collect()
+}
+
+/// The step-path tag for a map-slot key.
+const STEP_KEY: u8 = 0x00;
+/// The step-path tag for a sequence index.
+const STEP_INDEX: u8 = 0x01;
+
+/// Encode a located repair path — a sequence of steps, each a map-slot key or a
+/// sequence index — as framed bytes a binding carries. Each step is a one-byte
+/// tag then its payload: a key is `u32` little-endian length then its bytes, an
+/// index is a `u64` little-endian. Distinct from [`encode_path`], which frames
+/// keys only: a repair location can descend a sequence index (a bounded list item,
+/// an xml child), so its path carries indices a bare key path cannot express.
+pub fn encode_repair_path(steps: &[Step]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for step in steps {
+        match step {
+            Step::Key(k) => {
+                out.push(STEP_KEY);
+                let len = u32::try_from(k.len()).expect("path: key length exceeds u32");
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(k);
+            }
+            Step::Index(i) => {
+                out.push(STEP_INDEX);
+                out.extend_from_slice(&(*i as u64).to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// Decode a repair path from [`encode_repair_path`] back into its [`Step`]s, or
+/// `None` if a tag is unknown or a length / field runs past the end — total over
+/// any bytes, since a repair path crosses an untrusted boundary and the decode
+/// never trusts its framing.
+pub fn parse_repair_path(bytes: &[u8]) -> Option<Vec<Step>> {
+    let mut steps = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let tag = bytes[i];
+        i += 1;
+        match tag {
+            STEP_KEY => {
+                let hdr = bytes.get(i..i.checked_add(4)?)?;
+                let klen = u32::from_le_bytes(hdr.try_into().unwrap()) as usize;
+                i += 4;
+                let key = bytes.get(i..i.checked_add(klen)?)?;
+                steps.push(Step::Key(key.to_vec()));
+                i += klen;
+            }
+            STEP_INDEX => {
+                let hdr = bytes.get(i..i.checked_add(8)?)?;
+                let n = u64::from_le_bytes(hdr.try_into().unwrap());
+                steps.push(Step::Index(usize::try_from(n).ok()?));
+                i += 8;
+            }
+            _ => return None,
+        }
+    }
+    Some(steps)
 }
 
 /// A range endpoint into the sequence at `path` at `index` with gravity `side`,
