@@ -7,6 +7,7 @@
 //! whose id it has already applied. Authorship, scope, schema version, and
 //! wall time are wire/server concerns and live outside the core.
 
+use crate::acl::{AclEffect, AclGrant, AclSubject};
 use crate::clientid::ClientId;
 use crate::elementid::ElementId;
 use crate::list::Anchor;
@@ -154,6 +155,24 @@ pub enum OpKind {
     RangedDelete {
         id: ElementId,
     },
+    /// Grant an [`AclTuple`](crate::acl::AclTuple) into the document's ACL set:
+    /// an allow/deny of a capability-or-role, to a subject, on a path. The new
+    /// tuple's id derives from the op's stamp, so every replica agrees and
+    /// concurrent grants are distinct entries. `grantor` is the authoring actor,
+    /// carried explicitly on the op (authorship is a wire/envelope concern, not a
+    /// core op field) and stored faithfully — core enforces no provenance here.
+    AclGrant {
+        subject: AclSubject,
+        grant: AclGrant,
+        effect: AclEffect,
+        path: Vec<u8>,
+        grantor: ClientId,
+    },
+    /// Tombstone an ACL tuple. A tuple is immutable once created; a revoke is the
+    /// only mutation, and it wins (retained tombstone).
+    AclRevoke {
+        id: ElementId,
+    },
 }
 
 impl OpKind {
@@ -188,7 +207,10 @@ impl OpKind {
             | OpKind::TextDelete { .. }
             | OpKind::XmlMove { .. }
             | OpKind::RangedSetPayload { .. }
-            | OpKind::RangedDelete { .. } => false,
+            | OpKind::RangedDelete { .. }
+            // An ACL tuple is pure data held in the doc-level set — no container.
+            | OpKind::AclGrant { .. }
+            | OpKind::AclRevoke { .. } => false,
         }
     }
 }
