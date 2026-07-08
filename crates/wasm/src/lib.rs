@@ -11,10 +11,11 @@ use crdtsync_core::diff::{diff as core_diff, Change, SeqItem};
 use crdtsync_core::element::ElementKind;
 use crdtsync_core::elementid::ElementId;
 use crdtsync_core::list::Side;
+use crdtsync_core::marks::{MarkState, ResolvedMark};
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_ops, path, Channel, ClientId, ClientSession,
-    Document, Message, RelativePosition, Scalar, UndoManager,
+    Document, RelativePosition, Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
 
@@ -185,6 +186,186 @@ impl WasmDocument {
     pub fn resolve_position(&self, path: &[u8], pos: &[u8]) -> Option<usize> {
         let position = RelativePosition::decode(pos).ok()?;
         path::resolve_position(&self.inner, path, &position)
+    }
+
+    /// Install an `XmlElement` with `tag` at a map-slot path. Returns the ops to
+    /// broadcast.
+    #[wasm_bindgen(js_name = xmlElement)]
+    pub fn xml_element(&mut self, path: &[u8], tag: &[u8]) -> Vec<u8> {
+        encode_ops(&path::xml_element(&mut self.inner, path, tag))
+    }
+
+    /// Install a tagless `XmlFragment` at a map-slot path.
+    #[wasm_bindgen(js_name = xmlFragment)]
+    pub fn xml_fragment(&mut self, path: &[u8]) -> Vec<u8> {
+        encode_ops(&path::xml_fragment(&mut self.inner, path))
+    }
+
+    /// The tag of the live `XmlElement` at a path, or `undefined` if the path is
+    /// not a live element (a fragment is tagless, so it too reads `undefined`).
+    #[wasm_bindgen(js_name = xmlTag)]
+    pub fn xml_tag(&self, path: &[u8]) -> Option<Vec<u8>> {
+        path::xml_tag(&self.inner, path)
+    }
+
+    /// Insert a nested `XmlElement` child with `tag` at live `index` in the children
+    /// of the element/fragment at `elem_path`. Inert if the target is not a live
+    /// XmlElement or XmlFragment.
+    #[wasm_bindgen(js_name = xmlInsertElement)]
+    pub fn xml_insert_element(&mut self, elem_path: &[u8], index: usize, tag: &[u8]) -> Vec<u8> {
+        encode_ops(&path::xml_insert_element(
+            &mut self.inner,
+            elem_path,
+            index,
+            tag,
+        ))
+    }
+
+    /// Insert a `Text`-run child initialised with `s` at live `index` in the
+    /// children of the element/fragment at `elem_path`. Inert if the target is not
+    /// a live XmlElement or XmlFragment.
+    #[wasm_bindgen(js_name = xmlInsertText)]
+    pub fn xml_insert_text(&mut self, elem_path: &[u8], index: usize, s: &str) -> Vec<u8> {
+        encode_ops(&path::xml_insert_text(&mut self.inner, elem_path, index, s))
+    }
+
+    /// Tombstone the child at live `index` in the children of the element/fragment
+    /// at `elem_path`. Inert if the target is not a live XmlElement or XmlFragment,
+    /// or `index` names no live child.
+    #[wasm_bindgen(js_name = xmlChildDelete)]
+    pub fn xml_child_delete(&mut self, elem_path: &[u8], index: usize) -> Vec<u8> {
+        encode_ops(&path::xml_child_delete(&mut self.inner, elem_path, index))
+    }
+
+    /// The count of live children of the element/fragment at `elem_path`, or
+    /// `undefined` if the path is not a live XmlElement or XmlFragment.
+    #[wasm_bindgen(js_name = xmlChildrenLen)]
+    pub fn xml_children_len(&self, elem_path: &[u8]) -> Option<usize> {
+        path::xml_children_len(&self.inner, elem_path)
+    }
+
+    /// Relocate the live child at `child_index` under the XML node at `parent_path`
+    /// to `dest_index` in the children of the XML node at `new_parent_path` — a
+    /// Kleppmann tree move that keeps the child's identity and subtree. Inert if
+    /// either path is not a live XML node or `child_index` names no live child.
+    #[wasm_bindgen(js_name = xmlMove)]
+    pub fn xml_move(
+        &mut self,
+        parent_path: &[u8],
+        child_index: usize,
+        new_parent_path: &[u8],
+        dest_index: usize,
+    ) -> Vec<u8> {
+        encode_ops(&path::xml_move_child(
+            &mut self.inner,
+            parent_path,
+            child_index,
+            new_parent_path,
+            dest_index,
+        ))
+    }
+
+    /// Author a mark named `name` over `[start_index, end_index)` of the sequence
+    /// (Text or List) at `seq_path`, each endpoint captured with the given gravity
+    /// `side` (0 left of the index, 1 right). `value` is an encoded [`Scalar`]
+    /// payload. Returns the mark's id as bytes — the handle a later
+    /// `markSetValue`/`markDelete` names it by — or `undefined` if `seq_path` is
+    /// not a live sequence, a side is unknown, or the value is malformed.
+    #[wasm_bindgen(js_name = mark)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark(
+        &mut self,
+        seq_path: &[u8],
+        start_index: usize,
+        start_side: u32,
+        end_index: usize,
+        end_side: u32,
+        name: &[u8],
+        value: &[u8],
+    ) -> Option<Vec<u8>> {
+        let start = side_from_u32(start_side)?;
+        let end = side_from_u32(end_side)?;
+        let scalar = Scalar::decode_state(value).ok()?;
+        let (_ops, id) = path::mark(
+            &mut self.inner,
+            seq_path,
+            start_index,
+            start,
+            end_index,
+            end,
+            name,
+            scalar,
+        );
+        id
+    }
+
+    /// Change the scalar payload of the mark handle `mark_id` to the encoded
+    /// [`Scalar`] `value`. Returns the ops to broadcast; empty on a malformed value
+    /// or a handle that names no live mark.
+    #[wasm_bindgen(js_name = markSetValue)]
+    pub fn mark_set_value(&mut self, mark_id: &[u8], value: &[u8]) -> Vec<u8> {
+        let Ok(scalar) = Scalar::decode_state(value) else {
+            return Vec::new();
+        };
+        encode_ops(&path::mark_set_value(&mut self.inner, mark_id, scalar))
+    }
+
+    /// Tombstone the mark handle `mark_id`. Returns the ops to broadcast; empty on
+    /// a handle that names no live mark.
+    #[wasm_bindgen(js_name = markDelete)]
+    pub fn mark_delete(&mut self, mark_id: &[u8]) -> Vec<u8> {
+        encode_ops(&path::mark_delete(&mut self.inner, mark_id))
+    }
+
+    /// The active marks covering character `index` of the sequence at `seq_path`,
+    /// as an array of `{ name, kind, value }` objects (a boolean's value is a bool,
+    /// a value mark's a tagged `{ t, v }` scalar, an object mark's an array of
+    /// `Uint8Array` instance ids). Empty if `seq_path` is not a live sequence.
+    #[wasm_bindgen(js_name = marksAt)]
+    pub fn marks_at(&self, seq_path: &[u8], index: usize) -> JsValue {
+        marks_to_js(&path::marks_at(&self.inner, seq_path, index))
+    }
+
+    /// Parse schema JSON bytes and bind the schema for `onRepaired` observation,
+    /// returning whether it bound. Non-UTF-8 or JSON that is not a valid schema
+    /// fails cleanly (`false`), binding nothing.
+    #[wasm_bindgen(js_name = setSchema)]
+    pub fn set_schema(&mut self, schema_bytes: &[u8]) -> bool {
+        path::set_schema(&mut self.inner, schema_bytes)
+    }
+
+    /// The located paths whose repaired reading has newly changed against the bound
+    /// schema since the last call — the `onRepaired` signal, as an array of
+    /// `Uint8Array` (each an encoded repair path). Empty when no schema is bound or
+    /// nothing newly needs repair.
+    #[wasm_bindgen(js_name = takeRepairs)]
+    pub fn take_repairs(&mut self) -> JsValue {
+        path::take_repairs(&mut self.inner)
+            .iter()
+            .map(|p| js_sys::Uint8Array::from(p.as_slice()))
+            .collect::<js_sys::Array>()
+            .into()
+    }
+
+    /// Diff two snapshots into one opaque buffer — the encoded [`Change`]s a
+    /// binding forwards across the SDK boundary and later reads with
+    /// [`decodeChanges`](WasmDocument::decode_changes), mirroring how a captured
+    /// position crosses as bytes. Throws on a malformed snapshot.
+    #[wasm_bindgen(js_name = diffEncoded)]
+    pub fn diff_encoded(old_state: &[u8], new_state: &[u8]) -> Result<Vec<u8>, JsError> {
+        let old = Document::decode_state(old_state).map_err(|e| JsError::new(&format!("{e:?}")))?;
+        let new = Document::decode_state(new_state).map_err(|e| JsError::new(&format!("{e:?}")))?;
+        Ok(path::diff_encoded(&old, &new))
+    }
+
+    /// Decode a diff buffer — the encoded [`Change`]s a peer computed and forwarded
+    /// as opaque bytes — back into the same array of tagged change objects
+    /// [`diff`](WasmDocument::diff) returns. Throws on a truncated or malformed
+    /// buffer.
+    #[wasm_bindgen(js_name = decodeChanges)]
+    pub fn decode_changes(bytes: &[u8]) -> Result<Vec<JsValue>, JsError> {
+        let changes = path::decode_changes(bytes).map_err(|e| JsError::new(&format!("{e:?}")))?;
+        Ok(changes.iter().map(change_to_js).collect())
     }
 
     /// Fold a peer's encoded ops in. Returns the number applied, -1 on error.
@@ -520,6 +701,158 @@ impl WasmClient {
             .and_then(|d| path::get_bytes(d, path))
     }
 
+    /// Install an `XmlElement` with `tag` at a path in `channel`'s room. Returns
+    /// the Ops frame to send; empty if the channel isn't held.
+    #[wasm_bindgen(js_name = xmlElement)]
+    pub fn xml_element(&mut self, channel: u32, path: &[u8], tag: &[u8]) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::xml_element(d, path, tag))
+    }
+
+    /// Install a tagless `XmlFragment` at a path in `channel`'s room.
+    #[wasm_bindgen(js_name = xmlFragment)]
+    pub fn xml_fragment(&mut self, channel: u32, path: &[u8]) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::xml_fragment(d, path))
+    }
+
+    /// Insert a nested `XmlElement` child with `tag` at live `index` in the children
+    /// of the element/fragment at `elem_path` in `channel`'s room.
+    #[wasm_bindgen(js_name = xmlInsertElement)]
+    pub fn xml_insert_element(
+        &mut self,
+        channel: u32,
+        elem_path: &[u8],
+        index: usize,
+        tag: &[u8],
+    ) -> Vec<u8> {
+        self.ops_frame(channel, |d| {
+            path::xml_insert_element(d, elem_path, index, tag)
+        })
+    }
+
+    /// Insert a `Text`-run child initialised with `s` at live `index` in the
+    /// children of the element/fragment at `elem_path` in `channel`'s room.
+    #[wasm_bindgen(js_name = xmlInsertText)]
+    pub fn xml_insert_text(
+        &mut self,
+        channel: u32,
+        elem_path: &[u8],
+        index: usize,
+        s: &str,
+    ) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::xml_insert_text(d, elem_path, index, s))
+    }
+
+    /// Tombstone the child at live `index` in the children of the element/fragment
+    /// at `elem_path` in `channel`'s room.
+    #[wasm_bindgen(js_name = xmlChildDelete)]
+    pub fn xml_child_delete(&mut self, channel: u32, elem_path: &[u8], index: usize) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::xml_child_delete(d, elem_path, index))
+    }
+
+    /// The count of live children of the element/fragment at `elem_path` in
+    /// `channel`'s room, or `undefined` if the path is not a live XML node.
+    #[wasm_bindgen(js_name = xmlChildrenLen)]
+    pub fn xml_children_len(&self, channel: u32, elem_path: &[u8]) -> Option<usize> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::xml_children_len(d, elem_path))
+    }
+
+    /// The tag of the live `XmlElement` at a path in `channel`'s room, or
+    /// `undefined` if the path is not a live element.
+    #[wasm_bindgen(js_name = xmlTag)]
+    pub fn xml_tag(&self, channel: u32, path: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::xml_tag(d, path))
+    }
+
+    /// Relocate the live child at `child_index` under `parent_path` to `dest_index`
+    /// in the children of `new_parent_path`, both in `channel`'s room — a Kleppmann
+    /// tree move. Returns the Ops frame to send.
+    #[wasm_bindgen(js_name = xmlMove)]
+    pub fn xml_move(
+        &mut self,
+        channel: u32,
+        parent_path: &[u8],
+        child_index: usize,
+        new_parent_path: &[u8],
+        dest_index: usize,
+    ) -> Vec<u8> {
+        self.ops_frame(channel, |d| {
+            path::xml_move_child(d, parent_path, child_index, new_parent_path, dest_index)
+        })
+    }
+
+    /// Author a mark named `name` over `[start_index, end_index)` of the sequence at
+    /// `seq_path` in `channel`'s room, routed through the outbox so it is resent /
+    /// acknowledged like every other client edit. Each endpoint carries the given
+    /// gravity `side` (0 left, 1 right); `value` is an encoded [`Scalar`]. Returns
+    /// the mark's id — its handle — while the authoring ops ride the outbox (send
+    /// them with [`resend`](WasmClient::resend)). `undefined` on an unheld channel,
+    /// a non-sequence path, an unknown side, or a malformed value.
+    #[wasm_bindgen(js_name = mark)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark(
+        &mut self,
+        channel: u32,
+        seq_path: &[u8],
+        start_index: usize,
+        start_side: u32,
+        end_index: usize,
+        end_side: u32,
+        name: &[u8],
+        value: &[u8],
+    ) -> Option<Vec<u8>> {
+        let start = side_from_u32(start_side)?;
+        let end = side_from_u32(end_side)?;
+        let scalar = Scalar::decode_state(value).ok()?;
+        let doc = self.inner.document_mut(Channel(channel))?;
+        let (ops, id) = path::mark(
+            doc,
+            seq_path,
+            start_index,
+            start,
+            end_index,
+            end,
+            name,
+            scalar,
+        );
+        self.inner.enqueue_ops(Channel(channel), ops);
+        id
+    }
+
+    /// Change the payload of the mark handle `mark_id` in `channel`'s room, routed
+    /// through the outbox. Returns the Ops frame to send; empty on a malformed
+    /// value or a handle that names no live mark.
+    #[wasm_bindgen(js_name = markSetValue)]
+    pub fn mark_set_value(&mut self, channel: u32, mark_id: &[u8], value: &[u8]) -> Vec<u8> {
+        let Ok(scalar) = Scalar::decode_state(value) else {
+            return Vec::new();
+        };
+        self.ops_frame(channel, |d| path::mark_set_value(d, mark_id, scalar))
+    }
+
+    /// Tombstone the mark handle `mark_id` in `channel`'s room, routed through the
+    /// outbox. Returns the Ops frame to send; empty on a handle that names no live
+    /// mark.
+    #[wasm_bindgen(js_name = markDelete)]
+    pub fn mark_delete(&mut self, channel: u32, mark_id: &[u8]) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::mark_delete(d, mark_id))
+    }
+
+    /// The active marks covering character `index` of the sequence at `seq_path` in
+    /// `channel`'s room, as an array of `{ name, kind, value }` objects (shaped as
+    /// on [`WasmDocument::marks_at`]). Empty if the channel isn't held or the path
+    /// is not a live sequence.
+    #[wasm_bindgen(js_name = marksAt)]
+    pub fn marks_at(&self, channel: u32, seq_path: &[u8], index: usize) -> JsValue {
+        match self.inner.document(Channel(channel)) {
+            Some(d) => marks_to_js(&path::marks_at(d, seq_path, index)),
+            None => js_sys::Array::new().into(),
+        }
+    }
+
     /// Publish an ephemeral awareness entry `key` on `channel`'s room; returns
     /// the frame to send. `None` if the channel isn't held.
     #[wasm_bindgen(js_name = setAwareness)]
@@ -626,6 +959,55 @@ impl WasmClient {
 /// Set an own property on a plain object; infallible for a fresh `Object`.
 fn set(obj: &js_sys::Object, key: &str, val: &JsValue) {
     js_sys::Reflect::set(obj, &JsValue::from_str(key), val).unwrap();
+}
+
+/// The gravity `Side` a `0`/`1` endpoint code names — `None` for any other code,
+/// matching how `relativePosition` reads a side.
+fn side_from_u32(side: u32) -> Option<Side> {
+    match side {
+        0 => Some(Side::Left),
+        1 => Some(Side::Right),
+        _ => None,
+    }
+}
+
+/// The resolved marks on a character as a JS array of `{ name, kind, value }`
+/// objects: a boolean's value is a bool, a value mark's a tagged `{ t, v }`
+/// scalar, an object mark's an array of `Uint8Array` instance ids.
+fn marks_to_js(marks: &[ResolvedMark]) -> JsValue {
+    marks
+        .iter()
+        .map(resolved_mark_to_js)
+        .collect::<js_sys::Array>()
+        .into()
+}
+
+fn resolved_mark_to_js(mark: &ResolvedMark) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(
+        &obj,
+        "name",
+        &js_sys::Uint8Array::from(mark.name.as_slice()).into(),
+    );
+    match &mark.state {
+        MarkState::Boolean(b) => {
+            set(&obj, "kind", &JsValue::from_str("boolean"));
+            set(&obj, "value", &JsValue::from_bool(*b));
+        }
+        MarkState::Value(s) => {
+            set(&obj, "kind", &JsValue::from_str("value"));
+            set(&obj, "value", &scalar_to_js(s));
+        }
+        MarkState::Object(ids) => {
+            set(&obj, "kind", &JsValue::from_str("object"));
+            let arr: js_sys::Array = ids
+                .iter()
+                .map(|id| js_sys::Uint8Array::from(&id.as_bytes()[..]))
+                .collect();
+            set(&obj, "value", &arr.into());
+        }
+    }
+    obj.into()
 }
 
 fn kind_name(k: ElementKind) -> &'static str {
@@ -790,7 +1172,15 @@ fn change_to_js(change: &Change) -> JsValue {
 /// The common head of a mark change as JS fields: the mark id, its target
 /// sequence, and its name (each a `Uint8Array`).
 fn set_mark_head(obj: &js_sys::Object, id: &ElementId, seq: &ElementId, name: &[u8]) {
-    set(obj, "id", &js_sys::Uint8Array::from(&id.as_bytes()[..]).into());
-    set(obj, "seq", &js_sys::Uint8Array::from(&seq.as_bytes()[..]).into());
+    set(
+        obj,
+        "id",
+        &js_sys::Uint8Array::from(&id.as_bytes()[..]).into(),
+    );
+    set(
+        obj,
+        "seq",
+        &js_sys::Uint8Array::from(&seq.as_bytes()[..]).into(),
+    );
     set(obj, "name", &js_sys::Uint8Array::from(name).into());
 }
