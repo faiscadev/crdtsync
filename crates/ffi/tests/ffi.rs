@@ -551,6 +551,185 @@ fn a_no_op_delete_does_not_create_a_container() {
     }
 }
 
+// --- xml navigation ---
+
+unsafe fn xml_tag(doc: *const CrdtDoc, p: &[u8]) -> (i32, Vec<u8>) {
+    let mut out = CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let rc = crdtsync_doc_xml_tag(doc, p.as_ptr(), p.len(), &mut out);
+    let tag = if rc == 1 {
+        std::slice::from_raw_parts(out.ptr, out.len).to_vec()
+    } else {
+        Vec::new()
+    };
+    crdtsync_buf_free(out);
+    (rc, tag)
+}
+
+unsafe fn children_len(doc: *const CrdtDoc, p: &[u8]) -> (i32, usize) {
+    let mut out: usize = 0;
+    let rc = crdtsync_doc_xml_children_len(doc, p.as_ptr(), p.len(), &mut out);
+    (rc, out)
+}
+
+#[test]
+fn an_xml_element_reads_its_tag_back_and_converges() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let p = path(&[b"doc", b"body"]);
+
+        let o = crdtsync_doc_xml_element(a, p.as_ptr(), p.len(), b"section".as_ptr(), 7);
+        assert!(o.len > 0, "the element install emits ops");
+        assert_eq!(xml_tag(a, &p), (1, b"section".to_vec()));
+        exchange(b, &o);
+        assert_eq!(xml_tag(b, &p), (1, b"section".to_vec()), "tag converges");
+
+        crdtsync_buf_free(o);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn an_xml_fragment_has_no_tag() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let p = path(&[b"root"]);
+
+        let o = crdtsync_doc_xml_fragment(doc, p.as_ptr(), p.len());
+        assert!(o.len > 0, "the fragment install emits ops");
+        // A fragment is tagless, so the tag read reports absent (0), not a panic.
+        assert_eq!(xml_tag(doc, &p).0, 0, "a fragment has no tag");
+        // But it is a live xml node: it owns a children sequence.
+        assert_eq!(children_len(doc, &p), (1, 0));
+
+        crdtsync_buf_free(o);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn xml_children_insert_delete_and_len_converge() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let p = path(&[b"doc", b"body"]);
+
+        let root = crdtsync_doc_xml_element(a, p.as_ptr(), p.len(), b"body".as_ptr(), 4);
+        let e = crdtsync_doc_xml_insert_element(a, p.as_ptr(), p.len(), 0, b"p".as_ptr(), 1);
+        let t = crdtsync_doc_xml_insert_text(a, p.as_ptr(), p.len(), 1, b"hi".as_ptr(), 2);
+        assert!(e.len > 0 && t.len > 0, "child inserts emit ops");
+        assert_eq!(children_len(a, &p), (1, 2));
+
+        for o in [&root, &e, &t] {
+            exchange(b, o);
+        }
+        assert_eq!(children_len(b, &p), (1, 2), "children converge");
+
+        // Delete the text child; the live count drops on both replicas.
+        let d = crdtsync_doc_xml_child_delete(a, p.as_ptr(), p.len(), 1);
+        assert!(d.len > 0, "the delete emits ops");
+        assert_eq!(children_len(a, &p), (1, 1));
+        exchange(b, &d);
+        assert_eq!(children_len(b, &p), (1, 1));
+
+        for o in [root, e, t, d] {
+            crdtsync_buf_free(o);
+        }
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn an_xml_move_relocates_a_child_and_converges() {
+    unsafe {
+        let (ca, cb) = (client(1), client(2));
+        let a = crdtsync_doc_new(ca.as_ptr());
+        let b = crdtsync_doc_new(cb.as_ptr());
+        let src = path(&[b"a"]);
+        let dst = path(&[b"b"]);
+
+        let fa = crdtsync_doc_xml_fragment(a, src.as_ptr(), src.len());
+        let fb = crdtsync_doc_xml_fragment(a, dst.as_ptr(), dst.len());
+        let kid = crdtsync_doc_xml_insert_element(a, src.as_ptr(), src.len(), 0, b"li".as_ptr(), 2);
+        assert_eq!(children_len(a, &src), (1, 1));
+        assert_eq!(children_len(a, &dst), (1, 0));
+
+        // Move the child from `src[0]` to `dst[0]` — a Kleppmann tree move.
+        let mv = crdtsync_doc_xml_move(a, src.as_ptr(), src.len(), 0, dst.as_ptr(), dst.len(), 0);
+        assert!(mv.len > 0, "the move emits ops");
+        assert_eq!(children_len(a, &src), (1, 0), "child left the source");
+        assert_eq!(children_len(a, &dst), (1, 1), "child arrived at the dest");
+
+        for o in [&fa, &fb, &kid, &mv] {
+            exchange(b, o);
+        }
+        assert_eq!(children_len(b, &src), (1, 0), "move converges");
+        assert_eq!(children_len(b, &dst), (1, 1));
+
+        for o in [fa, fb, kid, mv] {
+            crdtsync_buf_free(o);
+        }
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn xml_edits_on_a_bad_handle_or_path_are_inert() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+
+        // A null handle never emits and never dereferences.
+        let o = crdtsync_doc_xml_element(ptr::null_mut(), ptr::null(), 0, b"x".as_ptr(), 1);
+        assert_eq!(o.len, 0, "null handle emits nothing");
+        crdtsync_buf_free(o);
+        // A valid out buffer isolates the null-handle guard: it must report -1 for
+        // the handle, not merely because the out pointer is null.
+        let mut out = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            crdtsync_doc_xml_tag(ptr::null(), ptr::null(), 0, &mut out),
+            -1,
+            "null handle reads -1"
+        );
+
+        // A register slot is not an xml node: reads report absent, child edits and
+        // moves are inert and must not re-stamp it into an element.
+        let reg = path(&[b"age"]);
+        let r = register_int(doc, &reg, 30);
+        crdtsync_buf_free(r);
+        assert_eq!(xml_tag(doc, &reg).0, 0, "a register has no tag");
+        assert_eq!(children_len(doc, &reg).0, 0, "a register has no children");
+        let ins =
+            crdtsync_doc_xml_insert_element(doc, reg.as_ptr(), reg.len(), 0, b"p".as_ptr(), 1);
+        assert_eq!(ins.len, 0, "insert into a non-node emits nothing");
+        crdtsync_buf_free(ins);
+        let del = crdtsync_doc_xml_child_delete(doc, reg.as_ptr(), reg.len(), 0);
+        assert_eq!(del.len, 0, "delete on a non-node emits nothing");
+        crdtsync_buf_free(del);
+        // Reading it as an int still succeeds: the slot was never clobbered.
+        assert_eq!(get_int(doc, &reg), (1, 30));
+
+        // A move naming a non-node parent is inert.
+        let mv = crdtsync_doc_xml_move(doc, reg.as_ptr(), reg.len(), 0, reg.as_ptr(), reg.len(), 0);
+        assert_eq!(mv.len, 0, "move on a non-node emits nothing");
+        crdtsync_buf_free(mv);
+
+        crdtsync_doc_free(doc);
+    }
+}
+
 #[test]
 #[cfg_attr(miri, ignore = "stack depth is a native concern; slow under Miri")]
 fn a_very_deep_path_does_not_overflow_the_stack() {
