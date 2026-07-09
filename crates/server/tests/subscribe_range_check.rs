@@ -29,7 +29,7 @@ const MAP_V1: &str = r#"{ "schema": "s", "version": 1, "root": "R",
 const MAP_V2: &str = r#"{ "schema": "s", "version": 2, "root": "R",
     "types": { "R": { "kind": "map" } } }"#;
 
-fn registry() -> Registry {
+fn schema_registry() -> Arc<Mutex<SchemaRegistry>> {
     let mut sr = SchemaRegistry::new();
     sr.register(UP, 1, MAP_V1.as_bytes(), b"").unwrap();
     sr.register(
@@ -47,11 +47,47 @@ fn registry() -> Registry {
         br#"{ "from": 1, "to": 2, "steps": [ { "kind": "addField", "type": "R", "field": "note", "fieldType": "text" } ] }"#,
     )
     .unwrap();
+    Arc::new(Mutex::new(sr))
+}
 
+fn registry() -> Registry {
     let mut r = Registry::new(cid(0xFF));
-    r.set_schema_registry(Arc::new(Mutex::new(sr)));
+    r.set_schema_registry(schema_registry());
     r.set_clock(Arc::new(ManualClock::new(0)));
     r
+}
+
+/// A registry backed by the durable store at `path`, sharing the schema registry
+/// and a deterministic clock — the shape a restart reopens.
+fn store_registry(path: &std::path::Path) -> Registry {
+    let store = crdtsync_server::store::Store::open(path).unwrap();
+    let mut r = Registry::with_store(cid(0xFF), store).unwrap();
+    r.set_schema_registry(schema_registry());
+    r.set_clock(Arc::new(ManualClock::new(0)));
+    r
+}
+
+struct TempDir(std::path::PathBuf);
+impl TempDir {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempdir() -> TempDir {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("crdtsync-range-restart-{pid}-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    TempDir(dir)
 }
 
 fn hello(r: &mut Registry, client: u8, app: &[u8], version: u32) -> ConnId {
@@ -330,6 +366,52 @@ fn an_empty_log_is_never_refused_on_the_op_version_basis() {
         !is_update_required(&replies),
         "an empty log has no op version to reach"
     );
+    assert!(is_subscribed(&replies));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // drives the durable store on the filesystem
+fn a_below_gap_joiner_is_refused_after_a_compacted_restart() {
+    let tmp = tempdir();
+    // A v2 UP writer binds the room and writes a real v2 op, then compaction folds
+    // the whole log into the snapshot — the on-disk log no longer carries the op
+    // that set the high-water. The binding and the high-water persist beside it.
+    {
+        let mut r = store_registry(tmp.path());
+        r.set_compaction_threshold(1);
+        let writer = bind_room(&mut r, 1, UP, 2);
+        write(&mut r, writer, 1, b"years");
+    }
+
+    // A fresh node restores the durable binding and high-water, so a v1 joiner
+    // below the breaking rename is still refused — the compacted restart neither
+    // unbinds the room (which would serve it verbatim) nor under-counts the
+    // high-water to None (which would disarm the gate).
+    let mut r = store_registry(tmp.path());
+    let old = hello(&mut r, 2, UP, 1);
+    let replies = subscribe_reply(&mut r, old);
+    assert!(
+        is_update_required(&replies),
+        "the durable high-water outlives a compacted restart"
+    );
+    assert!(!is_subscribed(&replies));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // drives the durable store on the filesystem
+fn a_reachable_joiner_is_admitted_after_a_restart() {
+    let tmp = tempdir();
+    // An all-v1 room, restarted: a returning v1 joiner reaches the restored v1
+    // high-water and is served, so the durable metadata never over-refuses.
+    {
+        let mut r = store_registry(tmp.path());
+        let writer = bind_room(&mut r, 1, UP, 1);
+        write(&mut r, writer, 1, b"age");
+    }
+    let mut r = store_registry(tmp.path());
+    let returning = hello(&mut r, 2, UP, 1);
+    let replies = subscribe_reply(&mut r, returning);
+    assert!(!is_update_required(&replies));
     assert!(is_subscribed(&replies));
 }
 

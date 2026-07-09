@@ -176,11 +176,26 @@ impl Registry {
     }
 
     /// A registry backed by `store`: its hub replays the persisted log, and
-    /// every op the hub ingests is appended before it fans out to peers.
+    /// every op the hub ingests is appended before it fans out to peers. Each
+    /// room's persisted governing binding seeds the live `room_apps`, so a
+    /// populated room comes back bound — its first subscriber is served
+    /// translated catch-up, not verbatim — before any live subscriber rebuilds it.
     pub fn with_store(server: ClientId, store: Store) -> io::Result<Self> {
-        let mut hub = Hub::from_rooms(server, store.load()?)?;
+        let rooms = store.load()?;
+        let room_apps: HashMap<RoomId, (Vec<u8>, u32)> = rooms
+            .iter()
+            .filter_map(|(room, log)| {
+                log.meta
+                    .as_ref()
+                    .and_then(|meta| meta.governing.clone())
+                    .map(|governing| (room.clone(), governing))
+            })
+            .collect();
+        let mut hub = Hub::from_rooms(server, rooms)?;
         hub.attach_store(store);
-        Ok(Self::from_hub(hub))
+        let mut registry = Self::from_hub(hub);
+        registry.room_apps = room_apps;
+        Ok(registry)
     }
 
     /// Open a connection whose client authenticates in band, returning its
@@ -582,18 +597,26 @@ impl Registry {
     /// bind a room governs it — a later subscribe naming a *different* app is
     /// ignored, so a room is never re-governed by a foreign app's (shorter) TTL.
     /// A later subscribe on the *same* app lifts the binding to the higher
-    /// version, so a rolling upgrade resolves to the newest version.
+    /// version, so a rolling upgrade resolves to the newest version. The incumbent
+    /// is the live binding, or — where a dormant sweep or a restart dropped it —
+    /// the durable one the hub restored, so a foreign app cannot seize a
+    /// persisted room by subscribing first after it went idle. A same-app bind (a
+    /// new room or a version lift) is mirrored into the hub's durable binding.
     fn bind_room_app(&mut self, room: RoomId, app_id: Vec<u8>, version: u32) {
-        match self.room_apps.get(&room) {
-            Some((bound_app, bound_version)) => {
-                if *bound_app == app_id && version > *bound_version {
-                    self.room_apps.insert(room, (app_id, version));
-                }
+        let incumbent = self
+            .room_apps
+            .get(&room)
+            .cloned()
+            .or_else(|| self.hub.governing_app(&room));
+        let bound = match incumbent {
+            Some((bound_app, bound_version)) if bound_app == app_id => {
+                (app_id, version.max(bound_version))
             }
-            None => {
-                self.room_apps.insert(room, (app_id, version));
-            }
-        }
+            Some(existing) => existing,
+            None => (app_id, version),
+        };
+        self.hub.bind_governing(&room, bound.0.clone(), bound.1);
+        self.room_apps.insert(room, bound);
     }
 
     /// Tell each room's readable subscribers of the awareness removals a sweep
@@ -662,10 +685,17 @@ impl Registry {
             _ => None,
         };
         // The acted-on room's binding, resolved once: `Some(Some((app, ver)))`
-        // bound, `Some(None)` an addressed-but-unbound room, `None` no room.
-        let room_binding = authz_room
-            .as_deref()
-            .map(|room| self.room_apps.get(room).cloned());
+        // bound, `Some(None)` an addressed-but-unbound room, `None` no room. A
+        // room missing from the live map falls back to the hub's durable binding,
+        // so a populated room a dormant sweep or a restart left unbound is still
+        // governed by its persisted app — its first subscriber is served
+        // translated, not verbatim.
+        let room_binding = authz_room.as_deref().map(|room| {
+            self.room_apps
+                .get(room)
+                .cloned()
+                .or_else(|| self.hub.governing_app(room))
+        });
         // The schema whose `@auth` grants the enforcement points compose under the
         // deployment authorizer. A room already bound is governed by *its* app's
         // schema — never the connection's own, even when that schema fails to parse
@@ -687,11 +717,10 @@ impl Registry {
         // catch-up, an ops write's tag), and only for a *bound* room: an unbound
         // room's governing app is unknown (a catch-up there serves the delta
         // verbatim; an ops write is impossible until the room is bound by the
-        // writer's own subscribe). Inferring it from the connecting app would
-        // let a foreign first subscriber to a room whose binding was dropped
-        // (a dormant sweep, or a store restart that restores the log but not the
-        // binding) translate that log along the wrong chain — a durable binding
-        // that survives both is the robust fix, not yet built.
+        // writer's own subscribe). The binding a dormant sweep or a restart
+        // dropped is recovered above from the hub's durable record, not inferred
+        // from the connecting app — inferring would let a foreign first subscriber
+        // translate the log along the wrong chain.
         let governing = match room_binding {
             Some(Some((app, version)))
                 if matches!(msg, Message::Subscribe { .. } | Message::Ops { .. }) =>

@@ -52,6 +52,20 @@ pub struct Snapshot {
     pub state: Vec<u8>,
 }
 
+/// A room's durable governing metadata: the app that governs it — `{app_id,
+/// version}`, `None` for a relay/unbound room — and the highest governing-app op
+/// version ever folded into its merged state. Persisted beside the room's log
+/// and snapshot so a restart or a dormant-room sweep restores the binding and
+/// the op-version high-water, rather than rebinding a populated room's first
+/// subscriber untranslated or under-counting a compacted room's high-water from
+/// its post-compaction log tail. Absent or undecodable metadata falls back to
+/// the rebuild-from-log / bind-on-subscribe reconstruction, so it is a durability
+/// cache, not a source of truth the load path may fail on.
+pub struct RoomMeta {
+    pub governing: Option<(Vec<u8>, u32)>,
+    pub max_op_version: Option<u32>,
+}
+
 /// What a store holds for one room: an optional compaction snapshot, the op
 /// records still in its log, and its named versions. The log may overlap the
 /// snapshot — a crash between writing the snapshot and truncating the log leaves
@@ -63,6 +77,10 @@ pub struct RoomLog {
     /// The room's named versions as `(name, covered seq, auto-version origin,
     /// capture ordinal, state)`. `origin` is `None` for a manual version.
     pub versions: Vec<(Vec<u8>, u64, Option<Vec<u8>>, u64, Vec<u8>)>,
+    /// The room's durable governing metadata, or `None` when the store holds none
+    /// (an unbound relay room, or one whose record is absent or undecodable — the
+    /// rebuild-from-log fallback then stands).
+    pub meta: Option<RoomMeta>,
 }
 
 /// A directory of per-room logs and snapshots.
@@ -113,22 +131,11 @@ impl Store {
         buf.extend_from_slice(&base_seq.to_le_bytes());
         buf.extend_from_slice(state);
 
-        let tmp = self.snap_tmp_path(room);
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)?;
-            file.write_all(&buf)?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp, self.snap_path(room))?;
-        // Persist the rename itself: until the directory is flushed the snapshot
-        // entry is not crash-durable, so a power loss could drop it while the
-        // log removal below survives. Flushing here keeps the snapshot present
-        // before the log it replaces can disappear.
-        self.sync_dir()?;
+        // The snapshot lands durably — temp, flushed, renamed, directory flushed —
+        // before the log it replaces is removed: until the directory is flushed the
+        // snapshot entry is not crash-durable, so a power loss could otherwise drop
+        // it while the log removal below survives.
+        self.atomic_write(&self.snap_path(room), &self.snap_tmp_path(room), &buf)?;
 
         // The snapshot is durable; the log prefix it covers can go. A compaction
         // folds up to the head, so the whole log is dropped and later appends
@@ -154,11 +161,7 @@ impl Store {
         versions: &[(&[u8], u64, Option<&[u8]>, u64, &[u8])],
     ) -> io::Result<()> {
         if versions.is_empty() {
-            match fs::remove_file(self.versions_path(room)) {
-                Ok(()) => return self.sync_dir(),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(e) => return Err(e),
-            }
+            return self.remove_if_present(&self.versions_path(room));
         }
         let mut buf = Vec::new();
         for (name, seq, origin, ordinal, state) in versions {
@@ -174,18 +177,73 @@ impl Store {
             buf.extend_from_slice(&ordinal.to_le_bytes());
             put_bytes(&mut buf, state);
         }
-        let tmp = self.versions_tmp_path(room);
+        self.atomic_write(
+            &self.versions_path(room),
+            &self.versions_tmp_path(room),
+            &buf,
+        )
+    }
+
+    /// Rewrite `room`'s governing metadata to its own file, replacing whatever it
+    /// held. The record is a 1-byte governing present-flag then — when present —
+    /// the length-prefixed app id and the 4-byte little-endian version, then a
+    /// 1-byte high-water present-flag then — when present — the 4-byte
+    /// little-endian op version. The file lands atomically — temp, flushed,
+    /// renamed, directory flushed — so a crash never leaves a torn record; a
+    /// record with neither field removes the file. The binding is derived state
+    /// (re-derivable from live subscribers) rather than the authoritative op log,
+    /// so a caller treats a write failure as a durability-cache miss, not a data
+    /// loss.
+    pub fn write_meta(&mut self, room: &[u8], meta: &RoomMeta) -> io::Result<()> {
+        if meta.governing.is_none() && meta.max_op_version.is_none() {
+            return self.remove_if_present(&self.meta_path(room));
+        }
+        let mut buf = Vec::new();
+        match &meta.governing {
+            Some((app, version)) => {
+                buf.push(1);
+                put_bytes(&mut buf, app);
+                buf.extend_from_slice(&version.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+        match meta.max_op_version {
+            Some(version) => {
+                buf.push(1);
+                buf.extend_from_slice(&version.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+        self.atomic_write(&self.meta_path(room), &self.meta_tmp_path(room), &buf)
+    }
+
+    /// Write `buf` to `path` atomically: fill `tmp`, flush it, rename it into
+    /// place, then flush the directory so the rename itself is crash-durable. A
+    /// reader sees either the whole prior file or the whole new one, never a torn
+    /// mix.
+    fn atomic_write(&self, path: &Path, tmp: &Path, buf: &[u8]) -> io::Result<()> {
         {
             let mut file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(&tmp)?;
-            file.write_all(&buf)?;
+                .open(tmp)?;
+            file.write_all(buf)?;
             file.sync_all()?;
         }
-        fs::rename(&tmp, self.versions_path(room))?;
+        fs::rename(tmp, path)?;
         self.sync_dir()
+    }
+
+    /// Remove `path` and flush the directory so the removal is durable, treating
+    /// an already-absent file as success. A no-op leaves the directory unflushed —
+    /// nothing changed to persist.
+    fn remove_if_present(&self, path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => self.sync_dir(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Flush the root directory so a rename or removal within it is durable.
@@ -193,11 +251,12 @@ impl Store {
         File::open(&self.root)?.sync_all()
     }
 
-    /// Every room's snapshot and log, keyed by room id. Room order is
-    /// unspecified. A torn tail log record is dropped; a complete but
+    /// Every room's snapshot, log, and governing metadata, keyed by room id. Room
+    /// order is unspecified. A torn tail log record is dropped; a complete but
     /// undecodable record, or a snapshot missing its header, is an
-    /// [`io::ErrorKind::InvalidData`] error. An uncommitted snapshot temp is
-    /// ignored.
+    /// [`io::ErrorKind::InvalidData`] error. An undecodable metadata record loads
+    /// as absent (a durability cache, never fatal). An uncommitted snapshot temp
+    /// is ignored.
     pub fn load(&self) -> io::Result<Vec<(RoomId, RoomLog)>> {
         let mut rooms: HashMap<RoomId, RoomLog> = HashMap::new();
         for entry in fs::read_dir(&self.root)? {
@@ -212,6 +271,10 @@ impl Store {
                 FileKind::Log => slot.ops = decode_records(&bytes)?,
                 FileKind::Snapshot => slot.snapshot = Some(parse_snapshot(&bytes)?),
                 FileKind::Versions => slot.versions = parse_versions(&bytes)?,
+                // Metadata is a durability cache, not authoritative: an undecodable
+                // record loads as absent, leaving the rebuild-from-log /
+                // bind-on-subscribe fallback rather than failing the whole load.
+                FileKind::Meta => slot.meta = parse_meta(&bytes),
             }
         }
         Ok(rooms.into_iter().collect())
@@ -255,6 +318,17 @@ impl Store {
         self.root
             .join(format!("{}.versions.tmp", Self::hex_name(room)))
     }
+
+    /// The governing-metadata file backing `room`.
+    fn meta_path(&self, room: &[u8]) -> PathBuf {
+        self.root.join(format!("{}.meta", Self::hex_name(room)))
+    }
+
+    /// The in-progress metadata temp for `room`, renamed onto `meta_path` once
+    /// durable.
+    fn meta_tmp_path(&self, room: &[u8]) -> PathBuf {
+        self.root.join(format!("{}.meta.tmp", Self::hex_name(room)))
+    }
 }
 
 /// Append `bytes` to `buf` as a `u32` little-endian length prefix then the bytes.
@@ -271,15 +345,17 @@ enum FileKind {
     Log,
     Snapshot,
     Versions,
+    Meta,
 }
 
 /// Recover a room id and file kind from a path, or `None` if it is not one of
-/// ours (including an uncommitted `.snap.tmp` / `.versions.tmp`).
+/// ours (including an uncommitted `.snap.tmp` / `.versions.tmp` / `.meta.tmp`).
 fn classify(path: &Path) -> Option<(RoomId, FileKind)> {
     let kind = match path.extension()?.to_str()? {
         "log" => FileKind::Log,
         "snap" => FileKind::Snapshot,
         "versions" => FileKind::Versions,
+        "meta" => FileKind::Meta,
         _ => return None,
     };
     let stem = path.file_stem()?.to_str()?.as_bytes();
@@ -334,6 +410,39 @@ fn parse_versions(bytes: &[u8]) -> io::Result<Vec<(Vec<u8>, u64, Option<Vec<u8>>
         versions.push((name, seq, origin, ordinal, state));
     }
     Ok(versions)
+}
+
+/// Parse a governing-metadata record, or `None` if it is absent or malformed —
+/// the load path treats metadata as a durability cache and never fails on it, so
+/// any framing shortfall or bad flag reconstructs from the log instead. A record
+/// with neither field present decodes to `None`, matching the file's removal when
+/// there is nothing to persist.
+fn parse_meta(bytes: &[u8]) -> Option<RoomMeta> {
+    let mut at = 0;
+    let governing = match take_u8(bytes, &mut at).ok()? {
+        0 => None,
+        1 => {
+            let app = take_bytes(bytes, &mut at).ok()?;
+            let version = take_u32(bytes, &mut at).ok()?;
+            Some((app, version))
+        }
+        _ => return None,
+    };
+    let max_op_version = match take_u8(bytes, &mut at).ok()? {
+        0 => None,
+        1 => Some(take_u32(bytes, &mut at).ok()?),
+        _ => return None,
+    };
+    if at != bytes.len() {
+        return None;
+    }
+    if governing.is_none() && max_op_version.is_none() {
+        return None;
+    }
+    Some(RoomMeta {
+        governing,
+        max_op_version,
+    })
 }
 
 /// Read a single byte at `at`, advancing it.
