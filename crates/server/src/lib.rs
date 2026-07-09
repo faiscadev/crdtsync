@@ -51,6 +51,11 @@ struct Room {
     log: Vec<StoredOp>,
     seen: HashSet<OpId>,
     base_seq: u64,
+    /// The highest governing-app op version ever folded into this room — the
+    /// worst-case op version a joiner must down-reach to be served the whole
+    /// replica. It tracks the merged state, so compaction (which drops the log)
+    /// leaves it standing; relay and foreign-app ops are untagged and excluded.
+    max_op_version: Option<u32>,
 }
 
 impl Room {
@@ -60,6 +65,7 @@ impl Room {
             log: Vec::new(),
             seen: HashSet::new(),
             base_seq: 0,
+            max_op_version: None,
         }
     }
 
@@ -552,6 +558,7 @@ impl Hub {
                     log: Vec::new(),
                     seen,
                     base_seq: snapshot.base_seq,
+                    max_op_version: None,
                 },
             );
         }
@@ -634,6 +641,7 @@ impl Hub {
         for rec in &fresh {
             room.seen.insert(rec.op.id);
             room.doc.apply(&rec.op);
+            room.max_op_version = room.max_op_version.max(rec.schema_version);
             room.log.push(rec.clone());
         }
         // A retained log that has grown to the threshold folds into a snapshot
@@ -740,6 +748,7 @@ impl Hub {
                 log: Vec::new(),
                 seen,
                 base_seq,
+                max_op_version: None,
             },
         );
         Ok(true)
@@ -786,6 +795,17 @@ impl Hub {
             .get(room)
             .map(|r| r.log.iter().map(|rec| rec.schema_version).collect())
             .unwrap_or_default()
+    }
+
+    /// The governing app's op-version high-water for `room` — the highest op
+    /// version ever folded into the merged replica, the worst-case op version a
+    /// joiner must be able to down-reach to be served the whole state. It tracks
+    /// the merged state, not the retained log, so compaction leaves it standing;
+    /// relay and foreign-app ops are untagged and excluded. `None` when the room
+    /// holds no governing-app op, so the handshake range-check has nothing to
+    /// reach and the snapshot seam has no version to project from.
+    pub fn max_op_version(&self, room: &[u8]) -> Option<u32> {
+        self.rooms.get(room).and_then(|r| r.max_op_version)
     }
 
     /// Capture the room's current whole-replica state as a named version, keyed

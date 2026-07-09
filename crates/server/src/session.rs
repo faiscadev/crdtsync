@@ -274,10 +274,13 @@ pub fn step(
                 return forbidden("read denied");
             }
             // The handshake range-check: a joiner that cannot reach the room's
-            // governing version across a back-compatible path is refused with
+            // op-version high-water across a back-compatible path is refused with
             // `onUpdateRequired` before it becomes a subscriber, so down-
-            // translation at fan-out only ever traverses invertible edges.
-            if !subscriber_reaches_governing(registry, governing, session) {
+            // translation at fan-out only ever traverses invertible edges. The
+            // high-water is the worst-case op version the merged state embodies,
+            // not the sticky governing floor a departed higher-version peer left.
+            let high_water = hub.max_op_version(&room);
+            if !subscriber_reaches_governing(registry, governing, session, high_water) {
                 return Response {
                     replies: vec![Message::Error {
                         code: ErrorCode::UpdateRequired,
@@ -295,7 +298,7 @@ pub fn step(
                 Catchup::Snapshot { seq, state } => Message::Snapshot {
                     channel,
                     seq,
-                    state: catch_up_snapshot(registry, governing, session, state),
+                    state: catch_up_snapshot(registry, governing, session, high_water, state),
                 },
             };
             // After the catch-up, replay the room's current presence so the
@@ -615,26 +618,28 @@ fn catch_up_ops(
     }
 }
 
-/// Down-project a catch-up snapshot to the joining session's version, on the
-/// same app-scoping as the op delta: an enforcing joiner of the room's governing
-/// app has fields added above its version projected out of the snapshot; a
-/// relay, unbound, or foreign-app joiner takes it verbatim — its version is a
-/// different space and must never drive the room's chain.
+/// Migrate a catch-up snapshot to the joining session's version, on the same
+/// app-scoping as the op delta. The snapshot is projected from the room's
+/// op-version `high_water` — the version its merged state actually embodies — so
+/// an enforcing joiner below it has fields added above its version projected out,
+/// and one above it has the state up-migrated. The handshake admits a joiner only
+/// when it reaches the high-water, so this projection is always across invertible
+/// edges. A relay, unbound, foreign-app, or same-version joiner, or a room with
+/// no governing-app content, takes the snapshot verbatim.
 fn catch_up_snapshot(
     registry: &Mutex<SchemaRegistry>,
     governing: Option<(&[u8], u32)>,
     session: &Session,
+    high_water: Option<u32>,
     state: Vec<u8>,
 ) -> Vec<u8> {
-    match governing_target(governing, session) {
-        // A same-version joiner needs no migration and no chain — skip the lock
-        // and serve the snapshot as is.
-        Some((app, governing_version, target)) if governing_version != target => {
+    match (governing_target(governing, session), high_water) {
+        (Some((app, _, target)), Some(high_water)) if high_water != target => {
             let reg = match registry.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            crate::translate::translate_snapshot(&reg, app, &state, governing_version, target)
+            crate::translate::translate_snapshot(&reg, app, &state, high_water, target)
         }
         _ => state,
     }
@@ -642,27 +647,33 @@ fn catch_up_snapshot(
 
 /// Whether a subscriber may be served the room's ops, or must be refused with
 /// `onUpdateRequired`. Only an enforcing joiner of the room's governing app is
-/// range-checked: it must reach the governing version across a back-compatible
-/// path (forward always, backward only over invertible edges). A relay or
-/// foreign-app joiner is a different version space and is never refused. A
-/// broken chain (a gap the registry cannot bridge) refuses, fail-closed.
+/// range-checked: it must reach the room's op-version `high_water` — the highest
+/// creation version the merged state embodies — across a back-compatible path
+/// (forward always, backward only over invertible edges). A joiner admitted at
+/// the true high-water can down-reach every op the room holds, so fan-out and the
+/// snapshot seam only ever traverse invertible edges. A room with no versioned op
+/// (`high_water` is `None`) has nothing to reach and never refuses on this basis.
+/// A relay or
+/// foreign-app joiner is a different version space and is never refused. A broken
+/// chain (a gap the registry cannot bridge) refuses, fail-closed.
 fn subscriber_reaches_governing(
     registry: &Mutex<SchemaRegistry>,
     governing: Option<(&[u8], u32)>,
     session: &Session,
+    high_water: Option<u32>,
 ) -> bool {
-    match governing_target(governing, session) {
-        Some((app, governing_version, client_version)) => {
+    match (governing_target(governing, session), high_water) {
+        (Some((app, _, client_version)), Some(high_water)) => {
             let reg = match registry.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
             matches!(
-                crate::translate::reachable(&reg, app, governing_version, client_version),
+                crate::translate::reachable(&reg, app, high_water, client_version),
                 Ok(true)
             )
         }
-        None => true,
+        _ => true,
     }
 }
 
