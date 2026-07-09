@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crdtsync_core::schema::Trigger;
-use crdtsync_core::{ClientId, Message, Op, Schema};
+use crdtsync_core::{ClientId, ErrorCode, Message, Op, Schema};
 
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
@@ -729,6 +729,16 @@ impl Registry {
             }
             _ => None,
         };
+        // An ops write's room and its op-version high-water before the write. If
+        // the ingest raises the high-water past a joined enforcing peer's reach,
+        // that peer is re-checked and evicted below — captured pre-step so the
+        // lift is the pre/post delta.
+        let lift_room: Option<(RoomId, Option<u32>)> = match &msg {
+            Message::Ops { .. } => authz_room
+                .as_ref()
+                .map(|room| (room.clone(), self.hub.max_op_version(room))),
+            _ => None,
+        };
         let (
             broadcast,
             broadcast_version,
@@ -932,11 +942,67 @@ impl Registry {
                 }
             }
         }
+        // A write that raised the room's op-version high-water can strand a joined
+        // enforcing peer whose back-compat reach the new high-water opens past:
+        // fan-out fail-closes its down-drop, so evict it with `UpdateRequired`
+        // rather than leaving it silently un-updated. Only a genuine lift re-checks
+        // — a same-or-lower write moves nothing.
+        if let (Some((room, pre_high_water)), Some((app, version))) = (lift_room, &governing) {
+            let post_high_water = self.hub.max_op_version(&room);
+            if post_high_water > pre_high_water {
+                self.evict_stranded(&room, (app.as_slice(), *version), post_high_water);
+            }
+        }
         // Every room-bearing lifecycle event this delivery emitted (a subscribe, a
         // version mutation, a compaction) was recorded by the auto-version sink;
         // act on them now that the delivery has committed.
         self.drain_auto_versions();
         !close
+    }
+
+    /// Re-check each joined enforcing subscriber of `room` against the lifted
+    /// op-version `high_water` and evict any the write just stranded — a peer of
+    /// the governing app whose version can no longer down-reach the high-water
+    /// across a back-compatible path. The evicted peer is sent `UpdateRequired`
+    /// and dropped from the room, so it stops receiving fan-out and must
+    /// re-subscribe after updating. A relay, foreign-app, versionless, or
+    /// still-reachable peer — the writer included — is untouched: eviction reuses
+    /// the exact predicate the subscribe gate admits on, so admission and eviction
+    /// agree.
+    fn evict_stranded(&mut self, room: &[u8], governing: (&[u8], u32), high_water: Option<u32>) {
+        let schema = &self.schema;
+        let stranded: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter(|(_, conn)| {
+                conn.session
+                    .subscribed_rooms()
+                    .any(|r| r.as_slice() == room)
+            })
+            .filter(|(_, conn)| {
+                !crate::session::subscriber_reaches_governing(
+                    schema,
+                    Some(governing),
+                    &conn.session,
+                    high_water,
+                )
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stranded {
+            if let Some(conn) = self.conns.get_mut(&id) {
+                // `Error` names no channel, so one frame evicts the peer from the
+                // room however many channels it held it on.
+                if !conn.session.drop_room(room).is_empty() {
+                    conn.outbox.push(Message::Error {
+                        code: ErrorCode::UpdateRequired,
+                        message: "a write raised the room's version beyond this peer's reach"
+                            .to_string(),
+                        details: Vec::new(),
+                    });
+                }
+            }
+        }
     }
 
     /// Capture the auto-versions the recorded lifecycle events call for. For each
