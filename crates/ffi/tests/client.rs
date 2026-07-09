@@ -7,7 +7,7 @@
 //! the round trip is leak-clean under Miri.
 
 use crdtsync_core::{
-    decode_message, decode_ops, encode_message, Channel, ErrorCode, Message, Scalar,
+    decode_message, decode_ops, encode_message, encode_op, Channel, ErrorCode, Message, Op, Scalar,
 };
 use crdtsync_ffi::*;
 use std::ptr;
@@ -698,6 +698,131 @@ fn a_mark_enqueues_and_resends_over_the_wire_client() {
         crdtsync_buf_free(mid);
         crdtsync_client_free(a);
         crdtsync_client_free(b);
+    }
+}
+
+/// A little-endian reader over the `take_rejected` buffer.
+struct Reader<'a> {
+    d: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn u32(&mut self) -> u32 {
+        let v = u32::from_le_bytes(self.d[self.i..self.i + 4].try_into().unwrap());
+        self.i += 4;
+        v
+    }
+
+    fn i32(&mut self) -> i32 {
+        let v = i32::from_le_bytes(self.d[self.i..self.i + 4].try_into().unwrap());
+        self.i += 4;
+        v
+    }
+
+    fn blob(&mut self) -> &'a [u8] {
+        let n = self.u32() as usize;
+        let b = &self.d[self.i..self.i + n];
+        self.i += n;
+        b
+    }
+}
+
+/// One decoded rejected batch: its channel, reason discriminant, and op bytes.
+struct DecodedRejected {
+    channel: u32,
+    reason: i32,
+    ops: Vec<Vec<u8>>,
+}
+
+fn decode_rejected(data: &[u8]) -> Vec<DecodedRejected> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let mut r = Reader { d: data, i: 0 };
+    let n = r.u32();
+    (0..n)
+        .map(|_| {
+            let channel = r.u32();
+            let reason = r.i32();
+            let count = r.u32();
+            let ops = (0..count).map(|_| r.blob().to_vec()).collect();
+            DecodedRejected {
+                channel,
+                reason,
+                ops,
+            }
+        })
+        .collect()
+}
+
+/// The per-client sequences of an authored Ops frame — how the server names the
+/// ops it refuses.
+fn seqs_of_frame(frame: &CrdtBuf) -> (Vec<u64>, Vec<Op>) {
+    unsafe {
+        match decode_message(std::slice::from_raw_parts(frame.ptr, frame.len)).unwrap() {
+            Message::Ops { ops, .. } => (ops.iter().map(|o| o.id.seq).collect(), ops),
+            other => panic!("expected Ops, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_server_ops_rejection_surfaces_the_refused_batch() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        let (ch, sub) = subscribe(c, b"room-1");
+        crdtsync_buf_free(sub);
+        let p = path(&[b"age"]);
+
+        // Author an edit; its ops enter the outbox with per-client sequences.
+        let authored = register_int(c, ch, &p, 30);
+        let (seqs, ops) = seqs_of_frame(&authored);
+        crdtsync_buf_free(authored);
+
+        // The server refuses that batch — Forbidden, the auth-revoked rejection.
+        let rejection = encode_message(&Message::OpsRejected {
+            channel: Channel(ch),
+            seqs,
+            reason: ErrorCode::Forbidden,
+        });
+        assert_eq!(
+            crdtsync_client_receive(c, rejection.as_ptr(), rejection.len(), ptr::null_mut()),
+            1
+        );
+
+        // The drain yields the one batch: the channel, the reason (5 = Forbidden),
+        // and the refused ops still carrying their bytes.
+        let mut out = out_buf();
+        assert_eq!(crdtsync_client_take_rejected(c, &mut out), 1);
+        let decoded = decode_rejected(std::slice::from_raw_parts(out.ptr, out.len));
+        crdtsync_buf_free(out);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].channel, ch);
+        assert_eq!(decoded[0].reason, 5);
+        let expected: Vec<Vec<u8>> = ops.iter().map(encode_op).collect();
+        assert_eq!(decoded[0].ops, expected);
+
+        // Draining: a second call is a bare zero count, no batches.
+        let mut again = out_buf();
+        assert_eq!(crdtsync_client_take_rejected(c, &mut again), 1);
+        assert!(decode_rejected(std::slice::from_raw_parts(again.ptr, again.len)).is_empty());
+        crdtsync_buf_free(again);
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
+fn take_rejected_on_a_bad_handle_or_null_out_is_rejected() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        // A null out on a live handle is rejected, never written.
+        assert_eq!(crdtsync_client_take_rejected(c, ptr::null_mut()), -1);
+        // A bad handle is rejected, never dereferenced.
+        let mut out = out_buf();
+        assert_eq!(crdtsync_client_take_rejected(ptr::null_mut(), &mut out), -1);
+        crdtsync_client_free(c);
     }
 }
 

@@ -16,12 +16,13 @@ import enum
 import os
 import platform
 import struct
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 __all__ = [
     "Client",
     "Document",
     "ErrorCode",
+    "Rejected",
     "ServerError",
     "Side",
     "Undo",
@@ -61,6 +62,17 @@ class ServerError(RuntimeError):
     def __init__(self, code: ErrorCode):
         super().__init__(f"server reported {code.name}")
         self.code = code
+
+
+class Rejected(NamedTuple):
+    """An op batch the server refused, surfaced by :meth:`Client.take_rejected`
+    for the app to show, discard, or export. ``channel`` names the room, ``reason``
+    the :class:`ErrorCode` (``FORBIDDEN`` for auth revoked), and ``ops`` the refused
+    ops still carrying their bytes."""
+
+    channel: int
+    reason: ErrorCode
+    ops: List[bytes]
 
 
 class _CrdtBuf(ctypes.Structure):
@@ -194,6 +206,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         [doc, cbytes, size, c.POINTER(c.c_int32)],
         c.c_int32,
     )
+    sig(lib.crdtsync_client_take_rejected, [doc, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_last_seen_seq, [doc, ch, c.POINTER(c.c_uint64)], c.c_int32)
     sig(lib.crdtsync_client_register_int, [doc, ch, cbytes, size, c.c_int64], buf)
     sig(lib.crdtsync_client_inc, [doc, ch, cbytes, size, c.c_uint32], buf)
@@ -311,6 +324,9 @@ class _Reader:
 
     def u64(self) -> int:
         return int.from_bytes(self._take(8), "little")
+
+    def i32(self) -> int:
+        return int.from_bytes(self._take(4), "little", signed=True)
 
     def i64(self) -> int:
         return int.from_bytes(self._take(8), "little", signed=True)
@@ -471,6 +487,22 @@ def _decode_repair_paths(data: bytes) -> list:
         return []
     r = _Reader(data)
     return [_decode_repair_path(r.blob()) for _ in range(r.u32())]
+
+
+def _decode_rejected(data: bytes) -> List[Rejected]:
+    """Decode the ``take_rejected`` buffer: a ``u32`` count, then per batch the
+    channel (``u32``), the reason ``ErrorCode`` (``i32``), and the ops — a ``u32``
+    op-count then per op a length-prefixed op byte string."""
+    if not data:
+        return []
+    r = _Reader(data)
+    out = []
+    for _ in range(r.u32()):
+        channel = r.u32()
+        reason = ErrorCode(r.i32())
+        ops = [r.blob() for _ in range(r.u32())]
+        out.append(Rejected(channel=channel, reason=reason, ops=ops))
+    return out
 
 
 def _diff_raw(old_state: bytes, new_state: bytes) -> bytes:
@@ -1066,6 +1098,15 @@ class Client:
         if rc == 0 and code.value >= 0:
             raise ServerError(ErrorCode(code.value))
         return rc
+
+    def take_rejected(self) -> List[Rejected]:
+        """Drain the op batches the server refused since the last call — the
+        ``onOpsRejected`` observation. Each :class:`Rejected` names the channel, the
+        :class:`ErrorCode` reason, and the refused ops (their bytes, to show,
+        discard, or export). Draining, so a second call is empty."""
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_take_rejected(self._handle, ctypes.byref(out))
+        return _decode_rejected(_take_buf(out)) if rc == 1 else []
 
     def last_seen_seq(self, channel: int) -> Optional[int]:
         """The highest server sequence ``channel`` has caught up to."""

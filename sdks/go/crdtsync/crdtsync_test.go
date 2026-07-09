@@ -493,6 +493,77 @@ func TestServerErrorFrameSurfacesItsCode(t *testing.T) {
 	}
 }
 
+func TestServerOpsRejectionSurfacesTheRefusedBatch(t *testing.T) {
+	// OpsRejected: tag 22, u32 channel, u16 reason, u32 seq-count, u64 seqs.
+	opsRejected := func(channel uint32, seqs []uint64, reason uint16) []byte {
+		frame := make([]byte, 1+4+2+4+8*len(seqs))
+		frame[0] = 22
+		binary.LittleEndian.PutUint32(frame[1:], channel)
+		binary.LittleEndian.PutUint16(frame[5:], reason)
+		binary.LittleEndian.PutUint32(frame[7:], uint32(len(seqs)))
+		for i, s := range seqs {
+			binary.LittleEndian.PutUint64(frame[11+8*i:], s)
+		}
+		return frame
+	}
+
+	c := newClient(t, 1)
+	defer c.Close()
+	ca, _ := c.Subscribe(key("room-1"))
+
+	// Author an edit; its ops enter the outbox with per-client sequences 0..n.
+	c.RegisterInt(ca, path("age"), 30)
+	n := c.OutboxLen(ca)
+	if n == 0 {
+		t.Fatal("an authored edit should enter the outbox")
+	}
+	seqs := make([]uint64, n)
+	for i := range seqs {
+		seqs[i] = uint64(i)
+	}
+
+	// The server refuses that batch — Forbidden, the auth-revoked rejection.
+	if rc, _ := c.Receive(opsRejected(ca, seqs, uint16(Forbidden))); rc != 1 {
+		t.Fatalf("receive ops-rejected: got rc=%d, want 1", rc)
+	}
+
+	// The drain yields the one batch: the channel, the reason, and the refused ops
+	// still carrying their bytes.
+	rejected := c.TakeRejected()
+	if len(rejected) != 1 {
+		t.Fatalf("take rejected: got %d batches, want 1", len(rejected))
+	}
+	r := rejected[0]
+	if r.Channel != ca || r.Reason != Forbidden {
+		t.Fatalf("batch: got channel=%d reason=%d, want %d %d", r.Channel, r.Reason, ca, Forbidden)
+	}
+	if len(r.Ops) != int(n) {
+		t.Fatalf("batch ops: got %d, want %d", len(r.Ops), n)
+	}
+	for _, op := range r.Ops {
+		if len(op) == 0 {
+			t.Fatal("a refused op should carry its bytes")
+		}
+	}
+
+	// The refused ops left the outbox; draining, a second call is empty.
+	if left := c.OutboxLen(ca); left != 0 {
+		t.Fatalf("outbox after rejection: got %d, want 0", left)
+	}
+	if again := c.TakeRejected(); len(again) != 0 {
+		t.Fatalf("second drain: got %d batches, want 0", len(again))
+	}
+}
+
+func TestTakeRejectedIsEmptyWithoutARejection(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+	c.Subscribe(key("room-1"))
+	if r := c.TakeRejected(); len(r) != 0 {
+		t.Fatalf("take rejected without a rejection: got %d, want 0", len(r))
+	}
+}
+
 func newUndo(t *testing.T) *Undo {
 	t.Helper()
 	u, err := NewUndo()

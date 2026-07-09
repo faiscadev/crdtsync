@@ -407,6 +407,52 @@ fn a_server_error_frame_throws_its_code() {
 }
 
 #[wasm_bindgen_test]
+fn a_server_ops_rejection_surfaces_the_refused_batch() {
+    use crdtsync_core::protocol::{encode_message, Channel, ErrorCode as CoreErrorCode, Message};
+    use crdtsync_wasm::ErrorCode;
+    let mut c = wasm_client(1);
+    let sub = c.subscribe(b"room-1");
+    let ch = sub.channel();
+
+    // Author an edit; its ops enter the outbox with per-client sequences 0..n.
+    c.register_int(ch, &path(&["age"]), 30);
+    let n = c.outbox_len(ch);
+    assert!(n >= 1);
+    let seqs: Vec<u64> = (0..n as u64).collect();
+
+    // The server refuses that batch — Forbidden, the auth-revoked rejection.
+    let rejection = encode_message(&Message::OpsRejected {
+        channel: Channel(ch),
+        seqs,
+        reason: CoreErrorCode::Forbidden,
+    });
+    assert!(c.receive(&rejection).unwrap());
+
+    // The drain yields one { channel, reason, ops } batch.
+    let batches = js_sys::Array::from(&c.take_rejected());
+    assert_eq!(batches.length(), 1);
+    let entry = batches.get(0);
+    let channel = js_sys::Reflect::get(&entry, &"channel".into())
+        .unwrap()
+        .as_f64()
+        .unwrap();
+    assert_eq!(channel, ch as f64);
+    let reason = js_sys::Reflect::get(&entry, &"reason".into())
+        .unwrap()
+        .as_f64()
+        .unwrap();
+    assert_eq!(reason, ErrorCode::Forbidden as i32 as f64);
+    let ops = js_sys::Array::from(&js_sys::Reflect::get(&entry, &"ops".into()).unwrap());
+    assert_eq!(ops.length(), n as u32);
+    // Each refused op carries its bytes.
+    assert!(js_sys::Uint8Array::from(ops.get(0)).length() > 0);
+
+    // The refused ops left the outbox; draining, a second call is empty.
+    assert_eq!(c.outbox_len(ch), 0);
+    assert_eq!(js_sys::Array::from(&c.take_rejected()).length(), 0);
+}
+
+#[wasm_bindgen_test]
 fn a_client_atomic_transaction_travels_to_a_peer() {
     let mut a = wasm_client(1);
     let mut b = wasm_client(2);
