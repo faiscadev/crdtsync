@@ -32,6 +32,7 @@ use crate::list::List;
 use crate::map::Map;
 use crate::scalar::Scalar;
 use crate::schema::{Schema, TypeDef};
+use crate::zone::zone_of;
 
 /// One step down the element tree: a map slot key, or a list item index.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +76,12 @@ pub enum ViolationKind {
         expected: ElementKind,
         found: ElementKind,
     },
+    /// A ranged annotation whose two endpoints resolve to different zones. The
+    /// per-zone clocks never order across a zone boundary, so a range straddling
+    /// one is not admissible; it reads as absent. `id` is the ranged element's
+    /// document-level identity — it lives in the annotation set, not at a tree
+    /// path, so a cross-zone violation carries an empty path.
+    CrossZoneAnchor { id: ElementId },
 }
 
 /// A single constraint violation at a located element.
@@ -157,6 +164,7 @@ enum Work<'a> {
 /// order. An empty result is a conforming document.
 pub fn validate(doc: &Document, schema: &Schema) -> Vec<Violation> {
     Validator {
+        doc,
         schema,
         visited: HashSet::new(),
         out: Vec::new(),
@@ -166,12 +174,14 @@ pub fn validate(doc: &Document, schema: &Schema) -> Vec<Violation> {
             path: Rc::new(PathNode::Root),
         }],
         allowlists: HashMap::new(),
+        seq_paths: HashMap::new(),
     }
     .run()
 }
 
 /// The state of one validation walk over an explicit work stack.
 struct Validator<'a> {
+    doc: &'a Document,
     schema: &'a Schema,
     visited: HashSet<ElementId>,
     out: Vec<Violation>,
@@ -180,6 +190,10 @@ struct Validator<'a> {
     /// across every instance of it — a recursive schema visits one type's maps
     /// many times.
     allowlists: HashMap<&'a str, HashMap<&'a [u8], &'a str>>,
+    /// Each reached element's tree path, keyed by id — the location a ranged
+    /// anchor's `seq` resolves to for its zone. Recorded the first time an element
+    /// is reached, so the path is deterministic when a slot graph shares a node.
+    seq_paths: HashMap<ElementId, Rc<PathNode>>,
 }
 
 /// The runtime kind an element of type `td` must have.
@@ -308,6 +322,19 @@ fn is_target(element: &Element, target: ElementId) -> bool {
     !matches!(element, Element::Scalar(_)) && element.id() == target
 }
 
+/// A tree path as the uniform key path [`zone_of`] consumes: a map key is its raw
+/// bytes, a list/sequence index its decimal digits — the same byte segments a
+/// parsed location path carries.
+fn path_keys(steps: &[Step]) -> Vec<Vec<u8>> {
+    steps
+        .iter()
+        .map(|step| match step {
+            Step::Key(k) => k.clone(),
+            Step::Index(i) => i.to_string().into_bytes(),
+        })
+        .collect()
+}
+
 impl<'a> Validator<'a> {
     fn run(mut self) -> Vec<Violation> {
         while let Some(work) = self.stack.pop() {
@@ -327,7 +354,36 @@ impl<'a> Validator<'a> {
                 } => self.check(element, type_name, path),
             }
         }
+        self.check_cross_zone_anchors();
         self.out
+    }
+
+    /// Flag every ranged annotation whose two endpoints resolve to different
+    /// zones. A range lives in the document annotation set, id-sorted, and each
+    /// endpoint's `seq` resolves through the paths gathered by the tree walk — an
+    /// endpoint whose sequence the walk did not reach is unzoned, so it crosses
+    /// only a *reached* zoned endpoint, matching the "no zones declared" baseline.
+    fn check_cross_zone_anchors(&mut self) {
+        if self.schema.zones().is_empty() {
+            return;
+        }
+        let mut crossed = Vec::new();
+        for r in self.doc.ranged_elements() {
+            if self.endpoint_zone(r.start.seq) != self.endpoint_zone(r.end.seq) {
+                crossed.push(Violation {
+                    path: Vec::new(),
+                    kind: ViolationKind::CrossZoneAnchor { id: r.id },
+                });
+            }
+        }
+        self.out.extend(crossed);
+    }
+
+    /// The zone the sequence `seq` falls in, or `None` when it is unzoned or the
+    /// tree walk never reached it (an anchor into an unmaterialized sequence).
+    fn endpoint_zone(&self, seq: ElementId) -> Option<&'a str> {
+        let path = self.seq_paths.get(&seq)?;
+        zone_of(self.schema, &path_keys(&path.steps()))
     }
 
     /// Check one element against `type_name`: its own constraint every time it is
@@ -339,6 +395,13 @@ impl<'a> Validator<'a> {
         let Some(td) = self.schema.type_def(type_name) else {
             return;
         };
+        // Record where each sequence sits, so a ranged anchor naming it resolves to
+        // its zone. Scalars carry no id and never anchor a range.
+        if !matches!(element, Element::Scalar(_)) {
+            self.seq_paths
+                .entry(element.id())
+                .or_insert_with(|| path.clone());
+        }
         let found = element.kind();
         let expected = expected_kind(td);
         if found != expected {

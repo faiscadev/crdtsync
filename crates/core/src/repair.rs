@@ -91,6 +91,12 @@ pub(crate) enum RepairId {
     Wrap {
         id: ElementId,
     },
+    /// A cross-zone ranged annotation dropped from a conformant read. Keyed by the
+    /// ranged element's document-level id — it lives in the annotation set, not at
+    /// a tree path, so its identity is the id, not a location.
+    DropRanged {
+        id: ElementId,
+    },
 }
 
 /// How every non-conformant element in `doc` reads repaired against `schema`, in
@@ -143,6 +149,9 @@ pub(crate) fn keyed_repairs(doc: &Document, schema: &Schema) -> Vec<(Repair, Rep
                 | ViolationKind::DisallowedChild
                 | ViolationKind::ExcessChild { .. } => {
                     (RepairKind::Dropped, RepairId::Drop { path: path.clone() })
+                }
+                ViolationKind::CrossZoneAnchor { id } => {
+                    (RepairKind::Dropped, RepairId::DropRanged { id })
                 }
                 ViolationKind::OrphanInline { block } => {
                     let orphan = element_at(doc, &path)?;
