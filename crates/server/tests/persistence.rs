@@ -62,6 +62,7 @@ fn one_room_log(room: &[u8], ops: Vec<Op>) -> Vec<(RoomId, RoomLog)> {
             snapshot: None,
             ops: relay(ops),
             versions: Vec::new(),
+            meta: None,
         },
     )]
 }
@@ -146,6 +147,7 @@ fn from_rooms_replays_independent_rooms() {
                 snapshot: None,
                 ops: relay(a),
                 versions: Vec::new(),
+                meta: None,
             },
         ),
         (
@@ -154,6 +156,7 @@ fn from_rooms_replays_independent_rooms() {
                 snapshot: None,
                 ops: relay(b),
                 versions: Vec::new(),
+                meta: None,
             },
         ),
     ];
@@ -472,6 +475,79 @@ fn an_auto_compacted_room_persists_its_snapshot() {
     assert_eq!(int(reloaded.get(ROOM, b"a")), 1);
     assert_eq!(int(reloaded.get(ROOM, b"b")), 2);
     assert_eq!(reloaded.seq(ROOM), 2);
+}
+
+// --- durable governing metadata ---
+
+#[test]
+fn the_op_version_high_water_survives_a_compacted_restart() {
+    let tmp = tempdir();
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        // An enforcing op at version 4 sets the high-water, then compaction folds
+        // the whole log into the snapshot — the live log no longer carries the op
+        // that raised the high-water.
+        hub.ingest(
+            ROOM,
+            doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30))),
+            Some(4),
+        )
+        .unwrap();
+        hub.compact(ROOM).unwrap();
+        assert_eq!(hub.max_op_version(ROOM), Some(4));
+    }
+    // A restart replays only the post-compaction tail (empty), so the high-water
+    // is recovered from the persisted metadata rather than under-counted to None.
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hub.max_op_version(ROOM), Some(4));
+}
+
+#[test]
+fn the_op_version_high_water_survives_an_uncompacted_restart() {
+    let tmp = tempdir();
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        hub.ingest(
+            ROOM,
+            doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30))),
+            Some(7),
+        )
+        .unwrap();
+    }
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hub.max_op_version(ROOM), Some(7));
+}
+
+#[test]
+fn a_room_with_no_metadata_rebuilds_the_high_water_from_the_log() {
+    // An uncompacted room whose log the store carries but no metadata record: the
+    // high-water is rebuilt from the replayed ops, the standing fallback.
+    let tmp = tempdir();
+    let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
+    {
+        let mut store = Store::open(tmp.path()).unwrap();
+        let tagged: Vec<StoredOp> = ops
+            .iter()
+            .map(|op| StoredOp::new(op.clone(), Some(2)))
+            .collect();
+        store.append(ROOM, &tagged).unwrap();
+    }
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(hub.max_op_version(ROOM), Some(2));
 }
 
 // --- a tempdir without pulling in a dev-dependency ---

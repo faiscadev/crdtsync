@@ -37,7 +37,7 @@ pub use event::{EngineEvent, EventSink};
 pub use registry::{ConnId, Registry};
 pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry};
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
-pub use store::{RoomLog, Snapshot, Store, StoredOp};
+pub use store::{RoomLog, RoomMeta, Snapshot, Store, StoredOp};
 
 /// A room name, opaque bytes chosen by the deployment.
 pub type RoomId = Vec<u8>;
@@ -255,6 +255,14 @@ pub struct Hub {
     rooms: HashMap<RoomId, Room>,
     store: Option<Store>,
     compaction_threshold: u64,
+    /// The durable governing `{app_id, version}` per room, the mirror of the
+    /// store's persisted binding. Seeded from the store on load and updated by
+    /// [`bind_governing`](Hub::bind_governing) when a store is attached, so it
+    /// survives a restart and a dormant-room sweep that drops the registry's live
+    /// binding; a store-less hub leaves it empty, keeping the in-memory
+    /// rebuild-on-subscribe behavior. It rides here (not on `Room`) so a bound but
+    /// never-written room needs no empty replica.
+    governing: HashMap<RoomId, (Vec<u8>, u32)>,
     /// Ephemeral presence per room: each owner client's latest [`Presence`] per
     /// key. Never persisted or snapshotted. Nesting by client keeps the per-client
     /// key cap an O(1) check and lets a disconnect find a client's own entries
@@ -281,6 +289,7 @@ impl Hub {
             rooms: HashMap::new(),
             store: None,
             compaction_threshold: 0,
+            governing: HashMap::new(),
             awareness: HashMap::new(),
             versions: HashMap::new(),
             version_ordinal: 0,
@@ -567,6 +576,21 @@ impl Hub {
         // the batch) and cannot fail.
         self.ingest_records(&room, log.ops)
             .expect("a store-less replay never fails");
+        // Seed the durable governing metadata: the binding into the hub's mirror,
+        // and the op-version high-water past what the replayed tail alone yields —
+        // a compacted room's high-water counts ops folded into the snapshot, which
+        // the tail no longer carries. The persisted value is the all-time
+        // high-water, so it dominates the replay-derived one where they differ.
+        if let Some(meta) = log.meta {
+            if let Some(governing) = meta.governing {
+                self.governing.insert(room.clone(), governing);
+            }
+            if let Some(persisted) = meta.max_op_version {
+                if let Some(r) = self.rooms.get_mut(&room) {
+                    r.max_op_version = r.max_op_version.max(Some(persisted));
+                }
+            }
+        }
         if !log.versions.is_empty() {
             let index = self.versions.entry(room).or_default();
             for (name, seq, origin, ordinal, state) in log.versions {
@@ -637,12 +661,24 @@ impl Hub {
         if let Some(store) = self.store.as_mut() {
             store.append(room, &fresh)?;
         }
-        let room = self.rooms.get_mut(room).expect("room created above");
-        for rec in &fresh {
-            room.seen.insert(rec.op.id);
-            room.doc.apply(&rec.op);
-            room.max_op_version = room.max_op_version.max(rec.schema_version);
-            room.log.push(rec.clone());
+        let high_water_grew = {
+            let room = self.rooms.get_mut(room).expect("room created above");
+            let prev_high_water = room.max_op_version;
+            for rec in &fresh {
+                room.seen.insert(rec.op.id);
+                room.doc.apply(&rec.op);
+                room.max_op_version = room.max_op_version.max(rec.schema_version);
+                room.log.push(rec.clone());
+            }
+            room.max_op_version != prev_high_water
+        };
+        // The op-version high-water grew, so its durable record is stale: persist
+        // it beside the log now, before any compaction below drops the log the
+        // high-water would otherwise have to be rebuilt from. Best-effort — the
+        // metadata is a durability cache over derivable state, so a write failure
+        // degrades to the rebuild-from-log fallback rather than failing the write.
+        if high_water_grew {
+            let _ = self.persist_meta(key);
         }
         // A retained log that has grown to the threshold folds into a snapshot
         // now, resetting the window; the applied batch is returned unchanged.
@@ -806,6 +842,53 @@ impl Hub {
     /// reach and the snapshot seam has no version to project from.
     pub fn max_op_version(&self, room: &[u8]) -> Option<u32> {
         self.rooms.get(room).and_then(|r| r.max_op_version)
+    }
+
+    /// The durable governing `{app_id, version}` bound to `room`, or `None` for an
+    /// unbound room. The registry consults it to re-seed a live binding a dormant
+    /// sweep dropped, or one a restart has not yet rebuilt from a live subscriber,
+    /// so a populated room's first post-restart subscriber is served translated
+    /// rather than verbatim. Empty on a store-less hub, which keeps the pure
+    /// rebuild-on-subscribe behavior.
+    pub fn governing_app(&self, room: &[u8]) -> Option<(Vec<u8>, u32)> {
+        self.governing.get(room).cloned()
+    }
+
+    /// Bind `room`'s durable governing app to `{app_id, version}` and persist it
+    /// beside the room's state, so the binding survives a restart and a
+    /// dormant-room sweep. A no-op without a store attached — a binding is durable
+    /// only where there is a store to hold it, and a store-less hub relies on the
+    /// registry rebuilding the binding from live subscribers. Best-effort persist:
+    /// the binding is derived state, so a write failure leaves it in the mirror to
+    /// re-persist on the next bind rather than failing the caller.
+    pub fn bind_governing(&mut self, room: &[u8], app_id: Vec<u8>, version: u32) {
+        if self.store.is_none() {
+            return;
+        }
+        let next = (app_id, version);
+        if self.governing.get(room) == Some(&next) {
+            return;
+        }
+        self.governing.insert(room.to_vec(), next);
+        let _ = self.persist_meta(room);
+    }
+
+    /// Persist `room`'s governing metadata — the binding and the op-version
+    /// high-water — to the store, if one is attached. The two fields are written
+    /// together, each read from its own in-memory source, so a change to either
+    /// re-emits the whole record.
+    fn persist_meta(&mut self, room: &[u8]) -> io::Result<()> {
+        if self.store.is_none() {
+            return Ok(());
+        }
+        let meta = RoomMeta {
+            governing: self.governing.get(room).cloned(),
+            max_op_version: self.rooms.get(room).and_then(|r| r.max_op_version),
+        };
+        self.store
+            .as_mut()
+            .expect("store present, checked above")
+            .write_meta(room, &meta)
     }
 
     /// Capture the room's current whole-replica state as a named version, keyed

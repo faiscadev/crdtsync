@@ -373,10 +373,10 @@ fn a_foreign_app_writers_op_in_the_log_is_not_translated_for_a_governing_joiner(
 
 #[test]
 #[cfg_attr(miri, ignore)] // drives the durable store on the filesystem
-fn a_first_subscriber_after_a_restart_catches_up_untranslated_pending_a_persisted_binding() {
+fn a_first_subscriber_after_a_restart_catches_up_translated_from_the_persisted_binding() {
     let tmp = tempdir();
     // A v1 UP writer binds the room and writes "age"; the op persists tagged at
-    // UP v1.
+    // UP v1, and the room's governing binding persists beside it.
     {
         let mut r = store_registry(tmp.path());
         let w = hello(&mut r, 1, UP, 1);
@@ -384,18 +384,38 @@ fn a_first_subscriber_after_a_restart_catches_up_untranslated_pending_a_persiste
         write(&mut r, w, set(1, b"age"));
     }
 
-    // A fresh node over the same store restores the log but not the in-memory
-    // room binding (`room_apps` is rebuilt from live subscribers, not persisted).
-    // The first joiner meets an unbound room, whose governing app is unknown, so
-    // its catch-up is served verbatim — "age", not the up-translated "years" a
-    // bound-room v2 joiner would get. This is the known interim: the governing app
-    // cannot be inferred from the joiner (a foreign first subscriber would be
-    // mistranslated), so a durable binding that survives a restart is the fix, not
-    // yet built. The joiner binds the room, so every later joiner is translated.
+    // A fresh node over the same store restores both the log and the persisted
+    // governing binding, so the room comes back bound to UP before any live
+    // subscriber rebuilds it. The first joiner — a v2 client — meets a bound room
+    // and is served up-translated catch-up: "age" -> "years", exactly what a
+    // bound-room v2 joiner gets without a restart. The governing app is read from
+    // the durable record, never inferred from the joiner (a foreign first
+    // subscriber would otherwise mistranslate the log).
     let mut r = store_registry(tmp.path());
     let joiner = hello(&mut r, 2, UP, 2);
     subscribe(&mut r, joiner);
-    assert_eq!(caught_up_keys(&mut r, joiner), vec![b"age".to_vec()]);
+    assert_eq!(caught_up_keys(&mut r, joiner), vec![b"years".to_vec()]);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)] // drives the durable store on the filesystem
+fn a_dormant_sweep_does_not_lose_the_durable_binding() {
+    let tmp = tempdir();
+    let mut r = store_registry(tmp.path());
+    // A v1 UP writer binds the room and writes "age", then leaves — the room goes
+    // dormant (no presence, no subscriber). A sweep drops the live binding.
+    let w = hello(&mut r, 1, UP, 1);
+    subscribe(&mut r, w);
+    write(&mut r, w, set(1, b"age"));
+    r.disconnect(w);
+    r.sweep();
+
+    // The next subscriber — a v2 client — meets a room whose live binding the
+    // sweep dropped, but the durable binding the hub restored still governs it, so
+    // its catch-up is up-translated "age" -> "years", not served verbatim.
+    let joiner = hello(&mut r, 2, UP, 2);
+    subscribe(&mut r, joiner);
+    assert_eq!(caught_up_keys(&mut r, joiner), vec![b"years".to_vec()]);
 }
 
 /// A single RegisterSet on `key` from a fresh doc for `client`.

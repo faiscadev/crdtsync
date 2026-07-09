@@ -266,6 +266,115 @@ fn a_records_creation_version_round_trips() {
     assert_eq!(back, batch);
 }
 
+// --- governing metadata ---
+
+use crdtsync_server::RoomMeta;
+
+/// The metadata loaded for `room`, or `None` if the room has no record.
+fn loaded_meta(store: &Store, room: &[u8]) -> Option<RoomMeta> {
+    store
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|(r, _)| r == room)
+        .and_then(|(_, rl)| rl.meta)
+}
+
+#[test]
+fn governing_metadata_round_trips() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store
+        .write_meta(
+            ROOM,
+            &RoomMeta {
+                governing: Some((b"app".to_vec(), 3)),
+                max_op_version: Some(5),
+            },
+        )
+        .unwrap();
+
+    let meta = loaded_meta(&store, ROOM).expect("metadata present");
+    assert_eq!(meta.governing, Some((b"app".to_vec(), 3)));
+    assert_eq!(meta.max_op_version, Some(5));
+}
+
+#[test]
+fn a_relay_high_water_without_a_binding_round_trips() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store
+        .write_meta(
+            ROOM,
+            &RoomMeta {
+                governing: None,
+                max_op_version: Some(2),
+            },
+        )
+        .unwrap();
+
+    let meta = loaded_meta(&store, ROOM).expect("metadata present");
+    assert_eq!(meta.governing, None);
+    assert_eq!(meta.max_op_version, Some(2));
+}
+
+#[test]
+fn metadata_with_neither_field_removes_the_record() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store
+        .write_meta(
+            ROOM,
+            &RoomMeta {
+                governing: Some((b"app".to_vec(), 1)),
+                max_op_version: Some(1),
+            },
+        )
+        .unwrap();
+    // Clearing both fields removes the file, so the room carries no metadata.
+    store
+        .write_meta(
+            ROOM,
+            &RoomMeta {
+                governing: None,
+                max_op_version: None,
+            },
+        )
+        .unwrap();
+    assert!(loaded_meta(&store, ROOM).is_none());
+}
+
+#[test]
+fn a_malformed_metadata_record_loads_as_absent_and_never_panics() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    // A room with a real log, so its slot exists regardless of the metadata.
+    store.append(ROOM, &ops(1, b"age", 30)).unwrap();
+    store
+        .write_meta(
+            ROOM,
+            &RoomMeta {
+                governing: Some((b"app".to_vec(), 1)),
+                max_op_version: Some(1),
+            },
+        )
+        .unwrap();
+
+    // Truncate the metadata record mid-field: metadata is a durability cache, so
+    // this loads as absent rather than failing the whole load.
+    let meta_file = {
+        let hex: String = ROOM.iter().map(|b| format!("{b:02x}")).collect();
+        tmp.path().join(format!("{hex}.meta"))
+    };
+    fs::write(&meta_file, [1u8, 0, 0]).unwrap();
+
+    let store = Store::open(tmp.path()).unwrap();
+    let loaded = store.load().unwrap();
+    let (_, rl) = loaded.iter().find(|(r, _)| r == ROOM).unwrap();
+    assert!(rl.meta.is_none(), "a malformed record loads as absent");
+    assert_eq!(rl.ops.len(), 1, "the log still loads");
+}
+
 // --- a tempdir without pulling in a dev-dependency ---
 
 struct TempDir(std::path::PathBuf);
