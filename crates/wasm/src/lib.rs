@@ -14,10 +14,40 @@ use crdtsync_core::list::Side;
 use crdtsync_core::marks::{MarkState, ResolvedMark};
 use crdtsync_core::op::Op;
 use crdtsync_core::{
-    decode_message, decode_ops, encode_message, encode_ops, path, Channel, ClientId, ClientSession,
-    Document, RelativePosition, Scalar, UndoManager,
+    decode_message, decode_ops, encode_message, encode_ops, path, Channel, ClientError, ClientId,
+    ClientSession, Document, ErrorCode as CoreErrorCode, RelativePosition, Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
+
+/// A failure the server reports to the client, surfaced by [`WasmClient::receive`].
+/// `UpdateRequired` is the `onUpdateRequired` signal: the client's version can't
+/// bridge the room's across a breaking gap, so the app prompts an update or falls
+/// back read-only.
+#[wasm_bindgen]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ErrorCode {
+    ProtocolViolation = 0,
+    UnsupportedVersion = 1,
+    AuthFailed = 2,
+    UnknownRoom = 3,
+    Internal = 4,
+    Forbidden = 5,
+    UpdateRequired = 6,
+}
+
+impl From<CoreErrorCode> for ErrorCode {
+    fn from(code: CoreErrorCode) -> Self {
+        match code {
+            CoreErrorCode::ProtocolViolation => ErrorCode::ProtocolViolation,
+            CoreErrorCode::UnsupportedVersion => ErrorCode::UnsupportedVersion,
+            CoreErrorCode::AuthFailed => ErrorCode::AuthFailed,
+            CoreErrorCode::UnknownRoom => ErrorCode::UnknownRoom,
+            CoreErrorCode::Internal => ErrorCode::Internal,
+            CoreErrorCode::Forbidden => ErrorCode::Forbidden,
+            CoreErrorCode::UpdateRequired => ErrorCode::UpdateRequired,
+        }
+    }
+}
 
 /// A CRDT replica for one 16-byte client id.
 #[wasm_bindgen]
@@ -627,11 +657,19 @@ impl WasmClient {
     }
 
     /// Fold one received wire frame in. `true` when applied, `false` when the
-    /// frame is undecodable or the session refuses it.
-    pub fn receive(&mut self, msg: &[u8]) -> bool {
-        match decode_message(msg) {
-            Ok(message) => self.inner.receive(message).is_ok(),
-            Err(_) => false,
+    /// frame is undecodable or the session refuses it. Throws the server
+    /// [`ErrorCode`] when the frame is a server `Error` — `UpdateRequired` is the
+    /// `onUpdateRequired` signal.
+    pub fn receive(&mut self, msg: &[u8]) -> Result<bool, JsValue> {
+        let Ok(message) = decode_message(msg) else {
+            return Ok(false);
+        };
+        match self.inner.receive(message) {
+            Ok(()) => Ok(true),
+            Err(ClientError::Server { code, .. }) => {
+                Err(JsValue::from(ErrorCode::from(code) as i32))
+            }
+            Err(_) => Ok(false),
         }
     }
 

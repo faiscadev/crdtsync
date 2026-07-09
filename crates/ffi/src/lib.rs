@@ -22,8 +22,9 @@ use crdtsync_core::diff::{diff, encode_changes};
 use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
-    decode_message, encode_message, encode_ops, path, Channel, ClientId, ClientSession, Document,
-    MarkState, Message, RelativePosition, ResolvedMark, Scalar, UndoManager,
+    decode_message, encode_message, encode_ops, path, Channel, ClientError, ClientId,
+    ClientSession, Document, ErrorCode, MarkState, Message, RelativePosition, ResolvedMark, Scalar,
+    UndoManager,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
@@ -1637,16 +1638,38 @@ pub unsafe extern "C" fn crdtsync_client_subscribe(
     .unwrap_or_else(|_| CrdtBuf::empty())
 }
 
+/// The stable integer a server [`ErrorCode`] crosses the boundary as, mirroring
+/// the wire tags so every SDK decodes it identically: `0` ProtocolViolation, `1`
+/// UnsupportedVersion, `2` AuthFailed, `3` UnknownRoom, `4` Internal, `5`
+/// Forbidden, `6` UpdateRequired — the `onUpdateRequired` signal.
+fn error_code_discriminant(code: ErrorCode) -> i32 {
+    match code {
+        ErrorCode::ProtocolViolation => 0,
+        ErrorCode::UnsupportedVersion => 1,
+        ErrorCode::AuthFailed => 2,
+        ErrorCode::UnknownRoom => 3,
+        ErrorCode::Internal => 4,
+        ErrorCode::Forbidden => 5,
+        ErrorCode::UpdateRequired => 6,
+    }
+}
+
 /// Fold one received wire frame into the addressed room. Returns 1 when applied,
 /// 0 when the frame is undecodable or the session refuses it, -1 on a bad handle.
+/// When the server refused with an `Error` frame, writes the failure's
+/// [`error_code_discriminant`] to `out_error_code` (`6` is `UpdateRequired`, the
+/// `onUpdateRequired` signal) and returns 0; every other outcome leaves
+/// `out_error_code` untouched. A null `out_error_code` skips the write.
 ///
 /// # Safety
-/// `client` is a live handle; `msg`/`msg_len` follow [`as_slice`].
+/// `client` is a live handle; `msg`/`msg_len` follow [`as_slice`]; `out_error_code`
+/// is null or points to a writable `i32`.
 #[no_mangle]
 pub unsafe extern "C" fn crdtsync_client_receive(
     client: *mut CrdtClient,
     msg: *const u8,
     msg_len: usize,
+    out_error_code: *mut i32,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         if client.is_null() {
@@ -1660,6 +1683,12 @@ pub unsafe extern "C" fn crdtsync_client_receive(
         };
         match (*client).session.receive(message) {
             Ok(()) => 1,
+            Err(ClientError::Server { code, .. }) => {
+                if !out_error_code.is_null() {
+                    *out_error_code = error_code_discriminant(code);
+                }
+                0
+            }
             Err(_) => 0,
         }
     }))
