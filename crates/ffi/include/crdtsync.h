@@ -664,10 +664,18 @@ CrdtBuf crdtsync_client_subscribe(CrdtClient *client,
 
 // Fold one received wire frame into the addressed room. Returns 1 when applied,
 // 0 when the frame is undecodable or the session refuses it, -1 on a bad handle.
+// When the server refused with an `Error` frame, writes the failure's
+// [`error_code_discriminant`] to `out_error_code` (`6` is `UpdateRequired`, the
+// `onUpdateRequired` signal) and returns 0; every other outcome leaves
+// `out_error_code` untouched. A null `out_error_code` skips the write.
 //
 // # Safety
-// `client` is a live handle; `msg`/`msg_len` follow [`as_slice`].
-int32_t crdtsync_client_receive(CrdtClient *client, const uint8_t *msg, uintptr_t msg_len);
+// `client` is a live handle; `msg`/`msg_len` follow [`as_slice`]; `out_error_code`
+// is null or points to a writable `i32`.
+int32_t crdtsync_client_receive(CrdtClient *client,
+                                const uint8_t *msg,
+                                uintptr_t msg_len,
+                                int32_t *out_error_code);
 
 // The highest server sequence `channel`'s room has caught up to, into `out`.
 // Returns 1 on success, 0 if the channel isn't held, -1 on a bad handle.

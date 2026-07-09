@@ -1,7 +1,7 @@
 """The Python SDK drives the wire client over the C ABI: a local edit produces a
 frame a peer folds in and converges on, and the handshake surface marshals."""
 
-from crdtsync import Client
+from crdtsync import Client, ErrorCode, ServerError
 
 
 def cid(first: int) -> bytes:
@@ -118,6 +118,31 @@ def test_version_requests_marshal():
 def test_receive_rejects_garbage():
     with Client(cid(1)) as a:
         assert a.receive(b"\xff\xff\xff\xff") == 0
+
+
+def test_server_error_frame_raises_with_its_code():
+    import struct
+
+    import pytest
+
+    def error(code: int, message: bytes) -> bytes:
+        # Error: tag 3, u16 code, u32-prefixed message, u32-prefixed details.
+        return (
+            struct.pack("<BH", 3, code)
+            + struct.pack("<I", len(message))
+            + message
+            + struct.pack("<I", 0)
+        )
+
+    with Client(cid(1)) as a:
+        # A server Error surfaces as ServerError carrying the code; UPDATE_REQUIRED
+        # (6) is the onUpdateRequired signal.
+        with pytest.raises(ServerError) as excinfo:
+            a.receive(error(6, b"please update"))
+        assert excinfo.value.code is ErrorCode.UPDATE_REQUIRED
+        # A normal frame still applies cleanly.
+        ca, _ = a.subscribe(b"room-1")
+        assert a.receive(a.register_int(ca, [b"age"], 30)) == 1
 
 
 def test_channel_bounds_are_checked():

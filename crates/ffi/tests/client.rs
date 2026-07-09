@@ -6,7 +6,9 @@
 //! channel the client assigned at subscribe. Every buffer and handle is freed so
 //! the round trip is leak-clean under Miri.
 
-use crdtsync_core::{decode_message, decode_ops, encode_message, Channel, Message, Scalar};
+use crdtsync_core::{
+    decode_message, decode_ops, encode_message, Channel, ErrorCode, Message, Scalar,
+};
 use crdtsync_ffi::*;
 use std::ptr;
 
@@ -51,7 +53,7 @@ unsafe fn get_int(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, i64) {
 }
 
 unsafe fn receive(c: *mut CrdtClient, frame: &CrdtBuf) -> i32 {
-    crdtsync_client_receive(c, frame.ptr, frame.len)
+    crdtsync_client_receive(c, frame.ptr, frame.len, ptr::null_mut())
 }
 
 #[test]
@@ -132,9 +134,46 @@ fn a_bad_handle_is_rejected_not_dereferenced() {
         crdtsync_buf_free(ops);
         assert_eq!(get_int(ptr::null(), 0, &p), (-1, 0));
         assert_eq!(
-            crdtsync_client_receive(ptr::null_mut(), p.as_ptr(), p.len()),
+            crdtsync_client_receive(ptr::null_mut(), p.as_ptr(), p.len(), ptr::null_mut()),
             -1
         );
+    }
+}
+
+#[test]
+fn a_server_error_frame_surfaces_its_code_as_the_out_param() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+
+        // A server Error frame is refused (0) and writes its code — UpdateRequired
+        // (6), the onUpdateRequired signal — to the out-param.
+        let err = encode_message(&Message::Error {
+            code: ErrorCode::UpdateRequired,
+            message: "please update".to_string(),
+            details: Vec::new(),
+        });
+        let mut code: i32 = -1;
+        assert_eq!(
+            crdtsync_client_receive(c, err.as_ptr(), err.len(), &mut code),
+            0
+        );
+        assert_eq!(code, 6);
+
+        // A null out-param is tolerated: the same refusal, no crash.
+        assert_eq!(
+            crdtsync_client_receive(c, err.as_ptr(), err.len(), ptr::null_mut()),
+            0
+        );
+
+        // A malformed frame is refused without writing a spurious code.
+        let mut untouched: i32 = -1;
+        assert_eq!(
+            crdtsync_client_receive(c, [0xff, 0xff, 0xff].as_ptr(), 3, &mut untouched),
+            0
+        );
+        assert_eq!(untouched, -1);
+
+        crdtsync_client_free(c);
     }
 }
 
@@ -204,7 +243,10 @@ fn the_server_advertised_schema_is_recorded_and_readable() {
             schema_version: 4,
             schema: b"schema-body".to_vec(),
         });
-        assert_eq!(crdtsync_client_receive(c, advert.as_ptr(), advert.len()), 1);
+        assert_eq!(
+            crdtsync_client_receive(c, advert.as_ptr(), advert.len(), ptr::null_mut()),
+            1
+        );
         assert_eq!(crdtsync_client_active_schema_version(c, &mut version), 1);
         assert_eq!(version, 4);
         assert_eq!(crdtsync_client_active_schema(c, &mut schema), 1);
@@ -220,7 +262,10 @@ fn the_server_advertised_schema_is_recorded_and_readable() {
             schema_version: 5,
             schema: b"next-body".to_vec(),
         });
-        assert_eq!(crdtsync_client_receive(c, advert.as_ptr(), advert.len()), 1);
+        assert_eq!(
+            crdtsync_client_receive(c, advert.as_ptr(), advert.len(), ptr::null_mut()),
+            1
+        );
         assert_eq!(crdtsync_client_active_schema_version(c, &mut version), 1);
         assert_eq!(version, 5);
         assert_eq!(crdtsync_client_active_schema(c, &mut schema), 1);
@@ -237,7 +282,10 @@ fn the_server_advertised_schema_is_recorded_and_readable() {
             schema_version: 6,
             schema: Vec::new(),
         });
-        assert_eq!(crdtsync_client_receive(c, advert.as_ptr(), advert.len()), 1);
+        assert_eq!(
+            crdtsync_client_receive(c, advert.as_ptr(), advert.len(), ptr::null_mut()),
+            1
+        );
         assert_eq!(crdtsync_client_active_schema_version(c, &mut version), 1);
         assert_eq!(version, 6);
         assert_eq!(crdtsync_client_active_schema(c, &mut schema), 1);
@@ -279,7 +327,10 @@ fn auth_establishes_the_actor_once_authok_arrives() {
         let frame = encode_message(&Message::AuthOk {
             actor: b"alice".to_vec(),
         });
-        assert_eq!(crdtsync_client_receive(c, frame.as_ptr(), frame.len()), 1);
+        assert_eq!(
+            crdtsync_client_receive(c, frame.as_ptr(), frame.len(), ptr::null_mut()),
+            1
+        );
         assert_eq!(crdtsync_client_actor(c, &mut out), 1);
         assert_eq!(std::slice::from_raw_parts(out.ptr, out.len), b"alice");
 
@@ -308,7 +359,10 @@ fn a_peer_awareness_update_is_folded_and_readable() {
             key: b"cursor".to_vec(),
             value: vec![9],
         });
-        assert_eq!(crdtsync_client_receive(c, frame.as_ptr(), frame.len()), 1);
+        assert_eq!(
+            crdtsync_client_receive(c, frame.as_ptr(), frame.len(), ptr::null_mut()),
+            1
+        );
 
         let mut out = out_buf();
         let rc =
@@ -350,7 +404,7 @@ fn named_versions_round_trip_over_the_client() {
             names: vec![b"v1".to_vec(), b"v2".to_vec()],
         });
         assert_eq!(
-            crdtsync_client_receive(c, listing.as_ptr(), listing.len()),
+            crdtsync_client_receive(c, listing.as_ptr(), listing.len(), ptr::null_mut()),
             1
         );
 
@@ -372,7 +426,10 @@ fn named_versions_round_trip_over_the_client() {
             seq: 1,
             state: vec![7, 8, 9],
         });
-        assert_eq!(crdtsync_client_receive(c, state.as_ptr(), state.len()), 1);
+        assert_eq!(
+            crdtsync_client_receive(c, state.as_ptr(), state.len(), ptr::null_mut()),
+            1
+        );
         let mut st = out_buf();
         assert_eq!(
             crdtsync_client_version_state(c, ch, b"v1".as_ptr(), 2, &mut st),
@@ -442,7 +499,7 @@ fn the_outbox_drains_against_an_ack_over_the_wire_client() {
             through: u64::MAX,
         });
         assert_eq!(
-            crdtsync_client_receive(c, accepted.as_ptr(), accepted.len()),
+            crdtsync_client_receive(c, accepted.as_ptr(), accepted.len(), ptr::null_mut()),
             1
         );
 
@@ -496,7 +553,7 @@ fn an_xml_edit_enqueues_and_resends_over_the_wire_client() {
             through: u64::MAX,
         });
         assert_eq!(
-            crdtsync_client_receive(a, accepted.as_ptr(), accepted.len()),
+            crdtsync_client_receive(a, accepted.as_ptr(), accepted.len(), ptr::null_mut()),
             1
         );
         assert_eq!(crdtsync_client_outbox_len(a, ca, &mut n), 1);
@@ -555,7 +612,7 @@ unsafe fn seed_body_text(c: *mut CrdtClient, channel: u32, p: &[u8], s: &str) {
         ops,
     });
     assert!(
-        crdtsync_client_receive(c, frame.as_ptr(), frame.len()) >= 1,
+        crdtsync_client_receive(c, frame.as_ptr(), frame.len(), ptr::null_mut()) >= 1,
         "the seeded text applies to the replica"
     );
     crdtsync_buf_free(ops_buf);
@@ -628,7 +685,7 @@ fn a_mark_enqueues_and_resends_over_the_wire_client() {
             through: u64::MAX,
         });
         assert_eq!(
-            crdtsync_client_receive(a, accepted.as_ptr(), accepted.len()),
+            crdtsync_client_receive(a, accepted.as_ptr(), accepted.len(), ptr::null_mut()),
             1
         );
         assert_eq!(crdtsync_client_outbox_len(a, ca, &mut n), 1);

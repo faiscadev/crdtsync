@@ -18,7 +18,17 @@ import platform
 import struct
 from typing import List, Optional, Tuple
 
-__all__ = ["Client", "Document", "Side", "Undo", "diff", "diff_decode", "encode_path"]
+__all__ = [
+    "Client",
+    "Document",
+    "ErrorCode",
+    "ServerError",
+    "Side",
+    "Undo",
+    "diff",
+    "diff_decode",
+    "encode_path",
+]
 
 Path = List[bytes]
 
@@ -28,6 +38,29 @@ class Side(enum.IntEnum):
 
     LEFT = 0
     RIGHT = 1
+
+
+class ErrorCode(enum.IntEnum):
+    """A failure the server reports to the client. ``UPDATE_REQUIRED`` is the
+    ``onUpdateRequired`` signal: the client's version can't bridge the room's
+    across a breaking gap, so the app prompts an update or falls back read-only."""
+
+    PROTOCOL_VIOLATION = 0
+    UNSUPPORTED_VERSION = 1
+    AUTH_FAILED = 2
+    UNKNOWN_ROOM = 3
+    INTERNAL = 4
+    FORBIDDEN = 5
+    UPDATE_REQUIRED = 6
+
+
+class ServerError(RuntimeError):
+    """A server ``Error`` frame folded in through :meth:`Client.receive`, carrying
+    the :class:`ErrorCode` the server reported."""
+
+    def __init__(self, code: ErrorCode):
+        super().__init__(f"server reported {code.name}")
+        self.code = code
 
 
 class _CrdtBuf(ctypes.Structure):
@@ -156,7 +189,11 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_resend, [doc, ch], buf)
     sig(lib.crdtsync_client_outbox_len, [doc, ch, c.POINTER(size)], c.c_int32)
     sig(lib.crdtsync_client_unsubscribe, [doc, ch], buf)
-    sig(lib.crdtsync_client_receive, [doc, cbytes, size], c.c_int32)
+    sig(
+        lib.crdtsync_client_receive,
+        [doc, cbytes, size, c.POINTER(c.c_int32)],
+        c.c_int32,
+    )
     sig(lib.crdtsync_client_last_seen_seq, [doc, ch, c.POINTER(c.c_uint64)], c.c_int32)
     sig(lib.crdtsync_client_register_int, [doc, ch, cbytes, size, c.c_int64], buf)
     sig(lib.crdtsync_client_inc, [doc, ch, cbytes, size, c.c_uint32], buf)
@@ -1018,8 +1055,17 @@ class Client:
         return _take_buf(_LIB.crdtsync_client_unsubscribe(self._handle, channel))
 
     def receive(self, msg: bytes) -> int:
-        """Fold one received wire frame in. 1 applied, 0 refused, -1 bad handle."""
-        return _LIB.crdtsync_client_receive(self._handle, msg, len(msg))
+        """Fold one received wire frame in. 1 applied, 0 refused, -1 bad handle.
+        Raises :class:`ServerError` when the frame is a server ``Error`` — read its
+        ``.code``, ``ErrorCode.UPDATE_REQUIRED`` being the ``onUpdateRequired``
+        signal."""
+        code = ctypes.c_int32(-1)
+        rc = _LIB.crdtsync_client_receive(
+            self._handle, msg, len(msg), ctypes.byref(code)
+        )
+        if rc == 0 and code.value >= 0:
+            raise ServerError(ErrorCode(code.value))
+        return rc
 
     def last_seen_seq(self, channel: int) -> Optional[int]:
         """The highest server sequence ``channel`` has caught up to."""

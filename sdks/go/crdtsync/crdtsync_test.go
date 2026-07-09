@@ -294,7 +294,7 @@ func TestServerAdvertisedSchemaIsReadable(t *testing.T) {
 	}
 
 	// Folding a SchemaAdvert records the served version and its bytes.
-	if rc := c.Receive(advert(4, []byte("schema-body"))); rc != 1 {
+	if rc, _ := c.Receive(advert(4, []byte("schema-body"))); rc != 1 {
 		t.Fatalf("advert not applied: rc=%d", rc)
 	}
 	if v, ok := c.ActiveSchemaVersion(); !ok || v != 4 {
@@ -305,7 +305,7 @@ func TestServerAdvertisedSchemaIsReadable(t *testing.T) {
 	}
 
 	// A later advert supersedes it.
-	if rc := c.Receive(advert(5, []byte("next-body"))); rc != 1 {
+	if rc, _ := c.Receive(advert(5, []byte("next-body"))); rc != 1 {
 		t.Fatalf("second advert not applied: rc=%d", rc)
 	}
 	if v, _ := c.ActiveSchemaVersion(); v != 5 {
@@ -316,7 +316,7 @@ func TestServerAdvertisedSchemaIsReadable(t *testing.T) {
 	}
 
 	// An empty body is still an advertisement, not "none".
-	if rc := c.Receive(advert(6, []byte{})); rc != 1 {
+	if rc, _ := c.Receive(advert(6, []byte{})); rc != 1 {
 		t.Fatalf("empty-body advert not applied: rc=%d", rc)
 	}
 	if v, ok := c.ActiveSchemaVersion(); !ok || v != 6 {
@@ -344,7 +344,7 @@ func TestClientEditTravelsToAPeer(t *testing.T) {
 	if v, ok := a.GetInt(ca, path("age")); !ok || v != 30 {
 		t.Fatalf("local read: got (%d,%v), want (30,true)", v, ok)
 	}
-	if rc := b.Receive(ops); rc != 1 {
+	if rc, _ := b.Receive(ops); rc != 1 {
 		t.Fatalf("receive: got %d, want 1", rc)
 	}
 	if v, ok := b.GetInt(cb, path("age")); !ok || v != 30 {
@@ -378,7 +378,7 @@ func TestClientOutboxDrainsOnAck(t *testing.T) {
 	accepted[0] = 18
 	binary.LittleEndian.PutUint32(accepted[1:], ca)
 	binary.LittleEndian.PutUint64(accepted[5:], math.MaxUint64)
-	if rc := a.Receive(accepted); rc != 1 {
+	if rc, _ := a.Receive(accepted); rc != 1 {
 		t.Fatalf("receive accepted: got %d, want 1", rc)
 	}
 	if n := a.OutboxLen(ca); n != 0 {
@@ -461,8 +461,35 @@ func TestClientVersionRequestsMarshal(t *testing.T) {
 func TestClientReceiveRejectsGarbage(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()
-	if rc := c.Receive([]byte{0xff, 0xff, 0xff, 0xff}); rc != 0 {
-		t.Fatalf("garbage receive: got %d, want 0", rc)
+	if rc, code := c.Receive([]byte{0xff, 0xff, 0xff, 0xff}); rc != 0 || code != NoErrorCode {
+		t.Fatalf("garbage receive: got rc=%d code=%d, want 0 %d", rc, code, NoErrorCode)
+	}
+}
+
+func TestServerErrorFrameSurfacesItsCode(t *testing.T) {
+	// Error: tag 3, u16 code, u32-prefixed message, u32-prefixed details.
+	errFrame := func(code uint16, message []byte) []byte {
+		frame := make([]byte, 3+4+len(message)+4)
+		frame[0] = 3
+		binary.LittleEndian.PutUint16(frame[1:], code)
+		binary.LittleEndian.PutUint32(frame[3:], uint32(len(message)))
+		copy(frame[7:], message)
+		return frame
+	}
+
+	c := newClient(t, 1)
+	defer c.Close()
+
+	// A server Error is refused (rc 0) and surfaces its code — UpdateRequired (6)
+	// is the onUpdateRequired signal.
+	if rc, code := c.Receive(errFrame(6, []byte("please update"))); rc != 0 || code != UpdateRequired {
+		t.Fatalf("server error: got rc=%d code=%d, want 0 %d", rc, code, UpdateRequired)
+	}
+
+	// A normal frame still applies cleanly, carrying no error code.
+	ca, _ := c.Subscribe(key("room-1"))
+	if rc, code := c.Receive(c.RegisterInt(ca, path("age"), 30)); rc != 1 || code != NoErrorCode {
+		t.Fatalf("normal frame: got rc=%d code=%d, want 1 %d", rc, code, NoErrorCode)
 	}
 }
 
@@ -963,13 +990,13 @@ func TestClientXmlEditRoutesThroughTheOutbox(t *testing.T) {
 	if len(tail) == 0 {
 		t.Fatal("the tail replays")
 	}
-	if rc := b.Receive(tail); rc < 1 {
+	if rc, _ := b.Receive(tail); rc < 1 {
 		t.Fatalf("peer applies the replayed xml edits: rc=%d", rc)
 	}
 
 	// An ack through the tip drains the outbox.
 	accepted := acceptedThrough(ca, math.MaxUint64)
-	if rc := a.Receive(accepted); rc != 1 {
+	if rc, _ := a.Receive(accepted); rc != 1 {
 		t.Fatalf("ack applied: rc=%d", rc)
 	}
 	if n := a.OutboxLen(ca); n != 0 {

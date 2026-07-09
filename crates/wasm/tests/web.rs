@@ -273,7 +273,7 @@ fn a_client_edit_travels_to_a_peer() {
     let p = path(&["age"]);
     let ops = a.register_int(sa.channel(), &p, 30);
     assert_eq!(a.get_int(sa.channel(), &p), Some(30));
-    assert!(b.receive(&ops));
+    assert!(b.receive(&ops).unwrap());
     assert_eq!(b.get_int(sb.channel(), &p), Some(30));
     assert_eq!(b.last_seen_seq(sb.channel()), Some(1));
 }
@@ -316,7 +316,7 @@ fn the_server_advertised_schema_is_recorded_and_readable() {
         schema_version: 4,
         schema: b"schema-body".to_vec(),
     });
-    assert!(c.receive(&advert));
+    assert!(c.receive(&advert).unwrap());
     assert_eq!(c.active_schema_version(), Some(4));
     assert_eq!(c.active_schema().as_deref(), Some(&b"schema-body"[..]));
 
@@ -325,7 +325,7 @@ fn the_server_advertised_schema_is_recorded_and_readable() {
         schema_version: 5,
         schema: b"next-body".to_vec(),
     });
-    assert!(c.receive(&advert));
+    assert!(c.receive(&advert).unwrap());
     assert_eq!(c.active_schema_version(), Some(5));
     assert_eq!(c.active_schema().as_deref(), Some(&b"next-body"[..]));
 
@@ -334,7 +334,7 @@ fn the_server_advertised_schema_is_recorded_and_readable() {
         schema_version: 6,
         schema: Vec::new(),
     });
-    assert!(c.receive(&advert));
+    assert!(c.receive(&advert).unwrap());
     assert_eq!(c.active_schema_version(), Some(6));
     assert_eq!(c.active_schema().as_deref(), Some(&[][..]));
 }
@@ -358,7 +358,7 @@ fn a_client_outbox_drains_on_ack() {
         channel: Channel(ch),
         through: u64::MAX,
     });
-    assert!(a.receive(&accepted));
+    assert!(a.receive(&accepted).unwrap());
     assert_eq!(a.outbox_len(ch), 0);
     assert!(a.resend(ch).is_none());
 }
@@ -381,7 +381,29 @@ fn a_client_version_requests_marshal() {
 #[wasm_bindgen_test]
 fn a_client_rejects_garbage_frames() {
     let mut c = wasm_client(1);
-    assert!(!c.receive(&[0xff, 0xff, 0xff, 0xff]));
+    assert!(!c.receive(&[0xff, 0xff, 0xff, 0xff]).unwrap());
+}
+
+#[wasm_bindgen_test]
+fn a_server_error_frame_throws_its_code() {
+    use crdtsync_core::protocol::{encode_message, ErrorCode as CoreErrorCode, Message};
+    use crdtsync_wasm::ErrorCode;
+    let mut c = wasm_client(1);
+    let err = encode_message(&Message::Error {
+        code: CoreErrorCode::UpdateRequired,
+        message: "please update".to_string(),
+        details: Vec::new(),
+    });
+    // A server Error throws its code — UpdateRequired is the onUpdateRequired
+    // signal; a normal frame still applies.
+    let thrown = c.receive(&err).unwrap_err();
+    assert_eq!(
+        thrown.as_f64(),
+        Some(ErrorCode::UpdateRequired as i32 as f64)
+    );
+    let sa = c.subscribe(b"room-1");
+    let ops = c.register_int(sa.channel(), &path(&["age"]), 30);
+    assert!(c.receive(&ops).unwrap());
 }
 
 #[wasm_bindgen_test]
@@ -399,7 +421,7 @@ fn a_client_atomic_transaction_travels_to_a_peer() {
     assert!(!frame.is_empty());
     assert_eq!(a.get_int(sa.channel(), &path(&["x"])), Some(1));
 
-    assert!(b.receive(&frame));
+    assert!(b.receive(&frame).unwrap());
     assert_eq!(b.get_int(sb.channel(), &path(&["x"])), Some(1));
     assert_eq!(b.get_int(sb.channel(), &path(&["y"])), Some(2));
 }
@@ -637,9 +659,11 @@ fn a_client_xml_edit_rides_the_outbox_and_travels_to_a_peer() {
     assert!(!frame.is_empty());
     assert_eq!(a.outbox_len(sa.channel()), 1);
     assert!(a.resend(sa.channel()).is_some());
-    assert!(b.receive(&frame));
+    assert!(b.receive(&frame).unwrap());
 
-    assert!(b.receive(&a.xml_insert_element(sa.channel(), &p, 0, b"p")));
+    assert!(b
+        .receive(&a.xml_insert_element(sa.channel(), &p, 0, b"p"))
+        .unwrap());
     assert_eq!(a.xml_tag(sa.channel(), &p), Some(b"div".to_vec()));
     assert_eq!(b.xml_children_len(sb.channel(), &p), Some(1));
 }

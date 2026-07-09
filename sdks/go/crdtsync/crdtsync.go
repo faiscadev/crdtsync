@@ -246,6 +246,24 @@ const (
 	Right Side = 1
 )
 
+// ErrorCode is a failure the server reports to the client through Receive.
+type ErrorCode int32
+
+const (
+	// NoErrorCode marks a Receive that carried no server Error.
+	NoErrorCode        ErrorCode = -1
+	ProtocolViolation  ErrorCode = 0
+	UnsupportedVersion ErrorCode = 1
+	AuthFailed         ErrorCode = 2
+	UnknownRoom        ErrorCode = 3
+	Internal           ErrorCode = 4
+	Forbidden          ErrorCode = 5
+	// UpdateRequired is the onUpdateRequired signal: the client's version can't
+	// bridge the room's across a breaking gap, so the app prompts an update or
+	// falls back read-only.
+	UpdateRequired ErrorCode = 6
+)
+
 // RelativePosition captures a stable position in the List or Text at path — the
 // encoded bytes to resolve later with ResolvePosition. Nil for a bad handle or
 // path, a non-sequence slot, or an unknown side.
@@ -510,10 +528,16 @@ func (c *Client) OutboxLen(channel uint32) uint {
 	return uint(out)
 }
 
-// Receive folds one received wire frame in. 1 applied, 0 refused, -1 bad handle.
-func (c *Client) Receive(msg []byte) int {
+// Receive folds one received wire frame in, returning the apply status (1
+// applied, 0 refused, -1 bad handle) and the server's ErrorCode. The code is
+// NoErrorCode unless the frame was a server Error: then the status is 0 and the
+// code is what the server reported — UpdateRequired being the onUpdateRequired
+// signal.
+func (c *Client) Receive(msg []byte) (int, ErrorCode) {
 	mp, ml := bytesArg(msg)
-	return int(C.crdtsync_client_receive(c.h, mp, ml))
+	code := C.int32_t(NoErrorCode)
+	rc := int(C.crdtsync_client_receive(c.h, mp, ml, &code))
+	return rc, ErrorCode(code)
 }
 
 // LastSeenSeq is the highest server sequence channel has caught up to.
