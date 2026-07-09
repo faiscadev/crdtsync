@@ -117,6 +117,18 @@ impl Session {
     pub fn subscribed_rooms(&self) -> impl Iterator<Item = &RoomId> {
         self.channels.values()
     }
+
+    /// Drop every channel this connection bound to `room`, returning them — the
+    /// eviction counterpart to Unsubscribe. A peer stranded when a write lifts
+    /// the room's version past its reach is dropped from the room and must
+    /// re-subscribe after updating.
+    pub(crate) fn drop_room(&mut self, room: &[u8]) -> Vec<Channel> {
+        let channels = self.channels_for_room(room);
+        for channel in &channels {
+            self.channels.remove(channel);
+        }
+        channels
+    }
 }
 
 impl Default for Session {
@@ -655,8 +667,10 @@ fn catch_up_snapshot(
 /// (`high_water` is `None`) has nothing to reach and never refuses on this basis.
 /// A relay or
 /// foreign-app joiner is a different version space and is never refused. A broken
-/// chain (a gap the registry cannot bridge) refuses, fail-closed.
-fn subscriber_reaches_governing(
+/// chain (a gap the registry cannot bridge) refuses, fail-closed. The same
+/// predicate re-checks an already-joined peer when a write lifts the high-water,
+/// so admission and stranded-peer eviction agree on reachability.
+pub(crate) fn subscriber_reaches_governing(
     registry: &Mutex<SchemaRegistry>,
     governing: Option<(&[u8], u32)>,
     session: &Session,
