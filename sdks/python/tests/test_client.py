@@ -1,7 +1,7 @@
 """The Python SDK drives the wire client over the C ABI: a local edit produces a
 frame a peer folds in and converges on, and the handshake surface marshals."""
 
-from crdtsync import Client, ErrorCode, ServerError
+from crdtsync import Client, ErrorCode, Rejected, ServerError
 
 
 def cid(first: int) -> bytes:
@@ -143,6 +143,48 @@ def test_server_error_frame_raises_with_its_code():
         # A normal frame still applies cleanly.
         ca, _ = a.subscribe(b"room-1")
         assert a.receive(a.register_int(ca, [b"age"], 30)) == 1
+
+
+def test_a_server_ops_rejection_surfaces_the_refused_batch():
+    import struct
+
+    def ops_rejected(channel: int, seqs: list, reason: int) -> bytes:
+        # OpsRejected: tag 22, u32 channel, u16 reason, u32 seq-count, u64 seqs.
+        out = struct.pack("<BIHI", 22, channel, reason, len(seqs))
+        for s in seqs:
+            out += struct.pack("<Q", s)
+        return out
+
+    with Client(cid(1)) as a:
+        ca, _ = a.subscribe(b"room-1")
+        # Author an edit; its ops enter the outbox with per-client sequences 0..n.
+        a.register_int(ca, [b"age"], 30)
+        n = a.outbox_len(ca)
+        assert n >= 1
+
+        # The server refuses that batch — Forbidden, the auth-revoked rejection.
+        assert a.receive(ops_rejected(ca, list(range(n)), ErrorCode.FORBIDDEN)) == 1
+
+        # The drain yields the one batch: the channel, the reason, and the refused
+        # ops still carrying their bytes.
+        rejected = a.take_rejected()
+        assert len(rejected) == 1
+        r = rejected[0]
+        assert isinstance(r, Rejected)
+        assert r.channel == ca
+        assert r.reason is ErrorCode.FORBIDDEN
+        assert len(r.ops) == n
+        assert all(isinstance(op, bytes) and len(op) > 0 for op in r.ops)
+
+        # The refused ops left the outbox; draining, a second call is empty.
+        assert a.outbox_len(ca) == 0
+        assert a.take_rejected() == []
+
+
+def test_take_rejected_is_empty_without_a_rejection():
+    with Client(cid(1)) as a:
+        a.subscribe(b"room-1")
+        assert a.take_rejected() == []
 
 
 def test_channel_bounds_are_checked():

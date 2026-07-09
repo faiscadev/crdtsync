@@ -14,8 +14,9 @@ use crdtsync_core::list::Side;
 use crdtsync_core::marks::{MarkState, ResolvedMark};
 use crdtsync_core::op::Op;
 use crdtsync_core::{
-    decode_message, decode_ops, encode_message, encode_ops, path, Channel, ClientError, ClientId,
-    ClientSession, Document, ErrorCode as CoreErrorCode, RelativePosition, Scalar, UndoManager,
+    decode_message, decode_ops, encode_message, encode_op, encode_ops, path, Channel, ClientError,
+    ClientId, ClientSession, Document, ErrorCode as CoreErrorCode, Rejected, RelativePosition,
+    Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
 
@@ -673,6 +674,22 @@ impl WasmClient {
         }
     }
 
+    /// Drain the op batches the server refused since the last call — the
+    /// `onOpsRejected` observation — as an array of `{ channel, reason, ops }`:
+    /// `channel` a number, `reason` the server [`ErrorCode`] (`5` is `Forbidden`,
+    /// the auth-revoked rejection), `ops` an array of `Uint8Array`, each a refused
+    /// op's bytes to show, discard, or export. Empty when nothing was refused;
+    /// draining, so a second call is empty.
+    #[wasm_bindgen(js_name = takeRejected)]
+    pub fn take_rejected(&mut self) -> JsValue {
+        self.inner
+            .take_rejected()
+            .iter()
+            .map(rejected_to_js)
+            .collect::<js_sys::Array>()
+            .into()
+    }
+
     /// The highest server sequence `channel` has caught up to.
     #[wasm_bindgen(js_name = lastSeenSeq)]
     pub fn last_seen_seq(&self, channel: u32) -> Option<u64> {
@@ -1045,6 +1062,22 @@ fn resolved_mark_to_js(mark: &ResolvedMark) -> JsValue {
             set(&obj, "value", &arr.into());
         }
     }
+    obj.into()
+}
+
+/// One refused op batch as a `{ channel, reason, ops }` object: `channel` a
+/// number, `reason` the server `ErrorCode` discriminant, `ops` an array of
+/// `Uint8Array` (each a refused op's bytes).
+fn rejected_to_js(r: &Rejected) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(&obj, "channel", &JsValue::from_f64(r.channel.0 as f64));
+    set(&obj, "reason", &JsValue::from(ErrorCode::from(r.reason) as i32));
+    let ops: js_sys::Array = r
+        .ops
+        .iter()
+        .map(|op| js_sys::Uint8Array::from(encode_op(op).as_slice()))
+        .collect();
+    set(&obj, "ops", &ops.into());
     obj.into()
 }
 

@@ -677,6 +677,18 @@ int32_t crdtsync_client_receive(CrdtClient *client,
                                 uintptr_t msg_len,
                                 int32_t *out_error_code);
 
+// Drain the op batches the server refused since the last call — the
+// `onOpsRejected` observation — into `out`: each batch names its channel, the
+// reason [`error_code_discriminant`] (`5` is `Forbidden`, the auth-revoked
+// rejection), and the refused ops still carrying their bytes so the app can show,
+// discard, or export them. Draining, so a second call reports a bare zero count;
+// empty likewise when no rejection has arrived. Returns 1 with the encoded list,
+// -1 on a bad handle or a null `out`.
+//
+// # Safety
+// `client` is a live handle or null; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_client_take_rejected(CrdtClient *client, CrdtBuf *out);
+
 // The highest server sequence `channel`'s room has caught up to, into `out`.
 // Returns 1 on success, 0 if the channel isn't held, -1 on a bad handle.
 //

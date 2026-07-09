@@ -22,9 +22,9 @@ use crdtsync_core::diff::{diff, encode_changes};
 use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
-    decode_message, encode_message, encode_ops, path, Channel, ClientError, ClientId,
-    ClientSession, Document, ErrorCode, MarkState, Message, RelativePosition, ResolvedMark, Scalar,
-    UndoManager,
+    decode_message, encode_message, encode_op, encode_ops, path, Channel, ClientError, ClientId,
+    ClientSession, Document, ErrorCode, MarkState, Message, Rejected, RelativePosition,
+    ResolvedMark, Scalar, UndoManager,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
@@ -1691,6 +1691,53 @@ pub unsafe extern "C" fn crdtsync_client_receive(
             }
             Err(_) => 0,
         }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Serialize the refused op batches to one buffer the SDK decodes: a `u32` count,
+/// then per batch the channel (`u32`), the reason [`error_code_discriminant`]
+/// (`i32`), and the ops — a `u32` op-count then per op a `u32`-length-prefixed
+/// `encode_op` byte string. An empty list is a bare zero count, the no-rejection
+/// signal.
+fn encode_rejected(rejected: &[Rejected]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(rejected.len() as u32).to_le_bytes());
+    for r in rejected {
+        out.extend_from_slice(&r.channel.0.to_le_bytes());
+        out.extend_from_slice(&error_code_discriminant(r.reason).to_le_bytes());
+        out.extend_from_slice(&(r.ops.len() as u32).to_le_bytes());
+        for op in &r.ops {
+            let body = encode_op(op);
+            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out.extend_from_slice(&body);
+        }
+    }
+    out
+}
+
+/// Drain the op batches the server refused since the last call — the
+/// `onOpsRejected` observation — into `out`: each batch names its channel, the
+/// reason [`error_code_discriminant`] (`5` is `Forbidden`, the auth-revoked
+/// rejection), and the refused ops still carrying their bytes so the app can show,
+/// discard, or export them. Draining, so a second call reports a bare zero count;
+/// empty likewise when no rejection has arrived. Returns 1 with the encoded list,
+/// -1 on a bad handle or a null `out`.
+///
+/// # Safety
+/// `client` is a live handle or null; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_take_rejected(
+    client: *mut CrdtClient,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        let rejected = (*client).session.take_rejected();
+        *out = CrdtBuf::from_vec(encode_rejected(&rejected));
+        1
     }))
     .unwrap_or(-1)
 }

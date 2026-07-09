@@ -264,6 +264,16 @@ const (
 	UpdateRequired ErrorCode = 6
 )
 
+// Rejected is an op batch the server refused, surfaced by TakeRejected for the
+// app to show, discard, or export. Channel names the room, Reason the ErrorCode
+// the server reported (Forbidden for auth revoked), and Ops the refused ops still
+// carrying their bytes.
+type Rejected struct {
+	Channel uint32
+	Reason  ErrorCode
+	Ops     [][]byte
+}
+
 // RelativePosition captures a stable position in the List or Text at path — the
 // encoded bytes to resolve later with ResolvePosition. Nil for a bad handle or
 // path, a non-sequence slot, or an unknown side.
@@ -538,6 +548,40 @@ func (c *Client) Receive(msg []byte) (int, ErrorCode) {
 	code := C.int32_t(NoErrorCode)
 	rc := int(C.crdtsync_client_receive(c.h, mp, ml, &code))
 	return rc, ErrorCode(code)
+}
+
+// TakeRejected drains the op batches the server refused since the last call — the
+// onOpsRejected observation. Each Rejected names the channel, the reason, and the
+// refused ops still carrying their bytes. Draining, so a second call is empty.
+func (c *Client) TakeRejected() []Rejected {
+	var out C.CrdtBuf
+	if C.crdtsync_client_take_rejected(c.h, &out) != 1 {
+		return nil
+	}
+	return decodeRejected(takeBuf(out))
+}
+
+// decodeRejected reads the take_rejected buffer: a u32 count, then per batch the
+// channel (u32), the reason ErrorCode (i32), and the ops — a u32 op-count then
+// per op a length-prefixed op byte string.
+func decodeRejected(data []byte) []Rejected {
+	r := &changeReader{d: data}
+	n := int(r.u32())
+	out := make([]Rejected, 0, n)
+	for k := 0; k < n && r.err == nil; k++ {
+		channel := r.u32()
+		reason := ErrorCode(int32(r.u32()))
+		m := int(r.u32())
+		ops := make([][]byte, 0, m)
+		for j := 0; j < m && r.err == nil; j++ {
+			ops = append(ops, r.blob())
+		}
+		out = append(out, Rejected{Channel: channel, Reason: reason, Ops: ops})
+	}
+	if r.err != nil {
+		return nil
+	}
+	return out
 }
 
 // LastSeenSeq is the highest server sequence channel has caught up to.
