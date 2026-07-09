@@ -200,12 +200,16 @@ fn registry() -> Registry {
 }
 
 fn hello(r: &mut Registry, client: u8, version: u32) -> ConnId {
+    hello_app(r, client, APP, version)
+}
+
+fn hello_app(r: &mut Registry, client: u8, app: &[u8], version: u32) -> ConnId {
     let id = r.connect();
     assert!(r.deliver(
         id,
         Message::Hello {
             client: cid(client),
-            app_id: APP.to_vec(),
+            app_id: app.to_vec(),
             schema_version: version,
         }
     ));
@@ -263,4 +267,55 @@ fn a_below_floor_v1_joiner_is_served_a_down_projected_snapshot() {
         .expect("a below-floor joiner is served a snapshot");
     let d = Document::decode_state(&state).unwrap();
     assert_eq!(observe(&d), (Some(1), None, Some("hi".to_string())));
+}
+
+#[test]
+fn a_below_floor_snapshot_is_sourced_from_the_content_version_not_the_lifted_floor() {
+    let mut r = registry();
+    // A v1 writer authors the whole UP history — a single `title` field, plus a
+    // filler to reach the compaction threshold — folding it into a v1 snapshot.
+    let writer = hello_app(&mut r, 1, UP, 1);
+    subscribe(&mut r, writer);
+    r.take_outbox(writer);
+    let mut w = Document::new(cid(1));
+    let ops = w.transact(|tx| {
+        tx.register(b"title", Scalar::Int(1));
+        tx.register(b"filler", Scalar::Int(9));
+    });
+    assert!(r.deliver(
+        writer,
+        Message::Ops {
+            channel: Channel(0),
+            ops,
+        }
+    ));
+    r.take_outbox(writer);
+
+    // A transient v2 peer lifts the room's governing floor to v2, then leaves; the
+    // snapshot still embodies only v1 content.
+    let transient = hello_app(&mut r, 2, UP, 2);
+    subscribe(&mut r, transient);
+    r.take_outbox(transient);
+    r.disconnect(transient);
+
+    // A v2 joiner below the floor is served the snapshot up-migrated from the v1
+    // content — `title` re-keyed to `heading` — not the v1 state left verbatim
+    // under a mistaken v2 source drawn from the lifted floor.
+    let joiner = hello_app(&mut r, 3, UP, 2);
+    subscribe(&mut r, joiner);
+    let state = r
+        .take_outbox(joiner)
+        .into_iter()
+        .find_map(|m| match m {
+            Message::Snapshot { state, .. } => Some(state),
+            _ => None,
+        })
+        .expect("a below-floor joiner is served a snapshot");
+    let d = Document::decode_state(&state).unwrap();
+    assert_eq!(int_at(&d, b"title"), None, "the v1 field is re-keyed");
+    assert_eq!(
+        int_at(&d, b"heading"),
+        Some(1),
+        "the snapshot is up-migrated from its v1 content"
+    );
 }
