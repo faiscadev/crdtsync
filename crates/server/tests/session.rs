@@ -371,6 +371,26 @@ fn ops_on_an_unbound_channel_is_a_violation() {
 }
 
 #[test]
+fn a_client_sent_ops_rejected_is_a_violation() {
+    // OpsRejected only travels server-to-client; a client that sends one commits
+    // a protocol violation and the connection closes.
+    let mut h = hub();
+    let mut s = Session::new();
+    handshake(&mut h, &mut s, 1);
+    let r = st(
+        &mut h,
+        &mut s,
+        Message::OpsRejected {
+            channel: CH,
+            seqs: vec![1],
+            reason: ErrorCode::Forbidden,
+        },
+    );
+    assert!(r.close);
+    assert!(is_violation(&r.replies[0]));
+}
+
+#[test]
 fn a_resent_op_batch_broadcasts_nothing() {
     let mut h = hub();
     let mut s = Session::new();

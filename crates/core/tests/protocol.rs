@@ -304,6 +304,90 @@ fn trailing_bytes_after_an_error_are_rejected() {
     assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
 }
 
+// --- ops rejected ---
+
+#[test]
+fn ops_rejected_round_trips_a_populated_set() {
+    round_trips(Message::OpsRejected {
+        channel: Channel(3),
+        seqs: vec![7, 8, 42, u64::MAX],
+        reason: ErrorCode::Forbidden,
+    });
+}
+
+#[test]
+fn ops_rejected_round_trips_an_empty_set() {
+    round_trips(Message::OpsRejected {
+        channel: Channel(0),
+        seqs: Vec::new(),
+        reason: ErrorCode::Forbidden,
+    });
+}
+
+#[test]
+fn ops_rejected_round_trips_every_reason_code() {
+    for reason in [
+        ErrorCode::ProtocolViolation,
+        ErrorCode::UnsupportedVersion,
+        ErrorCode::AuthFailed,
+        ErrorCode::UnknownRoom,
+        ErrorCode::Internal,
+        ErrorCode::Forbidden,
+        ErrorCode::UpdateRequired,
+    ] {
+        round_trips(Message::OpsRejected {
+            channel: Channel(1),
+            seqs: vec![1],
+            reason,
+        });
+    }
+}
+
+#[test]
+fn a_truncated_ops_rejected_is_an_error_not_a_panic() {
+    let bytes = encode_message(&Message::OpsRejected {
+        channel: Channel(9),
+        seqs: vec![1, 2, 3],
+        reason: ErrorCode::Forbidden,
+    });
+    for cut in 0..bytes.len() {
+        assert!(
+            decode_message(&bytes[..cut]).is_err(),
+            "truncating to {cut} bytes must error, not panic",
+        );
+    }
+}
+
+#[test]
+fn trailing_bytes_after_an_ops_rejected_are_an_error() {
+    let mut bytes = encode_message(&Message::OpsRejected {
+        channel: Channel(2),
+        seqs: vec![5],
+        reason: ErrorCode::Forbidden,
+    });
+    bytes.push(0);
+    assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
+}
+
+#[test]
+fn an_unknown_reason_code_in_ops_rejected_is_an_error() {
+    let mut bytes = encode_message(&Message::OpsRejected {
+        channel: Channel(0),
+        seqs: Vec::new(),
+        reason: ErrorCode::Internal,
+    });
+    // The reason is the two bytes right after the tag and the 4-byte channel.
+    bytes[5] = 0xEE;
+    bytes[6] = 0x00;
+    assert_eq!(
+        decode_message(&bytes),
+        Err(ProtocolError::BadTag {
+            what: "error code",
+            tag: 0xEE,
+        })
+    );
+}
+
 // --- messages reject malformed input ---
 
 #[test]

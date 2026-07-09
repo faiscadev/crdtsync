@@ -8,8 +8,8 @@
 //! acknowledged. The sender is never echoed its own ops, so `Accepted` is the
 //! only thing that drains the outbox.
 
-use crdtsync_core::client::{ClientError, ClientSession};
-use crdtsync_core::{Channel, ClientId, Document, Message, Op, Scalar};
+use crdtsync_core::client::{ClientError, ClientSession, Rejected};
+use crdtsync_core::{Channel, ClientId, Document, ErrorCode, Message, Op, Scalar};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -218,6 +218,159 @@ fn resend_on_a_fresh_room_is_none() {
 fn resend_on_an_unheld_channel_is_none() {
     let s = ClientSession::new(cid(1));
     assert!(s.resend(Channel(7)).is_none());
+}
+
+// --- rejection drains the outbox ---
+
+/// The per-client sequences of a batch — how the server names the ops it refuses.
+fn seqs_of(ops: &[Op]) -> Vec<u64> {
+    ops.iter().map(|o| o.id.seq).collect()
+}
+
+#[test]
+fn a_rejection_drains_the_named_ops_from_the_outbox() {
+    let mut s = ClientSession::new(cid(1));
+    let (ch, _) = s.subscribe(ROOM_A);
+    let ops = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
+
+    s.receive(Message::OpsRejected {
+        channel: ch,
+        seqs: seqs_of(&ops),
+        reason: ErrorCode::Forbidden,
+    })
+    .unwrap();
+
+    // The refused ops leave the outbox, and a resend never replays them.
+    assert_eq!(s.outbox_len(ch), 0);
+    assert!(s.resend(ch).is_none());
+}
+
+#[test]
+fn a_rejection_leaves_the_unnamed_ops_outstanding() {
+    let mut s = ClientSession::new(cid(1));
+    let (ch, _) = s.subscribe(ROOM_A);
+    let first = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
+    let second = ops_of(s.edit(ch, |c| c.register(b"b", Scalar::Int(2))).unwrap());
+
+    // Only the first batch is refused; the second stays queued to resend.
+    s.receive(Message::OpsRejected {
+        channel: ch,
+        seqs: seqs_of(&first),
+        reason: ErrorCode::Forbidden,
+    })
+    .unwrap();
+
+    assert_eq!(s.outbox_len(ch), second.len());
+    match s.resend(ch) {
+        Some(Message::Ops { ops, .. }) => assert_eq!(ops, second),
+        other => panic!("expected the unrefused tail, got {other:?}"),
+    }
+}
+
+#[test]
+fn take_rejected_reports_the_ops_and_reason_once() {
+    let mut s = ClientSession::new(cid(1));
+    let (ch, _) = s.subscribe(ROOM_A);
+    let ops = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
+
+    s.receive(Message::OpsRejected {
+        channel: ch,
+        seqs: seqs_of(&ops),
+        reason: ErrorCode::Forbidden,
+    })
+    .unwrap();
+
+    // The refused ops surface once, carrying their bytes and the reason.
+    assert_eq!(
+        s.take_rejected(),
+        vec![Rejected {
+            channel: ch,
+            reason: ErrorCode::Forbidden,
+            ops,
+        }]
+    );
+    // Draining, so a second call reports nothing.
+    assert!(s.take_rejected().is_empty());
+}
+
+#[test]
+fn take_rejected_is_empty_without_a_rejection() {
+    let mut s = ClientSession::new(cid(1));
+    let (ch, _) = s.subscribe(ROOM_A);
+    s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap();
+    assert!(s.take_rejected().is_empty());
+}
+
+#[test]
+fn a_rejection_and_an_accepted_prune_independently() {
+    let mut s = ClientSession::new(cid(1));
+    let (ch, _) = s.subscribe(ROOM_A);
+    let first = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
+    let second = ops_of(s.edit(ch, |c| c.register(b"b", Scalar::Int(2))).unwrap());
+
+    // The first batch is accepted (pruned) and the second rejected (drained);
+    // the outbox ends empty and only the second surfaces as rejected.
+    s.receive(Message::Accepted {
+        channel: ch,
+        through: max_seq(&first),
+    })
+    .unwrap();
+    s.receive(Message::OpsRejected {
+        channel: ch,
+        seqs: seqs_of(&second),
+        reason: ErrorCode::Forbidden,
+    })
+    .unwrap();
+
+    assert_eq!(s.outbox_len(ch), 0);
+    assert_eq!(
+        s.take_rejected(),
+        vec![Rejected {
+            channel: ch,
+            reason: ErrorCode::Forbidden,
+            ops: second,
+        }]
+    );
+}
+
+#[test]
+fn a_rejection_on_an_unheld_channel_is_rejected() {
+    let mut s = ClientSession::new(cid(1));
+    s.subscribe(ROOM_A);
+    let err = s.receive(Message::OpsRejected {
+        channel: Channel(9),
+        seqs: vec![1],
+        reason: ErrorCode::Forbidden,
+    });
+    assert!(matches!(err, Err(ClientError::UnknownChannel(_))));
+}
+
+#[test]
+fn rejections_across_channels_drain_together() {
+    let mut s = ClientSession::new(cid(1));
+    let (a, _) = s.subscribe(ROOM_A);
+    let (b, _) = s.subscribe(ROOM_B);
+    let a_ops = ops_of(s.edit(a, |c| c.register(b"a", Scalar::Int(1))).unwrap());
+    let b_ops = ops_of(s.edit(b, |c| c.register(b"b", Scalar::Int(2))).unwrap());
+
+    s.receive(Message::OpsRejected {
+        channel: a,
+        seqs: seqs_of(&a_ops),
+        reason: ErrorCode::Forbidden,
+    })
+    .unwrap();
+    s.receive(Message::OpsRejected {
+        channel: b,
+        seqs: seqs_of(&b_ops),
+        reason: ErrorCode::Forbidden,
+    })
+    .unwrap();
+
+    // One drain surfaces both channels' rejections.
+    let drained = s.take_rejected();
+    assert_eq!(drained.len(), 2);
+    assert!(drained.iter().any(|r| r.channel == a && r.ops == a_ops));
+    assert!(drained.iter().any(|r| r.channel == b && r.ops == b_ops));
 }
 
 // --- isolation ---
