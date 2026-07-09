@@ -188,6 +188,20 @@ pub enum Message {
         message: String,
         details: Vec<u8>,
     },
+    /// The server's refusal of a batch of authored ops on `channel` — the actor's
+    /// write was denied (auth revoked while offline), or the ops failed the
+    /// enforcing server's validation. Sender-directed and non-fatal: the
+    /// connection stays open, the named ops are neither ingested nor
+    /// acknowledged, and the client drains them from its outbox to surface as the
+    /// `onOpsRejected` signal for the app to show, discard, or export. `seqs` are
+    /// the rejected ops' per-client sequences (`OpId.seq`), which the client
+    /// resolves against its own outbox — it still holds the op bytes; `reason` is
+    /// the closed-enum code for why (`Forbidden` for a revoked write).
+    OpsRejected {
+        channel: Channel,
+        seqs: Vec<u64>,
+        reason: ErrorCode,
+    },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -377,6 +391,22 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, message.as_bytes());
             put_bytes(&mut out, details);
         }
+        Message::OpsRejected {
+            channel,
+            seqs,
+            reason,
+        } => {
+            put_u8(&mut out, 22);
+            put_u32(&mut out, channel.0);
+            put_u16(&mut out, error_code_tag(*reason));
+            put_u32(
+                &mut out,
+                u32::try_from(seqs.len()).expect("rejected op count exceeds u32"),
+            );
+            for seq in seqs {
+                put_u64(&mut out, *seq);
+            }
+        }
     }
     out
 }
@@ -537,6 +567,23 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let channel = Channel(cur.u32()?);
             let seq = cur.u64()?;
             Message::Ack { channel, seq }
+        }
+        22 => {
+            let channel = Channel(cur.u32()?);
+            let reason = error_code(cur.u16()?)?;
+            let count = cur.u32()?;
+            // Grow as sequences are read rather than trusting `count` to size the
+            // allocation — a bogus count then fails on the missing bytes, not on a
+            // giant up-front reservation.
+            let mut seqs = Vec::new();
+            for _ in 0..count {
+                seqs.push(cur.u64()?);
+            }
+            Message::OpsRejected {
+                channel,
+                seqs,
+                reason,
+            }
         }
         tag => {
             return Err(ProtocolError::BadTag {

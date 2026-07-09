@@ -133,7 +133,8 @@ fn sample_ops(client: u8) -> Vec<Op> {
     Document::new(cid(client)).transact(|tx| tx.register(b"age", Scalar::Int(30)))
 }
 
-/// Whether an ops write on channel 0 was accepted — no error reply.
+/// Whether an ops write on channel 0 was accepted — no refusal reply. A denied
+/// write comes back as a non-fatal `OpsRejected`; a handshake failure as `Error`.
 fn write_ok(r: &mut Registry, id: ConnId, client: u8) -> bool {
     assert!(r.deliver(
         id,
@@ -145,7 +146,7 @@ fn write_ok(r: &mut Registry, id: ConnId, client: u8) -> bool {
     let denied = r
         .take_outbox(id)
         .into_iter()
-        .any(|m| matches!(m, Message::Error { .. }));
+        .any(|m| matches!(m, Message::Error { .. } | Message::OpsRejected { .. }));
     !denied
 }
 

@@ -349,7 +349,12 @@ pub fn step(
                 Action::Write,
                 &Resource::Room(&room),
             ) {
-                return forbidden("write denied");
+                // Authored ops sit in the client's outbox until acknowledged, so a
+                // refusal must be recoverable rather than a connection close: name
+                // the rejected ops, keep the connection open, ingest and ack
+                // nothing. The client drains them from its outbox and surfaces the
+                // rejection for the app to show, discard, or export.
+                return ops_rejected(channel, &ops, ErrorCode::Forbidden);
             }
             // The batch's highest per-client op sequence: the frontier the author
             // is acknowledged through once the ops are durably logged, so it can
@@ -401,6 +406,9 @@ pub fn step(
         // `Accepted` is the server's own reply to an author; a client never sends
         // one.
         Message::Accepted { .. } => violation("client sent an accepted"),
+        // `OpsRejected` is the server's own refusal of an author's ops; it only
+        // travels server-to-client.
+        Message::OpsRejected { .. } => violation("client sent an ops rejected"),
         Message::AwarenessSet {
             channel,
             key,
@@ -693,6 +701,22 @@ fn internal(reason: &str) -> Response {
             details: Vec::new(),
         }],
         close: true,
+        ..Response::default()
+    }
+}
+
+/// Refuse a batch of authored ops without closing the connection: name the
+/// rejected ops by their per-client sequence and why, ingesting and
+/// acknowledging nothing. The client drains the named ops from its outbox and
+/// surfaces the rejection, so an op the server will not accept never sits
+/// acked-forever in the queue.
+fn ops_rejected(channel: Channel, ops: &[Op], reason: ErrorCode) -> Response {
+    Response {
+        replies: vec![Message::OpsRejected {
+            channel,
+            seqs: ops.iter().map(|op| op.id.seq).collect(),
+            reason,
+        }],
         ..Response::default()
     }
 }

@@ -67,6 +67,12 @@ fn is_forbidden(m: &Message) -> bool {
     )
 }
 
+/// A refusal of authored ops naming `reason` — the non-fatal reply on a denied
+/// write, distinct from a connection-closing `Error`.
+fn is_ops_rejected(m: &Message, reason: ErrorCode) -> bool {
+    matches!(m, Message::OpsRejected { reason: r, .. } if *r == reason)
+}
+
 fn sample_ops() -> Vec<Op> {
     doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)))
 }
@@ -106,16 +112,79 @@ fn a_write_denied_room_rejects_ops_and_does_not_ingest() {
     assert!(r.deliver(a, sub(0, b"room-a")));
     r.take_outbox(a);
 
+    let ops = sample_ops();
     let keep_open = r.deliver(
+        a,
+        Message::Ops {
+            channel: Channel(0),
+            ops: ops.clone(),
+        },
+    );
+    // A denied write is refused with a non-fatal OpsRejected naming the ops and
+    // the reason — not a connection close.
+    assert!(keep_open, "an ops rejection keeps the connection open");
+    let out = r.take_outbox(a);
+    assert!(is_ops_rejected(&out[0], ErrorCode::Forbidden));
+    match &out[0] {
+        Message::OpsRejected { channel, seqs, .. } => {
+            assert_eq!(*channel, Channel(0));
+            assert_eq!(seqs, &ops.iter().map(|o| o.id.seq).collect::<Vec<_>>());
+        }
+        other => panic!("expected OpsRejected, got {other:?}"),
+    }
+    assert_eq!(r.hub().seq(b"room-a"), 0, "a denied write never ingests");
+}
+
+#[test]
+fn a_rejected_write_leaves_the_session_live() {
+    let mut r = registry();
+    // Writes denied; reads allowed, so a following subscribe still lands.
+    r.set_authorizer(Box::new(
+        |_id: &Identity, action: Action, _res: &Resource| action != Action::Write,
+    ));
+    let a = hello_auth(&mut r, 1);
+    assert!(r.deliver(a, sub(0, b"room-a")));
+    r.take_outbox(a);
+
+    r.deliver(
         a,
         Message::Ops {
             channel: Channel(0),
             ops: sample_ops(),
         },
     );
-    assert!(keep_open);
-    assert!(is_forbidden(&r.take_outbox(a)[0]));
-    assert_eq!(r.hub().seq(b"room-a"), 0, "a denied write never ingests");
+    assert!(is_ops_rejected(&r.take_outbox(a)[0], ErrorCode::Forbidden));
+
+    // The connection is intact — a following legal frame from the same session
+    // still processes.
+    assert!(r.deliver(a, sub(1, b"room-b")));
+    assert!(matches!(r.take_outbox(a).as_slice(), [Message::Ops { .. }]));
+}
+
+#[test]
+fn a_permitted_write_still_ingests_and_fans_out() {
+    let mut r = registry();
+    let a = hello_auth(&mut r, 1);
+    let b = hello_auth(&mut r, 2);
+    assert!(r.deliver(a, sub(0, b"room-a")));
+    assert!(r.deliver(b, sub(0, b"room-a")));
+    r.take_outbox(a);
+    r.take_outbox(b);
+
+    assert!(r.deliver(
+        a,
+        Message::Ops {
+            channel: Channel(0),
+            ops: sample_ops(),
+        }
+    ));
+    // The author is acknowledged, the peer sees the fan-out, and the hub ingests.
+    assert!(matches!(
+        r.take_outbox(a).as_slice(),
+        [Message::Accepted { .. }]
+    ));
+    assert!(matches!(r.take_outbox(b).as_slice(), [Message::Ops { .. }]));
+    assert_eq!(r.hub().seq(b"room-a"), 1);
 }
 
 #[test]

@@ -9,7 +9,7 @@
 //! off instead of replaying from zero. Pure logic: messages in, local replicas
 //! and messages out; the transport moves the bytes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::doc::MapCursor;
 use crate::{Channel, ClientId, Document, ErrorCode, Message, Op};
@@ -25,6 +25,18 @@ pub enum ClientError {
     UnknownChannel(Channel),
     /// The server reported a failure.
     Server { code: ErrorCode, message: String },
+}
+
+/// A batch of authored ops the server refused, surfaced for the app to show,
+/// discard, or export. The server rejected these — auth revoked, or an enforcing
+/// server's validation failed — so they left the outbox (a `resend` will never
+/// replay them) but are kept here, with the `reason`, until the app drains them
+/// through [`take_rejected`](ClientSession::take_rejected).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Rejected {
+    pub channel: Channel,
+    pub reason: ErrorCode,
+    pub ops: Vec<Op>,
 }
 
 /// One subscribed room: its local replica, the room name, how far it has caught
@@ -55,6 +67,10 @@ pub struct ClientSession {
     active_schema: Option<(u32, Vec<u8>)>,
     rooms: HashMap<Channel, Room>,
     next_channel: u32,
+    /// Op batches the server refused, awaiting the app's drain. Held at the
+    /// session, not the room, so one [`take_rejected`](Self::take_rejected)
+    /// surfaces rejections across every channel; each entry names its channel.
+    rejected: Vec<Rejected>,
 }
 
 impl ClientSession {
@@ -69,6 +85,7 @@ impl ClientSession {
             active_schema: None,
             rooms: HashMap::new(),
             next_channel: 0,
+            rejected: Vec::new(),
         }
     }
 
@@ -184,6 +201,15 @@ impl ClientSession {
     /// the offline queue. `0` if the channel isn't held.
     pub fn outbox_len(&self, channel: Channel) -> usize {
         self.rooms.get(&channel).map_or(0, |r| r.outbox.len())
+    }
+
+    /// Drain the op batches the server has refused since the last call — the
+    /// `onOpsRejected` observation. Each entry names the channel, the reason, and
+    /// the rejected ops (still carrying their bytes) so the app can show, discard,
+    /// or export them. Draining, so a second call reports nothing new; empty when
+    /// no rejection has arrived.
+    pub fn take_rejected(&mut self) -> Vec<Rejected> {
+        std::mem::take(&mut self.rejected)
     }
 
     /// Apply a local edit to `channel`'s room and return the ops to broadcast.
@@ -447,6 +473,32 @@ impl ClientSession {
                 // identity, so a resent op re-acks to the same frontier and the
                 // prune is idempotent.
                 room.outbox.retain(|op| op.id.seq > through);
+                Ok(())
+            }
+            Message::OpsRejected {
+                channel,
+                seqs,
+                reason,
+            } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
+                // The refused ops will never be acknowledged, so they must leave
+                // the outbox — else `resend` would replay them forever. Move them
+                // to the rejected buffer, keeping the op bytes so the app can
+                // export them, and leave the rest queued.
+                let refused: HashSet<u64> = seqs.into_iter().collect();
+                let (ops, remaining) = room
+                    .outbox
+                    .drain(..)
+                    .partition(|op| refused.contains(&op.id.seq));
+                room.outbox = remaining;
+                self.rejected.push(Rejected {
+                    channel,
+                    reason,
+                    ops,
+                });
                 Ok(())
             }
             // `Ack` reports a client's applied sequence to the server; it never
