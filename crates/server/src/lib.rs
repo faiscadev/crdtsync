@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 
+use crdtsync_core::diff::Change;
 use crdtsync_core::op::OpId;
 use crdtsync_core::{ClientId, Document, Element, Op, Schema};
 
@@ -51,6 +52,44 @@ pub const MAIN_BRANCH: &[u8] = b"main";
 /// deployment names none: editors edit `main`, read-only consumers subscribe to
 /// this branch's snapshot of the last published state.
 pub const PUBLISHED_BRANCH: &[u8] = b"published";
+
+/// Why a snapshot diff could not be computed. A diff runs the core engine over
+/// two decoded whole-replica states; either a named version or branch is absent,
+/// or a snapshot's encoded state does not decode into a document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffError {
+    /// A named version the room does not have.
+    UnknownVersion(Vec<u8>),
+    /// A branch the room does not have.
+    UnknownBranch(Vec<u8>),
+    /// A snapshot's encoded state failed to decode into a document.
+    Decode,
+}
+
+impl std::fmt::Display for DiffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiffError::UnknownVersion(name) => {
+                write!(f, "unknown version {}", String::from_utf8_lossy(name))
+            }
+            DiffError::UnknownBranch(name) => {
+                write!(f, "unknown branch {}", String::from_utf8_lossy(name))
+            }
+            DiffError::Decode => write!(f, "a snapshot's state failed to decode"),
+        }
+    }
+}
+
+impl std::error::Error for DiffError {}
+
+/// Decode two encoded whole-replica states and diff them with the core engine. A
+/// state that does not decode is [`DiffError::Decode`]; identical states diff to
+/// an empty change list.
+fn diff_states(old: &[u8], new: &[u8]) -> Result<Vec<Change>, DiffError> {
+    let old = Document::decode_state(old).map_err(|_| DiffError::Decode)?;
+    let new = Document::decode_state(new).map_err(|_| DiffError::Decode)?;
+    Ok(crdtsync_core::path::diff(&old, &new))
+}
 
 /// A room's branches, always holding the default [`MAIN_BRANCH`] and any forks
 /// past it. A fork shares immutable history up to its fork point; only the
@@ -1485,6 +1524,42 @@ impl Hub {
             .get(room)?
             .get(name)
             .map(|v| v.state.as_slice())
+    }
+
+    /// The structural diff turning version `a`'s snapshot into version `b`'s: the
+    /// [`Change`] list [`path::diff`](crdtsync_core::path::diff) computes over the
+    /// two decoded whole-replica states. Diffing a version against itself is empty.
+    /// An absent version is [`DiffError::UnknownVersion`]; a snapshot that does not
+    /// decode is [`DiffError::Decode`] — never a panic.
+    pub fn diff_versions(&self, room: &[u8], a: &[u8], b: &[u8]) -> Result<Vec<Change>, DiffError> {
+        let old = self
+            .version_state(room, a)
+            .ok_or_else(|| DiffError::UnknownVersion(a.to_vec()))?;
+        let new = self
+            .version_state(room, b)
+            .ok_or_else(|| DiffError::UnknownVersion(b.to_vec()))?;
+        diff_states(old, new)
+    }
+
+    /// The structural diff turning branch `a`'s current state into branch `b`'s —
+    /// each branch materialized (shared base plus divergent tail, or its owned
+    /// snapshot base) then fed to the core engine, so a branch against its fork
+    /// source yields only the divergence. Diffing a branch against itself is empty.
+    /// An unknown branch is [`DiffError::UnknownBranch`]; a state that does not
+    /// decode is [`DiffError::Decode`].
+    pub fn diff_branches(
+        &mut self,
+        room: &[u8],
+        a: &[u8],
+        b: &[u8],
+    ) -> Result<Vec<Change>, DiffError> {
+        let old = self
+            .materialize_branch(room, a)
+            .ok_or_else(|| DiffError::UnknownBranch(a.to_vec()))?;
+        let new = self
+            .materialize_branch(room, b)
+            .ok_or_else(|| DiffError::UnknownBranch(b.to_vec()))?;
+        diff_states(&old, &new)
     }
 
     /// The names of a room's versions, sorted, for listing and pagination.
