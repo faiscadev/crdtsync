@@ -45,6 +45,7 @@ fn st(hub: &mut Hub, s: &mut Session, msg: Message) -> crdtsync_server::Response
         None,
         &Mutex::new(SchemaRegistry::new()),
         None,
+        None,
         0,
         None,
         msg,
