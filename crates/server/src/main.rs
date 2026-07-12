@@ -9,7 +9,12 @@
 //! verifier admits any credential. Set `CRDTSYNC_WEBHOOK_URL` to POST each
 //! room-bearing lifecycle event to an HTTP endpoint (best-effort, off the commit
 //! path), with `CRDTSYNC_WEBHOOK_SECRET` attached as a shared-secret header for
-//! the receiver to verify; unset, no webhook fires.
+//! the receiver to verify; unset, no webhook fires. Set `CRDTSYNC_CLUSTER_PEERS`
+//! to a comma-separated list of peer advertise addresses to join a horizontal
+//! cluster — the node holds its member view and placement, deriving its own id
+//! from `CRDTSYNC_NODE_ID` or `CRDTSYNC_ADVERTISE_ADDR`, with
+//! `CRDTSYNC_REPLICATION_FACTOR` overriding the per-room replica count; unset, the
+//! node is single-node and serves every room locally.
 //!
 //! A policy's `actor:` and subject-class (`authenticated` / `anonymous`) rules
 //! are only real boundaries when the actor is server-derived. With a credentials
@@ -26,10 +31,11 @@ use std::sync::{Arc, Mutex};
 use crdtsync_core::ClientId;
 use crdtsync_server::acl::{Acl, PolicyFileError};
 use crdtsync_server::auth::CredentialsFileError;
+use crdtsync_server::membership::{Membership, MembershipConfigError};
 use crdtsync_server::runtime::{serve_with_authorizer, ServeConfig};
 use crdtsync_server::{
     serve_admin, AllowAll, Authorizer, PermitAll, SchemaRegistry, StaticTokens, Store, Verifier,
-    WebhookConfig,
+    WebhookConfig, DEFAULT_REPLICATION_FACTOR,
 };
 use tokio::net::TcpListener;
 
@@ -99,6 +105,44 @@ fn webhook() -> std::io::Result<Option<WebhookConfig>> {
     }
 }
 
+/// The node's static cluster membership for the run. Set `CRDTSYNC_CLUSTER_PEERS`
+/// to a comma-separated list of peer advertise addresses (`host:port,...`) to
+/// join a cluster; the node's own identity comes from `CRDTSYNC_NODE_ID` if set,
+/// else its `CRDTSYNC_ADVERTISE_ADDR`. `CRDTSYNC_REPLICATION_FACTOR` overrides the
+/// default per-room replica count. Unset `CRDTSYNC_CLUSTER_PEERS` is single-node
+/// mode — no cluster, every room served locally, exactly the current behavior.
+/// A malformed peer list or replication factor is a clean startup error.
+fn membership() -> std::io::Result<Option<Membership>> {
+    let Some(peers) = path_var("CRDTSYNC_CLUSTER_PEERS")? else {
+        return Ok(None);
+    };
+    let node_id = path_var("CRDTSYNC_NODE_ID")?;
+    let advertise = path_var("CRDTSYNC_ADVERTISE_ADDR")?;
+    let factor = match path_var("CRDTSYNC_REPLICATION_FACTOR")? {
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(0) | Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "CRDTSYNC_REPLICATION_FACTOR must be a positive integer",
+                ))
+            }
+            Ok(n) => n,
+        },
+        None => DEFAULT_REPLICATION_FACTOR,
+    };
+    let m =
+        Membership::from_static_config(node_id.as_deref(), advertise.as_deref(), &peers, factor)
+            .map_err(|e| {
+                let kind = match e {
+                    MembershipConfigError::EmptyPeer | MembershipConfigError::MissingSelfId => {
+                        std::io::ErrorKind::InvalidInput
+                    }
+                };
+                std::io::Error::new(kind, e)
+            })?;
+    Ok(Some(m))
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let addr = match std::env::var("CRDTSYNC_ADDR") {
@@ -132,6 +176,7 @@ async fn main() -> std::io::Result<()> {
         ServeConfig {
             schema: schema.clone(),
             webhook: webhook()?,
+            membership: membership()?,
             ..ServeConfig::default()
         },
         verifier()?,

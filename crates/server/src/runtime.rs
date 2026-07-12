@@ -31,6 +31,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Authorizer, PermitAll};
+use crate::membership::Membership;
 use crate::webhook::{WebhookConfig, WebhookSink};
 use crate::{negotiate, ConnId, Registry, RoomId, RoomLog, Store};
 
@@ -64,6 +65,11 @@ pub struct ServeConfig {
     /// event as a POST. `None` registers no sink, so a deployment that wants no
     /// webhooks pays nothing per event.
     pub webhook: Option<WebhookConfig>,
+    /// The node's static cluster membership + placement. `None` is single-node
+    /// mode — every room is served locally, the current behavior. When set, the
+    /// node holds its member view; routing on it is Unit 3, so a set membership
+    /// changes nothing here yet.
+    pub membership: Option<Membership>,
 }
 
 impl Default for ServeConfig {
@@ -74,6 +80,7 @@ impl Default for ServeConfig {
             anonymous: false,
             schema: Arc::default(),
             webhook: None,
+            membership: None,
         }
     }
 }
@@ -266,6 +273,9 @@ async fn registry_actor(
     reg.set_authorizer(authorizer);
     reg.set_schema_registry(config.schema.clone());
     reg.set_grace_millis(config.grace.as_millis() as u64);
+    if let Some(membership) = config.membership.clone() {
+        reg.set_membership(membership);
+    }
     if let Some(webhook) = webhook {
         reg.add_event_sink(Box::new(webhook));
     }

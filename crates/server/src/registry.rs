@@ -22,6 +22,7 @@ use crate::auto_version::{
     AutoVersionState,
 };
 use crate::clock::{Clock, SystemClock};
+use crate::membership::Membership;
 use crate::schema_registry::SchemaRegistry;
 use crate::{
     step, AwarenessPolicy, EngineEvent, EventSink, Hub, RoomId, SchemaAwarenessPolicy, Session,
@@ -84,6 +85,10 @@ pub struct Registry {
     /// seen and captures once its interval has since elapsed; entries for unbound
     /// rooms are pruned each sweep, so a rebound room re-arms.
     schedule_fires: HashMap<(RoomId, Vec<u8>), u64>,
+    /// The node's static cluster membership + placement view. `None` is
+    /// single-node mode: every room is served locally. Held for the routing and
+    /// replication layers to consult; this layer does not yet route on it.
+    membership: Option<Membership>,
 }
 
 impl Registry {
@@ -116,6 +121,7 @@ impl Registry {
             schema_cache: HashMap::new(),
             auto_version,
             schedule_fires: HashMap::new(),
+            membership: None,
         }
     }
 
@@ -166,6 +172,18 @@ impl Registry {
     /// How long a departed client's presence lingers before a sweep may clear it.
     pub fn set_grace_millis(&mut self, millis: u64) {
         self.grace_millis = millis;
+    }
+
+    /// Hold the node's static cluster [`Membership`] — its member view and
+    /// placement. Unset (the default) is single-node mode, every room local.
+    pub fn set_membership(&mut self, membership: Membership) {
+        self.membership = Some(membership);
+    }
+
+    /// The node's cluster membership view, or `None` in single-node mode. Routing
+    /// (Unit 3) and replication (Unit 4) read placement through this.
+    pub fn membership(&self) -> Option<&Membership> {
+        self.membership.as_ref()
     }
 
     /// Auto-compact a room once its retained log reaches `threshold` ops, so a
