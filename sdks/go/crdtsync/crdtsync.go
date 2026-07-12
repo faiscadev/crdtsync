@@ -510,6 +510,16 @@ func (c *Client) Subscribe(room []byte) (uint32, []byte) {
 	return uint32(channel), frame
 }
 
+// SubscribeBranch joins branch of room on a fresh channel; returns the channel
+// and the frame. An empty branch is the default/active branch, as Subscribe.
+func (c *Client) SubscribeBranch(room, branch []byte) (uint32, []byte) {
+	rp, rl := bytesArg(room)
+	bp, bl := bytesArg(branch)
+	var channel C.uint32_t
+	frame := takeBuf(C.crdtsync_client_subscribe_branch(c.h, rp, rl, bp, bl, &channel))
+	return uint32(channel), frame
+}
+
 // Resume re-issues Subscribe for a held channel from its caught-up position.
 func (c *Client) Resume(channel uint32) []byte {
 	return takeBuf(C.crdtsync_client_resume(c.h, C.uint32_t(channel)))

@@ -279,6 +279,27 @@ fn a_client_edit_travels_to_a_peer() {
 }
 
 #[wasm_bindgen_test]
+fn subscribe_branch_carries_the_named_branch() {
+    use crdtsync_core::{decode_message, Message};
+
+    let branch_of = |frame: &[u8]| match decode_message(frame).unwrap() {
+        Message::Subscribe { branch, .. } => branch,
+        other => panic!("expected Subscribe, got {other:?}"),
+    };
+
+    let mut a = wasm_client(1);
+    // A named branch rides along in the Subscribe frame.
+    let sub = a.subscribe_branch(b"room-1", b"feature-x");
+    assert_eq!(sub.channel(), 0);
+    assert_eq!(branch_of(&sub.frame()), b"feature-x");
+    // An empty branch is the default/active branch, as the plain subscribe.
+    let sub = a.subscribe_branch(b"room-1", b"");
+    assert!(branch_of(&sub.frame()).is_empty());
+    let sub = a.subscribe(b"room-1");
+    assert!(branch_of(&sub.frame()).is_empty());
+}
+
+#[wasm_bindgen_test]
 fn a_client_handshake_and_awareness_marshal() {
     let mut c = wasm_client(1);
     assert!(!c.hello().is_empty());
