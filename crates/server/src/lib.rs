@@ -37,10 +37,119 @@ pub use event::{EngineEvent, EventSink};
 pub use registry::{ConnId, Registry};
 pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry};
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
-pub use store::{RoomLog, RoomMeta, Snapshot, Store, StoredOp};
+pub use store::{Branch, RoomLog, RoomMeta, Snapshot, Store, StoredOp};
 
 /// A room name, opaque bytes chosen by the deployment.
 pub type RoomId = Vec<u8>;
+
+/// The default branch every room has: the one that shares the whole op log from
+/// its origin. It is never deletable and never renamable, so a room always
+/// resolves it.
+pub const MAIN_BRANCH: &[u8] = b"main";
+
+/// A room's branches, always holding the default [`MAIN_BRANCH`] and any forks
+/// past it. A fork shares immutable history up to its fork point; only the
+/// divergent forks are persisted, `main` being synthesized. Listing order is
+/// deterministic (by name), so replicas agree.
+#[derive(Clone)]
+pub struct BranchRegistry {
+    branches: BTreeMap<Vec<u8>, Branch>,
+}
+
+impl Default for BranchRegistry {
+    fn default() -> Self {
+        let mut branches = BTreeMap::new();
+        branches.insert(
+            MAIN_BRANCH.to_vec(),
+            Branch {
+                name: MAIN_BRANCH.to_vec(),
+                fork_point: 0,
+                head: 0,
+            },
+        );
+        Self { branches }
+    }
+}
+
+impl BranchRegistry {
+    /// A registry restored from its persisted forks, with the default `main`
+    /// re-synthesized around them.
+    fn from_forks(forks: impl IntoIterator<Item = Branch>) -> Self {
+        let mut registry = Self::default();
+        for fork in forks {
+            registry.branches.insert(fork.name.clone(), fork);
+        }
+        registry
+    }
+
+    /// A branch by name, or `None` if this room has no such branch.
+    pub fn branch(&self, name: &[u8]) -> Option<&Branch> {
+        self.branches.get(name)
+    }
+
+    /// Every branch, in deterministic name order — always at least `main`.
+    pub fn branches(&self) -> impl Iterator<Item = &Branch> {
+        self.branches.values()
+    }
+
+    /// Fork a fresh branch `new` off the existing branch `from`, sharing its
+    /// history up to position `at`. Refuses — changing nothing — if `new` already
+    /// exists or `from` is absent. The new branch starts with no divergence past
+    /// the fork point, so its head is the fork point.
+    fn fork(&mut self, new: &[u8], from: &[u8], at: u64) -> bool {
+        if self.branches.contains_key(new) || !self.branches.contains_key(from) {
+            return false;
+        }
+        self.branches.insert(
+            new.to_vec(),
+            Branch {
+                name: new.to_vec(),
+                fork_point: at,
+                head: at,
+            },
+        );
+        true
+    }
+
+    /// Rename branch `from` to `to`. Refuses — changing nothing — for the
+    /// undeletable `main`, an absent `from`, or a `to` already taken.
+    fn rename(&mut self, from: &[u8], to: &[u8]) -> bool {
+        if from == MAIN_BRANCH
+            || self.branches.contains_key(to)
+            || !self.branches.contains_key(from)
+        {
+            return false;
+        }
+        let mut branch = self.branches.remove(from).expect("presence checked above");
+        branch.name = to.to_vec();
+        self.branches.insert(to.to_vec(), branch);
+        true
+    }
+
+    /// Delete branch `name`, returning whether one was removed. `main` is never
+    /// deletable, so a room always keeps its default branch.
+    fn delete(&mut self, name: &[u8]) -> bool {
+        if name == MAIN_BRANCH {
+            return false;
+        }
+        self.branches.remove(name).is_some()
+    }
+
+    /// The forks past the default `main` — the persisted subset, `main` being
+    /// synthesized on load.
+    fn forks(&self) -> impl Iterator<Item = &Branch> {
+        self.branches
+            .values()
+            .filter(|branch| branch.name != MAIN_BRANCH)
+    }
+
+    /// Point `main`'s head at the room's current log head, which it tracks.
+    fn set_main_head(&mut self, head: u64) {
+        if let Some(main) = self.branches.get_mut(MAIN_BRANCH) {
+            main.head = head;
+        }
+    }
+}
 
 /// One room's authoritative replica and its op log. A server sequence is a
 /// 1-based position across the room's whole history; `base_seq` counts the ops
@@ -276,6 +385,10 @@ pub struct Hub {
     /// restart; a gap (a rolled-back persist) is harmless — only monotonicity
     /// matters.
     version_ordinal: u64,
+    /// The branches per room, keyed by room. A room absent here has only the
+    /// default `main` — the registry is materialized lazily on the first fork, so a
+    /// never-forked room carries no per-room branch state and no branches file.
+    branches: HashMap<RoomId, BranchRegistry>,
     /// The engine event sinks, notified of each lifecycle moment. Empty by
     /// default — no sink, no emission cost.
     sinks: Vec<Box<dyn EventSink>>,
@@ -293,6 +406,7 @@ impl Hub {
             awareness: HashMap::new(),
             versions: HashMap::new(),
             version_ordinal: 0,
+            branches: HashMap::new(),
             sinks: Vec::new(),
         }
     }
@@ -592,7 +706,7 @@ impl Hub {
             }
         }
         if !log.versions.is_empty() {
-            let index = self.versions.entry(room).or_default();
+            let index = self.versions.entry(room.clone()).or_default();
             for (name, seq, origin, ordinal, state) in log.versions {
                 index.insert(
                     name,
@@ -604,6 +718,12 @@ impl Hub {
                     },
                 );
             }
+        }
+        // Restore the room's forks; `main` is synthesized around them. An empty
+        // set leaves the room with the lazy default `{main}` — no entry at all.
+        if !log.branches.is_empty() {
+            self.branches
+                .insert(room, BranchRegistry::from_forks(log.branches));
         }
         Ok(())
     }
@@ -1107,5 +1227,100 @@ impl Hub {
             })
             .collect();
         store.write_versions(room, &records)
+    }
+
+    /// The room's branch registry as it should be observed — the stored forks
+    /// plus a `main` whose head tracks the room's current log head. A room with no
+    /// materialized entry observes the default `{main}`.
+    fn observed_branches(&self, room: &[u8]) -> BranchRegistry {
+        let mut registry = self.branches.get(room).cloned().unwrap_or_default();
+        registry.set_main_head(self.rooms.get(room).map_or(0, Room::head));
+        registry
+    }
+
+    /// The room's branches, in deterministic name order — always at least the
+    /// default `main`, whose head tracks the room's log head.
+    pub fn branches(&self, room: &[u8]) -> Vec<Branch> {
+        self.observed_branches(room).branches().cloned().collect()
+    }
+
+    /// A room's branch by name, or `None` if it has no such branch. `main` always
+    /// resolves.
+    pub fn branch(&self, room: &[u8], name: &[u8]) -> Option<Branch> {
+        self.observed_branches(room).branch(name).cloned()
+    }
+
+    /// Fork a fresh branch `new` off `from`, sharing its history up to position
+    /// `at`. Returns `Ok(false)` — changing nothing — if `new` already exists or
+    /// `from` is absent. With a store attached the set is persisted before the
+    /// fork commits, so a persist failure leaves no branch the disk has not
+    /// accepted.
+    pub fn fork_branch(
+        &mut self,
+        room: &[u8],
+        new: &[u8],
+        from: &[u8],
+        at: u64,
+    ) -> io::Result<bool> {
+        self.mutate_branches(room, |registry| registry.fork(new, from, at))
+    }
+
+    /// Rename branch `from` to `to`. Returns `Ok(false)` — changing nothing — for
+    /// the default `main`, an absent `from`, or a `to` already taken. Persisted
+    /// before the rename commits when a store is attached.
+    pub fn rename_branch(&mut self, room: &[u8], from: &[u8], to: &[u8]) -> io::Result<bool> {
+        self.mutate_branches(room, |registry| registry.rename(from, to))
+    }
+
+    /// Delete branch `name`, returning whether one was removed. The default `main`
+    /// is never deletable. Persisted before the removal commits when a store is
+    /// attached.
+    pub fn delete_branch(&mut self, room: &[u8], name: &[u8]) -> io::Result<bool> {
+        self.mutate_branches(room, |registry| registry.delete(name))
+    }
+
+    /// Apply `change` to `room`'s registry, persisting the result before it
+    /// commits. A no-op change (the closure returns `false`) installs nothing, so
+    /// a never-forked room keeps no per-room entry; a persist failure rolls the
+    /// registry back to its pre-change state, so it never reflects a set the disk
+    /// rejected.
+    fn mutate_branches(
+        &mut self,
+        room: &[u8],
+        change: impl FnOnce(&mut BranchRegistry) -> bool,
+    ) -> io::Result<bool> {
+        // Work on a copy of the room's registry (the default `{main}` when it has
+        // none), so a refused change leaves the map untouched — a room only
+        // materializes an entry once a change actually takes.
+        let mut registry = self.branches.get(room).cloned().unwrap_or_default();
+        if !change(&mut registry) {
+            return Ok(false);
+        }
+        let previous = self.branches.insert(room.to_vec(), registry);
+        if let Err(e) = self.persist_branches(room) {
+            match previous {
+                Some(prev) => {
+                    self.branches.insert(room.to_vec(), prev);
+                }
+                None => {
+                    self.branches.remove(room);
+                }
+            }
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Persist `room`'s forks to the store, if one is attached. Only the forks
+    /// past the default `main` are written; an empty set removes the file,
+    /// restoring the room to `{main}`.
+    fn persist_branches(&mut self, room: &[u8]) -> io::Result<()> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(());
+        };
+        let empty = BranchRegistry::default();
+        let registry = self.branches.get(room).unwrap_or(&empty);
+        let forks: Vec<Branch> = registry.forks().cloned().collect();
+        store.write_branches(room, &forks)
     }
 }

@@ -66,6 +66,19 @@ pub struct RoomMeta {
     pub max_op_version: Option<u32>,
 }
 
+/// One branch of a room: a named pointer into the op log. `fork_point` is the
+/// history position up to which it shares the log with the branch it forked from;
+/// `head` is its own high-water position (the room's server sequence, the
+/// single-node log's monotonic history counter). The default `main` (fork_point
+/// 0) is synthesized rather than stored, so the persisted set holds only the forks
+/// that diverge from it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Branch {
+    pub name: Vec<u8>,
+    pub fork_point: u64,
+    pub head: u64,
+}
+
 /// What a store holds for one room: an optional compaction snapshot, the op
 /// records still in its log, and its named versions. The log may overlap the
 /// snapshot — a crash between writing the snapshot and truncating the log leaves
@@ -81,6 +94,10 @@ pub struct RoomLog {
     /// (an unbound relay room, or one whose record is absent or undecodable — the
     /// rebuild-from-log fallback then stands).
     pub meta: Option<RoomMeta>,
+    /// The room's persisted branches — the forks past the default `main`. Empty
+    /// when the store holds none (a never-forked room, or a record that is absent
+    /// or undecodable), which the hub restores as the default `{main}`.
+    pub branches: Vec<Branch>,
 }
 
 /// A directory of per-room logs and snapshots.
@@ -217,6 +234,32 @@ impl Store {
         self.atomic_write(&self.meta_path(room), &self.meta_tmp_path(room), &buf)
     }
 
+    /// Rewrite `room`'s branches to their own file, replacing whatever it held.
+    /// Only the forks past the default `main` are stored — `main` is synthesized
+    /// on load — so an empty slice removes the file, restoring the room to the
+    /// default `{main}`. Each record is the name (length-prefixed), the fork-point
+    /// position (8-byte little-endian), then the head position (8-byte
+    /// little-endian). The file lands atomically — temp, flushed, renamed,
+    /// directory flushed — so a crash never leaves a torn set; the whole file is
+    /// rewritten on every change, as the *set* of branches is mutable though a
+    /// branch's history is not.
+    pub fn write_branches(&mut self, room: &[u8], branches: &[Branch]) -> io::Result<()> {
+        if branches.is_empty() {
+            return self.remove_if_present(&self.branches_path(room));
+        }
+        let mut buf = Vec::new();
+        for branch in branches {
+            put_bytes(&mut buf, &branch.name);
+            buf.extend_from_slice(&branch.fork_point.to_le_bytes());
+            buf.extend_from_slice(&branch.head.to_le_bytes());
+        }
+        self.atomic_write(
+            &self.branches_path(room),
+            &self.branches_tmp_path(room),
+            &buf,
+        )
+    }
+
     /// Write `buf` to `path` atomically: fill `tmp`, flush it, rename it into
     /// place, then flush the directory so the rename itself is crash-durable. A
     /// reader sees either the whole prior file or the whole new one, never a torn
@@ -254,9 +297,9 @@ impl Store {
     /// Every room's snapshot, log, and governing metadata, keyed by room id. Room
     /// order is unspecified. A torn tail log record is dropped; a complete but
     /// undecodable record, or a snapshot missing its header, is an
-    /// [`io::ErrorKind::InvalidData`] error. An undecodable metadata record loads
-    /// as absent (a durability cache, never fatal). An uncommitted snapshot temp
-    /// is ignored.
+    /// [`io::ErrorKind::InvalidData`] error. An undecodable metadata or branches
+    /// record loads as absent (a durability cache / the default `{main}`, never
+    /// fatal). An uncommitted snapshot temp is ignored.
     pub fn load(&self) -> io::Result<Vec<(RoomId, RoomLog)>> {
         let mut rooms: HashMap<RoomId, RoomLog> = HashMap::new();
         for entry in fs::read_dir(&self.root)? {
@@ -275,6 +318,9 @@ impl Store {
                 // record loads as absent, leaving the rebuild-from-log /
                 // bind-on-subscribe fallback rather than failing the whole load.
                 FileKind::Meta => slot.meta = parse_meta(&bytes),
+                // A malformed branches record loads as no forks, restoring the
+                // room to the default `{main}` rather than failing the whole load.
+                FileKind::Branches => slot.branches = parse_branches(&bytes),
             }
         }
         Ok(rooms.into_iter().collect())
@@ -329,6 +375,18 @@ impl Store {
     fn meta_tmp_path(&self, room: &[u8]) -> PathBuf {
         self.root.join(format!("{}.meta.tmp", Self::hex_name(room)))
     }
+
+    /// The branches file backing `room`.
+    fn branches_path(&self, room: &[u8]) -> PathBuf {
+        self.root.join(format!("{}.branches", Self::hex_name(room)))
+    }
+
+    /// The in-progress branches temp for `room`, renamed onto `branches_path`
+    /// once durable.
+    fn branches_tmp_path(&self, room: &[u8]) -> PathBuf {
+        self.root
+            .join(format!("{}.branches.tmp", Self::hex_name(room)))
+    }
 }
 
 /// Append `bytes` to `buf` as a `u32` little-endian length prefix then the bytes.
@@ -346,16 +404,19 @@ enum FileKind {
     Snapshot,
     Versions,
     Meta,
+    Branches,
 }
 
 /// Recover a room id and file kind from a path, or `None` if it is not one of
-/// ours (including an uncommitted `.snap.tmp` / `.versions.tmp` / `.meta.tmp`).
+/// ours (including an uncommitted `.snap.tmp` / `.versions.tmp` / `.meta.tmp` /
+/// `.branches.tmp`).
 fn classify(path: &Path) -> Option<(RoomId, FileKind)> {
     let kind = match path.extension()?.to_str()? {
         "log" => FileKind::Log,
         "snap" => FileKind::Snapshot,
         "versions" => FileKind::Versions,
         "meta" => FileKind::Meta,
+        "branches" => FileKind::Branches,
         _ => return None,
     };
     let stem = path.file_stem()?.to_str()?.as_bytes();
@@ -443,6 +504,33 @@ fn parse_meta(bytes: &[u8]) -> Option<RoomMeta> {
         governing,
         max_op_version,
     })
+}
+
+/// Parse a branches file: a sequence of `(name, fork_point, head)` records, each
+/// a length-prefixed name and two 8-byte little-endian history positions.
+/// Branches are a durability cache over the default `{main}`, so any framing
+/// shortfall discards the whole set (loading as no forks) rather than failing the
+/// load — the hub then re-synthesizes `{main}`.
+fn parse_branches(bytes: &[u8]) -> Vec<Branch> {
+    let mut branches = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let Ok(name) = take_bytes(bytes, &mut at) else {
+            return Vec::new();
+        };
+        let Ok(fork_point) = take_u64(bytes, &mut at) else {
+            return Vec::new();
+        };
+        let Ok(head) = take_u64(bytes, &mut at) else {
+            return Vec::new();
+        };
+        branches.push(Branch {
+            name,
+            fork_point,
+            head,
+        });
+    }
+    branches
 }
 
 /// Read a single byte at `at`, advancing it.
