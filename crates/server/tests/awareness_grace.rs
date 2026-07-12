@@ -83,6 +83,7 @@ fn subscribe(r: &mut Registry, id: ConnId, channel: u32, room: &[u8]) {
             channel: Channel(channel),
             room: room.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(id);
@@ -130,6 +131,7 @@ fn a_sweep_past_the_grace_window_clears_departed_presence() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert!(awareness_updates(r.take_outbox(b)).is_empty());
@@ -199,6 +201,7 @@ fn closing_one_tab_keeps_a_sibling_tabs_presence() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert!(!awareness_updates(r.take_outbox(joiner)).is_empty());
@@ -229,6 +232,7 @@ fn presence_is_retained_within_the_grace_window() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert_eq!(
@@ -271,6 +275,7 @@ fn a_reconnect_within_the_window_cancels_the_clear() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert_eq!(
@@ -302,6 +307,7 @@ fn a_sweep_with_nothing_stale_is_a_no_op() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert_eq!(awareness_updates(r.take_outbox(b)).len(), 1);
@@ -340,6 +346,7 @@ fn a_second_connection_asserting_a_live_client_cannot_steal_its_presence() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert!(
@@ -370,6 +377,7 @@ fn an_authenticated_second_connection_cannot_steal_a_live_clients_presence() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert!(
@@ -430,6 +438,7 @@ fn an_unauthenticated_socket_does_not_keep_a_departed_clients_presence() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert!(
@@ -468,6 +477,7 @@ fn an_unauthenticated_hello_does_not_cancel_a_pending_sweep() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert!(

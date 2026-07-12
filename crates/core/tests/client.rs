@@ -364,16 +364,53 @@ fn subscribe_assigns_a_channel_and_requests_from_zero() {
         Message::Subscribe {
             channel: c,
             room,
+            branch,
             last_seen_seq,
         } => {
             assert_eq!(c, channel);
             assert_eq!(room, ROOM_A);
+            // No branch named — the default `main`, empty on the wire.
+            assert_eq!(branch, b"");
             assert_eq!(last_seen_seq, 0);
         }
         other => panic!("expected Subscribe, got {other:?}"),
     }
     assert_eq!(session.room(channel), Some(ROOM_A));
+    assert_eq!(session.branch(channel), Some(&b""[..]));
     assert_eq!(session.last_seen_seq(channel), Some(0));
+}
+
+#[test]
+fn subscribe_branch_names_its_branch_on_the_frame_and_records_it() {
+    let mut session = ClientSession::new(cid(1));
+    let (channel, msg) = session.subscribe_branch(ROOM_A, b"release-2");
+    match msg {
+        Message::Subscribe {
+            channel: c,
+            room,
+            branch,
+            last_seen_seq,
+        } => {
+            assert_eq!(c, channel);
+            assert_eq!(room, ROOM_A);
+            assert_eq!(branch, b"release-2");
+            assert_eq!(last_seen_seq, 0);
+        }
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+    assert_eq!(session.room(channel), Some(ROOM_A));
+    assert_eq!(session.branch(channel), Some(&b"release-2"[..]));
+}
+
+#[test]
+fn subscribe_branch_with_an_empty_branch_is_main() {
+    let mut session = ClientSession::new(cid(1));
+    let (channel, msg) = session.subscribe_branch(ROOM_A, b"");
+    match msg {
+        Message::Subscribe { branch, .. } => assert_eq!(branch, b""),
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+    assert_eq!(session.branch(channel), Some(&b""[..]));
 }
 
 #[test]
@@ -480,12 +517,24 @@ fn resume_resubscribes_a_room_from_its_last_seen_sequence() {
         Some(Message::Subscribe {
             channel,
             room,
+            branch,
             last_seen_seq,
         }) => {
             assert_eq!(channel, ch);
             assert_eq!(room, ROOM_A);
+            assert_eq!(branch, b"");
             assert_eq!(last_seen_seq, 2);
         }
+        other => panic!("expected a Subscribe, got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_carries_the_subscribed_branch() {
+    let mut session = ClientSession::new(cid(2));
+    let (ch, _) = session.subscribe_branch(ROOM_A, b"release-2");
+    match session.resume(ch) {
+        Some(Message::Subscribe { branch, .. }) => assert_eq!(branch, b"release-2"),
         other => panic!("expected a Subscribe, got {other:?}"),
     }
 }
@@ -688,6 +737,7 @@ fn a_client_only_message_from_the_server_is_a_violation() {
         session.receive(Message::Subscribe {
             channel: Channel(0),
             room: ROOM_A.to_vec(),
+            branch: Vec::new(),
             last_seen_seq: 0,
         }),
         Err(ClientError::UnexpectedMessage(_))

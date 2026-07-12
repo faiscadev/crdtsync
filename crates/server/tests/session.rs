@@ -55,6 +55,7 @@ fn sub(room: &[u8], last_seen_seq: u64) -> Message {
     Message::Subscribe {
         channel: CH,
         room: room.to_vec(),
+        branch: Vec::new(),
         last_seen_seq,
     }
 }
@@ -170,6 +171,25 @@ fn subscribe_binds_the_room_to_its_channel() {
 }
 
 #[test]
+fn a_subscribe_naming_a_branch_binds_the_room_ignoring_the_branch() {
+    let mut h = hub();
+    let mut s = Session::new();
+    handshake(&mut h, &mut s, 1);
+    // The branch is carried, not enforced; the room alone binds the subscription.
+    st(
+        &mut h,
+        &mut s,
+        Message::Subscribe {
+            channel: CH,
+            room: ROOM.to_vec(),
+            branch: b"release-2".to_vec(),
+            last_seen_seq: 0,
+        },
+    );
+    assert_eq!(s.channels_for_room(ROOM), vec![CH]);
+}
+
+#[test]
 fn subscribe_replies_with_the_catch_up_batch() {
     let mut h = hub();
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
@@ -279,6 +299,7 @@ fn a_second_channel_binds_a_second_room() {
             channel: Channel(1),
             room: b"room-b".to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert_eq!(s.channels_for_room(b"room-a"), vec![CH]);
@@ -298,6 +319,7 @@ fn reusing_a_bound_channel_is_a_violation() {
             channel: CH,
             room: b"room-b".to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert!(r.close);

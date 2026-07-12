@@ -96,6 +96,7 @@ fn subscribe(r: &mut Registry, peer: &Peer) {
             channel: Channel(0),
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     let replies = r.take_outbox(peer.id);

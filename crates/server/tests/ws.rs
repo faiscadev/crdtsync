@@ -184,6 +184,7 @@ async fn join(url: &str, client: u8) -> Ws {
             channel: CH,
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     )
     .await;
@@ -273,6 +274,7 @@ async fn a_real_verifier_makes_actor_policy_enforceable() {
             channel: CH,
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     )
     .await;
@@ -378,6 +380,7 @@ async fn a_declared_policy_gates_subscribe_over_the_transport() {
             channel: CH,
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     )
     .await;
@@ -394,6 +397,7 @@ async fn a_declared_policy_gates_subscribe_over_the_transport() {
             channel: CH,
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     )
     .await;
@@ -464,6 +468,7 @@ async fn a_late_joiner_catches_up() {
             channel: Channel(1),
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     )
     .await;
@@ -577,6 +582,7 @@ async fn a_credential_at_the_upgrade_skips_the_auth_phase() {
             channel: CH,
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     )
     .await;

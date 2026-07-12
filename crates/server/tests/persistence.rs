@@ -194,6 +194,7 @@ fn ingest_via(r: &mut Registry, client: u8, room: &[u8], ops: Vec<crdtsync_core:
             channel: Channel(0),
             room: room.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -280,6 +281,7 @@ fn catch_up_uses_stable_sequences_across_a_restart() {
                 channel: Channel(0),
                 room: ROOM.to_vec(),
                 last_seen_seq: 0,
+                branch: Vec::new(),
             },
         );
         r.deliver(

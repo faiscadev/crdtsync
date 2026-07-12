@@ -216,6 +216,7 @@ fn the_registry_emits_connect_then_subscribe() {
             channel: Channel(0),
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     // Connect emits at accept; a Hello/Auth is silent; an accepted Subscribe emits.
@@ -249,6 +250,7 @@ fn a_rejected_duplicate_subscribe_does_not_re_emit() {
         channel: Channel(0),
         room: ROOM.to_vec(),
         last_seen_seq: 0,
+        branch: Vec::new(),
     };
     assert!(r.deliver(id, sub()));
     // The identical re-subscribe is rejected — the room is already mapped — so no

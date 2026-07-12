@@ -126,6 +126,7 @@ fn subscribe(r: &mut Registry, id: ConnId, room: &[u8]) {
             channel: Channel(0),
             room: room.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(id);
@@ -160,6 +161,7 @@ fn replayed_keys(r: &mut Registry, room: &[u8]) -> Vec<Vec<u8>> {
             channel: Channel(0),
             room: room.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(observer)
@@ -328,6 +330,7 @@ fn a_read_denied_subscribe_does_not_bind_the_rooms_schema() {
             channel: Channel(0),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(enforcing);

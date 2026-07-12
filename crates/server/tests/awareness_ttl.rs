@@ -115,6 +115,7 @@ fn subscribe(r: &mut Registry, id: ConnId, channel: u32, room: &[u8]) {
             channel: Channel(channel),
             room: room.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(id);
@@ -149,6 +150,7 @@ fn replayed_keys(r: &mut Registry, room: &[u8]) -> Vec<Vec<u8>> {
             channel: Channel(0),
             room: room.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(observer)

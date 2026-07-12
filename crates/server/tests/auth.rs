@@ -131,6 +131,7 @@ fn after_auth_subscribe_is_allowed() {
             channel: Channel(0),
             room: b"room-1".to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert_eq!(
@@ -244,6 +245,7 @@ fn subscribe_before_auth_is_a_violation() {
             channel: Channel(0),
             room: b"room-1".to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert!(r.close);
@@ -310,6 +312,7 @@ fn a_fast_path_session_subscribes_without_an_auth_phase() {
             channel: Channel(0),
             room: b"room-1".to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert_eq!(

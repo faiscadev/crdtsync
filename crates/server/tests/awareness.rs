@@ -63,6 +63,7 @@ fn subscribe(r: &mut Registry, id: ConnId, channel: u32, room: &[u8]) {
             channel: Channel(channel),
             room: room.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(id);
@@ -174,6 +175,7 @@ fn a_late_joiner_is_replayed_current_presence() {
             channel: Channel(7),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     assert_eq!(
@@ -209,6 +211,7 @@ fn replay_reflects_the_latest_value_per_key() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert_eq!(
@@ -251,6 +254,7 @@ fn a_departed_clients_presence_is_not_replayed_after_the_grace_window() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         },
     );
     assert!(
@@ -269,6 +273,7 @@ fn a_fresh_room_replays_no_presence() {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     // Only the empty catch-up, no awareness replay.

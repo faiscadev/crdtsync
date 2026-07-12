@@ -118,6 +118,7 @@ fn subscribe_reply(r: &mut Registry, id: ConnId) -> Vec<Message> {
             channel: Channel(0),
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(id)
