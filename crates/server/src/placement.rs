@@ -21,6 +21,15 @@ impl NodeId {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Derive a node's id from its advertise address. The id is the trimmed
+    /// address bytes verbatim — a pure function of the address, so every node
+    /// configured with the same peer address string derives the identical id and
+    /// the cluster agrees on placement. Trimming absorbs padding from the
+    /// comma-separated peer-list carrier.
+    pub fn from_addr(addr: &str) -> Self {
+        Self(addr.trim().as_bytes().to_vec())
+    }
 }
 
 impl From<&str> for NodeId {
