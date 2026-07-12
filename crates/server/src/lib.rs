@@ -416,6 +416,13 @@ pub struct Hub {
     /// `main`'s log, never copied, so a room absent here has only branches that
     /// have not yet diverged (and `main`, which is the log itself).
     branch_logs: HashMap<RoomId, HashMap<Vec<u8>, BranchLog>>,
+    /// Each snapshot-forked branch's owned base — the materialized state of the
+    /// version it forked from — keyed by room then branch. A live-log fork shares
+    /// `main`'s log and has no entry; a snapshot fork owns a copy of the version
+    /// state, so it serves that state (never `main`'s later ops) and survives the
+    /// source version's deletion. The presence of an entry is what marks a branch
+    /// a snapshot fork, routing its catch-up to the owned base.
+    branch_bases: HashMap<RoomId, HashMap<Vec<u8>, Vec<u8>>>,
     /// The engine event sinks, notified of each lifecycle moment. Empty by
     /// default — no sink, no emission cost.
     sinks: Vec<Box<dyn EventSink>>,
@@ -435,6 +442,7 @@ impl Hub {
             version_ordinal: 0,
             branches: HashMap::new(),
             branch_logs: HashMap::new(),
+            branch_bases: HashMap::new(),
             sinks: Vec::new(),
         }
     }
@@ -762,6 +770,28 @@ impl Hub {
                 logs.insert(branch, BranchLog { ops, seen });
             }
         }
+        // Restore each snapshot fork's owned base, so its catch-up serves the
+        // version state it forked from rather than reading main's log. A base whose
+        // branch is not a registered fork is an orphan — left by a crash between a
+        // failed pointer persist and the base cleanup, or by a delete whose base
+        // removal failed — and is dropped, so a stale base never shadows a later
+        // live-log fork that reuses the name.
+        if !log.branch_bases.is_empty() {
+            let registered: HashSet<Vec<u8>> = self
+                .branches
+                .get(&room)
+                .map(|r| r.branches().map(|b| b.name.clone()).collect())
+                .unwrap_or_default();
+            let bases = self.branch_bases.entry(room.clone()).or_default();
+            for (branch, state) in log.branch_bases {
+                if registered.contains(&branch) {
+                    bases.insert(branch, state);
+                }
+            }
+            if bases.is_empty() {
+                self.branch_bases.remove(&room);
+            }
+        }
         // A branch's head is its fork point plus its tail length. Recompute it from
         // the restored tail so a crash between persisting the tail and the branch
         // pointer never leaves the head trailing the ops on disk.
@@ -965,9 +995,10 @@ impl Hub {
     /// A `main` branch is the whole log via [`catch_up`](Hub::catch_up); an unknown
     /// branch yields an empty delta.
     ///
-    /// A shared base compacted below the fork point (fork-from-snapshot) is out of
-    /// scope here: the retained base is served, so a freshly forked branch on an
-    /// uncompacted base catches up in full.
+    /// A snapshot-forked branch (one forked from a named version rather than a live
+    /// log point) instead owns its base: it serves that version's materialized
+    /// state — with its tail folded in — never main's log. See
+    /// [`fork_branch_from_version`](Hub::fork_branch_from_version).
     pub fn catch_up_branch(&mut self, room: &[u8], branch: &[u8], last_seen_seq: u64) -> Catchup {
         if branch == MAIN_BRANCH {
             return self.catch_up(room, last_seen_seq);
@@ -980,6 +1011,39 @@ impl Hub {
         else {
             return Catchup::Ops(Vec::new());
         };
+        // A snapshot-forked branch owns its base — a version's materialized state
+        // at `fork_point` — instead of sharing main's log. Its base and tail form a
+        // self-contained stream: a fresh subscriber (below `fork_point`) is served
+        // the base with the tail folded in as one whole-replica snapshot, while one
+        // already past the base is served just the divergent tail.
+        if let Some(base) = self.branch_bases.get(room).and_then(|m| m.get(branch)) {
+            let tail = self
+                .branch_logs
+                .get(room)
+                .and_then(|logs| logs.get(branch))
+                .map(|log| log.ops.as_slice())
+                .unwrap_or(&[]);
+            if last_seen_seq < fork_point {
+                let mut doc = match Document::decode_state(base) {
+                    Ok(doc) => doc,
+                    Err(_) => return Catchup::Ops(Vec::new()),
+                };
+                for rec in tail {
+                    doc.apply(&rec.op);
+                }
+                return Catchup::Snapshot {
+                    seq: fork_point + tail.len() as u64,
+                    state: doc.encode_state(),
+                };
+            }
+            let seen_in_tail = last_seen_seq.saturating_sub(fork_point);
+            let delta = usize::try_from(seen_in_tail)
+                .ok()
+                .and_then(|start| tail.get(start..))
+                .map(<[StoredOp]>::to_vec)
+                .unwrap_or_default();
+            return Catchup::Ops(delta);
+        }
         let mut delta = Vec::new();
         // The shared base: `main`'s retained log records with sequence in
         // `(last_seen_seq, fork_point]`. A record at log index `i` carries sequence
@@ -1462,11 +1526,72 @@ impl Hub {
             if let Some(logs) = self.branch_logs.get_mut(room) {
                 logs.remove(name);
             }
+            // A snapshot fork's owned base is dropped with it, so a later fork
+            // reusing the name never inherits a stale base.
+            if let Some(bases) = self.branch_bases.get_mut(room) {
+                bases.remove(name);
+            }
             if let Some(store) = self.store.as_mut() {
                 store.remove_branch_log(room, name)?;
+                store.remove_branch_base(room, name)?;
             }
         }
         Ok(removed)
+    }
+
+    /// Fork a fresh branch `new` off the snapshot of named version `version` — the
+    /// deferred fork-from-snapshot base machinery. Unlike [`fork_branch`](Hub::fork_branch),
+    /// which shares `main`'s live log up to a point, the new branch owns a copy of
+    /// the version's materialized state at the sequence that version covered: its
+    /// catch-up serves that state — never `main`'s later ops — and it survives the
+    /// source version's deletion. Its divergent tail appends past the base exactly
+    /// as a live-log fork's does.
+    ///
+    /// Returns `Ok(false)` — forking nothing — if `version` is unknown or `new`
+    /// already exists. With a store attached the owned base is persisted before the
+    /// branch pointer commits, so a persist failure leaves no branch whose base the
+    /// disk has not accepted.
+    pub fn fork_branch_from_version(
+        &mut self,
+        room: &[u8],
+        new: &[u8],
+        version: &[u8],
+    ) -> io::Result<bool> {
+        let Some((base_seq, state)) = self
+            .versions
+            .get(room)
+            .and_then(|index| index.get(version))
+            .map(|v| (v.seq, v.state.clone()))
+        else {
+            return Ok(false);
+        };
+        if self.observed_branches(room).branch(new).is_some() {
+            return Ok(false);
+        }
+        // Persist the owned base before the pointer, so a crash never leaves a
+        // snapshot fork whose base is missing.
+        if let Some(store) = self.store.as_mut() {
+            store.write_branch_base(room, new, &state)?;
+        }
+        self.branch_bases
+            .entry(room.to_vec())
+            .or_default()
+            .insert(new.to_vec(), state);
+        // Record the pointer at the version's covered sequence. The source-branch
+        // check is satisfied by the always-present `main`; the name was checked
+        // free above, so this only fails on a persist error — roll the base back.
+        match self.mutate_branches(room, |registry| registry.fork(new, MAIN_BRANCH, base_seq)) {
+            Ok(true) => Ok(true),
+            other => {
+                if let Some(bases) = self.branch_bases.get_mut(room) {
+                    bases.remove(new);
+                }
+                if let Some(store) = self.store.as_mut() {
+                    let _ = store.remove_branch_base(room, new);
+                }
+                other
+            }
+        }
     }
 
     /// Apply `change` to `room`'s registry, persisting the result before it

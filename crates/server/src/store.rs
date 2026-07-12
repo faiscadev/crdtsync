@@ -102,6 +102,12 @@ pub struct RoomLog {
     /// ops appended past its fork point. The shared base rides `main`'s log, so it
     /// is never stored here. Empty for a room with no diverged branch.
     pub branch_ops: Vec<(Vec<u8>, Vec<StoredOp>)>,
+    /// Each snapshot-forked branch's owned base as `(branch name, encoded state)`
+    /// — the materialized state of the version it forked from, at that version's
+    /// covered sequence. A live-log fork shares `main`'s log and has no entry here;
+    /// only a fork whose base is a snapshot owns a copy. Empty for a room with no
+    /// snapshot fork.
+    pub branch_bases: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// A directory of per-room logs and snapshots.
@@ -176,6 +182,30 @@ impl Store {
     /// success.
     pub fn remove_branch_log(&mut self, room: &[u8], branch: &[u8]) -> io::Result<()> {
         self.remove_if_present(&self.branch_log_path(room, branch))
+    }
+
+    /// Persist a snapshot fork's owned base `state` for `(room, branch)`, replacing
+    /// whatever it held. The base is the version's encoded state, stored verbatim;
+    /// it lands atomically — temp, flushed, renamed, directory flushed — so a crash
+    /// never leaves a torn base beside a branch pointer.
+    pub fn write_branch_base(
+        &mut self,
+        room: &[u8],
+        branch: &[u8],
+        state: &[u8],
+    ) -> io::Result<()> {
+        self.atomic_write(
+            &self.branch_base_path(room, branch),
+            &self.branch_base_tmp_path(room, branch),
+            state,
+        )
+    }
+
+    /// Drop a snapshot fork's base file for `(room, branch)`, if any — the durable
+    /// counterpart to deleting the branch, treating an already-absent file as
+    /// success.
+    pub fn remove_branch_base(&mut self, room: &[u8], branch: &[u8]) -> io::Result<()> {
+        self.remove_if_present(&self.branch_base_path(room, branch))
     }
 
     /// Fold `room`'s log prefix into a snapshot and drop the covered records.
@@ -366,6 +396,9 @@ impl Store {
                 FileKind::BranchLog(branch) => {
                     slot.branch_ops.push((branch, decode_records(&bytes)?))
                 }
+                // A snapshot fork's base is the version's encoded state, stored
+                // verbatim; it is restored as the branch's owned base.
+                FileKind::BranchBase(branch) => slot.branch_bases.push((branch, bytes)),
             }
         }
         Ok(rooms.into_iter().collect())
@@ -443,6 +476,26 @@ impl Store {
             Self::hex_name(branch)
         ))
     }
+
+    /// The snapshot-fork base file backing `(room, branch)`. Room and branch are
+    /// each hex-encoded and joined by a non-hex separator, matching `.blog`.
+    fn branch_base_path(&self, room: &[u8], branch: &[u8]) -> PathBuf {
+        self.root.join(format!(
+            "{}_{}.bbase",
+            Self::hex_name(room),
+            Self::hex_name(branch)
+        ))
+    }
+
+    /// The in-progress base temp for `(room, branch)`, renamed onto
+    /// `branch_base_path` once durable.
+    fn branch_base_tmp_path(&self, room: &[u8], branch: &[u8]) -> PathBuf {
+        self.root.join(format!(
+            "{}_{}.bbase.tmp",
+            Self::hex_name(room),
+            Self::hex_name(branch)
+        ))
+    }
 }
 
 /// Append `bytes` to `buf` as a `u32` little-endian length prefix then the bytes.
@@ -463,6 +516,7 @@ enum FileKind {
     Meta,
     Branches,
     BranchLog(Vec<u8>),
+    BranchBase(Vec<u8>),
 }
 
 /// Recover a room id and file kind from a path, or `None` if it is not one of
@@ -474,6 +528,10 @@ fn classify(path: &Path) -> Option<(RoomId, FileKind)> {
     if ext == "blog" {
         let (room, branch) = stem.split_once('_')?;
         return Some((decode_hex(room)?, FileKind::BranchLog(decode_hex(branch)?)));
+    }
+    if ext == "bbase" {
+        let (room, branch) = stem.split_once('_')?;
+        return Some((decode_hex(room)?, FileKind::BranchBase(decode_hex(branch)?)));
     }
     let kind = match ext {
         "log" => FileKind::Log,
