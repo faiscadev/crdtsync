@@ -30,6 +30,7 @@ pub mod schema_registry;
 pub mod session;
 pub mod store;
 pub mod translate;
+pub mod webhook;
 pub use admin::{admin_router, register_schema, serve_admin, RegisterOutcome, RegisterRequest};
 pub use auth::{AllowAll, Identity, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};
@@ -39,6 +40,7 @@ pub use registry::{ConnId, Registry};
 pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry};
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{Branch, RoomLog, RoomMeta, Snapshot, Store, StoredOp};
+pub use webhook::{WebhookConfig, WebhookSink};
 
 /// A room name, opaque bytes chosen by the deployment.
 pub type RoomId = Vec<u8>;
