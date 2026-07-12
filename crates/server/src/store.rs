@@ -108,6 +108,10 @@ pub struct RoomLog {
     /// only a fork whose base is a snapshot owns a copy. Empty for a room with no
     /// snapshot fork.
     pub branch_bases: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The room's active-HEAD branch — the branch a default (unnamed) subscribe
+    /// follows after a restore-as-branch switched it. `None` when the store holds
+    /// none (the room has never been restored, so the default `main` is served).
+    pub active_branch: Option<Vec<u8>>,
 }
 
 /// A directory of per-room logs and snapshots.
@@ -206,6 +210,18 @@ impl Store {
     /// success.
     pub fn remove_branch_base(&mut self, room: &[u8], branch: &[u8]) -> io::Result<()> {
         self.remove_if_present(&self.branch_base_path(room, branch))
+    }
+
+    /// Persist `room`'s active-HEAD `branch` — the branch a default subscribe
+    /// follows — replacing whatever it held. The name is stored verbatim and lands
+    /// atomically. The default `main` is never stored: an absent file *is* `main`,
+    /// so passing `main` (or the empty name) removes the file, restoring the
+    /// default.
+    pub fn write_active_branch(&mut self, room: &[u8], branch: &[u8]) -> io::Result<()> {
+        if branch.is_empty() || branch == crate::MAIN_BRANCH {
+            return self.remove_if_present(&self.active_path(room));
+        }
+        self.atomic_write(&self.active_path(room), &self.active_tmp_path(room), branch)
     }
 
     /// Fold `room`'s log prefix into a snapshot and drop the covered records.
@@ -399,6 +415,8 @@ impl Store {
                 // A snapshot fork's base is the version's encoded state, stored
                 // verbatim; it is restored as the branch's owned base.
                 FileKind::BranchBase(branch) => slot.branch_bases.push((branch, bytes)),
+                // The active-HEAD branch name, stored verbatim.
+                FileKind::Active => slot.active_branch = Some(bytes),
             }
         }
         Ok(rooms.into_iter().collect())
@@ -496,6 +514,18 @@ impl Store {
             Self::hex_name(branch)
         ))
     }
+
+    /// The active-HEAD file backing `room`.
+    fn active_path(&self, room: &[u8]) -> PathBuf {
+        self.root.join(format!("{}.active", Self::hex_name(room)))
+    }
+
+    /// The in-progress active-HEAD temp for `room`, renamed onto `active_path`
+    /// once durable.
+    fn active_tmp_path(&self, room: &[u8]) -> PathBuf {
+        self.root
+            .join(format!("{}.active.tmp", Self::hex_name(room)))
+    }
 }
 
 /// Append `bytes` to `buf` as a `u32` little-endian length prefix then the bytes.
@@ -517,6 +547,7 @@ enum FileKind {
     Branches,
     BranchLog(Vec<u8>),
     BranchBase(Vec<u8>),
+    Active,
 }
 
 /// Recover a room id and file kind from a path, or `None` if it is not one of
@@ -539,6 +570,7 @@ fn classify(path: &Path) -> Option<(RoomId, FileKind)> {
         "versions" => FileKind::Versions,
         "meta" => FileKind::Meta,
         "branches" => FileKind::Branches,
+        "active" => FileKind::Active,
         _ => return None,
     };
     Some((decode_hex(stem)?, kind))

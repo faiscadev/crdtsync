@@ -314,7 +314,17 @@ pub fn step(
             ) {
                 return forbidden("read denied");
             }
-            let branch = normalize_branch(branch);
+            // A default (empty) subscribe follows the room's active HEAD — `main`
+            // until a restore-as-branch switched it — so a plain subscriber tracks
+            // the restored state. An explicitly named branch (including `main`) is
+            // taken as given, so the old branch stays subscribable by name. The
+            // resolved branch is stored on the channel, so a channel bound before a
+            // later restore keeps writing to the branch it joined.
+            let branch = if branch.is_empty() {
+                hub.active_branch(&room)
+            } else {
+                branch
+            };
             // A named branch must already exist (forked via the engine) to be
             // served — an unknown one is refused rather than silently served
             // `main`'s stream, which would cross replication units. The default
@@ -627,16 +637,6 @@ fn version_room(
     let identity = session.identity()?;
     let room = session.channels.get(&channel)?.room.clone();
     authorized(authorizer, schema, identity, action, &Resource::Room(&room)).then_some(room)
-}
-
-/// Normalize a subscribe's branch: an empty branch is the default [`MAIN_BRANCH`],
-/// so a subscription always names a concrete branch and fan-out matches exactly.
-fn normalize_branch(branch: Vec<u8>) -> Vec<u8> {
-    if branch.is_empty() {
-        MAIN_BRANCH.to_vec()
-    } else {
-        branch
-    }
 }
 
 /// The refusal for a version request that [`version_room`] rejected: a violation
