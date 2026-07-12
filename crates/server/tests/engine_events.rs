@@ -3,8 +3,9 @@
 //! The engine emits one [`EngineEvent`] stream: connections and subscribes from
 //! the registry, version create/delete and compaction from the hub. A sink is a
 //! passive observer — it never alters behavior — so a no-sink engine runs exactly
-//! as before, and several sinks each see every event, in order. The reserved
-//! variants (branch/migration) are declarable now and fired by a later layer.
+//! as before, and several sinks each see every event, in order. `AfterRestore`
+//! fires on restore-as-branch; the remaining reserved variants (publish/migration)
+//! are declarable now and fired by a later layer.
 
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +40,7 @@ enum Ev {
     VersionRenamed(Vec<u8>, Vec<u8>, Vec<u8>),
     VersionDeleted(Vec<u8>, Vec<u8>),
     Compacted(Vec<u8>, u64),
+    AfterRestore(Vec<u8>, Vec<u8>),
     Reserved,
 }
 
@@ -57,6 +59,9 @@ fn snapshot(e: &EngineEvent) -> Ev {
             Ev::VersionDeleted(room.to_vec(), name.to_vec())
         }
         EngineEvent::Compacted { room, floor } => Ev::Compacted(room.to_vec(), *floor),
+        EngineEvent::AfterRestore { room, branch } => {
+            Ev::AfterRestore(room.to_vec(), branch.to_vec())
+        }
         _ => Ev::Reserved,
     }
 }
@@ -108,6 +113,33 @@ fn the_hub_emits_version_and_compaction_events_in_order() {
             // The one ingested op folds into the snapshot: the floor advances to 1.
             Ev::Compacted(ROOM.to_vec(), 1),
         ]
+    );
+}
+
+#[test]
+fn a_restore_emits_after_restore_exactly_once() {
+    let mut h = hub();
+    let (log, sink) = recording();
+    h.add_event_sink(sink);
+    populate(&mut h);
+    h.create_version(ROOM, b"v1").unwrap();
+    log.lock().unwrap().clear();
+
+    assert!(h.restore_as_branch(ROOM, b"v1", b"restored").unwrap());
+
+    let events = log.lock().unwrap().clone();
+    let restores: Vec<&Ev> = events
+        .iter()
+        .filter(|e| matches!(e, Ev::AfterRestore(..)))
+        .collect();
+    assert_eq!(
+        restores.len(),
+        1,
+        "AfterRestore fires exactly once: {events:?}"
+    );
+    assert_eq!(
+        restores[0],
+        &Ev::AfterRestore(ROOM.to_vec(), b"restored".to_vec())
     );
 }
 
@@ -283,13 +315,10 @@ fn disconnect_emits_the_connected_counterpart() {
 #[test]
 fn reserved_events_are_declarable_but_never_emitted() {
     // A reserved variant exists in the enum for a later layer to emit — it can be
-    // constructed and handed to a sink now.
+    // constructed and handed to a sink now. (`AfterRestore` is no longer reserved:
+    // restore-as-branch fires it, covered above.)
     let (log, sink) = recording();
     sink.on_event(&EngineEvent::BeforePublish {
-        room: ROOM,
-        branch: b"feature",
-    });
-    sink.on_event(&EngineEvent::AfterRestore {
         room: ROOM,
         branch: b"feature",
     });
@@ -297,10 +326,7 @@ fn reserved_events_are_declarable_but_never_emitted() {
         room: ROOM,
         to_version: 2,
     });
-    assert_eq!(
-        *log.lock().unwrap(),
-        vec![Ev::Reserved, Ev::Reserved, Ev::Reserved]
-    );
+    assert_eq!(*log.lock().unwrap(), vec![Ev::Reserved, Ev::Reserved]);
 
     // But the engine's own lifecycle paths never emit one.
     let mut h = hub();

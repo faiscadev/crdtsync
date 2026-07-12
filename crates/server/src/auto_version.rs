@@ -68,8 +68,9 @@ impl AutoVersionState {
 }
 
 /// The recording sink the hub holds: maps each room-bearing event to its trigger
-/// kind and queues it. Roomless events (connect/disconnect) and the reserved
-/// variants carry no room to version, so they are ignored.
+/// kind and queues it. Roomless events (connect/disconnect) and the still-reserved
+/// variants (before-publish, before-migration) carry no room to version here, so
+/// they are ignored.
 pub(crate) struct AutoVersionSink(pub(crate) Rc<AutoVersionState>);
 
 impl EventSink for AutoVersionSink {
@@ -89,6 +90,7 @@ impl EventSink for AutoVersionSink {
                 (room.to_vec(), TriggerEvent::VersionDeleted)
             }
             EngineEvent::Compacted { room, .. } => (room.to_vec(), TriggerEvent::Compaction),
+            EngineEvent::AfterRestore { room, .. } => (room.to_vec(), TriggerEvent::AfterRestore),
             _ => return,
         };
         self.0.queue.borrow_mut().push(signal);

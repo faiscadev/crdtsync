@@ -207,6 +207,32 @@ fn a_non_matching_event_does_not_fire() {
 }
 
 #[test]
+fn an_after_restore_trigger_captures_the_restored_state() {
+    let (mut r, clock) =
+        registry_with(r#"[{ "on": "after-restore", "name": "auto/restore/${timestamp}" }]"#);
+    let a = seed_room(&mut r);
+    // A version to restore from, past the seed write.
+    assert!(r.hub_mut().create_version(ROOM, b"v1").unwrap());
+    write(
+        &mut r,
+        a,
+        doc(1).transact(|tx| tx.register(b"k2", Scalar::Int(2))),
+    );
+
+    clock.advance(1000);
+    assert!(r.restore_as_branch(ROOM, b"v1", b"restored").unwrap());
+
+    // The after-restore trigger fired once, capturing a version named at the clock,
+    // beside `v1` and the restore's own audit version.
+    let restore_capture = format!("auto/restore/{}", stamp(1000)).into_bytes();
+    assert!(
+        version_names(&r).contains(&restore_capture),
+        "after-restore trigger captured a version: {:?}",
+        version_names(&r),
+    );
+}
+
+#[test]
 fn a_compaction_event_captures_a_version() {
     let (mut r, clock) =
         registry_with(r#"[{ "on": "compaction", "name": "auto/c/${timestamp}" }]"#);

@@ -423,6 +423,12 @@ pub struct Hub {
     /// source version's deletion. The presence of an entry is what marks a branch
     /// a snapshot fork, routing its catch-up to the owned base.
     branch_bases: HashMap<RoomId, HashMap<Vec<u8>, Vec<u8>>>,
+    /// The active-HEAD branch per room — the branch a default (unnamed) subscribe
+    /// follows. A room absent here serves the default `main`; a restore-as-branch
+    /// switches it to the restored branch, so a plain subscriber then follows the
+    /// restored state while the old branch stays subscribable by name. Durable, so
+    /// the switch replays on reload.
+    active_branch: HashMap<RoomId, Vec<u8>>,
     /// The engine event sinks, notified of each lifecycle moment. Empty by
     /// default — no sink, no emission cost.
     sinks: Vec<Box<dyn EventSink>>,
@@ -443,6 +449,7 @@ impl Hub {
             branches: HashMap::new(),
             branch_logs: HashMap::new(),
             branch_bases: HashMap::new(),
+            active_branch: HashMap::new(),
             sinks: Vec::new(),
         }
     }
@@ -790,6 +797,20 @@ impl Hub {
             }
             if bases.is_empty() {
                 self.branch_bases.remove(&room);
+            }
+        }
+        // Restore the active-HEAD switch, so a default subscribe after a reload
+        // follows the branch a restore made active. A pointer to a branch no longer
+        // registered (its fork was deleted) falls back to `main`, so a plain
+        // subscribe is never refused for a dangling HEAD.
+        if let Some(branch) = log.active_branch {
+            let known = branch == MAIN_BRANCH
+                || self
+                    .branches
+                    .get(&room)
+                    .is_some_and(|r| r.branch(&branch).is_some());
+            if known && branch != MAIN_BRANCH {
+                self.active_branch.insert(room.clone(), branch);
             }
         }
         // A branch's head is its fork point plus its tail length. Recompute it from
@@ -1535,8 +1556,87 @@ impl Hub {
                 store.remove_branch_log(room, name)?;
                 store.remove_branch_base(room, name)?;
             }
+            // Deleting the active HEAD resets it to `main`, so a default subscribe
+            // is never left pointing at a branch that no longer exists.
+            if self.active_branch.get(room).is_some_and(|b| b == name) {
+                self.set_active_branch(room, MAIN_BRANCH)?;
+            }
         }
         Ok(removed)
+    }
+
+    /// The room's active-HEAD branch — the branch a default (unnamed) subscribe
+    /// follows. `main` until a restore-as-branch switches it, so an un-restored
+    /// room behaves exactly as before.
+    pub fn active_branch(&self, room: &[u8]) -> Vec<u8> {
+        self.active_branch
+            .get(room)
+            .cloned()
+            .unwrap_or_else(|| MAIN_BRANCH.to_vec())
+    }
+
+    /// Switch `room`'s active HEAD to `branch`, persisting it so the switch replays
+    /// on reload. Setting it back to `main` clears the pointer (the default). A
+    /// no-op if the branch is already active. Best-effort would lose the switch on
+    /// a crash, so the persist is propagated: the pointer is durable before it is
+    /// observed.
+    pub fn set_active_branch(&mut self, room: &[u8], branch: &[u8]) -> io::Result<()> {
+        let is_main = branch == MAIN_BRANCH;
+        if self.active_branch(room) == branch {
+            return Ok(());
+        }
+        if let Some(store) = self.store.as_mut() {
+            store.write_active_branch(room, branch)?;
+        }
+        if is_main {
+            self.active_branch.remove(room);
+        } else {
+            self.active_branch.insert(room.to_vec(), branch.to_vec());
+        }
+        Ok(())
+    }
+
+    /// Restore `room` to named version `version` as a fresh branch `new_branch`,
+    /// switching the active HEAD to it — the first-class restore-as-branch op.
+    ///
+    /// It does not rewrite history or reset any sequence: it forks `new_branch`
+    /// from the version's snapshot ([`fork_branch_from_version`](Hub::fork_branch_from_version)),
+    /// captures an audit version of the pre-restore live (`main`) state, switches
+    /// the active HEAD so a default subscribe now follows the restored branch, and
+    /// emits [`EngineEvent::AfterRestore`]. The old branch is untouched — still
+    /// subscribable by name — so an offline op in flight against the old HEAD lands
+    /// on the old branch (its channel names it), never corrupting the restored
+    /// state. Durable throughout, so the whole switch replays on reload.
+    ///
+    /// Returns `Ok(false)` — restoring nothing — if `version` is unknown or
+    /// `new_branch` already exists.
+    pub fn restore_as_branch(
+        &mut self,
+        room: &[u8],
+        version: &[u8],
+        new_branch: &[u8],
+    ) -> io::Result<bool> {
+        if !self.fork_branch_from_version(room, new_branch, version)? {
+            return Ok(false);
+        }
+        // An audit version of the pre-restore live (`main`) state — a recoverable,
+        // first-class record of the restore. Keyed on the branch and the captured
+        // `main` sequence (the branch bytes verbatim, so an opaque name round-trips),
+        // so a branch name reused after a delete still audits each restore: a later
+        // restore captures a moved-on `main` under a new sequence, while a repeat at
+        // the very same sequence (identical state) is a no-op the existing audit
+        // already covers.
+        let mut audit = b"audit/restore/".to_vec();
+        audit.extend_from_slice(new_branch);
+        audit.push(b'@');
+        audit.extend_from_slice(self.seq(room).to_string().as_bytes());
+        self.create_version(room, &audit)?;
+        self.set_active_branch(room, new_branch)?;
+        self.emit(EngineEvent::AfterRestore {
+            room,
+            branch: new_branch,
+        });
+        Ok(true)
     }
 
     /// Fork a fresh branch `new` off the snapshot of named version `version` — the

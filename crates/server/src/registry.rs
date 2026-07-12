@@ -1110,6 +1110,26 @@ impl Registry {
     pub fn hub_mut(&mut self) -> &mut Hub {
         &mut self.hub
     }
+
+    /// Restore `room` to named version `version` as a fresh branch `new_branch`,
+    /// switching the active HEAD to it — the registry entry point for
+    /// [`Hub::restore_as_branch`], which additionally drives the auto-version
+    /// drain so an `after-restore` trigger the room's schema declares captures the
+    /// restored state. Returns whether the restore took (`false` for an unknown
+    /// version or an already-taken branch name).
+    pub fn restore_as_branch(
+        &mut self,
+        room: &[u8],
+        version: &[u8],
+        new_branch: &[u8],
+    ) -> io::Result<bool> {
+        let restored = self.hub.restore_as_branch(room, version, new_branch)?;
+        // The restore's `AfterRestore` was recorded by the auto-version sink; act on
+        // it now, as a delivery's post-step drain does, so an `after-restore`
+        // trigger fires.
+        self.drain_auto_versions();
+        Ok(restored)
+    }
 }
 
 /// The app to govern a room among those present, chosen deterministically: the
