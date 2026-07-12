@@ -628,6 +628,18 @@ impl WasmClient {
         }
     }
 
+    /// Join `branch` of `room` on a fresh channel; returns the channel and
+    /// Subscribe frame. An empty `branch` is the default/active branch, as
+    /// `subscribe`.
+    #[wasm_bindgen(js_name = subscribeBranch)]
+    pub fn subscribe_branch(&mut self, room: &[u8], branch: &[u8]) -> WasmSubscription {
+        let (channel, msg) = self.inner.subscribe_branch(room, branch);
+        WasmSubscription {
+            channel: channel.0,
+            frame: encode_message(&msg),
+        }
+    }
+
     /// Re-issue Subscribe for a held channel from its caught-up position; `None`
     /// if the channel isn't held.
     pub fn resume(&self, channel: u32) -> Option<Vec<u8>> {

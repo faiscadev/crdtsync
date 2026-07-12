@@ -432,6 +432,27 @@ func TestClientHandshakeAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestClientSubscribeBranchCarriesTheNamedBranch(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+
+	// A named branch rides along in the Subscribe frame.
+	ch, frame := c.SubscribeBranch(key("room-1"), key("feature-x"))
+	if ch != 0 {
+		t.Fatalf("first channel: got %d, want 0", ch)
+	}
+	if !bytes.Contains(frame, key("feature-x")) {
+		t.Fatal("subscribe-branch frame should carry the branch name")
+	}
+	// An empty branch is the default/active branch, as the plain Subscribe.
+	if _, def := c.SubscribeBranch(key("room-1"), nil); bytes.Contains(def, key("feature-x")) {
+		t.Fatal("empty-branch frame should not carry a branch name")
+	}
+	if _, plain := c.Subscribe(key("room-1")); bytes.Contains(plain, key("feature-x")) {
+		t.Fatal("plain subscribe frame should not carry a branch name")
+	}
+}
+
 func TestClientVersionRequestsMarshal(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()

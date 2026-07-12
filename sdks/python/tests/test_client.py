@@ -102,6 +102,19 @@ def test_awareness_publish_and_lifecycle():
         assert a.resume(ch) == b""
 
 
+def test_subscribe_branch_carries_the_named_branch():
+    with Client(cid(1)) as a:
+        # A named branch rides along in the Subscribe frame.
+        ch, frame = a.subscribe_branch(b"room-1", b"feature-x")
+        assert ch == 0
+        assert b"feature-x" in frame
+        # An empty branch is the default/active branch, as the plain subscribe.
+        _, default_frame = a.subscribe_branch(b"room-1", b"")
+        assert b"feature-x" not in default_frame
+        _, plain = a.subscribe(b"room-1")
+        assert b"feature-x" not in plain
+
+
 def test_version_requests_marshal():
     with Client(cid(1)) as a:
         ch, _ = a.subscribe(b"room-1")

@@ -1638,6 +1638,37 @@ pub unsafe extern "C" fn crdtsync_client_subscribe(
     .unwrap_or_else(|_| CrdtBuf::empty())
 }
 
+/// Join `branch` of `room` on a fresh channel, writing the assigned channel to
+/// `out_channel` and returning the Subscribe frame to send. An empty `branch` is
+/// the default/active branch, matching [`crdtsync_client_subscribe`]. Empty on a
+/// bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len` and `branch`/`branch_len` follow
+/// [`as_slice`]; `out_channel` points to a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_subscribe_branch(
+    client: *mut CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    branch: *const u8,
+    branch_len: usize,
+    out_channel: *mut u32,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out_channel.is_null() {
+            return CrdtBuf::empty();
+        }
+        let (Some(r), Some(b)) = (as_slice(room, room_len), as_slice(branch, branch_len)) else {
+            return CrdtBuf::empty();
+        };
+        let (channel, msg) = (*client).session.subscribe_branch(r, b);
+        *out_channel = channel.0;
+        CrdtBuf::from_vec(encode_message(&msg))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
 /// The stable integer a server [`ErrorCode`] crosses the boundary as, mirroring
 /// the wire tags so every SDK decodes it identically: `0` ProtocolViolation, `1`
 /// UnsupportedVersion, `2` AuthFailed, `3` UnknownRoom, `4` Internal, `5`

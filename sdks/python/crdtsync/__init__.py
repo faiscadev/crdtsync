@@ -197,6 +197,11 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_auth, [doc, cbytes, size], buf)
     sig(lib.crdtsync_client_actor, [doc, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_subscribe, [doc, cbytes, size, c.POINTER(ch)], buf)
+    sig(
+        lib.crdtsync_client_subscribe_branch,
+        [doc, cbytes, size, cbytes, size, c.POINTER(ch)],
+        buf,
+    )
     sig(lib.crdtsync_client_resume, [doc, ch], buf)
     sig(lib.crdtsync_client_resend, [doc, ch], buf)
     sig(lib.crdtsync_client_outbox_len, [doc, ch, c.POINTER(size)], c.c_int32)
@@ -1059,6 +1064,18 @@ class Client:
         frame = _take_buf(
             _LIB.crdtsync_client_subscribe(
                 self._handle, room, len(room), ctypes.byref(channel)
+            )
+        )
+        return channel.value, frame
+
+    def subscribe_branch(self, room: bytes, branch: bytes) -> Tuple[int, bytes]:
+        """Join ``branch`` of ``room`` on a fresh channel; return
+        ``(channel, subscribe_frame)``. An empty ``branch`` is the default/active
+        branch, matching :meth:`subscribe`."""
+        channel = ctypes.c_uint32()
+        frame = _take_buf(
+            _LIB.crdtsync_client_subscribe_branch(
+                self._handle, room, len(room), branch, len(branch), ctypes.byref(channel)
             )
         )
         return channel.value, frame

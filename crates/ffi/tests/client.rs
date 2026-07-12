@@ -42,6 +42,28 @@ unsafe fn subscribe(c: *mut CrdtClient, room: &[u8]) -> (u32, CrdtBuf) {
     (channel, frame)
 }
 
+unsafe fn subscribe_branch(c: *mut CrdtClient, room: &[u8], branch: &[u8]) -> (u32, CrdtBuf) {
+    let mut channel: u32 = u32::MAX;
+    let frame = crdtsync_client_subscribe_branch(
+        c,
+        room.as_ptr(),
+        room.len(),
+        branch.as_ptr(),
+        branch.len(),
+        &mut channel,
+    );
+    (channel, frame)
+}
+
+/// The branch a Subscribe frame carries, or panics on any other frame.
+unsafe fn subscribe_frame_branch(frame: &CrdtBuf) -> Vec<u8> {
+    let bytes = std::slice::from_raw_parts(frame.ptr, frame.len);
+    match decode_message(bytes).unwrap() {
+        Message::Subscribe { branch, .. } => branch,
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+}
+
 unsafe fn register_int(c: *mut CrdtClient, channel: u32, p: &[u8], v: i64) -> CrdtBuf {
     crdtsync_client_register_int(c, channel, p.as_ptr(), p.len(), v)
 }
@@ -87,6 +109,45 @@ fn a_local_edit_travels_to_a_peer_over_the_wire_client() {
         crdtsync_buf_free(ops);
         crdtsync_client_free(a);
         crdtsync_client_free(b);
+    }
+}
+
+#[test]
+fn subscribe_branch_carries_the_named_branch() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+
+        // A named branch rides along in the Subscribe frame.
+        let (ch, frame) = subscribe_branch(a, b"room-1", b"feature-x");
+        assert_eq!(ch, 0);
+        assert_eq!(subscribe_frame_branch(&frame), b"feature-x");
+        crdtsync_buf_free(frame);
+
+        // An empty branch is the default/active branch, as the plain subscribe.
+        let (ch, frame) = subscribe_branch(a, b"room-1", b"");
+        assert_eq!(ch, 1);
+        assert!(subscribe_frame_branch(&frame).is_empty());
+        crdtsync_buf_free(frame);
+
+        let (_, frame) = subscribe(a, b"room-1");
+        assert!(subscribe_frame_branch(&frame).is_empty());
+        crdtsync_buf_free(frame);
+
+        // A null handle yields the empty-buffer sentinel and assigns no channel.
+        let mut channel: u32 = u32::MAX;
+        let frame = crdtsync_client_subscribe_branch(
+            ptr::null_mut(),
+            b"room-1".as_ptr(),
+            6,
+            b"feature-x".as_ptr(),
+            9,
+            &mut channel,
+        );
+        assert_eq!(frame.len, 0);
+        assert_eq!(channel, u32::MAX);
+        crdtsync_buf_free(frame);
+
+        crdtsync_client_free(a);
     }
 }
 
