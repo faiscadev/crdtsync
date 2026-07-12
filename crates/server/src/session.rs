@@ -436,6 +436,13 @@ pub fn step(
                 // rejection for the app to show, discard, or export.
                 return ops_rejected(channel, &ops, ErrorCode::Forbidden);
             }
+            // A published branch is a read-only publish target — its HEAD is advanced
+            // only by `publish`, never by a client write. Refuse recoverably, as the
+            // authz denial above does: the author keeps its ops and surfaces the
+            // rejection rather than losing the connection.
+            if hub.is_published(&room, &branch) {
+                return ops_rejected(channel, &ops, ErrorCode::Forbidden);
+            }
             // The batch's highest per-client op sequence: the frontier the author
             // is acknowledged through once the ops are durably logged, so it can
             // prune its outbox. Computed over the whole submitted batch, not just

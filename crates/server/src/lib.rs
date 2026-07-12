@@ -47,6 +47,11 @@ pub type RoomId = Vec<u8>;
 /// resolves it.
 pub const MAIN_BRANCH: &[u8] = b"main";
 
+/// The default read-only publish target [`publish`](Hub::publish) points at when a
+/// deployment names none: editors edit `main`, read-only consumers subscribe to
+/// this branch's snapshot of the last published state.
+pub const PUBLISHED_BRANCH: &[u8] = b"published";
+
 /// A room's branches, always holding the default [`MAIN_BRANCH`] and any forks
 /// past it. A fork shares immutable history up to its fork point; only the
 /// divergent forks are persisted, `main` being synthesized. Listing order is
@@ -65,6 +70,7 @@ impl Default for BranchRegistry {
                 name: MAIN_BRANCH.to_vec(),
                 fork_point: 0,
                 head: 0,
+                published: false,
             },
         );
         Self { branches }
@@ -106,9 +112,44 @@ impl BranchRegistry {
                 name: new.to_vec(),
                 fork_point: at,
                 head: at,
+                published: false,
             },
         );
         true
+    }
+
+    /// Point a read-only publish target `name` at position `at`: fork it fresh (its
+    /// base is the editor state a [`publish`](Hub::publish) captures) or, when it
+    /// already exists, repoint its fork position to the newer publish. Either way it
+    /// is marked `published` — a read-only target no client write advances. Refuses
+    /// the default `main`, which is the editor branch, never a publish target.
+    fn point_published(&mut self, name: &[u8], at: u64) -> bool {
+        match self.branches.get_mut(name) {
+            Some(branch) if branch.name == MAIN_BRANCH => false,
+            Some(branch) => {
+                branch.fork_point = at;
+                branch.head = at;
+                branch.published = true;
+                true
+            }
+            None => {
+                self.branches.insert(
+                    name.to_vec(),
+                    Branch {
+                        name: name.to_vec(),
+                        fork_point: at,
+                        head: at,
+                        published: true,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Whether branch `name` is a read-only publish target.
+    fn is_published(&self, name: &[u8]) -> bool {
+        self.branches.get(name).is_some_and(|b| b.published)
     }
 
     /// Rename branch `from` to `to`. Refuses — changing nothing — for the
@@ -769,12 +810,31 @@ impl Hub {
                 .insert(room.clone(), BranchRegistry::from_forks(log.branches));
         }
         // Restore each branch's divergent tail, seeding its dedup set from the
-        // stored ops.
+        // stored ops. A read-only publish target never diverges, so a tail persisted
+        // under its name is a stale orphan (a former writable fork's, left by a
+        // repoint whose best-effort tail removal failed) — dropped, so it never folds
+        // onto the published base.
         if !log.branch_ops.is_empty() {
+            let published: HashSet<Vec<u8>> = self
+                .branches
+                .get(&room)
+                .map(|r| {
+                    r.branches()
+                        .filter(|b| b.published)
+                        .map(|b| b.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             let logs = self.branch_logs.entry(room.clone()).or_default();
             for (branch, ops) in log.branch_ops {
+                if published.contains(&branch) {
+                    continue;
+                }
                 let seen = ops.iter().map(|rec| rec.op.id).collect();
                 logs.insert(branch, BranchLog { ops, seen });
+            }
+            if logs.is_empty() {
+                self.branch_logs.remove(&room);
             }
         }
         // Restore each snapshot fork's owned base, so its catch-up serves the
@@ -1274,7 +1334,7 @@ impl Hub {
     /// is persisted before the version is committed, so a persist failure leaves
     /// no version the disk has not accepted.
     pub fn create_version(&mut self, room: &[u8], name: &[u8]) -> io::Result<bool> {
-        self.create_version_with(room, name, None)
+        self.create_version_with(room, name, None, None)
     }
 
     /// Capture a version authored by an auto-version trigger, tagged with its
@@ -1287,7 +1347,21 @@ impl Hub {
         name: &[u8],
         origin: &[u8],
     ) -> io::Result<bool> {
-        self.create_version_with(room, name, Some(origin))
+        self.create_version_with(room, name, Some(origin), None)
+    }
+
+    /// Capture a version from an explicit whole-replica `state` covering server
+    /// sequence `seq`, rather than the room's current live doc — the seam a
+    /// [`publish`](Hub::publish) uses to record the published (editor-branch)
+    /// snapshot, so each published state stays reachable for independent rollback.
+    fn create_version_from_state(
+        &mut self,
+        room: &[u8],
+        name: &[u8],
+        seq: u64,
+        state: Vec<u8>,
+    ) -> io::Result<bool> {
+        self.create_version_with(room, name, None, Some((seq, state)))
     }
 
     fn create_version_with(
@@ -1295,15 +1369,22 @@ impl Hub {
         room: &[u8],
         name: &[u8],
         origin: Option<&[u8]>,
+        snapshot: Option<(u64, Vec<u8>)>,
     ) -> io::Result<bool> {
-        let Some(r) = self.rooms.get(room) else {
-            return Ok(false);
+        let (seq, state) = match snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                let Some(r) = self.rooms.get(room) else {
+                    return Ok(false);
+                };
+                (r.head(), r.doc.encode_state())
+            }
         };
         let version = Version {
-            seq: r.head(),
+            seq,
             origin: origin.map(<[u8]>::to_vec),
             ordinal: self.version_ordinal,
-            state: r.doc.encode_state(),
+            state,
         };
         let index = self.versions.entry(room.to_vec()).or_default();
         if index.contains_key(name) {
@@ -1690,6 +1771,156 @@ impl Hub {
                     let _ = store.remove_branch_base(room, new);
                 }
                 other
+            }
+        }
+    }
+
+    /// Whether `(room, branch)` is a read-only publish target — a branch whose HEAD
+    /// [`publish`](Hub::publish) advances and a client write never does. `main` is
+    /// the editor branch, so it is never published.
+    pub fn is_published(&self, room: &[u8], branch: &[u8]) -> bool {
+        self.branches
+            .get(room)
+            .is_some_and(|registry| registry.is_published(branch))
+    }
+
+    /// Publish the active editor branch's current state onto the read-only
+    /// `published` branch — the publish/draft workflow. Editors keep writing the
+    /// editor branch (`main` by default); read-only consumers subscribe to
+    /// `published` and are served the state as it stood at the last publish, until
+    /// the next one. Returns `Ok(false)` — publishing nothing — for an empty/unknown
+    /// room, or a `published` naming the editor branch or `main`.
+    ///
+    /// Republishing repoints `published`'s HEAD to the newer editor state. Each
+    /// published state is first captured as an immutable named version
+    /// (`publish/<published>@<seq>`), so the previous published state stays
+    /// reachable — apps roll published state back independently of the editor
+    /// branch. [`EngineEvent::BeforePublish`] fires before the repoint, so an
+    /// `on: before-publish` auto-version trigger captures at the publish point.
+    pub fn publish(&mut self, room: &[u8], published: &[u8]) -> io::Result<bool> {
+        // `main` is the editor branch, never a publish target.
+        if published == MAIN_BRANCH {
+            return Ok(false);
+        }
+        // Publishing freezes the active editor branch's current state — `main` by
+        // default, or a restored HEAD. A `published` that names the editor branch
+        // would snapshot it onto itself, so it is refused.
+        let source = self.active_branch(room);
+        if source == published {
+            return Ok(false);
+        }
+        let Some(state) = self.materialize_branch(room, &source) else {
+            return Ok(false);
+        };
+        // The editor sequence being published — the source branch's head — names the
+        // rollback version and marks the published fork point.
+        let seq = self
+            .branch(room, &source)
+            .map_or_else(|| self.seq(room), |b| b.head);
+        // BeforePublish fires before the repoint, so an `on: before-publish`
+        // auto-version trigger captures at the publish point.
+        self.emit(EngineEvent::BeforePublish {
+            room,
+            branch: published,
+        });
+        // Record the published state as an immutable named version, so this and
+        // every prior published state stays reachable for independent rollback. The
+        // name carries the source branch as well as its sequence: a branch's state at
+        // a given head is fixed, so two publishes of the same `(source, seq)` are the
+        // same state and reuse the name (a no-op the existing version covers), while
+        // the same head number on a different editor branch stays a distinct version.
+        let mut audit = b"publish/".to_vec();
+        audit.extend_from_slice(published);
+        audit.push(b'/');
+        audit.extend_from_slice(&source);
+        audit.push(b'@');
+        audit.extend_from_slice(seq.to_string().as_bytes());
+        self.create_version_from_state(room, &audit, seq, state.clone())?;
+        self.repoint_published(room, published, seq, state)?;
+        Ok(true)
+    }
+
+    /// Point the read-only `published` branch at the freshly published `state`,
+    /// covering editor sequence `seq`. The published branch owns its base (the
+    /// editor snapshot) and never carries a divergent tail — client writes to it are
+    /// refused — so its catch-up serves that base to read-only consumers. The base
+    /// is persisted before the pointer, so a crash never leaves a published branch
+    /// whose base is missing.
+    fn repoint_published(
+        &mut self,
+        room: &[u8],
+        published: &[u8],
+        seq: u64,
+        state: Vec<u8>,
+    ) -> io::Result<bool> {
+        if let Some(store) = self.store.as_mut() {
+            store.write_branch_base(room, published, &state)?;
+        }
+        let prev_base = self
+            .branch_bases
+            .entry(room.to_vec())
+            .or_default()
+            .insert(published.to_vec(), state);
+        match self.mutate_branches(room, |registry| registry.point_published(published, seq)) {
+            Ok(true) => {
+                // The pointer committed. A published target never diverges — drop any
+                // stale tail a name reused from a former writable branch left behind,
+                // so its base alone serves it. Done only on success, so a failed
+                // repoint leaves the prior branch's tail intact. The on-disk removal is
+                // best-effort: the in-memory drop is authoritative, and the load path
+                // drops a published branch's tail anyway, so an orphaned tail file
+                // never folds onto the published base after a restart.
+                if let Some(logs) = self.branch_logs.get_mut(room) {
+                    logs.remove(published);
+                }
+                if let Some(store) = self.store.as_mut() {
+                    let _ = store.remove_branch_log(room, published);
+                }
+                Ok(true)
+            }
+            other => {
+                // The repoint did not commit — roll the base back to what it held, on
+                // disk as well as in memory, so a persist failure never leaves the new
+                // base beside the old pointer.
+                let bases = self.branch_bases.entry(room.to_vec()).or_default();
+                match prev_base {
+                    Some(prev) => {
+                        bases.insert(published.to_vec(), prev.clone());
+                        if let Some(store) = self.store.as_mut() {
+                            let _ = store.write_branch_base(room, published, &prev);
+                        }
+                    }
+                    None => {
+                        bases.remove(published);
+                        if let Some(store) = self.store.as_mut() {
+                            let _ = store.remove_branch_base(room, published);
+                        }
+                    }
+                }
+                other
+            }
+        }
+    }
+
+    /// The whole-replica state of `(room, branch)` — the bytes a publish freezes
+    /// onto the published branch. `main` is the room's live replica; a named branch
+    /// folds its own stream (shared base plus divergent tail, or its owned snapshot
+    /// base) into one state. `None` for an unknown room or branch.
+    fn materialize_branch(&mut self, room: &[u8], branch: &[u8]) -> Option<Vec<u8>> {
+        if branch == MAIN_BRANCH {
+            return self.export_room(room);
+        }
+        if self.branch(room, branch).is_none() {
+            return None;
+        }
+        match self.catch_up_branch(room, branch, 0) {
+            Catchup::Snapshot { state, .. } => Some(state),
+            Catchup::Ops(ops) => {
+                let mut doc = Document::new(self.server);
+                for rec in &ops {
+                    doc.apply(&rec.op);
+                }
+                Some(doc.encode_state())
             }
         }
     }

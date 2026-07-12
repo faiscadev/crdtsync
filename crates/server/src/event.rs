@@ -9,9 +9,9 @@
 //! is a pure fan-out the engine performs after the moment has committed.
 //!
 //! An event borrows its context; a sink that retains records copies what it
-//! needs. The variants a later layer will emit — a branch publish, a migration —
-//! are declared here now and left unfired, so that layer routes through the one
-//! seam without an enum break; `AfterRestore` fires today (restore-as-branch).
+//! needs. `AfterRestore` fires on restore-as-branch and `BeforePublish` on
+//! publish/draft; `BeforeMigration` stays declared but unfired, so the migration
+//! layer routes through the one seam without an enum break when it lands.
 
 use crate::registry::ConnId;
 
@@ -45,12 +45,15 @@ pub enum EngineEvent<'a> {
     /// state.
     AfterRestore { room: &'a [u8], branch: &'a [u8] },
 
-    // Reserved — declared for the layers that will emit them, never fired by this
+    /// A `branch` is about to be repointed to the newly published editor state.
+    /// Fired before a [`publish`](crate::Hub::publish) repoints the read-only
+    /// published branch, so an `before-publish` auto-version trigger captures at the
+    /// publish point.
+    BeforePublish { room: &'a [u8], branch: &'a [u8] },
+
+    // Reserved — declared for the layer that will emit it, never fired by this
     // unit. Routing a new lifecycle point through the one seam then needs no enum
     // break at its call sites.
-    /// Reserved: a branch is about to publish onto its base (the publish/draft
-    /// workflow layer).
-    BeforePublish { room: &'a [u8], branch: &'a [u8] },
     /// Reserved: a room is about to migrate to a new schema version.
     BeforeMigration { room: &'a [u8], to_version: u32 },
 }

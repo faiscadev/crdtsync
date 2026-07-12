@@ -72,11 +72,17 @@ pub struct RoomMeta {
 /// single-node log's monotonic history counter). The default `main` (fork_point
 /// 0) is synthesized rather than stored, so the persisted set holds only the forks
 /// that diverge from it.
+///
+/// `published` marks a read-only publish target — a branch whose HEAD is advanced
+/// only by [`publish`](crate::Hub::publish), never by a client write. A client
+/// `Ops` write to one is refused, so the published state stays a snapshot of the
+/// editor branch at each publish, not a live-editable stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Branch {
     pub name: Vec<u8>,
     pub fork_point: u64,
     pub head: u64,
+    pub published: bool,
 }
 
 /// What a store holds for one room: an optional compaction snapshot, the op
@@ -324,8 +330,8 @@ impl Store {
     /// Only the forks past the default `main` are stored — `main` is synthesized
     /// on load — so an empty slice removes the file, restoring the room to the
     /// default `{main}`. Each record is the name (length-prefixed), the fork-point
-    /// position (8-byte little-endian), then the head position (8-byte
-    /// little-endian). The file lands atomically — temp, flushed, renamed,
+    /// position (8-byte little-endian), the head position (8-byte little-endian),
+    /// then a 1-byte read-only-publish-target flag. The file lands atomically — temp, flushed, renamed,
     /// directory flushed — so a crash never leaves a torn set; the whole file is
     /// rewritten on every change, as the *set* of branches is mutable though a
     /// branch's history is not.
@@ -338,6 +344,7 @@ impl Store {
             put_bytes(&mut buf, &branch.name);
             buf.extend_from_slice(&branch.fork_point.to_le_bytes());
             buf.extend_from_slice(&branch.head.to_le_bytes());
+            buf.push(branch.published as u8);
         }
         self.atomic_write(
             &self.branches_path(room),
@@ -682,10 +689,14 @@ fn parse_branches(bytes: &[u8]) -> Vec<Branch> {
         let Ok(head) = take_u64(bytes, &mut at) else {
             return Vec::new();
         };
+        let Ok(published) = take_u8(bytes, &mut at) else {
+            return Vec::new();
+        };
         branches.push(Branch {
             name,
             fork_point,
             head,
+            published: published != 0,
         });
     }
     branches

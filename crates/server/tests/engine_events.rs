@@ -41,6 +41,7 @@ enum Ev {
     VersionDeleted(Vec<u8>, Vec<u8>),
     Compacted(Vec<u8>, u64),
     AfterRestore(Vec<u8>, Vec<u8>),
+    BeforePublish(Vec<u8>, Vec<u8>),
     Reserved,
 }
 
@@ -61,6 +62,9 @@ fn snapshot(e: &EngineEvent) -> Ev {
         EngineEvent::Compacted { room, floor } => Ev::Compacted(room.to_vec(), *floor),
         EngineEvent::AfterRestore { room, branch } => {
             Ev::AfterRestore(room.to_vec(), branch.to_vec())
+        }
+        EngineEvent::BeforePublish { room, branch } => {
+            Ev::BeforePublish(room.to_vec(), branch.to_vec())
         }
         _ => Ev::Reserved,
     }
@@ -313,22 +317,36 @@ fn disconnect_emits_the_connected_counterpart() {
 // --- reserved variants ---
 
 #[test]
-fn reserved_events_are_declarable_but_never_emitted() {
-    // A reserved variant exists in the enum for a later layer to emit — it can be
-    // constructed and handed to a sink now. (`AfterRestore` is no longer reserved:
-    // restore-as-branch fires it, covered above.)
+fn publish_fires_before_publish_exactly_once() {
+    let mut h = hub();
     let (log, sink) = recording();
-    sink.on_event(&EngineEvent::BeforePublish {
-        room: ROOM,
-        branch: b"feature",
-    });
+    h.add_event_sink(sink);
+    populate(&mut h);
+    assert!(h.publish(ROOM, b"published").unwrap());
+
+    let events = log.lock().unwrap();
+    let n = events
+        .iter()
+        .filter(|e| matches!(e, Ev::BeforePublish(..)))
+        .count();
+    assert_eq!(n, 1, "publish fires BeforePublish exactly once: {events:?}");
+    assert!(events.contains(&Ev::BeforePublish(ROOM.to_vec(), b"published".to_vec())));
+}
+
+#[test]
+fn the_remaining_reserved_event_is_declarable_but_never_emitted() {
+    // `BeforeMigration` is declared for the migration layer to emit later — it can
+    // be constructed and handed to a sink now, but no engine path fires it yet.
+    // (`AfterRestore` and `BeforePublish` are no longer reserved: restore-as-branch
+    // and publish/draft fire them, covered above.)
+    let (log, sink) = recording();
     sink.on_event(&EngineEvent::BeforeMigration {
         room: ROOM,
         to_version: 2,
     });
-    assert_eq!(*log.lock().unwrap(), vec![Ev::Reserved, Ev::Reserved]);
+    assert_eq!(*log.lock().unwrap(), vec![Ev::Reserved]);
 
-    // But the engine's own lifecycle paths never emit one.
+    // The engine's own lifecycle paths never emit a reserved variant.
     let mut h = hub();
     let (log2, sink2) = recording();
     h.add_event_sink(sink2);
