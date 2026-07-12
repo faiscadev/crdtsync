@@ -63,6 +63,7 @@ fn one_room_log(room: &[u8], ops: Vec<Op>) -> Vec<(RoomId, RoomLog)> {
             ops: relay(ops),
             versions: Vec::new(),
             meta: None,
+            branches: Vec::new(),
         },
     )]
 }
@@ -148,6 +149,7 @@ fn from_rooms_replays_independent_rooms() {
                 ops: relay(a),
                 versions: Vec::new(),
                 meta: None,
+                branches: Vec::new(),
             },
         ),
         (
@@ -157,6 +159,7 @@ fn from_rooms_replays_independent_rooms() {
                 ops: relay(b),
                 versions: Vec::new(),
                 meta: None,
+                branches: Vec::new(),
             },
         ),
     ];
