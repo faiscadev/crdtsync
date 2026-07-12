@@ -149,6 +149,28 @@ impl BranchRegistry {
             main.head = head;
         }
     }
+
+    /// Point branch `name`'s head at `head`, reporting whether it moved. A branch
+    /// write advances its own head past the fork point; the default `main` tracks
+    /// the log head instead and is not set here.
+    fn set_head(&mut self, name: &[u8], head: u64) -> bool {
+        match self.branches.get_mut(name) {
+            Some(branch) if branch.head != head => {
+                branch.head = head;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A non-`main` branch's divergent op tail: the ops appended past its fork point.
+/// The shared base — every op up to the fork — lives in `main`'s log and is never
+/// duplicated here, so a branch's storage cost is only its divergence.
+#[derive(Default)]
+struct BranchLog {
+    ops: Vec<StoredOp>,
+    seen: HashSet<OpId>,
 }
 
 /// One room's authoritative replica and its op log. A server sequence is a
@@ -389,6 +411,11 @@ pub struct Hub {
     /// default `main` — the registry is materialized lazily on the first fork, so a
     /// never-forked room carries no per-room branch state and no branches file.
     branches: HashMap<RoomId, BranchRegistry>,
+    /// The divergent op tail of each non-`main` branch, keyed by room then branch.
+    /// Only the ops past a branch's fork point live here; its shared base is
+    /// `main`'s log, never copied, so a room absent here has only branches that
+    /// have not yet diverged (and `main`, which is the log itself).
+    branch_logs: HashMap<RoomId, HashMap<Vec<u8>, BranchLog>>,
     /// The engine event sinks, notified of each lifecycle moment. Empty by
     /// default — no sink, no emission cost.
     sinks: Vec<Box<dyn EventSink>>,
@@ -407,6 +434,7 @@ impl Hub {
             versions: HashMap::new(),
             version_ordinal: 0,
             branches: HashMap::new(),
+            branch_logs: HashMap::new(),
             sinks: Vec::new(),
         }
     }
@@ -723,7 +751,28 @@ impl Hub {
         // set leaves the room with the lazy default `{main}` — no entry at all.
         if !log.branches.is_empty() {
             self.branches
-                .insert(room, BranchRegistry::from_forks(log.branches));
+                .insert(room.clone(), BranchRegistry::from_forks(log.branches));
+        }
+        // Restore each branch's divergent tail, seeding its dedup set from the
+        // stored ops.
+        if !log.branch_ops.is_empty() {
+            let logs = self.branch_logs.entry(room.clone()).or_default();
+            for (branch, ops) in log.branch_ops {
+                let seen = ops.iter().map(|rec| rec.op.id).collect();
+                logs.insert(branch, BranchLog { ops, seen });
+            }
+        }
+        // A branch's head is its fork point plus its tail length. Recompute it from
+        // the restored tail so a crash between persisting the tail and the branch
+        // pointer never leaves the head trailing the ops on disk.
+        if let (Some(registry), Some(logs)) =
+            (self.branches.get_mut(&room), self.branch_logs.get(&room))
+        {
+            for (branch, log) in logs {
+                if let Some(fork) = registry.branch(branch).map(|b| b.fork_point) {
+                    registry.set_head(branch, fork + log.ops.len() as u64);
+                }
+            }
         }
         Ok(())
     }
@@ -810,6 +859,74 @@ impl Hub {
         Ok(fresh.into_iter().map(|rec| rec.op).collect())
     }
 
+    /// Apply a client's ops to a non-`main` branch of `room`, appending them to
+    /// that branch's divergent tail and advancing its head — never `main`'s log.
+    /// Each is tagged with the writer's `schema_version`, deduped against the
+    /// branch's own seen set (and within the batch), and durably logged before it
+    /// is applied. Returns the ops newly appended, in order — the batch to fan out
+    /// to the `(room, branch)` stream's subscribers. A `main` branch delegates to
+    /// [`ingest`](Hub::ingest); an unknown branch appends nothing.
+    pub fn ingest_branch(
+        &mut self,
+        room: &[u8],
+        branch: &[u8],
+        ops: Vec<Op>,
+        schema_version: Option<u32>,
+    ) -> io::Result<Vec<Op>> {
+        if branch == MAIN_BRANCH {
+            return self.ingest(room, ops, schema_version);
+        }
+        // A non-`main` branch's fork point is a stored pointer (no `main`-head
+        // overlay), so read it straight from the registry — no clone per write.
+        let Some(fork_point) = self
+            .branches
+            .get(room)
+            .and_then(|registry| registry.branch(branch))
+            .map(|b| b.fork_point)
+        else {
+            return Ok(Vec::new());
+        };
+        let records: Vec<StoredOp> = ops
+            .into_iter()
+            .map(|op| StoredOp::new(op, schema_version))
+            .collect();
+        // The records not already in the branch's tail, deduped within the batch.
+        let fresh: Vec<StoredOp> = {
+            let log = self
+                .branch_logs
+                .entry(room.to_vec())
+                .or_default()
+                .entry(branch.to_vec())
+                .or_default();
+            let mut batch = HashSet::new();
+            records
+                .into_iter()
+                .filter(|rec| !log.seen.contains(&rec.op.id) && batch.insert(rec.op.id))
+                .collect()
+        };
+        // Persist before committing: a branch op reaches the tail only once it is
+        // on disk, so a persist failure leaves no trace to advertise.
+        if let Some(store) = self.store.as_mut() {
+            store.append_branch(room, branch, &fresh)?;
+        }
+        let head = {
+            let log = self
+                .branch_logs
+                .get_mut(room)
+                .expect("tail created above")
+                .get_mut(branch)
+                .expect("tail created above");
+            for rec in &fresh {
+                log.seen.insert(rec.op.id);
+                log.ops.push(rec.clone());
+            }
+            fork_point + log.ops.len() as u64
+        };
+        // Advance and persist the branch's head pointer beside its tail.
+        self.mutate_branches(room, |registry| registry.set_head(branch, head))?;
+        Ok(fresh.into_iter().map(|rec| rec.op).collect())
+    }
+
     /// What a subscriber needs given the sequence it last saw. Above the
     /// compaction floor it gets the ops past `last_seen_seq` as a delta; below
     /// it — the ops it missed are compacted away — it gets a snapshot of the
@@ -836,6 +953,60 @@ impl Hub {
             .get(start..)
             .map(|records| records.to_vec())
             .unwrap_or_default();
+        Catchup::Ops(delta)
+    }
+
+    /// What a subscriber to the `(room, branch)` stream needs given the sequence
+    /// it last saw: the shared base — `main`'s log records up to the branch's fork
+    /// point — followed by the branch's own divergent tail past it. The base is
+    /// never duplicated per branch; it is read straight from `main`'s log. Sequence
+    /// numbering is the branch's own: a base record keeps its `main` sequence
+    /// (≤ fork point), and a tail record at index `i` sits at `fork_point + i + 1`.
+    /// A `main` branch is the whole log via [`catch_up`](Hub::catch_up); an unknown
+    /// branch yields an empty delta.
+    ///
+    /// A shared base compacted below the fork point (fork-from-snapshot) is out of
+    /// scope here: the retained base is served, so a freshly forked branch on an
+    /// uncompacted base catches up in full.
+    pub fn catch_up_branch(&mut self, room: &[u8], branch: &[u8], last_seen_seq: u64) -> Catchup {
+        if branch == MAIN_BRANCH {
+            return self.catch_up(room, last_seen_seq);
+        }
+        let Some(fork_point) = self
+            .branches
+            .get(room)
+            .and_then(|registry| registry.branch(branch))
+            .map(|b| b.fork_point)
+        else {
+            return Catchup::Ops(Vec::new());
+        };
+        let mut delta = Vec::new();
+        // The shared base: `main`'s retained log records with sequence in
+        // `(last_seen_seq, fork_point]`. A record at log index `i` carries sequence
+        // `base_seq + i + 1`.
+        if let Some(r) = self.rooms.get(room) {
+            let base_end = fork_point.min(r.head());
+            if base_end > last_seen_seq && base_end > r.base_seq {
+                let lo = last_seen_seq.max(r.base_seq) - r.base_seq;
+                let hi = base_end - r.base_seq;
+                if let (Ok(lo), Ok(hi)) = (usize::try_from(lo), usize::try_from(hi)) {
+                    if let Some(base) = r.log.get(lo..hi) {
+                        delta.extend(base.iter().cloned());
+                    }
+                }
+            }
+        }
+        // The branch's divergent tail: records past the fork point the subscriber
+        // has not seen. A tail record at index `j` carries branch sequence
+        // `fork_point + j + 1`.
+        if let Some(log) = self.branch_logs.get(room).and_then(|logs| logs.get(branch)) {
+            let seen_in_tail = last_seen_seq.saturating_sub(fork_point);
+            if let Ok(start) = usize::try_from(seen_in_tail) {
+                if let Some(tail) = log.ops.get(start..) {
+                    delta.extend(tail.iter().cloned());
+                }
+            }
+        }
         Catchup::Ops(delta)
     }
 
@@ -1255,6 +1426,11 @@ impl Hub {
     /// `from` is absent. With a store attached the set is persisted before the
     /// fork commits, so a persist failure leaves no branch the disk has not
     /// accepted.
+    ///
+    /// The fork point is clamped to the source's current head: a branch shares
+    /// only history that exists, so forking past the source's head would leave a
+    /// gap in the branch's sequence space (no ops between the head and `at`) and
+    /// let the source's later writes into that gap leak into the branch's base.
     pub fn fork_branch(
         &mut self,
         room: &[u8],
@@ -1262,6 +1438,10 @@ impl Hub {
         from: &[u8],
         at: u64,
     ) -> io::Result<bool> {
+        let at = match self.observed_branches(room).branch(from) {
+            Some(source) => at.min(source.head),
+            None => at,
+        };
         self.mutate_branches(room, |registry| registry.fork(new, from, at))
     }
 
@@ -1274,9 +1454,19 @@ impl Hub {
 
     /// Delete branch `name`, returning whether one was removed. The default `main`
     /// is never deletable. Persisted before the removal commits when a store is
-    /// attached.
+    /// attached. Its divergent tail is dropped with it — both in memory and on
+    /// disk — so a later fork reusing the name never inherits stale ops.
     pub fn delete_branch(&mut self, room: &[u8], name: &[u8]) -> io::Result<bool> {
-        self.mutate_branches(room, |registry| registry.delete(name))
+        let removed = self.mutate_branches(room, |registry| registry.delete(name))?;
+        if removed {
+            if let Some(logs) = self.branch_logs.get_mut(room) {
+                logs.remove(name);
+            }
+            if let Some(store) = self.store.as_mut() {
+                store.remove_branch_log(room, name)?;
+            }
+        }
+        Ok(removed)
     }
 
     /// Apply `change` to `room`'s registry, persisting the result before it

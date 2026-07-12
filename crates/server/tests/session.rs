@@ -171,12 +171,14 @@ fn subscribe_binds_the_room_to_its_channel() {
 }
 
 #[test]
-fn a_subscribe_naming_a_branch_binds_the_room_ignoring_the_branch() {
+fn a_subscribe_names_the_branch_stream_it_binds() {
     let mut h = hub();
     let mut s = Session::new();
     handshake(&mut h, &mut s, 1);
-    // The branch is carried, not enforced; the room alone binds the subscription.
-    st(
+    h.fork_branch(ROOM, b"release-2", b"main", 0).unwrap();
+    // The branch is the second dimension of the subscription: it binds the
+    // `(room, branch)` stream, not just the room.
+    let r = st(
         &mut h,
         &mut s,
         Message::Subscribe {
@@ -186,6 +188,11 @@ fn a_subscribe_naming_a_branch_binds_the_room_ignoring_the_branch() {
             last_seen_seq: 0,
         },
     );
+    assert!(!r.close);
+    assert_eq!(s.channels_for_stream(ROOM, b"release-2"), vec![CH]);
+    // Not the `main` stream — a branch write on `main` would not reach it.
+    assert!(s.channels_for_stream(ROOM, b"main").is_empty());
+    // Room-scoped views (awareness, eviction) still see the channel.
     assert_eq!(s.channels_for_room(ROOM), vec![CH]);
 }
 
