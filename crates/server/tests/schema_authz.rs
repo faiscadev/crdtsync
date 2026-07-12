@@ -120,6 +120,7 @@ fn subscribe_ok(r: &mut Registry, id: ConnId) -> bool {
             channel: Channel(0),
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     let denied = r

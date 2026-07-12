@@ -266,6 +266,10 @@ pub fn step(
         Message::Subscribe {
             channel,
             room,
+            // A subscription is scoped by `(room, branch)`; an empty branch is
+            // `main`. The room binds the subscription; the branch is carried but
+            // does not scope the log or rooms.
+            branch: _,
             last_seen_seq,
         } => {
             let Some(identity) = session.identity() else {

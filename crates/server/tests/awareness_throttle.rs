@@ -78,6 +78,7 @@ fn subscribe(r: &mut Registry, id: ConnId, room: &[u8]) {
             channel: Channel(0),
             room: room.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(id);
@@ -271,6 +272,7 @@ fn a_joiner_replays_the_last_broadcast_value_not_a_coalesced_one() {
             channel: Channel(0),
             room: ROOM_A.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     assert_eq!(

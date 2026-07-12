@@ -85,6 +85,7 @@ fn subscribe(r: &mut Registry, id: ConnId, room: &[u8]) {
             channel: CH,
             room: room.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(id);

@@ -157,6 +157,7 @@ fn wrapping_the_registry_authorizer_logs_enforcement() {
             channel: Channel(0),
             room: b"open".to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -165,6 +166,7 @@ fn wrapping_the_registry_authorizer_logs_enforcement() {
             channel: Channel(1),
             room: b"secret".to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
 
@@ -219,6 +221,7 @@ fn an_awareness_publish_logs_the_decision_not_the_entry() {
             channel: Channel(0),
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     assert!(r.deliver(

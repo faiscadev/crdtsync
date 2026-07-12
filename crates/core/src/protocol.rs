@@ -98,10 +98,13 @@ pub enum Message {
         schema_version: u32,
         schema: Vec<u8>,
     },
-    /// Joins a room on `channel`, requesting every op past `last_seen_seq`.
+    /// Joins a room on `channel`, requesting every op past `last_seen_seq`. A
+    /// subscription names its room and the `branch` within it — an empty `branch`
+    /// is the default `main`. The replication unit is `(room, branch)`.
     Subscribe {
         channel: Channel,
         room: Vec<u8>,
+        branch: Vec<u8>,
         last_seen_seq: u64,
     },
     /// Leaves the room bound to `channel`, freeing the handle.
@@ -244,11 +247,13 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
         Message::Subscribe {
             channel,
             room,
+            branch,
             last_seen_seq,
         } => {
             put_u8(&mut out, 1);
             put_u32(&mut out, channel.0);
             put_bytes(&mut out, room);
+            put_bytes(&mut out, branch);
             put_u64(&mut out, *last_seen_seq);
         }
         Message::Ops { channel, ops } => {
@@ -423,10 +428,12 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
         1 => {
             let channel = Channel(cur.u32()?);
             let room = cur.bytes()?;
+            let branch = cur.bytes()?;
             let last_seen_seq = cur.u64()?;
             Message::Subscribe {
                 channel,
                 room,
+                branch,
                 last_seen_seq,
             }
         }

@@ -39,12 +39,14 @@ pub struct Rejected {
     pub ops: Vec<Op>,
 }
 
-/// One subscribed room: its local replica, the room name, how far it has caught
-/// up, the outbox of authored-but-unacknowledged ops, the peers' ephemeral
-/// awareness entries keyed by `(actor, key)`, and the version view — the last
-/// name list the server reported and any fetched version states keyed by name.
+/// One subscribed room: its local replica, the room name and the branch within
+/// it (empty is the default `main`), how far it has caught up, the outbox of
+/// authored-but-unacknowledged ops, the peers' ephemeral awareness entries keyed
+/// by `(actor, key)`, and the version view — the last name list the server
+/// reported and any fetched version states keyed by name.
 struct Room {
     room: Vec<u8>,
+    branch: Vec<u8>,
     doc: Document,
     last_seen_seq: u64,
     outbox: Vec<Op>,
@@ -144,14 +146,24 @@ impl ClientSession {
     }
 
     /// Join `room` on a fresh channel, requesting everything from the start.
-    /// Returns the assigned channel and the Subscribe frame to send.
+    /// Returns the assigned channel and the Subscribe frame to send. Scoped to
+    /// the default `main` branch; [`subscribe_branch`](Self::subscribe_branch)
+    /// names another.
     pub fn subscribe(&mut self, room: &[u8]) -> (Channel, Message) {
+        self.subscribe_branch(room, b"")
+    }
+
+    /// Join `branch` of `room` on a fresh channel, requesting everything from the
+    /// start. An empty `branch` is the default `main`. Returns the assigned
+    /// channel and the Subscribe frame to send.
+    pub fn subscribe_branch(&mut self, room: &[u8], branch: &[u8]) -> (Channel, Message) {
         let channel = Channel(self.next_channel);
         self.next_channel += 1;
         self.rooms.insert(
             channel,
             Room {
                 room: room.to_vec(),
+                branch: branch.to_vec(),
                 doc: Document::new(self.client),
                 last_seen_seq: 0,
                 outbox: Vec::new(),
@@ -165,6 +177,7 @@ impl ClientSession {
             Message::Subscribe {
                 channel,
                 room: room.to_vec(),
+                branch: branch.to_vec(),
                 last_seen_seq: 0,
             },
         )
@@ -178,6 +191,7 @@ impl ClientSession {
         Some(Message::Subscribe {
             channel,
             room: room.room.clone(),
+            branch: room.branch.clone(),
             last_seen_seq: room.last_seen_seq,
         })
     }
@@ -570,5 +584,10 @@ impl ClientSession {
     /// The room name bound to `channel`, if held.
     pub fn room(&self, channel: Channel) -> Option<&[u8]> {
         self.rooms.get(&channel).map(|r| r.room.as_slice())
+    }
+
+    /// The branch bound to `channel`, if held — empty for the default `main`.
+    pub fn branch(&self, channel: Channel) -> Option<&[u8]> {
+        self.rooms.get(&channel).map(|r| r.branch.as_slice())
     }
 }

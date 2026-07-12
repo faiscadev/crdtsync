@@ -299,6 +299,7 @@ fn an_acl_gates_subscribe_when_set_on_the_registry() {
             channel: Channel(0),
             room: b"open".to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     assert!(
@@ -312,6 +313,7 @@ fn an_acl_gates_subscribe_when_set_on_the_registry() {
             channel: Channel(1),
             room: b"secret".to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     assert!(

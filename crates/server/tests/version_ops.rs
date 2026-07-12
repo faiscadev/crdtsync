@@ -52,6 +52,7 @@ fn joined(r: &mut Registry, client: u8) -> ConnId {
             channel: CH,
             room: ROOM.to_vec(),
             last_seen_seq: 0,
+            branch: Vec::new(),
         }
     ));
     r.take_outbox(id);
