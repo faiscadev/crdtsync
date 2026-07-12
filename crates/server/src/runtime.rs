@@ -31,6 +31,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Authorizer, PermitAll};
+use crate::webhook::{WebhookConfig, WebhookSink};
 use crate::{negotiate, ConnId, Registry, RoomId, RoomLog, Store};
 
 /// How many outbound messages may queue for one connection before it is judged
@@ -59,6 +60,10 @@ pub struct ServeConfig {
     /// so a registration becomes visible to the data plane; the default is an
     /// empty registry, so every connection resolves to a relay.
     pub schema: Arc<Mutex<crate::SchemaRegistry>>,
+    /// An outbound webhook endpoint that receives every room-bearing lifecycle
+    /// event as a POST. `None` registers no sink, so a deployment that wants no
+    /// webhooks pays nothing per event.
+    pub webhook: Option<WebhookConfig>,
 }
 
 impl Default for ServeConfig {
@@ -68,6 +73,7 @@ impl Default for ServeConfig {
             sweep_interval: std::time::Duration::from_secs(1),
             anonymous: false,
             schema: Arc::default(),
+            webhook: None,
         }
     }
 }
@@ -201,6 +207,11 @@ pub async fn serve_with_authorizer(
         None => (Vec::new(), None),
     };
     let (cmds, cmd_rx) = unbounded_channel::<Cmd>();
+    // Start the webhook delivery worker here, on this I/O-enabled runtime — the
+    // registry's own single-threaded runtime carries only the time driver. The
+    // sink it hands back feeds that worker over a channel, so the registry
+    // thread emits without ever touching the network.
+    let webhook = config.webhook.clone().map(WebhookSink::spawn);
     // The replicas are single-threaded; keep them on one dedicated thread.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -208,7 +219,7 @@ pub async fn serve_with_authorizer(
             .build()
             .expect("build registry runtime");
         rt.block_on(registry_actor(
-            server, rooms, store, config, verifier, authorizer, cmd_rx,
+            server, rooms, store, config, verifier, authorizer, webhook, cmd_rx,
         ));
     });
 
@@ -242,6 +253,7 @@ async fn registry_actor(
     config: ServeConfig,
     verifier: Box<dyn Verifier + Send + Sync>,
     authorizer: Box<dyn Authorizer + Send + Sync>,
+    webhook: Option<WebhookSink>,
     mut cmds: UnboundedReceiver<Cmd>,
 ) {
     // The rooms were validated during startup, so reconstruction can't fail.
@@ -254,6 +266,9 @@ async fn registry_actor(
     reg.set_authorizer(authorizer);
     reg.set_schema_registry(config.schema.clone());
     reg.set_grace_millis(config.grace.as_millis() as u64);
+    if let Some(webhook) = webhook {
+        reg.add_event_sink(Box::new(webhook));
+    }
     let mut peers: HashMap<ConnId, Peer> = HashMap::new();
     // The sweep expires the presence of clients past their grace deadline; its
     // first immediate tick is a harmless no-op with nothing yet stale.

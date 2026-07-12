@@ -6,7 +6,10 @@
 //! `CRDTSYNC_POLICY_FILE` to enforce a declarative authorization policy; unset,
 //! every authenticated actor is permitted. Set `CRDTSYNC_CREDENTIALS_FILE` to
 //! authenticate actors against a static secret-token table; unset, the dev-mode
-//! verifier admits any credential.
+//! verifier admits any credential. Set `CRDTSYNC_WEBHOOK_URL` to POST each
+//! room-bearing lifecycle event to an HTTP endpoint (best-effort, off the commit
+//! path), with `CRDTSYNC_WEBHOOK_SECRET` attached as a shared-secret header for
+//! the receiver to verify; unset, no webhook fires.
 //!
 //! A policy's `actor:` and subject-class (`authenticated` / `anonymous`) rules
 //! are only real boundaries when the actor is server-derived. With a credentials
@@ -26,6 +29,7 @@ use crdtsync_server::auth::CredentialsFileError;
 use crdtsync_server::runtime::{serve_with_authorizer, ServeConfig};
 use crdtsync_server::{
     serve_admin, AllowAll, Authorizer, PermitAll, SchemaRegistry, StaticTokens, Store, Verifier,
+    WebhookConfig,
 };
 use tokio::net::TcpListener;
 
@@ -82,6 +86,19 @@ fn authorizer() -> std::io::Result<Box<dyn Authorizer + Send + Sync>> {
     }
 }
 
+/// The outbound webhook config for the run: an endpoint from `CRDTSYNC_WEBHOOK_URL`,
+/// carrying the optional shared secret `CRDTSYNC_WEBHOOK_SECRET` the receiver
+/// checks. Unset URL registers no webhook sink, so events cost nothing.
+fn webhook() -> std::io::Result<Option<WebhookConfig>> {
+    match path_var("CRDTSYNC_WEBHOOK_URL")? {
+        Some(url) => Ok(Some(WebhookConfig {
+            url,
+            secret: path_var("CRDTSYNC_WEBHOOK_SECRET")?,
+        })),
+        None => Ok(None),
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let addr = match std::env::var("CRDTSYNC_ADDR") {
@@ -114,6 +131,7 @@ async fn main() -> std::io::Result<()> {
         store,
         ServeConfig {
             schema: schema.clone(),
+            webhook: webhook()?,
             ..ServeConfig::default()
         },
         verifier()?,
