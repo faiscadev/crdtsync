@@ -243,7 +243,9 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## 🚧 In progress
 
-- _(nothing in flight — **XmlElement epic Units 1–6 COMPLETE**; **Zones 1b-ii-a (cross-zone anchor rejection) COMPLETE (#237)**. Remaining frontier is design-gated: ACL slice 4 human-gated on the identity model; Zones **1b-ii-b (cross-zone move)** + Unit 2 gated on the op-apply seam. Next cs-next run cuts the next epic from ARCHITECTURE, or the loop parks on the human gates.)_
+- _(nothing in flight — **XmlElement epic Units 1–6 COMPLETE**; **Zones 1b-ii-a (cross-zone anchor rejection) COMPLETE (#237)**._
+  - **GATED** (a subset of the frontier, needs a human/seam ruling — do NOT cut): ACL slice 4 (identity model), Zones **1b-ii-b (cross-zone move)** + Zone Unit 2/3 (op-apply seam), Unit 8 type-scope + container-field migration filters (materialize/persist element-set), Unit 9c (repair-closure).
+  - **UNGATED + READY — next cs-next tick cuts this** (design-gate backlog cleared 2026-07-04, DECISIONS 565; a gated *visible* item ≠ an empty frontier): the **branch layer** (§Versioning-and-Branches) — design-ready, deps green (op log / snapshots / named versions / `Channel` `(room,branch,zone)` abstraction), most foundational (unblocks restore-as-branch, channel-mux widening, branch/migration engine events, the parked auto-version branch triggers, publish/draft, per-user branches). Smaller v0.2 ungated alternates: webhooks (event-bus #191 substrate done), awareness auth-filter. cs-next replenishes + cuts on the next run — the frontier is not gated, only the visible dregs are.)_
 
 ---
 
