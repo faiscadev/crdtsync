@@ -1130,6 +1130,21 @@ impl Registry {
         self.drain_auto_versions();
         Ok(restored)
     }
+
+    /// Publish the active editor branch's state onto the read-only `published`
+    /// branch — the registry entry point for [`Hub::publish`], which additionally
+    /// drives the auto-version drain so an `on: before-publish` trigger the room's
+    /// schema declares captures at the publish point. Returns whether the publish
+    /// took (`false` for an empty/unknown room or a `published` naming the editor
+    /// branch).
+    pub fn publish(&mut self, room: &[u8], published: &[u8]) -> io::Result<bool> {
+        let did = self.hub.publish(room, published)?;
+        // The publish's `BeforePublish` was recorded by the auto-version sink; act on
+        // it now, as a delivery's post-step drain does, so an `before-publish`
+        // trigger fires.
+        self.drain_auto_versions();
+        Ok(did)
+    }
 }
 
 /// The app to govern a room among those present, chosen deterministically: the
