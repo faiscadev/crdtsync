@@ -98,6 +98,10 @@ pub struct RoomLog {
     /// when the store holds none (a never-forked room, or a record that is absent
     /// or undecodable), which the hub restores as the default `{main}`.
     pub branches: Vec<Branch>,
+    /// Each non-`main` branch's divergent op tail as `(branch name, ops)` — the
+    /// ops appended past its fork point. The shared base rides `main`'s log, so it
+    /// is never stored here. Empty for a room with no diverged branch.
+    pub branch_ops: Vec<(Vec<u8>, Vec<StoredOp>)>,
 }
 
 /// A directory of per-room logs and snapshots.
@@ -136,6 +140,42 @@ impl Store {
         file.write_all(&buf)?;
         file.sync_all()?;
         Ok(())
+    }
+
+    /// Append `ops` to `branch`'s divergent tail in `room`, each a version-tagged,
+    /// length-prefixed record — the same framing as the main log. Flushes before
+    /// returning so the tail survives a crash. An empty batch writes nothing.
+    pub fn append_branch(
+        &mut self,
+        room: &[u8],
+        branch: &[u8],
+        ops: &[StoredOp],
+    ) -> io::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::new();
+        for stored in ops {
+            let body = encode_op(&stored.op);
+            let len = u32::try_from(body.len()).expect("op length exceeds u32");
+            buf.extend_from_slice(&stored.schema_version.unwrap_or(0).to_le_bytes());
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&body);
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.branch_log_path(room, branch))?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Drop `branch`'s divergent-tail file in `room`, if any — the durable
+    /// counterpart to deleting the branch, treating an already-absent file as
+    /// success.
+    pub fn remove_branch_log(&mut self, room: &[u8], branch: &[u8]) -> io::Result<()> {
+        self.remove_if_present(&self.branch_log_path(room, branch))
     }
 
     /// Fold `room`'s log prefix into a snapshot and drop the covered records.
@@ -321,6 +361,11 @@ impl Store {
                 // A malformed branches record loads as no forks, restoring the
                 // room to the default `{main}` rather than failing the whole load.
                 FileKind::Branches => slot.branches = parse_branches(&bytes),
+                // A branch tail is framed as the main log; a torn tail record is
+                // dropped, a complete-but-undecodable one is corruption.
+                FileKind::BranchLog(branch) => {
+                    slot.branch_ops.push((branch, decode_records(&bytes)?))
+                }
             }
         }
         Ok(rooms.into_iter().collect())
@@ -387,6 +432,17 @@ impl Store {
         self.root
             .join(format!("{}.branches.tmp", Self::hex_name(room)))
     }
+
+    /// The divergent-tail log file backing `(room, branch)`. Room and branch are
+    /// each hex-encoded and joined by a non-hex separator, so any bytes — the
+    /// branch name included — map to one safe, unambiguous name.
+    fn branch_log_path(&self, room: &[u8], branch: &[u8]) -> PathBuf {
+        self.root.join(format!(
+            "{}_{}.blog",
+            Self::hex_name(room),
+            Self::hex_name(branch)
+        ))
+    }
 }
 
 /// Append `bytes` to `buf` as a `u32` little-endian length prefix then the bytes.
@@ -398,20 +454,28 @@ fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// Which kind of per-room file a path is.
+/// Which kind of per-room file a path is. A branch tail carries its branch name,
+/// the second dimension of its `(room, branch)` key.
 enum FileKind {
     Log,
     Snapshot,
     Versions,
     Meta,
     Branches,
+    BranchLog(Vec<u8>),
 }
 
 /// Recover a room id and file kind from a path, or `None` if it is not one of
 /// ours (including an uncommitted `.snap.tmp` / `.versions.tmp` / `.meta.tmp` /
-/// `.branches.tmp`).
+/// `.branches.tmp`). A `.blog` names its branch too: `<hex room>_<hex branch>`.
 fn classify(path: &Path) -> Option<(RoomId, FileKind)> {
-    let kind = match path.extension()?.to_str()? {
+    let ext = path.extension()?.to_str()?;
+    let stem = path.file_stem()?.to_str()?;
+    if ext == "blog" {
+        let (room, branch) = stem.split_once('_')?;
+        return Some((decode_hex(room)?, FileKind::BranchLog(decode_hex(branch)?)));
+    }
+    let kind = match ext {
         "log" => FileKind::Log,
         "snap" => FileKind::Snapshot,
         "versions" => FileKind::Versions,
@@ -419,15 +483,19 @@ fn classify(path: &Path) -> Option<(RoomId, FileKind)> {
         "branches" => FileKind::Branches,
         _ => return None,
     };
-    let stem = path.file_stem()?.to_str()?.as_bytes();
-    if stem.len() % 2 != 0 {
+    Some((decode_hex(stem)?, kind))
+}
+
+/// Decode a hex file-name component back to its bytes, or `None` if it is not an
+/// even-length run of hex digits.
+fn decode_hex(hex: &str) -> Option<RoomId> {
+    let hex = hex.as_bytes();
+    if hex.len() % 2 != 0 {
         return None;
     }
-    let room: RoomId = stem
-        .chunks(2)
+    hex.chunks(2)
         .map(|pair| Some(unhex(pair[0])? << 4 | unhex(pair[1])?))
-        .collect::<Option<_>>()?;
-    Some((room, kind))
+        .collect()
 }
 
 /// Parse a snapshot record: an 8-byte little-endian base sequence, then the

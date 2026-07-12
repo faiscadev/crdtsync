@@ -19,7 +19,16 @@ use crate::acl::authorized;
 use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Resource};
 use crate::schema_registry::{Resolution, SchemaRegistry};
-use crate::{Catchup, Hub, RoomId, StoredOp};
+use crate::{Catchup, Hub, RoomId, StoredOp, MAIN_BRANCH};
+
+/// One channel's subscription: the room it joined and the branch within it. An
+/// empty subscribe branch is normalized to [`MAIN_BRANCH`] here, so every bound
+/// channel names a concrete branch and fan-out matches `(room, branch)` exactly.
+#[derive(Clone)]
+struct Subscription {
+    room: RoomId,
+    branch: Vec<u8>,
+}
 
 /// One client connection's protocol state. The handshake runs Hello → Auth →
 /// Subscribe: the client names itself, then presents a credential the server
@@ -30,7 +39,7 @@ use crate::{Catchup, Hub, RoomId, StoredOp};
 pub struct Session {
     client: Option<ClientId>,
     identity: Option<Identity>,
-    channels: HashMap<Channel, RoomId>,
+    channels: HashMap<Channel, Subscription>,
     /// The app named at Hello (empty for a relay connection with no app).
     app_id: Vec<u8>,
     /// The registered schema version this connection is enforced at, resolved at
@@ -98,16 +107,27 @@ impl Session {
     /// The room this connection has bound to `channel`, if any — the reverse of a
     /// subscribe, for resolving an inbound frame's room from its channel handle.
     pub fn room_for_channel(&self, channel: Channel) -> Option<&RoomId> {
-        self.channels.get(&channel)
+        self.channels.get(&channel).map(|s| &s.room)
     }
 
-    /// The channels this connection has bound to `room`. A broadcast for the
-    /// room is delivered on each — one connection may hold the same room on
-    /// more than one channel.
+    /// The channels this connection has bound to `room`, across every branch. A
+    /// room-scoped fan-out (awareness, stranded-peer eviction) reaches each — one
+    /// connection may hold the room on more than one channel or branch.
     pub fn channels_for_room(&self, room: &[u8]) -> Vec<Channel> {
         self.channels
             .iter()
-            .filter(|(_, r)| r.as_slice() == room)
+            .filter(|(_, s)| s.room == room)
+            .map(|(c, _)| *c)
+            .collect()
+    }
+
+    /// The channels this connection has bound to the `(room, branch)` stream. A
+    /// branch write fans out on each — the replication unit is `(room, branch)`,
+    /// so a write on one branch never reaches another branch's subscribers.
+    pub fn channels_for_stream(&self, room: &[u8], branch: &[u8]) -> Vec<Channel> {
+        self.channels
+            .iter()
+            .filter(|(_, s)| s.room == room && s.branch == branch)
             .map(|(c, _)| *c)
             .collect()
     }
@@ -115,7 +135,7 @@ impl Session {
     /// The rooms this connection currently subscribes, one entry per channel —
     /// the same room recurs if held on several channels, so the caller dedups.
     pub fn subscribed_rooms(&self) -> impl Iterator<Item = &RoomId> {
-        self.channels.values()
+        self.channels.values().map(|s| &s.room)
     }
 
     /// Drop every channel this connection bound to `room`, returning them — the
@@ -154,6 +174,10 @@ pub struct Response {
     pub replies: Vec<Message>,
     pub broadcast: Vec<Op>,
     pub broadcast_room: Option<RoomId>,
+    /// The branch the broadcast ops belong to — the `(room, branch)` stream they
+    /// fan out to. `None` when there is nothing to fan out; a `main` write carries
+    /// the normalized `main` name, so fan-out never crosses into another branch.
+    pub broadcast_branch: Option<Vec<u8>>,
     /// The schema version the broadcast ops were created under — the writing
     /// connection's — so the fan-out translates each op from it to every
     /// recipient's own version. `None` for a relay write (no schema).
@@ -266,10 +290,11 @@ pub fn step(
         Message::Subscribe {
             channel,
             room,
-            // A subscription is scoped by `(room, branch)`; an empty branch is
-            // `main`. The room binds the subscription; the branch is carried but
-            // does not scope the log or rooms.
-            branch: _,
+            // A subscription is scoped by `(room, branch)` — the replication unit.
+            // An empty branch is the default `main`, the whole existing log; a
+            // named branch serves the shared base up to its fork point plus its own
+            // divergent tail.
+            branch,
             last_seen_seq,
         } => {
             let Some(identity) = session.identity() else {
@@ -289,6 +314,21 @@ pub fn step(
             ) {
                 return forbidden("read denied");
             }
+            let branch = normalize_branch(branch);
+            // A named branch must already exist (forked via the engine) to be
+            // served — an unknown one is refused rather than silently served
+            // `main`'s stream, which would cross replication units. The default
+            // `main` always resolves.
+            if branch != MAIN_BRANCH && hub.branch(&room, &branch).is_none() {
+                return Response {
+                    replies: vec![Message::Error {
+                        code: ErrorCode::UnknownRoom,
+                        message: "unknown branch".to_string(),
+                        details: Vec::new(),
+                    }],
+                    ..Response::default()
+                };
+            }
             // The handshake range-check: a joiner that cannot reach the room's
             // op-version high-water across a back-compatible path is refused with
             // `onUpdateRequired` before it becomes a subscriber, so down-
@@ -306,7 +346,15 @@ pub fn step(
                     ..Response::default()
                 };
             }
-            let reply = match hub.catch_up(&room, last_seen_seq) {
+            // Resolve the `(room, branch)` stream: `main` is the room's whole log
+            // (today's behavior); a named branch is the shared base up to its fork
+            // point followed by its divergent tail.
+            let catchup = if branch == MAIN_BRANCH {
+                hub.catch_up(&room, last_seen_seq)
+            } else {
+                hub.catch_up_branch(&room, &branch, last_seen_seq)
+            };
+            let reply = match catchup {
                 Catchup::Ops(delta) => Message::Ops {
                     channel,
                     ops: catch_up_ops(registry, governing, session, delta),
@@ -328,7 +376,9 @@ pub fn step(
                     value,
                 });
             }
-            session.channels.insert(channel, room);
+            session
+                .channels
+                .insert(channel, Subscription { room, branch });
             Response {
                 replies,
                 ..Response::default()
@@ -350,7 +400,8 @@ pub fn step(
             let Some(client) = session.client else {
                 return violation("ops before hello");
             };
-            let Some(room) = session.channels.get(&channel).cloned() else {
+            let Some(Subscription { room, branch }) = session.channels.get(&channel).cloned()
+            else {
                 return violation("ops on an unbound channel");
             };
             // Every op must carry the client declared at Hello, so a
@@ -388,10 +439,18 @@ pub fn step(
             // (`None`, relay-like) and pass verbatim on both the live and the
             // catch-up seam, exactly as the fan-out already leaves them.
             let write_version = governing_target(governing, session).map(|(_, _, client)| client);
-            // The deduped ops fan out to the room's other subscribers; nothing
-            // echoes back to the sender. A hub that cannot durably record the
-            // ops rejects the write rather than advertising an unpersisted one.
-            match hub.ingest(&room, ops, write_version) {
+            // The deduped ops fan out to the `(room, branch)` stream's other
+            // subscribers; nothing echoes back to the sender. A `main` write
+            // appends to the room's log as today; a branch write appends to that
+            // branch's divergent tail, advancing its head, never main's. A hub that
+            // cannot durably record the ops rejects the write rather than
+            // advertising an unpersisted one.
+            let applied = if branch == MAIN_BRANCH {
+                hub.ingest(&room, ops, write_version)
+            } else {
+                hub.ingest_branch(&room, &branch, ops, write_version)
+            };
+            match applied {
                 Ok(applied) => Response {
                     replies: through
                         .map(|through| Message::Accepted { channel, through })
@@ -399,6 +458,7 @@ pub fn step(
                         .collect(),
                     broadcast: applied,
                     broadcast_room: Some(room),
+                    broadcast_branch: Some(branch),
                     broadcast_version: write_version,
                     ..Response::default()
                 },
@@ -440,7 +500,7 @@ pub fn step(
             let Some(client) = session.client else {
                 return violation("awareness before hello");
             };
-            let Some(room) = session.channels.get(&channel).cloned() else {
+            let Some(room) = session.channels.get(&channel).map(|s| s.room.clone()) else {
                 return violation("awareness on an unbound channel");
             };
             if !authorized(
@@ -565,8 +625,18 @@ fn version_room(
     action: Action,
 ) -> Option<RoomId> {
     let identity = session.identity()?;
-    let room = session.channels.get(&channel)?.clone();
+    let room = session.channels.get(&channel)?.room.clone();
     authorized(authorizer, schema, identity, action, &Resource::Room(&room)).then_some(room)
+}
+
+/// Normalize a subscribe's branch: an empty branch is the default [`MAIN_BRANCH`],
+/// so a subscription always names a concrete branch and fan-out matches exactly.
+fn normalize_branch(branch: Vec<u8>) -> Vec<u8> {
+    if branch.is_empty() {
+        MAIN_BRANCH.to_vec()
+    } else {
+        branch
+    }
 }
 
 /// The refusal for a version request that [`version_room`] rejected: a violation

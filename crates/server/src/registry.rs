@@ -744,6 +744,7 @@ impl Registry {
             broadcast_version,
             close,
             room,
+            broadcast_branch,
             awareness,
             authed_client,
             bind,
@@ -812,6 +813,7 @@ impl Registry {
                 resp.broadcast_version,
                 resp.close,
                 resp.broadcast_room,
+                resp.broadcast_branch,
                 resp.awareness,
                 authed_client,
                 bind,
@@ -844,7 +846,10 @@ impl Registry {
         // sent the ops on the channel it opened for the room, so a peer
         // multiplexing several rooms can route what it receives.
         if !broadcast.is_empty() {
-            if let Some(room) = room {
+            // A broadcast is scoped to its `(room, branch)` stream: an `Ops` write
+            // always names both, so a branch write reaches only that branch's
+            // subscribers and never crosses into another branch's stream.
+            if let (Some(room), Some(branch)) = (room, broadcast_branch) {
                 // The room's governing schema gates each peer's read consistently,
                 // resolved once (owned) so the peer loop can borrow the conns.
                 let schema = self.governing_schema(&room);
@@ -908,7 +913,7 @@ impl Registry {
                     if ops.is_empty() {
                         continue;
                     }
-                    for channel in conn.session.channels_for_room(&room) {
+                    for channel in conn.session.channels_for_stream(&room, &branch) {
                         conn.outbox.push(Message::Ops {
                             channel,
                             ops: ops.to_vec(),
@@ -1098,6 +1103,12 @@ impl Registry {
     /// The shared hub, for reading merged room state.
     pub fn hub(&self) -> &Hub {
         &self.hub
+    }
+
+    /// The shared hub, mutably — the seam an engine operation (forking a branch,
+    /// importing a room) drives that has no client-facing wire message.
+    pub fn hub_mut(&mut self) -> &mut Hub {
+        &mut self.hub
     }
 }
 

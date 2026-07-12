@@ -33,6 +33,14 @@ fn write_age(hub: &mut Hub, d: &mut Document, value: i64) {
     .unwrap();
 }
 
+/// Grow the room's log to head `n`, so a fork point up to `n` names history that
+/// exists (the fork point is clamped to the source's head).
+fn advance(hub: &mut Hub, d: &mut Document, n: u64) {
+    for i in 0..n {
+        write_age(hub, d, i as i64);
+    }
+}
+
 #[test]
 fn a_fresh_room_has_only_the_default_main() {
     let hub = Hub::new(cid(0xFF));
@@ -56,6 +64,7 @@ fn main_head_tracks_the_room_log_head() {
 #[test]
 fn fork_creates_a_branch_sharing_history_to_the_fork_point() {
     let mut hub = Hub::new(cid(0xFF));
+    advance(&mut hub, &mut Document::new(cid(1)), 5);
     assert!(hub.fork_branch(ROOM, b"draft", b"main", 5).unwrap());
     assert_eq!(names(&hub, ROOM), vec![b"draft".to_vec(), b"main".to_vec()]);
     let draft = hub.branch(ROOM, b"draft").unwrap();
@@ -66,6 +75,7 @@ fn fork_creates_a_branch_sharing_history_to_the_fork_point() {
 #[test]
 fn fork_refuses_a_duplicate_name_or_an_unknown_source() {
     let mut hub = Hub::new(cid(0xFF));
+    advance(&mut hub, &mut Document::new(cid(1)), 7);
     assert!(hub.fork_branch(ROOM, b"draft", b"main", 3).unwrap());
     // A duplicate name changes nothing.
     assert!(!hub.fork_branch(ROOM, b"draft", b"main", 7).unwrap());
@@ -85,6 +95,7 @@ fn main_is_never_deletable() {
 #[test]
 fn rename_moves_a_non_main_branch() {
     let mut hub = Hub::new(cid(0xFF));
+    advance(&mut hub, &mut Document::new(cid(1)), 4);
     hub.fork_branch(ROOM, b"draft", b"main", 4).unwrap();
     assert!(hub.rename_branch(ROOM, b"draft", b"final").unwrap());
     assert!(hub.branch(ROOM, b"draft").is_none());
@@ -144,6 +155,7 @@ mod durable {
         let tmp = tempdir();
         {
             let mut hub = open_hub(tmp.path());
+            advance(&mut hub, &mut Document::new(cid(1)), 9);
             hub.fork_branch(ROOM, b"draft", b"main", 5).unwrap();
             hub.fork_branch(ROOM, b"spike", b"main", 9).unwrap();
             hub.rename_branch(ROOM, b"draft", b"final").unwrap();
