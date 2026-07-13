@@ -66,6 +66,7 @@ fn an_authenticated_actor_is_granted_the_read_its_class_is_allowed() {
     let s = schema(SCHEMA);
     assert!(authorized(
         &abstaining(),
+        Decision::Abstain,
         Some(&s),
         &actor("alice"),
         Action::Read,
@@ -79,6 +80,7 @@ fn a_role_grant_turns_on_the_claim_not_the_actor() {
     // `editor` is granted write; a bare actor without the claim is not.
     assert!(authorized(
         &abstaining(),
+        Decision::Abstain,
         Some(&s),
         &with_roles("bob", &["editor"]),
         Action::Write,
@@ -86,6 +88,7 @@ fn a_role_grant_turns_on_the_claim_not_the_actor() {
     ));
     assert!(!authorized(
         &abstaining(),
+        Decision::Abstain,
         Some(&s),
         &actor("bob"),
         Action::Write,
@@ -99,6 +102,7 @@ fn a_schema_deny_wins_over_a_schema_allow_for_the_same_actor() {
     // Holds both claims: `editor` allows write, `viewer` denies it — deny wins.
     assert!(!authorized(
         &abstaining(),
+        Decision::Abstain,
         Some(&s),
         &with_roles("carol", &["editor", "viewer"]),
         Action::Write,
@@ -112,6 +116,7 @@ fn an_action_no_grant_mentions_defaults_to_deny() {
     // No grant allows a bare authenticated actor to write.
     assert!(!authorized(
         &abstaining(),
+        Decision::Abstain,
         Some(&s),
         &actor("alice"),
         Action::Write,
@@ -125,6 +130,7 @@ fn an_anonymous_actor_is_not_authenticated() {
     // The read grant is to `authenticated`; an `anon:`-prefixed actor is not.
     assert!(!authorized(
         &abstaining(),
+        Decision::Abstain,
         Some(&s),
         &actor("anon:x"),
         Action::Read,
@@ -139,6 +145,7 @@ fn an_ownership_template_subject_never_matches_here() {
     // could match; templates are unenforced, so she is still denied write.
     assert!(!authorized(
         &abstaining(),
+        Decision::Abstain,
         Some(&s),
         &actor("alice"),
         Action::Write,
@@ -153,6 +160,7 @@ fn a_path_scoped_grant_is_not_enforced_at_the_room_level() {
     // read resolves through no grant and defaults to deny.
     assert!(!authorized(
         &abstaining(),
+        Decision::Abstain,
         Some(&s),
         &actor("alice"),
         Action::Read,
@@ -167,6 +175,7 @@ fn register_schema_never_resolves_through_the_grant_tier() {
     // so the composition defaults to deny.
     assert!(!authorized(
         &abstaining(),
+        Decision::Abstain,
         Some(&s),
         &with_roles("bob", &["editor"]),
         Action::RegisterSchema,
@@ -184,6 +193,7 @@ fn a_deployment_allow_wins_over_a_schema_deny() {
     // higher in the flow.
     assert!(authorized(
         &deploy,
+        Decision::Abstain,
         Some(&s),
         &with_roles("carol", &["viewer"]),
         Action::Write,
@@ -198,6 +208,7 @@ fn a_deployment_deny_wins_over_a_schema_allow() {
     // The schema allows an editor write, but the operator's explicit deny wins.
     assert!(!authorized(
         &deploy,
+        Decision::Abstain,
         Some(&s),
         &with_roles("bob", &["editor"]),
         Action::Write,
@@ -212,6 +223,7 @@ fn a_bool_authorizer_never_abstains_so_the_schema_is_not_consulted() {
     // write) is never reached.
     assert!(authorized(
         &PermitAll,
+        Decision::Abstain,
         Some(&s),
         &actor("alice"),
         Action::Write,
@@ -222,6 +234,7 @@ fn a_bool_authorizer_never_abstains_so_the_schema_is_not_consulted() {
     let deny_all = |_: &Identity, _: Action, _: &Resource| false;
     assert!(!authorized(
         &deny_all,
+        Decision::Abstain,
         Some(&s),
         &actor("alice"),
         Action::Read,
@@ -234,6 +247,7 @@ fn a_relay_room_with_no_schema_is_the_deployment_decision_alone() {
     // No schema: an abstaining deployment falls straight to default-deny.
     assert!(!authorized(
         &abstaining(),
+        Decision::Abstain,
         None,
         &actor("alice"),
         Action::Read,
@@ -243,6 +257,7 @@ fn a_relay_room_with_no_schema_is_the_deployment_decision_alone() {
     let deploy = Acl::new().allow(Subject::Anyone, Some(Action::Read), ResourceMatch::AnyRoom);
     assert!(authorized(
         &deploy,
+        Decision::Abstain,
         None,
         &actor("alice"),
         Action::Read,
@@ -272,6 +287,7 @@ fn an_audited_wrapper_preserves_the_abstain_so_the_schema_tier_still_runs() {
     let audited = Audited::new(Box::new(Acl::new()), Box::new(|_: &AccessRecord| {}));
     assert!(authorized(
         &audited,
+        Decision::Abstain,
         Some(&s),
         &actor("alice"),
         Action::Read,

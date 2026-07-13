@@ -290,6 +290,7 @@ fn governing_metadata_round_trips() {
             &RoomMeta {
                 governing: Some((b"app".to_vec(), 3)),
                 max_op_version: Some(5),
+                creator: None,
             },
         )
         .unwrap();
@@ -309,6 +310,7 @@ fn a_relay_high_water_without_a_binding_round_trips() {
             &RoomMeta {
                 governing: None,
                 max_op_version: Some(2),
+                creator: None,
             },
         )
         .unwrap();
@@ -328,6 +330,7 @@ fn metadata_with_neither_field_removes_the_record() {
             &RoomMeta {
                 governing: Some((b"app".to_vec(), 1)),
                 max_op_version: Some(1),
+                creator: None,
             },
         )
         .unwrap();
@@ -338,6 +341,7 @@ fn metadata_with_neither_field_removes_the_record() {
             &RoomMeta {
                 governing: None,
                 max_op_version: None,
+                creator: None,
             },
         )
         .unwrap();
@@ -356,6 +360,7 @@ fn a_malformed_metadata_record_loads_as_absent_and_never_panics() {
             &RoomMeta {
                 governing: Some((b"app".to_vec(), 1)),
                 max_op_version: Some(1),
+                creator: None,
             },
         )
         .unwrap();

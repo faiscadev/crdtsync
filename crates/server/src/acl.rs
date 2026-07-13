@@ -14,10 +14,15 @@
 //! [`authorized`] composes that abstain with the room's governing schema `@auth`
 //! grants (decision-flow step 4) and a terminal default-deny.
 
+use crdtsync_core::acl::{
+    decide_capability_with_authority, AclActor, AclDecision, AclRecord, Capability,
+};
 use crdtsync_core::schema::{
     Action as SchemaAction, Auth, Effect as GrantEffect, Schema, Subject as GrantSubject,
     SubjectClass,
 };
+use crdtsync_core::ClientId;
+use sha2::{Digest, Sha256};
 
 use crate::auth::Identity;
 use crate::authz::{Action, Authorizer, Decision, Resource};
@@ -419,15 +424,23 @@ impl Authorizer for Acl {
 
 /// The composed authorization decision the data-plane enforcement points make:
 /// the deployment [`Authorizer`] first, then — only where it abstains — the room's
-/// governing schema `@auth` grants, then a terminal default-deny. This is the
-/// decision flow's tail (explicit deny → explicit allow → schema role-grant →
-/// default-deny); ownership and per-actor doc-ACL tiers slot in above the schema
-/// once a carrier exists.
+/// live doc-ACL tuple tier (`doc_acl`), then the room's governing schema `@auth`
+/// grants, then a terminal default-deny. This is the decision flow (explicit deny →
+/// explicit allow → per-actor doc-ACL grant → schema role-grant → default-deny).
+///
+/// `doc_acl` is the room's doc-ACL tuple tier verdict, pre-resolved by
+/// [`doc_acl_tier`] over the room's live ACL records and creator; it is
+/// [`Abstain`](Decision::Abstain) for a resource with no governing doc-ACL state
+/// (an app resource, or a room with no creator and no tuples), so the composition
+/// then behaves exactly as the deployment-plus-schema tiers alone. A deployment
+/// `Deny`/`Allow` is terminal and never reaches it — a doc-ACL grant cannot re-open
+/// what the deployment explicitly refused.
 ///
 /// `schema` is the schema governing the request's room, or `None` for a relay
-/// room (then the deployment authorizer is the whole decision).
+/// room (then the deployment authorizer and doc-ACL are the whole decision).
 pub fn authorized(
     deployment: &dyn Authorizer,
+    doc_acl: Decision,
     schema: Option<&Schema>,
     identity: &Identity,
     action: Action,
@@ -436,19 +449,143 @@ pub fn authorized(
     let granted = match deployment.decide(identity, action, resource) {
         Decision::Allow => true,
         Decision::Deny => false,
-        Decision::Abstain => matches!(
-            schema.map_or(Decision::Abstain, |s| schema_decision(
-                s.auth(),
-                identity,
-                action
-            )),
-            Decision::Allow
-        ),
+        Decision::Abstain => match doc_acl {
+            Decision::Allow => true,
+            Decision::Deny => false,
+            Decision::Abstain => matches!(
+                schema.map_or(Decision::Abstain, |s| schema_decision(
+                    s.auth(),
+                    identity,
+                    action
+                )),
+                Decision::Allow
+            ),
+        },
     };
     // Report the composed verdict, not the deployment tier's — an auditing
-    // authorizer records what was actually enforced, schema grants included.
+    // authorizer records what was actually enforced, doc-ACL and schema grants
+    // included.
     deployment.observe(identity, action, resource, granted);
     granted
+}
+
+/// The root path the doc-ACL tier evaluates at — a `core::path` key sequence with
+/// no keys, which [`governs`](crdtsync_core::acl) every path. The first cut
+/// evaluates whole-document (`/`) authority only, because the room-level
+/// [`Resource`] carries no path; a path-carrying `Resource` widens it to a subtree
+/// later.
+///
+/// Consequence, until then: a tuple scoped to a *subtree* — an allow **or a deny** —
+/// does not `govern` the root query, so it is inert here. A subtree allow grants
+/// nothing yet (fail-closed), and a subtree deny blocks nothing yet (fail-open at
+/// this seam) — only whole-document (`/`) tuples are enforced. The op-submit gate is
+/// room-level (it cannot see which path an op targets), so this is a scope boundary,
+/// not a per-path decision that leaks.
+fn root_path() -> Vec<u8> {
+    crdtsync_core::path::encode_path(&[])
+}
+
+/// The doc-ACL tuple tier's verdict on whether `identity` may take `action` on a
+/// room, over its live ACL `records` and `creator`. Composed between the
+/// deployment and schema tiers by [`authorized`].
+///
+/// The room's `creator` (an authenticated actor) is the un-granted owner of the
+/// root — it holds every capability with no explicit tuple (creator-auto-owns-`/`).
+/// Every other verdict is a grant the creator (or a delegate it owns from) authored:
+/// core's [`decide_capability_with_authority`] resolves attenuated delegation,
+/// provenance-bounded deny, and deny-overrides over the record set. A room with no
+/// creator has no doc-ACL authority root, so the tier abstains (its tuple set is
+/// empty until a first write establishes the creator).
+///
+/// The querying actor's ACL identity is derived from the credential [`Identity`]:
+/// its actor id keys the [`AclSubject::Actor`](crdtsync_core::acl::AclSubject) /
+/// creator / grantor match via [`actor_key`], its groups and roles ride from the
+/// credential's claims, and its authentication state distinguishes
+/// `Authenticated` from `Anonymous`. `RegisterSchema` is a control-plane action
+/// with no capability form, so it always abstains.
+pub fn doc_acl_tier(
+    records: &[AclRecord],
+    creator: Option<&[u8]>,
+    identity: &Identity,
+    action: Action,
+) -> Decision {
+    let Some(capability) = capability_for(action) else {
+        return Decision::Abstain;
+    };
+    // No creator ⇒ no authority root, and (since a tuple is authored by a write,
+    // which establishes the creator) no tuples either: the tier holds no opinion.
+    let Some(creator) = creator else {
+        return Decision::Abstain;
+    };
+    let actor = actor_acl(identity);
+    let decision = decide_capability_with_authority(
+        records,
+        actor_key(creator),
+        &actor,
+        &root_path(),
+        capability,
+    );
+    match decision {
+        AclDecision::Allow => Decision::Allow,
+        AclDecision::Deny => Decision::Deny,
+        AclDecision::Abstain => Decision::Abstain,
+    }
+}
+
+/// The doc-ACL [`Capability`] a data-plane [`Action`] resolves to, or `None` for
+/// `RegisterSchema` — a control-plane meta-auth with no doc-level capability form.
+fn capability_for(action: Action) -> Option<Capability> {
+    match action {
+        Action::Read => Some(Capability::Read),
+        Action::Write => Some(Capability::Write),
+        Action::PublishAwareness => Some(Capability::PublishAwareness),
+        Action::RegisterSchema => None,
+    }
+}
+
+/// The doc-ACL querying actor built from the credential [`Identity`]: the actor id
+/// keyed via [`actor_key`], the credential's groups and roles carried as byte
+/// strings, and the authentication state read from the actor prefix (an
+/// [`ANON_PREFIX`] actor is anonymous).
+fn actor_acl(identity: &Identity) -> AclActor {
+    AclActor {
+        id: actor_key(identity.actor()),
+        groups: identity
+            .groups()
+            .iter()
+            .map(|g| g.clone().into_bytes())
+            .collect(),
+        roles: identity
+            .roles()
+            .iter()
+            .map(|r| r.clone().into_bytes())
+            .collect(),
+        authenticated: is_authenticated(identity.actor()),
+    }
+}
+
+/// Whether `actor` is a credentialed (non-anonymous) actor — the doc-ACL
+/// `Authenticated`/`Anonymous` distinction, read from the [`ANON_PREFIX`] an
+/// anonymous connection's id carries. The room creator must be one of these: an
+/// anonymous id is ephemeral per-connection, so it would never re-present to
+/// reclaim the ownership it was granted.
+pub fn is_authenticated(actor: &[u8]) -> bool {
+    !actor.starts_with(ANON_PREFIX)
+}
+
+/// The doc-ACL actor key for a credential actor: a stable 16-byte id derived from
+/// the (variable-length) actor bytes by truncating their SHA-256 digest. Core's
+/// ACL set matches an actor, a grantor, and the creator by this fixed-width key, so
+/// the *authenticated actor* — not the ephemeral per-device `ClientId` — is the ACL
+/// principal: the same human across two devices presents the same credential-derived
+/// actor, derives the same key, and so is one ACL subject. The derivation is fixed
+/// (SHA-256, never a process-seeded hash), so a persisted grant's embedded key
+/// re-matches after a restart.
+pub fn actor_key(actor: &[u8]) -> ClientId {
+    let digest = Sha256::digest(actor);
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    ClientId::from_bytes(bytes)
 }
 
 /// The schema `@auth` grant tier: deny-wins over the whole-document grants whose

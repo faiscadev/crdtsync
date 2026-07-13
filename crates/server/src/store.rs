@@ -64,6 +64,10 @@ pub struct Snapshot {
 pub struct RoomMeta {
     pub governing: Option<(Vec<u8>, u32)>,
     pub max_op_version: Option<u32>,
+    /// The room's doc-ACL creator — the authenticated actor that established it, the
+    /// authority root that auto-owns `/`. Persisted so creator-auto-owns survives a
+    /// restart; `None` for a room with no established creator.
+    pub creator: Option<Vec<u8>>,
 }
 
 /// One branch of a room: a named pointer into the op log. `fork_point` is the
@@ -297,14 +301,18 @@ impl Store {
     /// held. The record is a 1-byte governing present-flag then — when present —
     /// the length-prefixed app id and the 4-byte little-endian version, then a
     /// 1-byte high-water present-flag then — when present — the 4-byte
-    /// little-endian op version. The file lands atomically — temp, flushed,
-    /// renamed, directory flushed — so a crash never leaves a torn record; a
-    /// record with neither field removes the file. The binding is derived state
-    /// (re-derivable from live subscribers) rather than the authoritative op log,
-    /// so a caller treats a write failure as a durability-cache miss, not a data
-    /// loss.
+    /// little-endian op version, then a 1-byte creator present-flag then — when
+    /// present — the length-prefixed creator actor. The file lands atomically — temp,
+    /// flushed, renamed, directory flushed — so a crash never leaves a torn record; a
+    /// record with no field removes the file. The governing binding and op-version
+    /// high-water are re-derivable (from live subscribers and the op log), so a write
+    /// failure of those degrades to a durability-cache miss. The creator is **not**
+    /// re-derivable — the op log carries per-device `ClientId`s, not the credential
+    /// actor — so its persist is still best-effort but a lost creator record means a
+    /// later authenticated writer bootstraps the room's authority root instead; the
+    /// caller persists it eagerly on the establishing write to keep that window small.
     pub fn write_meta(&mut self, room: &[u8], meta: &RoomMeta) -> io::Result<()> {
-        if meta.governing.is_none() && meta.max_op_version.is_none() {
+        if meta.governing.is_none() && meta.max_op_version.is_none() && meta.creator.is_none() {
             return self.remove_if_present(&self.meta_path(room));
         }
         let mut buf = Vec::new();
@@ -320,6 +328,13 @@ impl Store {
             Some(version) => {
                 buf.push(1);
                 buf.extend_from_slice(&version.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+        match &meta.creator {
+            Some(actor) => {
+                buf.push(1);
+                put_bytes(&mut buf, actor);
             }
             None => buf.push(0),
         }
@@ -659,15 +674,21 @@ fn parse_meta(bytes: &[u8]) -> Option<RoomMeta> {
         1 => Some(take_u32(bytes, &mut at).ok()?),
         _ => return None,
     };
+    let creator = match take_u8(bytes, &mut at).ok()? {
+        0 => None,
+        1 => Some(take_bytes(bytes, &mut at).ok()?),
+        _ => return None,
+    };
     if at != bytes.len() {
         return None;
     }
-    if governing.is_none() && max_op_version.is_none() {
+    if governing.is_none() && max_op_version.is_none() && creator.is_none() {
         return None;
     }
     Some(RoomMeta {
         governing,
         max_op_version,
+        creator,
     })
 }
 

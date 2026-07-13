@@ -141,6 +141,35 @@ fn ingest_tags_the_creation_version_and_replay_preserves_it() {
 }
 
 #[test]
+fn a_rooms_doc_acl_creator_survives_a_restart() {
+    // The creator is the doc-ACL authority root, so creator-auto-owns-`/` must
+    // survive a reload — it is persisted beside the room's governing metadata.
+    let tmp = tempdir();
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        hub.ingest(
+            ROOM,
+            doc(1).transact(|tx| tx.register(b"a", Scalar::Int(1))),
+            None,
+        )
+        .unwrap();
+        hub.ensure_creator(ROOM, b"alice");
+        assert_eq!(hub.room_creator(ROOM), Some(b"alice".to_vec()));
+    }
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        hub.room_creator(ROOM),
+        Some(b"alice".to_vec()),
+        "the persisted creator comes back on reload",
+    );
+}
+
+#[test]
 fn from_rooms_replays_independent_rooms() {
     let a = doc(1).transact(|tx| tx.register(b"k", Scalar::Int(1)));
     let b = doc(2).transact(|tx| tx.register(b"k", Scalar::Int(2)));
