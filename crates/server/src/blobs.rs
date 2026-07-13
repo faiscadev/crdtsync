@@ -108,6 +108,30 @@ impl BlobStore {
         })
     }
 
+    /// Store `bytes` under a fresh handle that [`get`](BlobStore::get) always
+    /// resolves — the HTTP fetch channel, where even a small blob must be
+    /// retrievable by handle rather than riding an op's inline ref. Unlike
+    /// [`put`](BlobStore::put), no blob is left inline-only: the bytes are
+    /// content-addressed and the UUID → sha256 mapping persisted regardless of
+    /// size. The returned ref still reports `inline` truthfully, so a caller may
+    /// skip the fetch for a small blob it just uploaded.
+    pub fn put_fetchable(&mut self, bytes: &[u8], mime: &str) -> io::Result<BlobRef> {
+        let id = new_uuid();
+        let sha = content_sha(bytes);
+        let object = self.object_path(&sha);
+        if !object.exists() {
+            atomic_write(&object, bytes)?;
+        }
+        atomic_write(&self.ref_path(&id), &sha)?;
+        self.index.insert(id, sha);
+        Ok(BlobRef {
+            id,
+            mime: mime.to_string(),
+            size: bytes.len() as u64,
+            inline: (bytes.len() <= INLINE_MAX).then(|| bytes.to_vec()),
+        })
+    }
+
     /// Resolve a public handle to its stored bytes, or `None` if the id is
     /// unknown. Inline blobs are not held here — they ride their ref — so this
     /// serves stored (non-inline) blobs.
@@ -169,7 +193,7 @@ fn atomic_write(path: &Path, buf: &[u8]) -> io::Result<()> {
 }
 
 /// Lowercase hex of `bytes`.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
         s.push(HEX[(b >> 4) as usize] as char);
@@ -180,7 +204,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Parse a 32-char lowercase-hex ref filename back to its 16-byte handle,
 /// rejecting any name that is not exactly one.
-fn parse_uuid(name: &str) -> Option<[u8; 16]> {
+pub(crate) fn parse_uuid(name: &str) -> Option<[u8; 16]> {
     let bytes = name.as_bytes();
     if bytes.len() != 32 {
         return None;
@@ -225,5 +249,40 @@ mod tests {
         assert_eq!(parse_uuid("short"), None);
         assert_eq!(parse_uuid(&"zz".repeat(16)), None);
         assert_eq!(parse_uuid(&"a".repeat(31)), None);
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "crdtsync-blobstore-{}-{}",
+            std::process::id(),
+            NONCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    // Touches the filesystem — skip under Miri, which cannot execute the syscalls.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn put_fetchable_round_trips_inline_and_stored() {
+        let root = temp_root();
+        let mut store = BlobStore::open(&root).unwrap();
+
+        // A small blob reports `inline` yet is still fetchable by handle.
+        let small = store.put_fetchable(b"hi", "text/plain").unwrap();
+        assert!(small.inline.is_some());
+        assert_eq!(store.get(&small.id).unwrap().as_deref(), Some(&b"hi"[..]));
+
+        // A large blob is stored and fetched by handle.
+        let big = vec![9u8; INLINE_MAX + 1];
+        let large = store
+            .put_fetchable(&big, "application/octet-stream")
+            .unwrap();
+        assert!(large.inline.is_none());
+        assert_eq!(store.get(&large.id).unwrap(), Some(big));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
