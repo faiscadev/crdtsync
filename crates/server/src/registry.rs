@@ -45,6 +45,17 @@ struct Conn {
     outbox: Vec<Message>,
 }
 
+/// A client write-ack withheld pending majority replication. The leader owes the
+/// author an [`Message::Accepted`] for the write that reached server sequence
+/// `seq` in `room`; it is released to `conn` once a majority of `room`'s replica
+/// set holds that sequence.
+struct PendingAck {
+    room: RoomId,
+    seq: u64,
+    conn: ConnId,
+    accepted: Message,
+}
+
 /// The set of live connections sharing one hub.
 pub struct Registry {
     hub: Hub,
@@ -96,6 +107,12 @@ pub struct Registry {
     /// mode — a node with no membership never leads a room, so it never
     /// replicates.
     replication: Replication,
+    /// Client write-acks withheld pending majority replication: for each write
+    /// the leader has committed but not yet confirmed durable, the `Accepted` owed
+    /// to its author and the server sequence a majority of the replica set must
+    /// reach to release it. Empty in single-node mode, where a write is majority-
+    /// durable on commit and acked at once.
+    pending_acks: Vec<PendingAck>,
 }
 
 impl Registry {
@@ -130,6 +147,7 @@ impl Registry {
             schedule_fires: HashMap::new(),
             membership: None,
             replication: Replication::default(),
+            pending_acks: Vec::new(),
         }
     }
 
@@ -211,11 +229,9 @@ impl Registry {
         if !membership.is_primary_for(room) {
             return;
         }
-        let followers: Vec<NodeId> = membership
-            .replicas_for(room)
-            .into_iter()
-            .filter(|node| !membership.is_self(node))
-            .collect();
+        // The same replica-set-minus-self the majority gate counts, so the fan-out
+        // and the quorum never disagree on who is a follower.
+        let followers = self.quorum(room).1;
         if followers.is_empty() {
             return;
         }
@@ -284,10 +300,76 @@ impl Registry {
     }
 
     /// Record a follower's [`Message::ReplicaAck`], advancing its acknowledged
-    /// watermark for the room. The leader's peer connection calls this when the
-    /// follower answers a Replicate.
+    /// watermark for the room, then release any withheld client ack the fresh
+    /// watermark now carries to a majority. The leader's peer connection calls this
+    /// when the follower answers a Replicate.
     pub fn record_replica_ack(&mut self, follower: NodeId, room: &[u8], through_seq: u64) {
         self.replication.record_ack(follower, room, through_seq);
+        self.release_pending_acks(room);
+    }
+
+    /// `room`'s quorum: the majority threshold and this leader's followers — its
+    /// replica set (the primary self plus followers), of size R, minus self. A
+    /// majority is `R / 2 + 1`; self, which holds any write it committed, is the
+    /// implicit one every quorum count starts from. Single-node mode (no
+    /// membership) or a self-only replica set is `(1, [])` — a majority of one self
+    /// alone satisfies. The one place the replica set is turned into followers, so
+    /// the majority count and [`enqueue_replication`](Self::enqueue_replication)'s
+    /// fan-out never diverge on who is a follower.
+    fn quorum(&self, room: &[u8]) -> (usize, Vec<NodeId>) {
+        let Some(membership) = &self.membership else {
+            return (1, Vec::new());
+        };
+        let replicas = membership.replicas_for(room);
+        let majority = replicas.len() / 2 + 1;
+        let followers = replicas
+            .into_iter()
+            .filter(|node| !membership.is_self(node))
+            .collect();
+        (majority, followers)
+    }
+
+    /// Whether a majority of `room`'s replica set holds the write at server
+    /// sequence `seq`: self (always one, holding the committed write) plus each
+    /// `follower` whose acknowledged watermark has reached `seq`, against the
+    /// majority threshold.
+    fn quorum_met(&self, room: &[u8], majority: usize, followers: &[NodeId], seq: u64) -> bool {
+        let held = 1 + followers
+            .iter()
+            .filter(|node| self.replication.watermark(room, node) >= seq)
+            .count();
+        held >= majority
+    }
+
+    /// Whether a majority of `room`'s replica set holds the write at server
+    /// sequence `seq` — the single-write form of [`quorum_met`](Self::quorum_met),
+    /// resolving `room`'s quorum first.
+    fn write_has_majority(&self, room: &[u8], seq: u64) -> bool {
+        let (majority, followers) = self.quorum(room);
+        self.quorum_met(room, majority, &followers, seq)
+    }
+
+    /// Release every write withheld for `room` that a majority of its replica set
+    /// now holds — a follower ack advanced a watermark — queueing each owed
+    /// `Accepted` to its author's outbox and dropping the record. `room`'s quorum
+    /// is resolved once, since it is invariant across the withheld writes. A write
+    /// whose author has since disconnected is discarded.
+    fn release_pending_acks(&mut self, room: &[u8]) {
+        let (majority, followers) = self.quorum(room);
+        let mut i = 0;
+        while i < self.pending_acks.len() {
+            let entry = &self.pending_acks[i];
+            let release =
+                entry.room == room && self.quorum_met(room, majority, &followers, entry.seq);
+            if release {
+                let pending = self.pending_acks.swap_remove(i);
+                if let Some(conn) = self.conns.get_mut(&pending.conn) {
+                    conn.outbox.push(pending.accepted);
+                }
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// The server sequence `follower` has acknowledged for `room` — the watermark
@@ -358,6 +440,10 @@ impl Registry {
     /// with a grace deadline, so a reconnect within the window keeps its presence
     /// and only a later [`sweep`](Registry::sweep) past the deadline drops it.
     pub fn disconnect(&mut self, id: ConnId) {
+        // A withheld write-ack for this author is moot once it is gone — drop it, so
+        // a room that never reaches a majority (dead followers, no failure detection
+        // yet) does not accumulate orphaned records for the process lifetime.
+        self.pending_acks.retain(|pending| pending.conn != id);
         if let Some(conn) = self.conns.remove(&id) {
             // The counterpart to the Connected emitted at accept — fires for every
             // closed connection, authenticated or not, so a connect/disconnect
@@ -879,6 +965,10 @@ impl Registry {
                 .map(|room| (room.clone(), self.hub.max_op_version(room))),
             _ => None,
         };
+        // A write's `Accepted` is the one reply gated on majority replication, so
+        // it is pulled out of the step's replies below and released only once the
+        // room's replica set confirms the write durable.
+        let is_ops_write = matches!(msg, Message::Ops { .. });
         let (
             broadcast,
             broadcast_version,
@@ -889,6 +979,7 @@ impl Registry {
             authed_client,
             bind,
             newly_subscribed,
+            owed_accept,
         ) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
@@ -918,7 +1009,22 @@ impl Registry {
                 throttle,
                 msg,
             );
-            conn.outbox.extend(resp.replies);
+            // A write's `Accepted` is withheld from the outbox and carried out to
+            // the majority gate below; every other reply — errors, adverts, the
+            // catch-up, an awareness fan-out — is queued for send now.
+            let owed_accept = if is_ops_write {
+                let mut owed = None;
+                for reply in resp.replies {
+                    match reply {
+                        accepted @ Message::Accepted { .. } => owed = Some(accepted),
+                        other => conn.outbox.push(other),
+                    }
+                }
+                owed
+            } else {
+                conn.outbox.extend(resp.replies);
+                None
+            };
             // Only an authenticated session may touch a client's grace timer, so
             // a bare Hello-only socket can neither cancel a pending sweep nor
             // keep a foreign client id's presence alive.
@@ -959,6 +1065,7 @@ impl Registry {
                 authed_client,
                 bind,
                 newly_subscribed,
+                owed_accept,
             )
         };
         if newly_subscribed {
@@ -990,6 +1097,38 @@ impl Registry {
         if !broadcast.is_empty() {
             if let (Some(room), Some(branch)) = (&room, &broadcast_branch) {
                 self.enqueue_replication(room, branch, &broadcast);
+            }
+        }
+        // Gate the write's ack on majority durability. Only a main-stream write
+        // with fresh ops in a room that has not yet reached a majority is
+        // withheld — held in `pending_acks` until a follower ack meets the quorum.
+        // Everything else is durable now and released at once: a branch write (not
+        // yet mirrored to followers), a no-op resend (no fresh ops to replicate), a
+        // single-node or self-only replica set, or — defensively — an `Accepted`
+        // with no committed room, which is sent rather than silently dropped.
+        if let Some(accepted) = owed_accept {
+            let withhold = match &room {
+                Some(room)
+                    if broadcast_branch.as_deref() == Some(MAIN_BRANCH)
+                        && !broadcast.is_empty() =>
+                {
+                    let write_seq = self.hub.seq(room);
+                    (!self.write_has_majority(room, write_seq)).then(|| (room.clone(), write_seq))
+                }
+                _ => None,
+            };
+            match withhold {
+                Some((room, seq)) => self.pending_acks.push(PendingAck {
+                    room,
+                    seq,
+                    conn: id,
+                    accepted,
+                }),
+                None => {
+                    if let Some(conn) = self.conns.get_mut(&id) {
+                        conn.outbox.push(accepted);
+                    }
+                }
             }
         }
         // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),

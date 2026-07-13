@@ -381,7 +381,11 @@ async fn registry_actor(
                         room,
                         through_seq,
                     } => {
+                        // The ack may carry a withheld client write to a majority;
+                        // recording it releases the owed `Accepted` into the
+                        // author's outbox, so flush to deliver it.
                         reg.record_replica_ack(follower, &room, through_seq);
+                        flush(&mut reg, &mut peers);
                     }
                 }
             }
