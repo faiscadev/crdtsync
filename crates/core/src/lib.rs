@@ -67,7 +67,7 @@ pub use protocol::{
 };
 pub use ranged::{RangeAnchor, RangedElement, RangedInit, RangedPayload};
 pub use register::Register;
-pub use scalar::{BlobRef, Scalar};
+pub use scalar::{BlobRef, Scalar, INLINE_MAX};
 pub use schema::{
     Action, Auth, AwarenessEntry, Effect, Grant, MarkDef, MarkExpand, MarkFlavor, Schema,
     SchemaError, SchemaErrorKind, Subject, SubjectClass, TemplateVar, TypeDef,
