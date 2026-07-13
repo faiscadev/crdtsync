@@ -74,6 +74,7 @@ async fn recv(rx: &mut UnboundedReceiver<Received>) -> Received {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // binds a loopback capture server over a real socket
 async fn a_version_create_is_posted_with_the_secret_header() {
     let (url, mut rx) = capture_server().await;
     let sink = WebhookSink::spawn(WebhookConfig {
@@ -93,6 +94,7 @@ async fn a_version_create_is_posted_with_the_secret_header() {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // binds a loopback capture server over a real socket
 async fn a_compaction_is_posted_with_its_floor_and_no_secret_header() {
     let (url, mut rx) = capture_server().await;
     let sink = WebhookSink::spawn(WebhookConfig { url, secret: None });
@@ -111,6 +113,7 @@ async fn a_compaction_is_posted_with_its_floor_and_no_secret_header() {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // binds a loopback capture server over a real socket
 async fn no_sink_registered_delivers_nothing() {
     let (_url, mut rx) = capture_server().await;
     let mut h = Hub::new(cid(0xFF));
@@ -123,6 +126,7 @@ async fn no_sink_registered_delivers_nothing() {
 }
 
 #[tokio::test]
+#[cfg_attr(miri, ignore)] // connects out over a real socket
 async fn a_failing_endpoint_never_blocks_or_panics_the_hub() {
     // Port 1 has no listener: every POST fails fast at connect. The sink must
     // still never block or panic the commit path, even past the queue capacity.
