@@ -16,7 +16,7 @@ use crdtsync_core::{ClientId, ErrorCode, Message, Op, Schema};
 
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
-use crate::authz::{Action, Authorizer, PermitAll, Resource};
+use crate::authz::{Action, Authorizer, Decision, PermitAll, Resource};
 use crate::auto_version::{
     expand_name, expand_schedule_name, schedule_origin, trigger_origin, AutoVersionSink,
     AutoVersionState,
@@ -1456,8 +1456,12 @@ fn peer_may_read(
     room: &[u8],
 ) -> bool {
     match session.identity() {
+        // The per-recipient fan-out gate does not yet consult the doc-ACL tier
+        // (outbound redaction over doc-ACL reads is a later sub-slice); it abstains,
+        // so the deployment and schema tiers decide as before.
         Some(identity) => authorized(
             authorizer,
+            Decision::Abstain,
             schema,
             identity,
             Action::Read,

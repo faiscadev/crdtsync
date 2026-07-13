@@ -15,9 +15,9 @@ use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
 
 use crdtsync_core::schema::Schema;
 
-use crate::acl::authorized;
+use crate::acl::{authorized, doc_acl_tier};
 use crate::auth::{Identity, Verifier};
-use crate::authz::{Action, Authorizer, Resource};
+use crate::authz::{Action, Authorizer, Decision, Resource};
 use crate::membership::Membership;
 use crate::schema_registry::{Resolution, SchemaRegistry};
 use crate::{Catchup, Hub, RoomId, StoredOp, MAIN_BRANCH};
@@ -313,9 +313,14 @@ pub fn step(
                 return redirect;
             }
             // A subscription reads the room; the server never serves a room the
-            // actor may not read.
+            // actor may not read. The doc-ACL tier is not yet wired into the read
+            // path (the first cut gates the op-submit Write path only) — it abstains,
+            // so read authority stays the deployment and schema tiers exactly as
+            // before. Wiring read + the per-recipient fan-out redaction together is
+            // 4b, so subscribe-read and fan-out never disagree on doc-ACL.
             if !authorized(
                 authorizer,
+                Decision::Abstain,
                 schema,
                 identity,
                 Action::Read,
@@ -439,8 +444,20 @@ pub fn step(
                 return redirect;
             }
             let identity = session.identity().expect("identity set, checked above");
+            // The doc-ACL tuple tier gates the write between the deployment and
+            // schema tiers: the room creator owns `/`, and its grants let others
+            // in. A first write to a fresh room finds no creator and no tuples, so
+            // the tier abstains and the deployment/schema tiers bootstrap it; that
+            // authorized first writer then becomes the creator (below).
+            let doc_acl = doc_acl_tier(
+                &hub.acl_records(&room),
+                hub.room_creator(&room).as_deref(),
+                identity,
+                Action::Write,
+            );
             if !authorized(
                 authorizer,
+                doc_acl,
                 schema,
                 identity,
                 Action::Write,
@@ -480,7 +497,22 @@ pub fn step(
             // cannot durably record the ops rejects the write rather than
             // advertising an unpersisted one.
             let applied = if branch == MAIN_BRANCH {
-                hub.ingest(&room, ops, write_version)
+                // Only an authenticated actor may become the creator: an anonymous
+                // id is ephemeral per-connection, so it could never re-present to
+                // exercise the ownership, and set-once would then wedge the room's
+                // authority root on a dead principal.
+                let creator = crate::acl::is_authenticated(identity.actor())
+                    .then(|| identity.actor().to_vec());
+                let applied = hub.ingest(&room, ops, write_version);
+                // The first authenticated actor to write a room establishes it, so it
+                // becomes the room's creator — the doc-ACL authority root that owns
+                // `/`. Set-once: a later writer never displaces it. A branch write
+                // presupposes an already-established (forked) room, so it never
+                // bootstraps a creator.
+                if let (Ok(_), Some(creator)) = (&applied, creator) {
+                    hub.ensure_creator(&room, &creator);
+                }
+                applied
             } else {
                 hub.ingest_branch(&room, &branch, ops, write_version)
             };
@@ -537,8 +569,12 @@ pub fn step(
             let Some(room) = session.channels.get(&channel).map(|s| s.room.clone()) else {
                 return violation("awareness on an unbound channel");
             };
+            // Awareness publish is not yet gated by the doc-ACL tier (the write and
+            // read paths are the first cut): the tier abstains, leaving the
+            // deployment and schema tiers to decide exactly as before.
             if !authorized(
                 authorizer,
+                Decision::Abstain,
                 schema,
                 identity,
                 Action::PublishAwareness,
@@ -708,7 +744,17 @@ fn version_room(
 ) -> Option<RoomId> {
     let identity = session.identity()?;
     let room = session.channels.get(&channel)?.room.clone();
-    authorized(authorizer, schema, identity, action, &Resource::Room(&room)).then_some(room)
+    // Version mutations are not yet gated by the doc-ACL tier — it abstains, so the
+    // deployment and schema tiers decide as before.
+    authorized(
+        authorizer,
+        Decision::Abstain,
+        schema,
+        identity,
+        action,
+        &Resource::Room(&room),
+    )
+    .then_some(room)
 }
 
 /// The refusal for a version request that [`version_room`] rejected: a violation

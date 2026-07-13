@@ -279,6 +279,12 @@ struct Room {
     /// replica. It tracks the merged state, so compaction (which drops the log)
     /// leaves it standing; relay and foreign-app ops are untagged and excluded.
     max_op_version: Option<u32>,
+    /// The authenticated actor that established the room — its first writer. The
+    /// doc-ACL authority root: it auto-owns `/`, so it may always read and write and
+    /// its grants confer authority. Set once, on the first write, and never
+    /// displaced; durable across a restart. `None` for a room reconstructed from a
+    /// snapshot with no persisted creator, or one never written through the ops path.
+    creator: Option<Vec<u8>>,
 }
 
 impl Room {
@@ -289,6 +295,7 @@ impl Room {
             seen: HashSet::new(),
             base_seq: 0,
             max_op_version: None,
+            creator: None,
         }
     }
 
@@ -817,6 +824,7 @@ impl Hub {
                     seen,
                     base_seq: snapshot.base_seq,
                     max_op_version: None,
+                    creator: None,
                 },
             );
         }
@@ -837,6 +845,11 @@ impl Hub {
             if let Some(persisted) = meta.max_op_version {
                 if let Some(r) = self.rooms.get_mut(&room) {
                     r.max_op_version = r.max_op_version.max(Some(persisted));
+                }
+            }
+            if let Some(creator) = meta.creator {
+                if let Some(r) = self.rooms.get_mut(&room) {
+                    r.creator = Some(creator);
                 }
             }
         }
@@ -1272,6 +1285,7 @@ impl Hub {
                 seen,
                 base_seq,
                 max_op_version: None,
+                creator: None,
             },
         );
         Ok(true)
@@ -1327,6 +1341,41 @@ impl Hub {
             .unwrap_or_default()
     }
 
+    /// The room's live doc-ACL records — every stored authorization tuple with its
+    /// revoke provenance, id-sorted — for the server-side authority evaluator. Empty
+    /// for an unknown room. Mirrors [`logged_versions`](Hub::logged_versions): a read
+    /// view over the room's replica the enforcement seam consumes.
+    pub fn acl_records(&self, room: &[u8]) -> Vec<crdtsync_core::acl::AclRecord> {
+        self.rooms
+            .get(room)
+            .map(|r| r.doc.acl_records())
+            .unwrap_or_default()
+    }
+
+    /// The authenticated actor that created `room` — its doc-ACL authority root — or
+    /// `None` for an unknown room or one with no established creator.
+    pub fn room_creator(&self, room: &[u8]) -> Option<Vec<u8>> {
+        self.rooms.get(room).and_then(|r| r.creator.clone())
+    }
+
+    /// Record `actor` as `room`'s creator if it has none yet, persisting the durable
+    /// metadata. Set-once: a room keeps its first writer as creator, so a later
+    /// caller never displaces it. A no-op for an unknown room. Best-effort persist,
+    /// matching the governing metadata: a write failure leaves the in-memory creator
+    /// to re-persist rather than failing the write.
+    pub fn ensure_creator(&mut self, room: &[u8], actor: &[u8]) {
+        let established = match self.rooms.get_mut(room) {
+            Some(r) if r.creator.is_none() => {
+                r.creator = Some(actor.to_vec());
+                true
+            }
+            _ => false,
+        };
+        if established {
+            let _ = self.persist_meta(room);
+        }
+    }
+
     /// The governing app's op-version high-water for `room` — the highest op
     /// version ever folded into the merged replica, the worst-case op version a
     /// joiner must be able to down-reach to be served the whole state. It tracks
@@ -1378,6 +1427,7 @@ impl Hub {
         let meta = RoomMeta {
             governing: self.governing.get(room).cloned(),
             max_op_version: self.rooms.get(room).and_then(|r| r.max_op_version),
+            creator: self.rooms.get(room).and_then(|r| r.creator.clone()),
         };
         self.store
             .as_mut()
