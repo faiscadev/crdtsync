@@ -15,7 +15,10 @@ use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
 
 use crdtsync_core::schema::Schema;
 
-use crate::acl::{authorized, doc_acl_tier};
+use crate::acl::{
+    authorized, doc_acl_tier, has_any_read_grant, op_read_path, reads_whole_document,
+    recipient_reads_path,
+};
 use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Decision, Resource};
 use crate::membership::Membership;
@@ -313,19 +316,36 @@ pub fn step(
                 return redirect;
             }
             // A subscription reads the room; the server never serves a room the
-            // actor may not read. The doc-ACL tier is not yet wired into the read
-            // path (the first cut gates the op-submit Write path only) — it abstains,
-            // so read authority stays the deployment and schema tiers exactly as
-            // before. Wiring read + the per-recipient fan-out redaction together is
-            // 4b, so subscribe-read and fan-out never disagree on doc-ACL.
-            if !authorized(
+            // actor may not read. The doc-ACL read tier composes at the root: the
+            // creator (owns `/`) and a root-level read grant pass here. A
+            // subtree-scoped reader abstains at the root, so it is admitted on
+            // holding read on *any* subtree — the per-recipient fan-out and catch-up
+            // redaction then serve it exactly the subtrees it may read, so subscribe
+            // and fan-out never disagree on doc-ACL.
+            let records = hub.acl_records(&room);
+            let creator = hub.room_creator(&room);
+            let root_path = crdtsync_core::path::encode_path(&[]);
+            // Whole-document read: the composed verdict at the root — the creator, a
+            // root-level grant, or a deployment/schema room-read allow. It also
+            // decides whether an unredactable snapshot catch-up may be served (below).
+            let whole_doc_read = recipient_reads_path(
                 authorizer,
-                Decision::Abstain,
+                &records,
+                creator.as_deref(),
                 schema,
                 identity,
-                Action::Read,
-                &Resource::Room(&room),
-            ) {
+                &room,
+                &root_path,
+            );
+            // A subtree-scoped reader abstains at the root, so it is admitted on
+            // holding read on any subtree — but only where the deployment tier itself
+            // abstains: a deployment read-deny stays terminal, so a doc-ACL subtree
+            // grant never re-opens a subscription the deployment refused.
+            let may_read = whole_doc_read
+                || (authorizer.decide(identity, Action::Read, &Resource::Room(&room))
+                    == Decision::Abstain
+                    && has_any_read_grant(&records, creator.as_deref(), identity));
+            if !may_read {
                 return forbidden("read denied");
             }
             // A default (empty) subscribe follows the room's active HEAD — `main`
@@ -379,15 +399,64 @@ pub fn step(
                 hub.catch_up_branch(&room, &branch, last_seen_seq)
             };
             let reply = match catchup {
-                Catchup::Ops(delta) => Message::Ops {
-                    channel,
-                    ops: catch_up_ops(registry, governing, session, delta),
-                },
-                Catchup::Snapshot { seq, state } => Message::Snapshot {
-                    channel,
-                    seq,
-                    state: catch_up_snapshot(registry, governing, session, high_water, state),
-                },
+                Catchup::Ops(delta) => {
+                    // Replay only the ops this subscriber may read — the same
+                    // per-path read authority the live fan-out applies, so a fresh
+                    // partial reader catches up on exactly its granted subtrees. A
+                    // room with no doc-ACL state replays the delta unchanged. Snapshot
+                    // catch-up (a compacted room) replays the materialized state whole:
+                    // path redaction there is a state-level projection, not an op
+                    // filter, so it rides the snapshot seam rather than this one.
+                    let delta = if records.is_empty() {
+                        delta
+                    } else {
+                        let index = hub.element_paths(&room);
+                        delta
+                            .into_iter()
+                            .filter(|rec| {
+                                let p = op_read_path(&index, &rec.op);
+                                recipient_reads_path(
+                                    authorizer,
+                                    &records,
+                                    creator.as_deref(),
+                                    schema,
+                                    identity,
+                                    &room,
+                                    &p,
+                                )
+                            })
+                            .collect()
+                    };
+                    Message::Ops {
+                        channel,
+                        ops: catch_up_ops(registry, governing, session, delta),
+                    }
+                }
+                // A snapshot is the whole materialized replica; redacting it needs a
+                // state-level projection this seam does not do. A reader that does not
+                // read the *whole* document — including one carved out of a
+                // whole-document grant by a downstream read-deny — is refused rather
+                // than served subtrees it may not read; a whole-document reader, and
+                // every reader of a room with no doc-ACL state, is served as before.
+                Catchup::Snapshot { seq, state } => {
+                    let reads_all = records.is_empty()
+                        || reads_whole_document(
+                            authorizer,
+                            &records,
+                            creator.as_deref(),
+                            schema,
+                            identity,
+                            &room,
+                        );
+                    if !reads_all {
+                        return forbidden("read denied");
+                    }
+                    Message::Snapshot {
+                        channel,
+                        seq,
+                        state: catch_up_snapshot(registry, governing, session, high_water, state),
+                    }
+                }
             };
             // After the catch-up, replay the room's current presence so the
             // joiner sees who is already here without waiting for a republish.

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crdtsync_core::diff::Change;
 use crdtsync_core::op::OpId;
-use crdtsync_core::{ClientId, Document, Element, Op, Schema};
+use crdtsync_core::{ClientId, Document, Element, ElementId, Op, Schema};
 
 pub mod acl;
 pub mod admin;
@@ -270,6 +270,57 @@ struct BranchLog {
 /// 1-based position across the room's whole history; `base_seq` counts the ops
 /// already compacted away (sequences `1..=base_seq`), so a retained op at
 /// `log[i]` carries seq `base_seq + i + 1`.
+/// Index the container `elem` and every container it holds into `out`, mapping each
+/// element id to its `core::path` — the recursive core of [`Hub::element_paths`]. A
+/// map keys its container children (each descends under `path + [key]`); a
+/// non-map container's descendants are node-addressed, not key-addressed, so they
+/// inherit `path` (read authority governs the whole subtree) — a list's container
+/// items, and an XML element's attrs map, children list, and nested element/text
+/// children. A leaf (scalar / register / counter) holds no container and is not
+/// indexed; an op on a leaf slot targets the map that keys it, already indexed.
+fn index_container(elem: &Element, path: &[Vec<u8>], out: &mut HashMap<ElementId, Vec<Vec<u8>>>) {
+    match elem {
+        Element::Map(m) => {
+            let m = m.borrow();
+            out.insert(m.id(), path.to_vec());
+            let mut child_path = path.to_vec();
+            for key in m.keys() {
+                let Some(child) = m.get(&key) else { continue };
+                if !child.is_container() {
+                    continue;
+                }
+                child_path.push(key.clone());
+                index_container(&child, &child_path, out);
+                child_path.pop();
+            }
+        }
+        Element::List(l) => {
+            let l = l.borrow();
+            out.insert(l.id(), path.to_vec());
+            for child in l.values() {
+                if child.is_container() {
+                    index_container(&child, path, out);
+                }
+            }
+        }
+        Element::Text(t) => {
+            out.insert(t.borrow().id(), path.to_vec());
+        }
+        Element::XmlElement(x) => {
+            let x = x.borrow();
+            out.insert(x.id(), path.to_vec());
+            index_container(&Element::Map(x.attrs()), path, out);
+            index_container(&Element::List(x.children()), path, out);
+        }
+        Element::XmlFragment(f) => {
+            let f = f.borrow();
+            out.insert(f.id(), path.to_vec());
+            index_container(&Element::List(f.children()), path, out);
+        }
+        Element::Scalar(_) | Element::Register(_) | Element::Counter(_) => {}
+    }
+}
+
 struct Room {
     doc: Document,
     log: Vec<StoredOp>,
@@ -1351,6 +1402,24 @@ impl Hub {
             .get(room)
             .map(|r| r.doc.acl_records())
             .unwrap_or_default()
+    }
+
+    /// Each live container element's id mapped to its `core::path` key sequence,
+    /// walked from `room`'s document root — the index the per-recipient read
+    /// redaction resolves an op's target to its document path with. Every container
+    /// is covered: a map keys its children, and a non-map container's node-addressed
+    /// descendants (list items, an XML element's attrs / children / nested elements)
+    /// inherit that container's own path, since read authority governs a whole
+    /// subtree. An op whose target is still unindexed (a since-deleted container, a
+    /// composite annotation payload) resolves to the root by
+    /// [`op_read_path`](crate::acl::op_read_path), so only a whole-document reader
+    /// carries it. Empty for an unknown room.
+    pub fn element_paths(&self, room: &[u8]) -> HashMap<ElementId, Vec<Vec<u8>>> {
+        let mut out = HashMap::new();
+        if let Some(r) = self.rooms.get(room) {
+            index_container(&Element::Map(r.doc.root()), &[], &mut out);
+        }
+        out
     }
 
     /// The authenticated actor that created `room` — its doc-ACL authority root — or
