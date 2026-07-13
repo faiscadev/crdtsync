@@ -22,6 +22,7 @@ pub mod audit;
 pub mod auth;
 pub mod authz;
 pub mod auto_version;
+pub mod blobs;
 pub mod clock;
 pub mod event;
 pub mod membership;
