@@ -704,6 +704,18 @@ int32_t crdtsync_client_receive(CrdtClient *client,
 // `client` is a live handle or null; `out` points to a writable `CrdtBuf`.
 int32_t crdtsync_client_take_rejected(CrdtClient *client, CrdtBuf *out);
 
+// Drain the room redirects the server has sent since the last call — a node that
+// does not lead a room telling the client to reconnect to its leader — into
+// `out`: each names the `room` and the leader's advertise address `leader_addr`.
+// The core holds no socket, so reconnecting is the transport's job; this only
+// surfaces the target. Draining, so a second call reports a bare zero count;
+// empty likewise when no redirect has arrived. Returns 1 with the encoded list,
+// -1 on a bad handle or a null `out`.
+//
+// # Safety
+// `client` is a live handle or null; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_client_take_redirects(CrdtClient *client, CrdtBuf *out);
+
 // The highest server sequence `channel`'s room has caught up to, into `out`.
 // Returns 1 on success, 0 if the channel isn't held, -1 on a bad handle.
 //

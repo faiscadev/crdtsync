@@ -887,6 +887,76 @@ fn take_rejected_on_a_bad_handle_or_null_out_is_rejected() {
     }
 }
 
+/// One decoded redirect: the room and the leader's advertise address.
+struct DecodedRedirect {
+    room: Vec<u8>,
+    leader_addr: Vec<u8>,
+}
+
+fn decode_redirects(data: &[u8]) -> Vec<DecodedRedirect> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let mut r = Reader { d: data, i: 0 };
+    let n = r.u32();
+    (0..n)
+        .map(|_| DecodedRedirect {
+            room: r.blob().to_vec(),
+            leader_addr: r.blob().to_vec(),
+        })
+        .collect()
+}
+
+#[test]
+fn a_server_redirect_surfaces_the_room_and_leader() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+
+        // A node that does not lead the room tells the client where the leader is.
+        let redirect = encode_message(&Message::Redirect {
+            room: b"room-1".to_vec(),
+            leader_addr: b"10.0.0.7:4000".to_vec(),
+        });
+        assert_eq!(
+            crdtsync_client_receive(c, redirect.as_ptr(), redirect.len(), ptr::null_mut()),
+            1
+        );
+
+        // The drain yields the one target: the room and the leader's address.
+        let mut out = out_buf();
+        assert_eq!(crdtsync_client_take_redirects(c, &mut out), 1);
+        let decoded = decode_redirects(std::slice::from_raw_parts(out.ptr, out.len));
+        crdtsync_buf_free(out);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].room, b"room-1");
+        assert_eq!(decoded[0].leader_addr, b"10.0.0.7:4000");
+
+        // Draining: a second call is a bare zero count, no targets.
+        let mut again = out_buf();
+        assert_eq!(crdtsync_client_take_redirects(c, &mut again), 1);
+        assert!(decode_redirects(std::slice::from_raw_parts(again.ptr, again.len)).is_empty());
+        crdtsync_buf_free(again);
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
+fn take_redirects_on_a_bad_handle_or_null_out_is_rejected() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        // A null out on a live handle is rejected, never written.
+        assert_eq!(crdtsync_client_take_redirects(c, ptr::null_mut()), -1);
+        // A bad handle is rejected, never dereferenced.
+        let mut out = out_buf();
+        assert_eq!(
+            crdtsync_client_take_redirects(ptr::null_mut(), &mut out),
+            -1
+        );
+        crdtsync_client_free(c);
+    }
+}
+
 #[test]
 fn a_mark_on_a_bad_client_handle_is_inert() {
     unsafe {

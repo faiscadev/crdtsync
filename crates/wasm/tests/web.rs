@@ -474,6 +474,32 @@ fn a_server_ops_rejection_surfaces_the_refused_batch() {
 }
 
 #[wasm_bindgen_test]
+fn a_server_redirect_surfaces_the_room_and_leader() {
+    use crdtsync_core::protocol::{encode_message, Message};
+    let mut c = wasm_client(1);
+
+    // A node that does not lead the room reports where the leader is.
+    let redirect = encode_message(&Message::Redirect {
+        room: b"room-1".to_vec(),
+        leader_addr: b"10.0.0.7:4000".to_vec(),
+    });
+    assert!(c.receive(&redirect).unwrap());
+
+    // The drain yields one { room, leaderAddr } target.
+    let targets = js_sys::Array::from(&c.take_redirects());
+    assert_eq!(targets.length(), 1);
+    let entry = targets.get(0);
+    let room = js_sys::Uint8Array::from(js_sys::Reflect::get(&entry, &"room".into()).unwrap());
+    assert_eq!(room.to_vec(), b"room-1");
+    let leader =
+        js_sys::Uint8Array::from(js_sys::Reflect::get(&entry, &"leaderAddr".into()).unwrap());
+    assert_eq!(leader.to_vec(), b"10.0.0.7:4000");
+
+    // Draining, a second call is empty.
+    assert_eq!(js_sys::Array::from(&c.take_redirects()).length(), 0);
+}
+
+#[wasm_bindgen_test]
 fn a_client_atomic_transaction_travels_to_a_peer() {
     let mut a = wasm_client(1);
     let mut b = wasm_client(2);

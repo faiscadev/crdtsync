@@ -585,6 +585,51 @@ func TestTakeRejectedIsEmptyWithoutARejection(t *testing.T) {
 	}
 }
 
+func TestServerRedirectSurfacesTheRoomAndLeader(t *testing.T) {
+	// Redirect: tag 23, then a u32-length-prefixed room and leader_addr.
+	redirect := func(room, leaderAddr []byte) []byte {
+		frame := make([]byte, 1+4+len(room)+4+len(leaderAddr))
+		frame[0] = 23
+		binary.LittleEndian.PutUint32(frame[1:], uint32(len(room)))
+		copy(frame[5:], room)
+		off := 5 + len(room)
+		binary.LittleEndian.PutUint32(frame[off:], uint32(len(leaderAddr)))
+		copy(frame[off+4:], leaderAddr)
+		return frame
+	}
+
+	c := newClient(t, 1)
+	defer c.Close()
+
+	// A node that does not lead the room reports where the leader is.
+	if rc, _ := c.Receive(redirect([]byte("room-1"), []byte("10.0.0.7:4000"))); rc != 1 {
+		t.Fatalf("receive redirect: got rc=%d, want 1", rc)
+	}
+
+	// The drain yields the one target: the room and the leader's address.
+	redirects := c.TakeRedirects()
+	if len(redirects) != 1 {
+		t.Fatalf("take redirects: got %d targets, want 1", len(redirects))
+	}
+	got := redirects[0]
+	if !bytes.Equal(got.Room, []byte("room-1")) || !bytes.Equal(got.LeaderAddr, []byte("10.0.0.7:4000")) {
+		t.Fatalf("target: got room=%q leader=%q, want %q %q", got.Room, got.LeaderAddr, "room-1", "10.0.0.7:4000")
+	}
+
+	// Draining: a second call is empty.
+	if again := c.TakeRedirects(); len(again) != 0 {
+		t.Fatalf("second drain: got %d targets, want 0", len(again))
+	}
+}
+
+func TestTakeRedirectsIsEmptyWithoutARedirect(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+	if r := c.TakeRedirects(); len(r) != 0 {
+		t.Fatalf("take redirects without a redirect: got %d, want 0", len(r))
+	}
+}
+
 func newUndo(t *testing.T) *Undo {
 	t.Helper()
 	u, err := NewUndo()

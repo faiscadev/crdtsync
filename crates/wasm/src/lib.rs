@@ -15,7 +15,8 @@ use crdtsync_core::marks::{MarkState, ResolvedMark};
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_op, encode_ops, path, Channel, ClientError,
-    ClientId, ClientSession, Document, ErrorCode as CoreErrorCode, Rejected, RelativePosition,
+    ClientId, ClientSession, Document, ErrorCode as CoreErrorCode, Redirect, Rejected,
+    RelativePosition,
     Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
@@ -702,6 +703,22 @@ impl WasmClient {
             .into()
     }
 
+    /// Drain the room redirects the server has sent since the last call — a node
+    /// that does not lead a room telling the client to reconnect to its leader —
+    /// as an array of `{ room, leaderAddr }`, each a `Uint8Array`: `room` the
+    /// room name, `leaderAddr` the leader's advertise address. The core holds no
+    /// socket, so reconnecting is the app's job. Empty when none arrived;
+    /// draining, so a second call is empty.
+    #[wasm_bindgen(js_name = takeRedirects)]
+    pub fn take_redirects(&mut self) -> JsValue {
+        self.inner
+            .take_redirects()
+            .iter()
+            .map(redirect_to_js)
+            .collect::<js_sys::Array>()
+            .into()
+    }
+
     /// The highest server sequence `channel` has caught up to.
     #[wasm_bindgen(js_name = lastSeenSeq)]
     pub fn last_seen_seq(&self, channel: u32) -> Option<u64> {
@@ -1090,6 +1107,23 @@ fn rejected_to_js(r: &Rejected) -> JsValue {
         .map(|op| js_sys::Uint8Array::from(encode_op(op).as_slice()))
         .collect();
     set(&obj, "ops", &ops.into());
+    obj.into()
+}
+
+/// One redirect as a `{ room, leaderAddr }` object, each a `Uint8Array`: `room`
+/// the redirected room, `leaderAddr` the leader's advertise address.
+fn redirect_to_js(r: &Redirect) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(
+        &obj,
+        "room",
+        &js_sys::Uint8Array::from(r.room.as_slice()).into(),
+    );
+    set(
+        &obj,
+        "leaderAddr",
+        &js_sys::Uint8Array::from(r.leader_addr.as_slice()).into(),
+    );
     obj.into()
 }
 
