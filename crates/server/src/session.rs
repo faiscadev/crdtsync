@@ -705,11 +705,17 @@ pub fn step(
 /// The redirect to send when this node does not lead `room` — the leader's
 /// advertise address for the client to reconnect to — or `None` when this node
 /// serves the room itself: it leads it, or single-node mode (no membership)
-/// makes it leader of every room. The leader is `room`'s placement primary; a
-/// node that is not the primary declines to serve and points the client at it.
+/// makes it leader of every room. The leader is `room`'s *effective* leader —
+/// its placement primary while that primary is live, else the promoted next-live
+/// replica (failover, Unit 6a) — so a client is never redirected at a dead node.
+/// When every replica of the room is down, the redirect falls back to the
+/// placement primary: a client retrying a dead leader is correct backpressure,
+/// and a node that does not hold the room never serves it itself.
 fn redirect_if_not_leader(membership: Option<&Membership>, room: &[u8]) -> Option<Message> {
     let membership = membership?;
-    let leader = membership.primary_for(room)?;
+    let leader = membership
+        .effective_primary_for(room)
+        .or_else(|| membership.primary_for(room))?;
     if membership.is_self(&leader) {
         return None;
     }

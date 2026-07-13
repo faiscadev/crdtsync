@@ -412,17 +412,28 @@ fn two_node_membership(me: &str, other: &str) -> Membership {
 }
 
 #[tokio::test]
-#[cfg_attr(miri, ignore)] // binds and dials a loopback server over a real socket
+#[cfg_attr(miri, ignore)] // binds and dials loopback servers over real sockets
 async fn a_follower_applies_a_replicate_over_the_socket_and_acks() {
-    // A two-member cluster of fixed names; pick a room the peer leads, so this
-    // node is a follower and applies a Replicate for it. The peer is never
-    // reachable — this node only receives — so its dial harmlessly retries.
+    // Pick a room the peer leads, so this node is a follower and applies a
+    // Replicate for it. The leader must stay REACHABLE: under liveness failover
+    // (Unit 6a) a follower whose placement primary is unreachable promotes itself
+    // to effective leader and then correctly rejects a Replicate for the room it
+    // now leads — so the peer is given a real listener that accepts this node's
+    // outbound relay dial and holds it open, keeping the leader live.
     let me = "node-a";
-    let leader_name = "node-b";
-    let m = two_node_membership(me, leader_name);
+    let leader_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_addr = leader_listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = leader_listener.accept().await {
+            if let Ok(mut ws) = accept_async(stream).await {
+                while let Some(Ok(_)) = ws.next().await {}
+            }
+        }
+    });
+    let m = two_node_membership(me, &leader_addr);
     let room = (0..1_000_000)
         .map(|i| format!("room-{i}").into_bytes())
-        .find(|room| m.primary_for(room) == Some(NodeId::from(leader_name)))
+        .find(|room| m.primary_for(room) == Some(NodeId::from_addr(&leader_addr)))
         .expect("a room the peer leads");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -144,6 +144,11 @@ enum Cmd {
         room: RoomId,
         through_seq: u64,
     },
+    /// A peer's reachability changed — its relay link connected (`live`) or
+    /// dropped/failed to dial — the failover liveness signal (Unit 6a). The
+    /// registry updates its membership view so a down member is skipped when
+    /// electing a room's effective leader.
+    PeerLive { node: NodeId, live: bool },
 }
 
 /// What the actor makes of a connect request after weighing any upgrade
@@ -387,6 +392,11 @@ async fn registry_actor(
                         reg.record_replica_ack(follower, &room, through_seq);
                         flush(&mut reg, &mut peers);
                     }
+                    Cmd::PeerLive { node, live } => {
+                        // The next client delivery recomputes leadership off the
+                        // updated view, so there is nothing to flush here.
+                        reg.set_peer_liveness(node, live);
+                    }
                 }
             }
             _ = sweep.tick() => {
@@ -478,16 +488,29 @@ async fn peer_connection(
     cmds: UnboundedSender<Cmd>,
 ) {
     let url = format!("ws://{addr}/");
+    // Report the follower's reachability to the registry — the failover liveness
+    // signal (Unit 6a). A down follower is skipped when electing a room's effective
+    // leader, so a dead primary's rooms promote to the next live replica.
+    let mark = |live: bool| {
+        let _ = cmds.send(Cmd::PeerLive {
+            node: follower.clone(),
+            live,
+        });
+    };
     loop {
         match connect_peer(&url, server).await {
             Some((write, read)) => {
+                mark(true);
                 // Pump until the socket or the frame channel closes, then redial.
                 if pump_peer(write, read, &follower, &mut frames, &cmds).await {
                     // The frame channel closed — the registry is gone; stop.
                     return;
                 }
+                // The link dropped: the follower is unreachable until it redials.
+                mark(false);
             }
             None => {
+                mark(false);
                 // The frame channel closed while unreachable — nothing more to do.
                 if frames.is_closed() {
                     return;

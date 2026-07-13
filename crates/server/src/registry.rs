@@ -212,6 +212,22 @@ impl Registry {
         self.membership.as_ref()
     }
 
+    /// Record a peer's reachability, the failover liveness signal (Unit 6a): its
+    /// inter-node relay link connecting marks it `live`, dropping or failing to
+    /// dial marks it down. A down member is skipped when electing a room's
+    /// effective leader, so a dead placement primary's rooms promote to the next
+    /// live replica. Inert in single-node mode (no membership) — there are no
+    /// peers to track.
+    pub fn set_peer_liveness(&mut self, node: NodeId, live: bool) {
+        if let Some(membership) = &mut self.membership {
+            if live {
+                membership.mark_node_live(&node);
+            } else {
+                membership.mark_node_down(&node);
+            }
+        }
+    }
+
     /// Queue a [`Message::Replicate`] for each follower of `room` when this node
     /// leads it, mirroring the fresh `ops` on `branch`. A node with no membership
     /// leads nothing, so it never replicates — single-node behavior is unchanged.
@@ -226,7 +242,10 @@ impl Registry {
         let Some(membership) = &self.membership else {
             return;
         };
-        if !membership.is_primary_for(room) {
+        // Origination follows *effective* (live) leadership: a node promoted over a
+        // down placement primary originates replication for its newly-led rooms,
+        // and a demoted-but-recovered old primary defers until it leads again.
+        if !membership.is_effective_primary_for(room) {
             return;
         }
         // The same replica-set-minus-self the majority gate counts, so the fan-out
@@ -266,7 +285,11 @@ impl Registry {
         let Some(membership) = &self.membership else {
             return false;
         };
-        if !membership.owns(&room) || membership.is_primary_for(&room) {
+        // A node applies a Replicate only while it merely follows the room: it must
+        // hold the room (placement) and *not* be its effective leader. A node
+        // promoted over a down primary now leads and rejects the down node's frames
+        // rather than misapplying them under its own authority.
+        if !membership.owns(&room) || membership.is_effective_primary_for(&room) {
             return false;
         }
         // A leader replicates only the `main` stream (see `enqueue_replication`),
