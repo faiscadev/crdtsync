@@ -166,6 +166,87 @@ func (d *Document) GetBytes(path [][]byte) ([]byte, bool) {
 	return takeBuf(out), true
 }
 
+// --- blobs ---
+
+// BlobRef is a reference to out-of-band binary content read back by GetBlob. ID
+// is the 16-byte public handle, Mime the content type, Size the byte length.
+// Inline carries the bytes for a small blob that rides in the ref, and is nil
+// for a store-backed ref fetched by ID.
+type BlobRef struct {
+	ID     [16]byte
+	Mime   string
+	Size   uint64
+	Inline []byte
+}
+
+// idArg yields a C pointer to a 16-byte id. The core reads exactly 16 bytes.
+func idArg(id *[16]byte) *C.uint8_t {
+	return (*C.uint8_t)(unsafe.Pointer(&id[0]))
+}
+
+// SetBlob sets an inline blob at path, minting the blob's public handle. Returns
+// the ops to broadcast and true when the blob was inlined; nil and false when
+// bytes exceed the inline ceiling — a large blob is uploaded out of band and set
+// with SetBlobRef.
+func (d *Document) SetBlob(path [][]byte, mime string, bytes []byte) ([]byte, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	mp, ml := bytesArg([]byte(mime))
+	bp, bl := bytesArg(bytes)
+	var out C.CrdtBuf
+	rc := C.crdtsync_doc_set_blob(d.h, pp, pl, mp, ml, bp, bl, &out)
+	if rc != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// SetBlobRef sets a store-backed blob ref at path from a 16-byte id handle, mime,
+// and size. Carries no bytes; the content is fetched by id. Returns the ops to
+// broadcast.
+func (d *Document) SetBlobRef(path [][]byte, id [16]byte, mime string, size uint64) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	mp, ml := bytesArg([]byte(mime))
+	var out C.CrdtBuf
+	rc := C.crdtsync_doc_set_blob_ref(d.h, pp, pl, idArg(&id), mp, ml, C.uint64_t(size), &out)
+	if rc != 1 {
+		return nil
+	}
+	return takeBuf(out)
+}
+
+// GetBlob reads the BlobRef at path. The bool is false when the slot is absent or
+// holds no blob ref.
+func (d *Document) GetBlob(path [][]byte) (BlobRef, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_doc_get_blob(d.h, pp, pl, &out) != 1 {
+		return BlobRef{}, false
+	}
+	return decodeBlobRef(takeBuf(out)), true
+}
+
+// decodeBlobRef decodes the get_blob buffer: the 16-byte id, a u32-length mime,
+// the u64 size, then a present flag and, when set, the u32-length inline bytes.
+func decodeBlobRef(b []byte) BlobRef {
+	var ref BlobRef
+	copy(ref.ID[:], b[:16])
+	i := 16
+	mimeLen := int(binary.LittleEndian.Uint32(b[i:]))
+	i += 4
+	ref.Mime = string(b[i : i+mimeLen])
+	i += mimeLen
+	ref.Size = binary.LittleEndian.Uint64(b[i:])
+	i += 8
+	present := b[i]
+	i++
+	if present == 1 {
+		n := int(binary.LittleEndian.Uint32(b[i:]))
+		i += 4
+		ref.Inline = append([]byte(nil), b[i:i+n]...)
+	}
+	return ref
+}
+
 // --- list ---
 
 // ListInsert inserts a bytes item at live index in the List at path.
@@ -668,6 +749,25 @@ func (c *Client) SetBytes(channel uint32, path [][]byte, value []byte) []byte {
 func (c *Client) Delete(channel uint32, path [][]byte) []byte {
 	pp, pl := bytesArg(EncodePath(path))
 	return takeBuf(C.crdtsync_client_delete(c.h, C.uint32_t(channel), pp, pl))
+}
+
+// SetBlob sets an inline blob at path in channel's room, routed through the
+// outbox. Returns the Ops frame to send; a bytes length over the inline ceiling
+// enqueues no op (use SetBlobRef for a large blob).
+func (c *Client) SetBlob(channel uint32, path [][]byte, mime string, bytes []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	mp, ml := bytesArg([]byte(mime))
+	bp, bl := bytesArg(bytes)
+	return takeBuf(C.crdtsync_client_set_blob(c.h, C.uint32_t(channel), pp, pl, mp, ml, bp, bl))
+}
+
+// SetBlobRef sets a store-backed blob ref at path in channel's room from a
+// 16-byte id handle, mime, and size, routed through the outbox. Returns the Ops
+// frame to send.
+func (c *Client) SetBlobRef(channel uint32, path [][]byte, id [16]byte, mime string, size uint64) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	mp, ml := bytesArg([]byte(mime))
+	return takeBuf(C.crdtsync_client_set_blob_ref(c.h, C.uint32_t(channel), pp, pl, idArg(&id), mp, ml, C.uint64_t(size)))
 }
 
 // BeginAtomic starts an atomic transaction on channel's room; edits accumulate

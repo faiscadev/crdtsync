@@ -19,6 +19,7 @@ import struct
 from typing import List, NamedTuple, Optional, Tuple
 
 __all__ = [
+    "BlobRef",
     "Client",
     "Document",
     "ErrorCode",
@@ -86,6 +87,19 @@ class Rejected(NamedTuple):
     ops: List[bytes]
 
 
+class BlobRef(NamedTuple):
+    """A reference to out-of-band binary content read back by
+    :meth:`Document.get_blob`. ``id`` is the 16-byte public handle, ``mime`` the
+    content type, ``size`` the byte length. ``inline`` carries the bytes for a
+    small blob that rides in the ref, and is ``None`` for a store-backed ref
+    fetched by ``id``."""
+
+    id: bytes
+    mime: str
+    size: int
+    inline: Optional[bytes]
+
+
 class _CrdtBuf(ctypes.Structure):
     _fields_ = [("ptr", ctypes.POINTER(ctypes.c_uint8)), ("len", ctypes.c_size_t)]
 
@@ -134,6 +148,17 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_get_int, [doc, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
     sig(lib.crdtsync_doc_get_counter, [doc, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
     sig(lib.crdtsync_doc_get_bytes, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(
+        lib.crdtsync_doc_set_blob,
+        [doc, cbytes, size, cbytes, size, cbytes, size, c.POINTER(buf)],
+        c.c_int32,
+    )
+    sig(
+        lib.crdtsync_doc_set_blob_ref,
+        [doc, cbytes, size, cbytes, cbytes, size, c.c_uint64, c.POINTER(buf)],
+        c.c_int32,
+    )
+    sig(lib.crdtsync_doc_get_blob, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_doc_list_insert, [doc, cbytes, size, size, cbytes, size], buf)
     sig(lib.crdtsync_doc_list_delete, [doc, cbytes, size, size], buf)
     sig(lib.crdtsync_doc_list_len, [doc, cbytes, size, c.POINTER(size)], c.c_int32)
@@ -229,6 +254,12 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_inc, [doc, ch, cbytes, size, c.c_uint32], buf)
     sig(lib.crdtsync_client_dec, [doc, ch, cbytes, size, c.c_uint32], buf)
     sig(lib.crdtsync_client_set_bytes, [doc, ch, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_set_blob, [doc, ch, cbytes, size, cbytes, size, cbytes, size], buf)
+    sig(
+        lib.crdtsync_client_set_blob_ref,
+        [doc, ch, cbytes, size, cbytes, cbytes, size, c.c_uint64],
+        buf,
+    )
     sig(lib.crdtsync_client_delete, [doc, ch, cbytes, size], buf)
     # xml navigation (client)
     sig(lib.crdtsync_client_xml_element, [doc, ch, cbytes, size, cbytes, size], buf)
@@ -459,6 +490,18 @@ def _encode_scalar(value) -> bytes:
     raise ValueError(f"unsupported scalar value: {value!r}")
 
 
+def _decode_blob_ref(data: bytes) -> BlobRef:
+    """Decode the ``get_blob`` buffer: the 16-byte id, a ``u32``-length mime, the
+    ``u64`` size, then a present flag and, when set, the ``u32``-length inline
+    bytes."""
+    r = _Reader(data)
+    blob_id = r._take(16)
+    mime = r.blob().decode("utf-8")
+    size = r.u64()
+    inline = r.blob() if r.u8() == 1 else None
+    return BlobRef(id=blob_id, mime=mime, size=size, inline=inline)
+
+
 def _decode_marks(data: bytes) -> list:
     """Decode the ``marks_at`` buffer: a ``u32`` count, then per mark a name, a
     flavor tag, and its payload — ``0`` a boolean, ``1`` a scalar value, ``2`` the
@@ -623,6 +666,43 @@ class Document:
 
     def get_bytes(self, path: Path) -> Optional[bytes]:
         return self._read_buf(_LIB.crdtsync_doc_get_bytes, path)
+
+    # --- blobs ---
+
+    def set_blob(self, path: Path, mime: str, bytes_: bytes) -> Optional[bytes]:
+        """Set an inline blob at a path, minting the blob's public handle. Returns
+        the ops to broadcast, or ``None`` when ``bytes_`` exceeds the inline
+        ceiling — a large blob is uploaded out of band and set with
+        :meth:`set_blob_ref`."""
+        p = encode_path(path)
+        m = mime.encode("utf-8")
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_doc_set_blob(
+            self._handle, p, len(p), m, len(m), bytes_, len(bytes_), ctypes.byref(out)
+        )
+        return _take_buf(out) if rc == 1 else None
+
+    def set_blob_ref(self, path: Path, blob_id: bytes, mime: str, size: int) -> bytes:
+        """Set a store-backed blob ref at a path from a 16-byte ``blob_id`` handle,
+        ``mime``, and ``size``. Carries no bytes; the content is fetched by id.
+        Returns the ops to broadcast."""
+        if len(blob_id) != 16:
+            raise ValueError("blob id must be 16 bytes")
+        if not isinstance(size, int) or not 0 <= size <= 2**64 - 1:
+            raise ValueError(f"size must be an int in 0..=2**64-1, got {size!r}")
+        p = encode_path(path)
+        m = mime.encode("utf-8")
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_doc_set_blob_ref(
+            self._handle, p, len(p), blob_id, m, len(m), size, ctypes.byref(out)
+        )
+        return _take_buf(out) if rc == 1 else b""
+
+    def get_blob(self, path: Path) -> Optional[BlobRef]:
+        """Read the :class:`BlobRef` at a path, or ``None`` when the slot holds no
+        blob ref."""
+        raw = self._read_buf(_LIB.crdtsync_doc_get_blob, path)
+        return None if raw is None else _decode_blob_ref(raw)
 
     # --- list ---
 
@@ -1196,6 +1276,38 @@ class Client:
         _u32("channel", channel)
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_client_delete(self._handle, channel, p, len(p)))
+
+    # --- per-channel blobs ---
+
+    def set_blob(self, channel: int, path: Path, mime: str, bytes_: bytes) -> bytes:
+        """Set an inline blob at a path in ``channel``'s room, routed through the
+        outbox. Returns the Ops frame to send; a ``bytes_`` length over the inline
+        ceiling enqueues no op (use :meth:`set_blob_ref` for a large blob)."""
+        _u32("channel", channel)
+        p = encode_path(path)
+        m = mime.encode("utf-8")
+        return _take_buf(
+            _LIB.crdtsync_client_set_blob(
+                self._handle, channel, p, len(p), m, len(m), bytes_, len(bytes_)
+            )
+        )
+
+    def set_blob_ref(self, channel: int, path: Path, blob_id: bytes, mime: str, size: int) -> bytes:
+        """Set a store-backed blob ref at a path in ``channel``'s room from a
+        16-byte ``blob_id`` handle, ``mime``, and ``size``, routed through the
+        outbox. Returns the Ops frame to send."""
+        _u32("channel", channel)
+        if len(blob_id) != 16:
+            raise ValueError("blob id must be 16 bytes")
+        if not isinstance(size, int) or not 0 <= size <= 2**64 - 1:
+            raise ValueError(f"size must be an int in 0..=2**64-1, got {size!r}")
+        p = encode_path(path)
+        m = mime.encode("utf-8")
+        return _take_buf(
+            _LIB.crdtsync_client_set_blob_ref(
+                self._handle, channel, p, len(p), blob_id, m, len(m), size
+            )
+        )
 
     # --- per-channel xml ---
 

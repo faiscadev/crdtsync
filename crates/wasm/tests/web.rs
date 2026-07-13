@@ -776,3 +776,96 @@ fn a_client_mark_over_a_non_sequence_is_inert() {
     // An unheld channel is likewise inert.
     assert!(a.mark(9, &t, 0, 0, 0, 1, b"c", &on).is_none());
 }
+
+// --- blobs ---
+
+fn get_u8array(obj: &wasm_bindgen::JsValue, key: &str) -> Option<Vec<u8>> {
+    let v = js_sys::Reflect::get(obj, &wasm_bindgen::JsValue::from_str(key)).unwrap();
+    if v.is_null() {
+        None
+    } else {
+        Some(js_sys::Uint8Array::from(v).to_vec())
+    }
+}
+
+fn get_f64(obj: &wasm_bindgen::JsValue, key: &str) -> f64 {
+    js_sys::Reflect::get(obj, &wasm_bindgen::JsValue::from_str(key))
+        .unwrap()
+        .as_f64()
+        .unwrap()
+}
+
+#[wasm_bindgen_test]
+fn an_inline_blob_reads_back_with_bytes() {
+    let mut a = doc(1);
+    let p = path(&["avatar"]);
+    let raw = vec![0x89u8, b'P', b'N', b'G', 0x00, 0xFF];
+    let ops = a.set_blob(&p, "image/png", &raw).expect("inlines");
+    assert!(!ops.is_empty());
+
+    let blob = a.get_blob(&p);
+    assert!(!blob.is_null());
+    assert_eq!(get_str(&blob, "mime"), "image/png");
+    assert_eq!(get_f64(&blob, "size") as usize, raw.len());
+    assert_eq!(get_u8array(&blob, "inline"), Some(raw));
+    let id = get_u8array(&blob, "id").unwrap();
+    assert_eq!(id.len(), 16);
+    assert_ne!(id, vec![0u8; 16]); // a real handle was minted
+}
+
+#[wasm_bindgen_test]
+fn a_blob_ref_reads_back_without_bytes() {
+    let mut a = doc(1);
+    let p = path(&["video"]);
+    let id: Vec<u8> = (0..16).collect();
+    a.set_blob_ref(&p, &id, "video/mp4", 10_000_000).unwrap();
+
+    let blob = a.get_blob(&p);
+    assert_eq!(get_u8array(&blob, "id"), Some(id));
+    assert_eq!(get_str(&blob, "mime"), "video/mp4");
+    assert_eq!(get_f64(&blob, "size"), 10_000_000.0);
+    assert_eq!(get_u8array(&blob, "inline"), None);
+}
+
+#[wasm_bindgen_test]
+fn an_over_ceiling_blob_is_not_inlined() {
+    let mut a = doc(1);
+    let p = path(&["huge"]);
+    assert!(a.set_blob(&p, "application/octet-stream", &vec![0u8; 4097]).is_none());
+    assert!(a.get_blob(&p).is_null());
+}
+
+#[wasm_bindgen_test]
+fn a_blob_converges_on_a_peer() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let p = path(&["pic"]);
+    let ops = a.set_blob(&p, "image/png", b"tiny-png").expect("inlines");
+    assert!(b.apply(&ops) >= 1);
+    assert_eq!(get_u8array(&b.get_blob(&p), "inline"), Some(b"tiny-png".to_vec()));
+}
+
+#[wasm_bindgen_test]
+fn a_bad_blob_ref_id_throws() {
+    let mut a = doc(1);
+    assert!(a.set_blob_ref(&path(&["x"]), &[0u8; 4], "image/png", 1).is_err());
+}
+
+#[wasm_bindgen_test]
+fn a_client_blob_edit_enqueues_and_travels() {
+    let mut a = wasm_client(1);
+    let mut b = wasm_client(2);
+    let sa = a.subscribe(b"room-1");
+    b.subscribe(b"room-1");
+
+    let frame = a.set_blob(sa.channel(), &path(&["avatar"]), "image/png", b"tiny-png");
+    assert!(!frame.is_empty());
+    assert_eq!(a.outbox_len(sa.channel()), 1);
+    assert!(b.receive(&frame).unwrap());
+
+    let rframe = a
+        .set_blob_ref(sa.channel(), &path(&["video"]), &[7u8; 16], "video/mp4", 10_000_000)
+        .unwrap();
+    assert_eq!(a.outbox_len(sa.channel()), 2);
+    assert!(b.receive(&rframe).unwrap());
+}
