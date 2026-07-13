@@ -115,6 +115,30 @@ pub fn set_blob(
     }))
 }
 
+/// Set a store-backed blob ref at a path from an `id` handle the caller already
+/// holds — the one `POST /blobs` returned after uploading the bytes out of band.
+/// Carries no bytes (`inline: None`): the content lives in the store and is
+/// fetched by `id`. Unlike [`set_blob`], this mints no handle (the id is a given,
+/// not fresh entropy) and imposes no size guard — a ref may name a blob of any
+/// size, since the bytes never ride the op.
+pub fn set_blob_ref(
+    doc: &mut Document,
+    path: &[u8],
+    id: [u8; 16],
+    mime: &str,
+    size: u64,
+) -> Vec<Op> {
+    let blob = BlobRef {
+        id,
+        mime: mime.to_owned(),
+        size,
+        inline: None,
+    };
+    emit(doc, path, move |cur, key| {
+        cur.set(key, Scalar::BlobRef(blob))
+    })
+}
+
 /// Tombstone the slot at a path.
 pub fn delete(doc: &mut Document, path: &[u8]) -> Vec<Op> {
     emit(doc, path, |cur, key| cur.delete(key))

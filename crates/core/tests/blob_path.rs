@@ -194,3 +194,95 @@ fn a_bytes_slot_still_reads_back() {
     assert_eq!(path::get_bytes(&d, &p(&["data"])), Some(b"hello".to_vec()));
     assert_eq!(path::get_blob(&d, &p(&["data"])), None);
 }
+
+// The ref-only producer: a handle the caller already holds, no bytes inline.
+#[test]
+fn set_blob_ref_reads_back_a_ref() {
+    let mut d = doc(1);
+    let id = [0x42; 16];
+    path::set_blob_ref(&mut d, &p(&["video"]), id, "video/mp4", 10_000_000);
+
+    let blob = path::get_blob(&d, &p(&["video"])).expect("reads a ref");
+    assert_eq!(blob.id, id);
+    assert_eq!(blob.mime, "video/mp4");
+    assert_eq!(blob.size, 10_000_000);
+    assert_eq!(blob.inline, None);
+}
+
+// A ref may name a blob far larger than the inline bound — the bytes never ride
+// the op, so there is no size guard.
+#[test]
+fn a_ref_names_a_blob_over_the_inline_bound() {
+    let mut d = doc(1);
+    let ops = path::set_blob_ref(
+        &mut d,
+        &p(&["huge"]),
+        [1; 16],
+        "application/octet-stream",
+        (INLINE_MAX as u64) * 1024,
+    );
+    assert!(!ops.is_empty());
+
+    let blob = path::get_blob(&d, &p(&["huge"])).expect("reads a ref");
+    assert_eq!(blob.size, (INLINE_MAX as u64) * 1024);
+    assert_eq!(blob.inline, None);
+}
+
+#[test]
+fn the_emitted_ref_op_converges_on_a_second_replica() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let id = [0x77; 16];
+    let ops = path::set_blob_ref(&mut a, &p(&["doc"]), id, "application/pdf", 500_000);
+    replay(&mut b, &ops);
+
+    let ra = path::get_blob(&a, &p(&["doc"])).expect("author reads");
+    let rb = path::get_blob(&b, &p(&["doc"])).expect("peer reads");
+    assert_eq!(ra, rb);
+    assert_eq!(rb.id, id);
+    assert_eq!(rb.mime, "application/pdf");
+    assert_eq!(rb.size, 500_000);
+    assert_eq!(rb.inline, None);
+}
+
+// An inline blob and a ref blob at different paths coexist and read back
+// distinctly: inline carries bytes, the ref does not.
+#[test]
+fn an_inline_blob_and_a_ref_blob_coexist() {
+    let mut d = doc(1);
+    path::set_blob(&mut d, &p(&["small"]), &host(3), "image/png", b"tiny").expect("inlines");
+    path::set_blob_ref(&mut d, &p(&["large"]), [9; 16], "video/mp4", 9_000_000);
+
+    let inline = path::get_blob(&d, &p(&["small"])).expect("reads inline");
+    assert_eq!(inline.inline.as_deref(), Some(&b"tiny"[..]));
+
+    let refonly = path::get_blob(&d, &p(&["large"])).expect("reads ref");
+    assert_eq!(refonly.inline, None);
+    assert_eq!(refonly.id, [9; 16]);
+}
+
+// Overwriting an inline slot with a ref (and vice-versa) is an ordinary LWW
+// scalar replace — the later write wins.
+#[test]
+fn overwriting_an_inline_blob_with_a_ref_is_lww() {
+    let mut d = doc(1);
+    path::set_blob(&mut d, &p(&["slot"]), &host(1), "image/png", b"inline").expect("ok");
+    path::set_blob_ref(&mut d, &p(&["slot"]), [5; 16], "video/mp4", 1_000);
+
+    let blob = path::get_blob(&d, &p(&["slot"])).expect("reads the winner");
+    assert_eq!(blob.mime, "video/mp4");
+    assert_eq!(blob.id, [5; 16]);
+    assert_eq!(blob.inline, None);
+}
+
+#[test]
+fn overwriting_a_ref_with_an_inline_blob_is_lww() {
+    let mut d = doc(1);
+    path::set_blob_ref(&mut d, &p(&["slot"]), [5; 16], "video/mp4", 1_000);
+    path::set_blob(&mut d, &p(&["slot"]), &host(2), "image/png", b"inline").expect("ok");
+
+    let blob = path::get_blob(&d, &p(&["slot"])).expect("reads the winner");
+    assert_eq!(blob.mime, "image/png");
+    assert_eq!(blob.inline.as_deref(), Some(&b"inline"[..]));
+    assert_eq!(blob.id, [2; 16]);
+}
