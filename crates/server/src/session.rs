@@ -658,6 +658,11 @@ pub fn step(
         Message::VersionState { .. } => violation("client sent a version state"),
         // A redirect is the server's own routing reply; a client never sends one.
         Message::Redirect { .. } => violation("client sent a redirect"),
+        // Replication frames travel node-to-node between replicas — the registry
+        // handles them off the client session path. A client that sends one on
+        // its own data plane commits a protocol violation.
+        Message::Replicate { .. } => violation("client sent a replicate"),
+        Message::ReplicaAck { .. } => violation("client sent a replica ack"),
     }
 }
 

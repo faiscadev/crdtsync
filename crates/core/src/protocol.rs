@@ -211,6 +211,22 @@ pub enum Message {
     /// of serving the room — a follower does not serve it directly. Server-
     /// directed; a client that sends one commits a protocol violation.
     Redirect { room: Vec<u8>, leader_addr: Vec<u8> },
+    /// A room's leader fans its freshly committed ops out to a follower replica:
+    /// `ops` is the batch (the op codec, as an `Ops` write), `base_seq` the
+    /// leader's compaction floor when it sent them, so the follower places them in
+    /// the same server-sequence space. Node-to-node — never a client frame; a
+    /// client that sends one commits a protocol violation.
+    Replicate {
+        room: Vec<u8>,
+        branch: Vec<u8>,
+        ops: Vec<Op>,
+        base_seq: u64,
+    },
+    /// A follower's acknowledgement of replicated ops: `through_seq` is the
+    /// server sequence the follower's replica of `room` has now reached, the
+    /// watermark the leader records per follower. Node-to-node — never a client
+    /// frame; a client that sends one commits a protocol violation.
+    ReplicaAck { room: Vec<u8>, through_seq: u64 },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -423,6 +439,23 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, room);
             put_bytes(&mut out, leader_addr);
         }
+        Message::Replicate {
+            room,
+            branch,
+            ops,
+            base_seq,
+        } => {
+            put_u8(&mut out, 24);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, branch);
+            put_u64(&mut out, *base_seq);
+            out.extend_from_slice(&encode_ops(ops));
+        }
+        Message::ReplicaAck { room, through_seq } => {
+            put_u8(&mut out, 25);
+            put_bytes(&mut out, room);
+            put_u64(&mut out, *through_seq);
+        }
     }
     out
 }
@@ -607,6 +640,24 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let room = cur.bytes()?;
             let leader_addr = cur.bytes()?;
             Message::Redirect { room, leader_addr }
+        }
+        // An op batch is length-framed and consumes the remainder after the
+        // leading fields, so decoding it is already total.
+        24 => {
+            let room = cur.bytes()?;
+            let branch = cur.bytes()?;
+            let base_seq = cur.u64()?;
+            return Ok(Message::Replicate {
+                room,
+                branch,
+                base_seq,
+                ops: decode_ops(cur.rest()).map_err(ProtocolError::Op)?,
+            });
+        }
+        25 => {
+            let room = cur.bytes()?;
+            let through_seq = cur.u64()?;
+            Message::ReplicaAck { room, through_seq }
         }
         tag => {
             return Err(ProtocolError::BadTag {

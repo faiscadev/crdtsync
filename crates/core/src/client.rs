@@ -591,6 +591,13 @@ impl ClientSession {
             | Message::VersionFetch { .. } => Err(ClientError::UnexpectedMessage(
                 "server sent a version request",
             )),
+            // Replication frames travel node-to-node; a client never sees one.
+            Message::Replicate { .. } => {
+                Err(ClientError::UnexpectedMessage("server sent a replicate"))
+            }
+            Message::ReplicaAck { .. } => {
+                Err(ClientError::UnexpectedMessage("server sent a replica ack"))
+            }
         }
     }
 

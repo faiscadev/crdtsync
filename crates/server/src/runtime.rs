@@ -17,13 +17,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use cookie::Cookie;
+use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::{
-    decode_header, decode_message, encode_message, ClientId, Document, ErrorCode, Message,
+    decode_header, decode_message, encode_header, encode_message, ClientId, Document, ErrorCode,
+    Message,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{channel, unbounded_channel, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{
+    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
 use tokio::sync::oneshot;
+use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, COOKIE, SEC_WEBSOCKET_PROTOCOL};
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -32,6 +37,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Authorizer, PermitAll};
 use crate::membership::Membership;
+use crate::placement::NodeId;
 use crate::webhook::{WebhookConfig, WebhookSink};
 use crate::{negotiate, ConnId, Registry, RoomId, RoomLog, Store};
 
@@ -43,6 +49,18 @@ const OUTBOX_CAPACITY: usize = 1024;
 /// before forcing the socket closed — a peer that has stopped reading can wedge
 /// the writer in `send`.
 const WRITER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many replication frames may queue for one follower before the leader
+/// drops further ones — a bound on per-follower memory when a peer falls behind.
+/// A dropped frame is not fatal: the follower catches up on the next commit, and
+/// majority-ack durability (a later unit) gates a client on a follower actually
+/// holding the write.
+const PEER_FRAME_CAPACITY: usize = 1024;
+
+/// How long a peer connection waits before redialing a follower that is
+/// unreachable or has dropped — long enough not to spin on a down peer, short
+/// enough to reconverge promptly once it returns.
+const PEER_REDIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Runtime policy: how the ephemeral-awareness sweep runs (how long a
 /// disconnected client's presence lingers, and how often the sweep checks), and
@@ -118,6 +136,14 @@ enum Cmd {
     },
     /// Close a connection.
     Disconnect { id: ConnId },
+    /// A follower's replication acknowledgement, read off its peer connection and
+    /// carrying the follower's node id so the leader records the watermark for the
+    /// right `(room, follower)`.
+    PeerAck {
+        follower: NodeId,
+        room: RoomId,
+        through_seq: u64,
+    },
 }
 
 /// What the actor makes of a connect request after weighing any upgrade
@@ -219,6 +245,12 @@ pub async fn serve_with_authorizer(
     // sink it hands back feeds that worker over a channel, so the registry
     // thread emits without ever touching the network.
     let webhook = config.webhook.clone().map(WebhookSink::spawn);
+    // Dial an outbound peer connection to every other cluster member here, on this
+    // I/O-enabled runtime — the registry thread has no network. Each holds a frame
+    // channel the registry actor routes replication to, and reads the follower's
+    // acks back into the actor as `Cmd::PeerAck`. Single-node (no membership) opens
+    // no peer connections, so a plain deployment is unchanged.
+    let peer_conns = spawn_peers(server, config.membership.as_ref(), &cmds);
     // The replicas are single-threaded; keep them on one dedicated thread.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -226,7 +258,7 @@ pub async fn serve_with_authorizer(
             .build()
             .expect("build registry runtime");
         rt.block_on(registry_actor(
-            server, rooms, store, config, verifier, authorizer, webhook, cmd_rx,
+            server, rooms, store, config, verifier, authorizer, webhook, peer_conns, cmd_rx,
         ));
     });
 
@@ -261,6 +293,7 @@ async fn registry_actor(
     verifier: Box<dyn Verifier + Send + Sync>,
     authorizer: Box<dyn Authorizer + Send + Sync>,
     webhook: Option<WebhookSink>,
+    peer_conns: HashMap<NodeId, Sender<Message>>,
     mut cmds: UnboundedReceiver<Cmd>,
 ) {
     // The rooms were validated during startup, so reconstruction can't fail.
@@ -335,11 +368,20 @@ async fn registry_actor(
                     Cmd::Deliver { id, msg, reply } => {
                         let keep = reg.deliver(id, msg);
                         flush(&mut reg, &mut peers);
+                        // Route any commit the leader just made to its followers.
+                        dispatch_replication(&mut reg, &peer_conns);
                         let _ = reply.send(keep);
                     }
                     Cmd::Disconnect { id } => {
                         reg.disconnect(id);
                         peers.remove(&id);
+                    }
+                    Cmd::PeerAck {
+                        follower,
+                        room,
+                        through_seq,
+                    } => {
+                        reg.record_replica_ack(follower, &room, through_seq);
                     }
                 }
             }
@@ -370,6 +412,152 @@ fn flush(reg: &mut Registry, peers: &mut HashMap<ConnId, Peer>) {
             if let Some(closer) = peer.closer.take() {
                 let _ = closer.send(());
             }
+        }
+    }
+}
+
+/// Route every replication frame the leader queued during a delivery to its
+/// follower's peer connection. Best-effort: a frame for an unknown or backed-up
+/// follower is dropped, not blocked on — the follower reconverges on the next
+/// commit, and majority-ack durability (a later unit) is what actually gates a
+/// client on a follower holding the write.
+fn dispatch_replication(reg: &mut Registry, peer_conns: &HashMap<NodeId, Sender<Message>>) {
+    for (follower, frame) in reg.take_replication() {
+        if let Some(tx) = peer_conns.get(&follower) {
+            let _ = tx.try_send(frame);
+        }
+    }
+}
+
+/// Open an outbound peer connection to every cluster member other than self,
+/// returning the frame channel for each. Each spawned task owns the socket to one
+/// follower: it dials, redials on drop, sends the replication frames the registry
+/// routes to it, and reads that follower's acks back into the registry. With no
+/// membership the map is empty — a single-node deployment dials no peers.
+fn spawn_peers(
+    server: ClientId,
+    membership: Option<&Membership>,
+    cmds: &UnboundedSender<Cmd>,
+) -> HashMap<NodeId, Sender<Message>> {
+    let mut peer_conns = HashMap::new();
+    let Some(membership) = membership else {
+        return peer_conns;
+    };
+    for member in membership.members() {
+        if membership.is_self(member) {
+            continue;
+        }
+        let addr = String::from_utf8_lossy(member.as_bytes()).into_owned();
+        let (tx, rx) = channel::<Message>(PEER_FRAME_CAPACITY);
+        tokio::spawn(peer_connection(
+            server,
+            member.clone(),
+            addr,
+            rx,
+            cmds.clone(),
+        ));
+        peer_conns.insert(member.clone(), tx);
+    }
+    peer_conns
+}
+
+/// Own the socket to one follower: dial it, relay the replication frames that
+/// arrive on `frames`, and forward the follower's acks back to the registry as
+/// [`Cmd::PeerAck`]. A dial failure or a dropped socket redials after a short
+/// delay, so a follower that starts late or restarts reconverges. The task ends
+/// only when the frame channel closes (the registry shut down).
+async fn peer_connection(
+    server: ClientId,
+    follower: NodeId,
+    addr: String,
+    mut frames: Receiver<Message>,
+    cmds: UnboundedSender<Cmd>,
+) {
+    let url = format!("ws://{addr}/");
+    loop {
+        match connect_peer(&url, server).await {
+            Some((write, read)) => {
+                // Pump until the socket or the frame channel closes, then redial.
+                if pump_peer(write, read, &follower, &mut frames, &cmds).await {
+                    // The frame channel closed — the registry is gone; stop.
+                    return;
+                }
+            }
+            None => {
+                // The frame channel closed while unreachable — nothing more to do.
+                if frames.is_closed() {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(PEER_REDIAL_DELAY).await;
+    }
+}
+
+type PeerWrite = futures_util::stream::SplitSink<WsStream, WsMessage>;
+type PeerRead = futures_util::stream::SplitStream<WsStream>;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Dial the follower and open the relay peer connection: the 8-byte header, then
+/// an empty-`app_id` `Hello` that resolves to a relay so the follower accepts the
+/// peer. `None` if the dial or either opening frame fails.
+async fn connect_peer(url: &str, server: ClientId) -> Option<(PeerWrite, PeerRead)> {
+    let (ws, _) = connect_async(url).await.ok()?;
+    let (mut write, read) = ws.split();
+    write
+        .send(WsMessage::Binary(encode_header(PROTOCOL_VERSION).to_vec()))
+        .await
+        .ok()?;
+    let hello = Message::Hello {
+        client: server,
+        app_id: Vec::new(),
+        schema_version: 0,
+    };
+    write
+        .send(WsMessage::Binary(encode_message(&hello)))
+        .await
+        .ok()?;
+    Some((write, read))
+}
+
+/// Relay frames to the follower and its acks back, until the socket errors or the
+/// frame channel closes. Returns whether the frame channel closed (the registry
+/// shut down), so the caller stops rather than redials.
+async fn pump_peer(
+    mut write: PeerWrite,
+    mut read: PeerRead,
+    follower: &NodeId,
+    frames: &mut Receiver<Message>,
+    cmds: &UnboundedSender<Cmd>,
+) -> bool {
+    loop {
+        tokio::select! {
+            frame = frames.recv() => match frame {
+                Some(frame) => {
+                    if write
+                        .send(WsMessage::Binary(encode_message(&frame)))
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                None => return true,
+            },
+            inbound = read.next() => match inbound {
+                Some(Ok(WsMessage::Binary(bytes))) => {
+                    if let Ok(Message::ReplicaAck { room, through_seq }) = decode_message(&bytes) {
+                        let _ = cmds.send(Cmd::PeerAck {
+                            follower: follower.clone(),
+                            room,
+                            through_seq,
+                        });
+                    }
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => return false,
+            },
         }
     }
 }
