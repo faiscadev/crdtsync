@@ -999,3 +999,88 @@ fn a_mark_on_a_bad_client_handle_is_inert() {
         crdtsync_buf_free(del);
     }
 }
+
+unsafe fn outbox_len(c: *const CrdtClient, channel: u32) -> usize {
+    let mut out: usize = 0;
+    crdtsync_client_outbox_len(c, channel, &mut out);
+    out
+}
+
+#[test]
+fn a_blob_edit_enqueues_and_travels_over_the_client() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        let (_cb, sb) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sa);
+        crdtsync_buf_free(sb);
+
+        // Inline blob: enqueues one outbox entry and travels to the peer.
+        let p = path(&[b"avatar"]);
+        let mime = b"image/png";
+        let bytes = b"tiny-png";
+        let frame = crdtsync_client_set_blob(
+            a,
+            ca,
+            p.as_ptr(),
+            p.len(),
+            mime.as_ptr(),
+            mime.len(),
+            bytes.as_ptr(),
+            bytes.len(),
+        );
+        assert!(frame.len > 0, "an inline blob edit frames its ops");
+        assert_eq!(outbox_len(a, ca), 1, "the edit entered the outbox");
+        assert_eq!(receive(b, &frame), 1, "the peer folds the blob in");
+        crdtsync_buf_free(frame);
+
+        // Ref blob: a second outbox entry, also travelling.
+        let pr = path(&[b"video"]);
+        let id = [7u8; 16];
+        let rmime = b"video/mp4";
+        let rframe = crdtsync_client_set_blob_ref(
+            a,
+            ca,
+            pr.as_ptr(),
+            pr.len(),
+            id.as_ptr(),
+            rmime.as_ptr(),
+            rmime.len(),
+            10_000_000,
+        );
+        assert!(rframe.len > 0, "a ref blob edit frames its ops");
+        assert_eq!(outbox_len(a, ca), 2, "the ref edit entered the outbox");
+        assert_eq!(receive(b, &rframe), 1, "the peer folds the ref in");
+        crdtsync_buf_free(rframe);
+
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}
+
+#[test]
+fn an_over_ceiling_client_blob_enqueues_nothing() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        crdtsync_buf_free(sa);
+
+        let p = path(&[b"huge"]);
+        let mime = b"application/octet-stream";
+        let bytes = vec![0u8; 4097];
+        let frame = crdtsync_client_set_blob(
+            a,
+            ca,
+            p.as_ptr(),
+            p.len(),
+            mime.as_ptr(),
+            mime.len(),
+            bytes.as_ptr(),
+            bytes.len(),
+        );
+        assert_eq!(outbox_len(a, ca), 0, "over the ceiling enqueues no op");
+        crdtsync_buf_free(frame);
+        crdtsync_client_free(a);
+    }
+}
