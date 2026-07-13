@@ -330,11 +330,13 @@ fn a_promoted_leader_serves_and_originates_replication() {
 }
 
 #[test]
-fn a_recovered_primary_defers_to_no_one_and_a_follower_defers() {
+fn a_follower_applies_only_while_its_leader_is_live() {
     // The follower gate on `apply_replicate` routes on effective leadership: a
-    // node applies a Replicate only while it merely follows the room. Once
-    // promoted (its effective primary), it no longer accepts the down node's
-    // frames.
+    // node applies a Replicate only while it merely follows the room. Once its
+    // placement primary is unreachable it is promoted (the effective primary) and
+    // no longer accepts the down node's frames. This is the invariant behind the
+    // socket-level replication path: a follower whose leader is *live* applies and
+    // acks, but one whose leader is unreachable must not — it now leads the room.
     let m = membership_for(SELF_ADDR);
     let room = room_where_self_is_second(&m);
     let primary = m.replicas_for(&room)[0].clone();
@@ -342,6 +344,9 @@ fn a_recovered_primary_defers_to_no_one_and_a_follower_defers() {
     let mut r = Registry::new(cid(0xFF));
     r.set_clock(Arc::new(ManualClock::new(0)));
     r.set_membership(membership_for(SELF_ADDR));
+    // The leader is explicitly live (its relay link is up), so self stays a
+    // follower — the steady-state Unit-4 path, unchanged by liveness tracking.
+    r.set_peer_liveness(primary.clone(), true);
     let peer = r.connect();
 
     // While self follows, a Replicate from the leader applies.
