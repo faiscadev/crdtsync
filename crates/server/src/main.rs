@@ -14,7 +14,11 @@
 //! cluster — the node holds its member view and placement, deriving its own id
 //! from `CRDTSYNC_NODE_ID` or `CRDTSYNC_ADVERTISE_ADDR`, with
 //! `CRDTSYNC_REPLICATION_FACTOR` overriding the per-room replica count; unset, the
-//! node is single-node and serves every room locally.
+//! node is single-node and serves every room locally. Set `CRDTSYNC_BLOB_ADDR` to
+//! serve the out-of-band blob upload/fetch HTTP plane there — a client stores a
+//! large blob and fetches it by handle; its store root is `CRDTSYNC_BLOB_ROOT` or
+//! a `blobs/` subdirectory of `CRDTSYNC_DATA_DIR`, and requests authenticate
+//! through the same verifier as the data plane; unset, no blob plane.
 //!
 //! A policy's `actor:` and subject-class (`authenticated` / `anonymous`) rules
 //! are only real boundaries when the actor is server-derived. With a credentials
@@ -26,6 +30,9 @@
 //! the library and calling `serve_with_verifier` / `serve_with_authorizer`.
 
 use std::env::VarError;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use crdtsync_core::ClientId;
@@ -34,8 +41,8 @@ use crdtsync_server::auth::CredentialsFileError;
 use crdtsync_server::membership::{Membership, MembershipConfigError};
 use crdtsync_server::runtime::{serve_with_authorizer, ServeConfig};
 use crdtsync_server::{
-    serve_admin, AllowAll, Authorizer, PermitAll, SchemaRegistry, StaticTokens, Store, Verifier,
-    WebhookConfig, DEFAULT_REPLICATION_FACTOR,
+    serve_admin, serve_blobs, AllowAll, Authorizer, BlobStore, PermitAll, SchemaRegistry,
+    StaticTokens, Store, Verifier, WebhookConfig, DEFAULT_REPLICATION_FACTOR,
 };
 use tokio::net::TcpListener;
 
@@ -143,6 +150,23 @@ fn membership() -> std::io::Result<Option<Membership>> {
     Ok(Some(m))
 }
 
+/// The blob store root for the run: `CRDTSYNC_BLOB_ROOT` if set, else a `blobs`
+/// subdirectory of `CRDTSYNC_DATA_DIR`. Serving blobs (`CRDTSYNC_BLOB_ADDR`)
+/// without either is a clean startup error — there is nowhere to persist blob
+/// bytes.
+fn blob_root() -> std::io::Result<PathBuf> {
+    if let Some(root) = path_var("CRDTSYNC_BLOB_ROOT")? {
+        return Ok(PathBuf::from(root));
+    }
+    if let Some(dir) = path_var("CRDTSYNC_DATA_DIR")? {
+        return Ok(PathBuf::from(dir).join("blobs"));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "CRDTSYNC_BLOB_ADDR requires CRDTSYNC_BLOB_ROOT or CRDTSYNC_DATA_DIR",
+    ))
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let addr = match std::env::var("CRDTSYNC_ADDR") {
@@ -183,18 +207,39 @@ async fn main() -> std::io::Result<()> {
         authorizer()?,
     );
 
+    // Every plane the node serves runs concurrently over the shared runtime;
+    // the first to error stops the process. The data plane always runs; the
+    // control-plane HTTP listeners are opt-in.
+    let mut servers: Vec<Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>> =
+        vec![Box::pin(data)];
+
     // The schema-registration admin plane is a separate control-plane listener,
     // enabled only when CRDTSYNC_ADMIN_ADDR is set (unset → relay-only, no
     // registration). It gates registration through the same verifier + policy as
     // the data plane, differing only in the action + resource it checks.
-    match path_var("CRDTSYNC_ADMIN_ADDR")? {
-        Some(admin_addr) => {
-            let admin_listener = TcpListener::bind(&admin_addr).await?;
-            eprintln!("crdtsync admin on http://{admin_addr}");
-            let admin = serve_admin(admin_listener, verifier()?, authorizer()?, schema);
-            tokio::try_join!(data, admin)?;
-            Ok(())
-        }
-        None => data.await,
+    if let Some(admin_addr) = path_var("CRDTSYNC_ADMIN_ADDR")? {
+        let admin_listener = TcpListener::bind(&admin_addr).await?;
+        eprintln!("crdtsync admin on http://{admin_addr}");
+        servers.push(Box::pin(serve_admin(
+            admin_listener,
+            verifier()?,
+            authorizer()?,
+            schema,
+        )));
     }
+
+    // The blob upload/fetch plane is the out-of-band byte channel a client uses
+    // to store a large blob and fetch it by handle. Enabled only when
+    // CRDTSYNC_BLOB_ADDR is set; its store root is CRDTSYNC_BLOB_ROOT or a
+    // `blobs/` subdir of CRDTSYNC_DATA_DIR. It gates upload/fetch through the same
+    // verifier as the data plane; per-reference authorization is a later slice.
+    if let Some(blob_addr) = path_var("CRDTSYNC_BLOB_ADDR")? {
+        let store = Arc::new(Mutex::new(BlobStore::open(blob_root()?)?));
+        let blob_listener = TcpListener::bind(&blob_addr).await?;
+        eprintln!("crdtsync blobs on http://{blob_addr}");
+        servers.push(Box::pin(serve_blobs(blob_listener, verifier()?, store)));
+    }
+
+    futures_util::future::try_join_all(servers).await?;
+    Ok(())
 }

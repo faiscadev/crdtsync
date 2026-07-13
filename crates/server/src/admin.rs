@@ -22,15 +22,17 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::Router;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tower_http::timeout::TimeoutLayer;
 
-use crate::auth::Verifier;
+use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Resource};
+use crate::blobs::{self, BlobStore};
 use crate::schema_registry::{RegisterError, Registered, SchemaRegistry};
 
 /// A decoded registration request: which app and version, the schema and
@@ -191,4 +193,141 @@ async fn register(
         ),
     }
     .into_response()
+}
+
+// --- blob upload / fetch --------------------------------------------------
+
+/// The largest blob body the upload route accepts; a body past it is axum's
+/// `413`. Sized for out-of-band media a client stores by handle rather than
+/// inlining in an op — larger objects, chunking, and range requests are a later
+/// slice.
+pub const MAX_BLOB_BODY: usize = 8 << 20;
+
+/// The blob store plus the credential seam every blob request authenticates
+/// against. The store is behind a mutex because an upload mutates its handle
+/// index; a fetch only reads but shares the one lock — blob traffic is
+/// out-of-band and infrequent relative to the op stream, so a single lock is
+/// enough.
+struct BlobState {
+    verifier: Box<dyn Verifier + Send + Sync>,
+    store: Arc<Mutex<BlobStore>>,
+}
+
+/// The handle an upload returns: the public id as lowercase hex, the byte size,
+/// and whether the blob is small enough to ride inline in an op's ref (so a
+/// client may skip a later fetch). The bytes are fetchable by id regardless.
+#[derive(Serialize)]
+struct BlobHandle {
+    id: String,
+    size: u64,
+    inline: bool,
+}
+
+/// The blob upload/fetch router: `POST /blobs` stores a body and returns its
+/// [`BlobHandle`]; `GET /blobs/{id}` serves the stored bytes. Both authenticate
+/// the `Authorization` credential through `verifier` — a missing or unknown one
+/// is `401` — mirroring the schema-register gate; per-reference authorization is
+/// a deferred slice. The upload body cap is [`MAX_BLOB_BODY`] (over it → `413`).
+/// Exposed so it can be driven in-process by tests without a socket.
+pub fn blob_router(
+    verifier: Box<dyn Verifier + Send + Sync>,
+    store: Arc<Mutex<BlobStore>>,
+) -> Router {
+    let state = Arc::new(BlobState { verifier, store });
+    Router::new()
+        .route("/blobs", post(blob_upload))
+        .route("/blobs/{id}", get(blob_fetch))
+        .layer(DefaultBodyLimit::max(MAX_BLOB_BODY))
+        .with_state(state)
+}
+
+/// Serve the blob upload/fetch plane on `listener` — the out-of-band byte channel
+/// a client uses to store a large blob and fetch it back by handle, separate from
+/// the op-stream data plane.
+pub async fn serve_blobs(
+    listener: TcpListener,
+    verifier: Box<dyn Verifier + Send + Sync>,
+    store: Arc<Mutex<BlobStore>>,
+) -> std::io::Result<()> {
+    axum::serve(listener, blob_router(verifier, store)).await
+}
+
+/// Authenticate a blob request's `Authorization` credential to an [`Identity`],
+/// or the status to answer with. Mirrors the schema-register gate: no credential,
+/// or one the verifier rejects, is `401`. Per-reference authorization (the ACL
+/// seam) is a deferred slice, so an authenticated identity currently reaches
+/// every blob.
+fn authenticate(state: &BlobState, headers: &HeaderMap) -> Result<Identity, StatusCode> {
+    let credential = headers
+        .get("authorization")
+        .map(|v| v.as_bytes())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    state
+        .verifier
+        .verify(credential)
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+/// `POST /blobs` — store the request body and return its handle. The `Content-Type`
+/// header is the blob's mime (defaulting to `application/octet-stream`); the store
+/// records the bytes content-addressed and mints a fresh public handle. A body past
+/// [`MAX_BLOB_BODY`] never reaches here (axum answers `413`).
+async fn blob_upload(
+    State(state): State<Arc<BlobState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(status) = authenticate(&state, &headers) {
+        return status.into_response();
+    }
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    // The store's write is brief blocking IO under the mutex, held across no
+    // await — blob traffic is out-of-band and infrequent.
+    let stored = {
+        let mut store = state.store.lock().unwrap_or_else(|p| p.into_inner());
+        store.put_fetchable(&body, &mime)
+    };
+    match stored {
+        Ok(handle) => (
+            StatusCode::OK,
+            Json(BlobHandle {
+                id: blobs::hex(&handle.id),
+                size: handle.size,
+                inline: handle.inline.is_some(),
+            }),
+        )
+            .into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "blob store write failed").into_response(),
+    }
+}
+
+/// `GET /blobs/{id}` — serve the stored bytes for a handle. A malformed id is
+/// `400` (never a panic); an unknown one is `404`. The store does not persist a
+/// blob's mime, so the bytes are served as generic `application/octet-stream`.
+async fn blob_fetch(
+    State(state): State<Arc<BlobState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = authenticate(&state, &headers) {
+        return status.into_response();
+    }
+    let Some(id) = blobs::parse_uuid(&id) else {
+        return (StatusCode::BAD_REQUEST, "malformed blob id").into_response();
+    };
+    let fetched = {
+        let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
+        store.get(&id)
+    };
+    match fetched {
+        Ok(Some(bytes)) => {
+            ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "blob store read failed").into_response(),
+    }
 }

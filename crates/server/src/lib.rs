@@ -35,9 +35,13 @@ pub mod session;
 pub mod store;
 pub mod translate;
 pub mod webhook;
-pub use admin::{admin_router, register_schema, serve_admin, RegisterOutcome, RegisterRequest};
+pub use admin::{
+    admin_router, blob_router, register_schema, serve_admin, serve_blobs, RegisterOutcome,
+    RegisterRequest, MAX_BLOB_BODY,
+};
 pub use auth::{AllowAll, Identity, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};
+pub use blobs::BlobStore;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use event::{EngineEvent, EventSink};
 pub use membership::{Membership, MembershipConfigError, DEFAULT_REPLICATION_FACTOR};
