@@ -6,8 +6,13 @@
 //! peers`), and the [`Cluster`] placement built from them. The node's view is
 //! just the shared placement evaluated for its own id, so `owns`/`is_primary_for`
 //! never diverge from what another node computes for the same room. The routing
-//! (Unit 3) and replication (Unit 4) layers consult this; the static set is fixed
-//! for the process lifetime (dynamic liveness is gossip, Unit 7).
+//! (Unit 3) and replication (Unit 4) layers consult this. The member set is fixed
+//! for the process lifetime, but a node tracks each member's *liveness* — a peer
+//! whose relay link is down is skipped when electing a room's effective leader
+//! (failover, Unit 6a), so a dead placement primary's rooms promote to the next
+//! live replica rather than stranding. Membership discovery by gossip is Unit 7.
+
+use std::collections::HashSet;
 
 use crate::placement::{Cluster, NodeId};
 
@@ -52,6 +57,12 @@ pub struct Membership {
     self_id: NodeId,
     cluster: Cluster,
     replication_factor: usize,
+    /// The members currently believed DOWN — unreachable over their inter-node
+    /// relay link. Empty by default (every peer optimistically live until an
+    /// observed dial failure or link drop marks it down), so a steady-state
+    /// cluster's effective leadership is byte-identical to its placement. `self`
+    /// is never in this set: a node is always live to itself.
+    down: HashSet<NodeId>,
 }
 
 impl Membership {
@@ -67,6 +78,7 @@ impl Membership {
             self_id,
             cluster: Cluster::new(members),
             replication_factor,
+            down: HashSet::new(),
         }
     }
 
@@ -141,6 +153,47 @@ impl Membership {
     /// Whether this node is the primary (leader) for `room`.
     pub fn is_primary_for(&self, room: &[u8]) -> bool {
         self.primary_for(room).as_ref() == Some(&self.self_id)
+    }
+
+    /// Mark `node` reachable again — its relay link connected. A live node is a
+    /// candidate for effective leadership once more; a recovered placement primary
+    /// reclaims its rooms. No-op for a node already live.
+    pub fn mark_node_live(&mut self, node: &NodeId) {
+        self.down.remove(node);
+    }
+
+    /// Mark `node` unreachable — its relay link dropped or failed to dial — so it
+    /// is skipped when electing a room's effective leader. `self` is never marked
+    /// down: a node is always live to itself.
+    pub fn mark_node_down(&mut self, node: &NodeId) {
+        if !self.is_self(node) {
+            self.down.insert(node.clone());
+        }
+    }
+
+    /// Whether `node` is currently reachable. `self` is always live.
+    pub fn is_live(&self, node: &NodeId) -> bool {
+        self.is_self(node) || !self.down.contains(node)
+    }
+
+    /// The effective leader for `room` under liveness: the first replica in
+    /// `replicas_for` (HRW order) that is currently live. Equal to
+    /// [`primary_for`](Self::primary_for) while every replica is up — only a down
+    /// placement primary promotes the next live replica. `None` for an empty
+    /// cluster, or when every replica of the room is down (self, always live, is a
+    /// candidate whenever it holds the room).
+    pub fn effective_primary_for(&self, room: &[u8]) -> Option<NodeId> {
+        self.replicas_for(room)
+            .into_iter()
+            .find(|node| self.is_live(node))
+    }
+
+    /// Whether this node is `room`'s effective (live) leader — the liveness-aware
+    /// counterpart to [`is_primary_for`](Self::is_primary_for). True when the
+    /// placement primary is up and is self, or when self is the promoted next-live
+    /// replica.
+    pub fn is_effective_primary_for(&self, room: &[u8]) -> bool {
+        self.effective_primary_for(room).as_ref() == Some(&self.self_id)
     }
 }
 
