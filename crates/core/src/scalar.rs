@@ -25,6 +25,13 @@ pub enum Scalar {
     ElementRef(ElementId),
 }
 
+/// The largest blob that carries its bytes inline in the ref. A blob at or below
+/// this size rides in [`BlobRef::inline`] and needs no store — the producer mints
+/// the ref straight from the bytes. A larger one leaves `inline` empty and is held
+/// by the store, fetched by handle. The server-side store bounds inlining by its
+/// own copy of this size, not a shared one across the crate boundary.
+pub const INLINE_MAX: usize = 4096;
+
 /// An opaque reference to a blob in the store.
 ///
 /// `id` is a public, unguessable handle (never the content hash), so it can

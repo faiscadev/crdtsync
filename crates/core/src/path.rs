@@ -15,15 +15,17 @@ use crate::codec::DecodeError;
 use crate::diff::{self, Change};
 use crate::doc::{Document, MapCursor, XmlChildrenCursor};
 use crate::elementid::ElementId;
+use crate::host::Host;
 use crate::list::{List, Side};
 use crate::map::Map;
 use crate::marks::ResolvedMark;
 use crate::op::Op;
 use crate::ranged::RangeAnchor;
+use crate::scalar::INLINE_MAX;
 use crate::schema::Schema;
 use crate::stamp::Stamp;
 use crate::validate::Step;
-use crate::{Element, Scalar};
+use crate::{BlobRef, Element, Scalar};
 
 /// Encode a path from its keys.
 pub fn encode_path(keys: &[&[u8]]) -> Vec<u8> {
@@ -79,6 +81,38 @@ pub fn set_bytes(doc: &mut Document, path: &[u8], value: &[u8]) -> Vec<Op> {
     emit(doc, path, move |cur, key| {
         cur.set(key, Scalar::Bytes(value))
     })
+}
+
+/// Set an inline blob ref at a path from `bytes` and their `mime` type. Mints a
+/// fresh unguessable 16-byte handle from the injected [`Host`] entropy — the
+/// stable public id the ref keeps even if the bytes later evict to the store — and
+/// carries the bytes in `inline`, so a small blob needs no store round trip.
+///
+/// Inline only: `bytes` longer than [`INLINE_MAX`] belong to the store-backed
+/// large-blob path (a later slice) and are rejected here with `None`, never
+/// silently inlined. `Some(ops)` on an accepted write (the ops are empty if the
+/// path itself is inert, as with every producer).
+pub fn set_blob(
+    doc: &mut Document,
+    path: &[u8],
+    host: &dyn Host,
+    mime: &str,
+    bytes: &[u8],
+) -> Option<Vec<Op>> {
+    if bytes.len() > INLINE_MAX {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    host.entropy(&mut id);
+    let blob = BlobRef {
+        id,
+        mime: mime.to_owned(),
+        size: bytes.len() as u64,
+        inline: Some(bytes.to_vec()),
+    };
+    Some(emit(doc, path, move |cur, key| {
+        cur.set(key, Scalar::BlobRef(blob))
+    }))
 }
 
 /// Tombstone the slot at a path.
@@ -324,6 +358,14 @@ pub fn get_counter(doc: &Document, path: &[u8]) -> Option<i64> {
 pub fn get_bytes(doc: &Document, path: &[u8]) -> Option<Vec<u8>> {
     slot(doc, path).and_then(|e| match e {
         Element::Scalar(Scalar::Bytes(b)) => Some(b.clone()),
+        _ => None,
+    })
+}
+
+/// Read the [`BlobRef`] at a path, or `None` if the slot holds no blob ref.
+pub fn get_blob(doc: &Document, path: &[u8]) -> Option<BlobRef> {
+    slot(doc, path).and_then(|e| match e {
+        Element::Scalar(Scalar::BlobRef(b)) => Some(b.clone()),
         _ => None,
     })
 }
