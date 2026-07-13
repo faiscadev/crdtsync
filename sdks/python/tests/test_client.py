@@ -1,7 +1,7 @@
 """The Python SDK drives the wire client over the C ABI: a local edit produces a
 frame a peer folds in and converges on, and the handshake surface marshals."""
 
-from crdtsync import Client, ErrorCode, Rejected, ServerError
+from crdtsync import Client, ErrorCode, Redirect, Rejected, ServerError
 
 
 def cid(first: int) -> bytes:
@@ -198,6 +198,39 @@ def test_take_rejected_is_empty_without_a_rejection():
     with Client(cid(1)) as a:
         a.subscribe(b"room-1")
         assert a.take_rejected() == []
+
+
+def test_a_server_redirect_surfaces_the_room_and_leader():
+    import struct
+
+    def redirect(room: bytes, leader_addr: bytes) -> bytes:
+        # Redirect: tag 23, then a u32-length-prefixed room and leader_addr.
+        return (
+            struct.pack("<BI", 23, len(room))
+            + room
+            + struct.pack("<I", len(leader_addr))
+            + leader_addr
+        )
+
+    with Client(cid(1)) as a:
+        # A node that does not lead the room reports where the leader is.
+        assert a.receive(redirect(b"room-1", b"10.0.0.7:4000")) == 1
+
+        # The drain yields the one target: the room and the leader's address.
+        redirects = a.take_redirects()
+        assert len(redirects) == 1
+        target = redirects[0]
+        assert isinstance(target, Redirect)
+        assert target.room == b"room-1"
+        assert target.leader_addr == b"10.0.0.7:4000"
+
+        # Draining: a second call is empty.
+        assert a.take_redirects() == []
+
+
+def test_take_redirects_is_empty_without_a_redirect():
+    with Client(cid(1)) as a:
+        assert a.take_redirects() == []
 
 
 def test_channel_bounds_are_checked():

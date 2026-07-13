@@ -22,6 +22,7 @@ __all__ = [
     "Client",
     "Document",
     "ErrorCode",
+    "Redirect",
     "Rejected",
     "ServerError",
     "Side",
@@ -62,6 +63,16 @@ class ServerError(RuntimeError):
     def __init__(self, code: ErrorCode):
         super().__init__(f"server reported {code.name}")
         self.code = code
+
+
+class Redirect(NamedTuple):
+    """A room the server redirected to its leader, surfaced by
+    :meth:`Client.take_redirects`. A node that does not lead ``room`` reports the
+    leader's advertise address ``leader_addr`` so the transport reconnects there;
+    the core holds no socket, so reconnecting is the app's job."""
+
+    room: bytes
+    leader_addr: bytes
 
 
 class Rejected(NamedTuple):
@@ -212,6 +223,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         c.c_int32,
     )
     sig(lib.crdtsync_client_take_rejected, [doc, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_take_redirects, [doc, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_last_seen_seq, [doc, ch, c.POINTER(c.c_uint64)], c.c_int32)
     sig(lib.crdtsync_client_register_int, [doc, ch, cbytes, size, c.c_int64], buf)
     sig(lib.crdtsync_client_inc, [doc, ch, cbytes, size, c.c_uint32], buf)
@@ -508,6 +520,16 @@ def _decode_rejected(data: bytes) -> List[Rejected]:
         ops = [r.blob() for _ in range(r.u32())]
         out.append(Rejected(channel=channel, reason=reason, ops=ops))
     return out
+
+
+def _decode_redirects(data: bytes) -> List[Redirect]:
+    """Decode the ``take_redirects`` buffer: a ``u32`` count, then per redirect a
+    length-prefixed ``room`` byte string and a length-prefixed ``leader_addr``
+    byte string."""
+    if not data:
+        return []
+    r = _Reader(data)
+    return [Redirect(room=r.blob(), leader_addr=r.blob()) for _ in range(r.u32())]
 
 
 def _diff_raw(old_state: bytes, new_state: bytes) -> bytes:
@@ -1124,6 +1146,15 @@ class Client:
         out = _CrdtBuf()
         rc = _LIB.crdtsync_client_take_rejected(self._handle, ctypes.byref(out))
         return _decode_rejected(_take_buf(out)) if rc == 1 else []
+
+    def take_redirects(self) -> List[Redirect]:
+        """Drain the room redirects the server has sent since the last call — a
+        node that does not lead a room reporting the leader's address. Each
+        :class:`Redirect` names the ``room`` and the leader's ``leader_addr``;
+        reconnecting is the app's job. Draining, so a second call is empty."""
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_take_redirects(self._handle, ctypes.byref(out))
+        return _decode_redirects(_take_buf(out)) if rc == 1 else []
 
     def last_seen_seq(self, channel: int) -> Optional[int]:
         """The highest server sequence ``channel`` has caught up to."""

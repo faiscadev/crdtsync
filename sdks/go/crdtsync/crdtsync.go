@@ -274,6 +274,15 @@ type Rejected struct {
 	Ops     [][]byte
 }
 
+// Redirect is a room the server redirected to its leader, surfaced by
+// TakeRedirects. A node that does not lead Room reports the leader's advertise
+// address LeaderAddr so the transport reconnects there; the core holds no socket,
+// so reconnecting is the app's job.
+type Redirect struct {
+	Room       []byte
+	LeaderAddr []byte
+}
+
 // RelativePosition captures a stable position in the List or Text at path — the
 // encoded bytes to resolve later with ResolvePosition. Nil for a bad handle or
 // path, a non-sequence slot, or an unknown side.
@@ -587,6 +596,35 @@ func decodeRejected(data []byte) []Rejected {
 			ops = append(ops, r.blob())
 		}
 		out = append(out, Rejected{Channel: channel, Reason: reason, Ops: ops})
+	}
+	if r.err != nil {
+		return nil
+	}
+	return out
+}
+
+// TakeRedirects drains the room redirects the server has sent since the last call
+// — a node that does not lead a room reporting the leader's address. Each Redirect
+// names the Room and the leader's LeaderAddr; reconnecting is the app's job.
+// Draining, so a second call is empty.
+func (c *Client) TakeRedirects() []Redirect {
+	var out C.CrdtBuf
+	if C.crdtsync_client_take_redirects(c.h, &out) != 1 {
+		return nil
+	}
+	return decodeRedirects(takeBuf(out))
+}
+
+// decodeRedirects reads the take_redirects buffer: a u32 count, then per redirect
+// a length-prefixed room and a length-prefixed leader_addr byte string.
+func decodeRedirects(data []byte) []Redirect {
+	r := &changeReader{d: data}
+	n := int(r.u32())
+	out := make([]Redirect, 0, n)
+	for k := 0; k < n && r.err == nil; k++ {
+		room := r.blob()
+		leaderAddr := r.blob()
+		out = append(out, Redirect{Room: room, LeaderAddr: leaderAddr})
 	}
 	if r.err != nil {
 		return nil

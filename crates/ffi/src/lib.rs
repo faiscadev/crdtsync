@@ -23,7 +23,7 @@ use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, encode_message, encode_op, encode_ops, path, Channel, ClientError, ClientId,
-    ClientSession, Document, ErrorCode, MarkState, Message, Rejected, RelativePosition,
+    ClientSession, Document, ErrorCode, MarkState, Message, Redirect, Rejected, RelativePosition,
     ResolvedMark, Scalar, UndoManager,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -1768,6 +1768,48 @@ pub unsafe extern "C" fn crdtsync_client_take_rejected(
         }
         let rejected = (*client).session.take_rejected();
         *out = CrdtBuf::from_vec(encode_rejected(&rejected));
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Serialize the room redirects to one buffer the SDK decodes: a `u32` count,
+/// then per redirect a `u32`-length-prefixed `room` byte string and a
+/// `u32`-length-prefixed `leader_addr` byte string. An empty list is a bare zero
+/// count, the no-redirect signal.
+fn encode_redirects(redirects: &[Redirect]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(redirects.len() as u32).to_le_bytes());
+    for r in redirects {
+        out.extend_from_slice(&(r.room.len() as u32).to_le_bytes());
+        out.extend_from_slice(&r.room);
+        out.extend_from_slice(&(r.leader_addr.len() as u32).to_le_bytes());
+        out.extend_from_slice(&r.leader_addr);
+    }
+    out
+}
+
+/// Drain the room redirects the server has sent since the last call — a node that
+/// does not lead a room telling the client to reconnect to its leader — into
+/// `out`: each names the `room` and the leader's advertise address `leader_addr`.
+/// The core holds no socket, so reconnecting is the transport's job; this only
+/// surfaces the target. Draining, so a second call reports a bare zero count;
+/// empty likewise when no redirect has arrived. Returns 1 with the encoded list,
+/// -1 on a bad handle or a null `out`.
+///
+/// # Safety
+/// `client` is a live handle or null; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_take_redirects(
+    client: *mut CrdtClient,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        let redirects = (*client).session.take_redirects();
+        *out = CrdtBuf::from_vec(encode_redirects(&redirects));
         1
     }))
     .unwrap_or(-1)
