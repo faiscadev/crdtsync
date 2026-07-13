@@ -24,6 +24,10 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_doc_get_int",
         "crdtsync_doc_get_counter",
         "crdtsync_doc_get_bytes",
+        // blobs
+        "crdtsync_doc_set_blob",
+        "crdtsync_doc_set_blob_ref",
+        "crdtsync_doc_get_blob",
         // list
         "crdtsync_doc_list_insert",
         "crdtsync_doc_list_delete",
@@ -93,6 +97,8 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_inc",
         "crdtsync_client_dec",
         "crdtsync_client_set_bytes",
+        "crdtsync_client_set_blob",
+        "crdtsync_client_set_blob_ref",
         "crdtsync_client_delete",
         "crdtsync_client_xml_element",
         "crdtsync_client_xml_fragment",

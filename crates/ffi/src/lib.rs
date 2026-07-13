@@ -22,9 +22,9 @@ use crdtsync_core::diff::{diff, encode_changes};
 use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
-    decode_message, encode_message, encode_op, encode_ops, path, Channel, ClientError, ClientId,
-    ClientSession, Document, ErrorCode, MarkState, Message, Redirect, Rejected, RelativePosition,
-    ResolvedMark, Scalar, UndoManager,
+    decode_message, encode_message, encode_op, encode_ops, path, BlobRef, Channel, ClientError,
+    ClientId, ClientSession, Document, ErrorCode, Host, MarkState, Message, Redirect, Rejected,
+    RelativePosition, ResolvedMark, Scalar, UndoManager,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
@@ -68,6 +68,40 @@ unsafe fn as_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     } else {
         Some(slice::from_raw_parts(ptr, len))
     }
+}
+
+/// System entropy for the inline blob producer, which mints a blob's handle from
+/// it. The blob path never reads the clock.
+struct FfiHost;
+
+impl Host for FfiHost {
+    fn entropy(&self, buf: &mut [u8]) {
+        getrandom::getrandom(buf).expect("system entropy is available");
+    }
+
+    fn now_unix_millis(&self) -> u64 {
+        0
+    }
+}
+
+/// Frame a [`BlobRef`] into a self-describing buffer the SDKs decode: the 16-byte
+/// id, a `u32`-length-prefixed mime, the `u64` size, then a present flag and, when
+/// set, the `u32`-length-prefixed inline bytes.
+fn encode_blob_ref(blob: &BlobRef) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&blob.id);
+    out.extend_from_slice(&(blob.mime.len() as u32).to_le_bytes());
+    out.extend_from_slice(blob.mime.as_bytes());
+    out.extend_from_slice(&blob.size.to_le_bytes());
+    match &blob.inline {
+        Some(bytes) => {
+            out.push(1);
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        None => out.push(0),
+    }
+    out
 }
 
 /// Open a document for the 16-byte client id at `client`. Null on a bad handle.
@@ -232,6 +266,109 @@ pub unsafe extern "C" fn crdtsync_doc_get_bytes(
     out: *mut CrdtBuf,
 ) -> i32 {
     read_buf(doc, path, path_len, out, path::get_bytes)
+}
+
+/// Set an inline blob at a path from `mime` and `bytes`, minting the blob's public
+/// handle from system entropy. Writes the ops to broadcast into `out_ops`. Returns
+/// 1 when the blob was inlined, 0 when `bytes` exceeds the inline ceiling (nothing
+/// is written — a large blob is uploaded out of band and set with
+/// [`crdtsync_doc_set_blob_ref`]), -1 on a bad handle or null pointer.
+///
+/// # Safety
+/// `doc` is a live handle; `path`/`path_len`, `mime`/`mime_len`, and
+/// `bytes`/`bytes_len` each follow [`as_slice`]; `out_ops` points to a writable
+/// `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_set_blob(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    mime: *const u8,
+    mime_len: usize,
+    bytes: *const u8,
+    bytes_len: usize,
+    out_ops: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() || out_ops.is_null() {
+            return -1;
+        }
+        let (Some(p), Some(m), Some(b)) = (
+            as_slice(path, path_len),
+            as_slice(mime, mime_len),
+            as_slice(bytes, bytes_len),
+        ) else {
+            return -1;
+        };
+        let Ok(mime) = std::str::from_utf8(m) else {
+            return -1;
+        };
+        match path::set_blob(&mut (*doc).doc, p, &FfiHost, mime, b) {
+            Some(ops) => {
+                *out_ops = CrdtBuf::from_vec(encode_ops(&ops));
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Set a store-backed blob ref at a path from a 16-byte `id` handle (the one the
+/// upload route returned), the `mime`, and the blob's `size`. Carries no bytes;
+/// the content is fetched by `id`. Writes the ops to broadcast into `out_ops`.
+/// Returns 1 on success, -1 on a bad handle or null pointer.
+///
+/// # Safety
+/// `doc` is a live handle; `id` points to 16 readable bytes; `path`/`path_len` and
+/// `mime`/`mime_len` follow [`as_slice`]; `out_ops` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_set_blob_ref(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    id: *const u8,
+    mime: *const u8,
+    mime_len: usize,
+    size: u64,
+    out_ops: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() || out_ops.is_null() || id.is_null() {
+            return -1;
+        }
+        let (Some(p), Some(m)) = (as_slice(path, path_len), as_slice(mime, mime_len)) else {
+            return -1;
+        };
+        let Ok(mime) = std::str::from_utf8(m) else {
+            return -1;
+        };
+        let mut handle = [0u8; 16];
+        handle.copy_from_slice(slice::from_raw_parts(id, 16));
+        let ops = path::set_blob_ref(&mut (*doc).doc, p, handle, mime, size);
+        *out_ops = CrdtBuf::from_vec(encode_ops(&ops));
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Read the [`BlobRef`] at a path into `out` — a fresh [`encode_blob_ref`] buffer
+/// the caller frees and decodes. Returns 1 when found, 0 when absent or another
+/// type, -1 on a bad handle.
+///
+/// # Safety
+/// `doc` is a live handle or null; `path`/`path_len` follow [`as_slice`]; `out`
+/// points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_get_blob(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    read_buf(doc, path, path_len, out, |d, p| {
+        path::get_blob(d, p).map(|b| encode_blob_ref(&b))
+    })
 }
 
 /// Insert a bytes item into the List at a path, at live `index`. Returns the ops
@@ -2092,6 +2229,78 @@ pub unsafe extern "C" fn crdtsync_client_xml_move(
         }
     }))
     .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+// --- client blobs ---
+//
+// The inline and ref blob producers on a subscribed room's replica, routed
+// through the outbox like every other client edit. The read (`get_blob`) is a
+// doc-surface entry point.
+
+/// Set an inline blob at a path in `channel`'s room, minting the handle from
+/// system entropy, and route the ops through the outbox. Returns the Ops frame to
+/// send; empty on a bad handle, an unheld channel, or a non-UTF-8 mime. A `bytes`
+/// length over the inline ceiling enqueues no op (a large blob is uploaded out of
+/// band and set with [`crdtsync_client_set_blob_ref`]).
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len`, `mime`/`mime_len`, and
+/// `bytes`/`bytes_len` each follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_set_blob(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    mime: *const u8,
+    mime_len: usize,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> CrdtBuf {
+    let (Some(m), Some(b)) = (as_slice(mime, mime_len), as_slice(bytes, bytes_len)) else {
+        return CrdtBuf::empty();
+    };
+    let Ok(mime) = std::str::from_utf8(m) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::set_blob(d, p, &FfiHost, mime, b).unwrap_or_default()
+    })
+}
+
+/// Set a store-backed blob ref at a path in `channel`'s room from a 16-byte `id`
+/// handle, `mime`, and `size`, and route the ops through the outbox. Returns the
+/// Ops frame to send; empty on a bad handle, an unheld channel, a null `id`, or a
+/// non-UTF-8 mime.
+///
+/// # Safety
+/// `client` is a live handle; `id` points to 16 readable bytes; `path`/`path_len`
+/// and `mime`/`mime_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_set_blob_ref(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    id: *const u8,
+    mime: *const u8,
+    mime_len: usize,
+    size: u64,
+) -> CrdtBuf {
+    if id.is_null() {
+        return CrdtBuf::empty();
+    }
+    let Some(m) = as_slice(mime, mime_len) else {
+        return CrdtBuf::empty();
+    };
+    let Ok(mime) = std::str::from_utf8(m) else {
+        return CrdtBuf::empty();
+    };
+    let mut handle = [0u8; 16];
+    handle.copy_from_slice(slice::from_raw_parts(id, 16));
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::set_blob_ref(d, p, handle, mime, size)
+    })
 }
 
 // --- client marks ---

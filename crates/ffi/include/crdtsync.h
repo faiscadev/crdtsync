@@ -114,6 +114,54 @@ int32_t crdtsync_doc_get_bytes(const CrdtDoc *doc,
                                uintptr_t path_len,
                                CrdtBuf *out);
 
+// Set an inline blob at a path from `mime` and `bytes`, minting the blob's public
+// handle from system entropy. Writes the ops to broadcast into `out_ops`. Returns
+// 1 when the blob was inlined, 0 when `bytes` exceeds the inline ceiling (nothing
+// is written — a large blob is uploaded out of band and set with
+// [`crdtsync_doc_set_blob_ref`]), -1 on a bad handle or null pointer.
+//
+// # Safety
+// `doc` is a live handle; `path`/`path_len`, `mime`/`mime_len`, and
+// `bytes`/`bytes_len` each follow [`as_slice`]; `out_ops` points to a writable
+// `CrdtBuf`.
+int32_t crdtsync_doc_set_blob(CrdtDoc *doc,
+                              const uint8_t *path,
+                              uintptr_t path_len,
+                              const uint8_t *mime,
+                              uintptr_t mime_len,
+                              const uint8_t *bytes,
+                              uintptr_t bytes_len,
+                              CrdtBuf *out_ops);
+
+// Set a store-backed blob ref at a path from a 16-byte `id` handle (the one the
+// upload route returned), the `mime`, and the blob's `size`. Carries no bytes;
+// the content is fetched by `id`. Writes the ops to broadcast into `out_ops`.
+// Returns 1 on success, -1 on a bad handle or null pointer.
+//
+// # Safety
+// `doc` is a live handle; `id` points to 16 readable bytes; `path`/`path_len` and
+// `mime`/`mime_len` follow [`as_slice`]; `out_ops` points to a writable `CrdtBuf`.
+int32_t crdtsync_doc_set_blob_ref(CrdtDoc *doc,
+                                  const uint8_t *path,
+                                  uintptr_t path_len,
+                                  const uint8_t *id,
+                                  const uint8_t *mime,
+                                  uintptr_t mime_len,
+                                  uint64_t size,
+                                  CrdtBuf *out_ops);
+
+// Read the [`BlobRef`] at a path into `out` — a fresh [`encode_blob_ref`] buffer
+// the caller frees and decodes. Returns 1 when found, 0 when absent or another
+// type, -1 on a bad handle.
+//
+// # Safety
+// `doc` is a live handle or null; `path`/`path_len` follow [`as_slice`]; `out`
+// points to a writable `CrdtBuf`.
+int32_t crdtsync_doc_get_blob(const CrdtDoc *doc,
+                              const uint8_t *path,
+                              uintptr_t path_len,
+                              CrdtBuf *out);
+
 // Insert a bytes item into the List at a path, at live `index`. Returns the ops
 // to broadcast.
 //
@@ -862,6 +910,41 @@ CrdtBuf crdtsync_client_xml_move(CrdtClient *client,
                                  const uint8_t *new_parent_path,
                                  uintptr_t new_parent_path_len,
                                  uintptr_t dest_index);
+
+// Set an inline blob at a path in `channel`'s room, minting the handle from
+// system entropy, and route the ops through the outbox. Returns the Ops frame to
+// send; empty on a bad handle, an unheld channel, or a non-UTF-8 mime. A `bytes`
+// length over the inline ceiling enqueues no op (a large blob is uploaded out of
+// band and set with [`crdtsync_client_set_blob_ref`]).
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len`, `mime`/`mime_len`, and
+// `bytes`/`bytes_len` each follow [`as_slice`].
+CrdtBuf crdtsync_client_set_blob(CrdtClient *client,
+                                 uint32_t channel,
+                                 const uint8_t *path,
+                                 uintptr_t path_len,
+                                 const uint8_t *mime,
+                                 uintptr_t mime_len,
+                                 const uint8_t *bytes,
+                                 uintptr_t bytes_len);
+
+// Set a store-backed blob ref at a path in `channel`'s room from a 16-byte `id`
+// handle, `mime`, and `size`, and route the ops through the outbox. Returns the
+// Ops frame to send; empty on a bad handle, an unheld channel, a null `id`, or a
+// non-UTF-8 mime.
+//
+// # Safety
+// `client` is a live handle; `id` points to 16 readable bytes; `path`/`path_len`
+// and `mime`/`mime_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_set_blob_ref(CrdtClient *client,
+                                     uint32_t channel,
+                                     const uint8_t *path,
+                                     uintptr_t path_len,
+                                     const uint8_t *id,
+                                     const uint8_t *mime,
+                                     uintptr_t mime_len,
+                                     uint64_t size);
 
 // Author a named mark over `[start, end)` of the sequence at `seq_path` in
 // `channel`'s room, routed through the outbox. Endpoints and `value` cross as for

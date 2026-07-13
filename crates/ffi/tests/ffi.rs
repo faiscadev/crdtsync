@@ -1684,3 +1684,253 @@ fn marks_on_a_bad_handle_or_non_sequence_are_inert() {
         crdtsync_doc_free(doc);
     }
 }
+
+// --- blobs ---
+
+/// The decoded shape of a [`crdtsync_doc_get_blob`] buffer.
+struct Blob {
+    id: [u8; 16],
+    mime: String,
+    size: u64,
+    inline: Option<Vec<u8>>,
+}
+
+/// Decode the id[16] · u32-len mime · u64 size · present-flag · optional u32-len
+/// inline framing the get_blob buffer carries.
+fn decode_blob(b: &[u8]) -> Blob {
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&b[..16]);
+    let mut i = 16;
+    let mime_len = u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+    i += 4;
+    let mime = String::from_utf8(b[i..i + mime_len].to_vec()).unwrap();
+    i += mime_len;
+    let size = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    i += 8;
+    let present = b[i];
+    i += 1;
+    let inline = if present == 1 {
+        let n = u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+        i += 4;
+        Some(b[i..i + n].to_vec())
+    } else {
+        None
+    };
+    Blob {
+        id,
+        mime,
+        size,
+        inline,
+    }
+}
+
+unsafe fn get_blob(doc: *const CrdtDoc, p: &[u8]) -> (i32, Option<Blob>) {
+    let mut out = CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    };
+    let rc = crdtsync_doc_get_blob(doc, p.as_ptr(), p.len(), &mut out);
+    if rc == 1 {
+        let b = decode_blob(std::slice::from_raw_parts(out.ptr, out.len));
+        crdtsync_buf_free(out);
+        (rc, Some(b))
+    } else {
+        (rc, None)
+    }
+}
+
+#[test]
+fn an_inline_blob_reads_back_with_its_bytes() {
+    unsafe {
+        let doc = crdtsync_doc_new(client(1).as_ptr());
+        let p = path(&[b"avatar"]);
+        let bytes = [0x89, b'P', b'N', b'G', 0x00, 0xFF];
+        let mime = b"image/png";
+        let mut out = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let rc = crdtsync_doc_set_blob(
+            doc,
+            p.as_ptr(),
+            p.len(),
+            mime.as_ptr(),
+            mime.len(),
+            bytes.as_ptr(),
+            bytes.len(),
+            &mut out,
+        );
+        assert_eq!(rc, 1, "a small blob inlines");
+        assert!(out.len > 0, "the ops to broadcast are returned");
+        crdtsync_buf_free(out);
+
+        let (rc, blob) = get_blob(doc, &p);
+        assert_eq!(rc, 1);
+        let blob = blob.unwrap();
+        assert_eq!(blob.mime, "image/png");
+        assert_eq!(blob.size, bytes.len() as u64);
+        assert_eq!(blob.inline.as_deref(), Some(&bytes[..]));
+        // A minted handle is not all-zero.
+        assert_ne!(blob.id, [0u8; 16]);
+
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn a_blob_ref_reads_back_without_bytes() {
+    unsafe {
+        let doc = crdtsync_doc_new(client(1).as_ptr());
+        let p = path(&[b"video"]);
+        let id = [7u8; 16];
+        let mime = b"video/mp4";
+        let mut out = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let rc = crdtsync_doc_set_blob_ref(
+            doc,
+            p.as_ptr(),
+            p.len(),
+            id.as_ptr(),
+            mime.as_ptr(),
+            mime.len(),
+            10_000_000,
+            &mut out,
+        );
+        assert_eq!(rc, 1);
+        crdtsync_buf_free(out);
+
+        let (rc, blob) = get_blob(doc, &p);
+        assert_eq!(rc, 1);
+        let blob = blob.unwrap();
+        assert_eq!(blob.id, id, "the ref carries the caller's handle verbatim");
+        assert_eq!(blob.mime, "video/mp4");
+        assert_eq!(blob.size, 10_000_000);
+        assert_eq!(blob.inline, None, "a ref carries no inline bytes");
+
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn a_blob_over_the_inline_ceiling_is_not_inlined() {
+    unsafe {
+        let doc = crdtsync_doc_new(client(1).as_ptr());
+        let p = path(&[b"huge"]);
+        let bytes = vec![0u8; 4097];
+        let mime = b"application/octet-stream";
+        let mut out = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        let rc = crdtsync_doc_set_blob(
+            doc,
+            p.as_ptr(),
+            p.len(),
+            mime.as_ptr(),
+            mime.len(),
+            bytes.as_ptr(),
+            bytes.len(),
+            &mut out,
+        );
+        assert_eq!(rc, 0, "over the ceiling signals the not-inlined case");
+        assert_eq!(out.len, 0, "no ops and no giant inline are produced");
+        crdtsync_buf_free(out);
+        // Nothing was written at the path.
+        assert_eq!(get_blob(doc, &p).0, 0);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn a_blob_edit_converges_on_a_peer() {
+    unsafe {
+        let a = crdtsync_doc_new(client(1).as_ptr());
+        let b = crdtsync_doc_new(client(2).as_ptr());
+        let p = path(&[b"pic"]);
+        let bytes = b"tiny-png";
+        let mime = b"image/png";
+        let mut ops = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            crdtsync_doc_set_blob(
+                a,
+                p.as_ptr(),
+                p.len(),
+                mime.as_ptr(),
+                mime.len(),
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut ops,
+            ),
+            1
+        );
+        exchange(b, &ops);
+        crdtsync_buf_free(ops);
+
+        let (rc, blob) = get_blob(b, &p);
+        assert_eq!(rc, 1);
+        let blob = blob.unwrap();
+        assert_eq!(blob.mime, "image/png");
+        assert_eq!(blob.inline.as_deref(), Some(&bytes[..]));
+
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn get_blob_on_a_bad_handle_or_absent_slot() {
+    unsafe {
+        let p = path(&[b"nope"]);
+        // A null handle is rejected, not dereferenced.
+        assert_eq!(get_blob(ptr::null(), &p).0, -1);
+        let doc = crdtsync_doc_new(client(1).as_ptr());
+        // An absent slot reports not-found.
+        assert_eq!(get_blob(doc, &p).0, 0);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn a_blob_edit_on_a_null_handle_is_rejected() {
+    unsafe {
+        let p = path(&[b"x"]);
+        let mime = b"image/png";
+        let bytes = b"z";
+        let mut out = CrdtBuf {
+            ptr: ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(
+            crdtsync_doc_set_blob(
+                ptr::null_mut(),
+                p.as_ptr(),
+                p.len(),
+                mime.as_ptr(),
+                mime.len(),
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut out,
+            ),
+            -1
+        );
+        let id = [1u8; 16];
+        assert_eq!(
+            crdtsync_doc_set_blob_ref(
+                ptr::null_mut(),
+                p.as_ptr(),
+                p.len(),
+                id.as_ptr(),
+                mime.as_ptr(),
+                mime.len(),
+                9,
+                &mut out,
+            ),
+            -1
+        );
+    }
+}

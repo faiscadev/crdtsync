@@ -192,6 +192,7 @@ version = "0.0.0"
 dependencies = [
  "cbindgen",
  "crdtsync-core",
+ "getrandom 0.2.17",
 ]
 
 [[package]]

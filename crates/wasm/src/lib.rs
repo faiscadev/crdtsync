@@ -14,12 +14,40 @@ use crdtsync_core::list::Side;
 use crdtsync_core::marks::{MarkState, ResolvedMark};
 use crdtsync_core::op::Op;
 use crdtsync_core::{
-    decode_message, decode_ops, encode_message, encode_op, encode_ops, path, Channel, ClientError,
-    ClientId, ClientSession, Document, ErrorCode as CoreErrorCode, Redirect, Rejected,
-    RelativePosition,
-    Scalar, UndoManager,
+    decode_message, decode_ops, encode_message, encode_op, encode_ops, path, BlobRef, Channel,
+    ClientError, ClientId, ClientSession, Document, ErrorCode as CoreErrorCode, Host, Redirect,
+    Rejected, RelativePosition, Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
+
+/// The browser's crypto RNG for the inline blob producer, which mints a blob's
+/// handle from it. The blob path never reads the clock.
+struct WasmHost;
+
+impl Host for WasmHost {
+    fn entropy(&self, buf: &mut [u8]) {
+        getrandom::getrandom(buf).expect("crypto.getRandomValues is available");
+    }
+
+    fn now_unix_millis(&self) -> u64 {
+        0
+    }
+}
+
+/// Marshal a [`BlobRef`] into a plain JS object: `{ id: Uint8Array, mime: string,
+/// size: number, inline: Uint8Array | null }`.
+fn blob_ref_to_js(blob: &BlobRef) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(&obj, "id", &js_sys::Uint8Array::from(&blob.id[..]).into());
+    set(&obj, "mime", &JsValue::from_str(&blob.mime));
+    set(&obj, "size", &JsValue::from_f64(blob.size as f64));
+    let inline = match &blob.inline {
+        Some(bytes) => js_sys::Uint8Array::from(bytes.as_slice()).into(),
+        None => JsValue::NULL,
+    };
+    set(&obj, "inline", &inline);
+    obj.into()
+}
 
 /// A failure the server reports to the client, surfaced by [`WasmClient::receive`].
 /// `UpdateRequired` is the `onUpdateRequired` signal: the client's version can't
@@ -147,6 +175,48 @@ impl WasmDocument {
     #[wasm_bindgen(js_name = getBytes)]
     pub fn get_bytes(&self, path: &[u8]) -> Option<Vec<u8>> {
         path::get_bytes(&self.inner, path)
+    }
+
+    /// Set an inline blob at a path from `mime` and `bytes`, minting the blob's
+    /// public handle. Returns the ops to broadcast, or `undefined` when `bytes`
+    /// exceeds the inline ceiling — a large blob is uploaded out of band and set
+    /// with [`setBlobRef`](WasmDocument::set_blob_ref).
+    #[wasm_bindgen(js_name = setBlob)]
+    pub fn set_blob(&mut self, path: &[u8], mime: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+        path::set_blob(&mut self.inner, path, &WasmHost, mime, bytes).map(|ops| encode_ops(&ops))
+    }
+
+    /// Set a store-backed blob ref at a path from a 16-byte `id` handle, `mime`,
+    /// and `size`. Carries no bytes; the content is fetched by id. Returns the ops
+    /// to broadcast (throws if `id` is not 16 bytes).
+    #[wasm_bindgen(js_name = setBlobRef)]
+    pub fn set_blob_ref(
+        &mut self,
+        path: &[u8],
+        id: &[u8],
+        mime: &str,
+        size: u64,
+    ) -> Result<Vec<u8>, JsError> {
+        let handle: [u8; 16] = id
+            .try_into()
+            .map_err(|_| JsError::new("blob id must be 16 bytes"))?;
+        Ok(encode_ops(&path::set_blob_ref(
+            &mut self.inner,
+            path,
+            handle,
+            mime,
+            size,
+        )))
+    }
+
+    /// Read the blob ref at a path as `{ id, mime, size, inline }`, or `null` when
+    /// the slot holds no blob ref.
+    #[wasm_bindgen(js_name = getBlob)]
+    pub fn get_blob(&self, path: &[u8]) -> JsValue {
+        match path::get_blob(&self.inner, path) {
+            Some(blob) => blob_ref_to_js(&blob),
+            None => JsValue::NULL,
+        }
     }
 
     /// Insert a bytes item at a live index in the List at a path.
@@ -751,6 +821,35 @@ impl WasmClient {
     /// Tombstone the slot at a path in `channel`'s room.
     pub fn delete(&mut self, channel: u32, path: &[u8]) -> Vec<u8> {
         self.ops_frame(channel, |d| path::delete(d, path))
+    }
+
+    /// Set an inline blob at a path in `channel`'s room, routed through the outbox.
+    /// Returns the Ops frame to send; a `bytes` length over the inline ceiling
+    /// enqueues no op (use [`setBlobRef`](WasmClient::set_blob_ref) for a large
+    /// blob).
+    #[wasm_bindgen(js_name = setBlob)]
+    pub fn set_blob(&mut self, channel: u32, path: &[u8], mime: &str, bytes: &[u8]) -> Vec<u8> {
+        self.ops_frame(channel, |d| {
+            path::set_blob(d, path, &WasmHost, mime, bytes).unwrap_or_default()
+        })
+    }
+
+    /// Set a store-backed blob ref at a path in `channel`'s room from a 16-byte
+    /// `id` handle, `mime`, and `size`, routed through the outbox. Returns the Ops
+    /// frame to send (throws if `id` is not 16 bytes).
+    #[wasm_bindgen(js_name = setBlobRef)]
+    pub fn set_blob_ref(
+        &mut self,
+        channel: u32,
+        path: &[u8],
+        id: &[u8],
+        mime: &str,
+        size: u64,
+    ) -> Result<Vec<u8>, JsError> {
+        let handle: [u8; 16] = id
+            .try_into()
+            .map_err(|_| JsError::new("blob id must be 16 bytes"))?;
+        Ok(self.ops_frame(channel, |d| path::set_blob_ref(d, path, handle, mime, size)))
     }
 
     /// Begin an atomic transaction on `channel`'s room; edits accumulate until
