@@ -27,6 +27,17 @@ pub enum ClientError {
     Server { code: ErrorCode, message: String },
 }
 
+/// The server's redirect of a room to its leader: this node does not lead the
+/// room, so the client must reconnect to `leader_addr` and subscribe there. The
+/// core session holds no socket, so it cannot reconnect itself — it surfaces the
+/// target through [`take_redirects`](ClientSession::take_redirects) for the
+/// transport layer to act on, the same split as the `onOpsRejected` signal.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Redirect {
+    pub room: Vec<u8>,
+    pub leader_addr: Vec<u8>,
+}
+
 /// A batch of authored ops the server refused, surfaced for the app to show,
 /// discard, or export. The server rejected these — auth revoked, or an enforcing
 /// server's validation failed — so they left the outbox (a `resend` will never
@@ -73,6 +84,10 @@ pub struct ClientSession {
     /// session, not the room, so one [`take_rejected`](Self::take_rejected)
     /// surfaces rejections across every channel; each entry names its channel.
     rejected: Vec<Rejected>,
+    /// Room redirects the server sent — a node declining to serve a room it does
+    /// not lead, naming the leader to reconnect to. Buffered at the session for
+    /// the transport to drain and act on; the core holds no socket to reconnect.
+    redirects: Vec<Redirect>,
 }
 
 impl ClientSession {
@@ -88,6 +103,7 @@ impl ClientSession {
             rooms: HashMap::new(),
             next_channel: 0,
             rejected: Vec::new(),
+            redirects: Vec::new(),
         }
     }
 
@@ -224,6 +240,14 @@ impl ClientSession {
     /// no rejection has arrived.
     pub fn take_rejected(&mut self) -> Vec<Rejected> {
         std::mem::take(&mut self.rejected)
+    }
+
+    /// Drain the room redirects the server has sent since the last call — the
+    /// signal that a room's leader is elsewhere. Each entry names the room and the
+    /// leader's advertise address for the transport to reconnect to. Draining, so
+    /// a second call reports nothing new; empty when no redirect has arrived.
+    pub fn take_redirects(&mut self) -> Vec<Redirect> {
+        std::mem::take(&mut self.redirects)
     }
 
     /// Apply a local edit to `channel`'s room and return the ops to broadcast.
@@ -513,6 +537,13 @@ impl ClientSession {
                     reason,
                     ops,
                 });
+                Ok(())
+            }
+            // The room's leader is elsewhere; buffer the target for the transport
+            // to reconnect to. It names a room, not a held channel — the subscribe
+            // did not take — so no replica is touched.
+            Message::Redirect { room, leader_addr } => {
+                self.redirects.push(Redirect { room, leader_addr });
                 Ok(())
             }
             // `Ack` reports a client's applied sequence to the server; it never

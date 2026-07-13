@@ -791,6 +791,7 @@ impl Registry {
                 governing
                     .as_ref()
                     .map(|(app, version)| (app.as_slice(), *version)),
+                self.membership.as_ref(),
                 now,
                 throttle,
                 msg,

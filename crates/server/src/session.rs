@@ -18,6 +18,7 @@ use crdtsync_core::schema::Schema;
 use crate::acl::authorized;
 use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Resource};
+use crate::membership::Membership;
 use crate::schema_registry::{Resolution, SchemaRegistry};
 use crate::{Catchup, Hub, RoomId, StoredOp, MAIN_BRANCH};
 
@@ -196,6 +197,7 @@ pub fn step(
     schema: Option<&Schema>,
     registry: &Mutex<SchemaRegistry>,
     governing: Option<(&[u8], u32)>,
+    membership: Option<&Membership>,
     now: u64,
     throttle: Option<u64>,
     msg: Message,
@@ -302,6 +304,13 @@ pub fn step(
             };
             if session.channels.contains_key(&channel) {
                 return violation("channel already subscribed");
+            }
+            // This node serves a room only if it leads it. A subscribe to a room
+            // led elsewhere is answered with the leader's address instead of a
+            // catch-up, so the client reconnects there — a follower does not serve
+            // the room directly. Single-node (no membership) leads every room.
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
             }
             // A subscription reads the room; the server never serves a room the
             // actor may not read.
@@ -420,6 +429,14 @@ pub fn step(
             // this driver only enforces consistency.
             if ops.iter().any(|op| op.id.client != client) {
                 return violation("op client mismatch");
+            }
+            // A write is served only by the room's leader. A subscribe to a
+            // non-led room is already redirected, so a bound channel here implies
+            // leadership; the guard still holds if a write reaches a non-leader —
+            // it is redirected, not ingested, so a follower never folds a stray
+            // write.
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
             }
             let identity = session.identity().expect("identity set, checked above");
             if !authorized(
@@ -565,11 +582,17 @@ pub fn step(
         // A mutation replies with the fresh name list — the authoritative
         // post-state — and a list request the same; a fetch that hits replies
         // with the version's state, and one that misses falls back to the list.
+        // A version mutation persists to the room, so — like an ops write — it is
+        // served only by the room's leader; on a non-leader it is redirected
+        // rather than persisted, so a follower never diverges the room's versions.
         Message::VersionCreate { channel, name } => {
             let Some(room) = version_room(session, channel, authorizer, schema, Action::Write)
             else {
                 return version_denied(session, channel);
             };
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
             match hub.create_version(&room, &name) {
                 Ok(_) => versions_list(hub, channel, &room),
                 Err(_) => internal("failed to persist version"),
@@ -580,6 +603,9 @@ pub fn step(
             else {
                 return version_denied(session, channel);
             };
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
             match hub.rename_version(&room, &from, &to) {
                 Ok(_) => versions_list(hub, channel, &room),
                 Err(_) => internal("failed to persist version"),
@@ -590,6 +616,9 @@ pub fn step(
             else {
                 return version_denied(session, channel);
             };
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
             match hub.delete_version(&room, &name) {
                 Ok(_) => versions_list(hub, channel, &room),
                 Err(_) => internal("failed to persist version"),
@@ -627,7 +656,38 @@ pub fn step(
         // Version responses only travel server-to-client.
         Message::Versions { .. } => violation("client sent a versions list"),
         Message::VersionState { .. } => violation("client sent a version state"),
+        // A redirect is the server's own routing reply; a client never sends one.
+        Message::Redirect { .. } => violation("client sent a redirect"),
     }
+}
+
+/// The redirect to send when this node does not lead `room` — the leader's
+/// advertise address for the client to reconnect to — or `None` when this node
+/// serves the room itself: it leads it, or single-node mode (no membership)
+/// makes it leader of every room. The leader is `room`'s placement primary; a
+/// node that is not the primary declines to serve and points the client at it.
+fn redirect_if_not_leader(membership: Option<&Membership>, room: &[u8]) -> Option<Message> {
+    let membership = membership?;
+    let leader = membership.primary_for(room)?;
+    if membership.is_self(&leader) {
+        return None;
+    }
+    Some(Message::Redirect {
+        room: room.to_vec(),
+        leader_addr: leader.as_bytes().to_vec(),
+    })
+}
+
+/// The [`Response`] declining to serve `room` here — a lone [`Message::Redirect`]
+/// to its leader — or `None` to serve the request as usual. The one gate the
+/// room-serving requests (Subscribe, an ops write, a durable version mutation)
+/// share, so a follower never subscribes, ingests, or persists a room it does
+/// not lead; it points the client at the leader instead.
+fn redirect_response(membership: Option<&Membership>, room: &[u8]) -> Option<Response> {
+    redirect_if_not_leader(membership, room).map(|redirect| Response {
+        replies: vec![redirect],
+        ..Response::default()
+    })
 }
 
 /// Resolve the room a version request targets, having checked the connection is

@@ -205,6 +205,12 @@ pub enum Message {
         seqs: Vec<u64>,
         reason: ErrorCode,
     },
+    /// This room's leader is elsewhere: `leader_addr` is the advertise address of
+    /// the node that leads `room`, and the client must reconnect there to
+    /// subscribe or write. A node that is not `room`'s leader sends this instead
+    /// of serving the room — a follower does not serve it directly. Server-
+    /// directed; a client that sends one commits a protocol violation.
+    Redirect { room: Vec<u8>, leader_addr: Vec<u8> },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -412,6 +418,11 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
                 put_u64(&mut out, *seq);
             }
         }
+        Message::Redirect { room, leader_addr } => {
+            put_u8(&mut out, 23);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, leader_addr);
+        }
     }
     out
 }
@@ -591,6 +602,11 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 seqs,
                 reason,
             }
+        }
+        23 => {
+            let room = cur.bytes()?;
+            let leader_addr = cur.bytes()?;
+            Message::Redirect { room, leader_addr }
         }
         tag => {
             return Err(ProtocolError::BadTag {

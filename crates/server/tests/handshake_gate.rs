@@ -50,6 +50,7 @@ fn resolve(reg: &Mutex<SchemaRegistry>, msg: Message) -> (Session, crdtsync_serv
         None,
         reg,
         None,
+        None,
         0,
         None,
         msg,
