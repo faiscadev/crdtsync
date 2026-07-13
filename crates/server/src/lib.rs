@@ -27,6 +27,7 @@ pub mod event;
 pub mod membership;
 pub mod placement;
 pub mod registry;
+pub mod replication;
 pub mod runtime;
 pub mod schema_registry;
 pub mod session;
@@ -1296,6 +1297,13 @@ impl Hub {
     /// The room's current high-water server sequence (0 if unseen or empty).
     pub fn seq(&self, room: &[u8]) -> u64 {
         self.rooms.get(room).map_or(0, Room::head)
+    }
+
+    /// The room's compaction floor — the count of server sequences already
+    /// compacted away (`0` for an uncompacted or unseen room). A replicated
+    /// commit carries it so a follower places the ops in the same sequence space.
+    pub fn base_seq(&self, room: &[u8]) -> u64 {
+        self.rooms.get(room).map_or(0, |r| r.base_seq)
     }
 
     /// Read the merged state of a top-level slot in `room`.

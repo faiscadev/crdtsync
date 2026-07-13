@@ -23,10 +23,12 @@ use crate::auto_version::{
 };
 use crate::clock::{Clock, SystemClock};
 use crate::membership::Membership;
+use crate::placement::NodeId;
+use crate::replication::Replication;
 use crate::schema_registry::SchemaRegistry;
 use crate::{
     step, AwarenessPolicy, EngineEvent, EventSink, Hub, RoomId, SchemaAwarenessPolicy, Session,
-    Store,
+    Store, MAIN_BRANCH,
 };
 
 /// How long a departed client's presence is retained before a sweep clears it,
@@ -89,6 +91,11 @@ pub struct Registry {
     /// single-node mode: every room is served locally. Held for the routing and
     /// replication layers to consult; this layer does not yet route on it.
     membership: Option<Membership>,
+    /// Leader-to-follower replication state: frames queued for each follower and
+    /// the acknowledged per-`(room, follower)` watermark. Inert in single-node
+    /// mode — a node with no membership never leads a room, so it never
+    /// replicates.
+    replication: Replication,
 }
 
 impl Registry {
@@ -122,6 +129,7 @@ impl Registry {
             auto_version,
             schedule_fires: HashMap::new(),
             membership: None,
+            replication: Replication::default(),
         }
     }
 
@@ -184,6 +192,108 @@ impl Registry {
     /// (Unit 3) and replication (Unit 4) read placement through this.
     pub fn membership(&self) -> Option<&Membership> {
         self.membership.as_ref()
+    }
+
+    /// Queue a [`Message::Replicate`] for each follower of `room` when this node
+    /// leads it, mirroring the fresh `ops` on `branch`. A node with no membership
+    /// leads nothing, so it never replicates — single-node behavior is unchanged.
+    fn enqueue_replication(&mut self, room: &[u8], branch: &[u8], ops: &[Op]) {
+        // Unit 4 mirrors the room's `main` stream. A branch write is not
+        // replicated: a follower has no copy of the fork it diverges from (branch
+        // lifecycle is not yet mirrored), so replicating the tail alone would be
+        // discarded there — the branch replication path is a later unit.
+        if branch != MAIN_BRANCH {
+            return;
+        }
+        let Some(membership) = &self.membership else {
+            return;
+        };
+        if !membership.is_primary_for(room) {
+            return;
+        }
+        let followers: Vec<NodeId> = membership
+            .replicas_for(room)
+            .into_iter()
+            .filter(|node| !membership.is_self(node))
+            .collect();
+        if followers.is_empty() {
+            return;
+        }
+        let base_seq = self.hub.base_seq(room);
+        for follower in followers {
+            self.replication.enqueue(
+                follower,
+                Message::Replicate {
+                    room: room.to_vec(),
+                    branch: branch.to_vec(),
+                    ops: ops.to_vec(),
+                    base_seq,
+                },
+            );
+        }
+    }
+
+    /// Apply a leader's replicated `ops` into this node's follower replica of
+    /// `room`, queueing a [`Message::ReplicaAck`] on the peer connection `id` with
+    /// the sequence the replica has reached. Honored only on a node that holds
+    /// `room` as a follower — without membership (single-node), or for a room this
+    /// node does not replicate, or one it leads, a Replicate is a stray frame and
+    /// the connection is dropped. Returns whether the connection stays open.
+    fn apply_replicate(
+        &mut self,
+        id: ConnId,
+        room: RoomId,
+        branch: Vec<u8>,
+        ops: Vec<Op>,
+        base_seq: u64,
+    ) -> bool {
+        let Some(membership) = &self.membership else {
+            return false;
+        };
+        if !membership.owns(&room) || membership.is_primary_for(&room) {
+            return false;
+        }
+        // A leader replicates only the `main` stream (see `enqueue_replication`),
+        // so a non-`main` frame is anomalous — drop it rather than misapply it to
+        // a branch the follower may not hold.
+        if branch != MAIN_BRANCH {
+            return false;
+        }
+        // `base_seq` is the leader's compaction floor, carried so a future
+        // snapshot-based catch-up can align a late follower's sequence space. Unit
+        // 4 replicates the whole log from the first op, so the follower's own head
+        // already equals the leader's and the ack needs no adjustment.
+        let _ = base_seq;
+        // Ingest through the same path a client `Ops` write uses. A replicated
+        // write carries no schema version — the leader logs its writers' ops
+        // untagged on the relay seam, and the follower mirrors them verbatim.
+        if self.hub.ingest(&room, ops, None).is_err() {
+            return false;
+        }
+        let through_seq = self.hub.seq(&room);
+        if let Some(conn) = self.conns.get_mut(&id) {
+            conn.outbox.push(Message::ReplicaAck { room, through_seq });
+        }
+        true
+    }
+
+    /// Take every replication frame queued since the last drain — the transport
+    /// routes each to its follower's peer connection.
+    pub fn take_replication(&mut self) -> Vec<(NodeId, Message)> {
+        self.replication.take_pending()
+    }
+
+    /// Record a follower's [`Message::ReplicaAck`], advancing its acknowledged
+    /// watermark for the room. The leader's peer connection calls this when the
+    /// follower answers a Replicate.
+    pub fn record_replica_ack(&mut self, follower: NodeId, room: &[u8], through_seq: u64) {
+        self.replication.record_ack(follower, room, through_seq);
+    }
+
+    /// The server sequence `follower` has acknowledged for `room` — the watermark
+    /// a later majority-ack durability unit reads. `0` if nothing yet.
+    pub fn replica_watermark(&self, room: &[u8], follower: &NodeId) -> u64 {
+        self.replication.watermark(room, follower)
     }
 
     /// Auto-compact a room once its retained log reaches `threshold` ops, so a
@@ -661,6 +771,18 @@ impl Registry {
     /// replies and fanning any broadcast out to the room's other connections.
     /// Returns whether the connection should stay open.
     pub fn deliver(&mut self, id: ConnId, msg: Message) -> bool {
+        // A Replicate arrives from a room's leader on a peer connection, not from
+        // a client on its data plane — intercept it before the client session
+        // step (which treats it as a violation) and apply it as a follower.
+        let msg = match msg {
+            Message::Replicate {
+                room,
+                branch,
+                ops,
+                base_seq,
+            } => return self.apply_replicate(id, room, branch, ops, base_seq),
+            other => other,
+        };
         // Only an awareness set consults the clock (to stamp last-seen), so the
         // op hot path never reads wall time.
         let now = if matches!(msg, Message::AwarenessSet { .. }) {
@@ -859,6 +981,16 @@ impl Registry {
         // sweep's reconcile prunes dormant rooms, so the map stays bounded.
         if let Some((room, app_id, version)) = bind {
             self.bind_room_app(room, app_id, version);
+        }
+        // A leader mirrors each fresh commit to its follower replicas, so a client
+        // redirected to the leader reaches a node that already holds the state.
+        // Queued here, before the client fan-out, from the same durably-logged
+        // ops; single-node mode (no membership) and a non-leading node enqueue
+        // nothing.
+        if !broadcast.is_empty() {
+            if let (Some(room), Some(branch)) = (&room, &broadcast_branch) {
+                self.enqueue_replication(room, branch, &broadcast);
+            }
         }
         // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),
         // so fanning it out never advertises an unpersisted write. Each peer is
