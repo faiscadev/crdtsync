@@ -22,6 +22,7 @@ use crate::auto_version::{
     AutoVersionState,
 };
 use crate::clock::{Clock, SystemClock};
+use crate::leadership::LeadershipEpochs;
 use crate::membership::Membership;
 use crate::placement::NodeId;
 use crate::replication::Replication;
@@ -107,6 +108,10 @@ pub struct Registry {
     /// mode — a node with no membership never leads a room, so it never
     /// replicates.
     replication: Replication,
+    /// Per-room leadership epochs — the split-brain fence (see
+    /// [`LeadershipEpochs`]). Empty (inert) in single-node mode and until a room's
+    /// leadership first changes.
+    epochs: LeadershipEpochs,
     /// Client write-acks withheld pending majority replication: for each write
     /// the leader has committed but not yet confirmed durable, the `Accepted` owed
     /// to its author and the server sequence a majority of the replica set must
@@ -147,6 +152,7 @@ impl Registry {
             schedule_fires: HashMap::new(),
             membership: None,
             replication: Replication::default(),
+            epochs: LeadershipEpochs::default(),
             pending_acks: Vec::new(),
         }
     }
@@ -255,6 +261,8 @@ impl Registry {
             return;
         }
         let base_seq = self.hub.base_seq(room);
+        // Stamp the frames with this node's leadership epoch for the room.
+        let epoch = self.epochs.claim_leadership(room);
         for follower in followers {
             self.replication.enqueue(
                 follower,
@@ -263,6 +271,7 @@ impl Registry {
                     branch: branch.to_vec(),
                     ops: ops.to_vec(),
                     base_seq,
+                    epoch,
                 },
             );
         }
@@ -281,15 +290,34 @@ impl Registry {
         branch: Vec<u8>,
         ops: Vec<Op>,
         base_seq: u64,
+        epoch: u64,
     ) -> bool {
         let Some(membership) = &self.membership else {
             return false;
         };
+        let owns = membership.owns(&room);
+        let leads = membership.is_effective_primary_for(&room);
+        // Fence a stale leader: a frame below the highest epoch this node has seen
+        // for the room comes from a demoted-then-recovered primary that missed the
+        // promotion. Drop it — no apply, no ack — so its writes cannot resurrect.
+        // The connection stays open; the stale leader steps down when it in turn
+        // observes the higher epoch on the new leader's stream.
+        if epoch < self.epochs.highest_seen(&room) {
+            return true;
+        }
+        // A frame at a strictly higher epoch than this node leads at supersedes its
+        // leadership, so it converges on the new leader's stream even as the
+        // placement primary — the recovered-stale-leader reconciliation. The
+        // step-down itself is deferred until the frame is committed to below, so a
+        // frame this node rejects never churns its leadership epoch.
+        let supersedes = self.epochs.leads_below(&room, epoch);
         // A node applies a Replicate only while it merely follows the room: it must
-        // hold the room (placement) and *not* be its effective leader. A node
-        // promoted over a down primary now leads and rejects the down node's frames
-        // rather than misapplying them under its own authority.
-        if !membership.owns(&room) || membership.is_effective_primary_for(&room) {
+        // hold the room (placement) and not itself lead it, unless a strictly
+        // higher epoch supersedes that leadership.
+        if !owns {
+            return false;
+        }
+        if leads && !supersedes {
             return false;
         }
         // A leader replicates only the `main` stream (see `enqueue_replication`),
@@ -298,6 +326,10 @@ impl Registry {
         if branch != MAIN_BRANCH {
             return false;
         }
+        // Committed to apply: step down if superseded, and record the leader's epoch
+        // as this room's highest seen so later frames below it are fenced.
+        self.epochs.supersede_if_leading(&room, epoch);
+        self.epochs.observe(&room, epoch);
         // `base_seq` is the leader's compaction floor, carried so a future
         // snapshot-based catch-up can align a late follower's sequence space. Unit
         // 4 replicates the whole log from the first op, so the follower's own head
@@ -889,7 +921,8 @@ impl Registry {
                 branch,
                 ops,
                 base_seq,
-            } => return self.apply_replicate(id, room, branch, ops, base_seq),
+                epoch,
+            } => return self.apply_replicate(id, room, branch, ops, base_seq, epoch),
             other => other,
         };
         // Only an awareness set consults the clock (to stamp last-seen), so the

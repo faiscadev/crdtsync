@@ -25,6 +25,7 @@ pub mod auto_version;
 pub mod blobs;
 pub mod clock;
 pub mod event;
+pub mod leadership;
 pub mod membership;
 pub mod placement;
 pub mod registry;

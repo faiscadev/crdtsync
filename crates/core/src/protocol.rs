@@ -214,13 +214,18 @@ pub enum Message {
     /// A room's leader fans its freshly committed ops out to a follower replica:
     /// `ops` is the batch (the op codec, as an `Ops` write), `base_seq` the
     /// leader's compaction floor when it sent them, so the follower places them in
-    /// the same server-sequence space. Node-to-node — never a client frame; a
-    /// client that sends one commits a protocol violation.
+    /// the same server-sequence space. `epoch` is the leader's monotonic
+    /// leadership generation for the room (a Raft term): a promotion bumps it
+    /// strictly above any epoch the promoting node has seen, and a follower fences
+    /// a frame whose `epoch` is below the highest it has seen, so a demoted-then-
+    /// recovered stale leader cannot replicate. Node-to-node — never a client
+    /// frame; a client that sends one commits a protocol violation.
     Replicate {
         room: Vec<u8>,
         branch: Vec<u8>,
         ops: Vec<Op>,
         base_seq: u64,
+        epoch: u64,
     },
     /// A follower's acknowledgement of replicated ops: `through_seq` is the
     /// server sequence the follower's replica of `room` has now reached, the
@@ -444,11 +449,13 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             branch,
             ops,
             base_seq,
+            epoch,
         } => {
             put_u8(&mut out, 24);
             put_bytes(&mut out, room);
             put_bytes(&mut out, branch);
             put_u64(&mut out, *base_seq);
+            put_u64(&mut out, *epoch);
             out.extend_from_slice(&encode_ops(ops));
         }
         Message::ReplicaAck { room, through_seq } => {
@@ -647,10 +654,12 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let room = cur.bytes()?;
             let branch = cur.bytes()?;
             let base_seq = cur.u64()?;
+            let epoch = cur.u64()?;
             return Ok(Message::Replicate {
                 room,
                 branch,
                 base_seq,
+                epoch,
                 ops: decode_ops(cur.rest()).map_err(ProtocolError::Op)?,
             });
         }
