@@ -1934,3 +1934,313 @@ fn a_blob_edit_on_a_null_handle_is_rejected() {
         );
     }
 }
+
+// --- doc-level acl authoring ---
+//
+// A grant marshals a subject / capability-or-role / effect / path / grantor across
+// the ABI as discriminants plus byte strings, matching the op codec's tags. The
+// emitted op decodes to `OpKind::AclGrant`, its derived tuple id matches the id
+// handed back, and a revoke by that id emits `OpKind::AclRevoke`.
+
+fn out_buf() -> CrdtBuf {
+    CrdtBuf {
+        ptr: ptr::null_mut(),
+        len: 0,
+    }
+}
+
+unsafe fn ops_of(buf: &CrdtBuf) -> Vec<crdtsync_core::Op> {
+    crdtsync_core::decode_ops(std::slice::from_raw_parts(buf.ptr, buf.len)).unwrap()
+}
+
+#[test]
+fn acl_grant_emits_the_tuple_and_revoke_tombstones_it() {
+    use crdtsync_core::{AclEffect, AclGrant, AclSubject, Capability, ClientId, Document, OpKind};
+    unsafe {
+        let a = crdtsync_doc_new(client(1).as_ptr());
+        let subject = client(7); // the actor the grant targets
+        let grantor = client(1); // the authoring actor
+        let p = path(&[b"doc"]);
+
+        // Author: Allow Read to Actor(7) at /doc, granted by actor 1.
+        let mut id = out_buf();
+        let mut ops = out_buf();
+        let rc = crdtsync_doc_acl_grant(
+            a,
+            0, // subject kind: actor
+            subject.as_ptr(),
+            subject.len(),
+            0, // grant kind: capability
+            0, // capability: read
+            ptr::null(),
+            0,
+            0, // effect: allow
+            p.as_ptr(),
+            p.len(),
+            grantor.as_ptr(),
+            grantor.len(),
+            &mut id,
+            &mut ops,
+        );
+        assert_eq!(rc, 1, "a well-formed grant succeeds");
+        assert_eq!(id.len, 16, "the grant hands back a 16-byte tuple id");
+        assert!(ops.len > 0, "the grant emits an op");
+
+        // The emitted op decodes to the expected AclGrant.
+        let decoded = ops_of(&ops);
+        assert_eq!(decoded.len(), 1);
+        let OpKind::AclGrant {
+            subject: subj,
+            grant,
+            effect,
+            path: gp,
+            grantor: gtor,
+        } = &decoded[0].kind
+        else {
+            panic!("expected AclGrant, got {:?}", decoded[0].kind);
+        };
+        assert_eq!(*subj, AclSubject::Actor(ClientId::from_bytes(subject)));
+        assert_eq!(*grant, AclGrant::Capability(Capability::Read));
+        assert_eq!(*effect, AclEffect::Allow);
+        assert_eq!(gp.as_slice(), p.as_slice());
+        assert_eq!(*gtor, ClientId::from_bytes(grantor));
+
+        // A second replica converges: applying the op materialises the tuple, and
+        // its id equals the handle the author got back.
+        let mut b = Document::new(ClientId::from_bytes(client(2)));
+        assert!(b.apply(&decoded[0]));
+        let tuples = b.acl_tuples();
+        assert_eq!(tuples.len(), 1, "the grant tuple is present after apply");
+        let id_bytes = std::slice::from_raw_parts(id.ptr, id.len);
+        assert_eq!(
+            tuples[0].id.as_bytes().as_slice(),
+            id_bytes,
+            "the returned id names the applied tuple"
+        );
+
+        // Revoke by that id: the author holds the tuple, so it emits an AclRevoke;
+        // applying it tombstones the tuple on the peer.
+        let mut rev = out_buf();
+        let rc = crdtsync_doc_acl_revoke(a, id.ptr, id.len, &mut rev);
+        assert_eq!(rc, 1, "a revoke of a held tuple emits");
+        let revoked = ops_of(&rev);
+        assert_eq!(revoked.len(), 1);
+        match &revoked[0].kind {
+            OpKind::AclRevoke { id: rid } => {
+                assert_eq!(rid.as_bytes().as_slice(), id_bytes)
+            }
+            other => panic!("expected AclRevoke, got {other:?}"),
+        }
+        assert!(b.apply(&revoked[0]));
+        assert!(b.acl_tuples().is_empty(), "the revoke tombstones the tuple");
+
+        crdtsync_buf_free(id);
+        crdtsync_buf_free(ops);
+        crdtsync_buf_free(rev);
+        crdtsync_doc_free(a);
+    }
+}
+
+#[test]
+fn acl_grant_marshals_a_role_deny_to_a_group() {
+    use crdtsync_core::{AclEffect, AclGrant, AclSubject, OpKind};
+    unsafe {
+        let a = crdtsync_doc_new(client(1).as_ptr());
+        let grantor = client(1);
+        let group = b"editors";
+        let role = b"reviewer";
+        let p = path(&[b"doc"]);
+
+        let mut id = out_buf();
+        let mut ops = out_buf();
+        let rc = crdtsync_doc_acl_grant(
+            a,
+            1, // subject kind: group
+            group.as_ptr(),
+            group.len(),
+            1, // grant kind: role
+            0, // capability (ignored for a role)
+            role.as_ptr(),
+            role.len(),
+            1, // effect: deny
+            p.as_ptr(),
+            p.len(),
+            grantor.as_ptr(),
+            grantor.len(),
+            &mut id,
+            &mut ops,
+        );
+        assert_eq!(rc, 1);
+        let decoded = ops_of(&ops);
+        let OpKind::AclGrant {
+            subject,
+            grant,
+            effect,
+            ..
+        } = &decoded[0].kind
+        else {
+            panic!("expected AclGrant");
+        };
+        assert_eq!(*subject, AclSubject::Group(group.to_vec()));
+        assert_eq!(*grant, AclGrant::Role(role.to_vec()));
+        assert_eq!(*effect, AclEffect::Deny);
+
+        crdtsync_buf_free(id);
+        crdtsync_buf_free(ops);
+        crdtsync_doc_free(a);
+    }
+}
+
+#[test]
+fn acl_authoring_is_total_on_bad_input() {
+    unsafe {
+        let a = crdtsync_doc_new(client(1).as_ptr());
+        let subject = client(7);
+        let grantor = client(1);
+        let p = path(&[b"doc"]);
+        let mut id = out_buf();
+        let mut ops = out_buf();
+
+        // A null handle rejects with -1.
+        assert_eq!(
+            crdtsync_doc_acl_grant(
+                ptr::null_mut(),
+                0,
+                subject.as_ptr(),
+                subject.len(),
+                0,
+                0,
+                ptr::null(),
+                0,
+                0,
+                p.as_ptr(),
+                p.len(),
+                grantor.as_ptr(),
+                grantor.len(),
+                &mut id,
+                &mut ops,
+            ),
+            -1
+        );
+
+        // An unknown subject kind rejects with -1.
+        assert_eq!(
+            crdtsync_doc_acl_grant(
+                a,
+                99,
+                subject.as_ptr(),
+                subject.len(),
+                0,
+                0,
+                ptr::null(),
+                0,
+                0,
+                p.as_ptr(),
+                p.len(),
+                grantor.as_ptr(),
+                grantor.len(),
+                &mut id,
+                &mut ops,
+            ),
+            -1
+        );
+
+        // An unknown capability rejects with -1.
+        assert_eq!(
+            crdtsync_doc_acl_grant(
+                a,
+                0,
+                subject.as_ptr(),
+                subject.len(),
+                0,
+                99,
+                ptr::null(),
+                0,
+                0,
+                p.as_ptr(),
+                p.len(),
+                grantor.as_ptr(),
+                grantor.len(),
+                &mut id,
+                &mut ops,
+            ),
+            -1
+        );
+
+        // A malformed grantor (not 16 bytes) rejects with -1.
+        let short = [0u8; 15];
+        assert_eq!(
+            crdtsync_doc_acl_grant(
+                a,
+                0,
+                subject.as_ptr(),
+                subject.len(),
+                0,
+                0,
+                ptr::null(),
+                0,
+                0,
+                p.as_ptr(),
+                p.len(),
+                short.as_ptr(),
+                short.len(),
+                &mut id,
+                &mut ops,
+            ),
+            -1
+        );
+
+        // A revoke of an id the replica never held is inert (0), not an error.
+        let unknown = [3u8; 16];
+        let mut rev = out_buf();
+        assert_eq!(
+            crdtsync_doc_acl_revoke(a, unknown.as_ptr(), unknown.len(), &mut rev),
+            0
+        );
+        crdtsync_buf_free(rev);
+
+        // A malformed revoke id rejects with -1; a null handle too.
+        let mut rev = out_buf();
+        assert_eq!(
+            crdtsync_doc_acl_revoke(a, short.as_ptr(), short.len(), &mut rev),
+            -1
+        );
+        assert_eq!(
+            crdtsync_doc_acl_revoke(ptr::null_mut(), unknown.as_ptr(), 16, &mut rev),
+            -1
+        );
+
+        crdtsync_doc_free(a);
+    }
+}
+
+#[test]
+fn actor_key_is_deterministic_and_16_bytes() {
+    unsafe {
+        let actor = b"user:alice";
+        let mut a = out_buf();
+        let mut b = out_buf();
+        assert_eq!(crdtsync_actor_key(actor.as_ptr(), actor.len(), &mut a), 1);
+        assert_eq!(crdtsync_actor_key(actor.as_ptr(), actor.len(), &mut b), 1);
+        assert_eq!(a.len, 16, "the key is 16 bytes");
+        let ka = std::slice::from_raw_parts(a.ptr, a.len);
+        let kb = std::slice::from_raw_parts(b.ptr, b.len);
+        assert_eq!(ka, kb, "the derivation is stable");
+
+        // A different actor derives a different key.
+        let other = b"user:bob";
+        let mut c = out_buf();
+        assert_eq!(crdtsync_actor_key(other.as_ptr(), other.len(), &mut c), 1);
+        assert_ne!(std::slice::from_raw_parts(c.ptr, c.len), ka);
+
+        // A null out rejects.
+        assert_eq!(
+            crdtsync_actor_key(actor.as_ptr(), actor.len(), ptr::null_mut()),
+            -1
+        );
+
+        crdtsync_buf_free(a);
+        crdtsync_buf_free(b);
+        crdtsync_buf_free(c);
+    }
+}

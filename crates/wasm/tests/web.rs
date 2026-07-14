@@ -831,7 +831,9 @@ fn a_blob_ref_reads_back_without_bytes() {
 fn an_over_ceiling_blob_is_not_inlined() {
     let mut a = doc(1);
     let p = path(&["huge"]);
-    assert!(a.set_blob(&p, "application/octet-stream", &vec![0u8; 4097]).is_none());
+    assert!(a
+        .set_blob(&p, "application/octet-stream", &vec![0u8; 4097])
+        .is_none());
     assert!(a.get_blob(&p).is_null());
 }
 
@@ -842,13 +844,18 @@ fn a_blob_converges_on_a_peer() {
     let p = path(&["pic"]);
     let ops = a.set_blob(&p, "image/png", b"tiny-png").expect("inlines");
     assert!(b.apply(&ops) >= 1);
-    assert_eq!(get_u8array(&b.get_blob(&p), "inline"), Some(b"tiny-png".to_vec()));
+    assert_eq!(
+        get_u8array(&b.get_blob(&p), "inline"),
+        Some(b"tiny-png".to_vec())
+    );
 }
 
 #[wasm_bindgen_test]
 fn a_bad_blob_ref_id_throws() {
     let mut a = doc(1);
-    assert!(a.set_blob_ref(&path(&["x"]), &[0u8; 4], "image/png", 1).is_err());
+    assert!(a
+        .set_blob_ref(&path(&["x"]), &[0u8; 4], "image/png", 1)
+        .is_err());
 }
 
 #[wasm_bindgen_test]
@@ -864,8 +871,178 @@ fn a_client_blob_edit_enqueues_and_travels() {
     assert!(b.receive(&frame).unwrap());
 
     let rframe = a
-        .set_blob_ref(sa.channel(), &path(&["video"]), &[7u8; 16], "video/mp4", 10_000_000)
+        .set_blob_ref(
+            sa.channel(),
+            &path(&["video"]),
+            &[7u8; 16],
+            "video/mp4",
+            10_000_000,
+        )
         .unwrap();
     assert_eq!(a.outbox_len(sa.channel()), 2);
     assert!(b.receive(&rframe).unwrap());
+}
+
+// --- doc-level acl authoring ---
+//
+// A grant marshals subject / capability-or-role / effect / path / grantor across
+// the JS boundary as discriminants plus byte strings, returns `{ id, ops }`, and a
+// peer that applies the ops converges. A revoke tombstones by the returned id.
+
+#[wasm_bindgen_test]
+fn acl_grant_returns_id_and_ops_and_converges() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    // Allow Read to Actor(7) at /doc, granted by actor 1.
+    let grant = a
+        .acl_grant(0, &cid(7), 0, 0, &[], 0, &path(&["doc"]), &cid(1))
+        .unwrap();
+    let id = get_bytes_field(&grant, "id");
+    let ops = get_bytes_field(&grant, "ops");
+    assert_eq!(id.len(), 16, "a grant hands back a 16-byte id");
+    assert!(!ops.is_empty(), "a grant emits ops");
+    assert!(b.apply(&ops) >= 1, "the grant tuple converges");
+
+    // Revoke by the returned id.
+    let rev = a.acl_revoke(&id).unwrap();
+    assert!(!rev.is_empty(), "revoking a held tuple emits ops");
+    assert!(b.apply(&rev) >= 1, "the revoke converges");
+}
+
+#[wasm_bindgen_test]
+fn acl_grant_marshals_a_role_deny_to_a_group() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    // Deny the `reviewer` role to the `editors` group at /doc.
+    let grant = a
+        .acl_grant(
+            1,
+            b"editors",
+            1,
+            0,
+            b"reviewer",
+            1,
+            &path(&["doc"]),
+            &cid(1),
+        )
+        .unwrap();
+    let ops = get_bytes_field(&grant, "ops");
+
+    // The op decodes to exactly the marshalled subject / grant / effect — wasm's
+    // discriminant mapping is independent of the FFI's, so it is asserted here.
+    let decoded = crdtsync_core::decode_ops(&ops).unwrap();
+    let crdtsync_core::OpKind::AclGrant {
+        subject,
+        grant: g,
+        effect,
+        ..
+    } = &decoded[0].kind
+    else {
+        panic!("expected AclGrant, got {:?}", decoded[0].kind);
+    };
+    assert_eq!(
+        *subject,
+        crdtsync_core::AclSubject::Group(b"editors".to_vec())
+    );
+    assert_eq!(*g, crdtsync_core::AclGrant::Role(b"reviewer".to_vec()));
+    assert_eq!(*effect, crdtsync_core::AclEffect::Deny);
+
+    assert!(b.apply(&ops) >= 1);
+}
+
+#[wasm_bindgen_test]
+fn acl_grant_marshals_an_actor_capability_allow() {
+    use crdtsync_core::{
+        decode_ops, AclEffect, AclGrant, AclSubject, Capability, ClientId, OpKind,
+    };
+    use crdtsync_wasm::actor_key;
+
+    let mut a = doc(1);
+    // Allow Write to an actor keyed by `actorKey`, granted by another derived key.
+    let subject = actor_key(b"user:bob");
+    let grantor = actor_key(b"user:alice");
+    let grant = a
+        .acl_grant(0, &subject, 0, 1, &[], 0, &path(&["doc"]), &grantor)
+        .unwrap();
+    let ops = get_bytes_field(&grant, "ops");
+    let decoded = decode_ops(&ops).unwrap();
+    let OpKind::AclGrant {
+        subject: subj,
+        grant: g,
+        effect,
+        grantor: gtor,
+        ..
+    } = &decoded[0].kind
+    else {
+        panic!("expected AclGrant");
+    };
+    let want: [u8; 16] = subject.clone().try_into().unwrap();
+    assert_eq!(*subj, AclSubject::Actor(ClientId::from_bytes(want)));
+    assert_eq!(*g, AclGrant::Capability(Capability::Write));
+    assert_eq!(*effect, AclEffect::Allow);
+    let want_g: [u8; 16] = grantor.clone().try_into().unwrap();
+    assert_eq!(*gtor, ClientId::from_bytes(want_g));
+}
+
+#[wasm_bindgen_test]
+fn actor_key_is_deterministic_and_16_bytes() {
+    use crdtsync_wasm::actor_key;
+    let k = actor_key(b"user:alice");
+    assert_eq!(k.len(), 16);
+    assert_eq!(k, actor_key(b"user:alice"), "the derivation is stable");
+    assert_ne!(k, actor_key(b"user:bob"));
+}
+
+#[wasm_bindgen_test]
+fn acl_authoring_throws_on_bad_input() {
+    let mut a = doc(1);
+    let p = path(&["doc"]);
+    // Unknown subject kind, unknown capability, and a malformed grantor each throw.
+    assert!(a.acl_grant(99, &cid(7), 0, 0, &[], 0, &p, &cid(1)).is_err());
+    assert!(a.acl_grant(0, &cid(7), 0, 99, &[], 0, &p, &cid(1)).is_err());
+    assert!(a
+        .acl_grant(0, &cid(7), 0, 0, &[], 0, &p, &[0u8; 15])
+        .is_err());
+    // A malformed revoke id throws; a valid-but-unknown id is inert (empty ops).
+    assert!(a.acl_revoke(&[0u8; 15]).is_err());
+    assert!(a.acl_revoke(&[0u8; 16]).unwrap().is_empty());
+}
+
+#[wasm_bindgen_test]
+fn client_acl_routes_through_the_outbox() {
+    let mut a = wasm_client(1);
+    let mut b = wasm_client(2);
+    let sa = a.subscribe(b"room-1");
+    let sb = b.subscribe(b"room-1");
+    let ch = sa.channel();
+    let _ = sb;
+
+    // Allow Write to Actor(7) at /doc through channel `ch`.
+    let grant = a
+        .acl_grant(ch, 0, &cid(7), 0, 1, &[], 0, &path(&["doc"]), &cid(1))
+        .unwrap();
+    let id = get_bytes_field(&grant, "id");
+    let frame = get_bytes_field(&grant, "frame");
+    assert_eq!(id.len(), 16);
+    assert!(!frame.is_empty(), "the grant frames an Ops message");
+    assert_eq!(a.outbox_len(ch), 1, "the grant entered the outbox");
+    assert!(b.receive(&frame).unwrap(), "the peer applies the grant");
+
+    let rev = a.acl_revoke(ch, &id).unwrap();
+    assert!(!rev.is_empty(), "the revoke frames an Ops message");
+    assert_eq!(a.outbox_len(ch), 2, "the revoke entered the outbox");
+    assert!(b.receive(&rev).unwrap(), "the peer applies the revoke");
+}
+
+#[wasm_bindgen_test]
+fn client_acl_on_an_unheld_channel_is_inert() {
+    let mut a = wasm_client(1);
+    let grant = a
+        .acl_grant(99, 4, &[], 0, 0, &[], 0, &path(&["doc"]), &cid(1))
+        .unwrap();
+    assert!(
+        grant.is_undefined(),
+        "a grant on an unheld channel is undefined"
+    );
+    assert!(a.acl_revoke(99, &[0u8; 16]).unwrap().is_empty());
 }

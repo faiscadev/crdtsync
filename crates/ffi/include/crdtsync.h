@@ -402,6 +402,56 @@ int32_t crdtsync_doc_marks_at(const CrdtDoc *doc,
                               uintptr_t index,
                               CrdtBuf *out);
 
+// Derive the doc-ACL actor key for a credential `actor` into `out` (a fresh buffer
+// the caller frees) — the id an [`AclSubject::Actor`] grant targets and a grantor
+// carries, matching the authenticated actor the server enforces against. Returns 1,
+// or -1 on a null `out` or a rejected `actor` pointer.
+//
+// # Safety
+// `actor`/`actor_len` follow [`as_slice`]; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_actor_key(const uint8_t *actor, uintptr_t actor_len, CrdtBuf *out);
+
+// Grant a doc-level ACL tuple: an allow/deny (`effect`) of a capability-or-role
+// (`grant_kind` + `capability`/`role`) to `subject`, on `path`, recorded with the
+// authoring actor `grantor`. Writes the ops to broadcast into `out_ops` and the
+// new tuple's 16-byte id into `out_id` (each a fresh buffer the caller frees).
+// Returns 1 on success, -1 on a bad handle, a null out pointer, a malformed
+// subject/grant/effect, or a malformed grantor.
+//
+// # Safety
+// `doc` is a live handle; `subject`/`subject_len`, `role`/`role_len`,
+// `path`/`path_len`, and `grantor`/`grantor_len` each follow [`as_slice`];
+// `out_id` and `out_ops` point to writable `CrdtBuf`s.
+int32_t crdtsync_doc_acl_grant(CrdtDoc *doc,
+                               uint32_t subject_kind,
+                               const uint8_t *subject,
+                               uintptr_t subject_len,
+                               uint32_t grant_kind,
+                               uint32_t capability,
+                               const uint8_t *role,
+                               uintptr_t role_len,
+                               uint32_t effect,
+                               const uint8_t *path,
+                               uintptr_t path_len,
+                               const uint8_t *grantor,
+                               uintptr_t grantor_len,
+                               CrdtBuf *out_id,
+                               CrdtBuf *out_ops);
+
+// Revoke the doc-level ACL tuple `id` (16 bytes from [`crdtsync_doc_acl_grant`]),
+// tombstoning it. Writes the ops to broadcast into `out_ops`. Returns 1 when a
+// revoke was emitted, 0 when `id` names no tuple this replica holds (inert —
+// `out_ops` carries no ops), -1 on a bad handle, a null out pointer, or a
+// malformed id.
+//
+// # Safety
+// `doc` is a live handle; `id`/`id_len` follow [`as_slice`]; `out_ops` points to
+// a writable `CrdtBuf`.
+int32_t crdtsync_doc_acl_revoke(CrdtDoc *doc,
+                                const uint8_t *id,
+                                uintptr_t id_len,
+                                CrdtBuf *out_ops);
+
 // Capture a stable position in the List or Text at a path — the encoded
 // [`RelativePosition`] bytes, resolved later with
 // [`crdtsync_doc_resolve_position`]. `side` is 0 (left of `index`) or 1 (right).
@@ -910,6 +960,42 @@ CrdtBuf crdtsync_client_xml_move(CrdtClient *client,
                                  const uint8_t *new_parent_path,
                                  uintptr_t new_parent_path_len,
                                  uintptr_t dest_index);
+
+// Grant a doc-level ACL tuple in `channel`'s room and route the op through the
+// outbox. Writes the new tuple's 16-byte id into `out_id` (a fresh buffer the
+// caller frees). Returns the Ops frame to send; empty on a bad handle, an unheld
+// channel, a null `out_id`, or a malformed subject/grant/effect/grantor.
+//
+// # Safety
+// `client` is a live handle; `subject`/`subject_len`, `role`/`role_len`,
+// `path`/`path_len`, and `grantor`/`grantor_len` each follow [`as_slice`];
+// `out_id` points to a writable `CrdtBuf`.
+CrdtBuf crdtsync_client_acl_grant(CrdtClient *client,
+                                  uint32_t channel,
+                                  uint32_t subject_kind,
+                                  const uint8_t *subject,
+                                  uintptr_t subject_len,
+                                  uint32_t grant_kind,
+                                  uint32_t capability,
+                                  const uint8_t *role,
+                                  uintptr_t role_len,
+                                  uint32_t effect,
+                                  const uint8_t *path,
+                                  uintptr_t path_len,
+                                  const uint8_t *grantor,
+                                  uintptr_t grantor_len,
+                                  CrdtBuf *out_id);
+
+// Revoke the doc-level ACL tuple `id` (16 bytes) in `channel`'s room, routing the
+// op through the outbox. Returns the Ops frame to send; empty on a bad handle, an
+// unheld channel, a malformed id, or an id naming no tuple this replica holds.
+//
+// # Safety
+// `client` is a live handle; `id`/`id_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_acl_revoke(CrdtClient *client,
+                                   uint32_t channel,
+                                   const uint8_t *id,
+                                   uintptr_t id_len);
 
 // Set an inline blob at a path in `channel`'s room, minting the handle from
 // system entropy, and route the ops through the outbox. Returns the Ops frame to

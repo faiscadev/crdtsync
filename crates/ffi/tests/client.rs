@@ -1084,3 +1084,97 @@ fn an_over_ceiling_client_blob_enqueues_nothing() {
         crdtsync_client_free(a);
     }
 }
+
+/// The grant/revoke authoring surface on the wire client: the op is framed to send,
+/// enters the outbox (acked / resent), decodes to the expected `OpKind`, and folds
+/// into a peer.
+#[test]
+fn acl_grant_and_revoke_route_through_the_client_outbox() {
+    use crdtsync_core::{AclEffect, AclGrant, AclSubject, Capability, ClientId, OpKind};
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (ca, sub_a) = subscribe(a, b"room-1");
+        let (cb, sub_b) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sub_a);
+        crdtsync_buf_free(sub_b);
+        let _ = cb;
+
+        let subject = client_id(7);
+        let grantor = client_id(1);
+        let p = path(&[b"doc"]);
+
+        // Author: Allow Write to Actor(7) at /doc through channel `ca`.
+        let mut id = out_buf();
+        let frame = crdtsync_client_acl_grant(
+            a,
+            ca,
+            0, // subject kind: actor
+            subject.as_ptr(),
+            subject.len(),
+            0, // grant kind: capability
+            1, // capability: write
+            ptr::null(),
+            0,
+            0, // effect: allow
+            p.as_ptr(),
+            p.len(),
+            grantor.as_ptr(),
+            grantor.len(),
+            &mut id,
+        );
+        assert!(frame.len > 0, "the grant frames an Ops message to send");
+        assert_eq!(id.len, 16, "the grant hands back the tuple id");
+        assert_eq!(outbox_len(a, ca), 1, "the grant entered the outbox");
+
+        // The framed op decodes to the expected AclGrant.
+        let msg = decode_message(std::slice::from_raw_parts(frame.ptr, frame.len)).unwrap();
+        let Message::Ops { ops, channel } = msg else {
+            panic!("expected an Ops frame");
+        };
+        assert_eq!(channel, Channel(ca));
+        let OpKind::AclGrant {
+            subject: subj,
+            grant,
+            effect,
+            grantor: gtor,
+            ..
+        } = &ops[0].kind
+        else {
+            panic!("expected AclGrant, got {:?}", ops[0].kind);
+        };
+        assert_eq!(*subj, AclSubject::Actor(ClientId::from_bytes(subject)));
+        assert_eq!(*grant, AclGrant::Capability(Capability::Write));
+        assert_eq!(*effect, AclEffect::Allow);
+        assert_eq!(*gtor, ClientId::from_bytes(grantor));
+
+        // It folds into the peer.
+        assert!(receive(b, &frame) >= 1, "the peer applies the grant");
+
+        // Revoke by the returned id enqueues an AclRevoke.
+        let rev = crdtsync_client_acl_revoke(a, ca, id.ptr, id.len);
+        assert!(rev.len > 0, "the revoke frames an Ops message");
+        assert_eq!(outbox_len(a, ca), 2, "the revoke also entered the outbox");
+        let msg = decode_message(std::slice::from_raw_parts(rev.ptr, rev.len)).unwrap();
+        let Message::Ops { ops, .. } = msg else {
+            panic!("expected an Ops frame");
+        };
+        let id_bytes = std::slice::from_raw_parts(id.ptr, id.len);
+        match &ops[0].kind {
+            OpKind::AclRevoke { id: rid } => assert_eq!(rid.as_bytes().as_slice(), id_bytes),
+            other => panic!("expected AclRevoke, got {other:?}"),
+        }
+        assert!(receive(b, &rev) >= 1, "the peer applies the revoke");
+
+        // A bad handle is inert — an empty frame, no panic.
+        let empty = crdtsync_client_acl_revoke(ptr::null_mut(), ca, id.ptr, id.len);
+        assert_eq!(empty.len, 0);
+        crdtsync_buf_free(empty);
+
+        crdtsync_buf_free(id);
+        crdtsync_buf_free(frame);
+        crdtsync_buf_free(rev);
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}

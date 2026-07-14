@@ -193,6 +193,7 @@ dependencies = [
  "cbindgen",
  "crdtsync-core",
  "getrandom 0.2.17",
+ "sha2",
 ]
 
 [[package]]

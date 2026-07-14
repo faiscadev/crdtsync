@@ -327,6 +327,55 @@ const (
 	Right Side = 1
 )
 
+// SubjectKind names who a doc-ACL grant targets: an actor id, a group name, or a
+// well-known class.
+type SubjectKind uint32
+
+const (
+	// SubjectActor targets a 16-byte actor id.
+	SubjectActor SubjectKind = 0
+	// SubjectGroup targets a membership name.
+	SubjectGroup SubjectKind = 1
+	// SubjectAuthenticated targets every authenticated connection.
+	SubjectAuthenticated SubjectKind = 2
+	// SubjectAnonymous targets every unauthenticated connection.
+	SubjectAnonymous SubjectKind = 3
+	// SubjectAnyone targets everyone.
+	SubjectAnyone SubjectKind = 4
+)
+
+// Capability is a direct power a grant confers over a subtree.
+type Capability uint32
+
+const (
+	CapRead             Capability = 0
+	CapWrite            Capability = 1
+	CapPublishAwareness Capability = 2
+	CapOwn              Capability = 3
+)
+
+// Effect is whether a grant allows or denies.
+type Effect uint32
+
+const (
+	Allow Effect = 0
+	Deny  Effect = 1
+)
+
+// Grant is what an ACL tuple confers: a direct Capability or a named role. Build
+// one with CapabilityGrant or RoleGrant.
+type Grant struct {
+	kind uint32
+	cap  Capability
+	role []byte
+}
+
+// CapabilityGrant confers the direct capability c.
+func CapabilityGrant(c Capability) Grant { return Grant{kind: 0, cap: c} }
+
+// RoleGrant confers the schema-declared role named name.
+func RoleGrant(name []byte) Grant { return Grant{kind: 1, role: name} }
+
 // ErrorCode is a failure the server reports to the client through Receive.
 type ErrorCode int32
 
@@ -1359,6 +1408,50 @@ func (d *Document) MarkDelete(markID []byte) []byte {
 	return takeBuf(C.crdtsync_doc_mark_delete(d.h, mp, ml))
 }
 
+// AclGrant grants a doc-level ACL tuple: an allow/deny (effect) of grant to the
+// subject (a SubjectKind plus its bytes — a 16-byte actor id, a group name, or nil
+// for a class), on path, recorded with the authoring actor grantor (16 bytes).
+// Returns the new tuple's 16-byte id — the handle AclRevoke names it by — and the
+// ops to broadcast. Both are nil on a malformed subject/grant/grantor.
+func (d *Document) AclGrant(subjectKind SubjectKind, subject []byte, grant Grant, effect Effect, path [][]byte, grantor []byte) (tupleID []byte, ops []byte) {
+	sp, sl := bytesArg(subject)
+	rp, rl := bytesArg(grant.role)
+	pp, pl := bytesArg(EncodePath(path))
+	gp, gl := bytesArg(grantor)
+	var outID, outOps C.CrdtBuf
+	rc := C.crdtsync_doc_acl_grant(d.h, C.uint32_t(subjectKind), sp, sl, C.uint32_t(grant.kind), C.uint32_t(grant.cap), rp, rl, C.uint32_t(effect), pp, pl, gp, gl, &outID, &outOps)
+	if rc != 1 {
+		return nil, nil
+	}
+	return takeBuf(outID), takeBuf(outOps)
+}
+
+// ActorKey derives the doc-ACL actor key for a credential actor: the fixed 16-byte
+// SHA-256 truncation the server keys tuples by. Build an AclGrant SubjectActor
+// subject and its grantor from this so the authenticated actor — not an ephemeral
+// per-device id — is the matched ACL principal, identical across devices and after a
+// restart.
+func ActorKey(actor []byte) []byte {
+	ap, al := bytesArg(actor)
+	var out C.CrdtBuf
+	if C.crdtsync_actor_key(ap, al, &out) != 1 {
+		return nil
+	}
+	return takeBuf(out)
+}
+
+// AclRevoke tombstones the ACL tuple tupleID (16 bytes from AclGrant). Returns the
+// ops to broadcast; empty when tupleID names no tuple this replica holds or is
+// malformed.
+func (d *Document) AclRevoke(tupleID []byte) []byte {
+	ip, il := bytesArg(tupleID)
+	var out C.CrdtBuf
+	if C.crdtsync_doc_acl_revoke(d.h, ip, il, &out) < 0 {
+		return nil
+	}
+	return takeBuf(out)
+}
+
 // MarksAt reads the marks active on character index of the sequence at seqPath.
 func (d *Document) MarksAt(seqPath [][]byte, index uint) []Mark {
 	pp, pl := bytesArg(EncodePath(seqPath))
@@ -1398,6 +1491,31 @@ func (c *Client) MarkSetValue(channel uint32, markID []byte, value Scalar) []byt
 func (c *Client) MarkDelete(channel uint32, markID []byte) []byte {
 	mp, ml := bytesArg(markID)
 	return takeBuf(C.crdtsync_client_mark_delete(c.h, C.uint32_t(channel), mp, ml))
+}
+
+// AclGrant grants a doc-level ACL tuple in channel's room, routed through the
+// outbox. Same fields as Document.AclGrant. Returns the new tuple's 16-byte id and
+// the Ops frame to send; the id is nil when the channel isn't held.
+func (c *Client) AclGrant(channel uint32, subjectKind SubjectKind, subject []byte, grant Grant, effect Effect, path [][]byte, grantor []byte) (tupleID []byte, frame []byte) {
+	sp, sl := bytesArg(subject)
+	rp, rl := bytesArg(grant.role)
+	pp, pl := bytesArg(EncodePath(path))
+	gp, gl := bytesArg(grantor)
+	var outID C.CrdtBuf
+	frame = takeBuf(C.crdtsync_client_acl_grant(c.h, C.uint32_t(channel), C.uint32_t(subjectKind), sp, sl, C.uint32_t(grant.kind), C.uint32_t(grant.cap), rp, rl, C.uint32_t(effect), pp, pl, gp, gl, &outID))
+	id := takeBuf(outID)
+	if len(id) == 0 {
+		return nil, frame
+	}
+	return id, frame
+}
+
+// AclRevoke tombstones the ACL tuple tupleID in channel's room, routed through the
+// outbox. Returns the Ops frame to send; empty when the channel isn't held or the id
+// names no live tuple.
+func (c *Client) AclRevoke(channel uint32, tupleID []byte) []byte {
+	ip, il := bytesArg(tupleID)
+	return takeBuf(C.crdtsync_client_acl_revoke(c.h, C.uint32_t(channel), ip, il))
 }
 
 // --- schema + repair ---
