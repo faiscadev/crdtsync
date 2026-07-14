@@ -400,6 +400,16 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
             put_u32(out, tx.count);
         }
     }
+    // The zone dimension: a present-flag then the compact zone id, `None` (the
+    // root partition) costing a single byte so an unzoned document is barely
+    // heavier than before.
+    match op.zone {
+        None => put_u8(out, 0),
+        Some(zone) => {
+            put_u8(out, 1);
+            put_u32(out, zone);
+        }
+    }
 }
 
 // --- decode ---
@@ -783,12 +793,23 @@ impl<'a> Cursor<'a> {
             }),
             tag => return Err(DecodeError::BadTag { what: "tx", tag }),
         };
+        let zone = match self.u8()? {
+            0 => None,
+            1 => Some(self.u32()?),
+            tag => {
+                return Err(DecodeError::BadTag {
+                    what: "op zone",
+                    tag,
+                })
+            }
+        };
         Ok(Op {
             id: OpId { client, seq },
             stamp,
             target,
             kind,
             tx,
+            zone,
         })
     }
 }

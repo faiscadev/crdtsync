@@ -179,6 +179,47 @@ fn a_tx_id_round_trips() {
     assert_eq!(decode_op(&encode_op(&o)).unwrap(), o);
 }
 
+#[test]
+fn a_zone_dimension_round_trips() {
+    // The root partition (None) and a declared zone id both survive the codec.
+    let mut root = op(OpKind::MapDelete { key: b"k".to_vec() });
+    root.zone = None;
+    assert_eq!(decode_op(&encode_op(&root)).unwrap(), root);
+
+    let mut zoned = op(OpKind::MapSet {
+        key: b"k".to_vec(),
+        value: Scalar::Int(1),
+    });
+    zoned.zone = Some(3);
+    assert_eq!(decode_op(&encode_op(&zoned)).unwrap(), zoned);
+}
+
+#[test]
+fn a_truncated_zoned_op_is_an_error_not_a_panic() {
+    let mut o = op(OpKind::MapCreate { key: b"n".to_vec() });
+    o.zone = Some(42);
+    let bytes = encode_op(&o);
+    for cut in 0..bytes.len() {
+        assert_eq!(decode_op(&bytes[..cut]), Err(DecodeError::UnexpectedEof));
+    }
+}
+
+#[test]
+fn an_unknown_zone_present_flag_is_an_error() {
+    // The zone present-flag is the final byte an op with no tx encodes; a value
+    // past 1 names no shape and must be rejected, not misread.
+    let mut bytes = encode_op(&op(OpKind::MapCreate { key: b"n".to_vec() }));
+    let flag_at = bytes.len() - 1;
+    bytes[flag_at] = 7;
+    assert_eq!(
+        decode_op(&bytes),
+        Err(DecodeError::BadTag {
+            what: "op zone",
+            tag: 7,
+        })
+    );
+}
+
 // --- decoding is total ---
 
 #[test]
@@ -223,8 +264,9 @@ fn non_utf8_text_is_an_error() {
     });
     let mut bytes = encode_op(&good);
     // The string bytes are the two "ok" bytes near the end, before the anchor's
-    // two trailing tag bytes; corrupt the first of them to an invalid lead byte.
-    let s_at = bytes.len() - 4;
+    // two trailing tag bytes and the op's tx- and zone-flag bytes; corrupt the
+    // first of them to an invalid lead byte.
+    let s_at = bytes.len() - 5;
     bytes[s_at] = 0xFF;
     assert_eq!(decode_op(&bytes), Err(DecodeError::BadUtf8));
 }

@@ -43,17 +43,31 @@ fn is_prefix(root: &[Vec<u8>], path: &[Vec<u8>]) -> bool {
 /// do not) the first in declaration order wins, so resolution stays deterministic.
 /// Total on any key path.
 pub fn zone_of<'a>(schema: &'a Schema, path_keys: &[Vec<u8>]) -> Option<&'a str> {
-    let mut best: Option<(&str, usize)> = None;
-    for (name, root) in schema.zones() {
+    // The name of the zone the id resolves to — one longest-prefix walk, projected
+    // to its declared name rather than its index.
+    zone_id_of(schema, path_keys).map(|id| schema.zones()[id as usize].0.as_str())
+}
+
+/// The compact id of the zone a doc location falls in: the *index* of the
+/// resolved zone in the schema's [`zones()`](Schema::zones) declaration order, or
+/// `None` when the location is unzoned (the root partition). The id is a pure
+/// function of the order-preserving `zones()`, so every replica sharing the schema
+/// assigns the same partition to the same location. It is the op-envelope's zone
+/// dimension and the key of a per-zone lamport clock; the same longest-prefix rule
+/// as [`zone_of`] chooses which zone (and thus which id) wins. Total on any key
+/// path.
+pub fn zone_id_of(schema: &Schema, path_keys: &[Vec<u8>]) -> Option<u32> {
+    let mut best: Option<(u32, usize)> = None;
+    for (i, (_, root)) in schema.zones().iter().enumerate() {
         let root = root_keys(root);
         if is_prefix(&root, path_keys) {
             let len = root.len();
             if best.is_none_or(|(_, best_len)| len > best_len) {
-                best = Some((name.as_str(), len));
+                best = Some((i as u32, len));
             }
         }
     }
-    best.map(|(name, _)| name)
+    best.map(|(id, _)| id)
 }
 
 /// Whether two doc locations resolve to the same zone. Both in one zone, or both

@@ -8,7 +8,7 @@
 //! enforcement (forbidding a cross-zone tree move or anchor) consumes.
 
 use crdtsync_core::schema::Schema;
-use crdtsync_core::zone::{crosses_zones, same_zone, zone_of};
+use crdtsync_core::zone::{crosses_zones, same_zone, zone_id_of, zone_of};
 
 /// Build a schema carrying a `zones` block from a name→root-path JSON body.
 fn schema_with_zones(zones: &str) -> Schema {
@@ -179,4 +179,36 @@ fn the_resolver_is_total_on_any_key_path() {
     let _ = zone_of(&s, &deep);
     // Cross-zone detection is likewise total on any pair.
     assert!(!crosses_zones(&s, &[], &[]));
+}
+
+// --- compact zone ids (the op-envelope partition dimension) ---
+
+#[test]
+fn a_zone_id_is_its_declaration_index() {
+    // The compact id is the zone's position in the order-preserving `zones()`, so
+    // every replica sharing the schema keys the same partition the same way.
+    let s = schema_with_zones(r#"{ "a": "/x", "b": "/y", "c": "/z" }"#);
+    assert_eq!(zone_id_of(&s, &keys(&["x"])), Some(0));
+    assert_eq!(zone_id_of(&s, &keys(&["y", "deep"])), Some(1));
+    assert_eq!(zone_id_of(&s, &keys(&["z"])), Some(2));
+}
+
+#[test]
+fn an_unzoned_location_has_no_zone_id() {
+    let s = schema_with_zones(r#"{ "a": "/x" }"#);
+    assert_eq!(zone_id_of(&s, &keys(&["other"])), None);
+    assert_eq!(zone_id_of(&s, &[]), None);
+}
+
+#[test]
+fn the_zone_id_agrees_with_the_named_resolution() {
+    // The id resolves the same zone the name does — longest-prefix, innermost
+    // wins — just projected to the declaration index.
+    let s = schema_with_zones(r#"{ "outer": "/content", "inner": "/content/secret" }"#);
+    let deep = keys(&["content", "secret", "x"]);
+    assert_eq!(zone_of(&s, &deep), Some("inner"));
+    assert_eq!(zone_id_of(&s, &deep), Some(1));
+    let shallow = keys(&["content", "public"]);
+    assert_eq!(zone_of(&s, &shallow), Some("outer"));
+    assert_eq!(zone_id_of(&s, &shallow), Some(0));
 }
