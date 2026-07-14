@@ -47,7 +47,7 @@ pub use authz::{Action, Authorizer, PermitAll, Resource};
 pub use blobs::BlobStore;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use event::{EngineEvent, EventSink};
-pub use index::ElementPaths;
+pub use index::{ElementPaths, ElementTypes};
 pub use membership::{Membership, MembershipConfigError, DEFAULT_REPLICATION_FACTOR};
 pub use placement::{Cluster, NodeId};
 pub use registry::{ConnId, Registry};
@@ -1425,6 +1425,18 @@ impl Hub {
         self.rooms
             .get(room)
             .map(|r| index::element_paths(&r.doc))
+            .unwrap_or_default()
+    }
+
+    /// Project `room`'s document to `element id → declared type name` under
+    /// `schema` — the id→type resolution a type-scoped migration reads to narrow a
+    /// field rewrite to the elements of the step's declared type, the mirror of
+    /// [`element_zone`](Hub::element_zone). Empty for an unknown room. A consumer
+    /// resolving many ids builds it once and reads it across the fan-out.
+    pub fn element_types(&self, room: &[u8], schema: &Schema) -> ElementTypes {
+        self.rooms
+            .get(room)
+            .map(|r| index::element_types(&r.doc, schema))
             .unwrap_or_default()
     }
 

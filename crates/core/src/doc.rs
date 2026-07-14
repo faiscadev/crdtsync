@@ -515,6 +515,20 @@ impl Document {
     /// than mis-migrated as a leaf; faithful container-field migration is the
     /// deferred element-set-aware seam.
     pub fn migrate_leaf_slots(&mut self, fate: impl Fn(&[u8]) -> SlotFate) -> bool {
+        self.migrate_leaf_slots_scoped(|_, key| fate(key))
+    }
+
+    /// As [`migrate_leaf_slots`](Self::migrate_leaf_slots), but each slot's fate is
+    /// decided against its *owning map's* element id as well as its key — the seam a
+    /// type-scoped migration reads, so a field rewrite declared for one map type
+    /// narrows to that type's maps and leaves a same-named slot on another type
+    /// untouched. The op seam narrows the same way (an op's owning element is its
+    /// target map), so both converge. A `fate` that ignores the id is exactly
+    /// [`migrate_leaf_slots`](Self::migrate_leaf_slots).
+    pub fn migrate_leaf_slots_scoped(
+        &mut self,
+        fate: impl Fn(ElementId, &[u8]) -> SlotFate,
+    ) -> bool {
         let mut changed = false;
         let map_ids: Vec<ElementId> = self.maps.keys().copied().collect();
         for map_id in map_ids {
@@ -529,7 +543,7 @@ impl Document {
             let mut moved: Vec<LeafMove> = Vec::new();
             let keys = map.borrow().slot_keys();
             for key in keys {
-                let fate = match fate(&key) {
+                let fate = match fate(map_id, &key) {
                     SlotFate::Keep => continue,
                     other => other,
                 };

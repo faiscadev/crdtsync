@@ -928,6 +928,13 @@ impl Registry {
         let creator = self.hub.room_creator(room);
         let schema = self.governing_schema(room);
         let index = self.hub.element_paths(room);
+        // The owning-element type of each op, resolved once over the room document
+        // — a type-scoped migration step narrows to the ops whose owning element is
+        // of its declared type. Empty (no narrowing) when the room binds no schema.
+        let types = schema
+            .as_ref()
+            .map(|s| self.hub.element_types(room, s))
+            .unwrap_or_default();
         // Each op's document path is recipient-independent, so resolve it once.
         let op_paths: Vec<Vec<u8>> = broadcast
             .iter()
@@ -982,7 +989,7 @@ impl Registry {
                     if conn.session.app_id() == app && target != *from =>
                 {
                     match chains.as_ref().and_then(|c| c.get(&target)) {
-                        Some(Some(chain)) => chain.translate_ops(&readable),
+                        Some(Some(chain)) => chain.translate_ops_scoped(&readable, &types),
                         _ => Vec::new(),
                     }
                 }
@@ -1355,6 +1362,14 @@ impl Registry {
                     // resolved once (owned) so the peer loop can borrow the conns.
                     let schema = self.governing_schema(&room);
                     let authorizer = &*self.authorizer;
+                    // The owning-element type of each op, resolved once over the room
+                    // document, so a type-scoped migration step narrows to the ops
+                    // whose owning element is of its declared type. Empty (no
+                    // narrowing) when the room binds no schema.
+                    let types = schema
+                        .as_ref()
+                        .map(|s| self.hub.element_types(&room, s))
+                        .unwrap_or_default();
                     // Per-recipient migration translation rides the same seam as
                     // redaction. It is scoped to the room's governing app: the write
                     // is translated only when the writer speaks that app (its version
@@ -1380,7 +1395,7 @@ impl Registry {
                         .flatten()
                         .map(|(target, chain)| {
                             let ops = match chain {
-                                Some(chain) => chain.translate_ops(&broadcast),
+                                Some(chain) => chain.translate_ops_scoped(&broadcast, &types),
                                 None => Vec::new(),
                             };
                             (*target, ops)

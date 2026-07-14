@@ -427,9 +427,17 @@ pub fn step(
                             })
                             .collect()
                     };
+                    // The owning-element type of each delta op, resolved once over
+                    // the room document — a type-scoped migration step narrows to the
+                    // ops whose owning element is of its declared type, so the delta
+                    // joiner converges with a snapshot joiner. Empty (no narrowing)
+                    // when the room binds no schema.
+                    let types = schema
+                        .map(|s| hub.element_types(&room, s))
+                        .unwrap_or_default();
                     Message::Ops {
                         channel,
-                        ops: catch_up_ops(registry, governing, session, delta),
+                        ops: catch_up_ops(registry, governing, session, delta, &types),
                     }
                 }
                 // A snapshot is the whole materialized replica; redacting it needs a
@@ -454,7 +462,9 @@ pub fn step(
                     Message::Snapshot {
                         channel,
                         seq,
-                        state: catch_up_snapshot(registry, governing, session, high_water, state),
+                        state: catch_up_snapshot(
+                            registry, governing, session, high_water, state, schema,
+                        ),
                     }
                 }
             };
@@ -903,6 +913,7 @@ fn catch_up_ops(
     governing: Option<(&[u8], u32)>,
     session: &Session,
     delta: Vec<StoredOp>,
+    types: &crate::index::ElementTypes,
 ) -> Vec<Op> {
     match governing_target(governing, session) {
         Some((app, _, target)) => {
@@ -910,7 +921,7 @@ fn catch_up_ops(
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            crate::translate::translate_delta(&reg, app, delta, target)
+            crate::translate::translate_delta_scoped(&reg, app, delta, target, types)
         }
         None => delta.into_iter().map(|rec| rec.op).collect(),
     }
@@ -930,6 +941,7 @@ fn catch_up_snapshot(
     session: &Session,
     high_water: Option<u32>,
     state: Vec<u8>,
+    schema: Option<&Schema>,
 ) -> Vec<u8> {
     match (governing_target(governing, session), high_water) {
         (Some((app, _, target)), Some(high_water)) if high_water != target => {
@@ -937,7 +949,9 @@ fn catch_up_snapshot(
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            crate::translate::translate_snapshot(&reg, app, &state, high_water, target)
+            crate::translate::translate_snapshot_scoped(
+                &reg, app, &state, high_water, target, schema,
+            )
         }
         _ => state,
     }

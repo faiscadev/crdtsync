@@ -15,13 +15,13 @@
 use std::collections::{HashMap, HashSet};
 
 use crdtsync_core::doc::SlotFate;
-use crdtsync_core::migration::{
-    reachable_down, rewrite_down_along, rewrite_up_along, Migration, OpRewrite,
-};
+use crdtsync_core::migration::{reachable_down, Migration, OpRewrite, Step};
 use crdtsync_core::op::{OpId, OpKind, TxId};
+use crdtsync_core::schema::Schema;
 use crdtsync_core::stamp::Stamp;
 use crdtsync_core::{ClientId, Document, ElementId, Op, Scalar};
 
+use crate::index::{self, ElementTypes};
 use crate::schema_registry::SchemaRegistry;
 use crate::store::StoredOp;
 
@@ -83,15 +83,56 @@ pub fn resolve_chain(
 }
 
 impl Chain {
-    /// Rewrite one op along this resolved path. A down chain is only ever built
-    /// when reachable, so the inverse rewrite is always defined.
+    /// Rewrite one op along this resolved path, without type narrowing — every
+    /// field step acts by key, the field-name-unique behaviour. A down chain is
+    /// only ever built when reachable, so the inverse rewrite is always defined.
     pub fn translate_op(&self, op: &Op) -> OpRewrite {
+        self.translate_op_scoped(op, None)
+    }
+
+    /// Rewrite one op along this resolved path, narrowing each field step to the
+    /// op's owning element type. A field step (declared for a map type) rewrites
+    /// the op only when `owning_type` matches its declared type; a step for
+    /// another type is inert for this op, which passes at its key unchanged. An
+    /// unresolved owning type (`None`) applies every step by key — the fallback
+    /// that preserves the field-name-unique common case. Type steps carry no field
+    /// scope and always apply (their per-op rewrite is already inert). The op's
+    /// owning element is invariant across the chain (a rewrite only re-keys or
+    /// drops, never re-targets), so its type is resolved once by the caller.
+    fn translate_op_scoped(&self, op: &Op, owning_type: Option<&str>) -> OpRewrite {
+        let mut current = op.clone();
         if self.up {
-            rewrite_up_along(&self.edges, op)
+            for edge in &self.edges {
+                for step in edge.steps() {
+                    if !step_applies(step, owning_type) {
+                        continue;
+                    }
+                    match step.rewrite_up(&current) {
+                        OpRewrite::Keep(next) => current = next,
+                        OpRewrite::Drop => return OpRewrite::Drop,
+                    }
+                }
+            }
         } else {
-            rewrite_down_along(&self.edges, op)
-                .expect("a resolved down chain is reachable, so every op inverts")
+            // A down chain inverts top-first and step-last-first; it is only ever
+            // built when reachable (every edge back-compatible), so each applicable
+            // step's inverse is defined.
+            for edge in self.edges.iter().rev() {
+                for step in edge.steps().iter().rev() {
+                    if !step_applies(step, owning_type) {
+                        continue;
+                    }
+                    match step
+                        .rewrite_down(&current)
+                        .expect("a resolved down chain is reachable, so every step inverts")
+                    {
+                        OpRewrite::Keep(next) => current = next,
+                        OpRewrite::Drop => return OpRewrite::Drop,
+                    }
+                }
+            }
         }
+        OpRewrite::Keep(current)
     }
 
     /// The fate of a leaf slot at `key` under this chain — the state-level image
@@ -100,7 +141,15 @@ impl Chain {
     /// keep a [`SlotFate::Keep`]. Drives the snapshot migration exactly as the
     /// op-rewrite drives the live/catch-up seam, so the two converge.
     pub fn translate_key(&self, key: &[u8]) -> SlotFate {
-        match self.translate_op(&key_probe(key)) {
+        self.translate_key_scoped(key, None)
+    }
+
+    /// [`translate_key`](Self::translate_key), narrowing each field step to the
+    /// slot's owning map type — the state-level image of
+    /// [`translate_op_scoped`](Self::translate_op_scoped), so the snapshot seam
+    /// narrows byte-identically with the op seam.
+    fn translate_key_scoped(&self, key: &[u8], owning_type: Option<&str>) -> SlotFate {
+        match self.translate_op_scoped(&key_probe(key), owning_type) {
             OpRewrite::Drop => SlotFate::Drop,
             OpRewrite::Keep(out) => match out.kind {
                 OpKind::MapSet { key: rekeyed, .. } if rekeyed != key => SlotFate::Rename(rekeyed),
@@ -140,13 +189,24 @@ impl Chain {
     /// [`ListCreate`]: crdtsync_core::OpKind::ListCreate
     /// [`TextCreate`]: crdtsync_core::OpKind::TextCreate
     pub fn translate_ops(&self, ops: &[Op]) -> Vec<Op> {
+        self.translate_ops_scoped(ops, &ElementTypes::new())
+    }
+
+    /// [`translate_ops`](Self::translate_ops), narrowing each field step to the
+    /// owning element type of the op it acts on. An op's owning element is its
+    /// target map; `types` resolves that map's declared type (built once over the
+    /// room document). An op whose target `types` does not resolve is rewritten by
+    /// key, the field-name-unique fallback. An empty `types` map narrows nothing —
+    /// exactly [`translate_ops`](Self::translate_ops).
+    pub fn translate_ops_scoped(&self, ops: &[Op], types: &ElementTypes) -> Vec<Op> {
         let rewritten: Vec<OpRewrite> = ops
             .iter()
             .map(|op| {
                 if op.kind.creates_container() {
                     OpRewrite::Keep(op.clone())
                 } else {
-                    self.translate_op(op)
+                    let owning_type = types.get(&op.target).map(String::as_str);
+                    self.translate_op_scoped(op, owning_type)
                 }
             })
             .collect();
@@ -230,6 +290,21 @@ pub fn translate_delta(
     delta: Vec<StoredOp>,
     to: u32,
 ) -> Vec<Op> {
+    translate_delta_scoped(reg, app_id, delta, to, &ElementTypes::new())
+}
+
+/// [`translate_delta`], narrowing each field step to the owning element type of
+/// the op it acts on — `types` resolves an op's target map to its declared type
+/// (built once over the room document), so a rename scoped to one map type leaves
+/// a same-named slot on another type untouched, converging with the snapshot
+/// seam. An empty `types` map narrows nothing.
+pub fn translate_delta_scoped(
+    reg: &SchemaRegistry,
+    app_id: &[u8],
+    delta: Vec<StoredOp>,
+    to: u32,
+    types: &ElementTypes,
+) -> Vec<Op> {
     let mut out = Vec::new();
     let mut chains: HashMap<u32, Option<Chain>> = HashMap::new();
     let mut records = delta.into_iter().peekable();
@@ -248,7 +323,7 @@ pub fn translate_delta(
                     .entry(from)
                     .or_insert_with(|| resolve_chain(reg, app_id, from, to).ok());
                 if let Some(chain) = chain {
-                    out.extend(chain.translate_ops(&run));
+                    out.extend(chain.translate_ops_scoped(&run, types));
                 }
             }
             _ => out.extend(run),
@@ -275,6 +350,24 @@ pub fn translate_snapshot(
     from: u32,
     to: u32,
 ) -> Vec<u8> {
+    translate_snapshot_scoped(reg, app_id, state, from, to, None)
+}
+
+/// [`translate_snapshot`], narrowing each leaf-slot rewrite to its owning map's
+/// declared type under `schema`. The type projection is resolved over the decoded
+/// snapshot tree itself — the same tree the op seam projects — so a type-scoped
+/// rename re-keys a slot on the step's type and leaves a same-named slot on
+/// another type verbatim, byte-identically with the op seam. `None` schema (a
+/// relay room, or one with no bound schema) narrows nothing, the field-name-unique
+/// key-based fallback.
+pub fn translate_snapshot_scoped(
+    reg: &SchemaRegistry,
+    app_id: &[u8],
+    state: &[u8],
+    from: u32,
+    to: u32,
+    schema: Option<&Schema>,
+) -> Vec<u8> {
     if from == to {
         return state.to_vec();
     }
@@ -286,10 +379,38 @@ pub fn translate_snapshot(
         Ok(doc) => doc,
         Err(_) => return state.to_vec(),
     };
-    if doc.migrate_leaf_slots(|key| chain.translate_key(key)) {
+    let types = schema
+        .map(|s| index::element_types(&doc, s))
+        .unwrap_or_default();
+    let changed = doc.migrate_leaf_slots_scoped(|map_id, key| {
+        chain.translate_key_scoped(key, types.get(&map_id).map(String::as_str))
+    });
+    if changed {
         doc.encode_state()
     } else {
         state.to_vec()
+    }
+}
+
+/// The map type a field step is declared for, or `None` for a type step (which
+/// carries no field scope and always applies — its per-op rewrite is inert).
+fn field_scope(step: &Step) -> Option<&str> {
+    match step {
+        Step::AddField { ty, .. } | Step::RemoveField { ty, .. } | Step::RenameField { ty, .. } => {
+            Some(ty.as_str())
+        }
+        Step::AddType { .. } | Step::RemoveType { .. } | Step::RenameType { .. } => None,
+    }
+}
+
+/// Whether `step`'s rewrite applies to an op whose owning element is of
+/// `owning_type`. A field step applies only when the owning type resolves to the
+/// step's declared type; an unresolved owning type (`None`) applies every step by
+/// key, the field-name-unique fallback. A type step always applies.
+fn step_applies(step: &Step, owning_type: Option<&str>) -> bool {
+    match (field_scope(step), owning_type) {
+        (Some(scope), Some(ty)) => scope == ty,
+        _ => true,
     }
 }
 
