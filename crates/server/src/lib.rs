@@ -26,6 +26,7 @@ pub mod blobs;
 pub mod clock;
 pub mod event;
 pub mod gossip;
+pub mod index;
 pub mod leadership;
 pub mod membership;
 pub mod placement;
@@ -46,6 +47,7 @@ pub use authz::{Action, Authorizer, PermitAll, Resource};
 pub use blobs::BlobStore;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use event::{EngineEvent, EventSink};
+pub use index::ElementPaths;
 pub use membership::{Membership, MembershipConfigError, DEFAULT_REPLICATION_FACTOR};
 pub use placement::{Cluster, NodeId};
 pub use registry::{ConnId, Registry};
@@ -279,7 +281,11 @@ struct BranchLog {
 /// items, and an XML element's attrs map, children list, and nested element/text
 /// children. A leaf (scalar / register / counter) holds no container and is not
 /// indexed; an op on a leaf slot targets the map that keys it, already indexed.
-fn index_container(elem: &Element, path: &[Vec<u8>], out: &mut HashMap<ElementId, Vec<Vec<u8>>>) {
+pub(crate) fn index_container(
+    elem: &Element,
+    path: &[Vec<u8>],
+    out: &mut HashMap<ElementId, Vec<Vec<u8>>>,
+) {
     match elem {
         Element::Map(m) => {
             let m = m.borrow();
@@ -1415,12 +1421,38 @@ impl Hub {
     /// composite annotation payload) resolves to the root by
     /// [`op_read_path`](crate::acl::op_read_path), so only a whole-document reader
     /// carries it. Empty for an unknown room.
-    pub fn element_paths(&self, room: &[u8]) -> HashMap<ElementId, Vec<Vec<u8>>> {
-        let mut out = HashMap::new();
-        if let Some(r) = self.rooms.get(room) {
-            index_container(&Element::Map(r.doc.root()), &[], &mut out);
-        }
-        out
+    pub fn element_paths(&self, room: &[u8]) -> ElementPaths {
+        self.rooms
+            .get(room)
+            .map(|r| index::element_paths(&r.doc))
+            .unwrap_or_default()
+    }
+
+    /// The zone element `id` falls in in `room` under `schema`, or `None` when it
+    /// is unzoned, unknown, or the schema declares no zones — the id → zone
+    /// resolution the zone features read. Projects the room's document per call;
+    /// a consumer resolving many ids builds [`element_paths`](Hub::element_paths)
+    /// once and reads [`index::zone_of`] against it.
+    pub fn element_zone<'a>(
+        &self,
+        room: &[u8],
+        schema: &'a Schema,
+        id: ElementId,
+    ) -> Option<&'a str> {
+        let paths = self.element_paths(room);
+        index::zone_of(&paths, schema, id)
+    }
+
+    /// Whether `ops` carries an `XmlMove` that crosses a zone boundary in `room`
+    /// under `schema` — a moved node whose zone the batch changes. The crossing is
+    /// not detectable from the post-move tree, so the op-submit gate calls this
+    /// before the ops commit and refuses such a batch; the op then never enters the
+    /// log, so every replica converges on its absence. `false` for an unknown room,
+    /// a batch that moves nothing, or a schema with no zones.
+    pub fn batch_crosses_zone(&self, room: &[u8], ops: &[Op], schema: &Schema) -> bool {
+        self.rooms
+            .get(room)
+            .is_some_and(|r| index::batch_crosses_zone(&r.doc, ops, schema))
     }
 
     /// The authenticated actor that created `room` — its doc-ACL authority root — or
