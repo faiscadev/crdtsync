@@ -862,6 +862,102 @@ impl Registry {
             .collect()
     }
 
+    /// Fan a committed op batch out to `(room, branch)`'s subscribers with
+    /// per-recipient doc-ACL redaction: each recipient receives only the ops in
+    /// subtrees its actor may read, the rest silently withheld from *it* while an
+    /// authorized peer still gets them. The room's creator (owns `/`) reads every
+    /// op; a subtree-scoped reader receives just its granted subtrees.
+    ///
+    /// Redaction runs on the *authored* ops (their target resolves through the
+    /// room's element-path index), then the surviving subset is migration-translated
+    /// to each recipient's version — redact-then-translate, since translation can
+    /// drop ops and would otherwise desync the path lookup. An op whose target the
+    /// index cannot resolve reads at the root ([`op_read_path`](crate::acl::op_read_path)),
+    /// so only a whole-document reader carries it — never a subtree-scoped one.
+    fn fan_out_ops_redacted(
+        &mut self,
+        writer: ConnId,
+        room: &[u8],
+        branch: &[u8],
+        broadcast: &[Op],
+        broadcast_version: Option<u32>,
+        records: Vec<crdtsync_core::acl::AclRecord>,
+    ) {
+        let creator = self.hub.room_creator(room);
+        let schema = self.governing_schema(room);
+        let index = self.hub.element_paths(room);
+        // Each op's document path is recipient-independent, so resolve it once.
+        let op_paths: Vec<Vec<u8>> = broadcast
+            .iter()
+            .map(|op| crate::acl::op_read_path(&index, op))
+            .collect();
+        // Migration translation rides the same seam as redaction (scoped to the
+        // room's governing app); resolve each distinct target's chain once.
+        let source = self.translation_source(room, &writer, broadcast_version);
+        let chains = source
+            .as_ref()
+            .map(|(app, from)| self.resolve_chains(&writer, app, *from));
+        let authorizer = &*self.authorizer;
+        for (peer, conn) in self.conns.iter_mut() {
+            if *peer == writer {
+                continue;
+            }
+            let Some(identity) = conn.session.identity() else {
+                continue;
+            };
+            // Keep the authored ops whose path this recipient may read. The read
+            // verdict depends only on the path, so a batch touching one subtree
+            // resolves once — memoized per distinct path to avoid re-hashing the
+            // actor per op.
+            let mut verdict: HashMap<&[u8], bool> = HashMap::new();
+            let readable: Vec<Op> = broadcast
+                .iter()
+                .zip(&op_paths)
+                .filter_map(|(op, path)| {
+                    let ok = *verdict.entry(path).or_insert_with(|| {
+                        crate::acl::recipient_reads_path(
+                            authorizer,
+                            &records,
+                            creator.as_deref(),
+                            schema.as_deref(),
+                            identity,
+                            room,
+                            path,
+                        )
+                    });
+                    ok.then(|| op.clone())
+                })
+                .collect();
+            if readable.is_empty() {
+                continue;
+            }
+            // Translate the surviving subset to the recipient's version, or send it
+            // verbatim (a same-version, relay, or foreign-app recipient). An
+            // unresolved chain drops the batch, fail-closed, pending the handshake
+            // range-check that refuses that recipient outright.
+            let translated = match (&source, conn.session.schema_version()) {
+                (Some((app, from)), Some(target))
+                    if conn.session.app_id() == app && target != *from =>
+                {
+                    match chains.as_ref().and_then(|c| c.get(&target)) {
+                        Some(Some(chain)) => chain.translate_ops(&readable),
+                        _ => Vec::new(),
+                    }
+                }
+                _ => readable,
+            };
+            if translated.is_empty() {
+                continue;
+            }
+            for channel in conn.session.channels_for_stream(room, branch) {
+                conn.outbox.push(Message::Ops {
+                    channel,
+                    ops: translated.clone(),
+                });
+            }
+        }
+    }
+
     /// Bind `room`'s governing schema to `{app_id, version}`. The first app to
     /// bind a room governs it — a later subscribe naming a *different* app is
     /// ignored, so a room is never re-governed by a foreign app's (shorter) TTL.
@@ -1196,74 +1292,91 @@ impl Registry {
             // always names both, so a branch write reaches only that branch's
             // subscribers and never crosses into another branch's stream.
             if let (Some(room), Some(branch)) = (room, broadcast_branch) {
-                // The room's governing schema gates each peer's read consistently,
-                // resolved once (owned) so the peer loop can borrow the conns.
-                let schema = self.governing_schema(&room);
-                let authorizer = &*self.authorizer;
-                // Per-recipient migration translation rides the same seam as
-                // redaction. It is scoped to the room's governing app: the write
-                // is translated only when the writer speaks that app (its version
-                // number lives in that app's space), and only to recipients of
-                // that app — a foreign-app connection's version is a different
-                // space and must never drive the room's chain.
-                let source = self.translation_source(&room, &id, broadcast_version);
-                // Resolve every distinct target version's chain up front, holding
-                // the registry lock only for that (not across the fan-out), then
-                // translate the peer loop against the owned, parsed chains.
-                let chains = source
-                    .as_ref()
-                    .map(|(app, from)| self.resolve_chains(&id, app, *from));
-                // Translate the batch once per distinct target version — the
-                // rewrite depends only on the version, not the recipient, so a
-                // same-version fleet shares one result. A resolved chain
-                // translates; an unresolved one (unreachable / gapped /
-                // unparseable) yields an empty batch, dropping it for that
-                // target's recipients pending the handshake range-check that
-                // refuses them outright.
-                let translated_by_target: HashMap<u32, Vec<Op>> = chains
-                    .iter()
-                    .flatten()
-                    .map(|(target, chain)| {
-                        let ops = match chain {
-                            Some(chain) => chain.translate_ops(&broadcast),
-                            None => Vec::new(),
-                        };
-                        (*target, ops)
-                    })
-                    .collect();
-                for (peer, conn) in self.conns.iter_mut() {
-                    if *peer == id {
-                        continue;
-                    }
-                    // Per-recipient redaction: a peer whose read was revoked
-                    // mid-session stops receiving the room's ops at once, without
-                    // waiting for it to resubscribe.
-                    if !peer_may_read(authorizer, schema.as_deref(), &conn.session, &room) {
-                        continue;
-                    }
-                    // Translate to the recipient's version, or send verbatim when
-                    // there is nothing to bridge — a same-version, relay, or
-                    // foreign-app recipient, or a relay write.
-                    let translated = match (&source, conn.session.schema_version()) {
-                        (Some((app, from)), Some(target))
-                            if conn.session.app_id() == app && target != *from =>
-                        {
-                            // Total over every eligible recipient: `resolve_chains`
-                            // keyed the memo on this same (same-app, target != from)
-                            // predicate, so the target is always present.
-                            Some(translated_by_target[&target].as_slice())
+                // A room with live doc-ACL tuples redacts per-recipient by the op's
+                // document path — a recipient receives only the ops in subtrees its
+                // actor may read. A room with none (the `else`) fans out unredacted:
+                // the whole-document read gate plus per-target migration translation,
+                // no path walk.
+                let records = self.hub.acl_records(&room);
+                if !records.is_empty() {
+                    self.fan_out_ops_redacted(
+                        id,
+                        &room,
+                        &branch,
+                        &broadcast,
+                        broadcast_version,
+                        records,
+                    );
+                } else {
+                    // The room's governing schema gates each peer's read consistently,
+                    // resolved once (owned) so the peer loop can borrow the conns.
+                    let schema = self.governing_schema(&room);
+                    let authorizer = &*self.authorizer;
+                    // Per-recipient migration translation rides the same seam as
+                    // redaction. It is scoped to the room's governing app: the write
+                    // is translated only when the writer speaks that app (its version
+                    // number lives in that app's space), and only to recipients of
+                    // that app — a foreign-app connection's version is a different
+                    // space and must never drive the room's chain.
+                    let source = self.translation_source(&room, &id, broadcast_version);
+                    // Resolve every distinct target version's chain up front, holding
+                    // the registry lock only for that (not across the fan-out), then
+                    // translate the peer loop against the owned, parsed chains.
+                    let chains = source
+                        .as_ref()
+                        .map(|(app, from)| self.resolve_chains(&id, app, *from));
+                    // Translate the batch once per distinct target version — the
+                    // rewrite depends only on the version, not the recipient, so a
+                    // same-version fleet shares one result. A resolved chain
+                    // translates; an unresolved one (unreachable / gapped /
+                    // unparseable) yields an empty batch, dropping it for that
+                    // target's recipients pending the handshake range-check that
+                    // refuses them outright.
+                    let translated_by_target: HashMap<u32, Vec<Op>> = chains
+                        .iter()
+                        .flatten()
+                        .map(|(target, chain)| {
+                            let ops = match chain {
+                                Some(chain) => chain.translate_ops(&broadcast),
+                                None => Vec::new(),
+                            };
+                            (*target, ops)
+                        })
+                        .collect();
+                    for (peer, conn) in self.conns.iter_mut() {
+                        if *peer == id {
+                            continue;
                         }
-                        _ => None,
-                    };
-                    let ops = translated.unwrap_or(&broadcast);
-                    if ops.is_empty() {
-                        continue;
-                    }
-                    for channel in conn.session.channels_for_stream(&room, &branch) {
-                        conn.outbox.push(Message::Ops {
-                            channel,
-                            ops: ops.to_vec(),
-                        });
+                        // Per-recipient redaction: a peer whose read was revoked
+                        // mid-session stops receiving the room's ops at once, without
+                        // waiting for it to resubscribe.
+                        if !peer_may_read(authorizer, schema.as_deref(), &conn.session, &room) {
+                            continue;
+                        }
+                        // Translate to the recipient's version, or send verbatim when
+                        // there is nothing to bridge — a same-version, relay, or
+                        // foreign-app recipient, or a relay write.
+                        let translated = match (&source, conn.session.schema_version()) {
+                            (Some((app, from)), Some(target))
+                                if conn.session.app_id() == app && target != *from =>
+                            {
+                                // Total over every eligible recipient: `resolve_chains`
+                                // keyed the memo on this same (same-app, target != from)
+                                // predicate, so the target is always present.
+                                Some(translated_by_target[&target].as_slice())
+                            }
+                            _ => None,
+                        };
+                        let ops = translated.unwrap_or(&broadcast);
+                        if ops.is_empty() {
+                            continue;
+                        }
+                        for channel in conn.session.channels_for_stream(&room, &branch) {
+                            conn.outbox.push(Message::Ops {
+                                channel,
+                                ops: ops.to_vec(),
+                            });
+                        }
                     }
                 }
             }

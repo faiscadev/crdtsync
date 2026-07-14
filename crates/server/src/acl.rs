@@ -14,14 +14,17 @@
 //! [`authorized`] composes that abstain with the room's governing schema `@auth`
 //! grants (decision-flow step 4) and a terminal default-deny.
 
+use std::collections::HashMap;
+
 use crdtsync_core::acl::{
     decide_capability_with_authority, AclActor, AclDecision, AclRecord, Capability,
 };
+use crdtsync_core::path::encode_path;
 use crdtsync_core::schema::{
     Action as SchemaAction, Auth, Effect as GrantEffect, Schema, Subject as GrantSubject,
     SubjectClass,
 };
-use crdtsync_core::ClientId;
+use crdtsync_core::{ClientId, ElementId, Op, OpKind};
 use sha2::{Digest, Sha256};
 
 use crate::auth::Identity;
@@ -512,23 +515,203 @@ pub fn doc_acl_tier(
     let Some(capability) = capability_for(action) else {
         return Decision::Abstain;
     };
-    // No creator ⇒ no authority root, and (since a tuple is authored by a write,
-    // which establishes the creator) no tuples either: the tier holds no opinion.
+    doc_acl_at(records, creator, identity, &root_path(), capability)
+}
+
+/// The doc-ACL tuple tier's verdict on whether `identity` holds `capability` at
+/// `path`, over the room's live `records` and `creator` — the one resolver both the
+/// root-scoped write/read gate ([`doc_acl_tier`]) and the per-path read redaction
+/// ([`doc_acl_read_at`]) share, so a single change to how a doc-ACL verdict resolves
+/// cannot let the two enforcement points drift. A room with no creator holds no
+/// authority root (and, since a tuple is authored by a write that establishes the
+/// creator, no tuples either), so it abstains.
+fn doc_acl_at(
+    records: &[AclRecord],
+    creator: Option<&[u8]>,
+    identity: &Identity,
+    path: &[u8],
+    capability: Capability,
+) -> Decision {
     let Some(creator) = creator else {
         return Decision::Abstain;
     };
     let actor = actor_acl(identity);
-    let decision = decide_capability_with_authority(
-        records,
-        actor_key(creator),
-        &actor,
-        &root_path(),
-        capability,
-    );
-    match decision {
+    match decide_capability_with_authority(records, actor_key(creator), &actor, path, capability) {
         AclDecision::Allow => Decision::Allow,
         AclDecision::Deny => Decision::Deny,
         AclDecision::Abstain => Decision::Abstain,
+    }
+}
+
+/// The doc-ACL tuple tier's **Read** verdict for `identity` at `path`, over the
+/// room's live `records` and `creator` — the per-path form the outbound fan-out and
+/// catch-up redaction evaluate against each op's document path. The creator owns `/`
+/// and so reads every path; a room with no creator abstains (no authority root).
+/// Mirrors [`doc_acl_tier`] but at an arbitrary path with [`Capability::Read`].
+pub fn doc_acl_read_at(
+    records: &[AclRecord],
+    creator: Option<&[u8]>,
+    identity: &Identity,
+    path: &[u8],
+) -> Decision {
+    doc_acl_at(records, creator, identity, path, Capability::Read)
+}
+
+/// Whether `identity` holds doc-ACL read on the room at *any* path — the room's
+/// creator (owns `/`), or the subject of a rooted read/own grant on some subtree.
+/// The room-connect read gate widens to this: a subtree-scoped reader that abstains
+/// at the root must still be admitted to subscribe, since the per-op redaction then
+/// serves it exactly the subtrees it is granted. Empty/creatorless rooms hold no
+/// such grant, so the gate falls back to the deployment/schema decision unchanged.
+pub fn has_any_read_grant(
+    records: &[AclRecord],
+    creator: Option<&[u8]>,
+    identity: &Identity,
+) -> bool {
+    let Some(creator) = creator else {
+        return false;
+    };
+    let creator_key = actor_key(creator);
+    let actor = actor_acl(identity);
+    if actor.id == creator_key {
+        return true;
+    }
+    let mut paths: Vec<&[u8]> = records.iter().map(|r| r.tuple.path.as_slice()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths.into_iter().any(|path| {
+        matches!(
+            decide_capability_with_authority(records, creator_key, &actor, path, Capability::Read),
+            AclDecision::Allow
+        )
+    })
+}
+
+/// Whether `identity` may read the document `op_path`, composing the doc-ACL read
+/// tier at that path with the deployment and schema tiers exactly as the write gate
+/// composes — the per-recipient outbound read check. A recipient is served an op
+/// only when this holds for the op's path, so an unauthorized subtree's ops are
+/// withheld from it while an authorized peer still receives them.
+pub fn recipient_reads_path(
+    deployment: &dyn Authorizer,
+    records: &[AclRecord],
+    creator: Option<&[u8]>,
+    schema: Option<&Schema>,
+    identity: &Identity,
+    room: &[u8],
+    op_path: &[u8],
+) -> bool {
+    let doc_acl = doc_acl_read_at(records, creator, identity, op_path);
+    authorized(
+        deployment,
+        doc_acl,
+        schema,
+        identity,
+        Action::Read,
+        &Resource::Room(room),
+    )
+}
+
+/// Whether `identity` may read the **entire** document — the gate for serving it an
+/// unredacted whole-replica snapshot. Whole-document root read is necessary but not
+/// sufficient: a downstream `Deny(Read)` (or `Deny(Own)`) carves a subtree out of an
+/// otherwise whole-document grant — the AWS-style deny the model supports — and a
+/// root-only check cannot see it, since a descendant deny does not `govern` the root
+/// query. So this also re-checks read at every governing tuple path and treats a
+/// reader denied at any of them as **partial**: it is refused the snapshot rather
+/// than served a carved-out subtree the per-op fan-out correctly withholds.
+///
+/// A deployment read-*allow* is terminal — it grants the whole room regardless of
+/// any doc-ACL deny, and the per-op fan-out is then equally unredacted for the
+/// reader — so it needs no carve-out scan. A creatorless room has no doc-ACL
+/// authority (only the deployment/schema gate spoke), so root read is the whole
+/// answer.
+pub fn reads_whole_document(
+    deployment: &dyn Authorizer,
+    records: &[AclRecord],
+    creator: Option<&[u8]>,
+    schema: Option<&Schema>,
+    identity: &Identity,
+    room: &[u8],
+) -> bool {
+    let root = encode_path(&[]);
+    if !recipient_reads_path(deployment, records, creator, schema, identity, room, &root) {
+        return false;
+    }
+    if matches!(
+        deployment.decide(identity, Action::Read, &Resource::Room(room)),
+        Decision::Allow
+    ) {
+        return true;
+    }
+    let Some(creator) = creator else {
+        return true;
+    };
+    // Root read here is doc-ACL-granted (a root grant or the creator). Any effective
+    // read-deny at a governing tuple path is a subtree carve-out, so the reader does
+    // not read the whole document.
+    let actor = actor_acl(identity);
+    let creator_key = actor_key(creator);
+    let mut paths: Vec<&[u8]> = records.iter().map(|r| r.tuple.path.as_slice()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    !paths.into_iter().any(|path| {
+        matches!(
+            decide_capability_with_authority(records, creator_key, &actor, path, Capability::Read),
+            AclDecision::Deny
+        )
+    })
+}
+
+/// The document path an op reads — the `core::path` key sequence its target
+/// resolves to, for the per-recipient read redaction. `index` maps each live
+/// container element id to its key path (see
+/// [`Hub::element_paths`](crate::Hub::element_paths)); a keyed op appends its slot
+/// key, an id-addressed op takes its target container's own path.
+///
+/// An op whose target the index does not resolve — a since-deleted container, a
+/// composite annotation payload the walk does not enter — resolves to the **root**,
+/// so only a whole-document reader carries it. Root is the strictest read authority
+/// (it governs no narrower than `/`), so an unresolved op never leaks to a
+/// subtree-scoped reader, yet a whole-document reader (the creator, a root grantee)
+/// still receives it and stays convergent. A doc-level op (an ACL grant/revoke, a
+/// RangedElement annotation) has no map path and likewise resolves to the root.
+pub fn op_read_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, op: &Op) -> Vec<u8> {
+    let root = || encode_path(&[]);
+    let encode =
+        |segs: &[Vec<u8>]| encode_path(&segs.iter().map(|s| s.as_slice()).collect::<Vec<_>>());
+    match &op.kind {
+        // A keyed op addresses a slot in its target map: the target's path plus key.
+        OpKind::RegisterSet { key, .. }
+        | OpKind::CounterInc { key, .. }
+        | OpKind::CounterDec { key, .. }
+        | OpKind::MapSet { key, .. }
+        | OpKind::MapDelete { key }
+        | OpKind::MapCreate { key }
+        | OpKind::ListCreate { key }
+        | OpKind::TextCreate { key }
+        | OpKind::XmlElementCreate { key, .. }
+        | OpKind::XmlFragmentCreate { key } => match index.get(&op.target) {
+            Some(base) => {
+                let mut segs = base.clone();
+                segs.push(key.clone());
+                encode(&segs)
+            }
+            None => root(),
+        },
+        // An id-addressed op mutates its target container in place: its own path.
+        OpKind::ListInsert { .. }
+        | OpKind::ListDelete { .. }
+        | OpKind::TextInsert { .. }
+        | OpKind::TextDelete { .. }
+        | OpKind::XmlInsertChild { .. }
+        | OpKind::XmlMove { .. } => index.get(&op.target).map_or_else(root, |segs| encode(segs)),
+        // Doc-level state carries no map path — governed by whole-document read.
+        OpKind::RangedCreate { .. }
+        | OpKind::RangedSetPayload { .. }
+        | OpKind::RangedDelete { .. }
+        | OpKind::AclGrant { .. }
+        | OpKind::AclRevoke { .. } => root(),
     }
 }
 
