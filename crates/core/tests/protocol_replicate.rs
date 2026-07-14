@@ -1,9 +1,10 @@
 //! The `Replicate` and `ReplicaAck` wire frames — a room's leader fanning its
 //! committed ops to a follower replica, and the follower's watermark reply.
 //!
-//! `Replicate { room, branch, ops, base_seq }` carries a length-framed room and
-//! branch, the leader's compaction floor, then the op batch, which reuses the op
-//! codec and consumes the frame's remainder. `ReplicaAck { room, through_seq }`
+//! `Replicate { room, branch, ops, base_seq, epoch }` carries a length-framed
+//! room and branch, the leader's compaction floor, its leadership epoch, then the
+//! op batch, which reuses the op codec and consumes the frame's remainder.
+//! `ReplicaAck { room, through_seq }`
 //! reports the server sequence the follower has reached. Both are node-to-node,
 //! never client frames. Decoding is total — a truncation or trailing byte is a
 //! `ProtocolError`, never a panic.
@@ -55,6 +56,26 @@ fn replicate_round_trips() {
         branch: b"main".to_vec(),
         ops: sample_ops(),
         base_seq: 9,
+        epoch: 4,
+    });
+}
+
+#[test]
+fn replicate_round_trips_the_epoch() {
+    // The leadership epoch is carried verbatim across the wire, at its extremes.
+    round_trips(Message::Replicate {
+        room: b"room-42".to_vec(),
+        branch: b"main".to_vec(),
+        ops: sample_ops(),
+        base_seq: 1,
+        epoch: 0,
+    });
+    round_trips(Message::Replicate {
+        room: b"room-42".to_vec(),
+        branch: b"main".to_vec(),
+        ops: sample_ops(),
+        base_seq: 1,
+        epoch: u64::MAX,
     });
 }
 
@@ -65,6 +86,7 @@ fn replicate_round_trips_an_empty_room() {
         branch: b"main".to_vec(),
         ops: sample_ops(),
         base_seq: 0,
+        epoch: 1,
     });
 }
 
@@ -75,6 +97,7 @@ fn replicate_round_trips_an_empty_branch() {
         branch: Vec::new(),
         ops: sample_ops(),
         base_seq: 3,
+        epoch: 7,
     });
 }
 
@@ -85,6 +108,7 @@ fn replicate_round_trips_an_empty_batch() {
         branch: b"main".to_vec(),
         ops: Vec::new(),
         base_seq: 0,
+        epoch: 2,
     });
 }
 
@@ -95,21 +119,24 @@ fn replicate_round_trips_a_binary_room_and_branch() {
         branch: vec![0xFF, 0x00, 0x80, 0x7F],
         ops: sample_ops(),
         base_seq: u64::MAX,
+        epoch: u64::MAX,
     });
 }
 
 #[test]
 fn a_truncated_replicate_header_is_an_error_not_a_panic() {
-    // The fixed leading region (room, branch, base_seq) before the op batch:
-    // truncating anywhere inside it must error, never panic. The batch itself
-    // consumes the frame's remainder (like `Ops`), so a shorter batch decodes as
-    // valid — the corrupt-batch case is covered separately. An empty-batch frame
-    // is exactly that leading region, so its length is where the batch begins.
+    // The fixed leading region (room, branch, base_seq, epoch) before the op
+    // batch: truncating anywhere inside it must error, never panic. The batch
+    // itself consumes the frame's remainder (like `Ops`), so a shorter batch
+    // decodes as valid — the corrupt-batch case is covered separately. An empty-
+    // batch frame is exactly that leading region, so its length is where the batch
+    // begins.
     let header_len = encode_message(&Message::Replicate {
         room: b"room".to_vec(),
         branch: b"main".to_vec(),
         ops: Vec::new(),
         base_seq: 5,
+        epoch: 3,
     })
     .len();
     let bytes = encode_message(&Message::Replicate {
@@ -117,6 +144,7 @@ fn a_truncated_replicate_header_is_an_error_not_a_panic() {
         branch: b"main".to_vec(),
         ops: sample_ops(),
         base_seq: 5,
+        epoch: 3,
     });
     for cut in 0..header_len {
         assert!(
@@ -133,6 +161,7 @@ fn a_corrupt_op_batch_in_a_replicate_is_an_error() {
         branch: b"main".to_vec(),
         ops: sample_ops(),
         base_seq: 5,
+        epoch: 1,
     });
     // Truncate inside the batch payload; the framed op codec must reject it.
     assert!(matches!(
