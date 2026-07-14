@@ -22,9 +22,10 @@ use crdtsync_core::diff::{diff, encode_changes};
 use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
-    decode_message, encode_message, encode_op, encode_ops, path, BlobRef, Channel, ClientError,
-    ClientId, ClientSession, Document, ErrorCode, Host, MarkState, Message, Redirect, Rejected,
-    RelativePosition, ResolvedMark, Scalar, UndoManager,
+    decode_message, encode_message, encode_op, encode_ops, path, AclEffect, AclGrant, AclSubject,
+    BlobRef, Capability, Channel, ClientError, ClientId, ClientSession, Document, ElementId,
+    ErrorCode, Host, MarkState, Message, Redirect, Rejected, RelativePosition, ResolvedMark,
+    Scalar, UndoManager,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
@@ -886,6 +887,220 @@ unsafe fn write_mark_id(out: *mut CrdtBuf, id: Option<Vec<u8>>) {
     if let (Some(id), false) = (id, out.is_null()) {
         *out = CrdtBuf::from_vec(id);
     }
+}
+
+// --- acl ---
+//
+// Author a doc-level ACL grant or revoke. A grant is an allow/deny of a
+// capability-or-role, to a subject, on a path, recorded with the authoring actor
+// (the grantor). The fields cross as a small set of discriminants plus byte
+// strings, matching the op codec's tags: subject kind `0` an actor (16-byte id),
+// `1` a group (name bytes), `2` authenticated, `3` anonymous, `4` anyone; grant
+// kind `0` a capability (`0` read, `1` write, `2` publish-awareness, `3` own),
+// `1` a role (name bytes); effect `0` allow, `1` deny. Core stores the tuple
+// faithfully and checks no authority here (that is the server's concern). The
+// grant returns the tuple's 16-byte id — the handle a later revoke names it by.
+
+/// The doc-ACL actor key for a credential `actor`: the fixed 16-byte SHA-256
+/// truncation the server keys tuples by. A grant's `Actor` subject and its grantor
+/// carry this key, so the authenticated actor — not an ephemeral per-device id — is
+/// the ACL principal, matched identically across devices and after a restart.
+fn actor_key(actor: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(actor);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
+
+/// Derive the doc-ACL actor key for a credential `actor` into `out` (a fresh buffer
+/// the caller frees) — the id an [`AclSubject::Actor`] grant targets and a grantor
+/// carries, matching the authenticated actor the server enforces against. Returns 1,
+/// or -1 on a null `out` or a rejected `actor` pointer.
+///
+/// # Safety
+/// `actor`/`actor_len` follow [`as_slice`]; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_actor_key(
+    actor: *const u8,
+    actor_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if out.is_null() {
+            return -1;
+        }
+        let Some(a) = as_slice(actor, actor_len) else {
+            return -1;
+        };
+        *out = CrdtBuf::from_vec(actor_key(a).to_vec());
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Borrow a 16-byte client id at `ptr`, `None` unless exactly 16 readable bytes.
+unsafe fn client_id_from_c(ptr: *const u8, len: usize) -> Option<ClientId> {
+    let b = as_slice(ptr, len)?;
+    let bytes: [u8; 16] = b.try_into().ok()?;
+    Some(ClientId::from_bytes(bytes))
+}
+
+/// Borrow a 16-byte element id at `ptr`, `None` unless exactly 16 readable bytes.
+unsafe fn element_id_from_c(ptr: *const u8, len: usize) -> Option<ElementId> {
+    let b = as_slice(ptr, len)?;
+    let bytes: [u8; 16] = b.try_into().ok()?;
+    Some(ElementId::from_bytes(bytes))
+}
+
+/// Build an [`AclSubject`] from its C discriminant and payload bytes: an actor
+/// reads a 16-byte id, a group reads its name bytes, the classes ignore the
+/// payload. `None` on an unknown kind or a malformed actor id.
+unsafe fn acl_subject_from_c(kind: u32, ptr: *const u8, len: usize) -> Option<AclSubject> {
+    Some(match kind {
+        0 => AclSubject::Actor(client_id_from_c(ptr, len)?),
+        1 => AclSubject::Group(as_slice(ptr, len)?.to_vec()),
+        2 => AclSubject::Authenticated,
+        3 => AclSubject::Anonymous,
+        4 => AclSubject::Anyone,
+        _ => return None,
+    })
+}
+
+/// Build an [`AclGrant`] from its C discriminant: a capability reads the
+/// `capability` tag, a role reads its name bytes. `None` on an unknown kind or
+/// capability tag.
+unsafe fn acl_grant_from_c(
+    kind: u32,
+    capability: u32,
+    role: *const u8,
+    role_len: usize,
+) -> Option<AclGrant> {
+    Some(match kind {
+        0 => AclGrant::Capability(match capability {
+            0 => Capability::Read,
+            1 => Capability::Write,
+            2 => Capability::PublishAwareness,
+            3 => Capability::Own,
+            _ => return None,
+        }),
+        1 => AclGrant::Role(as_slice(role, role_len)?.to_vec()),
+        _ => return None,
+    })
+}
+
+/// Map the C `effect` argument to an [`AclEffect`]: 0 allow, 1 deny.
+fn acl_effect_from_u32(effect: u32) -> Option<AclEffect> {
+    match effect {
+        0 => Some(AclEffect::Allow),
+        1 => Some(AclEffect::Deny),
+        _ => None,
+    }
+}
+
+/// Author an ACL grant on `doc`, returning the new tuple's id and the ops it
+/// emits. The grant always emits, so the ops are never empty.
+fn acl_grant(
+    doc: &mut Document,
+    subject: AclSubject,
+    grant: AclGrant,
+    effect: AclEffect,
+    path: Vec<u8>,
+    grantor: ClientId,
+) -> (ElementId, Vec<Op>) {
+    let mut id = None;
+    let ops = doc.transact(|c| {
+        id = Some(c.acl().grant(subject, grant, effect, path, grantor));
+    });
+    (id.expect("grant emits a tuple id"), ops)
+}
+
+/// Revoke the ACL tuple `id` on `doc`, returning the ops. Empty when `id` names no
+/// tuple this replica holds (an inert revoke).
+fn acl_revoke(doc: &mut Document, id: ElementId) -> Vec<Op> {
+    doc.transact(|c| c.acl().revoke(id))
+}
+
+/// Grant a doc-level ACL tuple: an allow/deny (`effect`) of a capability-or-role
+/// (`grant_kind` + `capability`/`role`) to `subject`, on `path`, recorded with the
+/// authoring actor `grantor`. Writes the ops to broadcast into `out_ops` and the
+/// new tuple's 16-byte id into `out_id` (each a fresh buffer the caller frees).
+/// Returns 1 on success, -1 on a bad handle, a null out pointer, a malformed
+/// subject/grant/effect, or a malformed grantor.
+///
+/// # Safety
+/// `doc` is a live handle; `subject`/`subject_len`, `role`/`role_len`,
+/// `path`/`path_len`, and `grantor`/`grantor_len` each follow [`as_slice`];
+/// `out_id` and `out_ops` point to writable `CrdtBuf`s.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn crdtsync_doc_acl_grant(
+    doc: *mut CrdtDoc,
+    subject_kind: u32,
+    subject: *const u8,
+    subject_len: usize,
+    grant_kind: u32,
+    capability: u32,
+    role: *const u8,
+    role_len: usize,
+    effect: u32,
+    path: *const u8,
+    path_len: usize,
+    grantor: *const u8,
+    grantor_len: usize,
+    out_id: *mut CrdtBuf,
+    out_ops: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() || out_id.is_null() || out_ops.is_null() {
+            return -1;
+        }
+        let (Some(subj), Some(gr), Some(eff), Some(p), Some(gtor)) = (
+            acl_subject_from_c(subject_kind, subject, subject_len),
+            acl_grant_from_c(grant_kind, capability, role, role_len),
+            acl_effect_from_u32(effect),
+            as_slice(path, path_len),
+            client_id_from_c(grantor, grantor_len),
+        ) else {
+            return -1;
+        };
+        let (id, ops) = acl_grant(&mut (*doc).doc, subj, gr, eff, p.to_vec(), gtor);
+        *out_id = CrdtBuf::from_vec(id.as_bytes().to_vec());
+        *out_ops = CrdtBuf::from_vec(encode_ops(&ops));
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Revoke the doc-level ACL tuple `id` (16 bytes from [`crdtsync_doc_acl_grant`]),
+/// tombstoning it. Writes the ops to broadcast into `out_ops`. Returns 1 when a
+/// revoke was emitted, 0 when `id` names no tuple this replica holds (inert —
+/// `out_ops` carries no ops), -1 on a bad handle, a null out pointer, or a
+/// malformed id.
+///
+/// # Safety
+/// `doc` is a live handle; `id`/`id_len` follow [`as_slice`]; `out_ops` points to
+/// a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_acl_revoke(
+    doc: *mut CrdtDoc,
+    id: *const u8,
+    id_len: usize,
+    out_ops: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() || out_ops.is_null() {
+            return -1;
+        }
+        let Some(tuple_id) = element_id_from_c(id, id_len) else {
+            return -1;
+        };
+        let ops = acl_revoke(&mut (*doc).doc, tuple_id);
+        let rc = i32::from(!ops.is_empty());
+        *out_ops = CrdtBuf::from_vec(encode_ops(&ops));
+        rc
+    }))
+    .unwrap_or(-1)
 }
 
 /// Capture a stable position in the List or Text at a path — the encoded
@@ -2223,6 +2438,100 @@ pub unsafe extern "C" fn crdtsync_client_xml_move(
             return CrdtBuf::empty();
         };
         let ops = path::xml_move_child(doc, pp, child_index, np, dest_index);
+        match (*client).session.enqueue_ops(Channel(channel), ops) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+// --- client acl ---
+//
+// The grant/revoke authoring surface on a subscribed room's replica, routed
+// through the outbox (acked / resent) like every other client edit. The field
+// encoding mirrors the doc surface (`crdtsync_doc_acl_grant`).
+
+/// Grant a doc-level ACL tuple in `channel`'s room and route the op through the
+/// outbox. Writes the new tuple's 16-byte id into `out_id` (a fresh buffer the
+/// caller frees). Returns the Ops frame to send; empty on a bad handle, an unheld
+/// channel, a null `out_id`, or a malformed subject/grant/effect/grantor.
+///
+/// # Safety
+/// `client` is a live handle; `subject`/`subject_len`, `role`/`role_len`,
+/// `path`/`path_len`, and `grantor`/`grantor_len` each follow [`as_slice`];
+/// `out_id` points to a writable `CrdtBuf`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn crdtsync_client_acl_grant(
+    client: *mut CrdtClient,
+    channel: u32,
+    subject_kind: u32,
+    subject: *const u8,
+    subject_len: usize,
+    grant_kind: u32,
+    capability: u32,
+    role: *const u8,
+    role_len: usize,
+    effect: u32,
+    path: *const u8,
+    path_len: usize,
+    grantor: *const u8,
+    grantor_len: usize,
+    out_id: *mut CrdtBuf,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out_id.is_null() {
+            return CrdtBuf::empty();
+        }
+        let (Some(subj), Some(gr), Some(eff), Some(p), Some(gtor)) = (
+            acl_subject_from_c(subject_kind, subject, subject_len),
+            acl_grant_from_c(grant_kind, capability, role, role_len),
+            acl_effect_from_u32(effect),
+            as_slice(path, path_len),
+            client_id_from_c(grantor, grantor_len),
+        ) else {
+            return CrdtBuf::empty();
+        };
+        let Some(doc) = (*client).session.document_mut(Channel(channel)) else {
+            return CrdtBuf::empty();
+        };
+        let (id, ops) = acl_grant(doc, subj, gr, eff, p.to_vec(), gtor);
+        match (*client).session.enqueue_ops(Channel(channel), ops) {
+            Some(msg) => {
+                *out_id = CrdtBuf::from_vec(id.as_bytes().to_vec());
+                CrdtBuf::from_vec(encode_message(&msg))
+            }
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
+/// Revoke the doc-level ACL tuple `id` (16 bytes) in `channel`'s room, routing the
+/// op through the outbox. Returns the Ops frame to send; empty on a bad handle, an
+/// unheld channel, a malformed id, or an id naming no tuple this replica holds.
+///
+/// # Safety
+/// `client` is a live handle; `id`/`id_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_acl_revoke(
+    client: *mut CrdtClient,
+    channel: u32,
+    id: *const u8,
+    id_len: usize,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        let Some(tuple_id) = element_id_from_c(id, id_len) else {
+            return CrdtBuf::empty();
+        };
+        let Some(doc) = (*client).session.document_mut(Channel(channel)) else {
+            return CrdtBuf::empty();
+        };
+        let ops = acl_revoke(doc, tuple_id);
         match (*client).session.enqueue_ops(Channel(channel), ops) {
             Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
             None => CrdtBuf::empty(),

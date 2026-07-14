@@ -20,14 +20,18 @@ from typing import List, NamedTuple, Optional, Tuple
 
 __all__ = [
     "BlobRef",
+    "Capability",
     "Client",
     "Document",
+    "Effect",
     "ErrorCode",
     "Redirect",
     "Rejected",
     "ServerError",
     "Side",
+    "SubjectKind",
     "Undo",
+    "actor_key",
     "diff",
     "diff_decode",
     "encode_path",
@@ -41,6 +45,47 @@ class Side(enum.IntEnum):
 
     LEFT = 0
     RIGHT = 1
+
+
+class SubjectKind(enum.IntEnum):
+    """Who a doc-ACL grant targets. ``ACTOR`` names a 16-byte actor id; ``GROUP`` a
+    membership name; the rest are the well-known classes."""
+
+    ACTOR = 0
+    GROUP = 1
+    AUTHENTICATED = 2
+    ANONYMOUS = 3
+    ANYONE = 4
+
+
+class Capability(enum.IntEnum):
+    """A direct power a grant confers over a subtree."""
+
+    READ = 0
+    WRITE = 1
+    PUBLISH_AWARENESS = 2
+    OWN = 3
+
+
+class Effect(enum.IntEnum):
+    """Whether a grant allows or denies."""
+
+    ALLOW = 0
+    DENY = 1
+
+
+def _acl_grant_args(subject_kind, subject, capability, role, effect):
+    """Resolve a grant's subject/capability-or-role/effect to the C discriminants and
+    byte strings. A grant confers exactly one of ``capability`` or ``role``."""
+    sk = int(SubjectKind(subject_kind))
+    subject = subject or b""
+    if (capability is None) == (role is None):
+        raise ValueError("a grant confers exactly one of a capability or a role")
+    if capability is not None:
+        grant_kind, cap, role_bytes = 0, int(Capability(capability)), b""
+    else:
+        grant_kind, cap, role_bytes = 1, 0, role
+    return sk, subject, grant_kind, cap, role_bytes, int(Effect(effect))
 
 
 class ErrorCode(enum.IntEnum):
@@ -201,6 +246,18 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_mark_delete, [doc, cbytes, size], buf)
     sig(lib.crdtsync_doc_marks_at, [doc, cbytes, size, size, c.POINTER(buf)], c.c_int32)
 
+    # acl authoring (doc)
+    sig(lib.crdtsync_actor_key, [cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(
+        lib.crdtsync_doc_acl_grant,
+        [
+            doc, c.c_uint32, cbytes, size, c.c_uint32, c.c_uint32, cbytes, size,
+            c.c_uint32, cbytes, size, cbytes, size, c.POINTER(buf), c.POINTER(buf),
+        ],
+        c.c_int32,
+    )
+    sig(lib.crdtsync_doc_acl_revoke, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
+
     # schema + repair (doc)
     sig(lib.crdtsync_doc_set_schema, [doc, cbytes, size], c.c_int32)
     sig(lib.crdtsync_doc_take_repairs, [doc, c.POINTER(buf)], c.c_int32)
@@ -276,6 +333,16 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     )
     sig(lib.crdtsync_client_mark_set_value, [doc, ch, cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_client_mark_delete, [doc, ch, cbytes, size], buf)
+    # acl authoring (client)
+    sig(
+        lib.crdtsync_client_acl_grant,
+        [
+            doc, ch, c.c_uint32, cbytes, size, c.c_uint32, c.c_uint32, cbytes, size,
+            c.c_uint32, cbytes, size, cbytes, size, c.POINTER(buf),
+        ],
+        buf,
+    )
+    sig(lib.crdtsync_client_acl_revoke, [doc, ch, cbytes, size], buf)
     sig(lib.crdtsync_client_begin_atomic, [doc, ch], None)
     sig(lib.crdtsync_client_commit_atomic, [doc, ch], buf)
     sig(lib.crdtsync_client_get_int, [doc, ch, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
@@ -341,6 +408,17 @@ def _take_buf(buf: _CrdtBuf) -> bytes:
     data = ctypes.string_at(buf.ptr, buf.len)
     _LIB.crdtsync_buf_free(buf)
     return data
+
+
+def actor_key(actor: bytes) -> bytes:
+    """The doc-ACL actor key for a credential ``actor``: the fixed 16-byte SHA-256
+    truncation the server keys tuples by. Build an :meth:`Document.acl_grant`
+    ``ACTOR`` subject and its ``grantor`` from this so the authenticated actor — not
+    an ephemeral per-device id — is the matched ACL principal, identical across
+    devices and after a restart."""
+    out = _CrdtBuf()
+    _LIB.crdtsync_actor_key(actor, len(actor), ctypes.byref(out))
+    return _take_buf(out)
 
 
 _KINDS = ("scalar", "register", "counter", "map", "list", "text")
@@ -880,6 +958,58 @@ class Document:
         return _take_buf(
             _LIB.crdtsync_doc_mark_delete(self._handle, mark_id, len(mark_id))
         )
+
+    # --- acl authoring ---
+
+    def acl_grant(
+        self,
+        subject_kind: SubjectKind,
+        subject: bytes,
+        grantor: bytes,
+        path: Path = (),
+        *,
+        capability: Optional[Capability] = None,
+        role: Optional[bytes] = None,
+        effect: Effect = Effect.ALLOW,
+    ) -> Tuple[bytes, bytes]:
+        """Grant a doc-level ACL tuple: an allow/deny (``effect``) of ``capability``
+        or ``role`` to ``subject`` (a ``SubjectKind`` plus its bytes — a 16-byte
+        actor id, a group name, or empty for a class), on ``path``, recorded with the
+        authoring actor ``grantor`` (16 bytes). Returns ``(tuple_id, ops)``: the new
+        tuple's 16-byte id — the handle a later :meth:`acl_revoke` names it by — and
+        the ops to broadcast. Raises ``ValueError`` on a malformed subject/grant/
+        grantor."""
+        sk, subj, gk, cap, role_b, eff = _acl_grant_args(
+            subject_kind, subject, capability, role, effect
+        )
+        p = encode_path(path)
+        grantor = grantor or b""
+        out_id = _CrdtBuf()
+        out_ops = _CrdtBuf()
+        rc = _LIB.crdtsync_doc_acl_grant(
+            self._handle,
+            sk, subj, len(subj),
+            gk, cap, role_b, len(role_b),
+            eff, p, len(p),
+            grantor, len(grantor),
+            ctypes.byref(out_id),
+            ctypes.byref(out_ops),
+        )
+        if rc != 1:
+            raise ValueError("malformed acl grant (subject, grant, or grantor)")
+        return _take_buf(out_id), _take_buf(out_ops)
+
+    def acl_revoke(self, tuple_id: bytes) -> bytes:
+        """Revoke the ACL tuple ``tuple_id`` (16 bytes from :meth:`acl_grant`),
+        tombstoning it; return the ops to broadcast (empty when ``tuple_id`` names no
+        tuple this replica holds). Raises ``ValueError`` on a malformed id."""
+        out_ops = _CrdtBuf()
+        rc = _LIB.crdtsync_doc_acl_revoke(
+            self._handle, tuple_id, len(tuple_id), ctypes.byref(out_ops)
+        )
+        if rc < 0:
+            raise ValueError("malformed acl tuple id")
+        return _take_buf(out_ops)
 
     def marks_at(self, seq_path: Path, index: int) -> list:
         """The marks active on character ``index`` of the sequence at ``seq_path``,
@@ -1448,6 +1578,54 @@ class Client:
         _u32("channel", channel)
         return _take_buf(
             _LIB.crdtsync_client_mark_delete(self._handle, channel, mark_id, len(mark_id))
+        )
+
+    # --- per-channel acl authoring ---
+
+    def acl_grant(
+        self,
+        channel: int,
+        subject_kind: SubjectKind,
+        subject: bytes,
+        grantor: bytes,
+        path: Path = (),
+        *,
+        capability: Optional[Capability] = None,
+        role: Optional[bytes] = None,
+        effect: Effect = Effect.ALLOW,
+    ) -> Tuple[Optional[bytes], bytes]:
+        """Grant a doc-level ACL tuple in ``channel``'s room, routed through the
+        outbox. Same fields as :meth:`Document.acl_grant`. Returns
+        ``(tuple_id, frame)``: the new tuple's 16-byte id and the Ops frame to send.
+        ``tuple_id`` is ``None`` and ``frame`` empty when the channel isn't held."""
+        _u32("channel", channel)
+        sk, subj, gk, cap, role_b, eff = _acl_grant_args(
+            subject_kind, subject, capability, role, effect
+        )
+        p = encode_path(path)
+        grantor = grantor or b""
+        out_id = _CrdtBuf()
+        frame = _take_buf(
+            _LIB.crdtsync_client_acl_grant(
+                self._handle,
+                channel,
+                sk, subj, len(subj),
+                gk, cap, role_b, len(role_b),
+                eff, p, len(p),
+                grantor, len(grantor),
+                ctypes.byref(out_id),
+            )
+        )
+        tuple_id = _take_buf(out_id)
+        return (tuple_id if tuple_id else None), frame
+
+    def acl_revoke(self, channel: int, tuple_id: bytes) -> bytes:
+        """Revoke the ACL tuple ``tuple_id`` in ``channel``'s room, routed through the
+        outbox; Ops frame (empty when the channel isn't held or the id names no live
+        tuple)."""
+        _u32("channel", channel)
+        return _take_buf(
+            _LIB.crdtsync_client_acl_revoke(self._handle, channel, tuple_id, len(tuple_id))
         )
 
     def begin_atomic(self, channel: int) -> None:

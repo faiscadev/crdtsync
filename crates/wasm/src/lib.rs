@@ -14,9 +14,9 @@ use crdtsync_core::list::Side;
 use crdtsync_core::marks::{MarkState, ResolvedMark};
 use crdtsync_core::op::Op;
 use crdtsync_core::{
-    decode_message, decode_ops, encode_message, encode_op, encode_ops, path, BlobRef, Channel,
-    ClientError, ClientId, ClientSession, Document, ErrorCode as CoreErrorCode, Host, Redirect,
-    Rejected, RelativePosition, Scalar, UndoManager,
+    decode_message, decode_ops, encode_message, encode_op, encode_ops, path, AclEffect, AclGrant,
+    AclSubject, BlobRef, Capability, Channel, ClientError, ClientId, ClientSession, Document,
+    ErrorCode as CoreErrorCode, Host, Redirect, Rejected, RelativePosition, Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
 
@@ -417,6 +417,66 @@ impl WasmDocument {
     #[wasm_bindgen(js_name = markDelete)]
     pub fn mark_delete(&mut self, mark_id: &[u8]) -> Vec<u8> {
         encode_ops(&path::mark_delete(&mut self.inner, mark_id))
+    }
+
+    /// Grant a doc-level ACL tuple: an allow/deny (`effect`: 0 allow, 1 deny) of a
+    /// capability-or-role (`grant_kind` 0 a capability code, 1 a `role` name) to a
+    /// `subject` (`subject_kind` 0 an actor id / 1 a group name / 2-4 a class, with
+    /// `subject` its bytes), on `path`, recorded with the authoring actor `grantor`
+    /// (16 bytes). Returns `{ id: Uint8Array, ops: Uint8Array }` — the new tuple's
+    /// id (the handle `aclRevoke` names it by) and the ops to broadcast. Throws on a
+    /// malformed subject / grant / effect / grantor.
+    #[wasm_bindgen(js_name = aclGrant)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn acl_grant(
+        &mut self,
+        subject_kind: u32,
+        subject: &[u8],
+        grant_kind: u32,
+        capability: u32,
+        role: &[u8],
+        effect: u32,
+        path: &[u8],
+        grantor: &[u8],
+    ) -> Result<JsValue, JsError> {
+        let subj = acl_subject_from(subject_kind, subject)
+            .ok_or_else(|| JsError::new("malformed acl subject"))?;
+        let grant = acl_grant_from(grant_kind, capability, role)
+            .ok_or_else(|| JsError::new("malformed acl grant"))?;
+        let eff = acl_effect_from(effect).ok_or_else(|| JsError::new("malformed acl effect"))?;
+        let gtor = grantor
+            .try_into()
+            .map(ClientId::from_bytes)
+            .map_err(|_| JsError::new("grantor must be 16 bytes"))?;
+        let mut id = None;
+        let ops = self.inner.transact(|c| {
+            id = Some(c.acl().grant(subj, grant, eff, path.to_vec(), gtor));
+        });
+        let id = id.expect("a grant emits a tuple id");
+        let obj = js_sys::Object::new();
+        set(
+            &obj,
+            "id",
+            &js_sys::Uint8Array::from(&id.as_bytes()[..]).into(),
+        );
+        set(
+            &obj,
+            "ops",
+            &js_sys::Uint8Array::from(encode_ops(&ops).as_slice()).into(),
+        );
+        Ok(obj.into())
+    }
+
+    /// Revoke the ACL tuple `tuple_id` (16 bytes from [`aclGrant`](Self::acl_grant)),
+    /// tombstoning it. Returns the ops to broadcast; empty when `tuple_id` names no
+    /// tuple this replica holds. Throws when `tuple_id` is not 16 bytes.
+    #[wasm_bindgen(js_name = aclRevoke)]
+    pub fn acl_revoke(&mut self, tuple_id: &[u8]) -> Result<Vec<u8>, JsError> {
+        let id = tuple_id
+            .try_into()
+            .map(ElementId::from_bytes)
+            .map_err(|_| JsError::new("acl tuple id must be 16 bytes"))?;
+        Ok(encode_ops(&self.inner.transact(|c| c.acl().revoke(id))))
     }
 
     /// The active marks covering character `index` of the sequence at `seq_path`,
@@ -1024,6 +1084,72 @@ impl WasmClient {
         self.ops_frame(channel, |d| path::mark_delete(d, mark_id))
     }
 
+    /// Grant a doc-level ACL tuple in `channel`'s room, routed through the outbox.
+    /// Same fields as [`WasmDocument::acl_grant`]. Returns `{ id: Uint8Array, frame:
+    /// Uint8Array }` — the new tuple's id and the Ops frame to send — or `undefined`
+    /// when the channel isn't held. Throws on a malformed subject / grant / effect /
+    /// grantor.
+    #[wasm_bindgen(js_name = aclGrant)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn acl_grant(
+        &mut self,
+        channel: u32,
+        subject_kind: u32,
+        subject: &[u8],
+        grant_kind: u32,
+        capability: u32,
+        role: &[u8],
+        effect: u32,
+        path: &[u8],
+        grantor: &[u8],
+    ) -> Result<JsValue, JsError> {
+        let subj = acl_subject_from(subject_kind, subject)
+            .ok_or_else(|| JsError::new("malformed acl subject"))?;
+        let grant = acl_grant_from(grant_kind, capability, role)
+            .ok_or_else(|| JsError::new("malformed acl grant"))?;
+        let eff = acl_effect_from(effect).ok_or_else(|| JsError::new("malformed acl effect"))?;
+        let gtor = grantor
+            .try_into()
+            .map(ClientId::from_bytes)
+            .map_err(|_| JsError::new("grantor must be 16 bytes"))?;
+        let Some(doc) = self.inner.document_mut(Channel(channel)) else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        let mut id = None;
+        let ops = doc.transact(|c| {
+            id = Some(c.acl().grant(subj, grant, eff, path.to_vec(), gtor));
+        });
+        let id = id.expect("a grant emits a tuple id");
+        let frame = match self.inner.enqueue_ops(Channel(channel), ops) {
+            Some(msg) => encode_message(&msg),
+            None => Vec::new(),
+        };
+        let obj = js_sys::Object::new();
+        set(
+            &obj,
+            "id",
+            &js_sys::Uint8Array::from(&id.as_bytes()[..]).into(),
+        );
+        set(
+            &obj,
+            "frame",
+            &js_sys::Uint8Array::from(frame.as_slice()).into(),
+        );
+        Ok(obj.into())
+    }
+
+    /// Revoke the ACL tuple `tuple_id` in `channel`'s room, routed through the
+    /// outbox. Returns the Ops frame to send; empty when the channel isn't held or
+    /// the id names no live tuple. Throws when `tuple_id` is not 16 bytes.
+    #[wasm_bindgen(js_name = aclRevoke)]
+    pub fn acl_revoke(&mut self, channel: u32, tuple_id: &[u8]) -> Result<Vec<u8>, JsError> {
+        let id = tuple_id
+            .try_into()
+            .map(ElementId::from_bytes)
+            .map_err(|_| JsError::new("acl tuple id must be 16 bytes"))?;
+        Ok(self.ops_frame(channel, |d| d.transact(|c| c.acl().revoke(id))))
+    }
+
     /// The active marks covering character `index` of the sequence at `seq_path` in
     /// `channel`'s room, as an array of `{ name, kind, value }` objects (shaped as
     /// on [`WasmDocument::marks_at`]). Empty if the channel isn't held or the path
@@ -1154,6 +1280,56 @@ fn side_from_u32(side: u32) -> Option<Side> {
     }
 }
 
+/// Build an [`AclSubject`] from its JS discriminant and payload bytes: `0` an actor
+/// (16-byte id), `1` a group (name bytes), `2`/`3`/`4` the classes. `None` on an
+/// unknown kind or a malformed actor id.
+fn acl_subject_from(kind: u32, bytes: &[u8]) -> Option<AclSubject> {
+    Some(match kind {
+        0 => AclSubject::Actor(ClientId::from_bytes(bytes.try_into().ok()?)),
+        1 => AclSubject::Group(bytes.to_vec()),
+        2 => AclSubject::Authenticated,
+        3 => AclSubject::Anonymous,
+        4 => AclSubject::Anyone,
+        _ => return None,
+    })
+}
+
+/// Build an [`AclGrant`] from its JS discriminant: `0` a capability (`0` read, `1`
+/// write, `2` publish-awareness, `3` own), `1` a role (name bytes).
+fn acl_grant_from(kind: u32, capability: u32, role: &[u8]) -> Option<AclGrant> {
+    Some(match kind {
+        0 => AclGrant::Capability(match capability {
+            0 => Capability::Read,
+            1 => Capability::Write,
+            2 => Capability::PublishAwareness,
+            3 => Capability::Own,
+            _ => return None,
+        }),
+        1 => AclGrant::Role(role.to_vec()),
+        _ => return None,
+    })
+}
+
+/// The [`AclEffect`] a `0`/`1` code names — `0` allow, `1` deny.
+fn acl_effect_from(effect: u32) -> Option<AclEffect> {
+    match effect {
+        0 => Some(AclEffect::Allow),
+        1 => Some(AclEffect::Deny),
+        _ => None,
+    }
+}
+
+/// Derive the doc-ACL actor key for a credential `actor`: the fixed 16-byte SHA-256
+/// truncation the server keys tuples by. Build an [`aclGrant`](WasmDocument::acl_grant)
+/// `Actor` subject and grantor from this so the authenticated actor — not an
+/// ephemeral per-device id — is the matched ACL principal, identical across devices
+/// and after a restart.
+#[wasm_bindgen(js_name = actorKey)]
+pub fn actor_key(actor: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(actor)[..16].to_vec()
+}
+
 /// The resolved marks on a character as a JS array of `{ name, kind, value }`
 /// objects: a boolean's value is a bool, a value mark's a tagged `{ t, v }`
 /// scalar, an object mark's an array of `Uint8Array` instance ids.
@@ -1199,7 +1375,11 @@ fn resolved_mark_to_js(mark: &ResolvedMark) -> JsValue {
 fn rejected_to_js(r: &Rejected) -> JsValue {
     let obj = js_sys::Object::new();
     set(&obj, "channel", &JsValue::from_f64(r.channel.0 as f64));
-    set(&obj, "reason", &JsValue::from(ErrorCode::from(r.reason) as i32));
+    set(
+        &obj,
+        "reason",
+        &JsValue::from(ErrorCode::from(r.reason) as i32),
+    );
     let ops: js_sys::Array = r
         .ops
         .iter()

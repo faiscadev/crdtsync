@@ -11,6 +11,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 crdtsync-core = { path = "../core" }
 # Mints the unguessable handle for the inline `set_blob` producer.
 getrandom = "0.2"
+# Derives the doc-ACL actor key (SHA-256 truncation) the server keys tuples by.
+sha2 = "0.10"
 
 [build-dependencies]
 # Regenerates the C header from the ABI on build. `clap` (its CLI) isn't needed.
