@@ -20,6 +20,7 @@ from typing import List, NamedTuple, Optional, Tuple
 
 __all__ = [
     "BlobRef",
+    "Branch",
     "Capability",
     "Client",
     "Document",
@@ -130,6 +131,18 @@ class Rejected(NamedTuple):
     channel: int
     reason: ErrorCode
     ops: List[bytes]
+
+
+class Branch(NamedTuple):
+    """One branch of a room as the client observes it, returned by
+    :meth:`Client.branches`. ``name`` is the branch name, ``fork_point`` the
+    history position it shares up to, ``head`` its own high-water position, and
+    ``published`` whether it is a read-only publish target."""
+
+    name: bytes
+    fork_point: int
+    head: int
+    published: bool
 
 
 class BlobRef(NamedTuple):
@@ -362,6 +375,31 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_version_count, [doc, ch, c.POINTER(size)], c.c_int32)
     sig(lib.crdtsync_client_version_name, [doc, ch, size, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_version_state, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_list_branches, [doc, cbytes, size], buf)
+    sig(lib.crdtsync_client_fork_branch, [doc, cbytes, size, cbytes, size, cbytes, size], buf)
+    sig(
+        lib.crdtsync_client_fork_branch_from_version,
+        [doc, cbytes, size, cbytes, size, cbytes, size],
+        buf,
+    )
+    sig(lib.crdtsync_client_restore_branch, [doc, cbytes, size, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_publish_branch, [doc, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_delete_branch, [doc, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_branch_count, [doc, cbytes, size, c.POINTER(size)], c.c_int32)
+    sig(
+        lib.crdtsync_client_branch_at,
+        [
+            doc,
+            cbytes,
+            size,
+            size,
+            c.POINTER(buf),
+            c.POINTER(c.c_uint64),
+            c.POINTER(c.c_uint64),
+            c.POINTER(c.c_int32),
+        ],
+        c.c_int32,
+    )
     return lib
 
 
@@ -1741,3 +1779,88 @@ class Client:
             self._handle, channel, name, len(name), ctypes.byref(out)
         )
         return _take_buf(out) if rc == 1 else None
+
+    # --- branch management ---
+
+    def list_branches(self, room: bytes) -> bytes:
+        """Frame a request for ``room``'s branches. Room-keyed: a client may
+        enumerate a room's branches before it subscribes any of them."""
+        return _take_buf(_LIB.crdtsync_client_list_branches(self._handle, room, len(room)))
+
+    def fork_branch(self, room: bytes, name: bytes, frm: bytes) -> bytes:
+        """Frame a request to fork branch ``name`` off ``frm``'s HEAD in ``room``."""
+        return _take_buf(
+            _LIB.crdtsync_client_fork_branch(
+                self._handle, room, len(room), name, len(name), frm, len(frm)
+            )
+        )
+
+    def fork_branch_from_version(self, room: bytes, name: bytes, version: bytes) -> bytes:
+        """Frame a request to fork branch ``name`` off the snapshot of ``version``."""
+        return _take_buf(
+            _LIB.crdtsync_client_fork_branch_from_version(
+                self._handle, room, len(room), name, len(name), version, len(version)
+            )
+        )
+
+    def restore_branch(self, room: bytes, name: bytes, version: bytes) -> bytes:
+        """Frame a request to restore ``room`` to ``version`` as a fresh branch
+        ``name``, switching the active HEAD to it."""
+        return _take_buf(
+            _LIB.crdtsync_client_restore_branch(
+                self._handle, room, len(room), name, len(name), version, len(version)
+            )
+        )
+
+    def publish_branch(self, room: bytes, published: bytes) -> bytes:
+        """Frame a request to publish ``room``'s active editor branch onto the
+        read-only ``published`` branch."""
+        return _take_buf(
+            _LIB.crdtsync_client_publish_branch(
+                self._handle, room, len(room), published, len(published)
+            )
+        )
+
+    def delete_branch(self, room: bytes, name: bytes) -> bytes:
+        """Frame a request to delete branch ``name`` of ``room``. The default
+        ``main`` is never deletable."""
+        return _take_buf(
+            _LIB.crdtsync_client_delete_branch(
+                self._handle, room, len(room), name, len(name)
+            )
+        )
+
+    def branches(self, room: bytes) -> List[Branch]:
+        """The branch set last reported for ``room``, in order."""
+        count = ctypes.c_size_t()
+        rc = _LIB.crdtsync_client_branch_count(
+            self._handle, room, len(room), ctypes.byref(count)
+        )
+        if rc != 1:
+            return []
+        out: List[Branch] = []
+        for i in range(count.value):
+            name = _CrdtBuf()
+            fork_point = ctypes.c_uint64()
+            head = ctypes.c_uint64()
+            published = ctypes.c_int32()
+            got = _LIB.crdtsync_client_branch_at(
+                self._handle,
+                room,
+                len(room),
+                i,
+                ctypes.byref(name),
+                ctypes.byref(fork_point),
+                ctypes.byref(head),
+                ctypes.byref(published),
+            )
+            if got == 1:
+                out.append(
+                    Branch(
+                        name=_take_buf(name),
+                        fork_point=fork_point.value,
+                        head=head.value,
+                        published=published.value == 1,
+                    )
+                )
+        return out

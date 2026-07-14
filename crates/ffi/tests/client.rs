@@ -6,6 +6,7 @@
 //! channel the client assigned at subscribe. Every buffer and handle is freed so
 //! the round trip is leak-clean under Miri.
 
+use crdtsync_core::protocol::BranchInfo;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_op, Channel, ErrorCode, Message, Op, Scalar,
 };
@@ -505,6 +506,128 @@ fn named_versions_round_trip_over_the_client() {
             crdtsync_client_version_state(c, ch, b"other".as_ptr(), 5, &mut none),
             0
         );
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
+fn branch_management_round_trips_over_the_client() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+
+        // Every issue method frames a non-empty request to send — room-keyed, so
+        // no subscription is needed first.
+        for frame in [
+            crdtsync_client_list_branches(c, b"room-1".as_ptr(), 6),
+            crdtsync_client_fork_branch(
+                c,
+                b"room-1".as_ptr(),
+                6,
+                b"f".as_ptr(),
+                1,
+                b"main".as_ptr(),
+                4,
+            ),
+            crdtsync_client_fork_branch_from_version(
+                c,
+                b"room-1".as_ptr(),
+                6,
+                b"f".as_ptr(),
+                1,
+                b"v1".as_ptr(),
+                2,
+            ),
+            crdtsync_client_restore_branch(
+                c,
+                b"room-1".as_ptr(),
+                6,
+                b"r".as_ptr(),
+                1,
+                b"v1".as_ptr(),
+                2,
+            ),
+            crdtsync_client_publish_branch(c, b"room-1".as_ptr(), 6, b"live".as_ptr(), 4),
+            crdtsync_client_delete_branch(c, b"room-1".as_ptr(), 6, b"f".as_ptr(), 1),
+        ] {
+            assert!(frame.len > 0, "a branch request frames bytes to send");
+            crdtsync_buf_free(frame);
+        }
+
+        // The server's branch set lands in the view, keyed by room.
+        let listing = encode_message(&Message::Branches {
+            room: b"room-1".to_vec(),
+            branches: vec![
+                BranchInfo {
+                    name: b"main".to_vec(),
+                    fork_point: 0,
+                    head: 3,
+                    published: false,
+                },
+                BranchInfo {
+                    name: b"live".to_vec(),
+                    fork_point: 3,
+                    head: 3,
+                    published: true,
+                },
+            ],
+        });
+        assert_eq!(
+            crdtsync_client_receive(c, listing.as_ptr(), listing.len(), ptr::null_mut()),
+            1
+        );
+
+        let mut n: usize = 0;
+        assert_eq!(
+            crdtsync_client_branch_count(c, b"room-1".as_ptr(), 6, &mut n),
+            1
+        );
+        assert_eq!(n, 2);
+
+        let mut name = out_buf();
+        let (mut fork_point, mut head, mut published) = (0u64, 0u64, 0i32);
+        assert_eq!(
+            crdtsync_client_branch_at(
+                c,
+                b"room-1".as_ptr(),
+                6,
+                1,
+                &mut name,
+                &mut fork_point,
+                &mut head,
+                &mut published,
+            ),
+            1
+        );
+        assert_eq!(std::slice::from_raw_parts(name.ptr, name.len), b"live");
+        assert_eq!(fork_point, 3);
+        assert_eq!(head, 3);
+        assert_eq!(published, 1);
+        crdtsync_buf_free(name);
+
+        // Out of range reports absent.
+        let mut oob = out_buf();
+        assert_eq!(
+            crdtsync_client_branch_at(
+                c,
+                b"room-1".as_ptr(),
+                6,
+                9,
+                &mut oob,
+                &mut fork_point,
+                &mut head,
+                &mut published,
+            ),
+            0
+        );
+
+        // A room with no reported set counts zero.
+        let mut z: usize = 7;
+        assert_eq!(
+            crdtsync_client_branch_count(c, b"ghost".as_ptr(), 5, &mut z),
+            1
+        );
+        assert_eq!(z, 0);
 
         crdtsync_client_free(c);
     }

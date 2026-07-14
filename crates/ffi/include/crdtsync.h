@@ -1285,6 +1285,112 @@ int32_t crdtsync_client_version_state(const CrdtClient *client,
                                       uintptr_t name_len,
                                       CrdtBuf *out);
 
+// Frame a request for the branches of `room`; returns the frame to send. Empty
+// on a bad handle or input. Room-keyed: a client may enumerate a room's branches
+// before it subscribes any of them. The reply updates the branch view.
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_list_branches(const CrdtClient *client,
+                                      const uint8_t *room,
+                                      uintptr_t room_len);
+
+// Frame a request to fork branch `name` off `from`'s HEAD in `room`. Empty on a
+// bad handle or input.
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len`, `name`/`name_len`, and
+// `from`/`from_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_fork_branch(const CrdtClient *client,
+                                    const uint8_t *room,
+                                    uintptr_t room_len,
+                                    const uint8_t *name,
+                                    uintptr_t name_len,
+                                    const uint8_t *from,
+                                    uintptr_t from_len);
+
+// Frame a request to fork branch `name` off the snapshot of version `version` in
+// `room`. Empty on a bad handle or input.
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len`, `name`/`name_len`, and
+// `version`/`version_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_fork_branch_from_version(const CrdtClient *client,
+                                                 const uint8_t *room,
+                                                 uintptr_t room_len,
+                                                 const uint8_t *name,
+                                                 uintptr_t name_len,
+                                                 const uint8_t *version,
+                                                 uintptr_t version_len);
+
+// Frame a request to restore `room` to version `version` as a fresh branch
+// `name`, switching the active HEAD to it. Empty on a bad handle or input.
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len`, `name`/`name_len`, and
+// `version`/`version_len` follow [`as_slice`].
+CrdtBuf crdtsync_client_restore_branch(const CrdtClient *client,
+                                       const uint8_t *room,
+                                       uintptr_t room_len,
+                                       const uint8_t *name,
+                                       uintptr_t name_len,
+                                       const uint8_t *version,
+                                       uintptr_t version_len);
+
+// Frame a request to publish `room`'s active editor branch onto the read-only
+// `published` branch. Empty on a bad handle or input.
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len` and `published`/`published_len`
+// follow [`as_slice`].
+CrdtBuf crdtsync_client_publish_branch(const CrdtClient *client,
+                                       const uint8_t *room,
+                                       uintptr_t room_len,
+                                       const uint8_t *published,
+                                       uintptr_t published_len);
+
+// Frame a request to delete branch `name` of `room`. The default `main` is never
+// deletable. Empty on a bad handle or input.
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len` and `name`/`name_len` follow
+// [`as_slice`].
+CrdtBuf crdtsync_client_delete_branch(const CrdtClient *client,
+                                      const uint8_t *room,
+                                      uintptr_t room_len,
+                                      const uint8_t *name,
+                                      uintptr_t name_len);
+
+// How many branches `room` currently holds in the client view, into `out`.
+// Returns 1 on success, -1 on a bad handle or input (a room with no reported set
+// reports 0).
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len` follow [`as_slice`]; `out` points
+// to a writable `usize`.
+int32_t crdtsync_client_branch_count(const CrdtClient *client,
+                                     const uint8_t *room,
+                                     uintptr_t room_len,
+                                     uintptr_t *out);
+
+// The branch record at `index` in `room`'s view: its name into a fresh buffer at
+// `out_name`, its fork-point at `out_fork_point`, its head at `out_head`, and
+// whether it is a read-only published target at `out_published` (0 or 1).
+// Returns 1 if present, 0 if out of range or no set is reported, -1 on a bad
+// handle or input.
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len` follow [`as_slice`]; each `out_*`
+// pointer is writable and non-null.
+int32_t crdtsync_client_branch_at(const CrdtClient *client,
+                                  const uint8_t *room,
+                                  uintptr_t room_len,
+                                  uintptr_t index,
+                                  CrdtBuf *out_name,
+                                  uint64_t *out_fork_point,
+                                  uint64_t *out_head,
+                                  int32_t *out_published);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

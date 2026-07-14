@@ -3110,7 +3110,7 @@ pub unsafe extern "C" fn crdtsync_client_create_version(
     name: *const u8,
     name_len: usize,
 ) -> CrdtBuf {
-    version_frame(client, |s| {
+    request_frame(client, |s| {
         as_slice(name, name_len).and_then(|n| s.create_version(Channel(channel), n))
     })
 }
@@ -3130,7 +3130,7 @@ pub unsafe extern "C" fn crdtsync_client_rename_version(
     to: *const u8,
     to_len: usize,
 ) -> CrdtBuf {
-    version_frame(client, |s| {
+    request_frame(client, |s| {
         match (as_slice(from, from_len), as_slice(to, to_len)) {
             (Some(f), Some(t)) => s.rename_version(Channel(channel), f, t),
             _ => None,
@@ -3150,7 +3150,7 @@ pub unsafe extern "C" fn crdtsync_client_delete_version(
     name: *const u8,
     name_len: usize,
 ) -> CrdtBuf {
-    version_frame(client, |s| {
+    request_frame(client, |s| {
         as_slice(name, name_len).and_then(|n| s.delete_version(Channel(channel), n))
     })
 }
@@ -3165,7 +3165,7 @@ pub unsafe extern "C" fn crdtsync_client_list_versions(
     client: *const CrdtClient,
     channel: u32,
 ) -> CrdtBuf {
-    version_frame(client, |s| s.list_versions(Channel(channel)))
+    request_frame(client, |s| s.list_versions(Channel(channel)))
 }
 
 /// Frame a request for the captured state of version `name` on `channel`'s room.
@@ -3180,15 +3180,15 @@ pub unsafe extern "C" fn crdtsync_client_fetch_version(
     name: *const u8,
     name_len: usize,
 ) -> CrdtBuf {
-    version_frame(client, |s| {
+    request_frame(client, |s| {
         as_slice(name, name_len).and_then(|n| s.fetch_version(Channel(channel), n))
     })
 }
 
-/// Marshal a version request `frame` produces from the session into the wire
+/// Marshal a client request `frame` produces from the session into the wire
 /// frame to send, never letting a panic cross the C frame. Empty when `frame`
 /// yields nothing (a bad input or unheld channel).
-unsafe fn version_frame<F>(client: *const CrdtClient, frame: F) -> CrdtBuf
+unsafe fn request_frame<F>(client: *const CrdtClient, frame: F) -> CrdtBuf
 where
     F: FnOnce(&ClientSession) -> Option<Message>,
 {
@@ -3286,6 +3286,230 @@ pub unsafe extern "C" fn crdtsync_client_version_state(
         match (*client).session.version_state(Channel(channel), n) {
             Some(state) => {
                 *out = CrdtBuf::from_vec(state.to_vec());
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+// --- client branch management ---
+
+/// Frame a request for the branches of `room`; returns the frame to send. Empty
+/// on a bad handle or input. Room-keyed: a client may enumerate a room's branches
+/// before it subscribes any of them. The reply updates the branch view.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_list_branches(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+) -> CrdtBuf {
+    request_frame(client, |s| {
+        as_slice(room, room_len).map(|r| s.list_branches(r))
+    })
+}
+
+/// Frame a request to fork branch `name` off `from`'s HEAD in `room`. Empty on a
+/// bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len`, `name`/`name_len`, and
+/// `from`/`from_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_fork_branch(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    name: *const u8,
+    name_len: usize,
+    from: *const u8,
+    from_len: usize,
+) -> CrdtBuf {
+    request_frame(client, |s| {
+        match (
+            as_slice(room, room_len),
+            as_slice(name, name_len),
+            as_slice(from, from_len),
+        ) {
+            (Some(r), Some(n), Some(f)) => Some(s.fork_branch(r, n, f)),
+            _ => None,
+        }
+    })
+}
+
+/// Frame a request to fork branch `name` off the snapshot of version `version` in
+/// `room`. Empty on a bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len`, `name`/`name_len`, and
+/// `version`/`version_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_fork_branch_from_version(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    name: *const u8,
+    name_len: usize,
+    version: *const u8,
+    version_len: usize,
+) -> CrdtBuf {
+    request_frame(client, |s| {
+        match (
+            as_slice(room, room_len),
+            as_slice(name, name_len),
+            as_slice(version, version_len),
+        ) {
+            (Some(r), Some(n), Some(v)) => Some(s.fork_branch_from_version(r, n, v)),
+            _ => None,
+        }
+    })
+}
+
+/// Frame a request to restore `room` to version `version` as a fresh branch
+/// `name`, switching the active HEAD to it. Empty on a bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len`, `name`/`name_len`, and
+/// `version`/`version_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_restore_branch(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    name: *const u8,
+    name_len: usize,
+    version: *const u8,
+    version_len: usize,
+) -> CrdtBuf {
+    request_frame(client, |s| {
+        match (
+            as_slice(room, room_len),
+            as_slice(name, name_len),
+            as_slice(version, version_len),
+        ) {
+            (Some(r), Some(n), Some(v)) => Some(s.restore_branch(r, n, v)),
+            _ => None,
+        }
+    })
+}
+
+/// Frame a request to publish `room`'s active editor branch onto the read-only
+/// `published` branch. Empty on a bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len` and `published`/`published_len`
+/// follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_publish_branch(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    published: *const u8,
+    published_len: usize,
+) -> CrdtBuf {
+    request_frame(client, |s| {
+        match (as_slice(room, room_len), as_slice(published, published_len)) {
+            (Some(r), Some(p)) => Some(s.publish_branch(r, p)),
+            _ => None,
+        }
+    })
+}
+
+/// Frame a request to delete branch `name` of `room`. The default `main` is never
+/// deletable. Empty on a bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len` and `name`/`name_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_delete_branch(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    name: *const u8,
+    name_len: usize,
+) -> CrdtBuf {
+    request_frame(client, |s| {
+        match (as_slice(room, room_len), as_slice(name, name_len)) {
+            (Some(r), Some(n)) => Some(s.delete_branch(r, n)),
+            _ => None,
+        }
+    })
+}
+
+/// How many branches `room` currently holds in the client view, into `out`.
+/// Returns 1 on success, -1 on a bad handle or input (a room with no reported set
+/// reports 0).
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len` follow [`as_slice`]; `out` points
+/// to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_branch_count(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    out: *mut usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        let Some(r) = as_slice(room, room_len) else {
+            return -1;
+        };
+        *out = (*client).session.branches(r).map_or(0, <[_]>::len);
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// The branch record at `index` in `room`'s view: its name into a fresh buffer at
+/// `out_name`, its fork-point at `out_fork_point`, its head at `out_head`, and
+/// whether it is a read-only published target at `out_published` (0 or 1).
+/// Returns 1 if present, 0 if out of range or no set is reported, -1 on a bad
+/// handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len` follow [`as_slice`]; each `out_*`
+/// pointer is writable and non-null.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_branch_at(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    index: usize,
+    out_name: *mut CrdtBuf,
+    out_fork_point: *mut u64,
+    out_head: *mut u64,
+    out_published: *mut i32,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null()
+            || out_name.is_null()
+            || out_fork_point.is_null()
+            || out_head.is_null()
+            || out_published.is_null()
+        {
+            return -1;
+        }
+        let Some(r) = as_slice(room, room_len) else {
+            return -1;
+        };
+        match (*client)
+            .session
+            .branches(r)
+            .and_then(|branches| branches.get(index))
+        {
+            Some(b) => {
+                *out_name = CrdtBuf::from_vec(b.name.clone());
+                *out_fork_point = b.fork_point;
+                *out_head = b.head;
+                *out_published = i32::from(b.published);
                 1
             }
             None => 0,

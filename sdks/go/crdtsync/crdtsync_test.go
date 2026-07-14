@@ -479,6 +479,30 @@ func TestClientVersionRequestsMarshal(t *testing.T) {
 	}
 }
 
+func TestClientBranchRequestsMarshal(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+
+	room := key("room-1")
+	frames := [][]byte{
+		c.ListBranches(room),
+		c.ForkBranch(room, key("feature"), key("main")),
+		c.ForkBranchFromVersion(room, key("feature"), key("v1")),
+		c.RestoreBranch(room, key("restored"), key("v1")),
+		c.PublishBranch(room, key("live")),
+		c.DeleteBranch(room, key("feature")),
+	}
+	for i, f := range frames {
+		if len(f) == 0 {
+			t.Fatalf("branch request %d should yield a frame", i)
+		}
+	}
+	// Nothing reported until a server reply is folded in.
+	if bs := c.Branches(room); len(bs) != 0 {
+		t.Fatalf("branches: got %d, want 0", len(bs))
+	}
+}
+
 func TestClientReceiveRejectsGarbage(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()

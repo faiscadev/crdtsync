@@ -936,6 +936,91 @@ func (c *Client) VersionState(channel uint32, name []byte) ([]byte, bool) {
 	return takeBuf(out), true
 }
 
+// --- branch management ---
+
+// Branch is one branch of a room as the client observes it: its Name, the
+// ForkPoint it shares history up to, its own Head position, and whether it is a
+// read-only Published target.
+type Branch struct {
+	Name      []byte
+	ForkPoint uint64
+	Head      uint64
+	Published bool
+}
+
+// ListBranches frames a request for room's branches. Room-keyed: a client may
+// enumerate a room's branches before it subscribes any of them.
+func (c *Client) ListBranches(room []byte) []byte {
+	rp, rl := bytesArg(room)
+	return takeBuf(C.crdtsync_client_list_branches(c.h, rp, rl))
+}
+
+// ForkBranch frames a request to fork branch name off from's HEAD in room.
+func (c *Client) ForkBranch(room, name, from []byte) []byte {
+	rp, rl := bytesArg(room)
+	np, nl := bytesArg(name)
+	fp, fl := bytesArg(from)
+	return takeBuf(C.crdtsync_client_fork_branch(c.h, rp, rl, np, nl, fp, fl))
+}
+
+// ForkBranchFromVersion frames a request to fork branch name off the snapshot of
+// version in room.
+func (c *Client) ForkBranchFromVersion(room, name, version []byte) []byte {
+	rp, rl := bytesArg(room)
+	np, nl := bytesArg(name)
+	vp, vl := bytesArg(version)
+	return takeBuf(C.crdtsync_client_fork_branch_from_version(c.h, rp, rl, np, nl, vp, vl))
+}
+
+// RestoreBranch frames a request to restore room to version as a fresh branch
+// name, switching the active HEAD to it.
+func (c *Client) RestoreBranch(room, name, version []byte) []byte {
+	rp, rl := bytesArg(room)
+	np, nl := bytesArg(name)
+	vp, vl := bytesArg(version)
+	return takeBuf(C.crdtsync_client_restore_branch(c.h, rp, rl, np, nl, vp, vl))
+}
+
+// PublishBranch frames a request to publish room's active editor branch onto the
+// read-only published branch.
+func (c *Client) PublishBranch(room, published []byte) []byte {
+	rp, rl := bytesArg(room)
+	pp, pl := bytesArg(published)
+	return takeBuf(C.crdtsync_client_publish_branch(c.h, rp, rl, pp, pl))
+}
+
+// DeleteBranch frames a request to delete branch name of room. The default main
+// is never deletable.
+func (c *Client) DeleteBranch(room, name []byte) []byte {
+	rp, rl := bytesArg(room)
+	np, nl := bytesArg(name)
+	return takeBuf(C.crdtsync_client_delete_branch(c.h, rp, rl, np, nl))
+}
+
+// Branches returns the branch set last reported for room, in order.
+func (c *Client) Branches(room []byte) []Branch {
+	rp, rl := bytesArg(room)
+	var count C.uintptr_t
+	if C.crdtsync_client_branch_count(c.h, rp, rl, &count) != 1 {
+		return nil
+	}
+	branches := make([]Branch, 0, int(count))
+	for i := 0; i < int(count); i++ {
+		var name C.CrdtBuf
+		var forkPoint, head C.uint64_t
+		var published C.int32_t
+		if C.crdtsync_client_branch_at(c.h, rp, rl, C.uintptr_t(i), &name, &forkPoint, &head, &published) == 1 {
+			branches = append(branches, Branch{
+				Name:      takeBuf(name),
+				ForkPoint: uint64(forkPoint),
+				Head:      uint64(head),
+				Published: published == 1,
+			})
+		}
+	}
+	return branches
+}
+
 // --- schema-aware diff ---
 
 // Scalar is a tagged scalar value: T names the kind and the matching field

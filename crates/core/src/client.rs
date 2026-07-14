@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::doc::MapCursor;
-use crate::{Channel, ClientId, Document, ErrorCode, Message, Op};
+use crate::{BranchInfo, Channel, ClientId, Document, ErrorCode, Message, Op};
 
 /// Why an inbound message could not be folded into a replica.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -88,6 +88,12 @@ pub struct ClientSession {
     /// not lead, naming the leader to reconnect to. Buffered at the session for
     /// the transport to drain and act on; the core holds no socket to reconnect.
     redirects: Vec<Redirect>,
+    /// The last branch set the server reported per room — the view a
+    /// [`Message::Branches`] reply updates. Keyed by room rather than channel:
+    /// branch management is a room-level operation a client may run before it
+    /// holds any subscription. Empty until a list request or a mutation is
+    /// answered.
+    branches: HashMap<Vec<u8>, Vec<BranchInfo>>,
 }
 
 impl ClientSession {
@@ -104,6 +110,7 @@ impl ClientSession {
             next_channel: 0,
             rejected: Vec::new(),
             redirects: Vec::new(),
+            branches: HashMap::new(),
         }
     }
 
@@ -400,6 +407,70 @@ impl ClientSession {
             .map(|(_, state)| state.as_slice())
     }
 
+    /// Request the branches of `room`, returning the request frame. The reply
+    /// updates the [`branches`](ClientSession::branches) view. Room-keyed: a client
+    /// may enumerate a room's branches before it subscribes any of them.
+    pub fn list_branches(&self, room: &[u8]) -> Message {
+        Message::BranchList {
+            room: room.to_vec(),
+        }
+    }
+
+    /// Fork a fresh branch `name` off `from_branch`'s HEAD in `room`, returning the
+    /// request frame. The reply carries the fresh branch set.
+    pub fn fork_branch(&self, room: &[u8], name: &[u8], from_branch: &[u8]) -> Message {
+        Message::BranchFork {
+            room: room.to_vec(),
+            name: name.to_vec(),
+            from_branch: from_branch.to_vec(),
+        }
+    }
+
+    /// Fork a fresh branch `name` off the snapshot of version `version` in `room`,
+    /// returning the request frame. The reply carries the fresh branch set.
+    pub fn fork_branch_from_version(&self, room: &[u8], name: &[u8], version: &[u8]) -> Message {
+        Message::BranchForkFromVersion {
+            room: room.to_vec(),
+            name: name.to_vec(),
+            version: version.to_vec(),
+        }
+    }
+
+    /// Restore `room` to version `version` as a fresh branch `name`, switching the
+    /// active HEAD to it. Returns the request frame; the reply carries the fresh
+    /// branch set.
+    pub fn restore_branch(&self, room: &[u8], name: &[u8], version: &[u8]) -> Message {
+        Message::BranchRestore {
+            room: room.to_vec(),
+            name: name.to_vec(),
+            version: version.to_vec(),
+        }
+    }
+
+    /// Publish `room`'s active editor branch onto the read-only `published` branch,
+    /// returning the request frame. The reply carries the fresh branch set.
+    pub fn publish_branch(&self, room: &[u8], published: &[u8]) -> Message {
+        Message::BranchPublish {
+            room: room.to_vec(),
+            published: published.to_vec(),
+        }
+    }
+
+    /// Delete branch `name` of `room`, returning the request frame. The default
+    /// `main` is never deletable. The reply carries the fresh branch set.
+    pub fn delete_branch(&self, room: &[u8], name: &[u8]) -> Message {
+        Message::BranchDelete {
+            room: room.to_vec(),
+            name: name.to_vec(),
+        }
+    }
+
+    /// The branch set last reported for `room`, or `None` if none has been
+    /// reported. Empty until a list request or a branch mutation is answered.
+    pub fn branches(&self, room: &[u8]) -> Option<&[BranchInfo]> {
+        self.branches.get(room).map(Vec::as_slice)
+    }
+
     /// Leave the room on `channel`, dropping its replica. Returns the Unsubscribe
     /// frame to send, or `None` if the channel isn't held.
     pub fn unsubscribe(&mut self, channel: Channel) -> Option<Message> {
@@ -590,6 +661,20 @@ impl ClientSession {
             | Message::VersionList { .. }
             | Message::VersionFetch { .. } => Err(ClientError::UnexpectedMessage(
                 "server sent a version request",
+            )),
+            Message::Branches { room, branches } => {
+                // The server's set is authoritative — it replaces the view.
+                self.branches.insert(room, branches);
+                Ok(())
+            }
+            // Branch requests only travel client-to-server.
+            Message::BranchList { .. }
+            | Message::BranchFork { .. }
+            | Message::BranchForkFromVersion { .. }
+            | Message::BranchRestore { .. }
+            | Message::BranchPublish { .. }
+            | Message::BranchDelete { .. } => Err(ClientError::UnexpectedMessage(
+                "server sent a branch request",
             )),
             // Replication frames travel node-to-node; a client never sees one.
             Message::Replicate { .. } => {

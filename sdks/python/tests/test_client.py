@@ -128,6 +128,19 @@ def test_version_requests_marshal():
         assert a.version_state(ch, b"v1") is None
 
 
+def test_branch_requests_marshal():
+    with Client(cid(1)) as a:
+        room = b"room-1"
+        assert len(a.list_branches(room)) > 0
+        assert len(a.fork_branch(room, b"feature", b"main")) > 0
+        assert len(a.fork_branch_from_version(room, b"feature", b"v1")) > 0
+        assert len(a.restore_branch(room, b"restored", b"v1")) > 0
+        assert len(a.publish_branch(room, b"live")) > 0
+        assert len(a.delete_branch(room, b"feature")) > 0
+        # Nothing reported until a server reply is folded in.
+        assert a.branches(room) == []
+
+
 def test_receive_rejects_garbage():
     with Client(cid(1)) as a:
         assert a.receive(b"\xff\xff\xff\xff") == 0

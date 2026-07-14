@@ -86,6 +86,19 @@ pub enum ErrorCode {
     UpdateRequired,
 }
 
+/// One branch of a room as a client observes it over the wire: its `name`, the
+/// `fork_point` it shares history up to, its own `head` position, and whether it
+/// is a read-only `published` target. Marshaled in a [`Message::Branches`] reply
+/// so a client can enumerate a room's branches and decide which to subscribe or
+/// act on.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BranchInfo {
+    pub name: Vec<u8>,
+    pub fork_point: u64,
+    pub head: u64,
+    pub published: bool,
+}
+
 /// One framed message on the wire.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Message {
@@ -262,6 +275,45 @@ pub enum Message {
     Gossip {
         members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>,
     },
+    /// Requests the branches of `room` — the app-facing enumeration a client runs
+    /// to discover a room's forks and published targets before subscribing one.
+    /// Room-keyed rather than channel-keyed: branch management is a room-level
+    /// operation a client may run before it holds any subscription.
+    BranchList { room: Vec<u8> },
+    /// The branches of `room`, in deterministic name order — the server's reply to
+    /// a [`BranchList`](Message::BranchList) and the authoritative post-state after
+    /// any branch mutation.
+    Branches {
+        room: Vec<u8>,
+        branches: Vec<BranchInfo>,
+    },
+    /// Forks a fresh branch `name` off `from_branch`'s current HEAD in `room` — the
+    /// wire form of a live-log fork. Replies with the fresh branch list.
+    BranchFork {
+        room: Vec<u8>,
+        name: Vec<u8>,
+        from_branch: Vec<u8>,
+    },
+    /// Forks a fresh branch `name` off the snapshot of named version `version` in
+    /// `room` — the wire form of a snapshot fork. Replies with the fresh list.
+    BranchForkFromVersion {
+        room: Vec<u8>,
+        name: Vec<u8>,
+        version: Vec<u8>,
+    },
+    /// Restores `room` to named version `version` as a fresh branch `name`,
+    /// switching the active HEAD to it. Replies with the fresh branch list.
+    BranchRestore {
+        room: Vec<u8>,
+        name: Vec<u8>,
+        version: Vec<u8>,
+    },
+    /// Publishes `room`'s active editor branch onto the read-only `published`
+    /// branch. Replies with the fresh branch list.
+    BranchPublish { room: Vec<u8>, published: Vec<u8> },
+    /// Deletes branch `name` of `room`. The default `main` is never deletable.
+    /// Replies with the fresh branch list.
+    BranchDelete { room: Vec<u8>, name: Vec<u8> },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -506,6 +558,64 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
                 put_u8(&mut out, member_state_tag(*state));
             }
         }
+        Message::BranchList { room } => {
+            put_u8(&mut out, 27);
+            put_bytes(&mut out, room);
+        }
+        Message::Branches { room, branches } => {
+            put_u8(&mut out, 28);
+            put_bytes(&mut out, room);
+            put_u32(
+                &mut out,
+                u32::try_from(branches.len()).expect("branch count exceeds u32"),
+            );
+            for b in branches {
+                put_bytes(&mut out, &b.name);
+                put_u64(&mut out, b.fork_point);
+                put_u64(&mut out, b.head);
+                put_u8(&mut out, u8::from(b.published));
+            }
+        }
+        Message::BranchFork {
+            room,
+            name,
+            from_branch,
+        } => {
+            put_u8(&mut out, 29);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, name);
+            put_bytes(&mut out, from_branch);
+        }
+        Message::BranchForkFromVersion {
+            room,
+            name,
+            version,
+        } => {
+            put_u8(&mut out, 30);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, name);
+            put_bytes(&mut out, version);
+        }
+        Message::BranchRestore {
+            room,
+            name,
+            version,
+        } => {
+            put_u8(&mut out, 31);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, name);
+            put_bytes(&mut out, version);
+        }
+        Message::BranchPublish { room, published } => {
+            put_u8(&mut out, 32);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, published);
+        }
+        Message::BranchDelete { room, name } => {
+            put_u8(&mut out, 33);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, name);
+        }
     }
     out
 }
@@ -725,6 +835,68 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 members.push((node, addr, incarnation, state));
             }
             Message::Gossip { members }
+        }
+        27 => Message::BranchList { room: cur.bytes()? },
+        28 => {
+            let room = cur.bytes()?;
+            let count = cur.u32()?;
+            // Grow as records are read rather than trusting `count` to size the
+            // allocation — a bogus count then fails on the missing bytes, not on a
+            // giant up-front reservation.
+            let mut branches = Vec::new();
+            for _ in 0..count {
+                let name = cur.bytes()?;
+                let fork_point = cur.u64()?;
+                let head = cur.u64()?;
+                let published = cur.u8()? != 0;
+                branches.push(BranchInfo {
+                    name,
+                    fork_point,
+                    head,
+                    published,
+                });
+            }
+            Message::Branches { room, branches }
+        }
+        29 => {
+            let room = cur.bytes()?;
+            let name = cur.bytes()?;
+            let from_branch = cur.bytes()?;
+            Message::BranchFork {
+                room,
+                name,
+                from_branch,
+            }
+        }
+        30 => {
+            let room = cur.bytes()?;
+            let name = cur.bytes()?;
+            let version = cur.bytes()?;
+            Message::BranchForkFromVersion {
+                room,
+                name,
+                version,
+            }
+        }
+        31 => {
+            let room = cur.bytes()?;
+            let name = cur.bytes()?;
+            let version = cur.bytes()?;
+            Message::BranchRestore {
+                room,
+                name,
+                version,
+            }
+        }
+        32 => {
+            let room = cur.bytes()?;
+            let published = cur.bytes()?;
+            Message::BranchPublish { room, published }
+        }
+        33 => {
+            let room = cur.bytes()?;
+            let name = cur.bytes()?;
+            Message::BranchDelete { room, name }
         }
         tag => {
             return Err(ProtocolError::BadTag {
