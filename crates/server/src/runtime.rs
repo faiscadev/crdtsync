@@ -36,6 +36,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Authorizer, PermitAll};
+use crate::gossip::{GossipMember, GossipWireMember};
 use crate::membership::Membership;
 use crate::placement::NodeId;
 use crate::webhook::{WebhookConfig, WebhookSink};
@@ -149,14 +150,19 @@ enum Cmd {
     /// registry updates its membership view so a down member is skipped when
     /// electing a room's effective leader.
     PeerLive { node: NodeId, live: bool },
-    /// The gossip task asks for this node's current known members, so it can pick
-    /// a peer to gossip to and advertise the up-to-date set.
+    /// The gossip task asks for this node's current known members with liveness, so
+    /// it can pick a peer to gossip to and advertise the up-to-date view.
     GossipSnapshot {
-        reply: oneshot::Sender<Vec<(NodeId, Vec<u8>)>>,
+        reply: oneshot::Sender<Vec<GossipMember>>,
     },
-    /// The gossip task delivers the members a peer advertised back — the registry
-    /// unions them into its membership, growing the set toward convergence.
-    GossipLearned { members: Vec<(Vec<u8>, Vec<u8>)> },
+    /// The gossip task reports the outcome of a round it drove to `peer`: on
+    /// success, `learned` carries the liveness the peer advertised back (the
+    /// registry merges it) and the peer is noted reachable; on failure (`learned`
+    /// is `None`) the peer is noted unreachable — the gossip-driven failover signal.
+    GossipRound {
+        peer: NodeId,
+        learned: Option<Vec<GossipWireMember>>,
+    },
 }
 
 /// What the actor makes of a connect request after weighing any upgrade
@@ -412,12 +418,19 @@ async fn registry_actor(
                         reg.set_peer_liveness(node, live);
                     }
                     Cmd::GossipSnapshot { reply } => {
-                        let _ = reply.send(reg.known_members());
+                        let _ = reply.send(reg.known_liveness());
                     }
-                    Cmd::GossipLearned { members } => {
-                        // The next client delivery recomputes placement off the
-                        // grown member set, so there is nothing to flush here.
-                        reg.merge_gossip(members);
+                    Cmd::GossipRound { peer, learned } => {
+                        // The next client delivery recomputes placement and
+                        // effective leadership off the grown set and updated
+                        // liveness, so there is nothing to flush here.
+                        match learned {
+                            Some(members) => {
+                                reg.note_gossip_probe(peer, true);
+                                reg.merge_gossip(members);
+                            }
+                            None => reg.note_gossip_probe(peer, false),
+                        }
                     }
                 }
             }
@@ -533,15 +546,16 @@ async fn gossip_loop(server: ClientId, self_id: NodeId, cmds: UnboundedSender<Cm
         let Ok(members) = snapshot.await else {
             return;
         };
-        let Some(peer_addr) = crate::gossip::choose_peer(&members, &self_id) else {
+        let Some((peer, peer_addr)) = crate::gossip::choose_peer(&members, &self_id) else {
             continue;
         };
         let addr = String::from_utf8_lossy(&peer_addr).into_owned();
         let frame = crate::gossip::gossip_frame(&members);
-        if let Some(learned) = crate::gossip::gossip_exchange(&addr, server, frame).await {
-            if cmds.send(Cmd::GossipLearned { members: learned }).is_err() {
-                return;
-            }
+        // A successful round is first-hand proof the peer is alive and carries the
+        // liveness it advertised back; a failed one counts toward suspecting it.
+        let learned = crate::gossip::gossip_exchange(&addr, server, frame).await;
+        if cmds.send(Cmd::GossipRound { peer, learned }).is_err() {
+            return;
         }
     }
 }

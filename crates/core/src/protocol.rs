@@ -53,6 +53,22 @@ impl From<DecodeError> for ProtocolError {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Channel(pub u32);
 
+/// A cluster member's liveness in the SWIM-style gossip failure detector,
+/// disseminated in each [`Message::Gossip`] tuple. Variants are ordered least- to
+/// most-suspicious, so the derived `Ord` gives `Dead > Suspect > Alive` — the
+/// tie-break the anti-entropy merge applies at equal incarnation, letting a
+/// detected failure win over stale optimism.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum MemberState {
+    /// Reachable and participating — the default a member is learned at.
+    Alive,
+    /// Missed enough direct gossip probes to be doubted, but not yet declared
+    /// dead. Still routed to (optimistically live) until it reaches `Dead`.
+    Suspect,
+    /// Confirmed unreachable — excluded from room leadership cluster-wide.
+    Dead,
+}
+
 /// A closed set of failure reasons the server reports to a client.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ErrorCode {
@@ -233,14 +249,19 @@ pub enum Message {
     /// frame; a client that sends one commits a protocol violation.
     ReplicaAck { room: Vec<u8>, through_seq: u64 },
     /// A node's advertisement of the cluster members it knows, for gossip
-    /// membership discovery: `members` is a set of `(node_id, advertise_addr)`
-    /// pairs — the node id a peer places with and the address it dials to reach
-    /// that member. A receiver unions the pairs into its own membership (anti-
-    /// entropy: a purely additive set union), so a node that boots knowing only a
-    /// seed peer learns the whole cluster within a few gossip rounds. Node-to-node
+    /// membership discovery and SWIM-style failure detection: `members` is a set of
+    /// `(node_id, advertise_addr, incarnation, state)` tuples — the node id a peer
+    /// places with, the address it dials to reach that member, a monotonic per-node
+    /// refutation counter, and the member's [`MemberState`]. A receiver merges each
+    /// tuple into its own liveness view (anti-entropy: a higher incarnation wins,
+    /// and at equal incarnation the more-suspicious state wins), so a node that
+    /// boots knowing only a seed peer learns the whole cluster — and a node's
+    /// failure propagates to every node — within a few gossip rounds. Node-to-node
     /// — never a client frame; a client that sends one commits a protocol
     /// violation.
-    Gossip { members: Vec<(Vec<u8>, Vec<u8>)> },
+    Gossip {
+        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>,
+    },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -478,9 +499,11 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
                 &mut out,
                 u32::try_from(members.len()).expect("member count exceeds u32"),
             );
-            for (node, addr) in members {
+            for (node, addr, incarnation, state) in members {
                 put_bytes(&mut out, node);
                 put_bytes(&mut out, addr);
+                put_u64(&mut out, *incarnation);
+                put_u8(&mut out, member_state_tag(*state));
             }
         }
     }
@@ -690,14 +713,16 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
         }
         26 => {
             let count = cur.u32()?;
-            // Grow as pairs are read rather than trusting `count` to size the
+            // Grow as tuples are read rather than trusting `count` to size the
             // allocation — a bogus count then fails on the missing bytes, not on a
             // giant up-front reservation.
             let mut members = Vec::new();
             for _ in 0..count {
                 let node = cur.bytes()?;
                 let addr = cur.bytes()?;
-                members.push((node, addr));
+                let incarnation = cur.u64()?;
+                let state = member_state(cur.u8()?)?;
+                members.push((node, addr, incarnation, state));
             }
             Message::Gossip { members }
         }
@@ -712,6 +737,26 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
         return Err(ProtocolError::TrailingBytes);
     }
     Ok(msg)
+}
+
+fn member_state_tag(state: MemberState) -> u8 {
+    match state {
+        MemberState::Alive => 0,
+        MemberState::Suspect => 1,
+        MemberState::Dead => 2,
+    }
+}
+
+fn member_state(tag: u8) -> Result<MemberState, ProtocolError> {
+    match tag {
+        0 => Ok(MemberState::Alive),
+        1 => Ok(MemberState::Suspect),
+        2 => Ok(MemberState::Dead),
+        tag => Err(ProtocolError::BadTag {
+            what: "gossip member state",
+            tag,
+        }),
+    }
 }
 
 fn error_code_tag(code: ErrorCode) -> u16 {
