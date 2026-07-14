@@ -546,6 +546,22 @@ pub fn step(
             if hub.is_published(&room, &branch) {
                 return ops_rejected(channel, &ops, ErrorCode::Forbidden);
             }
+            // A cross-zone tree move is inadmissible: the per-zone clocks never
+            // order across zones, and the crossing is not detectable from the
+            // post-move tree, so it is caught here at the op against the room's
+            // pre-move document. Refused recoverably like an authz denial — the op
+            // never enters the log, so every replica converges on its absence.
+            // Gated to `main`: the enforcement resolves against the room's
+            // materialized document, which a branch's divergent tree is not part
+            // of, so branch-scoped move enforcement waits on the per-zone stream
+            // work that models branch/zone interaction.
+            if branch == MAIN_BRANCH {
+                if let Some(schema) = schema {
+                    if hub.batch_crosses_zone(&room, &ops, schema) {
+                        return ops_rejected(channel, &ops, ErrorCode::Forbidden);
+                    }
+                }
+            }
             // The batch's highest per-client op sequence: the frontier the author
             // is acknowledged through once the ops are durably logged, so it can
             // prune its outbox. Computed over the whole submitted batch, not just
