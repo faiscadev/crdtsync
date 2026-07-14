@@ -223,10 +223,23 @@ pub struct Op {
     pub target: ElementId,
     pub kind: OpKind,
     pub tx: Option<Tx>,
+    /// Which replication partition the op belongs to: the compact id of the zone
+    /// (`Schema::zones()` declaration index, see [`zone::zone_id_of`](crate::zone::zone_id_of))
+    /// its `target` resolves to, or `None` for the root partition (an unzoned
+    /// target, or a document with no zones). The op is stamped from that
+    /// partition's own lamport clock, so zones are causally independent — an op in
+    /// one zone never orders an op in another. The dimension travels on the
+    /// envelope rather than being re-derived on receipt, so a replica advances the
+    /// right clock even for an op whose target it cannot yet resolve, and a later
+    /// per-zone stream can route by it without materialising the tree.
+    pub zone: Option<u32>,
 }
 
 impl Op {
-    /// A standalone (non-atomic) op.
+    /// A standalone (non-atomic) op in the root partition. The zone dimension is
+    /// assigned by the emitting [`Document`](crate::Document) from the target's
+    /// position; an op minted without that context (a test fixture, a translated
+    /// or replayed op) defaults to the root partition.
     pub fn new(id: OpId, stamp: Stamp, target: ElementId, kind: OpKind) -> Self {
         Self {
             id,
@@ -234,6 +247,7 @@ impl Op {
             target,
             kind,
             tx: None,
+            zone: None,
         }
     }
 }

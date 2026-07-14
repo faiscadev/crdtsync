@@ -494,6 +494,7 @@ fn mk_op(kind: OpKind) -> Op {
             id: TxId(9),
             count: 2,
         }),
+        zone: None,
     }
 }
 

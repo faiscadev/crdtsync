@@ -36,6 +36,7 @@ use crate::text::Text;
 use crate::treemove::TreeMoves;
 use crate::validate::Step;
 use crate::xml::{XmlElement, XmlFragment};
+use crate::zone;
 
 /// One placement of a movable XML node: a Fugue node in some children `list`,
 /// keyed by its node `stamp`. A node moved N times has N+1 placements (birth plus
@@ -55,7 +56,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 8;
+const STATE_VERSION: u8 = 9;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -155,7 +156,18 @@ pub struct Document {
     /// revoke wins on merge and survives a snapshot reload. Storage only — core
     /// merges the set but enforces no authority (see [`crate::acl`]).
     acl: HashMap<ElementId, AclEntry>,
+    /// The lamport clock of the root partition — the zone every unzoned target
+    /// (and every op of a document with no zones) is stamped from. With no zones
+    /// this is the document's whole lamport clock, exactly as before zones.
     lamport: u64,
+    /// The per-zone lamport clocks, keyed by compact zone id
+    /// ([`zone::zone_id_of`]). Each declared zone advances its own clock, so an op
+    /// in one zone never bumps another's — the partitions are causally independent,
+    /// the property that lets each zone later replicate as its own stream. A zone
+    /// absent here has clock 0 (never yet stamped). The root partition is `lamport`
+    /// above, not an entry here; an empty map is a document behaving exactly as one
+    /// with no zones.
+    zone_clocks: HashMap<u32, u64>,
     seq: u64,
     /// The next atomic-transaction id to mint; namespaced by this replica's
     /// client, so `(client, tx)` is globally unique.
@@ -223,6 +235,7 @@ impl Document {
             ranged: HashMap::new(),
             acl: HashMap::new(),
             lamport: 0,
+            zone_clocks: HashMap::new(),
             seq: 0,
             next_tx: 0,
             atomic: None,
@@ -729,6 +742,17 @@ impl Document {
         put_u64(&mut out, self.lamport);
         put_u64(&mut out, self.seq);
 
+        // The per-zone lamport clocks (the root partition rides `lamport` above),
+        // id-sorted for a deterministic encoding. Empty for a document with no
+        // zones — a re-encode of a decoded no-zones snapshot is byte-stable.
+        let mut zone_clocks: Vec<(&u32, &u64)> = self.zone_clocks.iter().collect();
+        zone_clocks.sort_by_key(|(zone, _)| **zone);
+        put_u32(&mut out, len_u32(zone_clocks.len()));
+        for (zone, lamport) in zone_clocks {
+            put_u32(&mut out, *zone);
+            put_u64(&mut out, *lamport);
+        }
+
         encode_registry(&mut out, &self.counters, |c, o| {
             c.borrow().encode_state_into(o)
         });
@@ -880,6 +904,15 @@ impl Document {
         self.seq
     }
 
+    /// The current lamport high-water of a replication partition: the root clock
+    /// for `None`, or a declared zone's own clock (`0` if that zone has never been
+    /// stamped) for `Some(zone_id)`. Two replicas that have folded the same op set
+    /// report identical per-partition clocks — the causal-independence invariant
+    /// the per-zone replication streams build on.
+    pub fn zone_clock(&self, zone: Option<u32>) -> u64 {
+        self.clock(zone)
+    }
+
     /// Rebuild a replica from a snapshot but author future ops under `client`
     /// with an op counter no lower than `next_seq`, rather than the identity and
     /// counter the snapshot was encoded with. A replica adopting a snapshot
@@ -908,6 +941,20 @@ impl Document {
         let client = cur.client()?;
         let lamport = cur.u64()?;
         let seq = cur.u64()?;
+
+        let zone_clock_count = cur.u32()?;
+        let mut zone_clocks: HashMap<u32, u64> =
+            HashMap::with_capacity((zone_clock_count as usize).min(1024));
+        for _ in 0..zone_clock_count {
+            let zone = cur.u32()?;
+            let lamport = cur.u64()?;
+            if zone_clocks.insert(zone, lamport).is_some() {
+                return Err(DecodeError::BadTag {
+                    what: "document: duplicate zone clock",
+                    tag: 0,
+                });
+            }
+        }
 
         let counters = decode_registry(cur, |c| Counter::decode_state_from(c), |c| c.id())?;
         // Lists decode into shells with composite nodes still unresolved (like map
@@ -1223,6 +1270,7 @@ impl Document {
             ranged,
             acl,
             lamport,
+            zone_clocks,
             seq,
             // Tx ids scope only the buffering of remote partial transactions,
             // keyed by their author's client; a restored replica mints its own
@@ -1457,12 +1505,110 @@ impl Document {
     fn apply_now(&mut self, op: &Op) {
         self.seen.insert(op.id);
         // A text run occupies one char_id per codepoint from the op's stamp;
-        // the clock must clear the last of them, not just the base.
+        // the clock must clear the last of them, not just the base. The op's zone
+        // is honored from the envelope, never re-derived: the sender resolved it
+        // deterministically from the shared schema, and a per-zone `max` merge is
+        // order-independent, so two replicas folding the same ops converge to
+        // identical clocks. An op in one zone leaves every other zone's clock
+        // untouched, so it forms no causal edge across the partition boundary.
         let last = op.stamp.lamport.saturating_add(span(&op.kind) - 1);
-        if last > self.lamport {
-            self.lamport = last;
-        }
+        self.advance_clock(op.zone, last);
         self.apply_kind(op.target, &op.kind, op.stamp, op.id.client);
+    }
+
+    /// The current lamport high-water of a partition: the root clock for `None`,
+    /// else the zone's own clock (0 if never yet stamped).
+    fn clock(&self, zone: Option<u32>) -> u64 {
+        match zone {
+            None => self.lamport,
+            Some(z) => self.zone_clocks.get(&z).copied().unwrap_or(0),
+        }
+    }
+
+    /// Raise a partition's clock to at least `to` — the per-partition monotonic
+    /// merge, applied to the root clock or one zone's clock alone.
+    fn advance_clock(&mut self, zone: Option<u32>, to: u64) {
+        match zone {
+            None => {
+                if to > self.lamport {
+                    self.lamport = to;
+                }
+            }
+            Some(z) => {
+                let slot = self.zone_clocks.entry(z).or_insert(0);
+                if to > *slot {
+                    *slot = to;
+                }
+            }
+        }
+    }
+
+    /// The partition a local edit on `target` belongs to: the compact id of the
+    /// zone `target` resolves to, or `None` (the root partition) when no schema is
+    /// bound, the schema declares no zones, or the target is unzoned. Resolved from
+    /// the target's structural path, so it is a pure function of the shared schema
+    /// and the tree — every replica assigns the same op to the same partition.
+    fn zone_of_target(&self, target: ElementId) -> Option<u32> {
+        let schema = self.schema.as_ref()?;
+        if schema.zones().is_empty() {
+            return None;
+        }
+        let path = self.element_paths().remove(&target)?;
+        zone::zone_id_of(schema, &path)
+    }
+
+    /// Every materialised container mapped to its `core::path` key sequence — the
+    /// projection zone resolution reads. A zone governs a whole subtree, so a
+    /// node-addressed child (a list item, an XML attrs map / children list /
+    /// positional child) inherits its holding container's path rather than keying a
+    /// new segment; only a map slot extends the path. Walks the live tree from the
+    /// root, so the result reflects moves, displacement, and deletes exactly.
+    fn element_paths(&self) -> HashMap<ElementId, Vec<Vec<u8>>> {
+        fn walk(elem: &Element, path: &[Vec<u8>], out: &mut HashMap<ElementId, Vec<Vec<u8>>>) {
+            match elem {
+                Element::Map(m) => {
+                    let m = m.borrow();
+                    out.insert(m.id(), path.to_vec());
+                    let mut child_path = path.to_vec();
+                    for key in m.keys() {
+                        let Some(child) = m.get(&key) else { continue };
+                        if !child.is_container() {
+                            continue;
+                        }
+                        child_path.push(key.clone());
+                        walk(&child, &child_path, out);
+                        child_path.pop();
+                    }
+                }
+                Element::List(l) => {
+                    let l = l.borrow();
+                    out.insert(l.id(), path.to_vec());
+                    for child in l.values() {
+                        if child.is_container() {
+                            walk(&child, path, out);
+                        }
+                    }
+                }
+                Element::Text(t) => {
+                    out.insert(t.borrow().id(), path.to_vec());
+                }
+                Element::XmlElement(x) => {
+                    let x = x.borrow();
+                    out.insert(x.id(), path.to_vec());
+                    walk(&Element::Map(x.attrs()), path, out);
+                    walk(&Element::List(x.children()), path, out);
+                }
+                Element::XmlFragment(f) => {
+                    let f = f.borrow();
+                    out.insert(f.id(), path.to_vec());
+                    walk(&Element::List(f.children()), path, out);
+                }
+                Element::Scalar(_) | Element::Register(_) | Element::Counter(_) => {}
+            }
+        }
+        let mut out = HashMap::new();
+        walk(&Element::Map(self.root()), &[], &mut out);
+        out
     }
 
     /// Replay buffered ops that a state change just made reachable, to a
@@ -1701,13 +1847,19 @@ impl Document {
     /// caller that creates a stamp-keyed child (an XML sequence child) can derive
     /// its id without re-minting.
     fn emit_stamped(&mut self, target: ElementId, kind: OpKind) -> Stamp {
-        self.lamport += 1;
+        // The op is stamped from its own partition's clock, so an edit in one zone
+        // never advances another's and the op carries which partition it belongs
+        // to. The target already exists (a mutation names a materialised
+        // container), so its zone resolves now.
+        let zone = self.zone_of_target(target);
+        let base = self.clock(zone) + 1;
         let stamp = Stamp {
-            lamport: self.lamport,
+            lamport: base,
             client: self.client,
         };
         // Reserve the rest of a run's char_ids so the next op sorts after it.
-        self.lamport += span(&kind) - 1;
+        let last = base + (span(&kind) - 1);
+        self.advance_clock(zone, last);
         let id = OpId {
             client: self.client,
             seq: self.seq,
@@ -1716,7 +1868,14 @@ impl Document {
         self.seen.insert(id);
         let author = self.client;
         self.apply_kind(target, &kind, stamp, author);
-        self.pending.push(Op::new(id, stamp, target, kind));
+        self.pending.push(Op {
+            id,
+            stamp,
+            target,
+            kind,
+            tx: None,
+            zone,
+        });
         stamp
     }
 

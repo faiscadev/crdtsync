@@ -265,6 +265,7 @@ fn a_tx_textinsert_at_the_lamport_ceiling_does_not_overflow() {
             id: crdtsync_core::TxId(0),
             count: 1,
         }),
+        zone: None,
     };
     d.apply(&op); // must not panic
 }
