@@ -15,8 +15,9 @@ use crdtsync_core::marks::{MarkState, ResolvedMark};
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_op, encode_ops, path, AclEffect, AclGrant,
-    AclSubject, BlobRef, Capability, Channel, ClientError, ClientId, ClientSession, Document,
-    ErrorCode as CoreErrorCode, Host, Redirect, Rejected, RelativePosition, Scalar, UndoManager,
+    AclSubject, BlobRef, BranchInfo, Capability, Channel, ClientError, ClientId, ClientSession,
+    Document, ErrorCode as CoreErrorCode, Host, Redirect, Rejected, RelativePosition, Scalar,
+    UndoManager,
 };
 use wasm_bindgen::prelude::*;
 
@@ -1246,6 +1247,60 @@ impl WasmClient {
             .version_state(Channel(channel), name)
             .map(<[u8]>::to_vec)
     }
+
+    /// Frame a request for `room`'s branches. Room-keyed: a client may enumerate a
+    /// room's branches before it subscribes any of them. The reply updates the
+    /// branch view.
+    #[wasm_bindgen(js_name = listBranches)]
+    pub fn list_branches(&self, room: &[u8]) -> Vec<u8> {
+        encode_message(&self.inner.list_branches(room))
+    }
+
+    /// Frame a request to fork branch `name` off `from`'s HEAD in `room`.
+    #[wasm_bindgen(js_name = forkBranch)]
+    pub fn fork_branch(&self, room: &[u8], name: &[u8], from: &[u8]) -> Vec<u8> {
+        encode_message(&self.inner.fork_branch(room, name, from))
+    }
+
+    /// Frame a request to fork branch `name` off the snapshot of `version` in `room`.
+    #[wasm_bindgen(js_name = forkBranchFromVersion)]
+    pub fn fork_branch_from_version(&self, room: &[u8], name: &[u8], version: &[u8]) -> Vec<u8> {
+        encode_message(&self.inner.fork_branch_from_version(room, name, version))
+    }
+
+    /// Frame a request to restore `room` to `version` as a fresh branch `name`,
+    /// switching the active HEAD to it.
+    #[wasm_bindgen(js_name = restoreBranch)]
+    pub fn restore_branch(&self, room: &[u8], name: &[u8], version: &[u8]) -> Vec<u8> {
+        encode_message(&self.inner.restore_branch(room, name, version))
+    }
+
+    /// Frame a request to publish `room`'s active editor branch onto the read-only
+    /// `published` branch.
+    #[wasm_bindgen(js_name = publishBranch)]
+    pub fn publish_branch(&self, room: &[u8], published: &[u8]) -> Vec<u8> {
+        encode_message(&self.inner.publish_branch(room, published))
+    }
+
+    /// Frame a request to delete branch `name` of `room`. The default `main` is
+    /// never deletable.
+    #[wasm_bindgen(js_name = deleteBranch)]
+    pub fn delete_branch(&self, room: &[u8], name: &[u8]) -> Vec<u8> {
+        encode_message(&self.inner.delete_branch(room, name))
+    }
+
+    /// The branch set last reported for `room`, in order, as an array of
+    /// `{ name, forkPoint, head, published }` — `name` a `Uint8Array`, `forkPoint`
+    /// and `head` numbers, `published` a boolean. Empty if none has been reported.
+    pub fn branches(&self, room: &[u8]) -> JsValue {
+        self.inner
+            .branches(room)
+            .unwrap_or(&[])
+            .iter()
+            .map(branch_to_js)
+            .collect::<js_sys::Array>()
+            .into()
+    }
 }
 
 impl WasmClient {
@@ -1403,6 +1458,19 @@ fn redirect_to_js(r: &Redirect) -> JsValue {
         "leaderAddr",
         &js_sys::Uint8Array::from(r.leader_addr.as_slice()).into(),
     );
+    obj.into()
+}
+
+fn branch_to_js(b: &BranchInfo) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(
+        &obj,
+        "name",
+        &js_sys::Uint8Array::from(b.name.as_slice()).into(),
+    );
+    set(&obj, "forkPoint", &JsValue::from_f64(b.fork_point as f64));
+    set(&obj, "head", &JsValue::from_f64(b.head as f64));
+    set(&obj, "published", &JsValue::from_bool(b.published));
     obj.into()
 }
 

@@ -138,6 +138,15 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_version_count",
         "crdtsync_client_version_name",
         "crdtsync_client_version_state",
+        // client branch management
+        "crdtsync_client_list_branches",
+        "crdtsync_client_fork_branch",
+        "crdtsync_client_fork_branch_from_version",
+        "crdtsync_client_restore_branch",
+        "crdtsync_client_publish_branch",
+        "crdtsync_client_delete_branch",
+        "crdtsync_client_branch_count",
+        "crdtsync_client_branch_at",
     ];
     for sym in required {
         assert!(

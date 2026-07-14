@@ -400,6 +400,23 @@ fn a_client_version_requests_marshal() {
 }
 
 #[wasm_bindgen_test]
+fn a_client_branch_requests_marshal() {
+    let c = wasm_client(1);
+    let room = b"room-1";
+    assert!(!c.list_branches(room).is_empty());
+    assert!(!c.fork_branch(room, b"feature", b"main").is_empty());
+    assert!(!c
+        .fork_branch_from_version(room, b"feature", b"v1")
+        .is_empty());
+    assert!(!c.restore_branch(room, b"restored", b"v1").is_empty());
+    assert!(!c.publish_branch(room, b"live").is_empty());
+    assert!(!c.delete_branch(room, b"feature").is_empty());
+    // Nothing reported until a server reply is folded in.
+    let reported = js_sys::Array::from(&c.branches(room));
+    assert_eq!(reported.length(), 0);
+}
+
+#[wasm_bindgen_test]
 fn a_client_rejects_garbage_frames() {
     let mut c = wasm_client(1);
     assert!(!c.receive(&[0xff, 0xff, 0xff, 0xff]).unwrap());

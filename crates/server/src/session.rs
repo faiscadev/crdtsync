@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crdtsync_core::protocol::PROTOCOL_VERSION;
-use crdtsync_core::{Channel, ClientId, ErrorCode, Message, Op};
+use crdtsync_core::{BranchInfo, Channel, ClientId, ErrorCode, Message, Op};
 
 use crdtsync_core::schema::Schema;
 
@@ -787,6 +787,95 @@ pub fn step(
         // Version responses only travel server-to-client.
         Message::Versions { .. } => violation("client sent a versions list"),
         Message::VersionState { .. } => violation("client sent a version state"),
+        // Branch management is a room-keyed request/response sub-protocol. A
+        // mutation replies with the fresh branch set — the authoritative
+        // post-state — and a list request the same. Like a version mutation, a
+        // branch mutation persists to the room, so it is served only by the room's
+        // leader; on a non-leader it is redirected rather than persisted, so a
+        // follower never diverges the room's branches. A read (list) is served
+        // locally from the replicated registry.
+        Message::BranchList { room } => {
+            if !branch_authorized(session, authorizer, schema, &room, Action::Read) {
+                return branch_denied(session);
+            }
+            branches_list(hub, &room)
+        }
+        Message::BranchFork {
+            room,
+            name,
+            from_branch,
+        } => {
+            if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
+                return branch_denied(session);
+            }
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
+            // A fork past the source's head is clamped to it, so `u64::MAX` forks at
+            // the source branch's current HEAD.
+            match hub.fork_branch(&room, &name, &from_branch, u64::MAX) {
+                Ok(_) => branches_list(hub, &room),
+                Err(_) => internal("failed to persist branch"),
+            }
+        }
+        Message::BranchForkFromVersion {
+            room,
+            name,
+            version,
+        } => {
+            if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
+                return branch_denied(session);
+            }
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
+            match hub.fork_branch_from_version(&room, &name, &version) {
+                Ok(_) => branches_list(hub, &room),
+                Err(_) => internal("failed to persist branch"),
+            }
+        }
+        Message::BranchRestore {
+            room,
+            name,
+            version,
+        } => {
+            if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
+                return branch_denied(session);
+            }
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
+            match hub.restore_as_branch(&room, &version, &name) {
+                Ok(_) => branches_list(hub, &room),
+                Err(_) => internal("failed to persist branch"),
+            }
+        }
+        Message::BranchPublish { room, published } => {
+            if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
+                return branch_denied(session);
+            }
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
+            match hub.publish(&room, &published) {
+                Ok(_) => branches_list(hub, &room),
+                Err(_) => internal("failed to persist branch"),
+            }
+        }
+        Message::BranchDelete { room, name } => {
+            if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
+                return branch_denied(session);
+            }
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
+            match hub.delete_branch(&room, &name) {
+                Ok(_) => branches_list(hub, &room),
+                Err(_) => internal("failed to persist branch"),
+            }
+        }
+        // A branch set only travels server-to-client.
+        Message::Branches { .. } => violation("client sent a branch set"),
         // A redirect is the server's own routing reply; a client never sends one.
         Message::Redirect { .. } => violation("client sent a redirect"),
         // Replication frames travel node-to-node between replicas — the registry
@@ -880,6 +969,63 @@ fn versions_list(hub: &Hub, channel: Channel, room: &[u8]) -> Response {
         replies: vec![Message::Versions {
             channel,
             names: hub.version_names(room),
+        }],
+        ..Response::default()
+    }
+}
+
+/// Whether this session's actor is authorized for `action` on `room`'s branch
+/// management. Branch ops are room-management actions, gated by the same tier as
+/// version management: the doc-ACL tier abstains, so the deployment and schema
+/// tiers decide. Room-keyed rather than channel-keyed — a client may manage a
+/// room's branches without holding a subscription — so the room comes from the
+/// frame, checked only that the connection is authenticated.
+fn branch_authorized(
+    session: &Session,
+    authorizer: &dyn Authorizer,
+    schema: Option<&Schema>,
+    room: &[u8],
+    action: Action,
+) -> bool {
+    let Some(identity) = session.identity() else {
+        return false;
+    };
+    authorized(
+        authorizer,
+        Decision::Abstain,
+        schema,
+        identity,
+        action,
+        &Resource::Room(room),
+    )
+}
+
+/// The refusal for a branch request [`branch_authorized`] rejected: a violation
+/// if the connection is unauthenticated, otherwise a non-closing forbidden.
+fn branch_denied(session: &Session) -> Response {
+    if session.actor().is_none() {
+        violation("branch request before auth")
+    } else {
+        forbidden("branch request denied")
+    }
+}
+
+/// The reply carrying `room`'s current branch set.
+fn branches_list(hub: &Hub, room: &[u8]) -> Response {
+    let branches = hub
+        .branches(room)
+        .into_iter()
+        .map(|b| BranchInfo {
+            name: b.name,
+            fork_point: b.fork_point,
+            head: b.head,
+            published: b.published,
+        })
+        .collect();
+    Response {
+        replies: vec![Message::Branches {
+            room: room.to_vec(),
+            branches,
         }],
         ..Response::default()
     }
