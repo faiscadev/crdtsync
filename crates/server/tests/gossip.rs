@@ -199,6 +199,50 @@ fn add_member_is_idempotent_for_a_known_member() {
     assert_eq!(b_addr, Some(B.as_bytes().to_vec()));
 }
 
+#[test]
+fn a_member_with_an_empty_node_id_is_dropped() {
+    // A malformed gossip pair — an empty node id — is neither placeable nor
+    // dialable, so it must not poison the member set.
+    let mut m = seeded(A, B);
+    let before = member_set(&m);
+    m.add_member(NodeId::from(Vec::new()), b"10.0.0.9:9000".to_vec());
+    assert_eq!(member_set(&m), before, "an empty-id member is not added");
+    // The same guard holds through the wire merge path.
+    merge_into(
+        &mut m,
+        vec![
+            (Vec::new(), Vec::new()),
+            (C.as_bytes().to_vec(), C.as_bytes().to_vec()),
+        ],
+    );
+    assert!(member_set(&m).contains(&NodeId::from_addr(C)), "C is added");
+    assert!(
+        !member_set(&m).contains(&NodeId::from(Vec::new())),
+        "the empty-id pair is dropped",
+    );
+}
+
+#[test]
+fn a_batch_add_unions_every_new_member_at_once() {
+    let mut m = alone("10.0.0.9:9000");
+    m.add_members(vec![
+        (NodeId::from_addr(A), A.as_bytes().to_vec()),
+        (NodeId::from_addr(B), B.as_bytes().to_vec()),
+        (NodeId::from_addr(A), A.as_bytes().to_vec()), // duplicate within the batch
+    ]);
+    let mut expected = vec![
+        NodeId::from_addr("10.0.0.9:9000"),
+        NodeId::from_addr(A),
+        NodeId::from_addr(B),
+    ];
+    expected.sort();
+    assert_eq!(
+        member_set(&m),
+        expected,
+        "batch adds each distinct new member once"
+    );
+}
+
 // --- (d) single-node regression: no membership, no gossip ---
 
 #[test]

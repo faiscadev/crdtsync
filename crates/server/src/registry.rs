@@ -364,9 +364,11 @@ impl Registry {
     /// members.
     pub fn merge_gossip(&mut self, members: Vec<(Vec<u8>, Vec<u8>)>) {
         if let Some(membership) = &mut self.membership {
-            for (node, addr) in members {
-                membership.add_member(NodeId::from(node), addr);
-            }
+            membership.add_members(
+                members
+                    .into_iter()
+                    .map(|(node, addr)| (NodeId::from(node), addr)),
+            );
         }
     }
 

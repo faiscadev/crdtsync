@@ -10,9 +10,16 @@
 //! two nodes have learned the same members they place every room identically.
 //!
 //! The union is purely additive here — no member ever leaves. Failure detection
-//! (suspicion, then eviction) is a later slice; a member's *liveness* meanwhile
-//! rides on the replication relay link (Unit 6a), which already skips a down
-//! member when electing a room's effective leader.
+//! (suspicion, then eviction) is a later slice.
+//!
+//! Scope of this cut: gossip converges the *member set* and the placement view
+//! every node computes from it. The per-follower replication peer-connections
+//! (and the relay-link liveness signal they carry, Unit 6a) are still dialed from
+//! the static boot set — wiring those to a member learned *after* boot is a
+//! follow-on. So a dynamically-joined node's routing/redirect view converges here,
+//! while the existing nodes' replication to it (and their liveness reading of it)
+//! lands with that follow-on; a member learned by gossip is optimistically live
+//! until then.
 
 use std::time::Duration;
 
@@ -49,9 +56,11 @@ pub fn gossip_frame(members: &[(NodeId, Vec<u8>)]) -> Message {
 /// Each `(node_id, advertise_addr)` pair is added idempotently, so a re-gossip of
 /// an already-known set changes nothing and rebuilds no placement.
 pub fn merge_into(membership: &mut Membership, payload: Vec<(Vec<u8>, Vec<u8>)>) {
-    for (node, addr) in payload {
-        membership.add_member(NodeId::from(node), addr);
-    }
+    membership.add_members(
+        payload
+            .into_iter()
+            .map(|(node, addr)| (NodeId::from(node), addr)),
+    );
 }
 
 /// One in-process push-pull anti-entropy exchange between two memberships:
@@ -61,12 +70,8 @@ pub fn merge_into(membership: &mut Membership, payload: Vec<(Vec<u8>, Vec<u8>)>)
 /// server-side handler) realizes exactly this over a socket; this is its
 /// deterministic, socket-free form for driving convergence in tests.
 pub fn exchange(initiator: &mut Membership, peer: &mut Membership) {
-    for (node, addr) in initiator.known_members() {
-        peer.add_member(node, addr);
-    }
-    for (node, addr) in peer.known_members() {
-        initiator.add_member(node, addr);
-    }
+    peer.add_members(initiator.known_members());
+    initiator.add_members(peer.known_members());
 }
 
 /// Pick a random peer address to gossip to from `members`, excluding `self_id`.

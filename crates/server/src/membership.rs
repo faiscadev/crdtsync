@@ -128,14 +128,7 @@ impl Membership {
             (None, None) => return Err(MembershipConfigError::MissingSelfId),
         };
         let peers = parse_peers(peers)?;
-        let mut membership = Self::new(self_id.clone(), peers, replication_factor);
-        // A node configured with an explicit id *and* a separate advertise address
-        // dials at that address, not at its id — record it so gossip advertises the
-        // dialable address for self.
-        if let Some(addr) = advertise_addr {
-            membership.addrs.insert(self_id, addr.as_bytes().to_vec());
-        }
-        Ok(membership)
+        Ok(Self::new(self_id, peers, replication_factor))
     }
 
     /// The node's own id.
@@ -149,19 +142,32 @@ impl Membership {
     }
 
     /// Learn a member, dialable at `addr` — the anti-entropy union gossip applies
-    /// for each `(node, addr)` pair a peer advertises. Idempotent: a member already
-    /// known leaves the set and its placement untouched (no churn on re-gossip of a
-    /// fully-known set); a genuinely new member is added and the [`Cluster`]
-    /// placement rebuilt from the canonicalized set, so every node that has learned
-    /// the same members places every room identically regardless of learning order.
-    /// A node never learns itself anew — `self` is a member from construction.
+    /// for each `(node, addr)` pair a peer advertises. See [`add_members`](Self::add_members).
     pub fn add_member(&mut self, node: NodeId, addr: Vec<u8>) {
-        if self.cluster.nodes().contains(&node) {
-            return;
+        self.add_members(std::iter::once((node, addr)));
+    }
+
+    /// Union a batch of learned members in, rebuilding the [`Cluster`] placement
+    /// once if any were genuinely new. Idempotent: a member already known is
+    /// skipped, so a re-gossip of a fully-known set rebuilds no placement (no
+    /// churn). A member with an empty node id is dropped — it is neither placeable
+    /// nor dialable, so a malformed gossip pair cannot poison the set. When new
+    /// members land, placement is rebuilt from the canonicalized (sorted, de-duped)
+    /// set, so every node that has learned the same members places every room
+    /// identically regardless of the order it learned them in. `self` is a member
+    /// from construction and is never relearned.
+    pub fn add_members(&mut self, members: impl IntoIterator<Item = (NodeId, Vec<u8>)>) {
+        let mut added = false;
+        for (node, addr) in members {
+            if node.as_bytes().is_empty() || self.addrs.contains_key(&node) {
+                continue;
+            }
+            self.addrs.insert(node, addr);
+            added = true;
         }
-        self.addrs.insert(node.clone(), addr);
-        let members = self.cluster.nodes().iter().cloned().chain(Some(node));
-        self.cluster = Cluster::new(members);
+        if added {
+            self.cluster = Cluster::new(self.addrs.keys().cloned());
+        }
     }
 
     /// The members this node knows, each with its dial address — the payload a

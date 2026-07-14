@@ -517,6 +517,10 @@ fn spawn_gossip(server: ClientId, membership: Option<&Membership>, cmds: &Unboun
 /// command channel closes (the registry shut down).
 async fn gossip_loop(server: ClientId, self_id: NodeId, cmds: UnboundedSender<Cmd>) {
     let mut ticker = tokio::time::interval(crate::gossip::GOSSIP_INTERVAL);
+    // A round can block on a slow peer up to the gossip timeout; delay the next
+    // tick past that rather than firing a catch-up burst of rounds (the default
+    // Burst behavior) once the peer clears.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick fires immediately; skip it so a just-booted node settles
     // before its first round rather than gossiping an empty seed set.
     ticker.tick().await;
