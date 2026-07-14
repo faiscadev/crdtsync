@@ -348,6 +348,46 @@ impl Registry {
         true
     }
 
+    /// This node's known cluster members, each with its dial address — the payload
+    /// it gossips. Empty in single-node mode (no membership), so a non-cluster node
+    /// advertises nothing.
+    pub fn known_members(&self) -> Vec<(NodeId, Vec<u8>)> {
+        self.membership
+            .as_ref()
+            .map(Membership::known_members)
+            .unwrap_or_default()
+    }
+
+    /// Union a gossiped member payload into this node's membership — the anti-
+    /// entropy merge that grows the member set toward cluster-wide convergence.
+    /// Inert in single-node mode (no membership): a node with no cluster learns no
+    /// members.
+    pub fn merge_gossip(&mut self, members: Vec<(Vec<u8>, Vec<u8>)>) {
+        if let Some(membership) = &mut self.membership {
+            for (node, addr) in members {
+                membership.add_member(NodeId::from(node), addr);
+            }
+        }
+    }
+
+    /// Apply an inbound [`Message::Gossip`] on peer connection `id`: union the
+    /// advertised members into this node's set, then answer with this node's own
+    /// members so the exchange syncs both directions (push-pull anti-entropy).
+    /// Honored only in cluster mode — a Gossip on a single-node deployment (no
+    /// membership) is a stray frame and the connection is dropped. Returns whether
+    /// the connection stays open.
+    fn apply_gossip(&mut self, id: ConnId, members: Vec<(Vec<u8>, Vec<u8>)>) -> bool {
+        if self.membership.is_none() {
+            return false;
+        }
+        self.merge_gossip(members);
+        let reply = crate::gossip::gossip_frame(&self.known_members());
+        if let Some(conn) = self.conns.get_mut(&id) {
+            conn.outbox.push(reply);
+        }
+        true
+    }
+
     /// Take every replication frame queued since the last drain — the transport
     /// routes each to its follower's peer connection.
     pub fn take_replication(&mut self) -> Vec<(NodeId, Message)> {
@@ -1008,9 +1048,9 @@ impl Registry {
     /// replies and fanning any broadcast out to the room's other connections.
     /// Returns whether the connection should stay open.
     pub fn deliver(&mut self, id: ConnId, msg: Message) -> bool {
-        // A Replicate arrives from a room's leader on a peer connection, not from
-        // a client on its data plane — intercept it before the client session
-        // step (which treats it as a violation) and apply it as a follower.
+        // A Replicate or a Gossip arrives node-to-node on a peer connection, not
+        // from a client on its data plane — intercept each before the client
+        // session step (which treats both as a violation) and handle it as a peer.
         let msg = match msg {
             Message::Replicate {
                 room,
@@ -1019,6 +1059,7 @@ impl Registry {
                 base_seq,
                 epoch,
             } => return self.apply_replicate(id, room, branch, ops, base_seq, epoch),
+            Message::Gossip { members } => return self.apply_gossip(id, members),
             other => other,
         };
         // Only an awareness set consults the clock (to stamp last-seen), so the

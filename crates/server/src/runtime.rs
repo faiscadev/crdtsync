@@ -149,6 +149,14 @@ enum Cmd {
     /// registry updates its membership view so a down member is skipped when
     /// electing a room's effective leader.
     PeerLive { node: NodeId, live: bool },
+    /// The gossip task asks for this node's current known members, so it can pick
+    /// a peer to gossip to and advertise the up-to-date set.
+    GossipSnapshot {
+        reply: oneshot::Sender<Vec<(NodeId, Vec<u8>)>>,
+    },
+    /// The gossip task delivers the members a peer advertised back — the registry
+    /// unions them into its membership, growing the set toward convergence.
+    GossipLearned { members: Vec<(Vec<u8>, Vec<u8>)> },
 }
 
 /// What the actor makes of a connect request after weighing any upgrade
@@ -256,6 +264,12 @@ pub async fn serve_with_authorizer(
     // acks back into the actor as `Cmd::PeerAck`. Single-node (no membership) opens
     // no peer connections, so a plain deployment is unchanged.
     let peer_conns = spawn_peers(server, config.membership.as_ref(), &cmds);
+    // Run the anti-entropy gossip loop here, on this I/O-enabled runtime, behind the
+    // same cluster gate as replication: it periodically gossips this node's member
+    // set with a random peer and unions back what the peer knows, so a node that
+    // booted knowing only a seed converges on the full cluster. Single-node (no
+    // membership) spawns no gossip task.
+    spawn_gossip(server, config.membership.as_ref(), &cmds);
     // The replicas are single-threaded; keep them on one dedicated thread.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -397,6 +411,14 @@ async fn registry_actor(
                         // updated view, so there is nothing to flush here.
                         reg.set_peer_liveness(node, live);
                     }
+                    Cmd::GossipSnapshot { reply } => {
+                        let _ = reply.send(reg.known_members());
+                    }
+                    Cmd::GossipLearned { members } => {
+                        // The next client delivery recomputes placement off the
+                        // grown member set, so there is nothing to flush here.
+                        reg.merge_gossip(members);
+                    }
                 }
             }
             _ = sweep.tick() => {
@@ -473,6 +495,51 @@ fn spawn_peers(
         peer_conns.insert(member.clone(), tx);
     }
     peer_conns
+}
+
+/// Spawn the periodic gossip loop, gated on cluster membership: with no
+/// membership (single-node) nothing is spawned, so a plain deployment runs no
+/// gossip. The loop drives anti-entropy against the registry over the command
+/// channel — reading the current member set out and unioning learned members
+/// back in.
+fn spawn_gossip(server: ClientId, membership: Option<&Membership>, cmds: &UnboundedSender<Cmd>) {
+    let Some(membership) = membership else {
+        return;
+    };
+    let self_id = membership.self_id().clone();
+    tokio::spawn(gossip_loop(server, self_id, cmds.clone()));
+}
+
+/// The anti-entropy gossip round loop: each tick, snapshot this node's known
+/// members from the registry, pick a random peer, exchange member sets with it,
+/// and feed what the peer advertised back into the registry. A dead or slow peer
+/// is abandoned for the round and retried next tick. The loop ends when the
+/// command channel closes (the registry shut down).
+async fn gossip_loop(server: ClientId, self_id: NodeId, cmds: UnboundedSender<Cmd>) {
+    let mut ticker = tokio::time::interval(crate::gossip::GOSSIP_INTERVAL);
+    // The first tick fires immediately; skip it so a just-booted node settles
+    // before its first round rather than gossiping an empty seed set.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let (reply, snapshot) = oneshot::channel();
+        if cmds.send(Cmd::GossipSnapshot { reply }).is_err() {
+            return;
+        }
+        let Ok(members) = snapshot.await else {
+            return;
+        };
+        let Some(peer_addr) = crate::gossip::choose_peer(&members, &self_id) else {
+            continue;
+        };
+        let addr = String::from_utf8_lossy(&peer_addr).into_owned();
+        let frame = crate::gossip::gossip_frame(&members);
+        if let Some(learned) = crate::gossip::gossip_exchange(&addr, server, frame).await {
+            if cmds.send(Cmd::GossipLearned { members: learned }).is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// Own the socket to one follower: dial it, relay the replication frames that
