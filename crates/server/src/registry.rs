@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crdtsync_core::schema::Trigger;
-use crdtsync_core::{ClientId, ErrorCode, Message, Op, Schema};
+use crdtsync_core::{ClientId, ErrorCode, MemberState, Message, Op, Schema};
 
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
@@ -348,9 +348,8 @@ impl Registry {
         true
     }
 
-    /// This node's known cluster members, each with its dial address — the payload
-    /// it gossips. Empty in single-node mode (no membership), so a non-cluster node
-    /// advertises nothing.
+    /// This node's known cluster members, each with its dial address — the member
+    /// set without liveness. Empty in single-node mode (no membership).
     pub fn known_members(&self) -> Vec<(NodeId, Vec<u8>)> {
         self.membership
             .as_ref()
@@ -358,32 +357,60 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// Union a gossiped member payload into this node's membership — the anti-
-    /// entropy merge that grows the member set toward cluster-wide convergence.
-    /// Inert in single-node mode (no membership): a node with no cluster learns no
-    /// members.
-    pub fn merge_gossip(&mut self, members: Vec<(Vec<u8>, Vec<u8>)>) {
+    /// This node's known cluster members with liveness — the payload it gossips.
+    /// Empty in single-node mode (no membership), so a non-cluster node advertises
+    /// nothing.
+    pub fn known_liveness(&self) -> Vec<(NodeId, Vec<u8>, u64, MemberState)> {
+        self.membership
+            .as_ref()
+            .map(Membership::known_liveness)
+            .unwrap_or_default()
+    }
+
+    /// Merge a gossiped liveness payload into this node's membership — the SWIM
+    /// anti-entropy merge that both grows the member set and converges its liveness
+    /// toward a cluster-wide view. Inert in single-node mode (no membership).
+    pub fn merge_gossip(&mut self, members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>) {
         if let Some(membership) = &mut self.membership {
-            membership.add_members(
+            membership.merge_liveness(
                 members
                     .into_iter()
-                    .map(|(node, addr)| (NodeId::from(node), addr)),
+                    .map(|(node, addr, inc, state)| (NodeId::from(node), addr, inc, state)),
             );
         }
     }
 
-    /// Apply an inbound [`Message::Gossip`] on peer connection `id`: union the
-    /// advertised members into this node's set, then answer with this node's own
-    /// members so the exchange syncs both directions (push-pull anti-entropy).
-    /// Honored only in cluster mode — a Gossip on a single-node deployment (no
-    /// membership) is a stray frame and the connection is dropped. Returns whether
-    /// the connection stays open.
-    fn apply_gossip(&mut self, id: ConnId, members: Vec<(Vec<u8>, Vec<u8>)>) -> bool {
+    /// Record the outcome of a direct gossip round to `node`: a success is
+    /// first-hand proof it is alive, a failure counts toward suspicion (escalating
+    /// it `Alive → Suspect → Dead` over enough rounds). Inert in single-node mode.
+    /// This is the gossip-driven failover signal, cluster-wide where the relay-link
+    /// signal ([`set_peer_liveness`](Self::set_peer_liveness)) is connection-local.
+    pub fn note_gossip_probe(&mut self, node: NodeId, reachable: bool) {
+        if let Some(membership) = &mut self.membership {
+            if reachable {
+                membership.note_gossip_reachable(&node);
+            } else {
+                membership.note_gossip_unreachable(&node);
+            }
+        }
+    }
+
+    /// Apply an inbound [`Message::Gossip`] on peer connection `id`: merge the
+    /// advertised liveness into this node's view, then answer with this node's own
+    /// so the exchange syncs both directions (push-pull anti-entropy). Honored only
+    /// in cluster mode — a Gossip on a single-node deployment (no membership) is a
+    /// stray frame and the connection is dropped. Returns whether the connection
+    /// stays open.
+    fn apply_gossip(
+        &mut self,
+        id: ConnId,
+        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>,
+    ) -> bool {
         if self.membership.is_none() {
             return false;
         }
         self.merge_gossip(members);
-        let reply = crate::gossip::gossip_frame(&self.known_members());
+        let reply = crate::gossip::gossip_frame(&self.known_liveness());
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.outbox.push(reply);
         }
