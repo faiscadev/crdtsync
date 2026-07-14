@@ -13,9 +13,10 @@
 //! refold, an LWW displacement, a buffered-then-drained op, and a subtree delete
 //! are all already reflected in the document the projection reads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crdtsync_core::op::OpKind;
+use crdtsync_core::schema::TypeDef;
 use crdtsync_core::zone;
 use crdtsync_core::{Document, Element, ElementId, Op, Schema};
 
@@ -23,6 +24,15 @@ use crdtsync_core::{Document, Element, ElementId, Op, Schema};
 /// zone (and later type) resolution reads. A positional XML child inherits its
 /// holding node's path, since a zone governs a whole subtree.
 pub type ElementPaths = HashMap<ElementId, Vec<Vec<u8>>>;
+
+/// A container element id mapped to the schema type name that governs it — the
+/// projection a type-scoped migration reads to narrow a field rewrite to the
+/// elements of the step's declared type. Only map elements are ever named by a
+/// field-bearing op (the op's target is the map holding the slot), so those are
+/// the ids this resolves; an element the walk cannot type (a since-deleted map,
+/// or one whose runtime kind does not match its declared type) is simply absent,
+/// and the migration falls back to a key-based rewrite for it.
+pub type ElementTypes = HashMap<ElementId, String>;
 
 /// Project `doc` to the element-context index: every container element mapped to
 /// its `core::path`. Walks the authoritative tree, so the result reflects the
@@ -38,6 +48,58 @@ pub fn element_paths(doc: &Document) -> ElementPaths {
 /// zones.
 pub fn zone_of<'a>(paths: &ElementPaths, schema: &'a Schema, id: ElementId) -> Option<&'a str> {
     paths.get(&id).and_then(|path| zone::zone_of(schema, path))
+}
+
+/// Project `doc` to `id → declared type name` for every map element the schema
+/// governs, resolved by the same root-down, position-keyed descent
+/// [`crdtsync_core::validate`] walks: the root is the schema's root type, a map
+/// slot's child is the type its key names in the parent type's allowlist, and a
+/// list item is the list's declared item type. A map whose key names no declared
+/// slot, or whose runtime kind does not match its declared type, is not typed —
+/// it drops from the projection, so a migration rewriting one of its slots falls
+/// back to a key-based rewrite. The walk descends only through map slots and list
+/// items, the paths that can reach a map; it terminates on a cycle or shared
+/// subtree, since each element id is entered once.
+pub fn element_types(doc: &Document, schema: &Schema) -> ElementTypes {
+    let mut out = HashMap::new();
+    let mut visited = HashSet::new();
+    let mut stack: Vec<(Element, &str)> = vec![(Element::Map(doc.root()), schema.root())];
+    while let Some((element, type_name)) = stack.pop() {
+        let Some(td) = schema.type_def(type_name) else {
+            continue;
+        };
+        match (td, &element) {
+            (TypeDef::Map { children }, Element::Map(m)) => {
+                let m = m.borrow();
+                if !visited.insert(m.id()) {
+                    continue;
+                }
+                out.insert(m.id(), type_name.to_string());
+                let allow: HashMap<&[u8], &str> = children
+                    .iter()
+                    .map(|(s, t)| (s.as_bytes(), t.as_str()))
+                    .collect();
+                for key in m.keys() {
+                    if let Some(&child_type) = allow.get(key.as_slice()) {
+                        if let Some(child) = m.get(&key) {
+                            stack.push((child, child_type));
+                        }
+                    }
+                }
+            }
+            (TypeDef::List { items, .. }, Element::List(l)) => {
+                let l = l.borrow();
+                if !visited.insert(l.id()) {
+                    continue;
+                }
+                for item in l.values() {
+                    stack.push((item, items.as_str()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Whether applying `ops` to `doc` relocates any node across a zone boundary —

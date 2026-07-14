@@ -438,3 +438,58 @@ fn a_migrated_document_round_trips_canonically() {
     assert_eq!(reg(&back, b"note"), None);
     assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
 }
+
+// --- scoped by owning map ---
+
+/// The Int behind `outer.inner`, or `None` when either level is absent.
+fn nested_reg(d: &Document, outer: &[u8], inner: &[u8]) -> Option<i64> {
+    let m = match d.get(outer) {
+        Some(Element::Map(m)) => m,
+        _ => return None,
+    };
+    let child = m.borrow().get(inner);
+    match child {
+        Some(Element::Register(r)) => match r.borrow().read() {
+            Scalar::Int(n) => Some(*n),
+            _ => panic!("expected an Int register"),
+        },
+        None => None,
+        _ => panic!("expected a register or nothing"),
+    }
+}
+
+#[test]
+fn a_scoped_fate_narrows_to_its_owning_map() {
+    // Two maps hold the same slot key; a rename scoped to one map's id re-keys
+    // only that map's slot and leaves the other's verbatim — the id-aware seam a
+    // type-scoped migration reads, so a field rewrite on one type never touches a
+    // same-named slot on another.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"note").register(b"title", Scalar::Int(1));
+        tx.map(b"task").register(b"title", Scalar::Int(2));
+    });
+    let root = d.root_id();
+    let note = ElementId::derive(root, b"note", ElementKind::Map);
+
+    let changed = d.migrate_leaf_slots_scoped(|map_id, key| {
+        if map_id == note && key == b"title" {
+            SlotFate::Rename(b"heading".to_vec())
+        } else {
+            SlotFate::Keep
+        }
+    });
+    assert!(changed);
+    assert_eq!(
+        nested_reg(&d, b"note", b"heading"),
+        Some(1),
+        "note.title re-keys"
+    );
+    assert_eq!(nested_reg(&d, b"note", b"title"), None);
+    assert_eq!(
+        nested_reg(&d, b"task", b"title"),
+        Some(2),
+        "task.title is untouched"
+    );
+    assert_eq!(nested_reg(&d, b"task", b"heading"), None);
+}
