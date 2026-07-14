@@ -232,6 +232,15 @@ pub enum Message {
     /// watermark the leader records per follower. Node-to-node — never a client
     /// frame; a client that sends one commits a protocol violation.
     ReplicaAck { room: Vec<u8>, through_seq: u64 },
+    /// A node's advertisement of the cluster members it knows, for gossip
+    /// membership discovery: `members` is a set of `(node_id, advertise_addr)`
+    /// pairs — the node id a peer places with and the address it dials to reach
+    /// that member. A receiver unions the pairs into its own membership (anti-
+    /// entropy: a purely additive set union), so a node that boots knowing only a
+    /// seed peer learns the whole cluster within a few gossip rounds. Node-to-node
+    /// — never a client frame; a client that sends one commits a protocol
+    /// violation.
+    Gossip { members: Vec<(Vec<u8>, Vec<u8>)> },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -463,6 +472,17 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, room);
             put_u64(&mut out, *through_seq);
         }
+        Message::Gossip { members } => {
+            put_u8(&mut out, 26);
+            put_u32(
+                &mut out,
+                u32::try_from(members.len()).expect("member count exceeds u32"),
+            );
+            for (node, addr) in members {
+                put_bytes(&mut out, node);
+                put_bytes(&mut out, addr);
+            }
+        }
     }
     out
 }
@@ -667,6 +687,19 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let room = cur.bytes()?;
             let through_seq = cur.u64()?;
             Message::ReplicaAck { room, through_seq }
+        }
+        26 => {
+            let count = cur.u32()?;
+            // Grow as pairs are read rather than trusting `count` to size the
+            // allocation — a bogus count then fails on the missing bytes, not on a
+            // giant up-front reservation.
+            let mut members = Vec::new();
+            for _ in 0..count {
+                let node = cur.bytes()?;
+                let addr = cur.bytes()?;
+                members.push((node, addr));
+            }
+            Message::Gossip { members }
         }
         tag => {
             return Err(ProtocolError::BadTag {

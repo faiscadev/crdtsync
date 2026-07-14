@@ -768,6 +768,9 @@ pub fn step(
         // its own data plane commits a protocol violation.
         Message::Replicate { .. } => violation("client sent a replicate"),
         Message::ReplicaAck { .. } => violation("client sent a replica ack"),
+        // Gossip is a node-to-node membership advertisement the registry handles
+        // off the client session path; a client that sends one violates.
+        Message::Gossip { .. } => violation("client sent a gossip"),
     }
 }
 

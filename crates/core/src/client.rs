@@ -598,6 +598,7 @@ impl ClientSession {
             Message::ReplicaAck { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent a replica ack"))
             }
+            Message::Gossip { .. } => Err(ClientError::UnexpectedMessage("server sent a gossip")),
         }
     }
 

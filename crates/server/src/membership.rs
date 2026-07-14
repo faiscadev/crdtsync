@@ -1,18 +1,26 @@
-//! A node's live view of its cluster's static membership.
+//! A node's live view of its cluster's membership.
 //!
-//! A node learns its members from static config — its own advertise address (or
-//! an explicit node id) plus a peer list — with no discovery service. It holds a
-//! [`Membership`]: its own [`NodeId`], the canonical member set (`{self} ∪
-//! peers`), and the [`Cluster`] placement built from them. The node's view is
-//! just the shared placement evaluated for its own id, so `owns`/`is_primary_for`
-//! never diverge from what another node computes for the same room. The routing
-//! (Unit 3) and replication (Unit 4) layers consult this. The member set is fixed
-//! for the process lifetime, but a node tracks each member's *liveness* — a peer
-//! whose relay link is down is skipped when electing a room's effective leader
-//! (failover, Unit 6a), so a dead placement primary's rooms promote to the next
-//! live replica rather than stranding. Membership discovery by gossip is Unit 7.
+//! A node seeds its members from config — its own advertise address (or an
+//! explicit node id) plus a seed-peer list — with no discovery service. It holds
+//! a [`Membership`]: its own [`NodeId`], the canonical member set (`{self} ∪
+//! peers`), each member's dial address, and the [`Cluster`] placement built from
+//! them. The node's view is just the shared placement evaluated for its own id,
+//! so `owns`/`is_primary_for` never diverge from what another node computes for
+//! the same room. The routing (Unit 3) and replication (Unit 4) layers consult
+//! this.
+//!
+//! The member set is *dynamic*: gossip membership discovery (Unit 7) grows it by
+//! anti-entropy — a node need only know one seed peer at boot, then learns the
+//! rest by [`add_member`](Membership::add_member) unioning in the members a peer
+//! advertises. Placement stays deterministic and order-independent: the member
+//! set is canonicalized (sorted, de-duplicated) before the [`Cluster`] is built,
+//! so two nodes that have learned the same set place every room identically no
+//! matter the order they learned it in. A node also tracks each member's
+//! *liveness* — a peer whose relay link is down is skipped when electing a room's
+//! effective leader (failover, Unit 6a), so a dead placement primary's rooms
+//! promote to the next live replica rather than stranding.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::placement::{Cluster, NodeId};
 
@@ -63,6 +71,11 @@ pub struct Membership {
     /// cluster's effective leadership is byte-identical to its placement. `self`
     /// is never in this set: a node is always live to itself.
     down: HashSet<NodeId>,
+    /// Each member's advertise (dial) address, keyed by node id — what a node
+    /// gossips so a peer can dial a member it just learned. A member derived from
+    /// its address (every seed peer) maps to that address verbatim; `self` maps to
+    /// its configured advertise address when one was given, else its node-id bytes.
+    addrs: HashMap<NodeId, Vec<u8>>,
 }
 
 impl Membership {
@@ -73,12 +86,21 @@ impl Membership {
         peers: impl IntoIterator<Item = NodeId>,
         replication_factor: usize,
     ) -> Self {
-        let members = std::iter::once(self_id.clone()).chain(peers);
+        let members: Vec<NodeId> = std::iter::once(self_id.clone()).chain(peers).collect();
+        // A member seeded without a distinct advertise address dials at its node id
+        // — the identity every seed peer is derived from (`NodeId::from_addr`), so
+        // the id and the dial address coincide. `self` overrides this in
+        // `from_static_config` when a separate advertise address was configured.
+        let addrs = members
+            .iter()
+            .map(|node| (node.clone(), node.as_bytes().to_vec()))
+            .collect();
         Self {
             self_id,
             cluster: Cluster::new(members),
             replication_factor,
             down: HashSet::new(),
+            addrs,
         }
     }
 
@@ -117,6 +139,54 @@ impl Membership {
     /// The canonical (sorted, de-duplicated) member set, self included.
     pub fn members(&self) -> &[NodeId] {
         self.cluster.nodes()
+    }
+
+    /// Learn a member, dialable at `addr` — the anti-entropy union gossip applies
+    /// for each `(node, addr)` pair a peer advertises. See [`add_members`](Self::add_members).
+    pub fn add_member(&mut self, node: NodeId, addr: Vec<u8>) {
+        self.add_members(std::iter::once((node, addr)));
+    }
+
+    /// Union a batch of learned members in, rebuilding the [`Cluster`] placement
+    /// once if any were genuinely new. Idempotent: a member already known is
+    /// skipped, so a re-gossip of a fully-known set rebuilds no placement (no
+    /// churn). A member with an empty node id is dropped — it is neither placeable
+    /// nor dialable, so a malformed gossip pair cannot poison the set. When new
+    /// members land, placement is rebuilt from the canonicalized (sorted, de-duped)
+    /// set, so every node that has learned the same members places every room
+    /// identically regardless of the order it learned them in. `self` is a member
+    /// from construction and is never relearned.
+    pub fn add_members(&mut self, members: impl IntoIterator<Item = (NodeId, Vec<u8>)>) {
+        let mut added = false;
+        for (node, addr) in members {
+            if node.as_bytes().is_empty() || self.addrs.contains_key(&node) {
+                continue;
+            }
+            self.addrs.insert(node, addr);
+            added = true;
+        }
+        if added {
+            self.cluster = Cluster::new(self.addrs.keys().cloned());
+        }
+    }
+
+    /// The members this node knows, each with its dial address — the payload a
+    /// node gossips. Canonical order (the sorted member set), so the advertisement
+    /// is deterministic. A member's address falls back to its node-id bytes if none
+    /// was recorded, keeping every member dialable.
+    pub fn known_members(&self) -> Vec<(NodeId, Vec<u8>)> {
+        self.cluster
+            .nodes()
+            .iter()
+            .map(|node| {
+                let addr = self
+                    .addrs
+                    .get(node)
+                    .cloned()
+                    .unwrap_or_else(|| node.as_bytes().to_vec());
+                (node.clone(), addr)
+            })
+            .collect()
     }
 
     /// Whether `node` is this node.
