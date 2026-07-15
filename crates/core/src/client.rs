@@ -201,6 +201,9 @@ impl ClientSession {
                 channel,
                 room: room.to_vec(),
                 branch: branch.to_vec(),
+                // The client SDK's zone-scoped subscribe surface is a later unit;
+                // today it joins the whole room (every zone the actor may read).
+                zone: Vec::new(),
                 last_seen_seq: 0,
             },
         )
@@ -215,6 +218,7 @@ impl ClientSession {
             channel,
             room: room.room.clone(),
             branch: room.branch.clone(),
+            zone: Vec::new(),
             last_seen_seq: room.last_seen_seq,
         })
     }

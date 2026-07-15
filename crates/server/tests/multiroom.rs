@@ -56,6 +56,7 @@ fn subscribe(r: &mut Registry, id: ConnId, channel: u32, room: &[u8]) {
         Message::Subscribe {
             channel: Channel(channel),
             room: room.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -297,6 +298,7 @@ fn subscribing_an_already_bound_channel_is_a_violation() {
         Message::Subscribe {
             channel: Channel(1), // already in use on this connection
             room: ROOM_B.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },

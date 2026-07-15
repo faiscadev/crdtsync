@@ -57,6 +57,7 @@ fn sub(room: &[u8], last_seen_seq: u64) -> Message {
         channel: CH,
         room: room.to_vec(),
         branch: Vec::new(),
+        zone: Vec::new(),
         last_seen_seq,
     }
 }
@@ -186,6 +187,7 @@ fn a_subscribe_names_the_branch_stream_it_binds() {
             channel: CH,
             room: ROOM.to_vec(),
             branch: b"release-2".to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
         },
     );
@@ -306,6 +308,7 @@ fn a_second_channel_binds_a_second_room() {
         Message::Subscribe {
             channel: Channel(1),
             room: b"room-b".to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -326,6 +329,7 @@ fn reusing_a_bound_channel_is_a_violation() {
         Message::Subscribe {
             channel: CH,
             room: b"room-b".to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },

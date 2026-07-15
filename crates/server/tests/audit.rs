@@ -156,6 +156,7 @@ fn wrapping_the_registry_authorizer_logs_enforcement() {
         Message::Subscribe {
             channel: Channel(0),
             room: b"open".to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -165,6 +166,7 @@ fn wrapping_the_registry_authorizer_logs_enforcement() {
         Message::Subscribe {
             channel: Channel(1),
             room: b"secret".to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -220,6 +222,7 @@ fn an_awareness_publish_logs_the_decision_not_the_entry() {
         Message::Subscribe {
             channel: Channel(0),
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }

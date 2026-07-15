@@ -76,6 +76,7 @@ fn subscribe(r: &mut Registry, id: ConnId, ch: Channel, room: &[u8], branch: &[u
             channel: ch,
             room: room.to_vec(),
             branch: branch.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
         }
     ));

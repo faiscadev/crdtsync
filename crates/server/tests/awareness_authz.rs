@@ -71,6 +71,7 @@ fn subscribe(r: &mut Registry, id: ConnId, channel: u32, room: &[u8]) -> Vec<Mes
         Message::Subscribe {
             channel: Channel(channel),
             room: room.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },

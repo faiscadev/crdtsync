@@ -316,6 +316,7 @@ fn handshake(h: &mut Hub, s: &mut Session, schema: &Schema) {
             channel: CH,
             room: ROOM.to_vec(),
             branch: Vec::new(),
+            zone: Vec::new(),
             last_seen_seq: 0,
         },
     );

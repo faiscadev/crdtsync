@@ -86,6 +86,13 @@ pub enum ResourceMatch {
     Room(Vec<u8>),
     /// One specific app, by `app_id` — the schema-registry control plane.
     App(Vec<u8>),
+    /// One specific zone of one specific room — the partition-scoped grant a
+    /// deployment writes to isolate a zone: a `deny` here carves the partition out
+    /// of an otherwise room-readable actor, an `allow` opens it. The subscribe gate
+    /// consults this on a per-zone read; with no matching zone rule the policy
+    /// abstains, and the zone inherits the room's read verdict (visible by default
+    /// within a readable room).
+    Zone { room: Vec<u8>, zone: Vec<u8> },
 }
 
 impl ResourceMatch {
@@ -94,6 +101,9 @@ impl ResourceMatch {
             (ResourceMatch::AnyRoom, Resource::Room(_)) => true,
             (ResourceMatch::Room(name), Resource::Room(room)) => name.as_slice() == *room,
             (ResourceMatch::App(name), Resource::App(app)) => name.as_slice() == *app,
+            (ResourceMatch::Zone { room, zone }, Resource::Zone { room: r, zone: z }) => {
+                room.as_slice() == *r && zone.as_slice() == *z
+            }
             _ => false,
         }
     }

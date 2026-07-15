@@ -887,6 +887,116 @@ impl Document {
         out
     }
 
+    /// Project this replica in place to the root partition plus the `authorized`
+    /// zones, dropping every element, edge, clock, and annotation that resolves to
+    /// an unauthorized zone so a re-encode carries no trace of it — not the hidden
+    /// partition's content, structure, ids, op count, or clock. This is the state
+    /// half of the per-zone replication streams: a subscriber scoped to a subset of
+    /// a room's zones is served a snapshot narrowed by this projection, so an
+    /// unauthorized zone is wholly absent rather than redacted-but-present.
+    ///
+    /// Sound only as the final transform before [`encode_state`](Self::encode_state)
+    /// on a throwaway copy: it clears the causal `seen` frontier (a below-floor
+    /// subscriber only ever ingests ops after the snapshot's sequence, so it needs
+    /// no prior dedup, and an emptied frontier leaks no op count of the hidden
+    /// partition) and leaves the derived move relation filtered only in its
+    /// persisted log — neither is a valid live-replica state. A schema with no zones
+    /// leaves the document untouched.
+    pub fn project_zones(&mut self, schema: &Schema, authorized: &HashSet<u32>) {
+        if schema.zones().is_empty() {
+            return;
+        }
+        let root = self.root_id();
+        // The reachable containers that fall in an unauthorized zone — resolved by
+        // the same longest-prefix rule the op envelope stamps a zone with, over the
+        // live tree. The root map is never hidden (a zone rooted at `/` would name
+        // the whole document); its authorized subtrees are kept, its unauthorized
+        // ones pruned below.
+        let mut purge: HashSet<ElementId> = HashSet::new();
+        for (id, path) in self.element_paths() {
+            if id == root {
+                continue;
+            }
+            if let Some(zone) = zone::zone_id_of(schema, &path) {
+                if !authorized.contains(&zone) {
+                    purge.insert(id);
+                }
+            }
+        }
+        // Detach each hidden zone-root slot from its retained parent map, so no
+        // residual slot names the partition (its key would leak the zone's
+        // existence). A hidden container's parent is either the root or an
+        // authorized ancestor — both retained — so this reaches every zone root.
+        // Gather the slots to cut under shared borrows, then cut them, so no map is
+        // read and mutated at once.
+        let mut detach: Vec<(Rc<RefCell<Map>>, Vec<u8>)> = Vec::new();
+        for map in self.maps.values() {
+            let m = map.borrow();
+            if purge.contains(&m.id()) {
+                continue;
+            }
+            for key in m.slot_keys() {
+                if let Some(child) = m.get(&key) {
+                    if child.is_container() && purge.contains(&child.id()) {
+                        detach.push((Rc::clone(map), key));
+                    }
+                }
+            }
+        }
+        for (map, key) in detach {
+            map.borrow_mut().take_slot(&key);
+        }
+        // Drop the hidden containers and every id-keyed edge and annotation that
+        // names one, so the registries hold only authorized state.
+        self.maps.retain(|id, _| !purge.contains(id));
+        self.lists.retain(|id, _| !purge.contains(id));
+        self.texts.retain(|id, _| !purge.contains(id));
+        self.counters.retain(|id, _| !purge.contains(id));
+        self.xml_elements.retain(|id, _| !purge.contains(id));
+        self.xml_fragments.retain(|id, _| !purge.contains(id));
+        self.parents
+            .retain(|child, parent| !purge.contains(child) && !purge.contains(parent));
+        self.ranged.retain(|id, e| {
+            !purge.contains(id) && !purge.contains(&e.start.seq) && !purge.contains(&e.end.seq)
+        });
+        // ACL tuples are keyed by their own id, not a container's, so they are
+        // dropped by the zone their `path` resolves into (an unauthorized zone's
+        // grants would leak its path) as well as by a purged id.
+        self.acl.retain(|id, e| {
+            if purge.contains(id) {
+                return false;
+            }
+            match crate::path::parse_path(&e.path).and_then(|keys| zone::zone_id_of(schema, &keys))
+            {
+                Some(zone) => authorized.contains(&zone),
+                None => true,
+            }
+        });
+        self.placements.retain(|node, places| {
+            if purge.contains(node) {
+                return false;
+            }
+            places.retain(|p| !purge.contains(&p.list));
+            !places.is_empty()
+        });
+        self.placement_index = self
+            .placements
+            .values()
+            .flat_map(|places| places.iter().map(|p| (p.list, p.stamp)))
+            .collect();
+        self.moves
+            .retain(|child, parent| !purge.contains(&child) && !purge.contains(&parent));
+        self.zone_clocks.retain(|zone, _| authorized.contains(zone));
+        // The causal frontier and buffer, scrubbed of the hidden partition: `seen`
+        // is emptied (a below-floor subscriber dedups nothing before the snapshot
+        // sequence, and an emptied set carries no op count), and buffered ops are
+        // filtered to the authorized partitions.
+        self.seen.clear();
+        self.buffer
+            .retain(|op| op.zone.is_none_or(|zone| authorized.contains(&zone)));
+        self.buffered = self.buffer.iter().map(|op| op.id).collect();
+    }
+
     /// Rebuild a replica from a snapshot, rejecting trailing bytes.
     pub fn decode_state(bytes: &[u8]) -> Result<Document, DecodeError> {
         let mut cur = Cursor::new(bytes);
@@ -1543,17 +1653,31 @@ impl Document {
         }
     }
 
-    /// The partition a local edit on `target` belongs to: the compact id of the
-    /// zone `target` resolves to, or `None` (the root partition) when no schema is
-    /// bound, the schema declares no zones, or the target is unzoned. Resolved from
-    /// the target's structural path, so it is a pure function of the shared schema
-    /// and the tree — every replica assigns the same op to the same partition.
-    fn zone_of_target(&self, target: ElementId) -> Option<u32> {
+    /// The partition a local `kind` edit on `target` belongs to: the compact id of
+    /// the zone it resolves to, or `None` (the root partition) when no schema is
+    /// bound, the schema declares no zones, or the location is unzoned. Resolved from
+    /// the structural path, so it is a pure function of the shared schema and the
+    /// tree — every replica assigns the same op to the same partition.
+    ///
+    /// A container-create belongs to the partition of the *child* it installs, not
+    /// the parent it targets: the child's path is the parent's extended by the
+    /// created key, so a zone owns the creation of its own root container. Without
+    /// this the zone-root create would ride the parent partition and reach a
+    /// subscriber not authorized to the zone (the parent partition is one it does
+    /// see), materializing an empty zone-root container for it — and diverging from
+    /// the snapshot projection, which drops that container. With it the create is
+    /// stamped in the zone, withheld from an unauthorized subscriber on every seam.
+    /// Every other op belongs to the partition of the container it targets.
+    fn zone_of_op(&self, target: ElementId, kind: &OpKind) -> Option<u32> {
         let schema = self.schema.as_ref()?;
         if schema.zones().is_empty() {
             return None;
         }
-        let path = self.element_paths().remove(&target)?;
+        let paths = self.element_paths();
+        let mut path = paths.get(&target)?.clone();
+        if let Some(key) = create_child_key(kind) {
+            path.push(key.to_vec());
+        }
         zone::zone_id_of(schema, &path)
     }
 
@@ -1850,8 +1974,9 @@ impl Document {
         // The op is stamped from its own partition's clock, so an edit in one zone
         // never advances another's and the op carries which partition it belongs
         // to. The target already exists (a mutation names a materialised
-        // container), so its zone resolves now.
-        let zone = self.zone_of_target(target);
+        // container), so its zone — the created child's, for a container-create —
+        // resolves now.
+        let zone = self.zone_of_op(target, &kind);
         let base = self.clock(zone) + 1;
         let stamp = Stamp {
             lamport: base,
@@ -2663,6 +2788,21 @@ fn span(kind: &OpKind) -> u64 {
     }
 }
 
+/// The map key a container-create installs its child under, for a create keyed by a
+/// map slot — so the op's zone resolves at the child's path, not the parent's. A
+/// positional or keyless create (a list/XML positional child, a composite ranged
+/// payload) inherits its container's partition and is `None` here.
+fn create_child_key(kind: &OpKind) -> Option<&[u8]> {
+    match kind {
+        OpKind::MapCreate { key }
+        | OpKind::ListCreate { key }
+        | OpKind::TextCreate { key }
+        | OpKind::XmlFragmentCreate { key }
+        | OpKind::XmlElementCreate { key, .. } => Some(key),
+        _ => None,
+    }
+}
+
 /// The reading-stable ids of a keyed-repair set — the `onRepaired` baseline.
 fn repair_ids(keyed: Vec<(Repair, RepairId)>) -> Vec<RepairId> {
     keyed.into_iter().map(|(_, id)| id).collect()
@@ -3043,9 +3183,11 @@ impl<'a> MapCursor<'a> {
 
     /// Descend into a nested Map at `key`, creating it if absent.
     pub fn map(&mut self, key: &[u8]) -> MapCursor<'_> {
-        self.doc
-            .emit(self.map_id, OpKind::MapCreate { key: key.to_vec() });
         let child = ElementId::derive(self.map_id, key, ElementKind::Map);
+        if !self.holds_live_map(key, child) {
+            self.doc
+                .emit(self.map_id, OpKind::MapCreate { key: key.to_vec() });
+        }
         MapCursor {
             doc: self.doc,
             map_id: child,
@@ -3055,13 +3197,28 @@ impl<'a> MapCursor<'a> {
     /// Descend into a nested Map at `key`, consuming this cursor. Chains without
     /// nesting borrows, so a caller can walk a runtime-length path in a loop.
     pub fn into_map(self, key: &[u8]) -> MapCursor<'a> {
-        self.doc
-            .emit(self.map_id, OpKind::MapCreate { key: key.to_vec() });
         let child = ElementId::derive(self.map_id, key, ElementKind::Map);
+        if !self.holds_live_map(key, child) {
+            self.doc
+                .emit(self.map_id, OpKind::MapCreate { key: key.to_vec() });
+        }
         MapCursor {
             doc: self.doc,
             map_id: child,
         }
+    }
+
+    /// Whether `key` in this map already holds the live Map `child`. Descending into
+    /// an existing map re-asserts nothing, so the create is elided — an idempotent
+    /// re-create is a no-op on this replica's state, but it is still a real op in the
+    /// parent's partition, and re-emitting it on every nested write would leak that
+    /// partition's activity to its subscribers even when only the child changed. A
+    /// missing, tombstoned, or differently-kinded slot still emits the create.
+    fn holds_live_map(&self, key: &[u8], child: ElementId) -> bool {
+        self.doc.maps.contains_key(&child)
+            && self.doc.maps.get(&self.map_id).is_some_and(|m| {
+                matches!(m.borrow().get(key), Some(Element::Map(c)) if c.borrow().id() == child)
+            })
     }
 
     /// Descend into the keyed sub-namespace at `key`: an existing `XmlElement`'s

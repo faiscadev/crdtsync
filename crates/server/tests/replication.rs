@@ -91,6 +91,7 @@ fn sub(room: &[u8]) -> Message {
         channel: CH,
         room: room.to_vec(),
         branch: Vec::new(),
+        zone: Vec::new(),
         last_seen_seq: 0,
     }
 }
@@ -570,6 +571,7 @@ async fn a_leader_dials_a_follower_and_sends_a_replicate() {
             channel: CH,
             room: room.clone(),
             branch: Vec::new(),
+            zone: Vec::new(),
             last_seen_seq: 0,
         },
     )

@@ -131,6 +131,7 @@ fn after_auth_subscribe_is_allowed() {
         Message::Subscribe {
             channel: Channel(0),
             room: b"room-1".to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -245,6 +246,7 @@ fn subscribe_before_auth_is_a_violation() {
         Message::Subscribe {
             channel: Channel(0),
             room: b"room-1".to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -312,6 +314,7 @@ fn a_fast_path_session_subscribes_without_an_auth_phase() {
         Message::Subscribe {
             channel: Channel(0),
             room: b"room-1".to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },

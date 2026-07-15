@@ -84,6 +84,7 @@ fn subscribe(r: &mut Registry, id: ConnId, room: &[u8]) {
         Message::Subscribe {
             channel: CH,
             room: room.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }

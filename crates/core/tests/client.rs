@@ -365,6 +365,7 @@ fn subscribe_assigns_a_channel_and_requests_from_zero() {
             channel: c,
             room,
             branch,
+            zone: _,
             last_seen_seq,
         } => {
             assert_eq!(c, channel);
@@ -389,6 +390,7 @@ fn subscribe_branch_names_its_branch_on_the_frame_and_records_it() {
             channel: c,
             room,
             branch,
+            zone: _,
             last_seen_seq,
         } => {
             assert_eq!(c, channel);
@@ -518,6 +520,7 @@ fn resume_resubscribes_a_room_from_its_last_seen_sequence() {
             channel,
             room,
             branch,
+            zone: _,
             last_seen_seq,
         }) => {
             assert_eq!(channel, ch);
@@ -738,6 +741,7 @@ fn a_client_only_message_from_the_server_is_a_violation() {
             channel: Channel(0),
             room: ROOM_A.to_vec(),
             branch: Vec::new(),
+            zone: Vec::new(),
             last_seen_seq: 0,
         }),
         Err(ClientError::UnexpectedMessage(_))

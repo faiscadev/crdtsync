@@ -82,6 +82,7 @@ fn subscribe(r: &mut Registry, id: ConnId, channel: u32, room: &[u8]) {
         Message::Subscribe {
             channel: Channel(channel),
             room: room.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -130,6 +131,7 @@ fn a_sweep_past_the_grace_window_clears_departed_presence() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -200,6 +202,7 @@ fn closing_one_tab_keeps_a_sibling_tabs_presence() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -231,6 +234,7 @@ fn presence_is_retained_within_the_grace_window() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -274,6 +278,7 @@ fn a_reconnect_within_the_window_cancels_the_clear() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -306,6 +311,7 @@ fn a_sweep_with_nothing_stale_is_a_no_op() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -345,6 +351,7 @@ fn a_second_connection_asserting_a_live_client_cannot_steal_its_presence() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -376,6 +383,7 @@ fn an_authenticated_second_connection_cannot_steal_a_live_clients_presence() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -437,6 +445,7 @@ fn an_unauthenticated_socket_does_not_keep_a_departed_clients_presence() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -476,6 +485,7 @@ fn an_unauthenticated_hello_does_not_cancel_a_pending_sweep() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },

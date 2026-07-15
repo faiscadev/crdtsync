@@ -1026,10 +1026,15 @@ impl Registry {
                 continue;
             }
             for channel in conn.session.channels_for_stream(room, branch) {
-                conn.outbox.push(Message::Ops {
-                    channel,
-                    ops: translated.clone(),
-                });
+                // Narrow to the channel's authorized zone partitions — the wire
+                // redaction for per-zone streams. A channel scoped to a subset of the
+                // room's zones drops the rest; an unauthorized zone never surfaces,
+                // and a channel left with nothing is not sent an empty frame.
+                let ops = conn.session.zone_filter(channel, &translated);
+                if ops.is_empty() {
+                    continue;
+                }
+                conn.outbox.push(Message::Ops { channel, ops });
             }
         }
     }
@@ -1457,9 +1462,17 @@ impl Registry {
                             continue;
                         }
                         for channel in conn.session.channels_for_stream(&room, &branch) {
+                            // Narrow to the channel's authorized zone partitions — the
+                            // per-zone wire redaction. A channel scoped to a subset of
+                            // the room's zones drops the rest, so an unauthorized zone
+                            // never surfaces on it; an emptied channel gets no frame.
+                            let zoned = conn.session.zone_filter(channel, ops);
+                            if zoned.is_empty() {
+                                continue;
+                            }
                             conn.outbox.push(Message::Ops {
                                 channel,
-                                ops: ops.to_vec(),
+                                ops: zoned,
                             });
                         }
                     }

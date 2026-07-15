@@ -119,6 +119,7 @@ fn subscribe_ok(r: &mut Registry, id: ConnId) -> bool {
         Message::Subscribe {
             channel: Channel(0),
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }

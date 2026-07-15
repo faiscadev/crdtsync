@@ -52,6 +52,7 @@ fn subscribe_carries_its_channel() {
         channel: Channel(2),
         room: b"room-1".to_vec(),
         branch: Vec::new(),
+        zone: Vec::new(),
         last_seen_seq: 40,
     });
 }
@@ -62,6 +63,7 @@ fn subscribe_carries_its_branch() {
         channel: Channel(2),
         room: b"room-1".to_vec(),
         branch: b"release-2".to_vec(),
+        zone: Vec::new(),
         last_seen_seq: 40,
     });
 }
@@ -124,6 +126,7 @@ fn a_truncated_channel_message_is_an_error_not_a_panic() {
             channel: Channel(2),
             room: b"r".to_vec(),
             branch: b"b".to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 1,
         },
         Message::Snapshot {

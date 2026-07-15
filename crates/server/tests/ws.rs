@@ -183,6 +183,7 @@ async fn join(url: &str, client: u8) -> Ws {
         &Message::Subscribe {
             channel: CH,
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -273,6 +274,7 @@ async fn a_real_verifier_makes_actor_policy_enforceable() {
         &Message::Subscribe {
             channel: CH,
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -379,6 +381,7 @@ async fn a_declared_policy_gates_subscribe_over_the_transport() {
         &Message::Subscribe {
             channel: CH,
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -396,6 +399,7 @@ async fn a_declared_policy_gates_subscribe_over_the_transport() {
         &Message::Subscribe {
             channel: CH,
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -467,6 +471,7 @@ async fn a_late_joiner_catches_up() {
         &Message::Subscribe {
             channel: Channel(1),
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -581,6 +586,7 @@ async fn a_credential_at_the_upgrade_skips_the_auth_phase() {
         &Message::Subscribe {
             channel: CH,
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },

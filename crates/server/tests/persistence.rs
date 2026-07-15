@@ -231,6 +231,7 @@ fn ingest_via(r: &mut Registry, client: u8, room: &[u8], ops: Vec<crdtsync_core:
         Message::Subscribe {
             channel: Channel(0),
             room: room.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -318,6 +319,7 @@ fn catch_up_uses_stable_sequences_across_a_restart() {
             Message::Subscribe {
                 channel: Channel(0),
                 room: ROOM.to_vec(),
+                zone: Vec::new(),
                 last_seen_seq: 0,
                 branch: Vec::new(),
             },
