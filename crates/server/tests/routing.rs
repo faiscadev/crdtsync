@@ -191,7 +191,8 @@ fn a_solo_membership_leads_every_room() {
     // A single-member membership (self only) is primary for every room, so it
     // serves them all — a redirect never fires.
     let m = Membership::from_static_config(None, Some(SELF_ADDR), "", N).unwrap();
-    for i in 0..200 {
+    let rooms = if cfg!(miri) { 8 } else { 200 };
+    for i in 0..rooms {
         let room = format!("solo-{i}").into_bytes();
         let mut h = hub();
         let mut s = Session::new();

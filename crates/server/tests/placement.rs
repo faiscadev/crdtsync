@@ -26,7 +26,8 @@ fn deterministic_same_inputs_same_output() {
     let room = b"room-alpha";
     let first = cluster.replicas(room, 3);
     assert_eq!(first.len(), 3);
-    for _ in 0..1000 {
+    let reps = if cfg!(miri) { 20 } else { 1000 };
+    for _ in 0..reps {
         assert_eq!(cluster.replicas(room, 3), first);
     }
 }

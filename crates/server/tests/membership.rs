@@ -119,7 +119,8 @@ fn padded_node_id_matches_a_peers_derivation() {
 #[test]
 fn single_node_owns_and_leads_every_room() {
     let m = Membership::from_static_config(None, Some("solo:9000"), "", N).unwrap();
-    for i in 0..500 {
+    let rooms = if cfg!(miri) { 32 } else { 500 };
+    for i in 0..rooms {
         let room = format!("room-{i}").into_bytes();
         assert!(m.owns(&room), "single node owns every room");
         assert!(m.is_primary_for(&room), "single node leads every room");
@@ -133,7 +134,8 @@ fn self_view_agrees_with_shared_placement() {
     let peers = peer_addrs(6).join(",");
     let m = Membership::from_static_config(None, Some("10.0.0.100:9000"), &peers, N).unwrap();
     let cluster = Cluster::new(m.members().iter().cloned());
-    for i in 0..1000 {
+    let rooms = if cfg!(miri) { 32 } else { 1000 };
+    for i in 0..rooms {
         let room = format!("room-{i}").into_bytes();
         // The node's own queries are exactly the shared placement, evaluated for
         // its own id — no independent, possibly-divergent computation.
@@ -171,7 +173,8 @@ fn two_nodes_same_peer_set_agree_on_placement() {
         Membership::from_static_config(None, Some(node_b_self), &peers_of(node_b_self), N).unwrap();
     assert_eq!(a.members(), b.members(), "same total member set");
 
-    for i in 0..2000 {
+    let rooms = if cfg!(miri) { 32 } else { 2000 };
+    for i in 0..rooms {
         let room = format!("room-{i}").into_bytes();
         assert_eq!(a.replicas_for(&room), b.replicas_for(&room));
         assert_eq!(a.primary_for(&room), b.primary_for(&room));
@@ -202,7 +205,8 @@ fn every_room_is_owned_by_some_node() {
             Membership::from_static_config(None, Some(me), &peers, N).unwrap()
         })
         .collect();
-    for i in 0..500 {
+    let rooms = if cfg!(miri) { 32 } else { 500 };
+    for i in 0..rooms {
         let room = format!("room-{i}").into_bytes();
         let owners = views.iter().filter(|v| v.owns(&room)).count();
         assert_eq!(

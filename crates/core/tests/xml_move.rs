@@ -474,7 +474,8 @@ impl Rng {
 
 #[test]
 fn random_moves_converge_across_orderings() {
-    for seed in 0..80u64 {
+    let seeds: u64 = if cfg!(miri) { 4 } else { 80 };
+    for seed in 0..seeds {
         let mut rng = Rng::new(seed);
         // Author on one replica: a fragment with four elements, then a batch of
         // random moves relocating them under one another.
