@@ -17,13 +17,19 @@ jobs:
 
   miri:
     runs-on: ubuntu-latest
+    # Miri is the memory gate: UB + leaks, deterministic and cross-platform.
+    # One shard per crate so the three run in parallel — wall-clock is the
+    # slowest single crate, not the sum.
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [crdtsync-core, crdtsync-ffi, crdtsync-server]
     steps:
       - uses: actions/checkout@v5
-      # Miri is the memory gate: UB + leaks, deterministic and cross-platform.
       - name: Install Miri
         run: rustup toolchain install nightly --component miri
       - name: Miri
-        run: cargo +nightly miri test -p crdtsync-core -p crdtsync-ffi -p crdtsync-server
+        run: cargo +nightly miri test -p ${{ matrix.crate }}
 
   python-sdk:
     runs-on: ubuntu-latest
