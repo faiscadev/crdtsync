@@ -503,6 +503,56 @@ func TestClientBranchRequestsMarshal(t *testing.T) {
 	}
 }
 
+func TestClientDiffQueryRoundTrips(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+
+	room := key("room-1")
+	// Both kinds frame a request; room-keyed, no subscription needed.
+	for _, kind := range []DiffKind{DiffVersions, DiffBranches} {
+		if f := c.DiffQuery(room, kind, key("a"), key("b")); len(f) == 0 {
+			t.Fatalf("diff query (kind %d) should yield a frame", kind)
+		}
+	}
+	// No result until one is answered.
+	if changes, ok, err := c.DiffResult(room); ok || err != nil || changes != nil {
+		t.Fatalf("diff result before reply: got %v ok=%v err=%v", changes, ok, err)
+	}
+
+	// A DiffResult reply folds in: tag 41, u32-prefixed room, u32-prefixed
+	// encoded change list. The change list is the DiffEncode of two snapshots.
+	d := newDoc(t, 2)
+	defer d.Close()
+	d.RegisterInt(path("age"), 30)
+	oldState := d.EncodeState()
+	d.RegisterInt(path("age"), 40)
+	changesBytes := DiffEncode(oldState, d.EncodeState())
+
+	frame := make([]byte, 0, 1+4+len(room)+4+len(changesBytes))
+	frame = append(frame, 41)
+	frame = appendBytes(frame, room)
+	frame = appendBytes(frame, changesBytes)
+	if rc, _ := c.Receive(frame); rc != 1 {
+		t.Fatalf("diff result receive: got rc=%d, want 1", rc)
+	}
+
+	changes, ok, err := c.DiffResult(room)
+	if err != nil || !ok {
+		t.Fatalf("diff result: ok=%v err=%v", ok, err)
+	}
+	if len(changes) != 1 || changes[0].Op != "value" || changes[0].New == nil || changes[0].New.Int != 40 {
+		t.Fatalf("diff result changes: got %+v", changes)
+	}
+}
+
+// appendBytes writes a u32-length-prefixed byte string, the wire put_bytes form.
+func appendBytes(dst, b []byte) []byte {
+	var n [4]byte
+	binary.LittleEndian.PutUint32(n[:], uint32(len(b)))
+	dst = append(dst, n[:]...)
+	return append(dst, b...)
+}
+
 func TestClientReceiveRejectsGarbage(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()

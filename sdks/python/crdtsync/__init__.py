@@ -23,6 +23,7 @@ __all__ = [
     "Branch",
     "Capability",
     "Client",
+    "DiffKind",
     "Document",
     "Effect",
     "ErrorCode",
@@ -101,6 +102,14 @@ class ErrorCode(enum.IntEnum):
     INTERNAL = 4
     FORBIDDEN = 5
     UPDATE_REQUIRED = 6
+    NOT_FOUND = 7
+
+
+class DiffKind(enum.IntEnum):
+    """Which pair of a room's states a client :meth:`Client.diff_query` compares."""
+
+    VERSIONS = 0  # two of a room's saved versions
+    BRANCHES = 1  # two of a room's branches' HEADs
 
 
 class ServerError(RuntimeError):
@@ -400,6 +409,12 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         ],
         c.c_int32,
     )
+    sig(
+        lib.crdtsync_client_diff_query,
+        [doc, cbytes, size, c.c_uint32, cbytes, size, cbytes, size],
+        buf,
+    )
+    sig(lib.crdtsync_client_diff_result, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
     return lib
 
 
@@ -1864,3 +1879,28 @@ class Client:
                     )
                 )
         return out
+
+    def diff_query(
+        self, room: bytes, kind: DiffKind, a: bytes, b: bytes
+    ) -> bytes:
+        """Frame a request for the structural diff turning state ``a`` into state
+        ``b`` in ``room``. ``kind`` selects whether ``a``/``b`` name two saved
+        versions or two branches. Room-keyed: a client may diff a room before it
+        subscribes any of its branches. The reply updates the diff view, read with
+        :meth:`diff`."""
+        return _take_buf(
+            _LIB.crdtsync_client_diff_query(
+                self._handle, room, len(room), int(kind), a, len(a), b, len(b)
+            )
+        )
+
+    def diff(self, room: bytes) -> Optional[list]:
+        """The change list from the last diff query answered for ``room``, or
+        ``None`` if none has been. An empty diff is an empty list, not ``None``."""
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_diff_result(
+            self._handle, room, len(room), ctypes.byref(out)
+        )
+        if rc != 1:
+            return None
+        return _decode_changes(_take_buf(out))

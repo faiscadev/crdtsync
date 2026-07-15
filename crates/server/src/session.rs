@@ -10,8 +10,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use crdtsync_core::diff::encode_changes;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
-use crdtsync_core::{BranchInfo, Channel, ClientId, Document, ErrorCode, Message, Op};
+use crdtsync_core::{BranchInfo, Channel, ClientId, DiffKind, Document, ErrorCode, Message, Op};
 
 use crdtsync_core::schema::Schema;
 
@@ -23,7 +24,7 @@ use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Decision, Resource};
 use crate::membership::Membership;
 use crate::schema_registry::{Resolution, SchemaRegistry};
-use crate::{Catchup, Hub, RoomId, StoredOp, MAIN_BRANCH};
+use crate::{Catchup, DiffError, Hub, RoomId, StoredOp, MAIN_BRANCH};
 
 /// One channel's subscription: the room it joined, the branch within it, and the
 /// zone partitions it carries. An empty subscribe branch is normalized to
@@ -880,7 +881,7 @@ pub fn step(
         // locally from the replicated registry.
         Message::BranchList { room } => {
             if !branch_authorized(session, authorizer, schema, &room, Action::Read) {
-                return branch_denied(session);
+                return request_denied(session, "branch");
             }
             branches_list(hub, &room)
         }
@@ -890,7 +891,7 @@ pub fn step(
             from_branch,
         } => {
             if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
-                return branch_denied(session);
+                return request_denied(session, "branch");
             }
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
@@ -908,7 +909,7 @@ pub fn step(
             version,
         } => {
             if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
-                return branch_denied(session);
+                return request_denied(session, "branch");
             }
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
@@ -924,7 +925,7 @@ pub fn step(
             version,
         } => {
             if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
-                return branch_denied(session);
+                return request_denied(session, "branch");
             }
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
@@ -936,7 +937,7 @@ pub fn step(
         }
         Message::BranchPublish { room, published } => {
             if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
-                return branch_denied(session);
+                return request_denied(session, "branch");
             }
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
@@ -948,7 +949,7 @@ pub fn step(
         }
         Message::BranchDelete { room, name } => {
             if !branch_authorized(session, authorizer, schema, &room, Action::Write) {
-                return branch_denied(session);
+                return request_denied(session, "branch");
             }
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
@@ -958,6 +959,33 @@ pub fn step(
                 Err(_) => internal("failed to persist branch"),
             }
         }
+        // A diff query is a room-level read: it computes the structural diff
+        // between two of the room's saved versions or two of its branches, gated
+        // by the same read tier as a branch list — a diff reads room state, no new
+        // authz axis. Served locally from the replicated state, so no leader
+        // redirect. An absent version/branch maps to a recoverable NotFound; a
+        // snapshot that fails to decode is an internal fault.
+        Message::DiffQuery { room, kind, a, b } => {
+            if !branch_authorized(session, authorizer, schema, &room, Action::Read) {
+                return request_denied(session, "diff");
+            }
+            let diff = match kind {
+                DiffKind::Versions => hub.diff_versions(&room, &a, &b),
+                DiffKind::Branches => hub.diff_branches(&room, &a, &b),
+            };
+            match diff {
+                Ok(changes) => Response {
+                    replies: vec![Message::DiffResult {
+                        room,
+                        changes: encode_changes(&changes),
+                    }],
+                    ..Response::default()
+                },
+                Err(e) => diff_error(e),
+            }
+        }
+        // A diff result only travels server-to-client.
+        Message::DiffResult { .. } => violation("client sent a diff result"),
         // A branch set only travels server-to-client.
         Message::Branches { .. } => violation("client sent a branch set"),
         // A redirect is the server's own routing reply; a client never sends one.
@@ -1182,13 +1210,33 @@ fn branch_authorized(
     )
 }
 
-/// The refusal for a branch request [`branch_authorized`] rejected: a violation
-/// if the connection is unauthenticated, otherwise a non-closing forbidden.
-fn branch_denied(session: &Session) -> Response {
+/// The refusal for a room-keyed `what` request [`branch_authorized`] rejected: a
+/// violation if the connection is unauthenticated, otherwise a non-closing
+/// forbidden. `what` names the request kind (`"branch"`, `"diff"`) in the
+/// diagnostic so the message points at the surface the client actually used.
+fn request_denied(session: &Session, what: &str) -> Response {
     if session.actor().is_none() {
-        violation("branch request before auth")
+        violation(&format!("{what} request before auth"))
     } else {
-        forbidden("branch request denied")
+        forbidden(&format!("{what} request denied"))
+    }
+}
+
+/// Map a [`DiffError`] to the client failure it surfaces. An absent version or
+/// branch is a recoverable `NotFound` — a well-formed query naming something the
+/// room does not have, the connection stays open. A snapshot that fails to decode
+/// is a server-side fault, so it closes like any [`internal`] error.
+fn diff_error(e: DiffError) -> Response {
+    match e {
+        DiffError::UnknownVersion(_) | DiffError::UnknownBranch(_) => Response {
+            replies: vec![Message::Error {
+                code: ErrorCode::NotFound,
+                message: e.to_string(),
+                details: Vec::new(),
+            }],
+            ..Response::default()
+        },
+        DiffError::Decode => internal("a snapshot failed to decode for diff"),
     }
 }
 

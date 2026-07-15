@@ -128,7 +128,7 @@ fn a_server_sent_branch_request_is_refused() {
             room: ROOM.to_vec(),
         }),
         Err(ClientError::UnexpectedMessage(
-            "server sent a branch request"
+            "server sent a branch or diff request"
         ))
     );
 }

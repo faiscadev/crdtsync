@@ -417,6 +417,45 @@ fn a_client_branch_requests_marshal() {
 }
 
 #[wasm_bindgen_test]
+fn a_client_diff_query_round_trips() {
+    use crdtsync_core::diff::encode_changes;
+    use crdtsync_core::protocol::{encode_message, Message};
+
+    let mut c = wasm_client(1);
+    let room = b"room-1";
+    // Both kinds frame a request; a bad kind is an error.
+    assert!(!c.diff_query(room, 0, b"a", b"b").unwrap().is_empty());
+    assert!(!c.diff_query(room, 1, b"main", b"draft").unwrap().is_empty());
+    assert!(c.diff_query(room, 9, b"a", b"b").is_err());
+    // No result until one is answered.
+    assert!(c.diff(room).is_null());
+
+    // Build the change payload the server would return, from two snapshots.
+    let mut d = doc(2);
+    d.register_int(&path(&["age"]), 30);
+    let old = d.encode_state();
+    d.register_int(&path(&["age"]), 40);
+    let changes = WasmDocument::diff_encoded(&old, &d.encode_state()).unwrap();
+    // The changes buffer is the same shape encode_changes yields.
+    assert!(!changes.is_empty() && changes != encode_changes(&[]));
+
+    let frame = encode_message(&Message::DiffResult {
+        room: room.to_vec(),
+        changes,
+    });
+    assert!(c.receive(&frame).unwrap());
+
+    let result = js_sys::Array::from(&c.diff(room));
+    assert_eq!(result.length(), 1);
+    let change = js_sys::Object::from(result.get(0));
+    let op = js_sys::Reflect::get(&change, &"op".into()).unwrap();
+    assert_eq!(op.as_string().as_deref(), Some("value"));
+    let new = js_sys::Object::from(js_sys::Reflect::get(&change, &"new".into()).unwrap());
+    let t = js_sys::Reflect::get(&new, &"t".into()).unwrap();
+    assert_eq!(t.as_string().as_deref(), Some("int"));
+}
+
+#[wasm_bindgen_test]
 fn a_client_rejects_garbage_frames() {
     let mut c = wasm_client(1);
     assert!(!c.receive(&[0xff, 0xff, 0xff, 0xff]).unwrap());

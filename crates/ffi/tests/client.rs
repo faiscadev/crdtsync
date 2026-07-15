@@ -6,6 +6,7 @@
 //! channel the client assigned at subscribe. Every buffer and handle is freed so
 //! the round trip is leak-clean under Miri.
 
+use crdtsync_core::diff::{decode_changes, encode_changes, Change};
 use crdtsync_core::protocol::BranchInfo;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_op, Channel, ErrorCode, Message, Op, Scalar,
@@ -628,6 +629,79 @@ fn branch_management_round_trips_over_the_client() {
             1
         );
         assert_eq!(z, 0);
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
+fn a_diff_query_round_trips_over_the_client() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+
+        // A diff query frames a non-empty request — room-keyed, no subscription
+        // needed. Both kinds frame; a bad kind frames nothing.
+        for kind in [0u32, 1u32] {
+            let frame = crdtsync_client_diff_query(
+                c,
+                b"room-1".as_ptr(),
+                6,
+                kind,
+                b"a".as_ptr(),
+                1,
+                b"b".as_ptr(),
+                1,
+            );
+            assert!(frame.len > 0, "a diff query frames bytes to send");
+            crdtsync_buf_free(frame);
+        }
+        let bad = crdtsync_client_diff_query(
+            c,
+            b"room-1".as_ptr(),
+            6,
+            9,
+            b"a".as_ptr(),
+            1,
+            b"b".as_ptr(),
+            1,
+        );
+        assert_eq!(bad.len, 0, "a bad kind frames nothing");
+        crdtsync_buf_free(bad);
+
+        // No result until one is answered.
+        let mut none = out_buf();
+        assert_eq!(
+            crdtsync_client_diff_result(c, b"room-1".as_ptr(), 6, &mut none),
+            0
+        );
+
+        // The server's diff result lands in the view, keyed by room.
+        let expected = Change::Value {
+            path: path(&[b"age"]),
+            old: Scalar::Int(30),
+            new: Scalar::Int(40),
+        };
+        let result = encode_message(&Message::DiffResult {
+            room: b"room-1".to_vec(),
+            changes: encode_changes(std::slice::from_ref(&expected)),
+        });
+        assert_eq!(
+            crdtsync_client_receive(c, result.as_ptr(), result.len(), ptr::null_mut()),
+            1
+        );
+
+        let mut got = out_buf();
+        assert_eq!(
+            crdtsync_client_diff_result(c, b"room-1".as_ptr(), 6, &mut got),
+            1
+        );
+        let raw = std::slice::from_raw_parts(got.ptr, got.len);
+        // The buffer feeds the existing diff-decode binding back to the change.
+        assert_eq!(decode_changes(raw).unwrap(), vec![expected]);
+        let mut decoded = out_buf();
+        assert_eq!(crdtsync_diff_decode(got.ptr, got.len, &mut decoded), 1);
+        crdtsync_buf_free(decoded);
+        crdtsync_buf_free(got);
 
         crdtsync_client_free(c);
     }

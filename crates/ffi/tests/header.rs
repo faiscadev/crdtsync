@@ -147,6 +147,9 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_delete_branch",
         "crdtsync_client_branch_count",
         "crdtsync_client_branch_at",
+        // client diff query
+        "crdtsync_client_diff_query",
+        "crdtsync_client_diff_result",
     ];
     for sym in required {
         assert!(
