@@ -14,13 +14,44 @@
 //!   merged view — never rejected at merge.
 
 use crdtsync_core::acl::{
-    decide_capability_with_authority, evaluate_with_authority, AclActor, AclDecision, AclEffect,
-    AclGrant, AclRecord, AclSubject, AclTuple, Capability,
+    AclActor, AclDecision, AclEffect, AclGrant, AclRecord, AclScope, AclSubject, AclTuple,
+    Capability,
 };
 use crdtsync_core::doc::Document;
 use crdtsync_core::elementid::ElementId;
 use crdtsync_core::path::encode_path;
 use crdtsync_core::{ClientId, Op};
+
+// Path-scoped provenance tests carry no element scopes — the resolver is never
+// consulted. Element-scoped revocation/rooting is covered in `acl_element.rs`.
+fn evaluate_with_authority(
+    records: &[AclRecord],
+    creator: ClientId,
+    actor: &AclActor,
+    path: &[u8],
+    capability: Capability,
+) -> bool {
+    crdtsync_core::acl::evaluate_with_authority(records, creator, actor, path, capability, &|_| {
+        None
+    })
+}
+
+fn decide_capability_with_authority(
+    records: &[AclRecord],
+    creator: ClientId,
+    actor: &AclActor,
+    path: &[u8],
+    capability: Capability,
+) -> AclDecision {
+    crdtsync_core::acl::decide_capability_with_authority(
+        records,
+        creator,
+        actor,
+        path,
+        capability,
+        &|_| None,
+    )
+}
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -44,7 +75,7 @@ fn tup(subject: AclSubject, grant: AclGrant, path: Vec<u8>, grantor: ClientId) -
         subject,
         grant,
         effect: AclEffect::Allow,
-        path,
+        scope: AclScope::Path(path),
         grantor,
     }
 }

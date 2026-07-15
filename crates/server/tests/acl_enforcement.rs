@@ -11,14 +11,17 @@
 //! bootstraps a room, grants let others write, deny overrides, two devices of one
 //! actor share a grant).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crdtsync_core::acl::{AclEffect, AclGrant, AclRecord, AclSubject, AclTuple, Capability};
+use crdtsync_core::acl::{
+    AclEffect, AclGrant, AclRecord, AclScope, AclSubject, AclTuple, Capability,
+};
 use crdtsync_core::elementid::ElementId;
 use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Op, Scalar};
-use crdtsync_server::acl::{actor_key, doc_acl_tier, Acl, ResourceMatch, Subject};
+use crdtsync_server::acl::{actor_key, Acl, ResourceMatch, Subject};
 use crdtsync_server::authz::Decision;
 use crdtsync_server::{Action, ConnId, Identity, ManualClock, Registry, StaticTokens};
 
@@ -28,6 +31,18 @@ const ROOM: &[u8] = b"room-a";
 
 fn root() -> Vec<u8> {
     encode_path(&[])
+}
+
+// These tuples are all root path-scoped, so the element-context index is never
+// consulted — pass an empty one. Element-scoped enforcement is covered in
+// `acl_element.rs`.
+fn doc_acl_tier(
+    records: &[AclRecord],
+    creator: Option<&[u8]>,
+    identity: &Identity,
+    action: Action,
+) -> Decision {
+    crdtsync_server::acl::doc_acl_tier(records, creator, &HashMap::new(), identity, action)
 }
 
 /// A live actor-capability grant rooted at `grantor`.
@@ -43,7 +58,7 @@ fn grant(
             subject,
             grant: AclGrant::Capability(capability),
             effect,
-            path: root(),
+            scope: AclScope::Path(root()),
             grantor,
         },
         revoked_by: Vec::new(),

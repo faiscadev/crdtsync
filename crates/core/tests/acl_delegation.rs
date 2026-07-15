@@ -13,13 +13,27 @@
 //! confers nothing.
 
 use crdtsync_core::acl::{
-    evaluate_with_authority, AclActor, AclEffect, AclGrant, AclRecord, AclSubject, AclTuple,
-    Capability,
+    AclActor, AclEffect, AclGrant, AclRecord, AclScope, AclSubject, AclTuple, Capability,
 };
 use crdtsync_core::doc::Document;
 use crdtsync_core::elementid::ElementId;
 use crdtsync_core::path::encode_path;
 use crdtsync_core::{ClientId, Op};
+
+// These path-scoped delegation tests carry no element scopes, so they resolve
+// nothing — a `Path` scope never consults the resolver. Element-scoped rooting has
+// its own coverage in `acl_element.rs`.
+fn evaluate_with_authority(
+    records: &[AclRecord],
+    creator: ClientId,
+    actor: &AclActor,
+    path: &[u8],
+    capability: Capability,
+) -> bool {
+    crdtsync_core::acl::evaluate_with_authority(records, creator, actor, path, capability, &|_| {
+        None
+    })
+}
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -42,7 +56,7 @@ fn tup(subject: AclSubject, grant: AclGrant, path: Vec<u8>, grantor: ClientId) -
         subject,
         grant,
         effect: AclEffect::Allow,
-        path,
+        scope: AclScope::Path(path),
         grantor,
     }
 }
@@ -528,7 +542,7 @@ fn an_out_of_authority_deny_no_longer_strips_a_rooted_grant() {
                 subject: AclSubject::Actor(cid(2)),
                 grant: cap(Capability::Read),
                 effect: AclEffect::Deny,
-                path: doc(),
+                scope: AclScope::Path(doc()),
                 grantor: cid(9),
             },
             revoked_by: Vec::new(),

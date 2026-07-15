@@ -46,7 +46,7 @@ pub mod path;
 pub mod protocol;
 pub mod undo;
 
-pub use acl::{AclEffect, AclGrant, AclSubject, AclTuple, Capability};
+pub use acl::{AclEffect, AclGrant, AclScope, AclSubject, AclTuple, Capability};
 pub use anchor::RelativePosition;
 pub use client::{ClientError, ClientSession, Redirect, Rejected};
 pub use clientid::ClientId;

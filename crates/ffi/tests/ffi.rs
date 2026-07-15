@@ -1993,11 +1993,11 @@ fn acl_grant_emits_the_tuple_and_revoke_tombstones_it() {
             subject: subj,
             grant,
             effect,
-            path: gp,
+            scope: crdtsync_core::AclScope::Path(gp),
             grantor: gtor,
         } = &decoded[0].kind
         else {
-            panic!("expected AclGrant, got {:?}", decoded[0].kind);
+            panic!("expected a path-scoped AclGrant, got {:?}", decoded[0].kind);
         };
         assert_eq!(*subj, AclSubject::Actor(ClientId::from_bytes(subject)));
         assert_eq!(*grant, AclGrant::Capability(Capability::Read));
