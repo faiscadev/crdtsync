@@ -66,6 +66,28 @@ unsafe fn subscribe_frame_branch(frame: &CrdtBuf) -> Vec<u8> {
     }
 }
 
+unsafe fn subscribe_zone(c: *mut CrdtClient, room: &[u8], zone: &[u8]) -> (u32, CrdtBuf) {
+    let mut channel: u32 = u32::MAX;
+    let frame = crdtsync_client_subscribe_zone(
+        c,
+        room.as_ptr(),
+        room.len(),
+        zone.as_ptr(),
+        zone.len(),
+        &mut channel,
+    );
+    (channel, frame)
+}
+
+/// The zone a Subscribe frame carries, or panics on any other frame.
+unsafe fn subscribe_frame_zone(frame: &CrdtBuf) -> Vec<u8> {
+    let bytes = std::slice::from_raw_parts(frame.ptr, frame.len);
+    match decode_message(bytes).unwrap() {
+        Message::Subscribe { zone, .. } => zone,
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+}
+
 unsafe fn register_int(c: *mut CrdtClient, channel: u32, p: &[u8], v: i64) -> CrdtBuf {
     crdtsync_client_register_int(c, channel, p.as_ptr(), p.len(), v)
 }
@@ -143,6 +165,46 @@ fn subscribe_branch_carries_the_named_branch() {
             6,
             b"feature-x".as_ptr(),
             9,
+            &mut channel,
+        );
+        assert_eq!(frame.len, 0);
+        assert_eq!(channel, u32::MAX);
+        crdtsync_buf_free(frame);
+
+        crdtsync_client_free(a);
+    }
+}
+
+#[test]
+fn subscribe_zone_carries_the_named_zone() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+
+        // A named zone rides along in the Subscribe frame, on the default branch.
+        let (ch, frame) = subscribe_zone(a, b"room-1", b"west");
+        assert_eq!(ch, 0);
+        assert_eq!(subscribe_frame_zone(&frame), b"west");
+        assert!(subscribe_frame_branch(&frame).is_empty());
+        crdtsync_buf_free(frame);
+
+        // An empty zone is the whole room, as the plain subscribe.
+        let (ch, frame) = subscribe_zone(a, b"room-1", b"");
+        assert_eq!(ch, 1);
+        assert!(subscribe_frame_zone(&frame).is_empty());
+        crdtsync_buf_free(frame);
+
+        let (_, frame) = subscribe(a, b"room-1");
+        assert!(subscribe_frame_zone(&frame).is_empty());
+        crdtsync_buf_free(frame);
+
+        // A null handle yields the empty-buffer sentinel and assigns no channel.
+        let mut channel: u32 = u32::MAX;
+        let frame = crdtsync_client_subscribe_zone(
+            ptr::null_mut(),
+            b"room-1".as_ptr(),
+            6,
+            b"west".as_ptr(),
+            4,
             &mut channel,
         );
         assert_eq!(frame.len, 0);

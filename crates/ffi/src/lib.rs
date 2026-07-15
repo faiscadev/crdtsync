@@ -2021,6 +2021,39 @@ pub unsafe extern "C" fn crdtsync_client_subscribe_branch(
     .unwrap_or_else(|_| CrdtBuf::empty())
 }
 
+/// Join `room` on a fresh channel scoped to one `zone`, writing the assigned
+/// channel to `out_channel` and returning the Subscribe frame to send. An empty
+/// `zone` is the whole room (every zone the actor may read), matching
+/// [`crdtsync_client_subscribe`]; a named `zone` narrows the stream to that
+/// partition plus the unzoned root it is entitled to. Empty on a bad handle or
+/// input.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len` and `zone`/`zone_len` follow
+/// [`as_slice`]; `out_channel` points to a writable `u32`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_subscribe_zone(
+    client: *mut CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    zone: *const u8,
+    zone_len: usize,
+    out_channel: *mut u32,
+) -> CrdtBuf {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out_channel.is_null() {
+            return CrdtBuf::empty();
+        }
+        let (Some(r), Some(z)) = (as_slice(room, room_len), as_slice(zone, zone_len)) else {
+            return CrdtBuf::empty();
+        };
+        let (channel, msg) = (*client).session.subscribe_zone(r, z);
+        *out_channel = channel.0;
+        CrdtBuf::from_vec(encode_message(&msg))
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
+}
+
 /// The stable integer a server [`ErrorCode`] crosses the boundary as, mirroring
 /// the wire tags so every SDK decodes it identically: `0` ProtocolViolation, `1`
 /// UnsupportedVersion, `2` AuthFailed, `3` UnknownRoom, `4` Internal, `5`

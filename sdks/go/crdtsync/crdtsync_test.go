@@ -453,6 +453,27 @@ func TestClientSubscribeBranchCarriesTheNamedBranch(t *testing.T) {
 	}
 }
 
+func TestClientSubscribeZoneCarriesTheNamedZone(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+
+	// A named zone rides along in the Subscribe frame.
+	ch, frame := c.SubscribeZone(key("room-1"), key("west"))
+	if ch != 0 {
+		t.Fatalf("first channel: got %d, want 0", ch)
+	}
+	if !bytes.Contains(frame, key("west")) {
+		t.Fatal("subscribe-zone frame should carry the zone name")
+	}
+	// An empty zone is the whole room, as the plain Subscribe.
+	if _, def := c.SubscribeZone(key("room-1"), nil); bytes.Contains(def, key("west")) {
+		t.Fatal("empty-zone frame should not carry a zone name")
+	}
+	if _, plain := c.Subscribe(key("room-1")); bytes.Contains(plain, key("west")) {
+		t.Fatal("plain subscribe frame should not carry a zone name")
+	}
+}
+
 func TestClientVersionRequestsMarshal(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()

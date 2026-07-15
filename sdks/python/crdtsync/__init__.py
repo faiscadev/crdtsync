@@ -317,6 +317,11 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         [doc, cbytes, size, cbytes, size, c.POINTER(ch)],
         buf,
     )
+    sig(
+        lib.crdtsync_client_subscribe_zone,
+        [doc, cbytes, size, cbytes, size, c.POINTER(ch)],
+        buf,
+    )
     sig(lib.crdtsync_client_resume, [doc, ch], buf)
     sig(lib.crdtsync_client_resend, [doc, ch], buf)
     sig(lib.crdtsync_client_outbox_len, [doc, ch, c.POINTER(size)], c.c_int32)
@@ -1361,6 +1366,20 @@ class Client:
         frame = _take_buf(
             _LIB.crdtsync_client_subscribe_branch(
                 self._handle, room, len(room), branch, len(branch), ctypes.byref(channel)
+            )
+        )
+        return channel.value, frame
+
+    def subscribe_zone(self, room: bytes, zone: bytes) -> Tuple[int, bytes]:
+        """Join ``room`` on a fresh channel scoped to one ``zone``; return
+        ``(channel, subscribe_frame)``. An empty ``zone`` is the whole room (every
+        zone the actor may read), matching :meth:`subscribe`; a named ``zone``
+        narrows the stream to that partition plus the unzoned root it is entitled
+        to. Scoped to the default branch."""
+        channel = ctypes.c_uint32()
+        frame = _take_buf(
+            _LIB.crdtsync_client_subscribe_zone(
+                self._handle, room, len(room), zone, len(zone), ctypes.byref(channel)
             )
         )
         return channel.value, frame

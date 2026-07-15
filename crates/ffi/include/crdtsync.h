@@ -775,6 +775,23 @@ CrdtBuf crdtsync_client_subscribe_branch(CrdtClient *client,
                                          uintptr_t branch_len,
                                          uint32_t *out_channel);
 
+// Join `room` on a fresh channel scoped to one `zone`, writing the assigned
+// channel to `out_channel` and returning the Subscribe frame to send. An empty
+// `zone` is the whole room (every zone the actor may read), matching
+// [`crdtsync_client_subscribe`]; a named `zone` narrows the stream to that
+// partition plus the unzoned root it is entitled to. Empty on a bad handle or
+// input.
+//
+// # Safety
+// `client` is a live handle; `room`/`room_len` and `zone`/`zone_len` follow
+// [`as_slice`]; `out_channel` points to a writable `u32`.
+CrdtBuf crdtsync_client_subscribe_zone(CrdtClient *client,
+                                       const uint8_t *room,
+                                       uintptr_t room_len,
+                                       const uint8_t *zone,
+                                       uintptr_t zone_len,
+                                       uint32_t *out_channel);
+
 // Fold one received wire frame into the addressed room. Returns 1 when applied,
 // 0 when the frame is undecodable or the session refuses it, -1 on a bad handle.
 // When the server refused with an `Error` frame, writes the failure's

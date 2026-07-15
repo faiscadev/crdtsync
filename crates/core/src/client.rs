@@ -61,6 +61,7 @@ pub struct Rejected {
 struct Room {
     room: Vec<u8>,
     branch: Vec<u8>,
+    zone: Vec<u8>,
     doc: Document,
     last_seen_seq: u64,
     outbox: Vec<Op>,
@@ -179,16 +180,30 @@ impl ClientSession {
 
     /// Join `room` on a fresh channel, requesting everything from the start.
     /// Returns the assigned channel and the Subscribe frame to send. Scoped to
-    /// the default `main` branch; [`subscribe_branch`](Self::subscribe_branch)
-    /// names another.
+    /// the default `main` branch and the whole room (every zone the actor may
+    /// read); [`subscribe_branch`](Self::subscribe_branch) names another branch,
+    /// [`subscribe_zone`](Self::subscribe_zone) narrows to one zone.
     pub fn subscribe(&mut self, room: &[u8]) -> (Channel, Message) {
-        self.subscribe_branch(room, b"")
+        self.subscribe_inner(room, b"", b"")
     }
 
     /// Join `branch` of `room` on a fresh channel, requesting everything from the
     /// start. An empty `branch` is the default `main`. Returns the assigned
     /// channel and the Subscribe frame to send.
     pub fn subscribe_branch(&mut self, room: &[u8], branch: &[u8]) -> (Channel, Message) {
+        self.subscribe_inner(room, branch, b"")
+    }
+
+    /// Join `room` on a fresh channel scoped to one `zone`, requesting everything
+    /// from the start. An empty `zone` is the whole room (every zone the actor may
+    /// read); a named `zone` narrows the stream to that partition plus the unzoned
+    /// root it is entitled to. Scoped to the default `main` branch. Returns the
+    /// assigned channel and the Subscribe frame to send.
+    pub fn subscribe_zone(&mut self, room: &[u8], zone: &[u8]) -> (Channel, Message) {
+        self.subscribe_inner(room, b"", zone)
+    }
+
+    fn subscribe_inner(&mut self, room: &[u8], branch: &[u8], zone: &[u8]) -> (Channel, Message) {
         let channel = Channel(self.next_channel);
         self.next_channel += 1;
         self.rooms.insert(
@@ -196,6 +211,7 @@ impl ClientSession {
             Room {
                 room: room.to_vec(),
                 branch: branch.to_vec(),
+                zone: zone.to_vec(),
                 doc: Document::new(self.client),
                 last_seen_seq: 0,
                 outbox: Vec::new(),
@@ -210,9 +226,7 @@ impl ClientSession {
                 channel,
                 room: room.to_vec(),
                 branch: branch.to_vec(),
-                // The client SDK's zone-scoped subscribe surface is a later unit;
-                // today it joins the whole room (every zone the actor may read).
-                zone: Vec::new(),
+                zone: zone.to_vec(),
                 last_seen_seq: 0,
             },
         )
@@ -227,7 +241,7 @@ impl ClientSession {
             channel,
             room: room.room.clone(),
             branch: room.branch.clone(),
-            zone: Vec::new(),
+            zone: room.zone.clone(),
             last_seen_seq: room.last_seen_seq,
         })
     }
@@ -753,5 +767,10 @@ impl ClientSession {
     /// The branch bound to `channel`, if held — empty for the default `main`.
     pub fn branch(&self, channel: Channel) -> Option<&[u8]> {
         self.rooms.get(&channel).map(|r| r.branch.as_slice())
+    }
+
+    /// The zone selector bound to `channel`, if held — empty for the whole room.
+    pub fn zone(&self, channel: Channel) -> Option<&[u8]> {
+        self.rooms.get(&channel).map(|r| r.zone.as_slice())
     }
 }

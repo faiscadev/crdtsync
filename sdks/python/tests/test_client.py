@@ -115,6 +115,19 @@ def test_subscribe_branch_carries_the_named_branch():
         assert b"feature-x" not in plain
 
 
+def test_subscribe_zone_carries_the_named_zone():
+    with Client(cid(1)) as a:
+        # A named zone rides along in the Subscribe frame.
+        ch, frame = a.subscribe_zone(b"room-1", b"west")
+        assert ch == 0
+        assert b"west" in frame
+        # An empty zone is the whole room, as the plain subscribe.
+        _, default_frame = a.subscribe_zone(b"room-1", b"")
+        assert b"west" not in default_frame
+        _, plain = a.subscribe(b"room-1")
+        assert b"west" not in plain
+
+
 def test_version_requests_marshal():
     with Client(cid(1)) as a:
         ch, _ = a.subscribe(b"room-1")
