@@ -11,8 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::diff::{decode_changes, Change};
 use crate::doc::MapCursor;
-use crate::{BranchInfo, Channel, ClientId, Document, ErrorCode, Message, Op};
+use crate::{BranchInfo, Channel, ClientId, DiffKind, Document, ErrorCode, Message, Op};
 
 /// Why an inbound message could not be folded into a replica.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -21,6 +22,8 @@ pub enum ClientError {
     UnexpectedMessage(&'static str),
     /// A snapshot's state bytes did not decode into a replica.
     BadSnapshot,
+    /// A diff result's encoded change list did not decode.
+    BadDiff,
     /// A routed frame named a channel this session does not hold.
     UnknownChannel(Channel),
     /// The server reported a failure.
@@ -94,6 +97,11 @@ pub struct ClientSession {
     /// holds any subscription. Empty until a list request or a mutation is
     /// answered.
     branches: HashMap<Vec<u8>, Vec<BranchInfo>>,
+    /// The last diff result the server returned per room — the change list a
+    /// [`Message::DiffResult`] reply carried, decoded. Room-keyed like the branch
+    /// view; a fresh query replaces the room's entry. Empty until a diff query is
+    /// answered.
+    diffs: HashMap<Vec<u8>, Vec<Change>>,
 }
 
 impl ClientSession {
@@ -111,6 +119,7 @@ impl ClientSession {
             rejected: Vec::new(),
             redirects: Vec::new(),
             branches: HashMap::new(),
+            diffs: HashMap::new(),
         }
     }
 
@@ -475,6 +484,26 @@ impl ClientSession {
         self.branches.get(room).map(Vec::as_slice)
     }
 
+    /// Request the structural diff turning state `a` into state `b` in `room`,
+    /// returning the request frame. `kind` selects whether `a`/`b` name two saved
+    /// versions or two branches. The reply updates the [`diff`](Self::diff) view.
+    /// Room-keyed like branch management: a client may diff a room before it
+    /// subscribes any of its branches.
+    pub fn diff_query(&self, room: &[u8], kind: DiffKind, a: &[u8], b: &[u8]) -> Message {
+        Message::DiffQuery {
+            room: room.to_vec(),
+            kind,
+            a: a.to_vec(),
+            b: b.to_vec(),
+        }
+    }
+
+    /// The change list from the last diff query answered for `room`, or `None` if
+    /// none has been. An empty diff is an empty slice, not `None`.
+    pub fn diff(&self, room: &[u8]) -> Option<&[Change]> {
+        self.diffs.get(room).map(Vec::as_slice)
+    }
+
     /// Leave the room on `channel`, dropping its replica. Returns the Unsubscribe
     /// frame to send, or `None` if the channel isn't held.
     pub fn unsubscribe(&mut self, channel: Channel) -> Option<Message> {
@@ -671,14 +700,21 @@ impl ClientSession {
                 self.branches.insert(room, branches);
                 Ok(())
             }
-            // Branch requests only travel client-to-server.
+            Message::DiffResult { room, changes } => {
+                // A malformed change list is refused without touching the view.
+                let changes = decode_changes(&changes).map_err(|_| ClientError::BadDiff)?;
+                self.diffs.insert(room, changes);
+                Ok(())
+            }
+            // Branch and diff requests only travel client-to-server.
             Message::BranchList { .. }
             | Message::BranchFork { .. }
             | Message::BranchForkFromVersion { .. }
             | Message::BranchRestore { .. }
             | Message::BranchPublish { .. }
-            | Message::BranchDelete { .. } => Err(ClientError::UnexpectedMessage(
-                "server sent a branch request",
+            | Message::BranchDelete { .. }
+            | Message::DiffQuery { .. } => Err(ClientError::UnexpectedMessage(
+                "server sent a branch or diff request",
             )),
             // Replication frames travel node-to-node; a client never sees one.
             Message::Replicate { .. } => {

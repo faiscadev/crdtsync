@@ -1,7 +1,7 @@
 """The Python SDK drives the wire client over the C ABI: a local edit produces a
 frame a peer folds in and converges on, and the handshake surface marshals."""
 
-from crdtsync import Client, ErrorCode, Redirect, Rejected, ServerError
+from crdtsync import Client, DiffKind, Document, ErrorCode, Redirect, Rejected, ServerError
 
 
 def cid(first: int) -> bytes:
@@ -139,6 +139,40 @@ def test_branch_requests_marshal():
         assert len(a.delete_branch(room, b"feature")) > 0
         # Nothing reported until a server reply is folded in.
         assert a.branches(room) == []
+
+
+def test_diff_query_round_trips():
+    import struct
+
+    from crdtsync import _diff_raw
+
+    def put_bytes(b: bytes) -> bytes:
+        return struct.pack("<I", len(b)) + b
+
+    with Client(cid(1)) as a:
+        room = b"room-1"
+        # Both kinds frame a request; room-keyed, no subscription needed.
+        assert len(a.diff_query(room, DiffKind.VERSIONS, b"a", b"b")) > 0
+        assert len(a.diff_query(room, DiffKind.BRANCHES, b"main", b"draft")) > 0
+        # No result until one is answered.
+        assert a.diff(room) is None
+
+        # Build the change payload the server would return.
+        with Document(cid(2)) as d:
+            d.register_int([b"age"], 30)
+            old = d.encode_state()
+            d.register_int([b"age"], 40)
+            changes = _diff_raw(old, d.encode_state())
+
+        # A DiffResult reply: tag 41, u32-prefixed room, u32-prefixed change list.
+        frame = struct.pack("<B", 41) + put_bytes(room) + put_bytes(changes)
+        assert a.receive(frame) == 1
+
+        result = a.diff(room)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["op"] == "value"
+        assert result[0]["new"] == {"t": "int", "v": 40}
 
 
 def test_receive_rejects_garbage():

@@ -392,6 +392,9 @@ const (
 	// bridge the room's across a breaking gap, so the app prompts an update or
 	// falls back read-only.
 	UpdateRequired ErrorCode = 6
+	// NotFound is a diff query over a version or branch the room does not have —
+	// recoverable, the connection stays open.
+	NotFound ErrorCode = 7
 )
 
 // Rejected is an op batch the server refused, surfaced by TakeRejected for the
@@ -1019,6 +1022,40 @@ func (c *Client) Branches(room []byte) []Branch {
 		}
 	}
 	return branches
+}
+
+// DiffKind selects which pair of a room's states a client DiffQuery compares.
+type DiffKind uint32
+
+const (
+	// DiffVersions diffs two of a room's saved versions.
+	DiffVersions DiffKind = 0
+	// DiffBranches diffs two of a room's branches' HEADs.
+	DiffBranches DiffKind = 1
+)
+
+// DiffQuery frames a request for the structural diff turning state a into state b
+// in room. kind selects whether a/b name two saved versions or two branches.
+// Room-keyed: a client may diff a room before it subscribes any of its branches.
+// The reply updates the diff view, read with DiffResult.
+func (c *Client) DiffQuery(room []byte, kind DiffKind, a, b []byte) []byte {
+	rp, rl := bytesArg(room)
+	ap, al := bytesArg(a)
+	bp, bl := bytesArg(b)
+	return takeBuf(C.crdtsync_client_diff_query(c.h, rp, rl, C.uint32_t(kind), ap, al, bp, bl))
+}
+
+// DiffResult returns the change list from the last diff query answered for room,
+// decoded through the shared change reader. The bool is false until a result is
+// answered; an empty diff is a non-nil empty slice with the bool true.
+func (c *Client) DiffResult(room []byte) ([]Change, bool, error) {
+	rp, rl := bytesArg(room)
+	var out C.CrdtBuf
+	if C.crdtsync_client_diff_result(c.h, rp, rl, &out) != 1 {
+		return nil, false, nil
+	}
+	changes, err := decodeChanges(takeBuf(out))
+	return changes, true, err
 }
 
 // --- schema-aware diff ---

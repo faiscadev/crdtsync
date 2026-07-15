@@ -23,9 +23,9 @@ use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, encode_message, encode_op, encode_ops, path, AclEffect, AclGrant, AclSubject,
-    BlobRef, Capability, Channel, ClientError, ClientId, ClientSession, Document, ElementId,
-    ErrorCode, Host, MarkState, Message, Redirect, Rejected, RelativePosition, ResolvedMark,
-    Scalar, UndoManager,
+    BlobRef, Capability, Channel, ClientError, ClientId, ClientSession, DiffKind, Document,
+    ElementId, ErrorCode, Host, MarkState, Message, Redirect, Rejected, RelativePosition,
+    ResolvedMark, Scalar, UndoManager,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
@@ -2024,7 +2024,8 @@ pub unsafe extern "C" fn crdtsync_client_subscribe_branch(
 /// The stable integer a server [`ErrorCode`] crosses the boundary as, mirroring
 /// the wire tags so every SDK decodes it identically: `0` ProtocolViolation, `1`
 /// UnsupportedVersion, `2` AuthFailed, `3` UnknownRoom, `4` Internal, `5`
-/// Forbidden, `6` UpdateRequired — the `onUpdateRequired` signal.
+/// Forbidden, `6` UpdateRequired — the `onUpdateRequired` signal — `7` NotFound,
+/// a diff query over an absent version or branch.
 fn error_code_discriminant(code: ErrorCode) -> i32 {
     match code {
         ErrorCode::ProtocolViolation => 0,
@@ -2034,6 +2035,7 @@ fn error_code_discriminant(code: ErrorCode) -> i32 {
         ErrorCode::Internal => 4,
         ErrorCode::Forbidden => 5,
         ErrorCode::UpdateRequired => 6,
+        ErrorCode::NotFound => 7,
     }
 }
 
@@ -3510,6 +3512,79 @@ pub unsafe extern "C" fn crdtsync_client_branch_at(
                 *out_fork_point = b.fork_point;
                 *out_head = b.head;
                 *out_published = i32::from(b.published);
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+// --- client diff query ---
+
+/// Frame a diff query over `room`: the structural diff turning state `a` into
+/// state `b`, where `kind` selects the state space — 0 diffs two saved versions,
+/// 1 diffs two branches' HEADs. Returns the frame to send; empty on a bad handle,
+/// a bad `kind`, or a bad input. Room-keyed: a client may diff a room before it
+/// subscribes any of its branches. The reply updates the diff view.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len`, `a`/`a_len`, and `b`/`b_len`
+/// follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_diff_query(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    kind: u32,
+    a: *const u8,
+    a_len: usize,
+    b: *const u8,
+    b_len: usize,
+) -> CrdtBuf {
+    request_frame(client, |s| {
+        let kind = match kind {
+            0 => DiffKind::Versions,
+            1 => DiffKind::Branches,
+            _ => return None,
+        };
+        match (
+            as_slice(room, room_len),
+            as_slice(a, a_len),
+            as_slice(b, b_len),
+        ) {
+            (Some(r), Some(a), Some(b)) => Some(s.diff_query(r, kind, a, b)),
+            _ => None,
+        }
+    })
+}
+
+/// The change list from the last diff query answered for `room`, written to `out`
+/// as the encoded [`crdtsync_diff`] buffer a binding hands to
+/// [`crdtsync_diff_decode`]. Returns 1 if a result is held (an empty diff is an
+/// empty-but-present change list), 0 if none has been answered, -1 on a bad handle
+/// or a null `out`.
+///
+/// # Safety
+/// `client` is a live handle; `room`/`room_len` follow [`as_slice`]; `out` points
+/// to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_diff_result(
+    client: *const CrdtClient,
+    room: *const u8,
+    room_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        let Some(r) = as_slice(room, room_len) else {
+            return -1;
+        };
+        match (*client).session.diff(r) {
+            Some(changes) => {
+                *out = CrdtBuf::from_vec(encode_changes(changes));
                 1
             }
             None => 0,

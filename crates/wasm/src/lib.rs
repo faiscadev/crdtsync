@@ -16,8 +16,8 @@ use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_op, encode_ops, path, AclEffect, AclGrant,
     AclSubject, BlobRef, BranchInfo, Capability, Channel, ClientError, ClientId, ClientSession,
-    Document, ErrorCode as CoreErrorCode, Host, Redirect, Rejected, RelativePosition, Scalar,
-    UndoManager,
+    DiffKind, Document, ErrorCode as CoreErrorCode, Host, Redirect, Rejected, RelativePosition,
+    Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
 
@@ -64,6 +64,7 @@ pub enum ErrorCode {
     Internal = 4,
     Forbidden = 5,
     UpdateRequired = 6,
+    NotFound = 7,
 }
 
 impl From<CoreErrorCode> for ErrorCode {
@@ -76,6 +77,7 @@ impl From<CoreErrorCode> for ErrorCode {
             CoreErrorCode::Internal => ErrorCode::Internal,
             CoreErrorCode::Forbidden => ErrorCode::Forbidden,
             CoreErrorCode::UpdateRequired => ErrorCode::UpdateRequired,
+            CoreErrorCode::NotFound => ErrorCode::NotFound,
         }
     }
 }
@@ -1300,6 +1302,41 @@ impl WasmClient {
             .map(branch_to_js)
             .collect::<js_sys::Array>()
             .into()
+    }
+
+    /// Frame a diff query over `room`: the structural diff turning state `a` into
+    /// state `b`. `kind` selects the state space — 0 diffs two saved versions, 1
+    /// diffs two branches' HEADs; any other value is an error. Room-keyed: a
+    /// client may diff a room before it subscribes any of its branches. The reply
+    /// updates the diff view.
+    #[wasm_bindgen(js_name = diffQuery)]
+    pub fn diff_query(
+        &self,
+        room: &[u8],
+        kind: u32,
+        a: &[u8],
+        b: &[u8],
+    ) -> Result<Vec<u8>, JsError> {
+        let kind = match kind {
+            0 => DiffKind::Versions,
+            1 => DiffKind::Branches,
+            _ => return Err(JsError::new("diff kind must be 0 (versions) or 1 (branches)")),
+        };
+        Ok(encode_message(&self.inner.diff_query(room, kind, a, b)))
+    }
+
+    /// The change list from the last diff query answered for `room`, as an array
+    /// of change objects — the same shape [`WasmDocument::diff`] yields — or `null`
+    /// if none has been answered. An empty diff is an empty array.
+    pub fn diff(&self, room: &[u8]) -> JsValue {
+        match self.inner.diff(room) {
+            Some(changes) => changes
+                .iter()
+                .map(change_to_js)
+                .collect::<js_sys::Array>()
+                .into(),
+            None => JsValue::NULL,
+        }
     }
 }
 

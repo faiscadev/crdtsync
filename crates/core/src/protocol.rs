@@ -84,6 +84,20 @@ pub enum ErrorCode {
     /// subscribe as the `onUpdateRequired` signal, before the client joins; the
     /// app prompts an update or falls back to read-only.
     UpdateRequired,
+    /// A named resource the request addressed does not exist — a diff query over
+    /// an absent version or branch. Recoverable: the connection stays open.
+    NotFound,
+}
+
+/// Which pair of named states a [`Message::DiffQuery`] compares: two saved
+/// versions of a room, or two of its branches' current HEADs. The server routes
+/// the query to the matching diff seam.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffKind {
+    /// Diff two named versions' captured snapshots.
+    Versions,
+    /// Diff two branches' materialized HEAD states.
+    Branches,
 }
 
 /// One branch of a room as a client observes it over the wire: its `name`, the
@@ -321,6 +335,25 @@ pub enum Message {
     /// Deletes branch `name` of `room`. The default `main` is never deletable.
     /// Replies with the fresh branch list.
     BranchDelete { room: Vec<u8>, name: Vec<u8> },
+    /// Requests the structural diff turning state `a` into state `b` in `room` —
+    /// `kind` selects whether `a`/`b` name two saved versions or two branches.
+    /// The app-facing query a client runs to review what changed between two
+    /// points of a room, room-keyed like branch management so it is runnable
+    /// before any subscription. The reply is a
+    /// [`DiffResult`](Message::DiffResult) carrying the encoded change list, or an
+    /// [`Error`](Message::Error) with [`ErrorCode::NotFound`] when a named version
+    /// or branch is absent.
+    DiffQuery {
+        room: Vec<u8>,
+        kind: DiffKind,
+        a: Vec<u8>,
+        b: Vec<u8>,
+    },
+    /// The structural diff `a`→`b` a [`DiffQuery`](Message::DiffQuery) asked for:
+    /// `changes` is the encoded [`Change`](crate::diff::Change) list — the
+    /// `encode_changes` codec the diff SDK bindings already decode. An empty diff
+    /// is an empty change list, not an error.
+    DiffResult { room: Vec<u8>, changes: Vec<u8> },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -625,6 +658,18 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, room);
             put_bytes(&mut out, name);
         }
+        Message::DiffQuery { room, kind, a, b } => {
+            put_u8(&mut out, 40);
+            put_bytes(&mut out, room);
+            put_u8(&mut out, diff_kind_tag(*kind));
+            put_bytes(&mut out, a);
+            put_bytes(&mut out, b);
+        }
+        Message::DiffResult { room, changes } => {
+            put_u8(&mut out, 41);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, changes);
+        }
     }
     out
 }
@@ -909,6 +954,18 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let name = cur.bytes()?;
             Message::BranchDelete { room, name }
         }
+        40 => {
+            let room = cur.bytes()?;
+            let kind = diff_kind(cur.u8()?)?;
+            let a = cur.bytes()?;
+            let b = cur.bytes()?;
+            Message::DiffQuery { room, kind, a, b }
+        }
+        41 => {
+            let room = cur.bytes()?;
+            let changes = cur.bytes()?;
+            Message::DiffResult { room, changes }
+        }
         tag => {
             return Err(ProtocolError::BadTag {
                 what: "message",
@@ -951,6 +1008,7 @@ fn error_code_tag(code: ErrorCode) -> u16 {
         ErrorCode::Internal => 4,
         ErrorCode::Forbidden => 5,
         ErrorCode::UpdateRequired => 6,
+        ErrorCode::NotFound => 7,
     }
 }
 
@@ -963,9 +1021,28 @@ fn error_code(tag: u16) -> Result<ErrorCode, ProtocolError> {
         4 => Ok(ErrorCode::Internal),
         5 => Ok(ErrorCode::Forbidden),
         6 => Ok(ErrorCode::UpdateRequired),
+        7 => Ok(ErrorCode::NotFound),
         tag => Err(ProtocolError::BadTag {
             what: "error code",
             tag: tag as u8,
+        }),
+    }
+}
+
+fn diff_kind_tag(kind: DiffKind) -> u8 {
+    match kind {
+        DiffKind::Versions => 0,
+        DiffKind::Branches => 1,
+    }
+}
+
+fn diff_kind(tag: u8) -> Result<DiffKind, ProtocolError> {
+    match tag {
+        0 => Ok(DiffKind::Versions),
+        1 => Ok(DiffKind::Branches),
+        tag => Err(ProtocolError::BadTag {
+            what: "diff kind",
+            tag,
         }),
     }
 }
