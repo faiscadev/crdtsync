@@ -10,7 +10,9 @@
 //! leaf-level deny drops just that slot; a root the reader cannot read whole loses its
 //! own leaf slots and its ACL grants.
 
-use crdtsync_core::{zone, Document, Element, Scalar, Schema};
+use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
+use crdtsync_core::path::{encode_path, parse_path};
+use crdtsync_core::{zone, AclEffect, Document, Element, Op, Scalar, Schema};
 
 mod common;
 use common::cid;
@@ -64,6 +66,111 @@ fn counter(d: &Document, key: &[u8]) -> Option<i64> {
         None => None,
         _ => panic!("expected a counter or nothing"),
     }
+}
+
+/// Grant read on `path` to a fixed subject, authored by a fixed grantor — returns the
+/// emitted ops so an op-served replica can selectively apply them.
+fn grant_read(d: &mut Document, path: &[u8]) -> Vec<Op> {
+    d.transact(|tx| {
+        tx.acl().grant(
+            AclSubject::Actor(cid(9)),
+            AclGrant::Capability(Capability::Read),
+            AclEffect::Allow,
+            path.to_vec(),
+            cid(1),
+        );
+    })
+}
+
+/// The governing paths of a document's live ACL tuples, sorted.
+fn acl_paths(d: &Document) -> Vec<Vec<u8>> {
+    let mut p: Vec<Vec<u8>> = d.acl_tuples().into_iter().map(|t| t.path).collect();
+    p.sort();
+    p
+}
+
+#[test]
+fn acl_tuples_are_kept_on_readable_paths_and_dropped_on_unreadable_ones() {
+    let mut d = doc();
+    grant_read(&mut d, &encode_path(&[b"a"]));
+    grant_read(&mut d, &encode_path(&[b"b"]));
+    // Reads /a (and root), not /b.
+    d.project_read_paths(reads_top(true, &[b"a"]));
+    assert_eq!(
+        acl_paths(&d),
+        vec![encode_path(&[b"a"])],
+        "the /a tuple is kept, the /b tuple dropped — ACL state redacted by governing path",
+    );
+}
+
+#[test]
+fn a_whole_document_reader_keeps_every_acl_tuple() {
+    let mut d = doc();
+    grant_read(&mut d, &encode_path(&[b"a"]));
+    grant_read(&mut d, &encode_path(&[b"b"]));
+    grant_read(&mut d, &encode_path(&[]));
+    let before = acl_paths(&d);
+    d.project_read_paths(|_| true);
+    assert_eq!(
+        acl_paths(&d),
+        before,
+        "an identity projection keeps every ACL tuple",
+    );
+}
+
+#[test]
+fn a_subtree_readers_acl_tuple_survives_even_when_the_root_is_unreadable() {
+    // The refinement over the old root-gated rule: a reader denied the root still keeps
+    // the ACL tuples on subtrees it may read — and NONE on subtrees (or the root) it
+    // cannot. No subject/effect/path of an unreadable tuple leaks.
+    let mut d = doc();
+    grant_read(&mut d, &encode_path(&[b"a"])); // on readable /a
+    grant_read(&mut d, &encode_path(&[b"b"])); // on unreadable /b
+    grant_read(&mut d, &encode_path(&[])); // on the unreadable root
+    d.project_read_paths(reads_top(false, &[b"a"]));
+    assert_eq!(
+        acl_paths(&d),
+        vec![encode_path(&[b"a"])],
+        "only the /a tuple survives; the /b and root tuples are dropped",
+    );
+}
+
+#[test]
+fn op_join_and_snapshot_join_materialize_the_same_acl_subset() {
+    // Convergence: an op-served reader applies only the AclGrant ops on its readable
+    // paths; a snapshot-served reader is projected. Same path authority ⇒ same ACL set.
+    let reads = reads_top(false, &[b"a"]);
+    let grant_paths = [encode_path(&[b"a"]), encode_path(&[b"b"]), encode_path(&[])];
+
+    // snapshot-join: full document, then projected.
+    let mut snap = doc();
+    for p in &grant_paths {
+        grant_read(&mut snap, p);
+    }
+    snap.project_read_paths(&reads);
+
+    // op-join: apply an authoring replica's grant ops only where the path reads.
+    let mut authoring = doc();
+    let mut ops_replica = doc();
+    for p in &grant_paths {
+        let ops = grant_read(&mut authoring, p);
+        if reads(&parse_path(p).unwrap()) {
+            for op in ops {
+                ops_replica.apply(&op);
+            }
+        }
+    }
+
+    assert_eq!(
+        acl_paths(&snap),
+        acl_paths(&ops_replica),
+        "the snapshot-served and op-served readers materialize the same ACL subset",
+    );
+    assert_eq!(
+        acl_paths(&snap),
+        vec![encode_path(&[b"a"])],
+        "both hold exactly the /a tuple",
+    );
 }
 
 #[test]

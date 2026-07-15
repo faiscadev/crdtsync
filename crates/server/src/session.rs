@@ -477,7 +477,7 @@ pub fn step(
                         delta
                             .into_iter()
                             .filter(|rec| {
-                                let p = op_read_path(&index, &rec.op);
+                                let p = op_read_path(&index, &records, &rec.op);
                                 recipient_reads_path(
                                     authorizer,
                                     &records,

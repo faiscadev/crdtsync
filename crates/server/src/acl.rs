@@ -684,9 +684,23 @@ pub fn reads_whole_document(
 /// so only a whole-document reader carries it. Root is the strictest read authority
 /// (it governs no narrower than `/`), so an unresolved op never leaks to a
 /// subtree-scoped reader, yet a whole-document reader (the creator, a root grantee)
-/// still receives it and stays convergent. A doc-level op (an ACL grant/revoke, a
-/// RangedElement annotation) has no map path and likewise resolves to the root.
-pub fn op_read_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, op: &Op) -> Vec<u8> {
+/// still receives it and stays convergent.
+///
+/// An ACL op is redacted by the document path it governs, not by root: ACL state is
+/// itself privacy-sensitive — a tuple reveals a subject, an effect, and the existence
+/// of a governed path — so a recipient receives an [`AclGrant`](OpKind::AclGrant) only
+/// where it may read that grant's path, and an [`AclRevoke`](OpKind::AclRevoke) only
+/// where it may read the tombstoned tuple's path (resolved through `records`, the full
+/// tuple set the server holds) — so a recipient sees the revoke exactly where it saw,
+/// or would have seen, the grant. A revoke naming an id no held tuple carries falls back
+/// to the root (a moot revoke reaching only a whole-document reader). A RangedElement
+/// annotation stays root-governed — path-scoped ranged/marks redaction is a separate
+/// privacy axis, out of scope here.
+pub fn op_read_path(
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
+    records: &[AclRecord],
+    op: &Op,
+) -> Vec<u8> {
     let root = || encode_path(&[]);
     let encode =
         |segs: &[Vec<u8>]| encode_path(&segs.iter().map(|s| s.as_slice()).collect::<Vec<_>>());
@@ -716,12 +730,21 @@ pub fn op_read_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, op: &Op) -> Vec<u8
         | OpKind::TextDelete { .. }
         | OpKind::XmlInsertChild { .. }
         | OpKind::XmlMove { .. } => index.get(&op.target).map_or_else(root, |segs| encode(segs)),
-        // Doc-level state carries no map path — governed by whole-document read.
+        // A RangedElement annotation carries no map path — governed by whole-document
+        // read (root). Path-scoped ranged/marks redaction is out of scope here.
         OpKind::RangedCreate { .. }
         | OpKind::RangedSetPayload { .. }
-        | OpKind::RangedDelete { .. }
-        | OpKind::AclGrant { .. }
-        | OpKind::AclRevoke { .. } => root(),
+        | OpKind::RangedDelete { .. } => root(),
+        // An ACL grant is gated by the path it governs — `AclTuple.path` is already
+        // in the same encoded-path format this returns.
+        OpKind::AclGrant { path, .. } => path.clone(),
+        // A revoke names only the tombstoned tuple's id; gate it by that tuple's
+        // governing path so a recipient sees the revoke exactly where it saw the
+        // grant. An id resolving to no held tuple is a moot revoke → root.
+        OpKind::AclRevoke { id } => records
+            .iter()
+            .find(|r| r.tuple.id == *id)
+            .map_or_else(root, |r| r.tuple.path.clone()),
     }
 }
 
