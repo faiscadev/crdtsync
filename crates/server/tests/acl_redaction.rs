@@ -1388,6 +1388,234 @@ fn has_frag(d: &Document, key: &[u8]) -> bool {
     matches!(d.get(key), Some(crdtsync_core::Element::XmlFragment(_)))
 }
 
+/// alice grants `subject` an element-scoped `Allow(Read)` on `id`, authored by alice
+/// (the creator). The grant follows the element across a move.
+fn grant_read_element(doc: &mut Document, subject: AclSubject, id: ElementId) -> Vec<Op> {
+    doc.transact(|tx| {
+        tx.acl().grant_element(
+            subject,
+            AclGrant::Capability(Capability::Read),
+            AclEffect::Allow,
+            id,
+            actor_key(b"alice"),
+        );
+    })
+}
+
+/// A parenthesised rendering of one movable XML node — its tag and, recursively, its
+/// live children — so two replicas can be compared on their materialised tree.
+fn render_node(e: &crdtsync_core::Element) -> String {
+    match e {
+        crdtsync_core::Element::XmlElement(x) => {
+            let x = x.borrow();
+            let tag = String::from_utf8_lossy(x.tag()).into_owned();
+            let kids: Vec<String> = x
+                .children()
+                .borrow()
+                .values()
+                .iter()
+                .map(render_node)
+                .collect();
+            format!("{tag}({})", kids.join(","))
+        }
+        crdtsync_core::Element::Text(_) => "text".to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// A canonical rendering of the two board columns — `absent` when a column is not
+/// materialised, else its fragment and live children — the materialised-tree summary
+/// an op-served and a snapshot-served reader must agree on.
+fn board_render(d: &Document) -> String {
+    let col_render = |key: &[u8]| match d.get(key) {
+        Some(crdtsync_core::Element::XmlFragment(f)) => {
+            let kids: Vec<String> = f
+                .borrow()
+                .children()
+                .borrow()
+                .values()
+                .iter()
+                .map(render_node)
+                .collect();
+            format!("frag({})", kids.join(","))
+        }
+        None => "absent".to_string(),
+        _ => "?".to_string(),
+    };
+    format!("colA={} colB={}", col_render(COL_A), col_render(COL_B))
+}
+
+/// A snapshot round-trips through the state codec with no dangling reference — a
+/// re-encode of a decode is byte-identical, so no purged node is left referenced by a
+/// retained list slot.
+fn assert_reencodes(d: &Document, label: &str) {
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).expect("a projected snapshot decodes");
+    assert_eq!(
+        back.encode_state(),
+        bytes,
+        "{label}: re-encode is not canonical — a dangling reference survived the projection",
+    );
+}
+
+/// alice builds two columns (card born in colA) then moves the card colA -> colB.
+/// Authored as separate transactions so a partial-transaction confound never masks the
+/// redaction under test (a single cross-column transaction would strand its readable
+/// members). Returns the card id.
+fn build_and_move(r: &mut Registry, alice: ConnId, alice_doc: &mut Document) -> ElementId {
+    submit(r, alice, xml_fragment(alice_doc, &col(COL_B)));
+    submit(r, alice, xml_fragment(alice_doc, &col(COL_A)));
+    submit(
+        r,
+        alice,
+        xml_insert_element(alice_doc, &col(COL_A), 0, b"card"),
+    );
+    let card = xml_child_id(alice_doc, COL_A, 0);
+    submit(r, alice, move_card(alice_doc));
+    card
+}
+
+/// The stable element id of the live child at `index` under the fragment at map-slot
+/// key `key`.
+fn xml_child_id(doc: &Document, key: &[u8], index: usize) -> ElementId {
+    match doc.get(key) {
+        Some(crdtsync_core::Element::XmlFragment(f)) => {
+            f.borrow().children().borrow().values()[index].id()
+        }
+        _ => panic!("expected a fragment at the map slot"),
+    }
+}
+
+/// The stable element id of the fragment at map-slot key `key`.
+fn frag_id(doc: &Document, key: &[u8]) -> ElementId {
+    match doc.get(key) {
+        Some(crdtsync_core::Element::XmlFragment(f)) => f.borrow().id(),
+        _ => panic!("expected a fragment at the map slot"),
+    }
+}
+
+#[test]
+fn a_node_moved_into_a_denied_subtree_converges_op_join_with_snapshot_join() {
+    // The move-into-denied convergence bug (path scope). bob reads colA only. The card
+    // is born in colA (readable — bob receives its create) then moved to colB (denied —
+    // the XmlMove's read path is the denied destination, so bob never learns the card
+    // left). An op-served bob therefore keeps the card in colA; a snapshot-served bob
+    // must materialise the identical tree, with no dangling reference on re-encode.
+    let seed = |r: &mut Registry| {
+        let alice = auth(r, 1, "t-alice");
+        assert!(subscribe(r, alice));
+        r.take_outbox(alice);
+        let mut alice_doc = Document::new(cid(1));
+        submit(
+            r,
+            alice,
+            grant_read(
+                &mut alice_doc,
+                AclSubject::Actor(actor_key(b"bob")),
+                &col(COL_A),
+            ),
+        );
+        build_and_move(r, alice, &mut alice_doc);
+        r.take_outbox(alice);
+    };
+
+    let ops_replica = {
+        let mut r = registry();
+        seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        let mut replica = Document::new(cid(2));
+        for op in received_ops(&mut r, bob) {
+            replica.apply(&op);
+        }
+        replica
+    };
+    let snap_replica = {
+        let mut r = registry();
+        r.set_compaction_threshold(1);
+        seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        served_snapshot(&mut r, bob).expect("a partial reader is served a projected snapshot")
+    };
+
+    assert_eq!(
+        board_render(&ops_replica),
+        "colA=frag(card()) colB=absent",
+        "op-join bob keeps the card in colA — he got its create, never its move-away",
+    );
+    assert_eq!(
+        board_render(&snap_replica),
+        board_render(&ops_replica),
+        "snapshot-join bob must converge with op-join bob on the materialised tree",
+    );
+    assert_reencodes(&snap_replica, "snapshot-join");
+}
+
+#[test]
+fn an_element_grant_on_the_origin_column_converges_op_join_with_snapshot_join() {
+    // The move-into-denied convergence bug (element scope). bob's read is an
+    // element-scoped Allow(Read) on the colA fragment — the card's ORIGIN — which the
+    // server resolves through its element index to path colA. So bob reads colA and not
+    // colB, exactly as a path-scope reader would, but via an element grant that must
+    // resolve identically on the op fan-out and the snapshot projection. The card is born
+    // in colA (readable) then moved to colB (denied): an op-served bob keeps it at colA
+    // (he got its create, never its move-away), and a snapshot-served bob must converge.
+    let seed = |r: &mut Registry| {
+        let alice = auth(r, 1, "t-alice");
+        assert!(subscribe(r, alice));
+        r.take_outbox(alice);
+        let mut alice_doc = Document::new(cid(1));
+        submit(r, alice, xml_fragment(&mut alice_doc, &col(COL_B)));
+        submit(r, alice, xml_fragment(&mut alice_doc, &col(COL_A)));
+        let cola = frag_id(&alice_doc, COL_A);
+        submit(
+            r,
+            alice,
+            grant_read_element(&mut alice_doc, AclSubject::Actor(actor_key(b"bob")), cola),
+        );
+        submit(
+            r,
+            alice,
+            xml_insert_element(&mut alice_doc, &col(COL_A), 0, b"card"),
+        );
+        submit(r, alice, move_card(&mut alice_doc));
+        r.take_outbox(alice);
+    };
+
+    let ops_replica = {
+        let mut r = registry();
+        seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        let mut replica = Document::new(cid(2));
+        for op in received_ops(&mut r, bob) {
+            replica.apply(&op);
+        }
+        replica
+    };
+    let snap_replica = {
+        let mut r = registry();
+        r.set_compaction_threshold(1);
+        seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        served_snapshot(&mut r, bob).expect("a partial reader is served a projected snapshot")
+    };
+
+    assert_eq!(
+        board_render(&ops_replica),
+        "colA=frag(card()) colB=absent",
+        "op-join bob keeps the card in colA — the element grant on colA admits its create",
+    );
+    assert_eq!(
+        board_render(&snap_replica),
+        board_render(&ops_replica),
+        "snapshot-join bob must converge with op-join bob on the materialised tree",
+    );
+    assert_reencodes(&snap_replica, "snapshot-join");
+}
+
 #[test]
 fn an_element_grant_reader_converges_op_join_with_snapshot_join() {
     // bob reads colA + colB minus an element Deny(Read) on the card (in colA). Both an

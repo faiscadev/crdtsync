@@ -1197,6 +1197,36 @@ impl Document {
                 purge.insert(*id);
             }
         }
+        // A movable XML node created in a readable subtree but moved into a denied one is
+        // kept at its readable origin, not dropped by its current position. Op catch-up
+        // delivers the node's create at its birth list's path but withholds the move (an
+        // XmlMove's read path is its denied destination), so the reader holds the node
+        // where it last saw it and never learns it left. Dropping it by its current
+        // (denied) position instead would diverge from the op stream and leave the node's
+        // birth slot dangling in the retained origin list. Un-purge such a node and the
+        // attrs map + children list a decoded XmlElement needs; the denied content it
+        // carried into the destination (its attrs and descendants) is still cut by the
+        // position rules below, so it survives only as the emptied shell the op stream
+        // leaves. A node born in a *denied* subtree keeps the position verdict: the reader
+        // never received its create, and where a fresh joiner would hold it is a separate
+        // redaction seam left to op-stream delivery (see DECISIONS 2026-07-15).
+        let list_denied = |list: &ElementId| paths.get(list).is_none_or(|p| denied(p));
+        for (node, places) in &self.placements {
+            let Some(kind) = self.node_kind(*node) else {
+                continue;
+            };
+            let Some(birth) = birth_placement(*node, places, kind) else {
+                continue;
+            };
+            // Birth readable, current position denied — a move into a denied subtree.
+            if !list_denied(&birth.list) && purge.contains(node) {
+                purge.remove(node);
+                if kind == ElementKind::XmlElement {
+                    purge.remove(&XmlElement::attrs_id(*node));
+                    purge.remove(&XmlElement::children_id(*node));
+                }
+            }
+        }
         // Cut, from each retained map, its purged-container child slots and its
         // unreadable leaf slots — a leaf's read path is the map's path plus the slot key,
         // the same path the per-op redaction gates a keyed leaf op on, so a leaf-level
@@ -1249,6 +1279,16 @@ impl Document {
         self.xml_fragments.retain(|id, _| !purge.contains(id));
         self.parents
             .retain(|child, parent| !purge.contains(child) && !purge.contains(parent));
+        // A retained list at a denied path is the children list of a node kept at its
+        // readable origin: every node it holds sat at that node's denied current position
+        // and was dropped above, and a fresh op joiner never received any of them (their
+        // create's read path is that denied position). Clear it so it names no dropped
+        // node and matches the empty list the op joiner folds.
+        for (id, list) in &self.lists {
+            if paths.get(id).is_some_and(|p| denied(p)) {
+                list.borrow_mut().clear();
+            }
+        }
         // An ACL tuple is redacted by the path it governs, not by root read: ACL state is
         // itself privacy-sensitive — a tuple reveals a subject, an effect, and the existence
         // of a governed path — so a reader keeps it only where it may read that path. This
@@ -1289,11 +1329,15 @@ impl Document {
             !purge.contains(id) && anchor_reads(e.start.seq) && anchor_reads(e.end.seq)
         });
         let ranged_cut = self.ranged.len() != ranged_before;
+        // Drop every placement and move whose list/destination is purged or at a denied
+        // path — the reader never received the op that put a node there (a create or move
+        // into a denied position is withheld), so a kept node keeps only the placements it
+        // could see and re-folds to the last one it did, matching the op joiner.
         self.placements.retain(|node, places| {
             if purge.contains(node) {
                 return false;
             }
-            places.retain(|p| !purge.contains(&p.list));
+            places.retain(|p| !purge.contains(&p.list) && !list_denied(&p.list));
             !places.is_empty()
         });
         self.placement_index = self
@@ -1301,16 +1345,58 @@ impl Document {
             .values()
             .flat_map(|places| places.iter().map(|p| (p.list, p.stamp)))
             .collect();
-        self.moves
-            .retain(|child, parent| !purge.contains(&child) && !purge.contains(&parent));
+        self.moves.retain(|child, parent| {
+            !purge.contains(&child)
+                && !purge.contains(&parent)
+                && !list_denied(&XmlElement::children_id(parent))
+        });
         // Once anything is dropped, scrub the causal frontier and buffer of the hidden
-        // state so neither leaks an op count; a pure identity projection (a whole-
-        // document reader) leaves them, staying byte-identical on re-encode.
+        // state so neither leaks an op count, and rebuild the tree-move fold so the
+        // derived parents and `moved_away` overlay match the filtered log a reload
+        // replays — a node kept at its readable origin renders there, not at the denied
+        // destination it was folded to, so the projected snapshot is byte-stable through
+        // a round-trip. A pure identity projection (a whole-document reader) leaves both
+        // untouched, staying byte-identical on re-encode.
         if !purge.is_empty() || cut_leaf || acl_cut || ranged_cut || !root_reads {
+            self.refold_projected_moves();
             self.seen.clear();
             self.buffer.clear();
             self.buffered.clear();
         }
+    }
+
+    /// Rebuild the tree-move fold on a projected copy so its derived parent relation and
+    /// `moved_away` overlay match the filtered move log a reload replays — the same
+    /// reconstruction [`restore_moves`](Self::restore_moves) runs on decode, minus the
+    /// birth scan (every surviving placement is already recorded) and the cycle re-check
+    /// (the pre-projection tree was acyclic and filtering only removes edges). A node
+    /// whose move into a denied subtree was filtered out re-folds back under its readable
+    /// origin here, so the live copy renders it where a decoded joiner will. Sound only
+    /// as the final transform before [`encode_state`](Self::encode_state).
+    fn refold_projected_moves(&mut self) {
+        // A document with no placements is a document with no tree moves, so its fold is
+        // already trivial — skip the rebuild rather than pay it on every non-XML snapshot.
+        if self.placements.is_empty() {
+            return;
+        }
+        let log: Vec<(Stamp, ElementId, ElementId)> = self.moves.log().collect();
+        let bases: Vec<(ElementId, ElementId)> = self
+            .placements
+            .iter()
+            .filter_map(|(node, places)| {
+                let kind = self.node_kind(*node)?;
+                let birth = birth_placement(*node, places, kind)?;
+                Some((*node, *self.parents.get(&birth.list)?))
+            })
+            .collect();
+        self.moves = TreeMoves::new();
+        for (node, owner) in bases {
+            self.moves.set_base(node, owner);
+        }
+        for (stamp, node, parent) in log {
+            self.moves.apply(stamp, node, parent);
+        }
+        self.refold_moves();
     }
 
     /// Rebuild a replica from a snapshot, rejecting trailing bytes.
@@ -1741,9 +1827,7 @@ impl Document {
             .iter()
             .filter_map(|(node, places)| {
                 let kind = self.node_kind(*node)?;
-                let birth = places
-                    .iter()
-                    .find(|p| xml_child_id(p.list, p.stamp, kind) == *node)?;
+                let birth = birth_placement(*node, places, kind)?;
                 let owner = self.parents.get(&birth.list)?;
                 Some((*node, *owner))
             })
@@ -3076,6 +3160,15 @@ fn stamp_key(stamp: Stamp) -> [u8; 24] {
 /// agree. `kind` is `XmlElement` for an element child, `Text` for a text run.
 fn xml_child_id(list_id: ElementId, stamp: Stamp, kind: ElementKind) -> ElementId {
     ElementId::derive(list_id, &stamp_key(stamp), kind)
+}
+
+/// The placement a movable node was born at — the one whose `(list, stamp)` re-derives
+/// the node's own id. A move keeps the node's birth id, so a move placement never does,
+/// which tells the birth placement (the created-under list) from the move placements.
+fn birth_placement(node: ElementId, places: &[Placement], kind: ElementKind) -> Option<&Placement> {
+    places
+        .iter()
+        .find(|p| xml_child_id(p.list, p.stamp, kind) == node)
 }
 
 /// The id of the RangedElement a create at `stamp` mints. Derived under a fixed

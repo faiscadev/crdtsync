@@ -11,7 +11,9 @@
 //! own leaf slots and its ACL grants.
 
 use crdtsync_core::acl::{AclGrant, AclScope, AclSubject, Capability};
-use crdtsync_core::path::{encode_path, parse_path};
+use crdtsync_core::path::{
+    encode_path, parse_path, xml_children_len, xml_fragment, xml_insert_element, xml_move_child,
+};
 use crdtsync_core::{
     zone, AclEffect, Document, Element, ElementId, Op, RangeAnchor, Scalar, Schema, Side,
 };
@@ -360,6 +362,101 @@ fn a_grant_below_a_denied_ancestor_leaves_no_orphan_in_the_snapshot() {
     // And it round-trips clean.
     let back = Document::decode_state(&bytes).unwrap();
     assert!(back.get(b"a").is_none());
+    assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
+}
+
+#[test]
+fn a_node_moved_into_a_denied_subtree_is_kept_at_its_readable_origin() {
+    // A child born under the readable /a fragment then moved under the denied /b
+    // fragment. Op catch-up delivers the create (its birth path /a reads) but withholds
+    // the move (an XmlMove's read path is the denied destination /b), so an op-served
+    // reader keeps the child in /a, never learning it left. The projection must too:
+    // dropping it by its current /b position would diverge from the op stream and leave
+    // the child's birth slot dangling in the retained /a children list.
+    let mut d = doc();
+    xml_fragment(&mut d, &encode_path(&[b"a"]));
+    xml_fragment(&mut d, &encode_path(&[b"b"]));
+    xml_insert_element(&mut d, &encode_path(&[b"a"]), 0, b"card");
+    xml_move_child(&mut d, &encode_path(&[b"a"]), 0, &encode_path(&[b"b"]), 0);
+    assert_eq!(
+        xml_children_len(&d, &encode_path(&[b"b"])),
+        Some(1),
+        "the live tree renders the moved child under /b",
+    );
+
+    d.project_read_paths(reads_top(false, &[b"a"]));
+    assert!(d.get(b"b").is_none(), "the denied /b fragment is dropped");
+
+    // The projection filters the move state only in the persisted log (like
+    // `project_zones`), so it is sound solely as the final transform before a re-encode:
+    // a decoded joiner is what must converge. Decoding replays the filtered log — the
+    // move into /b is gone — and re-folds the child back under its readable origin /a,
+    // with no dangling reference to the dropped /b subtree, so the re-encode is canonical.
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).expect("the projected snapshot decodes");
+    assert_eq!(
+        xml_children_len(&back, &encode_path(&[b"a"])),
+        Some(1),
+        "a snapshot joiner re-folds the moved-into-denied child at its readable origin /a",
+    );
+    assert!(back.get(b"b").is_none());
+    assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
+}
+
+/// The live-children count of the first XML child under the fragment at raw map-slot key
+/// `key` — the grandchildren of a `frag(card(...))` shape — or `None` if the shape differs.
+fn first_child_grandchildren(d: &Document, key: &[u8]) -> Option<usize> {
+    let f = match d.get(key) {
+        Some(Element::XmlFragment(f)) => f,
+        _ => return None,
+    };
+    let children = f.borrow().children();
+    let vals = children.borrow().values();
+    match vals.first() {
+        Some(Element::XmlElement(card)) => Some(card.borrow().children().borrow().len()),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_node_kept_at_its_origin_drops_the_subtree_it_grew_in_the_denied_position() {
+    // A `card` element born under readable /a with a `gc` grandchild, then moved into
+    // denied /b. Op catch-up keeps the card at /a (its create read, its move withheld) but
+    // never delivers the grandchild — its create's read path is the card's denied /b
+    // position — so the op joiner holds the card with an EMPTY subtree. The projection must
+    // keep the card at /a and CLEAR the subtree it grew in the denied position: no dangling
+    // reference to the dropped grandchild, and the same empty card the op joiner folds.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_fragment(b"b");
+        let mut fa = tx.xml_fragment(b"a");
+        let mut kids = fa.children();
+        let mut card = kids.insert_element(0, b"card");
+        card.children().insert_element(0, b"gc");
+    });
+    xml_move_child(&mut d, &encode_path(&[b"a"]), 0, &encode_path(&[b"b"]), 0);
+    assert_eq!(
+        first_child_grandchildren(&d, b"b"),
+        Some(1),
+        "the live tree renders the card (with its grandchild) under /b",
+    );
+
+    d.project_read_paths(reads_top(false, &[b"a"]));
+    assert!(d.get(b"b").is_none(), "the denied /b fragment is dropped");
+
+    // A decoded joiner re-folds the card at /a with no grandchild and no dangling ref.
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).expect("the projected snapshot decodes");
+    assert_eq!(
+        xml_children_len(&back, &encode_path(&[b"a"])),
+        Some(1),
+        "the card is kept at its readable origin /a",
+    );
+    assert_eq!(
+        first_child_grandchildren(&back, b"a"),
+        Some(0),
+        "the grandchild grown in the denied /b is dropped — the card's subtree is empty",
+    );
     assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
 }
 
