@@ -470,8 +470,32 @@ fn a_deployment_read_deny_is_not_reopened_by_a_subtree_grant() {
     );
 }
 
+/// The `Snapshot` state in a connection's outbox, decoded — or `None` if it was not
+/// served one.
+fn served_snapshot(r: &mut Registry, id: ConnId) -> Option<Document> {
+    r.take_outbox(id).into_iter().find_map(|m| match m {
+        Message::Snapshot { state, .. } => {
+            Some(Document::decode_state(&state).expect("a served snapshot decodes"))
+        }
+        _ => None,
+    })
+}
+
+/// Whether a decoded doc holds the top-level subtree `key` as a live map.
+fn has_subtree(d: &Document, key: &[u8]) -> bool {
+    matches!(d.get(key), Some(crdtsync_core::Element::Map(_)))
+}
+
+/// Whether a decoded doc's map at `container` holds a live slot `key`.
+fn leaf_present(d: &Document, container: &[u8], key: &[u8]) -> bool {
+    match d.get(container) {
+        Some(crdtsync_core::Element::Map(m)) => m.borrow().get(key).is_some(),
+        _ => false,
+    }
+}
+
 #[test]
-fn a_partial_reader_is_refused_an_unredactable_snapshot_catch_up() {
+fn a_partial_reader_is_served_a_projected_snapshot_catch_up() {
     let (mut r, mut alice_doc, alice) = seeded();
     // Compact the room so a fresh subscriber below the floor catches up via a
     // Snapshot (the whole materialized replica), not an op delta.
@@ -480,46 +504,80 @@ fn a_partial_reader_is_refused_an_unredactable_snapshot_catch_up() {
     submit(&mut r, alice, write_subtree(&mut alice_doc, b"b", 2));
     r.take_outbox(alice);
 
-    // bob (reads /a only) subscribes fresh. The snapshot cannot be path-redacted, so
-    // a non-whole-document reader is refused rather than served the whole state
-    // (carol's /b included).
+    // bob (reads /a only) subscribes fresh. The snapshot is now PROJECTED to his
+    // authorized subtree rather than refused: he is served /a with /b and the /seed
+    // bootstrap he cannot read dropped.
     let bob = auth(&mut r, 2, "t-bob");
     assert!(subscribe(&mut r, bob));
-    let out = r.take_outbox(bob);
+    let snap =
+        served_snapshot(&mut r, bob).expect("a partial reader is served a projected snapshot");
+    assert!(has_subtree(&snap, b"a"), "the /a subtree is served");
+    assert!(!has_subtree(&snap, b"b"), "the /b subtree is dropped");
     assert!(
-        out.iter().any(|m| matches!(
-            m,
-            Message::Error {
-                code: ErrorCode::Forbidden,
-                ..
-            }
-        )),
-        "a partial reader is refused an unredactable snapshot",
-    );
-    assert!(
-        !out.iter().any(|m| matches!(m, Message::Snapshot { .. })),
-        "no snapshot state leaks to the partial reader",
+        !has_subtree(&snap, b"seed"),
+        "the /seed bootstrap bob cannot read is dropped",
     );
 
-    // A whole-document reader — a second alice device, the creator who owns `/` — IS
-    // served the snapshot.
+    // A whole-document reader — a second alice device, the creator who owns `/` — is
+    // served the FULL snapshot, /a and /b both present.
     let alice2 = auth(&mut r, 10, "t-alice2");
     assert!(subscribe(&mut r, alice2));
+    let full = served_snapshot(&mut r, alice2).expect("the creator is served the snapshot");
     assert!(
-        r.take_outbox(alice2)
-            .iter()
-            .any(|m| matches!(m, Message::Snapshot { .. })),
-        "the creator (a whole-document reader) is served the snapshot",
+        has_subtree(&full, b"a") && has_subtree(&full, b"b"),
+        "the whole-document reader gets the unprojected snapshot",
     );
 }
 
 #[test]
-fn a_downstream_read_deny_carve_out_refuses_the_snapshot() {
+fn a_snapshot_joiner_converges_with_an_op_joiner_for_a_partial_reader() {
+    // The load-bearing convergence property: the op-stream redaction withholds every
+    // op on a subtree bob may not read, so a bob who joins live never materializes
+    // those subtrees. Projecting them out of the snapshot must drop EXACTLY the same
+    // subtrees, so a snapshot-served bob converges with an op-served bob.
+
+    // op-join: an uncompacted room, bob catches up via the redacted op stream.
+    let ops_replica = {
+        let (mut r, mut alice_doc, alice) = seeded();
+        submit(&mut r, alice, write_subtree(&mut alice_doc, b"a", 1));
+        submit(&mut r, alice, write_subtree(&mut alice_doc, b"b", 2));
+        r.take_outbox(alice);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        let mut replica = Document::new(cid(2));
+        for op in received_ops(&mut r, bob) {
+            replica.apply(&op);
+        }
+        replica
+    };
+
+    // snapshot-join: the same history compacted, bob catches up via a projected snapshot.
+    let snap_replica = {
+        let (mut r, mut alice_doc, alice) = seeded();
+        r.set_compaction_threshold(1);
+        submit(&mut r, alice, write_subtree(&mut alice_doc, b"a", 1));
+        submit(&mut r, alice, write_subtree(&mut alice_doc, b"b", 2));
+        r.take_outbox(alice);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        served_snapshot(&mut r, bob).expect("a partial reader is served a projected snapshot")
+    };
+
+    // Both joiners hold /a and neither holds /b or the /seed bootstrap — they converge.
+    for (label, replica) in [("op-join", &ops_replica), ("snapshot-join", &snap_replica)] {
+        assert!(has_subtree(replica, b"a"), "{label} bob has /a");
+        assert!(!has_subtree(replica, b"b"), "{label} bob lacks /b");
+        assert!(!has_subtree(replica, b"seed"), "{label} bob lacks /seed");
+    }
+}
+
+#[test]
+fn a_downstream_read_deny_carve_out_is_served_a_projected_snapshot() {
     // bob is granted read on the whole document (`/`) then denied read on `/secret`
     // — the AWS-style downstream carve-out. He reads root (Allow, since a descendant
-    // deny does not govern the root query), so he subscribes; but the snapshot
-    // contains `/secret`, which the live fan-out withholds from him, so an
-    // unredactable snapshot is refused rather than leaking the carve-out.
+    // deny does not govern the root query), so he subscribes; the snapshot is
+    // projected to drop `/secret` — exactly the subtree the live fan-out withholds —
+    // and serve the rest, instead of refusing the whole catch-up.
     let mut r = registry();
     let alice = auth(&mut r, 1, "t-alice");
     assert!(subscribe(&mut r, alice));
@@ -558,19 +616,116 @@ fn a_downstream_read_deny_carve_out_refuses_the_snapshot() {
         subscribe(&mut r, bob),
         "bob's root read admits him to subscribe"
     );
-    let out = r.take_outbox(bob);
+    let snap =
+        served_snapshot(&mut r, bob).expect("the carved-out reader is served a projected snapshot");
+    assert!(has_subtree(&snap, b"pub"), "the readable subtree is served",);
     assert!(
-        out.iter().any(|m| matches!(
-            m,
-            Message::Error {
-                code: ErrorCode::Forbidden,
-                ..
+        !has_subtree(&snap, b"secret"),
+        "the /secret carve-out is dropped from the projected snapshot",
+    );
+}
+
+#[test]
+fn a_room_with_no_acl_tuples_serves_the_full_snapshot() {
+    // Regression: with no doc-ACL tuples the snapshot path is the pre-projection one —
+    // every subscriber the deployment admits is served the whole materialized replica,
+    // byte-identical to before.
+    let mut r = Registry::new(cid(0xFF));
+    r.set_verifier(Box::new(tokens(&[("t-alice", "alice"), ("t-bob", "bob")])));
+    r.set_authorizer(Box::new(
+        Acl::new()
+            .allow(
+                Subject::Anyone,
+                Some(Action::Read),
+                ResourceMatch::Room(ROOM.to_vec()),
+            )
+            .allow(
+                Subject::Anyone,
+                Some(Action::Write),
+                ResourceMatch::Room(ROOM.to_vec()),
+            ),
+    ));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+
+    let alice = join(&mut r, 1, "t-alice");
+    let mut alice_doc = Document::new(cid(1));
+    r.set_compaction_threshold(1);
+    submit(&mut r, alice, write_subtree(&mut alice_doc, b"a", 1));
+    submit(&mut r, alice, write_subtree(&mut alice_doc, b"b", 2));
+    r.take_outbox(alice);
+
+    let bob = auth(&mut r, 2, "t-bob");
+    assert!(subscribe(&mut r, bob));
+    let snap = served_snapshot(&mut r, bob).expect("a no-ACL room serves the snapshot");
+    assert!(
+        has_subtree(&snap, b"a") && has_subtree(&snap, b"b"),
+        "no ACL ⇒ the whole materialized replica is served",
+    );
+}
+
+#[test]
+fn a_leaf_level_deny_is_projected_out_of_the_snapshot() {
+    // bob reads /a but is denied the leaf /a/v. The op fan-out withholds the RegisterSet
+    // at /a/v while delivering the /a MapCreate; the snapshot projection gates each
+    // element on recipient_reads_path at the same path op_read_path resolves to, so it
+    // serves /a as a map with the /a/v slot cut. A snapshot joiner converges with an op
+    // joiner: both hold the /a map, neither holds /a/v.
+    let build = |compact: bool| -> Document {
+        let mut r = registry();
+        let alice = auth(&mut r, 1, "t-alice");
+        assert!(subscribe(&mut r, alice));
+        r.take_outbox(alice);
+        let mut alice_doc = Document::new(cid(1));
+        submit(&mut r, alice, write_subtree(&mut alice_doc, b"seed", 0));
+        submit(
+            &mut r,
+            alice,
+            grant_read(
+                &mut alice_doc,
+                AclSubject::Actor(actor_key(b"bob")),
+                &encode_path(&[b"a"]),
+            ),
+        );
+        submit(
+            &mut r,
+            alice,
+            grant_cap(
+                &mut alice_doc,
+                AclSubject::Actor(actor_key(b"bob")),
+                Capability::Read,
+                AclEffect::Deny,
+                &encode_path(&[b"a", b"v"]),
+            ),
+        );
+        r.take_outbox(alice);
+        if compact {
+            r.set_compaction_threshold(1);
+        }
+        // A MapCreate /a plus a RegisterSet /a/v.
+        submit(&mut r, alice, write_subtree(&mut alice_doc, b"a", 1));
+        r.take_outbox(alice);
+
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        if compact {
+            served_snapshot(&mut r, bob).expect("a projected snapshot is served")
+        } else {
+            let mut replica = Document::new(cid(2));
+            for op in received_ops(&mut r, bob) {
+                replica.apply(&op);
             }
-        )),
-        "a reader carved out of a whole-document grant is refused the snapshot",
-    );
-    assert!(
-        !out.iter().any(|m| matches!(m, Message::Snapshot { .. })),
-        "no snapshot leaks the /secret carve-out to bob",
-    );
+            replica
+        }
+    };
+
+    for (label, replica) in [("snapshot", build(true)), ("op-stream", build(false))] {
+        assert!(
+            has_subtree(&replica, b"a"),
+            "{label} joiner holds the /a map"
+        );
+        assert!(
+            !leaf_present(&replica, b"a", b"v"),
+            "{label} joiner is denied the /a/v leaf",
+        );
+    }
 }

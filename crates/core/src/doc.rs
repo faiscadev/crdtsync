@@ -997,6 +997,136 @@ impl Document {
         self.buffered = self.buffer.iter().map(|op| op.id).collect();
     }
 
+    /// Project this replica in place to the paths a reader may read, dropping every
+    /// element `reads` does not admit so a re-encode carries no trace of it — not the
+    /// hidden subtree's content, structure, ids, or the ACL grants that would reveal who
+    /// else may read it. `reads` is the server's composed doc-ACL read verdict at a
+    /// `core::path` key sequence — the exact per-path authority the per-op fan-out gates
+    /// each op on (the server's `op_read_path` resolves an op to this same path). This is
+    /// the doc-ACL analogue of [`project_zones`](Self::project_zones): the state half of the
+    /// per-path read redaction, so a compacted room's cold-start snapshot is narrowed to
+    /// a partial reader's granted subtrees rather than refused, and a snapshot-served
+    /// joiner converges with an op-served one — the two drop exactly the same elements.
+    ///
+    /// A container is served only if the reader may read its whole path down from the
+    /// root: op catch-up withholds the create op at any path level it may not read, and
+    /// a child whose parent create was withheld never applies. So a container is dropped
+    /// when *any* prefix of its path is unreadable — its own path, or an ancestor the
+    /// reader is denied even where a more-specific grant re-opens the child (an
+    /// unreadable container drops its whole subtree, its slot detached from its retained
+    /// parent so no residual key names it). A leaf slot is read-gated at the map's path
+    /// plus the slot key — the same path a keyed leaf op resolves to — so a leaf-level
+    /// deny drops the slot even inside a readable container. Doc-level state a root-path
+    /// op governs (ACL tuples, ranged annotations) is kept only when the root itself is
+    /// readable. A whole-document reader is left untouched, byte-identical on re-encode.
+    ///
+    /// Sound only as the final transform before [`encode_state`](Self::encode_state) on
+    /// a throwaway copy: like [`project_zones`](Self::project_zones) it clears the causal
+    /// `seen` frontier and the buffer once anything is dropped (a below-floor subscriber
+    /// dedups nothing before the snapshot's sequence, and an emptied frontier leaks no op
+    /// count of a hidden subtree) and leaves the derived move relation filtered only in
+    /// its persisted log — neither a valid live-replica state.
+    pub fn project_read_paths(&mut self, reads: impl Fn(&[Vec<u8>]) -> bool) {
+        let root = self.root_id();
+        let paths = self.element_paths();
+        let root_reads = reads(&[]);
+        // A container is dropped when any non-empty prefix of its path is unreadable —
+        // its own path, or an ancestor level whose create op catch-up would withhold, so
+        // the whole subtree below an unreadable level goes even where a deeper grant
+        // re-opens a descendant. The root map is never purged structurally.
+        let denied = |path: &[Vec<u8>]| (1..=path.len()).any(|i| !reads(&path[..i]));
+        let mut purge: HashSet<ElementId> = HashSet::new();
+        for (id, path) in &paths {
+            if *id == root {
+                continue;
+            }
+            if denied(path) {
+                purge.insert(*id);
+            }
+        }
+        // Cut, from each retained map, its purged-container child slots and its
+        // unreadable leaf slots — a leaf's read path is the map's path plus the slot key,
+        // the same path the per-op redaction gates a keyed leaf op on, so a leaf-level
+        // deny drops the slot here too. A cut counter's registry entry joins `purge` so
+        // no phantom tally survives the re-encode; a scalar or register is inline in the
+        // slot. Gather under shared borrows, then cut, so no map is read and mutated at
+        // once.
+        let mut detach: Vec<(Rc<RefCell<Map>>, Vec<u8>)> = Vec::new();
+        let mut cut_leaf = false;
+        for map in self.maps.values() {
+            let m = map.borrow();
+            let map_id = m.id();
+            if purge.contains(&map_id) {
+                continue;
+            }
+            let Some(base) = paths.get(&map_id) else {
+                continue;
+            };
+            for key in m.slot_keys() {
+                match m.get(&key) {
+                    Some(child) if child.is_container() => {
+                        if purge.contains(&child.id()) {
+                            detach.push((Rc::clone(map), key));
+                        }
+                    }
+                    other => {
+                        let mut leaf_path = base.clone();
+                        leaf_path.push(key.clone());
+                        if !reads(&leaf_path) {
+                            if let Some(Element::Counter(c)) = other {
+                                purge.insert(c.borrow().id());
+                            }
+                            detach.push((Rc::clone(map), key));
+                            cut_leaf = true;
+                        }
+                    }
+                }
+            }
+        }
+        for (map, key) in detach {
+            map.borrow_mut().take_slot(&key);
+        }
+        // Drop the hidden containers and every id-keyed edge and annotation that names
+        // one, so the registries hold only authorized state.
+        self.maps.retain(|id, _| !purge.contains(id));
+        self.lists.retain(|id, _| !purge.contains(id));
+        self.texts.retain(|id, _| !purge.contains(id));
+        self.counters.retain(|id, _| !purge.contains(id));
+        self.xml_elements.retain(|id, _| !purge.contains(id));
+        self.xml_fragments.retain(|id, _| !purge.contains(id));
+        self.parents
+            .retain(|child, parent| !purge.contains(child) && !purge.contains(parent));
+        // ACL tuples and ranged annotations are governed by root read: a root-path op
+        // carries each (op_read_path resolves them to `/`), so a reader that cannot read
+        // the whole document receives none of them — their existence alone would leak the
+        // subtrees they name — while a root reader receives them all.
+        self.acl.retain(|id, _| root_reads && !purge.contains(id));
+        self.ranged
+            .retain(|id, _| root_reads && !purge.contains(id));
+        self.placements.retain(|node, places| {
+            if purge.contains(node) {
+                return false;
+            }
+            places.retain(|p| !purge.contains(&p.list));
+            !places.is_empty()
+        });
+        self.placement_index = self
+            .placements
+            .values()
+            .flat_map(|places| places.iter().map(|p| (p.list, p.stamp)))
+            .collect();
+        self.moves
+            .retain(|child, parent| !purge.contains(&child) && !purge.contains(&parent));
+        // Once anything is dropped, scrub the causal frontier and buffer of the hidden
+        // state so neither leaks an op count; a pure identity projection (a whole-
+        // document reader) leaves them, staying byte-identical on re-encode.
+        if !purge.is_empty() || cut_leaf || !root_reads {
+            self.seen.clear();
+            self.buffer.clear();
+            self.buffered.clear();
+        }
+    }
+
     /// Rebuild a replica from a snapshot, rejecting trailing bytes.
     pub fn decode_state(bytes: &[u8]) -> Result<Document, DecodeError> {
         let mut cur = Cursor::new(bytes);

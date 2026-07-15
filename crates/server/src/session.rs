@@ -516,15 +516,16 @@ pub fn step(
                         ops: catch_up_ops(registry, governing, session, delta, &types),
                     }
                 }
-                // A snapshot is the whole materialized replica; doc-ACL redaction it
-                // needs a subtree projection this seam does not do, so a non-whole-
-                // document reader is refused rather than served subtrees it may not
-                // read. Zone scoping, by contrast, *is* a state-level projection: a
-                // zone-limited subscriber is served the replica narrowed to its
-                // authorized partitions, the hidden zones' state wholly dropped before
-                // any migration translation. A whole-document, whole-zone reader (and
-                // every reader of a room with no doc-ACL state or zones) is served as
-                // before.
+                // A snapshot is the whole materialized replica. A whole-document reader
+                // (the creator, a root grant, a deployment read-allow, or any reader of
+                // a room with no doc-ACL state) is served it verbatim. A partial reader
+                // — read on some subtrees, not the whole document — is served the
+                // snapshot *projected* to its authorized subtrees, exactly as the per-op
+                // fan-out withholds every op on a subtree it may not read: the two join
+                // paths drop the same subtrees, so a snapshot-served joiner converges
+                // with an op-served one. Zone scoping then narrows the result further.
+                // The subscribe gate already refused a reader with no read grant at all,
+                // so a partial reader here holds read on at least one subtree.
                 Catchup::Snapshot { seq, state } => {
                     let reads_all = records.is_empty()
                         || reads_whole_document(
@@ -535,9 +536,19 @@ pub fn step(
                             identity,
                             &room,
                         );
-                    if !reads_all {
-                        return forbidden("read denied");
-                    }
+                    let state = if reads_all {
+                        state
+                    } else {
+                        project_snapshot_reads(
+                            state,
+                            authorizer,
+                            &records,
+                            creator.as_deref(),
+                            schema,
+                            identity,
+                            &room,
+                        )
+                    };
                     let state = project_snapshot_zones(state, schema, &zones);
                     Message::Snapshot {
                         channel,
@@ -1095,6 +1106,43 @@ fn project_snapshot_zones(
         }
         // An undecodable snapshot is left as-is: it fails downstream on the same
         // footing it would have without zones, never silently served narrowed-wrong.
+        Err(_) => state,
+    }
+}
+
+/// Narrow a catch-up snapshot to a partial reader's readable paths, dropping every
+/// element its doc-ACL read tier does not admit so the snapshot carries no trace of it —
+/// the state half of the per-op read redaction. The projection gates each element on the
+/// same [`recipient_reads_path`] the op fan-out applies, at the same `core::path` the
+/// op's [`op_read_path`](crate::acl::op_read_path) resolves to, so a snapshot-served
+/// joiner drops exactly the elements an op-served joiner never received — the two
+/// converge. An unreadable container's whole subtree goes, a leaf-level deny drops its
+/// slot, and doc-level ACL/ranged state goes with an unreadable root.
+///
+/// An undecodable snapshot is left as-is: it fails downstream on the same footing it
+/// would have without projection, never silently served narrowed-wrong.
+#[allow(clippy::too_many_arguments)]
+fn project_snapshot_reads(
+    state: Vec<u8>,
+    authorizer: &dyn Authorizer,
+    records: &[crdtsync_core::acl::AclRecord],
+    creator: Option<&[u8]>,
+    schema: Option<&Schema>,
+    identity: &Identity,
+    room: &[u8],
+) -> Vec<u8> {
+    match Document::decode_state(&state) {
+        Ok(mut doc) => {
+            doc.project_read_paths(|path| {
+                let encoded = crdtsync_core::path::encode_path(
+                    &path.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                );
+                recipient_reads_path(
+                    authorizer, records, creator, schema, identity, room, &encoded,
+                )
+            });
+            doc.encode_state()
+        }
         Err(_) => state,
     }
 }
