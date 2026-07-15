@@ -1352,6 +1352,25 @@ impl WasmClient {
             None => JsValue::NULL,
         }
     }
+
+    /// Frame a request to duplicate room `src`'s live state into a fresh room
+    /// `dst`. Room-keyed: a client may clone a room before it subscribes any of
+    /// it. The reply updates the clone-result view, read with `cloneResult`.
+    #[wasm_bindgen(js_name = cloneRoom)]
+    pub fn clone_room(&self, src: &[u8], dst: &[u8]) -> Vec<u8> {
+        encode_message(&self.inner.clone_room(src, dst))
+    }
+
+    /// Whether the last clone answered for destination `dst` created it, as a
+    /// boolean, or `null` if none has been answered. `false` when the clone was a
+    /// no-op (source unknown or `dst` already existed).
+    #[wasm_bindgen(js_name = cloneResult)]
+    pub fn clone_result(&self, dst: &[u8]) -> JsValue {
+        match self.inner.clone_result(dst) {
+            Some(created) => JsValue::from_bool(created),
+            None => JsValue::NULL,
+        }
+    }
 }
 
 impl WasmClient {

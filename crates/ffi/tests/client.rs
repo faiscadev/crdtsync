@@ -770,6 +770,51 @@ fn a_diff_query_round_trips_over_the_client() {
 }
 
 #[test]
+fn clone_room_round_trips_over_the_client() {
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+
+        // The clone request frames non-empty bytes to send — room-keyed, no
+        // subscription needed first.
+        let frame = crdtsync_client_clone_room(c, b"template".as_ptr(), 8, b"copy".as_ptr(), 4);
+        assert!(frame.len > 0, "a clone request frames bytes to send");
+        match decode_message(std::slice::from_raw_parts(frame.ptr, frame.len)).unwrap() {
+            Message::CloneRoom { src, dst } => {
+                assert_eq!(src, b"template");
+                assert_eq!(dst, b"copy");
+            }
+            other => panic!("expected a CloneRoom, got {other:?}"),
+        }
+        crdtsync_buf_free(frame);
+
+        // No result until one is answered.
+        let mut created = -1i32;
+        assert_eq!(
+            crdtsync_client_clone_result(c, b"copy".as_ptr(), 4, &mut created),
+            0
+        );
+
+        // The server's clone result lands in the view, keyed by destination.
+        let result = encode_message(&Message::CloneRoomResult {
+            dst: b"copy".to_vec(),
+            created: true,
+        });
+        assert_eq!(
+            crdtsync_client_receive(c, result.as_ptr(), result.len(), ptr::null_mut()),
+            1
+        );
+        let mut created = -1i32;
+        assert_eq!(
+            crdtsync_client_clone_result(c, b"copy".as_ptr(), 4, &mut created),
+            1
+        );
+        assert_eq!(created, 1);
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
 fn unsubscribe_drops_the_channel() {
     unsafe {
         let c = crdtsync_client_new(client_id(1).as_ptr());

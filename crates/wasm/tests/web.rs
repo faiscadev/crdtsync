@@ -477,6 +477,28 @@ fn a_client_diff_query_round_trips() {
 }
 
 #[wasm_bindgen_test]
+fn a_client_clone_room_round_trips() {
+    use crdtsync_core::protocol::{encode_message, Message};
+
+    let mut c = wasm_client(1);
+    let src = b"template";
+    let dst = b"copy";
+    // The clone request frames a room-keyed request; no subscription needed.
+    assert!(!c.clone_room(src, dst).is_empty());
+    // No result until one is answered.
+    assert!(c.clone_result(dst).is_null());
+
+    let frame = encode_message(&Message::CloneRoomResult {
+        dst: dst.to_vec(),
+        created: true,
+    });
+    assert!(c.receive(&frame).unwrap());
+    assert_eq!(c.clone_result(dst).as_bool(), Some(true));
+    // An unrelated destination is untouched.
+    assert!(c.clone_result(b"other").is_null());
+}
+
+#[wasm_bindgen_test]
 fn a_client_rejects_garbage_frames() {
     let mut c = wasm_client(1);
     assert!(!c.receive(&[0xff, 0xff, 0xff, 0xff]).unwrap());

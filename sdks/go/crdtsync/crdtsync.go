@@ -1070,6 +1070,29 @@ func (c *Client) DiffResult(room []byte) ([]Change, bool, error) {
 	return changes, true, err
 }
 
+// --- clone room ---
+
+// CloneRoom frames a request to duplicate room src's live state into a fresh room
+// dst. Room-keyed: a client may clone a room before it subscribes any of it. The
+// reply updates the clone-result view, read with CloneResult.
+func (c *Client) CloneRoom(src, dst []byte) []byte {
+	sp, sl := bytesArg(src)
+	dp, dl := bytesArg(dst)
+	return takeBuf(C.crdtsync_client_clone_room(c.h, sp, sl, dp, dl))
+}
+
+// CloneResult returns whether the last clone answered for destination dst created
+// it. The bool is false until a result is answered; created is false when the
+// clone was a no-op (source unknown or dst already existed).
+func (c *Client) CloneResult(dst []byte) (created bool, answered bool) {
+	dp, dl := bytesArg(dst)
+	var out C.int32_t
+	if C.crdtsync_client_clone_result(c.h, dp, dl, &out) != 1 {
+		return false, false
+	}
+	return out == 1, true
+}
+
 // --- schema-aware diff ---
 
 // Scalar is a tagged scalar value: T names the kind and the matching field

@@ -1004,6 +1004,35 @@ pub fn step(
         }
         // A diff result only travels server-to-client.
         Message::DiffResult { .. } => violation("client sent a diff result"),
+        // Cloning duplicates the live state of `src` into a fresh room `dst` — a
+        // read of the whole source composed with a room create. Two gates compose:
+        // the actor must be able to read `src` (the same read tier a branch list or
+        // diff uses — the doc-ACL tier abstains, deployment and schema decide), and
+        // the create is a room-management mutation on `dst`, gated by the write tier
+        // a branch mutation uses. A create persists a new room, so like a branch
+        // mutation it is served only by `dst`'s leader; on a non-leader it is
+        // redirected rather than persisted. The reply is a `CloneRoomResult` whose
+        // `created` is false when the clone was a no-op (`src` unknown or `dst`
+        // already present).
+        Message::CloneRoom { src, dst } => {
+            if !branch_authorized(session, authorizer, schema, &src, Action::Read)
+                || !branch_authorized(session, authorizer, schema, &dst, Action::Write)
+            {
+                return request_denied(session, "clone");
+            }
+            if let Some(redirect) = redirect_response(membership, &dst) {
+                return redirect;
+            }
+            match hub.clone_room(&src, &dst) {
+                Ok(created) => Response {
+                    replies: vec![Message::CloneRoomResult { dst, created }],
+                    ..Response::default()
+                },
+                Err(_) => internal("failed to persist clone"),
+            }
+        }
+        // A clone result only travels server-to-client.
+        Message::CloneRoomResult { .. } => violation("client sent a clone result"),
         // A branch set only travels server-to-client.
         Message::Branches { .. } => violation("client sent a branch set"),
         // A redirect is the server's own routing reply; a client never sends one.

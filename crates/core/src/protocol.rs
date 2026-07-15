@@ -354,6 +354,16 @@ pub enum Message {
     /// `encode_changes` codec the diff SDK bindings already decode. An empty diff
     /// is an empty change list, not an error.
     DiffResult { room: Vec<u8>, changes: Vec<u8> },
+    /// Duplicates the live state of room `src` into a fresh room `dst` — the wire
+    /// form of the "duplicate this doc as a template" server primitive. Room-keyed
+    /// like branch management: a create runnable before any subscription. Replies
+    /// with a [`CloneRoomResult`](Message::CloneRoomResult). A create-only op: it
+    /// declines (`created == false`) when `src` is unknown or `dst` already exists.
+    CloneRoom { src: Vec<u8>, dst: Vec<u8> },
+    /// The outcome of a [`CloneRoom`](Message::CloneRoom): `created` is `true` when
+    /// `dst` was minted from `src`'s state, `false` when the clone was a no-op
+    /// (`src` unknown or `dst` already present).
+    CloneRoomResult { dst: Vec<u8>, created: bool },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -670,6 +680,16 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, room);
             put_bytes(&mut out, changes);
         }
+        Message::CloneRoom { src, dst } => {
+            put_u8(&mut out, 42);
+            put_bytes(&mut out, src);
+            put_bytes(&mut out, dst);
+        }
+        Message::CloneRoomResult { dst, created } => {
+            put_u8(&mut out, 43);
+            put_bytes(&mut out, dst);
+            put_u8(&mut out, u8::from(*created));
+        }
     }
     out
 }
@@ -965,6 +985,16 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let room = cur.bytes()?;
             let changes = cur.bytes()?;
             Message::DiffResult { room, changes }
+        }
+        42 => {
+            let src = cur.bytes()?;
+            let dst = cur.bytes()?;
+            Message::CloneRoom { src, dst }
+        }
+        43 => {
+            let dst = cur.bytes()?;
+            let created = cur.u8()? != 0;
+            Message::CloneRoomResult { dst, created }
         }
         tag => {
             return Err(ProtocolError::BadTag {

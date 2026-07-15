@@ -420,6 +420,12 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         buf,
     )
     sig(lib.crdtsync_client_diff_result, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_clone_room, [doc, cbytes, size, cbytes, size], buf)
+    sig(
+        lib.crdtsync_client_clone_result,
+        [doc, cbytes, size, c.POINTER(c.c_int32)],
+        c.c_int32,
+    )
     return lib
 
 
@@ -1923,3 +1929,26 @@ class Client:
         if rc != 1:
             return None
         return _decode_changes(_take_buf(out))
+
+    def clone_room(self, src: bytes, dst: bytes) -> bytes:
+        """Frame a request to duplicate room ``src``'s live state into a fresh room
+        ``dst``. Room-keyed: a client may clone a room before it subscribes any of
+        it. The reply updates the clone-result view, read with
+        :meth:`clone_result`."""
+        return _take_buf(
+            _LIB.crdtsync_client_clone_room(
+                self._handle, src, len(src), dst, len(dst)
+            )
+        )
+
+    def clone_result(self, dst: bytes) -> Optional[bool]:
+        """Whether the last clone answered for destination ``dst`` created it, or
+        ``None`` if none has been answered. ``False`` when the clone was a no-op
+        (source unknown or ``dst`` already existed)."""
+        created = ctypes.c_int32()
+        rc = _LIB.crdtsync_client_clone_result(
+            self._handle, dst, len(dst), ctypes.byref(created)
+        )
+        if rc != 1:
+            return None
+        return created.value == 1

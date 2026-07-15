@@ -188,6 +188,27 @@ def test_diff_query_round_trips():
         assert result[0]["new"] == {"t": "int", "v": 40}
 
 
+def test_clone_room_round_trips():
+    import struct
+
+    def put_bytes(b: bytes) -> bytes:
+        return struct.pack("<I", len(b)) + b
+
+    with Client(cid(1)) as a:
+        src, dst = b"template", b"copy"
+        # The clone request frames a room-keyed request; no subscription needed.
+        assert len(a.clone_room(src, dst)) > 0
+        # No result until one is answered.
+        assert a.clone_result(dst) is None
+
+        # A CloneRoomResult reply: tag 43, u32-prefixed dst, one byte created.
+        frame = struct.pack("<B", 43) + put_bytes(dst) + struct.pack("<B", 1)
+        assert a.receive(frame) == 1
+        assert a.clone_result(dst) is True
+        # An unrelated destination is untouched.
+        assert a.clone_result(b"other") is None
+
+
 def test_receive_rejects_garbage():
     with Client(cid(1)) as a:
         assert a.receive(b"\xff\xff\xff\xff") == 0

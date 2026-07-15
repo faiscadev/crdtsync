@@ -103,6 +103,11 @@ pub struct ClientSession {
     /// view; a fresh query replaces the room's entry. Empty until a diff query is
     /// answered.
     diffs: HashMap<Vec<u8>, Vec<Change>>,
+    /// The outcome of each clone-room request, keyed by the destination room — the
+    /// `created` flag a [`Message::CloneRoomResult`] reply carried. Keyed by `dst`
+    /// so a client reads the result of the clone it issued. Empty until a clone is
+    /// answered.
+    clone_results: HashMap<Vec<u8>, bool>,
 }
 
 impl ClientSession {
@@ -121,6 +126,7 @@ impl ClientSession {
             redirects: Vec::new(),
             branches: HashMap::new(),
             diffs: HashMap::new(),
+            clone_results: HashMap::new(),
         }
     }
 
@@ -518,6 +524,25 @@ impl ClientSession {
         self.diffs.get(room).map(Vec::as_slice)
     }
 
+    /// Duplicate room `src`'s live state into a fresh room `dst`, returning the
+    /// request frame. Room-keyed like branch management: a client may clone a room
+    /// before it subscribes any of it. The reply folds into the
+    /// [`clone_result`](Self::clone_result) view keyed by `dst`.
+    pub fn clone_room(&self, src: &[u8], dst: &[u8]) -> Message {
+        Message::CloneRoom {
+            src: src.to_vec(),
+            dst: dst.to_vec(),
+        }
+    }
+
+    /// The outcome of the last clone answered for destination `dst`: `Some(true)`
+    /// if `dst` was minted from the source's state, `Some(false)` if the clone was
+    /// a no-op (source unknown or `dst` already existed), `None` if no clone into
+    /// `dst` has been answered.
+    pub fn clone_result(&self, dst: &[u8]) -> Option<bool> {
+        self.clone_results.get(dst).copied()
+    }
+
     /// Leave the room on `channel`, dropping its replica. Returns the Unsubscribe
     /// frame to send, or `None` if the channel isn't held.
     pub fn unsubscribe(&mut self, channel: Channel) -> Option<Message> {
@@ -720,6 +745,10 @@ impl ClientSession {
                 self.diffs.insert(room, changes);
                 Ok(())
             }
+            Message::CloneRoomResult { dst, created } => {
+                self.clone_results.insert(dst, created);
+                Ok(())
+            }
             // Branch and diff requests only travel client-to-server.
             Message::BranchList { .. }
             | Message::BranchFork { .. }
@@ -729,6 +758,10 @@ impl ClientSession {
             | Message::BranchDelete { .. }
             | Message::DiffQuery { .. } => Err(ClientError::UnexpectedMessage(
                 "server sent a branch or diff request",
+            )),
+            // A clone request only travels client-to-server.
+            Message::CloneRoom { .. } => Err(ClientError::UnexpectedMessage(
+                "server sent a clone request",
             )),
             // Replication frames travel node-to-node; a client never sees one.
             Message::Replicate { .. } => {

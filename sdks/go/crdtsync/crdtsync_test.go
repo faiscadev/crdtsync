@@ -566,6 +566,40 @@ func TestClientDiffQueryRoundTrips(t *testing.T) {
 	}
 }
 
+func TestClientCloneRoomRoundTrips(t *testing.T) {
+	c := newClient(t, 1)
+	defer c.Close()
+
+	src := key("template")
+	dst := key("copy")
+	// The clone request frames a room-keyed request; no subscription needed.
+	if f := c.CloneRoom(src, dst); len(f) == 0 {
+		t.Fatalf("clone request should yield a frame")
+	}
+	// No result until one is answered.
+	if created, ok := c.CloneResult(dst); ok || created {
+		t.Fatalf("clone result before reply: created=%v ok=%v", created, ok)
+	}
+
+	// A CloneRoomResult reply folds in: tag 43, u32-prefixed dst, one byte created.
+	frame := make([]byte, 0, 1+4+len(dst)+1)
+	frame = append(frame, 43)
+	frame = appendBytes(frame, dst)
+	frame = append(frame, 1)
+	if rc, _ := c.Receive(frame); rc != 1 {
+		t.Fatalf("clone result receive: got rc=%d, want 1", rc)
+	}
+
+	created, ok := c.CloneResult(dst)
+	if !ok || !created {
+		t.Fatalf("clone result: created=%v ok=%v", created, ok)
+	}
+	// Another destination is untouched.
+	if _, ok := c.CloneResult(key("other")); ok {
+		t.Fatalf("an unrelated destination should report no result")
+	}
+}
+
 // appendBytes writes a u32-length-prefixed byte string, the wire put_bytes form.
 func appendBytes(dst, b []byte) []byte {
 	var n [4]byte
