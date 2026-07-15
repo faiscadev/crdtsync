@@ -149,6 +149,52 @@ fn grant_read(doc: &mut Document, subject: AclSubject, path: &[u8]) -> Vec<Op> {
     grant_cap(doc, subject, Capability::Read, AclEffect::Allow, path)
 }
 
+/// alice grants `subject` read at `path`; returns the emitted ops and the tuple's id
+/// (the handle a revoke names).
+fn grant_read_id(doc: &mut Document, subject: AclSubject, path: &[u8]) -> (Vec<Op>, ElementId) {
+    let mut id = None;
+    let ops = doc.transact(|tx| {
+        id = Some(tx.acl().grant(
+            subject,
+            AclGrant::Capability(Capability::Read),
+            AclEffect::Allow,
+            path.to_vec(),
+            actor_key(b"alice"),
+        ));
+    });
+    (ops, id.expect("a grant emits a tuple id"))
+}
+
+/// alice revokes the ACL tuple `id`.
+fn revoke(doc: &mut Document, id: ElementId) -> Vec<Op> {
+    doc.transact(|tx| {
+        tx.acl().revoke(id);
+    })
+}
+
+/// The governing paths of the `AclGrant` ops in `ops`, in order.
+fn acl_grant_paths(ops: &[Op]) -> Vec<Vec<u8>> {
+    ops.iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::AclGrant { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `ops` carries an `AclRevoke`.
+fn has_revoke(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op.kind, OpKind::AclRevoke { .. }))
+}
+
+/// The governing paths of a decoded snapshot's live ACL tuples, sorted.
+fn acl_tuple_paths(d: &Document) -> Vec<Vec<u8>> {
+    let mut p: Vec<Vec<u8>> = d.acl_tuples().into_iter().map(|t| t.path).collect();
+    p.sort();
+    p
+}
+
 fn submit(r: &mut Registry, id: ConnId, ops: Vec<Op>) {
     assert!(r.deliver(
         id,
@@ -342,11 +388,138 @@ fn catch_up_replays_only_the_subtrees_a_fresh_reader_may_read() {
         !touches_subtree(&replay, b"seed"),
         "the /seed bootstrap bob cannot read is withheld from his replay",
     );
+    // ACL state is redacted by governing path: bob's replay carries the grant governing
+    // /a (his own read, which he may read) but not the one governing /b (carol's).
+    let grant_paths = acl_grant_paths(&replay);
     assert!(
-        replay
-            .iter()
-            .all(|op| !matches!(op.kind, OpKind::AclGrant { .. })),
-        "the ACL grants bob cannot read are withheld from his replay",
+        grant_paths.contains(&encode_path(&[b"a"])),
+        "the ACL grant governing /a bob reads is replayed to him",
+    );
+    assert!(
+        !grant_paths.contains(&encode_path(&[b"b"])),
+        "the ACL grant governing /b bob cannot read is withheld from his replay",
+    );
+}
+
+#[test]
+fn an_acl_grant_reaches_only_recipients_who_may_read_its_governing_path() {
+    let (mut r, mut alice_doc, alice) = seeded();
+    let bob = join(&mut r, 2, "t-bob"); // reads /a
+    let carol = join(&mut r, 3, "t-carol"); // reads /b
+
+    // A grant governing /a reaches bob (reads /a) and is withheld from carol (reads /b)
+    // — the ACL tuple itself is privacy-sensitive, so it rides its governing path.
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"dave")),
+            &encode_path(&[b"a"]),
+        ),
+    );
+    assert_eq!(
+        acl_grant_paths(&received_ops(&mut r, bob)),
+        vec![encode_path(&[b"a"])],
+        "bob receives the ACL grant governing /a he may read",
+    );
+    assert!(
+        received_ops(&mut r, carol).is_empty(),
+        "carol is withheld the /a grant she cannot read",
+    );
+
+    // A grant governing /b reaches carol and is withheld from bob — opposite recipients.
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"dave")),
+            &encode_path(&[b"b"]),
+        ),
+    );
+    assert_eq!(
+        acl_grant_paths(&received_ops(&mut r, carol)),
+        vec![encode_path(&[b"b"])],
+        "carol receives the ACL grant governing /b she may read",
+    );
+    assert!(
+        received_ops(&mut r, bob).is_empty(),
+        "bob is withheld the /b grant he cannot read",
+    );
+}
+
+#[test]
+fn an_acl_revoke_reaches_only_recipients_who_may_read_the_revoked_grants_path() {
+    let (mut r, mut alice_doc, alice) = seeded();
+    // Grant dave read on /a and on /b before the readers join.
+    let (grant_a, id_a) = grant_read_id(
+        &mut alice_doc,
+        AclSubject::Actor(actor_key(b"dave")),
+        &encode_path(&[b"a"]),
+    );
+    let (grant_b, id_b) = grant_read_id(
+        &mut alice_doc,
+        AclSubject::Actor(actor_key(b"dave")),
+        &encode_path(&[b"b"]),
+    );
+    submit(&mut r, alice, grant_a);
+    submit(&mut r, alice, grant_b);
+    let bob = join(&mut r, 2, "t-bob"); // reads /a
+    let carol = join(&mut r, 3, "t-carol"); // reads /b
+
+    // Revoke the /a grant → resolved through the server's full tuple set to /a, so it
+    // reaches bob (reads /a) and is withheld from carol.
+    submit(&mut r, alice, revoke(&mut alice_doc, id_a));
+    assert!(
+        has_revoke(&received_ops(&mut r, bob)),
+        "bob receives the revoke of the /a grant he may read",
+    );
+    assert!(
+        received_ops(&mut r, carol).is_empty(),
+        "carol is withheld the /a revoke",
+    );
+
+    // Revoke the /b grant → reaches carol, withheld from bob.
+    submit(&mut r, alice, revoke(&mut alice_doc, id_b));
+    assert!(
+        has_revoke(&received_ops(&mut r, carol)),
+        "carol receives the revoke of the /b grant she may read",
+    );
+    assert!(
+        received_ops(&mut r, bob).is_empty(),
+        "bob is withheld the /b revoke",
+    );
+}
+
+#[test]
+fn the_creator_receives_every_acl_op() {
+    let (mut r, mut alice_doc, alice) = seeded();
+    // A second device of alice — the creator's actor, who owns `/`.
+    let alice2 = join(&mut r, 10, "t-alice2");
+
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"dave")),
+            &encode_path(&[b"a"]),
+        ),
+    );
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"dave")),
+            &encode_path(&[b"b"]),
+        ),
+    );
+    let paths = acl_grant_paths(&received_ops(&mut r, alice2));
+    assert!(
+        paths.contains(&encode_path(&[b"a"])) && paths.contains(&encode_path(&[b"b"])),
+        "the creator owns / and receives every ACL grant, unredacted",
     );
 }
 
@@ -564,10 +737,17 @@ fn a_snapshot_joiner_converges_with_an_op_joiner_for_a_partial_reader() {
     };
 
     // Both joiners hold /a and neither holds /b or the /seed bootstrap — they converge.
+    // The ACL set converges too: both materialize the tuple governing /a (bob's own read
+    // grant) and neither the one governing /b — the same subset either seam yields.
     for (label, replica) in [("op-join", &ops_replica), ("snapshot-join", &snap_replica)] {
         assert!(has_subtree(replica, b"a"), "{label} bob has /a");
         assert!(!has_subtree(replica, b"b"), "{label} bob lacks /b");
         assert!(!has_subtree(replica, b"seed"), "{label} bob lacks /seed");
+        assert_eq!(
+            acl_tuple_paths(replica),
+            vec![encode_path(&[b"a"])],
+            "{label} bob materializes only the /a ACL tuple",
+        );
     }
 }
 

@@ -965,7 +965,7 @@ impl Registry {
         // Each op's document path is recipient-independent, so resolve it once.
         let op_paths: Vec<Vec<u8>> = broadcast
             .iter()
-            .map(|op| crate::acl::op_read_path(&index, op))
+            .map(|op| crate::acl::op_read_path(&index, &records, op))
             .collect();
         // Migration translation rides the same seam as redaction (scoped to the
         // room's governing app); resolve each distinct target's chain once.

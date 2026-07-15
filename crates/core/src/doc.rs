@@ -1016,9 +1016,11 @@ impl Document {
     /// unreadable container drops its whole subtree, its slot detached from its retained
     /// parent so no residual key names it). A leaf slot is read-gated at the map's path
     /// plus the slot key — the same path a keyed leaf op resolves to — so a leaf-level
-    /// deny drops the slot even inside a readable container. Doc-level state a root-path
-    /// op governs (ACL tuples, ranged annotations) is kept only when the root itself is
-    /// readable. A whole-document reader is left untouched, byte-identical on re-encode.
+    /// deny drops the slot even inside a readable container. An ACL tuple is kept only
+    /// where its own governing path is readable (the op-stream redacts each `AclGrant` to
+    /// that path, so a snapshot reader materializes the same ACL subset an op reader does);
+    /// ranged annotations stay gated by root read. A whole-document reader is left
+    /// untouched, byte-identical on re-encode.
     ///
     /// Sound only as the final transform before [`encode_state`](Self::encode_state) on
     /// a throwaway copy: like [`project_zones`](Self::project_zones) it clears the causal
@@ -1096,11 +1098,19 @@ impl Document {
         self.xml_fragments.retain(|id, _| !purge.contains(id));
         self.parents
             .retain(|child, parent| !purge.contains(child) && !purge.contains(parent));
-        // ACL tuples and ranged annotations are governed by root read: a root-path op
-        // carries each (op_read_path resolves them to `/`), so a reader that cannot read
-        // the whole document receives none of them — their existence alone would leak the
-        // subtrees they name — while a root reader receives them all.
-        self.acl.retain(|id, _| root_reads && !purge.contains(id));
+        // An ACL tuple is redacted by the path it governs, not by root read: ACL state is
+        // itself privacy-sensitive — a tuple reveals a subject, an effect, and the existence
+        // of a governed path — so a reader keeps it only where it may read that path. This
+        // mirrors the op-stream rule (op_read_path maps an AclGrant to its own path), so a
+        // snapshot-served partial reader materializes the same ACL subset an op-served one
+        // would. `AclTuple.path` is the encoded key path; a malformed one fails closed.
+        let acl_before = self.acl.len();
+        self.acl.retain(|id, e| {
+            !purge.contains(id) && crate::path::parse_path(&e.path).is_some_and(|segs| reads(&segs))
+        });
+        let acl_cut = self.acl.len() != acl_before;
+        // Ranged annotations stay governed by root read — path-scoped ranged/marks
+        // redaction is a separate privacy axis, out of scope here.
         self.ranged
             .retain(|id, _| root_reads && !purge.contains(id));
         self.placements.retain(|node, places| {
@@ -1120,7 +1130,7 @@ impl Document {
         // Once anything is dropped, scrub the causal frontier and buffer of the hidden
         // state so neither leaks an op count; a pure identity projection (a whole-
         // document reader) leaves them, staying byte-identical on re-encode.
-        if !purge.is_empty() || cut_leaf || !root_reads {
+        if !purge.is_empty() || cut_leaf || acl_cut || !root_reads {
             self.seen.clear();
             self.buffer.clear();
             self.buffered.clear();
