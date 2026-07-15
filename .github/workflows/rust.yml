@@ -18,14 +18,24 @@ jobs:
   miri:
     runs-on: ubuntu-latest
     # Miri is the memory gate: UB + leaks, deterministic and cross-platform.
-    # One shard per crate so the three run in parallel — wall-clock is the
-    # slowest single crate, not the sum. Within each shard: a warm build cache
-    # skips the cold Miri codegen + sysroot rebuild, and nextest fans the tests
-    # across cores instead of one serial process.
+    # One shard per crate so they run in parallel — wall-clock is the slowest
+    # single job, not the sum. The server crate is the long pole, so it fans
+    # further into three nextest partitions that split its tests by hash and
+    # run in parallel, keeping the slowest job well under core's. Within each
+    # shard: a warm build cache skips the cold Miri codegen + sysroot rebuild,
+    # and nextest fans the tests across cores instead of one serial process.
     strategy:
       fail-fast: false
       matrix:
-        crate: [crdtsync-core, crdtsync-ffi, crdtsync-server]
+        include:
+          - crate: crdtsync-core
+          - crate: crdtsync-ffi
+          - crate: crdtsync-server
+            partition: 1/3
+          - crate: crdtsync-server
+            partition: 2/3
+          - crate: crdtsync-server
+            partition: 3/3
     steps:
       - uses: actions/checkout@v5
       - name: Install Miri
@@ -33,8 +43,9 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
-          # Per-crate key so the three shards keep separate caches instead of
-          # clobbering one; the Miri-built std sysroot lives under ~/.cache/miri.
+          # Keyed by crate, not by partition: the three server shards build the
+          # identical crate and restore the same warm build without clobbering.
+          # The Miri-built std sysroot lives under ~/.cache/miri.
           prefix-key: miri
           key: ${{ matrix.crate }}
           cache-directories: ~/.cache/miri
@@ -42,7 +53,7 @@ jobs:
       - name: Build the Miri sysroot
         run: cargo +nightly miri setup
       - name: Miri
-        run: cargo +nightly miri nextest run -p ${{ matrix.crate }}
+        run: cargo +nightly miri nextest run -p ${{ matrix.crate }} ${{ matrix.partition && format('--partition count:{0}', matrix.partition) || '' }}
 
   python-sdk:
     runs-on: ubuntu-latest
