@@ -8,12 +8,31 @@
 //! present — it never checks a grantor's authority (delegation is a later slice).
 
 use crdtsync_core::acl::{
-    decide_capability, effective_roles, evaluate, AclActor, AclDecision, AclEffect, AclGrant,
-    AclSubject, AclTuple, Capability,
+    AclActor, AclDecision, AclEffect, AclGrant, AclScope, AclSubject, AclTuple, Capability,
 };
 use crdtsync_core::doc::Document;
 use crdtsync_core::elementid::ElementId;
 use crdtsync_core::path::encode_path;
+
+// These path-scoped tests exercise the evaluator with no element scopes, so they
+// pass a resolver that resolves nothing — a `Path` scope never consults it. The
+// element-scope resolution path has its own tests (`acl_element.rs`).
+fn decide_capability(
+    tuples: &[AclTuple],
+    actor: &AclActor,
+    path: &[u8],
+    capability: Capability,
+) -> AclDecision {
+    crdtsync_core::acl::decide_capability(tuples, actor, path, capability, &|_| None)
+}
+
+fn evaluate(tuples: &[AclTuple], actor: &AclActor, path: &[u8], capability: Capability) -> bool {
+    crdtsync_core::acl::evaluate(tuples, actor, path, capability, &|_| None)
+}
+
+fn effective_roles(tuples: &[AclTuple], actor: &AclActor, path: &[u8]) -> Vec<Vec<u8>> {
+    crdtsync_core::acl::effective_roles(tuples, actor, path, &|_| None)
+}
 use crdtsync_core::{ClientId, Op};
 
 fn cid(first: u8) -> ClientId {
@@ -42,7 +61,7 @@ fn tup(subject: AclSubject, grant: AclGrant, effect: AclEffect, path: Vec<u8>) -
         subject,
         grant,
         effect,
-        path,
+        scope: AclScope::Path(path),
         grantor: cid(9),
     }
 }

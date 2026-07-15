@@ -10,7 +10,7 @@
 //! leaf-level deny drops just that slot; a root the reader cannot read whole loses its
 //! own leaf slots and its ACL grants.
 
-use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
+use crdtsync_core::acl::{AclGrant, AclScope, AclSubject, Capability};
 use crdtsync_core::path::{encode_path, parse_path};
 use crdtsync_core::{
     zone, AclEffect, Document, Element, ElementId, Op, RangeAnchor, Scalar, Schema, Side,
@@ -86,7 +86,14 @@ fn grant_read(d: &mut Document, path: &[u8]) -> Vec<Op> {
 
 /// The governing paths of a document's live ACL tuples, sorted.
 fn acl_paths(d: &Document) -> Vec<Vec<u8>> {
-    let mut p: Vec<Vec<u8>> = d.acl_tuples().into_iter().map(|t| t.path).collect();
+    let mut p: Vec<Vec<u8>> = d
+        .acl_tuples()
+        .into_iter()
+        .map(|t| match t.scope {
+            AclScope::Path(p) => p,
+            AclScope::Element(_) => unreachable!("fixtures grant only path scopes"),
+        })
+        .collect();
     p.sort();
     p
 }

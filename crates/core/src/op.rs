@@ -7,7 +7,7 @@
 //! whose id it has already applied. Authorship, scope, schema version, and
 //! wall time are wire/server concerns and live outside the core.
 
-use crate::acl::{AclEffect, AclGrant, AclSubject};
+use crate::acl::{AclEffect, AclGrant, AclScope, AclSubject};
 use crate::clientid::ClientId;
 use crate::elementid::ElementId;
 use crate::list::Anchor;
@@ -156,16 +156,17 @@ pub enum OpKind {
         id: ElementId,
     },
     /// Grant an [`AclTuple`](crate::acl::AclTuple) into the document's ACL set:
-    /// an allow/deny of a capability-or-role, to a subject, on a path. The new
-    /// tuple's id derives from the op's stamp, so every replica agrees and
-    /// concurrent grants are distinct entries. `grantor` is the authoring actor,
-    /// carried explicitly on the op (authorship is a wire/envelope concern, not a
-    /// core op field) and stored faithfully — core enforces no provenance here.
+    /// an allow/deny of a capability-or-role, to a subject, on a [scope](AclScope)
+    /// — a fixed path or a stable element id that follows the element across a
+    /// tree-move. The new tuple's id derives from the op's stamp, so every replica
+    /// agrees and concurrent grants are distinct entries. `grantor` is the authoring
+    /// actor, carried explicitly on the op (authorship is a wire/envelope concern,
+    /// not a core op field) and stored faithfully — core enforces no provenance here.
     AclGrant {
         subject: AclSubject,
         grant: AclGrant,
         effect: AclEffect,
-        path: Vec<u8>,
+        scope: AclScope,
         grantor: ClientId,
     },
     /// Tombstone an ACL tuple. A tuple is immutable once created; a revoke is the

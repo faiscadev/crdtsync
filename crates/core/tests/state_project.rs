@@ -592,8 +592,8 @@ fn a_stale_state_version_is_rejected() {
     let mut d = doc();
     d.transact(|tx| tx.set(b"a", Scalar::Int(1)));
     let mut bytes = d.encode_state();
-    assert_eq!(bytes[0], 10, "the current state version");
-    bytes[0] = 9;
+    assert_eq!(bytes[0], 11, "the current state version");
+    bytes[0] = 10;
     assert!(
         Document::decode_state(&bytes).is_err(),
         "a stale version is rejected, not migrated"

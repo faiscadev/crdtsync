@@ -6,7 +6,7 @@
 //! bytes, text is UTF-8, bytes and strings are length-prefixed. Decoding is
 //! total — malformed input yields a [`DecodeError`], never a panic.
 
-use crate::acl::{AclEffect, AclGrant, AclSubject, Capability};
+use crate::acl::{AclEffect, AclGrant, AclScope, AclSubject, Capability};
 use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::elementid::{ElementId, ElementKind};
@@ -227,6 +227,21 @@ pub(crate) fn put_acl_subject(out: &mut Vec<u8>, subject: &AclSubject) {
     }
 }
 
+/// An ACL scope, tag-prefixed: tag `0` a fixed path (its framed bytes), tag `1` a
+/// stable element id (its 16 raw bytes).
+pub(crate) fn put_acl_scope(out: &mut Vec<u8>, scope: &AclScope) {
+    match scope {
+        AclScope::Path(path) => {
+            put_u8(out, 0);
+            put_bytes(out, path);
+        }
+        AclScope::Element(id) => {
+            put_u8(out, 1);
+            out.extend_from_slice(&id.as_bytes());
+        }
+    }
+}
+
 /// An ACL grant: tag `0` a capability (its own tag byte), tag `1` a role name.
 pub(crate) fn put_acl_grant(out: &mut Vec<u8>, grant: &AclGrant) {
     match grant {
@@ -369,14 +384,14 @@ fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
             subject,
             grant,
             effect,
-            path,
+            scope,
             grantor,
         } => {
             put_u8(out, 19);
             put_acl_subject(out, subject);
             put_acl_grant(out, grant);
             put_acl_effect(out, *effect);
-            put_bytes(out, path);
+            put_acl_scope(out, scope);
             out.extend_from_slice(&grantor.as_bytes());
         }
         OpKind::AclRevoke { id } => {
@@ -642,6 +657,19 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    pub(crate) fn acl_scope(&mut self) -> Result<AclScope, DecodeError> {
+        Ok(match self.u8()? {
+            0 => AclScope::Path(self.bytes()?),
+            1 => AclScope::Element(self.element_id()?),
+            tag => {
+                return Err(DecodeError::BadTag {
+                    what: "acl scope",
+                    tag,
+                })
+            }
+        })
+    }
+
     pub(crate) fn acl_grant(&mut self) -> Result<AclGrant, DecodeError> {
         Ok(match self.u8()? {
             0 => AclGrant::Capability(self.capability()?),
@@ -764,7 +792,7 @@ impl<'a> Cursor<'a> {
                 subject: self.acl_subject()?,
                 grant: self.acl_grant()?,
                 effect: self.acl_effect()?,
-                path: self.bytes()?,
+                scope: self.acl_scope()?,
                 grantor: self.client()?,
             },
             20 => OpKind::AclRevoke {

@@ -72,11 +72,60 @@ pub enum AclEffect {
     Deny,
 }
 
+/// What a tuple is keyed to — the target its grant governs:
+///
+/// - [`Path`](AclScope::Path) — a fixed position in the tree, a `core::path`
+///   length-framed key sequence. A path grant governs whatever element occupies
+///   that slot: it stays put when content moves. Right for a stable structural
+///   location (a zone, a well-known field).
+/// - [`Element`](AclScope::Element) — a stable [`ElementId`]. An element grant
+///   resolves to the element's **current** path at evaluation, so it moves
+///   atomically with the element across a tree-move ([`XmlMove`](crate::op::OpKind::XmlMove)).
+///   Right for movable content that carries its own permission (a page dragged
+///   between parents, a card across columns). It closes two holes a path grant
+///   opens under tree-move: a restricted element cannot be freed by relocating it
+///   (exfil-by-move), and its restriction does not strand on the old slot to
+///   govern whatever slides in.
+///
+/// An element scope resolves through an injected [`PathResolver`] (core hosts no
+/// element index); an unresolvable id makes the grant inert (fail-closed), never
+/// failing open.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AclScope {
+    /// A fixed position path — a `core::path` length-framed key sequence, opaque
+    /// bytes to the set (stored and compared, never re-encoded).
+    Path(Vec<u8>),
+    /// A stable element id, resolved to the element's current path at evaluation.
+    Element(ElementId),
+}
+
+/// Resolves an element id to its current document path (an encoded `core::path`),
+/// or `None` when the id names no live element. Core hosts no element index, so an
+/// [`AclScope::Element`] grant is resolved through this injected map at evaluation:
+/// the grant thereby follows the element across a tree-move. The evaluator consults
+/// it only for element scopes — a [`Path`](AclScope::Path) scope never calls it.
+pub type PathResolver<'a> = dyn Fn(ElementId) -> Option<Vec<u8>> + 'a;
+
+impl AclScope {
+    /// The document path this scope governs, or `None` when it does not currently
+    /// resolve to one. A [`Path`](AclScope::Path) is its own encoded key sequence;
+    /// an [`Element`](AclScope::Element) resolves through `resolve` to the element's
+    /// current path, so the grant follows the element across a tree-move. An
+    /// unresolvable element id yields `None` — the grant is inert (fail-closed),
+    /// never governing a path it cannot be pinned to.
+    fn resolve(&self, resolve: &PathResolver) -> Option<Vec<u8>> {
+        match self {
+            AclScope::Path(p) => Some(p.clone()),
+            AclScope::Element(id) => resolve(*id),
+        }
+    }
+}
+
 /// One stored authorization tuple: an allow/deny of a capability-or-role, to a
-/// subject, on a path, recorded with the actor that granted it. Immutable once
-/// created — a change is a new tuple, and the only mutation is a revoke that
-/// tombstones it. A read view over the document's ACL set; obtain one from
-/// [`Document::acl_tuple`](crate::doc::Document::acl_tuple) or
+/// subject, on a [scope](AclScope), recorded with the actor that granted it.
+/// Immutable once created — a change is a new tuple, and the only mutation is a
+/// revoke that tombstones it. A read view over the document's ACL set; obtain one
+/// from [`Document::acl_tuple`](crate::doc::Document::acl_tuple) or
 /// [`acl_tuples`](crate::doc::Document::acl_tuples).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AclTuple {
@@ -84,9 +133,10 @@ pub struct AclTuple {
     pub subject: AclSubject,
     pub grant: AclGrant,
     pub effect: AclEffect,
-    /// A path into the document (a `core::path` length-framed key path), opaque
-    /// bytes to the set — stored and compared, never re-encoded.
-    pub path: Vec<u8>,
+    /// What the grant is keyed to — a fixed [`Path`](AclScope::Path), or an
+    /// [`Element`](AclScope::Element) that resolves to its current path so the
+    /// grant follows the element across a tree-move.
+    pub scope: AclScope,
     /// The actor that authored the grant. Stored faithfully; core performs no
     /// provenance check on it (that is the server-side evaluator's concern).
     pub grantor: ClientId,
@@ -191,13 +241,17 @@ pub fn decide_capability(
     actor: &AclActor,
     path: &[u8],
     capability: Capability,
+    resolve: &PathResolver,
 ) -> AclDecision {
     let mut deny_cap = false;
     let mut allow_cap = false;
     let mut deny_own = false;
     let mut allow_own = false;
     for t in tuples {
-        if !t.subject.matches(actor) || !governs(&t.path, path) {
+        let Some(scope_path) = t.scope.resolve(resolve) else {
+            continue;
+        };
+        if !t.subject.matches(actor) || !governs(&scope_path, path) {
             continue;
         }
         let AclGrant::Capability(c) = t.grant else {
@@ -239,9 +293,10 @@ pub fn evaluate(
     actor: &AclActor,
     path: &[u8],
     capability: Capability,
+    resolve: &PathResolver,
 ) -> bool {
     matches!(
-        decide_capability(tuples, actor, path, capability),
+        decide_capability(tuples, actor, path, capability, resolve),
         AclDecision::Allow
     )
 }
@@ -287,6 +342,7 @@ pub struct AclRecord {
 /// subject class confers no ownership an arbitrary actor could inherit (fail-closed).
 fn owns_path(
     records: &[AclRecord],
+    resolved: &[Option<Vec<u8>>],
     creator: ClientId,
     actor: ClientId,
     target: &[u8],
@@ -300,7 +356,7 @@ fn owns_path(
         r.tuple.subject == AclSubject::Actor(actor)
             && matches!(r.tuple.grant, AclGrant::Capability(Capability::Own))
             && r.tuple.effect == AclEffect::Allow
-            && governs(&r.tuple.path, target)
+            && resolved[i].as_deref().is_some_and(|p| governs(p, target))
             && rooted[i]
             && !revoked[i]
     })
@@ -311,21 +367,28 @@ fn owns_path(
 /// [`owns_path`], up to the creator.
 fn root_pass(
     records: &[AclRecord],
+    resolved: &[Option<Vec<u8>>],
     creator: ClientId,
     rooted: &[bool],
     revoked: &[bool],
 ) -> Vec<bool> {
     records
         .iter()
-        .map(|r| {
-            owns_path(
-                records,
-                creator,
-                r.tuple.grantor,
-                &r.tuple.path,
-                rooted,
-                revoked,
-            )
+        .enumerate()
+        .map(|(i, r)| {
+            // A grant whose scope does not currently resolve to a path (an
+            // unresolvable element id) roots nothing — it is inert.
+            resolved[i].as_deref().is_some_and(|p| {
+                owns_path(
+                    records,
+                    resolved,
+                    creator,
+                    r.tuple.grantor,
+                    p,
+                    rooted,
+                    revoked,
+                )
+            })
         })
         .collect()
 }
@@ -335,17 +398,21 @@ fn root_pass(
 /// owner of the grant's path.
 fn revoke_pass(
     records: &[AclRecord],
+    resolved: &[Option<Vec<u8>>],
     creator: ClientId,
     rooted: &[bool],
     revoked: &[bool],
 ) -> Vec<bool> {
     records
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
             r.revoked_by.iter().any(|&who| {
                 who == creator
                     || who == r.tuple.grantor
-                    || owns_path(records, creator, who, &r.tuple.path, rooted, revoked)
+                    || resolved[i].as_deref().is_some_and(|p| {
+                        owns_path(records, resolved, creator, who, p, rooted, revoked)
+                    })
             })
         })
         .collect()
@@ -370,8 +437,10 @@ fn revoke_pass(
 /// revoke may not). Only rooted, unrevoked actor-id `Own` grants are walked, so forged
 /// or revoked ownership lends no superiority; the `seen` set bounds the walk on any
 /// grantor cycle, so it terminates and is order-independent.
+#[allow(clippy::too_many_arguments)]
 fn at_or_above(
     records: &[AclRecord],
+    resolved: &[Option<Vec<u8>>],
     creator: ClientId,
     author: ClientId,
     grantor: ClientId,
@@ -396,7 +465,9 @@ fn at_or_above(
                     || r.tuple.effect != AclEffect::Allow
                     || !matches!(r.tuple.grant, AclGrant::Capability(Capability::Own))
                     || r.tuple.subject != AclSubject::Actor(who)
-                    || !governs(&r.tuple.path, grant_path)
+                    || !resolved[i]
+                        .as_deref()
+                        .is_some_and(|p| governs(p, grant_path))
                 {
                     continue;
                 }
@@ -427,6 +498,7 @@ fn at_or_above(
 #[allow(clippy::too_many_arguments)]
 fn deny_suppresses(
     records: &[AclRecord],
+    resolved: &[Option<Vec<u8>>],
     creator: ClientId,
     actor: &AclActor,
     path: &[u8],
@@ -441,7 +513,7 @@ fn deny_suppresses(
         if revoked[i]
             || r.tuple.effect != AclEffect::Deny
             || !r.tuple.subject.matches(actor)
-            || !governs(&r.tuple.path, path)
+            || !resolved[i].as_deref().is_some_and(|p| governs(p, path))
         {
             return false;
         }
@@ -452,6 +524,7 @@ fn deny_suppresses(
         relevant
             && at_or_above(
                 records,
+                resolved,
                 creator,
                 r.tuple.grantor,
                 granter,
@@ -507,10 +580,23 @@ pub fn decide_capability_with_authority(
     actor: &AclActor,
     path: &[u8],
     capability: Capability,
+    resolve: &PathResolver,
 ) -> AclDecision {
     let n = records.len();
     let mut rooted = vec![false; n];
     let mut revoked = vec![false; n];
+
+    // Resolve every tuple's scope to its current path once, up front: a
+    // `Path` scope is its own bytes, an `Element` scope its element's current
+    // document path (so the grant follows a tree-move), and an unresolvable
+    // element id is `None` — an inert grant that roots nothing, governs nothing,
+    // owns nothing, and denies nothing (fail-closed). The whole authority lattice
+    // below reads these resolved paths, so an element scope composes exactly as a
+    // path scope pinned to the element's live location.
+    let resolved: Vec<Option<Vec<u8>>> = records
+        .iter()
+        .map(|r| r.tuple.scope.resolve(resolve))
+        .collect();
 
     // Solve the mutually-recursive rooting/revocation relation by iterating from the
     // empty (all-false) seed. Each pass reads only the previous snapshot, so the result
@@ -520,8 +606,8 @@ pub fn decide_capability_with_authority(
     let bound = 2 * n + 2;
     let mut converged = false;
     for _ in 0..bound {
-        let next_rooted = root_pass(records, creator, &rooted, &revoked);
-        let next_revoked = revoke_pass(records, creator, &rooted, &revoked);
+        let next_rooted = root_pass(records, &resolved, creator, &rooted, &revoked);
+        let next_revoked = revoke_pass(records, &resolved, creator, &rooted, &revoked);
         if next_rooted == rooted && next_revoked == revoked {
             converged = true;
             break;
@@ -540,14 +626,14 @@ pub fn decide_capability_with_authority(
     // This makes the verdict a stable function of the merged set, never an artifact of
     // the pass count.
     if !converged {
-        let flux = revoke_pass(records, creator, &rooted, &revoked);
+        let flux = revoke_pass(records, &resolved, creator, &rooted, &revoked);
         for i in 0..n {
             if flux[i] != revoked[i] {
                 revoked[i] = false;
             }
         }
         for _ in 0..(n + 1) {
-            let next_rooted = root_pass(records, creator, &rooted, &revoked);
+            let next_rooted = root_pass(records, &resolved, creator, &rooted, &revoked);
             if next_rooted == rooted {
                 break;
             }
@@ -565,6 +651,7 @@ pub fn decide_capability_with_authority(
     let creator_owns = actor.id == creator
         && !deny_suppresses(
             records,
+            &resolved,
             creator,
             actor,
             path,
@@ -580,7 +667,10 @@ pub fn decide_capability_with_authority(
             if revoked[i] || !rooted[i] || r.tuple.effect != AclEffect::Allow {
                 return false;
             }
-            if !r.tuple.subject.matches(actor) || !governs(&r.tuple.path, path) {
+            let Some(granter_path) = resolved[i].as_deref() else {
+                return false;
+            };
+            if !r.tuple.subject.matches(actor) || !governs(granter_path, path) {
                 return false;
             }
             let AclGrant::Capability(c) = r.tuple.grant else {
@@ -592,12 +682,13 @@ pub fn decide_capability_with_authority(
             }
             !deny_suppresses(
                 records,
+                &resolved,
                 creator,
                 actor,
                 path,
                 capability,
                 r.tuple.grantor,
-                &r.tuple.path,
+                granter_path,
                 via_own,
                 &rooted,
                 &revoked,
@@ -615,7 +706,7 @@ pub fn decide_capability_with_authority(
         !revoked[i]
             && r.tuple.effect == AclEffect::Deny
             && r.tuple.subject.matches(actor)
-            && governs(&r.tuple.path, path)
+            && resolved[i].as_deref().is_some_and(|p| governs(p, path))
             && matches!(r.tuple.grant, AclGrant::Capability(c) if c == capability)
     });
     if floored {
@@ -634,18 +725,27 @@ pub fn evaluate_with_authority(
     actor: &AclActor,
     path: &[u8],
     capability: Capability,
+    resolve: &PathResolver,
 ) -> bool {
     matches!(
-        decide_capability_with_authority(records, creator, actor, path, capability),
+        decide_capability_with_authority(records, creator, actor, path, capability, resolve),
         AclDecision::Allow
     )
 }
 
-pub fn effective_roles(tuples: &[AclTuple], actor: &AclActor, path: &[u8]) -> Vec<Vec<u8>> {
+pub fn effective_roles(
+    tuples: &[AclTuple],
+    actor: &AclActor,
+    path: &[u8],
+    resolve: &PathResolver,
+) -> Vec<Vec<u8>> {
     let mut allowed: BTreeSet<Vec<u8>> = actor.roles.iter().cloned().collect();
     let mut denied: BTreeSet<Vec<u8>> = BTreeSet::new();
     for t in tuples {
-        if !t.subject.matches(actor) || !governs(&t.path, path) {
+        let Some(scope_path) = t.scope.resolve(resolve) else {
+            continue;
+        };
+        if !t.subject.matches(actor) || !governs(&scope_path, path) {
             continue;
         }
         let AclGrant::Role(ref r) = t.grant else {

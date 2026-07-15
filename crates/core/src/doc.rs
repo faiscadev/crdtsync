@@ -12,13 +12,13 @@
 //! and replays once a create restores reachability, so out-of-order delivery
 //! converges.
 
-use crate::acl::{AclEffect, AclGrant, AclRecord, AclSubject, AclTuple};
+use crate::acl::{AclEffect, AclGrant, AclRecord, AclScope, AclSubject, AclTuple};
 use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, len_u32, put_acl_effect, put_acl_grant, put_acl_subject, put_bytes,
-    put_opt_bytes, put_range_anchor, put_scalar, put_stamp, put_u32, put_u64, put_u8, Cursor,
-    DecodeError,
+    decode_ops, encode_ops, len_u32, put_acl_effect, put_acl_grant, put_acl_scope, put_acl_subject,
+    put_bytes, put_opt_bytes, put_range_anchor, put_scalar, put_stamp, put_u32, put_u64, put_u8,
+    Cursor, DecodeError,
 };
 use crate::counter::Counter;
 use crate::element::Element;
@@ -56,7 +56,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 10;
+const STATE_VERSION: u8 = 11;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -376,11 +376,12 @@ impl Document {
         self.acl_view(|_| true)
     }
 
-    /// Every live ACL tuple whose `path` matches `path` exactly. A content-neutral
-    /// storage filter — ancestor/prefix resolution is the evaluator's concern, not
-    /// this set's.
+    /// Every live ACL tuple scoped to `path` exactly — a [`Path`](AclScope::Path)
+    /// scope whose bytes equal `path`. A content-neutral storage filter:
+    /// ancestor/prefix resolution is the evaluator's concern, not this set's, and an
+    /// [`Element`](AclScope::Element) scope (which has no fixed path) never matches.
     pub fn acl_on(&self, path: &[u8]) -> Vec<AclTuple> {
-        self.acl_view(|e| e.path == path)
+        self.acl_view(|e| matches!(&e.scope, AclScope::Path(p) if p == path))
     }
 
     /// The live ACL tuples satisfying `keep`, id-sorted.
@@ -996,7 +997,7 @@ impl Document {
             put_acl_subject(&mut out, &e.subject);
             put_acl_grant(&mut out, &e.grant);
             put_acl_effect(&mut out, e.effect);
-            put_bytes(&mut out, &e.path);
+            put_acl_scope(&mut out, &e.scope);
             out.extend_from_slice(&e.grantor.as_bytes());
             // The revokers, sorted (BTreeSet order) for a deterministic encoding.
             put_u32(&mut out, len_u32(e.revokers.len()));
@@ -1054,14 +1055,15 @@ impl Document {
         // live tree. The root map is never hidden (a zone rooted at `/` would name
         // the whole document); its authorized subtrees are kept, its unauthorized
         // ones pruned below.
+        let paths = self.element_paths();
         let mut purge: HashSet<ElementId> = HashSet::new();
-        for (id, path) in self.element_paths() {
-            if id == root {
+        for (id, path) in &paths {
+            if *id == root {
                 continue;
             }
-            if let Some(zone) = zone::zone_id_of(schema, &path) {
+            if let Some(zone) = zone::zone_id_of(schema, path) {
                 if !authorized.contains(&zone) {
-                    purge.insert(id);
+                    purge.insert(*id);
                 }
             }
         }
@@ -1102,14 +1104,20 @@ impl Document {
             !purge.contains(id) && !purge.contains(&e.start.seq) && !purge.contains(&e.end.seq)
         });
         // ACL tuples are keyed by their own id, not a container's, so they are
-        // dropped by the zone their `path` resolves into (an unauthorized zone's
-        // grants would leak its path) as well as by a purged id.
+        // dropped by the zone their scope resolves into (an unauthorized zone's
+        // grants would leak its path) as well as by a purged id. An element scope
+        // resolves through the live tree's `paths`; a scope that resolves to no key
+        // sequence (an unresolvable element, a malformed path) names no zone and is
+        // kept, as an unzoned grant is.
         self.acl.retain(|id, e| {
             if purge.contains(id) {
                 return false;
             }
-            match crate::path::parse_path(&e.path).and_then(|keys| zone::zone_id_of(schema, &keys))
-            {
+            let keys = match &e.scope {
+                AclScope::Path(p) => crate::path::parse_path(p),
+                AclScope::Element(eid) => paths.get(eid).cloned(),
+            };
+            match keys.and_then(|keys| zone::zone_id_of(schema, &keys)) {
                 Some(zone) => authorized.contains(&zone),
                 None => true,
             }
@@ -1244,12 +1252,21 @@ impl Document {
         // An ACL tuple is redacted by the path it governs, not by root read: ACL state is
         // itself privacy-sensitive — a tuple reveals a subject, an effect, and the existence
         // of a governed path — so a reader keeps it only where it may read that path. This
-        // mirrors the op-stream rule (op_read_path maps an AclGrant to its own path), so a
+        // mirrors the op-stream rule (op_read_path maps an AclGrant to its scope's path), so a
         // snapshot-served partial reader materializes the same ACL subset an op-served one
-        // would. `AclTuple.path` is the encoded key path; a malformed one fails closed.
+        // would. A `Path` scope is the encoded key path; an `Element` scope resolves to its
+        // element's current path through `paths` (the grant follows the element). A scope that
+        // resolves to no key sequence — a malformed path, or an unresolvable element id —
+        // fails closed (the tuple is dropped).
         let acl_before = self.acl.len();
         self.acl.retain(|id, e| {
-            !purge.contains(id) && crate::path::parse_path(&e.path).is_some_and(|segs| reads(&segs))
+            if purge.contains(id) {
+                return false;
+            }
+            match &e.scope {
+                AclScope::Path(p) => crate::path::parse_path(p).is_some_and(|segs| reads(&segs)),
+                AclScope::Element(eid) => paths.get(eid).is_some_and(|segs| reads(segs)),
+            }
         });
         let acl_cut = self.acl.len() != acl_before;
         // A RangedElement is redacted by the path of EVERY sequence its endpoints
@@ -1514,7 +1531,7 @@ impl Document {
             let subject = cur.acl_subject()?;
             let grant = cur.acl_grant()?;
             let effect = cur.acl_effect()?;
-            let path = cur.bytes()?;
+            let scope = cur.acl_scope()?;
             let grantor = cur.client()?;
             let revoker_count = cur.u32()?;
             let mut revokers = BTreeSet::new();
@@ -1528,7 +1545,7 @@ impl Document {
                         subject,
                         grant,
                         effect,
-                        path,
+                        scope,
                         grantor,
                         revokers,
                     },
@@ -2464,7 +2481,7 @@ impl Document {
                 subject,
                 grant,
                 effect,
-                path,
+                scope,
                 grantor,
             } => {
                 let id = acl_id(stamp);
@@ -2474,7 +2491,7 @@ impl Document {
                     subject: subject.clone(),
                     grant: grant.clone(),
                     effect: *effect,
-                    path: path.clone(),
+                    scope: scope.clone(),
                     grantor: *grantor,
                     revokers: BTreeSet::new(),
                 });
@@ -2939,7 +2956,7 @@ struct AclEntry {
     subject: AclSubject,
     grant: AclGrant,
     effect: AclEffect,
-    path: Vec<u8>,
+    scope: AclScope,
     grantor: ClientId,
     revokers: BTreeSet<ClientId>,
 }
@@ -2959,7 +2976,7 @@ impl AclEntry {
             subject: self.subject.clone(),
             grant: self.grant.clone(),
             effect: self.effect,
-            path: self.path.clone(),
+            scope: self.scope.clone(),
             grantor: self.grantor,
         }
     }
@@ -3815,16 +3832,47 @@ pub struct AclCursor<'a> {
 }
 
 impl AclCursor<'_> {
-    /// Grant an ACL tuple: an allow/deny of `grant` (a capability or role) to
-    /// `subject`, on `path`, recorded with `grantor` (the authoring actor, passed
-    /// explicitly). Returns its stable id — the handle to revoke it. Core stores
-    /// the tuple faithfully; it enforces no authority over the grantor here.
+    /// Grant an ACL tuple scoped to a fixed `path` — sugar for
+    /// [`grant_scoped`](Self::grant_scoped) with an [`AclScope::Path`]. The grant
+    /// governs whatever occupies that slot; use [`grant_element`](Self::grant_element)
+    /// for a grant that follows a movable element instead.
     pub fn grant(
         &mut self,
         subject: AclSubject,
         grant: AclGrant,
         effect: AclEffect,
         path: Vec<u8>,
+        grantor: ClientId,
+    ) -> ElementId {
+        self.grant_scoped(subject, grant, effect, AclScope::Path(path), grantor)
+    }
+
+    /// Grant an ACL tuple scoped to a stable element `id` — sugar for
+    /// [`grant_scoped`](Self::grant_scoped) with an [`AclScope::Element`]. The grant
+    /// resolves to the element's current path at evaluation, so it follows the
+    /// element across a tree-move.
+    pub fn grant_element(
+        &mut self,
+        subject: AclSubject,
+        grant: AclGrant,
+        effect: AclEffect,
+        id: ElementId,
+        grantor: ClientId,
+    ) -> ElementId {
+        self.grant_scoped(subject, grant, effect, AclScope::Element(id), grantor)
+    }
+
+    /// Grant an ACL tuple: an allow/deny of `grant` (a capability or role) to
+    /// `subject`, on `scope` (a fixed path or a stable element id), recorded with
+    /// `grantor` (the authoring actor, passed explicitly). Returns its stable id —
+    /// the handle to revoke it. Core stores the tuple faithfully; it enforces no
+    /// authority over the grantor here.
+    pub fn grant_scoped(
+        &mut self,
+        subject: AclSubject,
+        grant: AclGrant,
+        effect: AclEffect,
+        scope: AclScope,
         grantor: ClientId,
     ) -> ElementId {
         let root = self.doc.root_id();
@@ -3834,7 +3882,7 @@ impl AclCursor<'_> {
                 subject,
                 grant,
                 effect,
-                path,
+                scope,
                 grantor,
             },
         );

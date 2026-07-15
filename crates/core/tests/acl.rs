@@ -7,7 +7,7 @@
 //! RangedElement set: concurrent grants union to distinct ids, a tuple is
 //! immutable once created, and a revoke tombstones it (retained, delete-wins).
 
-use crdtsync_core::acl::{AclEffect, AclGrant, AclSubject, AclTuple, Capability};
+use crdtsync_core::acl::{AclEffect, AclGrant, AclScope, AclSubject, AclTuple, Capability};
 use crdtsync_core::doc::Document;
 use crdtsync_core::elementid::ElementId;
 use crdtsync_core::path::encode_path;
@@ -51,7 +51,7 @@ fn a_grant_records_its_subject_grant_effect_path_and_grantor() {
     assert_eq!(t.subject, AclSubject::Actor(cid(2)));
     assert_eq!(t.grant, AclGrant::Capability(Capability::Own));
     assert_eq!(t.effect, AclEffect::Allow);
-    assert_eq!(t.path, path);
+    assert_eq!(t.scope, AclScope::Path(path));
     assert_eq!(t.grantor, grantor);
     assert_eq!(d.acl_tuples().len(), 1);
 }
