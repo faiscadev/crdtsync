@@ -379,8 +379,13 @@ pub fn step(
             // element's current path, so a grant follows the element across a
             // tree-move. Built once and shared by every doc-ACL read decision on this
             // subscribe (root gate, subtree admission, per-op catch-up, whole-document
-            // snapshot check), so they all resolve an element to the same path.
-            let index = hub.element_paths(&room);
+            // snapshot check), so they all resolve an element to the same path. A room
+            // with no doc-ACL records has no scopes to resolve, so skip the tree walk.
+            let index = if records.is_empty() {
+                HashMap::new()
+            } else {
+                hub.element_paths(&room)
+            };
             let root_path = crdtsync_core::path::encode_path(&[]);
             // Whole-document read: the composed verdict at the root — the creator, a
             // root-level grant, or a deployment/schema room-read allow. It also
@@ -639,10 +644,18 @@ pub fn step(
             // in. A first write to a fresh room finds no creator and no tuples, so
             // the tier abstains and the deployment/schema tiers bootstrap it; that
             // authorized first writer then becomes the creator (below).
+            // Element scopes resolve through the room's element-context index; a room
+            // with no doc-ACL records has none to resolve, so skip the tree walk.
+            let records = hub.acl_records(&room);
+            let index = if records.is_empty() {
+                HashMap::new()
+            } else {
+                hub.element_paths(&room)
+            };
             let doc_acl = doc_acl_tier(
-                &hub.acl_records(&room),
+                &records,
                 hub.room_creator(&room).as_deref(),
-                &hub.element_paths(&room),
+                &index,
                 identity,
                 Action::Write,
             );

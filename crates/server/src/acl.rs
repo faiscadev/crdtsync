@@ -791,8 +791,13 @@ pub fn op_read_path(
             scope_path(index, scope).unwrap_or_else(|| encode_path(&[]))
         }
         // A revoke names only the tombstoned tuple's id; gate it by that tuple's
-        // governing path so a recipient sees the revoke exactly where it saw the
-        // grant. An id resolving to no held tuple is a moot revoke → root.
+        // governing path so a recipient sees the revoke where it may read the grant.
+        // For a `Path` scope that is the same fixed path the grant was gated at; an
+        // `Element` scope gates at the element's *current* path, so — as with the grant
+        // itself — the revoke's audience follows the element, and a move between a grant
+        // and its revoke shifts both with the element (consistent with the grant's
+        // enforcement, which likewise tracks the element). An id resolving to no held
+        // tuple is a moot revoke → root.
         OpKind::AclRevoke { id } => records
             .iter()
             .find(|r| r.tuple.id == *id)
@@ -886,11 +891,7 @@ fn scope_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, scope: &AclScope) -> Opt
 fn element_resolver(
     index: &HashMap<ElementId, Vec<Vec<u8>>>,
 ) -> impl Fn(ElementId) -> Option<Vec<u8>> + '_ {
-    move |id| {
-        index
-            .get(&id)
-            .map(|segs| encode_path(&segs.iter().map(|s| s.as_slice()).collect::<Vec<_>>()))
-    }
+    move |id| scope_path(index, &AclScope::Element(id))
 }
 
 /// The doc-ACL [`Capability`] a data-plane [`Action`] resolves to, or `None` for

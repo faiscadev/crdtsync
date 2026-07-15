@@ -1255,9 +1255,11 @@ impl Document {
         // mirrors the op-stream rule (op_read_path maps an AclGrant to its scope's path), so a
         // snapshot-served partial reader materializes the same ACL subset an op-served one
         // would. A `Path` scope is the encoded key path; an `Element` scope resolves to its
-        // element's current path through `paths` (the grant follows the element). A scope that
-        // resolves to no key sequence — a malformed path, or an unresolvable element id —
-        // fails closed (the tuple is dropped).
+        // element's current path through `paths` (the grant follows the element). An `Element`
+        // scope that does not resolve (an unresolvable element id) falls back to root read —
+        // the same fallback the op-stream takes (`op_read_path` gates it at root), so an
+        // unresolvable-element tuple reaches exactly the readers on either seam and the two
+        // catch-ups stay convergent. A malformed `Path` fails closed (dropped).
         let acl_before = self.acl.len();
         self.acl.retain(|id, e| {
             if purge.contains(id) {
@@ -1265,7 +1267,7 @@ impl Document {
             }
             match &e.scope {
                 AclScope::Path(p) => crate::path::parse_path(p).is_some_and(|segs| reads(&segs)),
-                AclScope::Element(eid) => paths.get(eid).is_some_and(|segs| reads(segs)),
+                AclScope::Element(eid) => paths.get(eid).map_or(root_reads, |segs| reads(segs)),
             }
         });
         let acl_cut = self.acl.len() != acl_before;

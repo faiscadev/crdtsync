@@ -612,6 +612,51 @@ fn the_scope_codec_is_total_over_truncation_and_a_bad_tag() {
     );
 }
 
+#[test]
+fn a_projection_redacts_an_unresolvable_element_tuple_by_root_read() {
+    // Regression: a snapshot projection must redact an unresolvable-element ACL tuple by
+    // ROOT read — the same fallback the server op-stream takes (`op_read_path` gates it
+    // at root) — so a snapshot-served reader and an op-served reader converge on it.
+    // Dropping it here (fail-closed to nothing) diverged the two catch-up seams: an
+    // op-served root reader kept the tuple while a snapshot-served one lost it.
+    let mut d = Document::new(cid(1));
+    let card = board(&mut d);
+    let gid = std::cell::Cell::new(ElementId::from_bytes([0u8; 16]));
+    d.transact(|tx| {
+        let g = tx.acl().grant_element(
+            AclSubject::Actor(cid(2)),
+            cap(Capability::Read),
+            AclEffect::Deny,
+            card,
+            cid(1),
+        );
+        gid.set(g);
+    });
+    // Delete the card so its id no longer resolves in the live tree.
+    path::xml_child_delete(&mut d, &col_a(), 0);
+    assert!(
+        element_paths(&d).get(&card).is_none(),
+        "the card is unresolvable after deletion"
+    );
+
+    // A root-reading projection keeps the tuple (root fallback) — as the op-stream does.
+    let mut keep = Document::decode_state(&d.encode_state()).expect("round-trip");
+    keep.project_read_paths(|_path| true);
+    assert!(
+        keep.acl_tuple(gid.get()).is_some(),
+        "a root reader keeps the unresolvable-element tuple, matching the op-stream"
+    );
+
+    // A projection that cannot read root drops it — as the op-stream withholds a
+    // root-gated op from a non-root reader.
+    let mut cut = Document::decode_state(&d.encode_state()).expect("round-trip");
+    cut.project_read_paths(|path| !path.is_empty());
+    assert!(
+        cut.acl_tuple(gid.get()).is_none(),
+        "a reader that cannot read root drops the unresolvable-element tuple"
+    );
+}
+
 /// Emit one element-scoped `AclGrant` op against `d` and return its wire bytes.
 fn grant_op_bytes(d: &mut Document, scope: AclScope) -> Vec<u8> {
     let subject = AclSubject::Actor(cid(2));
