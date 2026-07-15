@@ -19,7 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     # Miri is the memory gate: UB + leaks, deterministic and cross-platform.
     # One shard per crate so the three run in parallel — wall-clock is the
-    # slowest single crate, not the sum.
+    # slowest single crate, not the sum. Within each shard: a warm build cache
+    # skips the cold Miri codegen + sysroot rebuild, and nextest fans the tests
+    # across cores instead of one serial process.
     strategy:
       fail-fast: false
       matrix:
@@ -28,8 +30,19 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install Miri
         run: rustup toolchain install nightly --component miri
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Per-crate key so the three shards keep separate caches instead of
+          # clobbering one; the Miri-built std sysroot lives under ~/.cache/miri.
+          prefix-key: miri
+          key: ${{ matrix.crate }}
+          cache-directories: ~/.cache/miri
+          cache-on-failure: true
+      - name: Build the Miri sysroot
+        run: cargo +nightly miri setup
       - name: Miri
-        run: cargo +nightly miri test -p ${{ matrix.crate }}
+        run: cargo +nightly miri nextest run -p ${{ matrix.crate }}
 
   python-sdk:
     runs-on: ubuntu-latest
