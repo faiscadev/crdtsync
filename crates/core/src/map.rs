@@ -30,6 +30,12 @@ const SLOT_TEXT: u8 = 5;
 const SLOT_XML_ELEMENT: u8 = 6;
 const SLOT_XML_FRAGMENT: u8 = 7;
 
+/// Slot presence tags: a slot is live, a leaf tombstone, or a deleted-container
+/// tombstone carrying the create-stamp its snapshot migration resurrects at.
+const SLOT_LIVE: u8 = 0;
+const SLOT_LEAF_TOMB: u8 = 1;
+const SLOT_CONTAINER_TOMB: u8 = 2;
+
 /// A map read from a snapshot: its id and slots, with composite children still
 /// unresolved references into the document's by-id registries.
 pub(crate) struct DecodedMap {
@@ -43,6 +49,9 @@ pub(crate) struct DecodedSlot {
     pub(crate) stamp: Stamp,
     pub(crate) tombstone: bool,
     pub(crate) value: Option<SlotValue>,
+    /// The retained (stamp, kind) of a deleted-container tombstone, `None`
+    /// otherwise — carried through so a re-decoded snapshot can still resurrect.
+    pub(crate) deleted: Option<(Stamp, ElementKind)>,
 }
 
 /// A decoded slot value: a leaf is self-contained; a composite is a kind-tagged
@@ -63,6 +72,24 @@ struct Entry {
     /// `None` exactly when `tombstone` is true.
     value: Option<Element>,
     tombstone: bool,
+    /// The container (map / list / text) that held this slot just before it was
+    /// tombstoned — retained across the delete so a snapshot migration can
+    /// resurrect the create at its old key and re-key the delete faithfully,
+    /// matching the op seam (which carries the container-create verbatim in the
+    /// log). `Some` only on a deleted-container tombstone; `None` on every live
+    /// slot and every leaf tombstone, which pay no extra bytes.
+    deleted: Option<DeletedContainer>,
+}
+
+/// The identity a snapshot migration resurrects a deleted container by: the stamp
+/// its create landed at, plus which key-derived kind (map / list / text) it was,
+/// so a key that hosted more than one container kind resurrects the exact one the
+/// last delete tombstoned. XML kinds derive ids by node, not key, so they are not
+/// resurrectable here and never recorded.
+#[derive(Clone, Copy)]
+struct DeletedContainer {
+    stamp: Stamp,
+    kind: ElementKind,
 }
 
 pub struct Map {
@@ -127,10 +154,19 @@ impl Map {
     }
 
     /// Whether `key`'s slot is a tombstone (deleted, no live value). A migration
-    /// consults this to tell a deleted container's slot — whose lost identity a
-    /// snapshot cannot re-key faithfully — from a live one.
+    /// consults this to tell a deleted container's slot from a live one.
     pub(crate) fn slot_is_tombstone(&self, key: &[u8]) -> bool {
         self.slots.get(key).is_some_and(|e| e.tombstone)
+    }
+
+    /// The retained (create-stamp, kind) of the deleted container that held `key`,
+    /// if the slot is a container tombstone — what a snapshot migration resurrects
+    /// the create by. `None` for a live slot or a leaf tombstone.
+    pub(crate) fn slot_deleted_container(&self, key: &[u8]) -> Option<(Stamp, ElementKind)> {
+        self.slots
+            .get(key)
+            .and_then(|e| e.deleted)
+            .map(|d| (d.stamp, d.kind))
     }
 
     /// Remove the slot at `key`, returning its `(stamp, value, tombstone)`.
@@ -159,6 +195,10 @@ impl Map {
                 stamp,
                 value,
                 tombstone,
+                // A migration re-homes a leaf body, or resurrects a container as a
+                // fresh live slot / a plain tombstone at the destination key —
+                // neither retains a deleted-container identity under the new key.
+                deleted: None,
             },
         );
     }
@@ -175,9 +215,22 @@ impl Map {
         for (key, entry) in slots {
             put_bytes(out, key);
             put_stamp(out, &entry.stamp);
-            put_u8(out, entry.tombstone as u8);
-            if entry.tombstone {
-                continue;
+            // The slot tag: `0` live, `1` a leaf tombstone, `2` a deleted-container
+            // tombstone carrying its create-stamp and kind. Only tag `2` costs the
+            // extra stamp + kind byte; a live slot and a leaf tombstone encode
+            // exactly as before.
+            match (entry.tombstone, entry.deleted) {
+                (false, _) => put_u8(out, SLOT_LIVE),
+                (true, None) => {
+                    put_u8(out, SLOT_LEAF_TOMB);
+                    continue;
+                }
+                (true, Some(deleted)) => {
+                    put_u8(out, SLOT_CONTAINER_TOMB);
+                    put_stamp(out, &deleted.stamp);
+                    put_u8(out, deleted.kind as u8);
+                    continue;
+                }
             }
             match entry.value.as_ref().expect("a live slot holds a value") {
                 Element::Scalar(s) => {
@@ -208,9 +261,22 @@ impl Map {
         for _ in 0..count {
             let key = cur.bytes()?;
             let stamp = cur.stamp()?;
-            let tombstone = match cur.u8()? {
-                0 => false,
-                1 => true,
+            let (tombstone, deleted) = match cur.u8()? {
+                SLOT_LIVE => (false, None),
+                SLOT_LEAF_TOMB => (true, None),
+                SLOT_CONTAINER_TOMB => {
+                    let stamp = cur.stamp()?;
+                    let kind = match ElementKind::from_tag(cur.u8()?) {
+                        Some(k @ (ElementKind::Map | ElementKind::List | ElementKind::Text)) => k,
+                        _ => {
+                            return Err(DecodeError::BadTag {
+                                what: "deleted-container kind",
+                                tag: 0,
+                            })
+                        }
+                    };
+                    (true, Some((stamp, kind)))
+                }
                 tag => {
                     return Err(DecodeError::BadTag {
                         what: "map slot tombstone",
@@ -245,6 +311,7 @@ impl Map {
                 stamp,
                 tombstone,
                 value,
+                deleted,
             });
         }
         Ok(DecodedMap { id, slots })
@@ -258,6 +325,7 @@ impl Map {
         stamp: Stamp,
         value: Option<Element>,
         tombstone: bool,
+        deleted: Option<(Stamp, ElementKind)>,
     ) -> bool {
         self.slots
             .insert(
@@ -266,6 +334,7 @@ impl Map {
                     stamp,
                     value,
                     tombstone,
+                    deleted: deleted.map(|(stamp, kind)| DeletedContainer { stamp, kind }),
                 },
             )
             .is_some()
@@ -335,6 +404,7 @@ impl Map {
                         stamp,
                         value: Some(value),
                         tombstone: false,
+                        deleted: None,
                     },
                 );
             }
@@ -345,6 +415,25 @@ impl Map {
         if self.slots.get(key).is_some_and(|e| !stamp.gt(&e.stamp)) {
             return;
         }
+        // Retain the identity a snapshot migration needs to resurrect a deleted
+        // container at its old key: capture the live container's (current stamp,
+        // kind) when this delete tombstones a key-resurrectable one (map / list /
+        // text — an XML kind derives its id by node, not key, so it is not
+        // resurrectable here); a re-delete inherits the identity already held. A
+        // leaf slot retains nothing.
+        let deleted = match self.slots.get(key) {
+            Some(e) if !e.tombstone => e.value.as_ref().and_then(|v| match v.kind() {
+                kind @ (ElementKind::Map | ElementKind::List | ElementKind::Text) => {
+                    Some(DeletedContainer {
+                        stamp: e.stamp,
+                        kind,
+                    })
+                }
+                _ => None,
+            }),
+            Some(e) => e.deleted,
+            None => None,
+        };
         self.evict(key);
         self.slots.insert(
             key.to_vec(),
@@ -352,6 +441,7 @@ impl Map {
                 stamp,
                 value: None,
                 tombstone: true,
+                deleted,
             },
         );
     }
@@ -401,6 +491,11 @@ impl Map {
             {
                 continue;
             }
+            // The deleted-container identity rides with the LWW winner, whichever
+            // entry that is — never a mix of the two — so a merge is commutative:
+            // the retained (stamp, kind) is a deterministic function of the winning
+            // delete, not of the merge order. Only a tombstone carries one.
+            let deleted = se.deleted.filter(|_| se.tombstone);
             self.evict(key);
             self.slots.insert(
                 key.clone(),
@@ -408,6 +503,7 @@ impl Map {
                     stamp: se.stamp,
                     value: se.value.as_ref().map(|v| v.deep_clone()),
                     tombstone: se.tombstone,
+                    deleted,
                 },
             );
         }
@@ -509,6 +605,7 @@ impl Map {
                 stamp,
                 value: Some(value),
                 tombstone: false,
+                deleted: None,
             },
         );
     }
@@ -524,6 +621,7 @@ impl Map {
                         stamp: e.stamp,
                         value: e.value.as_ref().map(|v| v.deep_clone()),
                         tombstone: e.tombstone,
+                        deleted: e.deleted,
                     },
                 )
             })
@@ -553,5 +651,58 @@ impl Map {
 
     pub fn is_displaced(&self) -> bool {
         self.displaced.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ClientId;
+
+    fn stamp(lamport: u64) -> Stamp {
+        Stamp {
+            lamport,
+            client: ClientId::from_bytes([1; 16]),
+        }
+    }
+
+    fn eid(b: u8) -> ElementId {
+        ElementId::from_bytes([b; 16])
+    }
+
+    #[test]
+    fn merge_of_a_deleted_container_identity_is_commutative() {
+        // A container tombstone (deleted identity, lower stamp) and a leaf
+        // tombstone (no identity, higher stamp) at the same key. The higher stamp
+        // wins in either merge direction, so its (absent) identity must survive
+        // regardless of order — a create identity is never mixed across the two,
+        // or the two seams would encode the same key as different slot tags.
+        let mut a = Map::new(eid(1));
+        a.set(
+            b"k",
+            Element::Map(Rc::new(RefCell::new(Map::new(eid(9))))),
+            stamp(1),
+        );
+        a.delete(b"k", stamp(2)); // container tombstone: deleted = Some((s1, Map))
+        assert!(a.slot_deleted_container(b"k").is_some());
+
+        let mut b = Map::new(eid(1));
+        b.set(b"k", Element::Scalar(Scalar::Int(1)), stamp(3));
+        b.delete(b"k", stamp(4)); // leaf tombstone: deleted = None
+        assert!(b.slot_deleted_container(b"k").is_none());
+
+        let mut ab = a.deep_clone();
+        ab.merge(&b);
+        let mut ba = b.deep_clone();
+        ba.merge(&a);
+        assert_eq!(
+            ab.slot_deleted_container(b"k"),
+            ba.slot_deleted_container(b"k"),
+            "merge order must not change the retained create identity"
+        );
+        assert!(
+            ab.slot_deleted_container(b"k").is_none(),
+            "the winning (higher-stamp) leaf tombstone carries no create identity"
+        );
     }
 }

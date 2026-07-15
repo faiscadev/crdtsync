@@ -8,9 +8,12 @@
 //! an added field down / a removed field up, rename a renamed field) while
 //! carrying a container-create verbatim; `migrate_leaf_slots` is that same
 //! transform at snapshot granularity — a per-key `SlotFate` over every leaf
-//! slot, containers untouched — so a snapshot-served joiner and an op-delta
-//! joiner converge. A dropped or renamed counter's element moves with its slot,
-//! leaving no phantom behind.
+//! slot, a live container carried verbatim — so a snapshot-served joiner and an
+//! op-delta joiner converge. A *deleted* container's tombstone is re-keyed
+//! faithfully by its retained create-stamp: the container resurrects live at the
+//! old key while its delete re-keys, matching the op seam byte-for-byte. A
+//! dropped or renamed counter's element moves with its slot, leaving no phantom
+//! behind.
 
 use crdtsync_core::doc::{Document, SlotFate};
 use crdtsync_core::{Element, ElementId, ElementKind, Scalar};
@@ -148,26 +151,90 @@ fn a_text_slot_is_never_dropped_or_renamed() {
 }
 
 #[test]
-fn a_deleted_container_slot_is_carried_verbatim() {
-    // A create-then-delete leaves a tombstone slot (value None) plus the displaced
-    // container retained in the registry. It must NOT migrate as a leaf tombstone:
-    // the op seam carries the create verbatim (resurrecting it at the old key) and
-    // the materialized snapshot has lost the create's stamp, so a snapshot cannot
-    // re-key it faithfully — it is carried verbatim, both drop and rename a no-op.
+fn a_deleted_container_slot_is_re_keyed_faithfully_on_rename() {
+    // A create-then-delete leaves a tombstone whose retained create-stamp lets the
+    // snapshot resurrect the container live at the old key (the create the op seam
+    // carries verbatim there) and re-key the delete to a fresh tombstone at the new
+    // key — the same state an op-served joiner reaches, not a verbatim carry.
     let mut d = doc();
     d.transact(|tx| {
         tx.map(b"note").set(b"inner", Scalar::Int(7));
     });
     d.transact(|tx| tx.delete(b"note"));
     assert!(
-        !d.migrate_leaf_slots(drop_keys(&[b"note"])),
-        "a deleted container's tombstone is not dropped as a leaf"
+        d.migrate_leaf_slots(rename(b"note", b"renamed")),
+        "the deleted container is re-keyed, a real change"
+    );
+    match d.get(b"note") {
+        Some(Element::Map(m)) => {
+            assert!(
+                matches!(
+                    m.borrow().get(b"inner"),
+                    Some(Element::Scalar(Scalar::Int(7)))
+                ),
+                "the container resurrects live at the old key with its content"
+            );
+        }
+        _ => panic!("expected the resurrected container at the old key"),
+    }
+    assert!(
+        d.get(b"renamed").is_none(),
+        "the delete re-keyed: the new key holds a tombstone, not a live slot"
+    );
+    // The re-key survives a round-trip: the resurrected container and the moved
+    // tombstone re-encode canonically.
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).unwrap();
+    assert_eq!(back.encode_state(), bytes, "re-encode is canonical");
+}
+
+#[test]
+fn a_multi_kind_key_resurrects_the_last_deleted_kind() {
+    // A key can host more than one container kind over its life — a map created
+    // then deleted, then a list created then deleted. Both ids stay registered, so
+    // the resurrection must pick the kind the last delete tombstoned (the list),
+    // not a fixed priority. The list won the slot before its delete, so the op
+    // seam resurrects the list; the snapshot must match.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"k").set(b"m", Scalar::Int(1));
+    });
+    d.transact(|tx| tx.delete(b"k"));
+    d.transact(|tx| {
+        tx.list(b"k").insert(0, Scalar::Int(2));
+    });
+    d.transact(|tx| tx.delete(b"k"));
+    assert!(d.migrate_leaf_slots(rename(b"k", b"k2")));
+    assert!(
+        matches!(d.get(b"k"), Some(Element::List(_))),
+        "the last-deleted kind (list) resurrects, not the map a fixed priority would pick"
+    );
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).unwrap();
+    assert_eq!(back.encode_state(), bytes, "re-encode is canonical");
+}
+
+#[test]
+fn a_deleted_container_slot_is_resurrected_on_drop() {
+    // Dropping a deleted container's field drops its delete op (the op seam drops
+    // a removed field's ops) while the create carries verbatim — so the container
+    // resurrects live at its key, no tombstone re-keyed anywhere.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"note").set(b"inner", Scalar::Int(7));
+    });
+    d.transact(|tx| tx.delete(b"note"));
+    assert!(
+        d.migrate_leaf_slots(drop_keys(&[b"note"])),
+        "the deleted container is resurrected, a real change"
     );
     assert!(
-        !d.migrate_leaf_slots(rename(b"note", b"renamed")),
-        "a deleted container's tombstone is not re-keyed as a leaf"
+        matches!(d.get(b"note"), Some(Element::Map(_))),
+        "the container resurrects live at its key"
     );
-    assert!(d.get(b"renamed").is_none(), "nothing lands at the new key");
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).unwrap();
+    assert_eq!(back.encode_state(), bytes, "re-encode is canonical");
 }
 
 #[test]
@@ -492,4 +559,76 @@ fn a_scoped_fate_narrows_to_its_owning_map() {
         "task.title is untouched"
     );
     assert_eq!(nested_reg(&d, b"task", b"heading"), None);
+}
+
+// --- persisted container create-stamp (STATE_VERSION 10) ---
+
+#[test]
+fn a_deleted_container_tombstone_round_trips_its_create_stamp() {
+    // The create-stamp a deleted container retains must survive encode/decode, or a
+    // re-decoded snapshot could no longer resurrect it. A round-trip is canonical,
+    // and the re-decoded tombstone still re-keys faithfully.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"note").set(b"inner", Scalar::Int(7));
+    });
+    d.transact(|tx| tx.delete(b"note"));
+    let bytes = d.encode_state();
+    let mut back = Document::decode_state(&bytes).unwrap();
+    assert_eq!(back.encode_state(), bytes, "the create-stamp round-trips");
+    // The retained stamp still drives a faithful re-key after the round-trip.
+    assert!(back.migrate_leaf_slots(rename(b"note", b"renamed")));
+    assert!(
+        matches!(back.get(b"note"), Some(Element::Map(_))),
+        "the re-decoded tombstone resurrects at the old key"
+    );
+    assert!(back.get(b"renamed").is_none());
+}
+
+#[test]
+fn a_stale_state_version_is_rejected() {
+    // Pre-release, a snapshot at any version but the current one is refused hard —
+    // no dual-decode path silently misreads a v9 container tombstone.
+    let mut d = doc();
+    d.transact(|tx| tx.set(b"a", Scalar::Int(1)));
+    let mut bytes = d.encode_state();
+    assert_eq!(bytes[0], 10, "the current state version");
+    bytes[0] = 9;
+    assert!(
+        Document::decode_state(&bytes).is_err(),
+        "a stale version is rejected, not migrated"
+    );
+}
+
+#[test]
+fn only_a_deleted_container_tombstone_pays_the_extra_bytes() {
+    // The retained create identity is a per-deleted-container-tombstone cost; a
+    // leaf tombstone pays nothing new. Deleting a leaf vs an (empty) container at
+    // the same key, both one tombstone slot, isolates the delta: the create
+    // identity (one stamp = u64 lamport + 16-byte client = 24 bytes, plus a 1-byte
+    // kind tag) plus the pre-existing per-container costs a leaf never had — the
+    // child-map registry entry (id + zero-slot count = 20 bytes) and its parent
+    // link (child id + parent id = 32 bytes).
+    let leaf_tomb = {
+        let mut d = doc();
+        d.transact(|tx| tx.set(b"k", Scalar::Int(1)));
+        d.transact(|tx| tx.delete(b"k"));
+        d.encode_state()
+    };
+    let container_tomb = {
+        let mut d = doc();
+        d.transact(|tx| {
+            tx.map(b"k");
+        });
+        d.transact(|tx| tx.delete(b"k"));
+        d.encode_state()
+    };
+    const CREATE_IDENTITY: usize = 24 + 1;
+    const CHILD_MAP_REGISTRY: usize = 16 + 4;
+    const PARENT_LINK: usize = 16 + 16;
+    assert_eq!(
+        container_tomb.len() - leaf_tomb.len(),
+        CREATE_IDENTITY + CHILD_MAP_REGISTRY + PARENT_LINK,
+        "of the delta over a leaf tombstone, only the create identity is this change's tax"
+    );
 }

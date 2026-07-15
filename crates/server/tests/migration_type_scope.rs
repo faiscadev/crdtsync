@@ -241,3 +241,73 @@ fn an_unresolvable_owning_element_falls_back_to_key() {
         other => panic!("expected a MapSet, got {other:?}"),
     }
 }
+
+/// A container field's schema, `foo` renamed to `bar` at the Doc level.
+fn container_schema(field: &str) -> Schema {
+    Schema::parse(&format!(
+        r#"{{ "schema": "s", "version": 1, "root": "Doc", "types": {{
+            "Doc": {{ "kind": "map", "children": {{ "{field}": "Inner" }} }},
+            "Inner": {{ "kind": "map", "children": {{ "x": "Str" }} }},
+            "Str": {{ "kind": "register" }} }} }}"#
+    ))
+    .expect("schema parses")
+}
+
+/// The shared state (container registries, parent links) with the replica-local
+/// identity — the client id and the local seq counter, which legitimately differ
+/// between a fresh op-applying replica and a decoded snapshot — normalized away.
+fn shared_state(d: &Document) -> Vec<u8> {
+    Document::decode_state_as(cid(9), 1000, &d.encode_state())
+        .expect("re-decodes")
+        .encode_state()
+}
+
+#[test]
+fn a_deleted_container_field_converges_across_seams() {
+    // The load-bearing property: a created-then-deleted container field, renamed,
+    // reaches BYTE-IDENTICAL state through the op seam and the snapshot seam. The
+    // op seam carries the container-create verbatim (resurrecting it live at the
+    // old key) and re-keys the delete; the snapshot seam does the same from the
+    // persisted create-stamp. On main the two hold the delete's tombstone under
+    // different dead keys — this extends the leaf convergence of #274 to containers.
+    let edge = r#"{ "from": 1, "to": 2, "steps": [
+        { "kind": "renameField", "type": "Doc", "from": "foo", "to": "bar" } ] }"#;
+    let mut reg = SchemaRegistry::new();
+    reg.register(APP, 1, b"{}", b"").unwrap();
+    reg.register(APP, 2, b"{}", edge.as_bytes()).unwrap();
+    let s2 = container_schema("bar");
+
+    let mut w = Document::new(cid(1));
+    let mut ops = w.transact(|tx| {
+        tx.map(b"foo").register(b"x", Scalar::Int(1));
+    });
+    ops.extend(w.transact(|tx| tx.delete(b"foo")));
+    let snapshot = w.encode_state();
+
+    // Op-delta joiner: the writer's client id, so only replica-local sync state
+    // (the local seq counter) can differ — normalized by `shared_state`.
+    let chain = resolve_chain(&reg, APP, 1, 2).unwrap();
+    let types = element_types(&w, &s2);
+    let mut via_delta = Document::new(cid(1));
+    for op in chain.translate_ops_scoped(&ops, &types) {
+        via_delta.apply(&op);
+    }
+
+    // Snapshot joiner: the whole v1 state up-migrated to v2.
+    let projected = translate_snapshot_scoped(&reg, APP, &snapshot, 1, 2, Some(&s2));
+    let via_snapshot = Document::decode_state(&projected).unwrap();
+
+    // Value-level: the container resurrects live at the old key on both seams, and
+    // nothing lands live at the new key (the delete re-keyed there).
+    assert!(matches!(via_delta.get(b"foo"), Some(Element::Map(_))));
+    assert!(matches!(via_snapshot.get(b"foo"), Some(Element::Map(_))));
+    assert!(via_delta.get(b"bar").is_none());
+    assert!(via_snapshot.get(b"bar").is_none());
+
+    // Byte-level: the shared state is identical.
+    assert_eq!(
+        shared_state(&via_delta),
+        shared_state(&via_snapshot),
+        "the op seam and the snapshot seam reach byte-identical shared state"
+    );
+}
