@@ -12,7 +12,9 @@
 
 use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
 use crdtsync_core::path::{encode_path, parse_path};
-use crdtsync_core::{zone, AclEffect, Document, Element, Op, Scalar, Schema};
+use crdtsync_core::{
+    zone, AclEffect, Document, Element, ElementId, Op, RangeAnchor, Scalar, Schema, Side,
+};
 
 mod common;
 use common::cid;
@@ -394,4 +396,175 @@ fn a_reader_limited_by_both_doc_acl_and_zones_gets_the_intersection() {
     // The stacked projection round-trips through the codec.
     let back = Document::decode_state(&d.encode_state()).unwrap();
     assert!(back.get(b"board").is_some() && back.get(b"secret").is_none());
+}
+
+/// Create a top-level List holding `items` bytes items, returning the emitted ops so
+/// an op-served replica can selectively apply them.
+fn list_ops(d: &mut Document, key: &[u8], items: usize) -> Vec<Op> {
+    let mut ops = Vec::new();
+    for i in 0..items {
+        ops.extend(crdtsync_core::path::list_insert(
+            d,
+            &encode_path(&[key]),
+            i,
+            b"x",
+        ));
+    }
+    ops
+}
+
+/// A range endpoint at `index` in the top-level List `key`, gravity left.
+fn anchor(d: &Document, key: &[u8], index: usize) -> RangeAnchor {
+    let seq = match d.get(key) {
+        Some(Element::List(l)) => l.borrow().id(),
+        _ => panic!("expected a live list at {key:?}"),
+    };
+    RangeAnchor {
+        seq,
+        pos: crdtsync_core::path::relative_position(d, &encode_path(&[key]), index, Side::Left)
+            .expect("a live sequence yields a position"),
+    }
+}
+
+/// A RangedElement spanning `[start_key[0], end_key[1])`; the two keys may name
+/// different sequences (a cross-element range). Returns the emitted ops and its id.
+fn make_range(d: &mut Document, start_key: &[u8], end_key: &[u8]) -> (Vec<Op>, ElementId) {
+    let start = anchor(d, start_key, 0);
+    let end = anchor(d, end_key, 1);
+    let mut id = None;
+    let ops = d.transact(|tx| {
+        id = Some(tx.ranged().create(start, end, Scalar::Bool(true)));
+    });
+    (ops, id.expect("a create emits a range id"))
+}
+
+/// The ids of a document's live RangedElements, sorted.
+fn ranged_ids(d: &Document) -> Vec<ElementId> {
+    let mut v: Vec<ElementId> = d.ranged_elements().into_iter().map(|r| r.id).collect();
+    v.sort_by_key(|id| id.as_bytes());
+    v
+}
+
+#[test]
+fn a_single_sequence_mark_is_kept_only_where_its_anchor_seq_reads() {
+    let mut d = doc();
+    list_ops(&mut d, b"a", 2);
+    list_ops(&mut d, b"b", 2);
+    let (_, mark_a) = make_range(&mut d, b"a", b"a"); // both endpoints in /a
+    let (_, _mark_b) = make_range(&mut d, b"b", b"b"); // both endpoints in /b
+                                                       // Reads /a (and root), not /b.
+    d.project_read_paths(reads_top(true, &[b"a"]));
+    assert_eq!(
+        ranged_ids(&d),
+        vec![mark_a],
+        "the /a mark is kept, the /b mark dropped — a range rides its anchor seq path",
+    );
+}
+
+#[test]
+fn a_cross_element_range_needs_read_on_both_anchor_seqs() {
+    // start anchored in /a, end anchored in /b — two governing paths, require-all.
+    let build = || {
+        let mut d = doc();
+        list_ops(&mut d, b"a", 2);
+        list_ops(&mut d, b"b", 2);
+        let (_, id) = make_range(&mut d, b"a", b"b");
+        (d, id)
+    };
+
+    // A reader of both anchor seqs keeps it.
+    let (mut both, id) = build();
+    both.project_read_paths(reads_top(true, &[b"a", b"b"]));
+    assert_eq!(
+        ranged_ids(&both),
+        vec![id],
+        "a reader of both /a and /b keeps the cross-element range",
+    );
+
+    // A reader of only /a drops it — the /b endpoint is unreadable (require-all).
+    let (mut only_a, _) = build();
+    only_a.project_read_paths(reads_top(true, &[b"a"]));
+    assert!(
+        ranged_ids(&only_a).is_empty(),
+        "a reader of only /a drops a range spanning into unreadable /b",
+    );
+
+    // A whole-document reader keeps it (identity projection).
+    let (mut whole, id2) = build();
+    whole.project_read_paths(|_| true);
+    assert_eq!(
+        ranged_ids(&whole),
+        vec![id2],
+        "a whole-document reader keeps the cross-element range",
+    );
+}
+
+#[test]
+fn op_join_and_snapshot_join_materialize_the_same_ranged_subset() {
+    // Convergence: an op-served reader receives a RangedCreate only where it reads all
+    // of the op's anchor seq paths (the server's require-all fan-out); a snapshot-served
+    // reader is projected by the same rule. Same path authority ⇒ same ranged subset.
+    let reads = reads_top(false, &[b"a"]); // reads /a only, not the root or /b
+
+    // authoring: lists /a and /b, a mark wholly in /a, a cross range /a→/b.
+    let mut authoring = doc();
+    let list_a = list_ops(&mut authoring, b"a", 2);
+    let list_b = list_ops(&mut authoring, b"b", 2);
+    let (mark_ops, mark_a) = make_range(&mut authoring, b"a", b"a");
+    let (cross_ops, _cross) = make_range(&mut authoring, b"a", b"b");
+
+    // snapshot-join: the full authoring document, projected.
+    let mut snap = Document::decode_state(&authoring.encode_state()).unwrap();
+    snap.project_read_paths(&reads);
+
+    // op-join: apply only the ops on readable paths — the /a sequence and the /a mark
+    // (both endpoints readable). Same op objects as authoring, so the ids match. The /b
+    // sequence and the cross range (its /b endpoint unread) are withheld.
+    let mut ops_replica = doc();
+    for op in list_a.iter().chain(&mark_ops) {
+        ops_replica.apply(op);
+    }
+    let _ = (list_b, cross_ops);
+
+    assert_eq!(
+        ranged_ids(&snap),
+        ranged_ids(&ops_replica),
+        "the snapshot-served and op-served readers materialize the same ranged subset",
+    );
+    assert_eq!(
+        ranged_ids(&snap),
+        vec![mark_a],
+        "both hold exactly the /a mark",
+    );
+}
+
+#[test]
+fn a_range_whose_anchor_seq_is_deleted_falls_back_to_root_gating() {
+    // Once a range's anchor sequence leaves the tree (deleted or re-parented away), its
+    // anchor no longer resolves, so it is gated by root — fail-closed. A partial reader
+    // drops the orphaned range; a whole-document reader keeps it. This is the same
+    // fallback op_read_paths applies on the op seam, so a fresh op-served and a fresh
+    // snapshot-served reader converge on dropping it.
+    let build = || {
+        let mut d = doc();
+        list_ops(&mut d, b"a", 2);
+        let (_, id) = make_range(&mut d, b"a", b"a");
+        crdtsync_core::path::delete(&mut d, &encode_path(&[b"a"])); // orphan the range
+        (d, id)
+    };
+
+    let (mut partial, _) = build();
+    partial.project_read_paths(reads_top(false, &[b"a"]));
+    assert!(
+        ranged_ids(&partial).is_empty(),
+        "a partial reader drops a range whose deleted anchor falls back to root",
+    );
+
+    let (mut whole, id) = build();
+    whole.project_read_paths(|_| true);
+    assert_eq!(
+        ranged_ids(&whole),
+        vec![id],
+        "a whole-document reader keeps the orphaned range",
+    );
 }

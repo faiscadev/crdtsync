@@ -693,9 +693,14 @@ pub fn reads_whole_document(
 /// where it may read the tombstoned tuple's path (resolved through `records`, the full
 /// tuple set the server holds) — so a recipient sees the revoke exactly where it saw,
 /// or would have seen, the grant. A revoke naming an id no held tuple carries falls back
-/// to the root (a moot revoke reaching only a whole-document reader). A RangedElement
-/// annotation stays root-governed — path-scoped ranged/marks redaction is a separate
-/// privacy axis, out of scope here.
+/// to the root (a moot revoke reaching only a whole-document reader).
+///
+/// A RangedElement op is governed by the *set* of its anchor-sequence paths, which a
+/// single path cannot express: it goes through [`op_read_paths`], the multi-path front
+/// this function's single-path cases fold into. Here the three Ranged ops fall to the
+/// root as the single-path degenerate — the whole-document reader always carries them —
+/// but the fan-out and catch-up filters resolve them through [`op_read_paths`], never
+/// this arm.
 pub fn op_read_path(
     index: &HashMap<ElementId, Vec<Vec<u8>>>,
     records: &[AclRecord],
@@ -729,9 +734,10 @@ pub fn op_read_path(
         | OpKind::TextInsert { .. }
         | OpKind::TextDelete { .. }
         | OpKind::XmlInsertChild { .. }
-        | OpKind::XmlMove { .. } => index.get(&op.target).map_or_else(root, |segs| encode(segs)),
-        // A RangedElement annotation carries no map path — governed by whole-document
-        // read (root). Path-scoped ranged/marks redaction is out of scope here.
+        | OpKind::XmlMove { .. } => resolve_read_path(index, op.target),
+        // A RangedElement op is governed by the set of its anchor-sequence paths, which
+        // `op_read_paths` resolves; the single-path form folds it to root (the whole-
+        // document reader always carries it) and is never taken by the redaction filters.
         OpKind::RangedCreate { .. }
         | OpKind::RangedSetPayload { .. }
         | OpKind::RangedDelete { .. } => root(),
@@ -746,6 +752,69 @@ pub fn op_read_path(
             .find(|r| r.tuple.id == *id)
             .map_or_else(root, |r| r.tuple.path.clone()),
     }
+}
+
+/// The set of document paths an op reads — the governing paths a recipient must
+/// **all** be able to read to receive it. For every op but the three RangedElement
+/// ops this is the single [`op_read_path`] wrapped in a one-element vec; a
+/// RangedElement is redacted by the path of *every* sequence its endpoints anchor
+/// (a require-all rule), since a mark/annotation reveals content-region info at both
+/// endpoints — a reader that cannot read where the range starts **or** ends must not
+/// see it. The common single-sequence mark yields one governing path; a cross-element
+/// range yields two.
+///
+/// A [`RangedCreate`](OpKind::RangedCreate) carries its `start`/`end` anchors, so its
+/// governing seqs are read straight off the op. A
+/// [`RangedSetPayload`](OpKind::RangedSetPayload) /
+/// [`RangedDelete`](OpKind::RangedDelete) carries only the RangedElement id, so its
+/// anchors resolve through `ranged` — the server's held anchor set, tombstoned ranges
+/// included (a delete's target is already tombstoned) — exactly as a revoke resolves
+/// its tuple through `records`. An id that resolves to no held range is one the
+/// recipient never received (its region was unreadable): it falls back to the root,
+/// reaching only a whole-document reader. Each governing seq resolves to its path
+/// through `index`; an unresolved seq falls back to the root, so only a whole-document
+/// reader carries the op — never a subtree-scoped one.
+pub fn op_read_paths(
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
+    ranged: &HashMap<ElementId, (ElementId, ElementId)>,
+    records: &[AclRecord],
+    op: &Op,
+) -> Vec<Vec<u8>> {
+    match &op.kind {
+        OpKind::RangedCreate { start, end, .. } => anchor_paths(index, start.seq, end.seq),
+        OpKind::RangedSetPayload { id, .. } | OpKind::RangedDelete { id } => match ranged.get(id) {
+            Some((start, end)) => anchor_paths(index, *start, *end),
+            None => vec![encode_path(&[])],
+        },
+        _ => vec![op_read_path(index, records, op)],
+    }
+}
+
+/// The distinct governing paths of a range's two anchor sequences: each seq's own
+/// path through `index`, an unresolved seq falling back to the root. Deduped, so the
+/// common single-sequence mark yields one path and a cross-element range two.
+fn anchor_paths(
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
+    start_seq: ElementId,
+    end_seq: ElementId,
+) -> Vec<Vec<u8>> {
+    let start = resolve_read_path(index, start_seq);
+    let end = resolve_read_path(index, end_seq);
+    if start == end {
+        vec![start]
+    } else {
+        vec![start, end]
+    }
+}
+
+/// The encoded `core::path` element `id` resolves to through the context `index`, or
+/// the root when the index does not hold it — a since-deleted or otherwise unindexed
+/// target reads at the root, so only a whole-document reader carries an op naming it.
+fn resolve_read_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, id: ElementId) -> Vec<u8> {
+    index.get(&id).map_or_else(
+        || encode_path(&[]),
+        |segs| encode_path(&segs.iter().map(|s| s.as_slice()).collect::<Vec<_>>()),
+    )
 }
 
 /// The doc-ACL [`Capability`] a data-plane [`Action`] resolves to, or `None` for
