@@ -356,9 +356,10 @@ pub enum Message {
     DiffResult { room: Vec<u8>, changes: Vec<u8> },
     /// Duplicates the live state of room `src` into a fresh room `dst` — the wire
     /// form of the "duplicate this doc as a template" server primitive. Room-keyed
-    /// like branch management: a create runnable before any subscription. Replies
-    /// with a [`CloneRoomResult`](Message::CloneRoomResult). A create-only op: it
-    /// declines (`created == false`) when `src` is unknown or `dst` already exists.
+    /// like branch management, so a client may run it before holding any
+    /// subscription. Replies with a [`CloneRoomResult`](Message::CloneRoomResult).
+    /// A create-only op: it declines (`created == false`) when `src` is unknown or
+    /// `dst` already exists.
     CloneRoom { src: Vec<u8>, dst: Vec<u8> },
     /// The outcome of a [`CloneRoom`](Message::CloneRoom): `created` is `true` when
     /// `dst` was minted from `src`'s state, `false` when the clone was a no-op

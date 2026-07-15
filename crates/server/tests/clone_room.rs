@@ -7,8 +7,8 @@
 //! destination is a no-op (`created == false`), never an error. The gate composes
 //! read on the source with the branch-management write tier on the destination; a
 //! request before auth is a protocol violation, a denied one a recoverable
-//! forbidden. Origin and clone take edits independently — the #196 independence
-//! property, now driven over the wire.
+//! forbidden. Origin and clone take edits independently — a write to one leaves
+//! the other untouched.
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, ErrorCode, Message, Op, Scalar};

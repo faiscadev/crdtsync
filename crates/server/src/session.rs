@@ -1011,9 +1011,13 @@ pub fn step(
         // the create is a room-management mutation on `dst`, gated by the write tier
         // a branch mutation uses. A create persists a new room, so like a branch
         // mutation it is served only by `dst`'s leader; on a non-leader it is
-        // redirected rather than persisted. The reply is a `CloneRoomResult` whose
-        // `created` is false when the clone was a no-op (`src` unknown or `dst`
-        // already present).
+        // redirected rather than persisted. The clone reads `src`'s state from the
+        // node that persists `dst`, so `src` and `dst` must share that leader: a
+        // cluster where they hash to different leaders finds no local `src` and
+        // reports `created == false` rather than misplacing `dst` — cross-leader
+        // clone is a cross-node state transfer this single-hub primitive does not
+        // do. The reply is a `CloneRoomResult` whose `created` is false when the
+        // clone was a no-op (`src` absent from this leader or `dst` already present).
         Message::CloneRoom { src, dst } => {
             if !branch_authorized(session, authorizer, schema, &src, Action::Read)
                 || !branch_authorized(session, authorizer, schema, &dst, Action::Write)
