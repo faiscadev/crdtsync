@@ -955,6 +955,10 @@ impl Registry {
         let creator = self.hub.room_creator(room);
         let schema = self.governing_schema(room);
         let index = self.hub.element_paths(room);
+        // A RangedElement op resolves its governing seq paths through the held anchor
+        // set (a SetPayload/Delete carries only the range id); tombstoned ranges are
+        // included so a just-applied delete still resolves.
+        let ranged_anchors = self.hub.ranged_anchors(room);
         // The owning-element type of each op, resolved once over the room document
         // — a type-scoped migration step narrows to the ops whose owning element is
         // of its declared type. Empty (no narrowing) when the room binds no schema.
@@ -962,10 +966,13 @@ impl Registry {
             .as_ref()
             .map(|s| self.hub.element_types(room, s))
             .unwrap_or_default();
-        // Each op's document path is recipient-independent, so resolve it once.
-        let op_paths: Vec<Vec<u8>> = broadcast
+        // Each op's set of governing document paths is recipient-independent, so
+        // resolve it once. A recipient must read every path in an op's set to receive
+        // it (require-all — a Ranged op's distinct anchor seq paths, one path for every
+        // other op).
+        let op_paths: Vec<Vec<Vec<u8>>> = broadcast
             .iter()
-            .map(|op| crate::acl::op_read_path(&index, &records, op))
+            .map(|op| crate::acl::op_read_paths(&index, &ranged_anchors, &records, op))
             .collect();
         // Migration translation rides the same seam as redaction (scoped to the
         // room's governing app); resolve each distinct target's chain once.
@@ -981,25 +988,27 @@ impl Registry {
             let Some(identity) = conn.session.identity() else {
                 continue;
             };
-            // Keep the authored ops whose path this recipient may read. The read
-            // verdict depends only on the path, so a batch touching one subtree
-            // resolves once — memoized per distinct path to avoid re-hashing the
-            // actor per op.
+            // Keep the authored ops this recipient may read — every governing path in
+            // the op's set (require-all). The read verdict depends only on the path, so
+            // a batch touching one subtree resolves once — memoized per distinct path to
+            // avoid re-hashing the actor per op.
             let mut verdict: HashMap<&[u8], bool> = HashMap::new();
             let readable: Vec<Op> = broadcast
                 .iter()
                 .zip(&op_paths)
-                .filter_map(|(op, path)| {
-                    let ok = *verdict.entry(path).or_insert_with(|| {
-                        crate::acl::recipient_reads_path(
-                            authorizer,
-                            &records,
-                            creator.as_deref(),
-                            schema.as_deref(),
-                            identity,
-                            room,
-                            path,
-                        )
+                .filter_map(|(op, paths)| {
+                    let ok = paths.iter().all(|path| {
+                        *verdict.entry(path).or_insert_with(|| {
+                            crate::acl::recipient_reads_path(
+                                authorizer,
+                                &records,
+                                creator.as_deref(),
+                                schema.as_deref(),
+                                identity,
+                                room,
+                                path,
+                            )
+                        })
                     });
                     ok.then(|| op.clone())
                 })

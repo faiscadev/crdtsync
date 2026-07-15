@@ -1428,6 +1428,18 @@ impl Hub {
             .unwrap_or_default()
     }
 
+    /// Project `room`'s document to `RangedElement id → (start seq, end seq)`,
+    /// tombstoned ranges included — the anchor resolution the per-recipient redaction
+    /// gates a `RangedSetPayload`/`RangedDelete` by
+    /// ([`op_read_paths`](crate::acl::op_read_paths)), so a delete's already-tombstoned
+    /// range still resolves to the sequences it annotated. Empty for an unknown room.
+    pub fn ranged_anchors(&self, room: &[u8]) -> HashMap<ElementId, (ElementId, ElementId)> {
+        self.rooms
+            .get(room)
+            .map(|r| r.doc.ranged_anchors())
+            .unwrap_or_default()
+    }
+
     /// Project `room`'s document to `element id → declared type name` under
     /// `schema` — the id→type resolution a type-scoped migration reads to narrow a
     /// field rewrite to the elements of the step's declared type, the mirror of

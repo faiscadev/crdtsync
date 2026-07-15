@@ -21,7 +21,8 @@ use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
 use crdtsync_core::path::{encode_path, xml_fragment, xml_insert_element};
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{
-    AclEffect, ClientId, Document, ElementId, ElementKind, ErrorCode, Message, Op, OpKind, Scalar,
+    AclEffect, ClientId, Document, ElementId, ElementKind, ErrorCode, Message, Op, OpKind,
+    RangeAnchor, Scalar, Side,
 };
 use crdtsync_server::acl::{actor_key, Acl, ResourceMatch, Subject};
 use crdtsync_server::{Action, ConnId, ManualClock, Registry, StaticTokens};
@@ -47,6 +48,7 @@ fn registry() -> Registry {
         ("t-bob", "bob"),
         ("t-bob2", "bob"),
         ("t-carol", "carol"),
+        ("t-dave", "dave"),
     ])));
     r.set_authorizer(Box::new(
         Acl::new()
@@ -908,4 +910,296 @@ fn a_leaf_level_deny_is_projected_out_of_the_snapshot() {
             "{label} joiner is denied the /a/v leaf",
         );
     }
+}
+
+/// alice creates a top-level List `key` (two items) in her doc and submits it — the
+/// sequence a range anchors into.
+fn seed_list(r: &mut Registry, alice: ConnId, doc: &mut Document, key: &[u8]) {
+    submit(
+        r,
+        alice,
+        crdtsync_core::path::list_insert(doc, &encode_path(&[key]), 0, b"x"),
+    );
+    submit(
+        r,
+        alice,
+        crdtsync_core::path::list_insert(doc, &encode_path(&[key]), 1, b"y"),
+    );
+}
+
+/// alice marks the span `[0, 1)` of the sequence at top-level `key`, submitting the
+/// create. Returns the mark's RangedElement id bytes.
+fn seed_mark(r: &mut Registry, alice: ConnId, doc: &mut Document, key: &[u8]) -> Vec<u8> {
+    let (ops, id) = crdtsync_core::path::mark(
+        doc,
+        &encode_path(&[key]),
+        0,
+        Side::Left,
+        1,
+        Side::Right,
+        b"bold",
+        Scalar::Bool(true),
+    );
+    let id = id.expect("a mark over a live sequence emits an id");
+    submit(r, alice, ops);
+    id
+}
+
+/// A range endpoint at `index` in the top-level List `key`, gravity left.
+fn seq_anchor(doc: &Document, key: &[u8], index: usize) -> RangeAnchor {
+    let seq = match doc.get(key) {
+        Some(crdtsync_core::Element::List(l)) => l.borrow().id(),
+        _ => panic!("expected a live list at {key:?}"),
+    };
+    RangeAnchor {
+        seq,
+        pos: crdtsync_core::path::relative_position(doc, &encode_path(&[key]), index, Side::Left)
+            .expect("a live sequence yields a position"),
+    }
+}
+
+/// alice creates a cross-element range from the sequence at /`start_key` to the one at
+/// /`end_key`, submitting it.
+fn seed_cross_range(
+    r: &mut Registry,
+    alice: ConnId,
+    doc: &mut Document,
+    start_key: &[u8],
+    end_key: &[u8],
+) {
+    let start = seq_anchor(doc, start_key, 0);
+    let end = seq_anchor(doc, end_key, 1);
+    let ops = doc.transact(|tx| {
+        tx.ranged().create(start, end, Scalar::Bool(true));
+    });
+    submit(r, alice, ops);
+}
+
+fn has_ranged_create(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|o| matches!(o.kind, OpKind::RangedCreate { .. }))
+}
+
+fn has_ranged_set(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|o| matches!(o.kind, OpKind::RangedSetPayload { .. }))
+}
+
+fn has_ranged_delete(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|o| matches!(o.kind, OpKind::RangedDelete { .. }))
+}
+
+#[test]
+fn a_single_sequence_mark_reaches_only_its_sequences_reader() {
+    let (mut r, mut alice_doc, alice) = seeded();
+    seed_list(&mut r, alice, &mut alice_doc, b"a");
+    r.take_outbox(alice);
+    let bob = join(&mut r, 2, "t-bob"); // reads /a
+    let carol = join(&mut r, 3, "t-carol"); // reads /b
+
+    // A mark over the /a sequence rides its anchor path: it reaches bob (reads /a) and is
+    // withheld from carol (reads /b) — the annotation is privacy-sensitive like the region.
+    seed_mark(&mut r, alice, &mut alice_doc, b"a");
+    assert!(
+        has_ranged_create(&received_ops(&mut r, bob)),
+        "bob reads /a, so the /a mark reaches him",
+    );
+    assert!(
+        received_ops(&mut r, carol).is_empty(),
+        "carol cannot read /a, so the /a mark is withheld from her",
+    );
+}
+
+#[test]
+fn a_cross_element_range_requires_read_on_both_anchor_sequences() {
+    // The load-bearing require-all case: a range with one endpoint in /a and one in /b
+    // reaches a reader of BOTH but not a reader of only /a.
+    let (mut r, mut alice_doc, alice) = seeded();
+    // dave reads both /a and /b — a genuine both-subtree reader, not the creator.
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"dave")),
+            &encode_path(&[b"a"]),
+        ),
+    );
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"dave")),
+            &encode_path(&[b"b"]),
+        ),
+    );
+    seed_list(&mut r, alice, &mut alice_doc, b"a");
+    seed_list(&mut r, alice, &mut alice_doc, b"b");
+    r.take_outbox(alice);
+
+    let bob = join(&mut r, 2, "t-bob"); // reads /a only
+    let dave = join(&mut r, 4, "t-dave"); // reads /a AND /b
+    let alice2 = join(&mut r, 10, "t-alice2"); // creator, owns /
+
+    seed_cross_range(&mut r, alice, &mut alice_doc, b"a", b"b");
+    assert!(
+        has_ranged_create(&received_ops(&mut r, dave)),
+        "dave reads both anchor sequences, so the cross-element range reaches him",
+    );
+    assert!(
+        has_ranged_create(&received_ops(&mut r, alice2)),
+        "the creator owns /, so the cross-element range reaches it",
+    );
+    assert!(
+        received_ops(&mut r, bob).is_empty(),
+        "bob reads only /a, so a range spanning into /b is withheld (require-all)",
+    );
+}
+
+#[test]
+fn a_ranged_payload_change_and_delete_follow_the_ranges_visibility() {
+    let (mut r, mut alice_doc, alice) = seeded();
+    seed_list(&mut r, alice, &mut alice_doc, b"a");
+    let id = seed_mark(&mut r, alice, &mut alice_doc, b"a"); // mark over /a
+    r.take_outbox(alice);
+    let bob = join(&mut r, 2, "t-bob"); // reads /a
+    let carol = join(&mut r, 3, "t-carol"); // reads /b
+
+    // A payload change carries only the range id; the server resolves it to /a, so it
+    // reaches bob and is withheld from carol — the op follows its range's visibility.
+    submit(
+        &mut r,
+        alice,
+        crdtsync_core::path::mark_set_value(&mut alice_doc, &id, Scalar::Bool(false)),
+    );
+    assert!(
+        has_ranged_set(&received_ops(&mut r, bob)),
+        "bob reads /a, so the /a range's payload change reaches him",
+    );
+    assert!(
+        received_ops(&mut r, carol).is_empty(),
+        "carol is withheld the /a range's payload change",
+    );
+
+    // A delete likewise resolves to /a (the range is already tombstoned when fan-out
+    // resolves it, so the anchor set must include tombstoned ranges).
+    submit(
+        &mut r,
+        alice,
+        crdtsync_core::path::mark_delete(&mut alice_doc, &id),
+    );
+    assert!(
+        has_ranged_delete(&received_ops(&mut r, bob)),
+        "bob reads /a, so the /a range's delete reaches him",
+    );
+    assert!(
+        received_ops(&mut r, carol).is_empty(),
+        "carol is withheld the /a range's delete",
+    );
+}
+
+#[test]
+fn the_creator_receives_every_ranged_op() {
+    let (mut r, mut alice_doc, alice) = seeded();
+    seed_list(&mut r, alice, &mut alice_doc, b"a");
+    seed_list(&mut r, alice, &mut alice_doc, b"b");
+    r.take_outbox(alice);
+    let alice2 = join(&mut r, 10, "t-alice2"); // the creator, owns /
+
+    let id = seed_mark(&mut r, alice, &mut alice_doc, b"a");
+    seed_cross_range(&mut r, alice, &mut alice_doc, b"a", b"b");
+    submit(
+        &mut r,
+        alice,
+        crdtsync_core::path::mark_set_value(&mut alice_doc, &id, Scalar::Bool(false)),
+    );
+    let got = received_ops(&mut r, alice2);
+    assert!(
+        has_ranged_create(&got) && has_ranged_set(&got),
+        "the creator owns / and receives every Ranged op, unredacted",
+    );
+}
+
+#[test]
+fn a_room_with_no_acl_tuples_fans_out_ranged_ops_unchanged() {
+    // Regression: with no doc-ACL tuples every subscriber the deployment admits receives
+    // every Ranged op, byte-identical to the pre-redaction path.
+    let mut r = Registry::new(cid(0xFF));
+    r.set_verifier(Box::new(tokens(&[
+        ("t-alice", "alice"),
+        ("t-bob", "bob"),
+        ("t-carol", "carol"),
+    ])));
+    r.set_authorizer(Box::new(
+        Acl::new()
+            .allow(
+                Subject::Anyone,
+                Some(Action::Read),
+                ResourceMatch::Room(ROOM.to_vec()),
+            )
+            .allow(
+                Subject::Anyone,
+                Some(Action::Write),
+                ResourceMatch::Room(ROOM.to_vec()),
+            ),
+    ));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+
+    let alice = join(&mut r, 1, "t-alice");
+    let bob = join(&mut r, 2, "t-bob");
+    let carol = join(&mut r, 3, "t-carol");
+    let mut alice_doc = Document::new(cid(1));
+
+    seed_list(&mut r, alice, &mut alice_doc, b"a");
+    r.take_outbox(bob);
+    r.take_outbox(carol);
+    seed_mark(&mut r, alice, &mut alice_doc, b"a");
+    let bob_ops = received_ops(&mut r, bob);
+    let carol_ops = received_ops(&mut r, carol);
+    assert!(
+        has_ranged_create(&bob_ops),
+        "no ACL ⇒ bob receives the mark"
+    );
+    assert_eq!(
+        bob_ops, carol_ops,
+        "no ACL ⇒ every subscriber receives the identical Ranged op",
+    );
+}
+
+#[test]
+fn a_partial_reader_snapshot_keeps_only_ranges_it_fully_reads() {
+    // The snapshot half converges with the op half: a compacted room's projected snapshot
+    // keeps a RangedElement iff the reader reads every anchor sequence's path.
+    let (mut r, mut alice_doc, alice) = seeded();
+    seed_list(&mut r, alice, &mut alice_doc, b"a");
+    seed_list(&mut r, alice, &mut alice_doc, b"b");
+    let mark_a = seed_mark(&mut r, alice, &mut alice_doc, b"a"); // wholly in /a
+    seed_cross_range(&mut r, alice, &mut alice_doc, b"a", b"b"); // spans /a → /b
+    r.take_outbox(alice);
+
+    // Compact so a fresh subscriber catches up via a projected Snapshot.
+    r.set_compaction_threshold(1);
+    submit(
+        &mut r,
+        alice,
+        crdtsync_core::path::list_insert(&mut alice_doc, &encode_path(&[b"a"]), 2, b"z"),
+    );
+    r.take_outbox(alice);
+
+    let bob = auth(&mut r, 2, "t-bob"); // reads /a only
+    assert!(subscribe(&mut r, bob));
+    let snap =
+        served_snapshot(&mut r, bob).expect("a partial reader is served a projected snapshot");
+    let ids: Vec<Vec<u8>> = snap
+        .ranged_elements()
+        .into_iter()
+        .map(|e| e.id.as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![mark_a],
+        "bob's snapshot keeps the /a mark and drops the range spanning into unreadable /b",
+    );
 }

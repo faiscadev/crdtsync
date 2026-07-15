@@ -17,7 +17,7 @@ use crdtsync_core::{BranchInfo, Channel, ClientId, DiffKind, Document, ErrorCode
 use crdtsync_core::schema::Schema;
 
 use crate::acl::{
-    authorized, doc_acl_tier, has_any_read_grant, op_read_path, reads_whole_document,
+    authorized, doc_acl_tier, has_any_read_grant, op_read_paths, reads_whole_document,
     recipient_reads_path,
 };
 use crate::auth::{Identity, Verifier};
@@ -474,19 +474,26 @@ pub fn step(
                         delta
                     } else {
                         let index = hub.element_paths(&room);
+                        let ranged_anchors = hub.ranged_anchors(&room);
                         delta
                             .into_iter()
                             .filter(|rec| {
-                                let p = op_read_path(&index, &records, &rec.op);
-                                recipient_reads_path(
-                                    authorizer,
-                                    &records,
-                                    creator.as_deref(),
-                                    schema,
-                                    identity,
-                                    &room,
-                                    &p,
-                                )
+                                // Require-all over the op's governing path set — a Ranged
+                                // op's distinct anchor seq paths, one path for every other
+                                // op — so a range replays only where both endpoints read.
+                                op_read_paths(&index, &ranged_anchors, &records, &rec.op)
+                                    .iter()
+                                    .all(|p| {
+                                        recipient_reads_path(
+                                            authorizer,
+                                            &records,
+                                            creator.as_deref(),
+                                            schema,
+                                            identity,
+                                            &room,
+                                            p,
+                                        )
+                                    })
                             })
                             .collect()
                     };

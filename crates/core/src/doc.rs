@@ -321,6 +321,20 @@ impl Document {
         self.sorted_view(|e| !e.tombstone && (e.start.seq == seq || e.end.seq == seq))
     }
 
+    /// Every RangedElement's endpoint sequences keyed by id, **tombstoned ones
+    /// included** — the anchor resolution the outbound per-recipient redaction
+    /// gates a `RangedSetPayload`/`RangedDelete` by, so a just-deleted range still
+    /// resolves to the sequences it annotated. Mirrors
+    /// [`acl_records`](Self::acl_records), which likewise carries tombstoned tuples;
+    /// the live [`ranged_elements`](Self::ranged_elements) view drops deleted ranges
+    /// and so cannot serve their anchors.
+    pub fn ranged_anchors(&self) -> HashMap<ElementId, (ElementId, ElementId)> {
+        self.ranged
+            .iter()
+            .map(|(id, e)| (*id, (e.start.seq, e.end.seq)))
+            .collect()
+    }
+
     /// A live (non-revoked) ACL tuple by id, or `None` if absent or revoked.
     pub fn acl_tuple(&self, id: ElementId) -> Option<AclTuple> {
         self.acl
@@ -1019,8 +1033,9 @@ impl Document {
     /// deny drops the slot even inside a readable container. An ACL tuple is kept only
     /// where its own governing path is readable (the op-stream redacts each `AclGrant` to
     /// that path, so a snapshot reader materializes the same ACL subset an op reader does);
-    /// ranged annotations stay gated by root read. A whole-document reader is left
-    /// untouched, byte-identical on re-encode.
+    /// a RangedElement is kept only where the path of EVERY sequence its endpoints anchor
+    /// is readable (require-all, so a mark leaks no content-region info at an unreadable
+    /// endpoint). A whole-document reader is left untouched, byte-identical on re-encode.
     ///
     /// Sound only as the final transform before [`encode_state`](Self::encode_state) on
     /// a throwaway copy: like [`project_zones`](Self::project_zones) it clears the causal
@@ -1109,10 +1124,24 @@ impl Document {
             !purge.contains(id) && crate::path::parse_path(&e.path).is_some_and(|segs| reads(&segs))
         });
         let acl_cut = self.acl.len() != acl_before;
-        // Ranged annotations stay governed by root read — path-scoped ranged/marks
-        // redaction is a separate privacy axis, out of scope here.
-        self.ranged
-            .retain(|id, _| root_reads && !purge.contains(id));
+        // A RangedElement is redacted by the path of EVERY sequence its endpoints
+        // anchor — a require-all rule — since a mark/annotation reveals content-region
+        // info at both endpoints: a reader that cannot read where the range starts OR
+        // ends must not materialize it. A single-sequence mark has one governing path;
+        // a cross-element range has two, and both must read. This mirrors the op-stream
+        // rule (op_read_paths gates each Ranged op on its distinct anchor seq paths), so
+        // a snapshot-served partial reader materializes the same RangedElement subset an
+        // op-served one does. An anchor seq the walk does not resolve (a since-deleted
+        // sequence) falls back to root read, so only a whole-document reader keeps it.
+        let ranged_before = self.ranged.len();
+        let anchor_reads = |seq: ElementId| match paths.get(&seq) {
+            Some(p) => reads(p),
+            None => root_reads,
+        };
+        self.ranged.retain(|id, e| {
+            !purge.contains(id) && anchor_reads(e.start.seq) && anchor_reads(e.end.seq)
+        });
+        let ranged_cut = self.ranged.len() != ranged_before;
         self.placements.retain(|node, places| {
             if purge.contains(node) {
                 return false;
@@ -1130,7 +1159,7 @@ impl Document {
         // Once anything is dropped, scrub the causal frontier and buffer of the hidden
         // state so neither leaks an op count; a pure identity projection (a whole-
         // document reader) leaves them, staying byte-identical on re-encode.
-        if !purge.is_empty() || cut_leaf || acl_cut || !root_reads {
+        if !purge.is_empty() || cut_leaf || acl_cut || ranged_cut || !root_reads {
             self.seen.clear();
             self.buffer.clear();
             self.buffered.clear();
