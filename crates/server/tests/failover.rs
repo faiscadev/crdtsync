@@ -160,7 +160,8 @@ fn all_replicas_live_effective_equals_placement() {
     // byte-identical to `primary_for` for every room — the no-behavior-change
     // regression the whole unit rests on.
     let m = membership_for(SELF_ADDR);
-    for i in 0..3000 {
+    let rooms = if cfg!(miri) { 50 } else { 3000 };
+    for i in 0..rooms {
         let room = format!("room-{i}").into_bytes();
         assert_eq!(m.effective_primary_for(&room), m.primary_for(&room));
         assert_eq!(m.is_effective_primary_for(&room), m.is_primary_for(&room));

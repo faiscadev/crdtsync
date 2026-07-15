@@ -393,7 +393,8 @@ fn random_orderings_converge() {
     apply_all(&mut reference, &ops);
     let expect = reference.acl_tuples();
 
-    for seed in 0..64u64 {
+    let seeds: u64 = if cfg!(miri) { 8 } else { 64 };
+    for seed in 0..seeds {
         let mut shuffled = ops.clone();
         let mut rng = Rng::new(seed);
         for i in (1..shuffled.len()).rev() {

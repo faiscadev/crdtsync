@@ -215,7 +215,8 @@ impl Rng {
 
 #[test]
 fn a_random_move_stream_converges_across_orderings_and_stays_acyclic() {
-    for seed in 0..200u64 {
+    let seeds: u64 = if cfg!(miri) { 4 } else { 200 };
+    for seed in 0..seeds {
         let mut gen = Rng::new(seed);
         // A pool of 6 nodes; each move relocates one under another, with a unique
         // ascending stamp so the total order is a strict permutation.
