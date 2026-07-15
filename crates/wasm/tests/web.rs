@@ -300,6 +300,27 @@ fn subscribe_branch_carries_the_named_branch() {
 }
 
 #[wasm_bindgen_test]
+fn subscribe_zone_carries_the_named_zone() {
+    use crdtsync_core::{decode_message, Message};
+
+    let zone_of = |frame: &[u8]| match decode_message(frame).unwrap() {
+        Message::Subscribe { zone, .. } => zone,
+        other => panic!("expected Subscribe, got {other:?}"),
+    };
+
+    let mut a = wasm_client(1);
+    // A named zone rides along in the Subscribe frame.
+    let sub = a.subscribe_zone(b"room-1", b"west");
+    assert_eq!(sub.channel(), 0);
+    assert_eq!(zone_of(&sub.frame()), b"west");
+    // An empty zone is the whole room, as the plain subscribe.
+    let sub = a.subscribe_zone(b"room-1", b"");
+    assert!(zone_of(&sub.frame()).is_empty());
+    let sub = a.subscribe(b"room-1");
+    assert!(zone_of(&sub.frame()).is_empty());
+}
+
+#[wasm_bindgen_test]
 fn a_client_handshake_and_awareness_marshal() {
     let mut c = wasm_client(1);
     assert!(!c.hello().is_empty());

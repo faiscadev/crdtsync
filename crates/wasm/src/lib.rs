@@ -774,6 +774,20 @@ impl WasmClient {
         }
     }
 
+    /// Join `room` on a fresh channel scoped to one `zone`; returns the channel
+    /// and Subscribe frame. An empty `zone` is the whole room (every zone the
+    /// actor may read), as `subscribe`; a named `zone` narrows the stream to that
+    /// partition plus the unzoned root it is entitled to. Scoped to the default
+    /// branch.
+    #[wasm_bindgen(js_name = subscribeZone)]
+    pub fn subscribe_zone(&mut self, room: &[u8], zone: &[u8]) -> WasmSubscription {
+        let (channel, msg) = self.inner.subscribe_zone(room, zone);
+        WasmSubscription {
+            channel: channel.0,
+            frame: encode_message(&msg),
+        }
+    }
+
     /// Re-issue Subscribe for a held channel from its caught-up position; `None`
     /// if the channel isn't held.
     pub fn resume(&self, channel: u32) -> Option<Vec<u8>> {

@@ -416,6 +416,67 @@ fn subscribe_branch_with_an_empty_branch_is_main() {
 }
 
 #[test]
+fn subscribe_leaves_the_zone_empty_for_the_whole_room() {
+    let mut session = ClientSession::new(cid(1));
+    let (channel, msg) = session.subscribe(ROOM_A);
+    match msg {
+        Message::Subscribe { zone, .. } => assert_eq!(zone, b""),
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+    assert_eq!(session.zone(channel), Some(&b""[..]));
+}
+
+#[test]
+fn subscribe_zone_names_its_zone_on_the_frame_and_records_it() {
+    let mut session = ClientSession::new(cid(1));
+    let (channel, msg) = session.subscribe_zone(ROOM_A, b"west");
+    match msg {
+        Message::Subscribe {
+            channel: c,
+            room,
+            branch,
+            zone,
+            last_seen_seq,
+        } => {
+            assert_eq!(c, channel);
+            assert_eq!(room, ROOM_A);
+            assert_eq!(branch, b"");
+            assert_eq!(zone, b"west");
+            assert_eq!(last_seen_seq, 0);
+        }
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+    assert_eq!(session.room(channel), Some(ROOM_A));
+    assert_eq!(session.branch(channel), Some(&b""[..]));
+    assert_eq!(session.zone(channel), Some(&b"west"[..]));
+}
+
+#[test]
+fn subscribe_zone_selector_rides_the_wire() {
+    let mut session = ClientSession::new(cid(1));
+    let (_, msg) = session.subscribe_zone(ROOM_A, b"west");
+    let decoded = crdtsync_core::decode_message(&crdtsync_core::encode_message(&msg))
+        .expect("Subscribe round-trips");
+    match decoded {
+        Message::Subscribe { room, zone, .. } => {
+            assert_eq!(room, ROOM_A);
+            assert_eq!(zone, b"west");
+        }
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_preserves_the_zone() {
+    let mut session = ClientSession::new(cid(1));
+    let (channel, _) = session.subscribe_zone(ROOM_A, b"west");
+    match session.resume(channel).expect("held channel resumes") {
+        Message::Subscribe { zone, .. } => assert_eq!(zone, b"west"),
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+}
+
+#[test]
 fn two_rooms_get_distinct_channels() {
     let mut session = ClientSession::new(cid(1));
     let (a, _) = session.subscribe(ROOM_A);

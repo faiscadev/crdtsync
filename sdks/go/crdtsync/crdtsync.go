@@ -662,6 +662,18 @@ func (c *Client) SubscribeBranch(room, branch []byte) (uint32, []byte) {
 	return uint32(channel), frame
 }
 
+// SubscribeZone joins room on a fresh channel scoped to one zone; returns the
+// channel and the frame. An empty zone is the whole room (every zone the actor
+// may read), as Subscribe; a named zone narrows the stream to that partition
+// plus the unzoned root it is entitled to. Scoped to the default branch.
+func (c *Client) SubscribeZone(room, zone []byte) (uint32, []byte) {
+	rp, rl := bytesArg(room)
+	zp, zl := bytesArg(zone)
+	var channel C.uint32_t
+	frame := takeBuf(C.crdtsync_client_subscribe_zone(c.h, rp, rl, zp, zl, &channel))
+	return uint32(channel), frame
+}
+
 // Resume re-issues Subscribe for a held channel from its caught-up position.
 func (c *Client) Resume(channel uint32) []byte {
 	return takeBuf(C.crdtsync_client_resume(c.h, C.uint32_t(channel)))

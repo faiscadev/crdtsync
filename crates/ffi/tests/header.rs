@@ -94,6 +94,7 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_hello",
         "crdtsync_client_subscribe",
         "crdtsync_client_subscribe_branch",
+        "crdtsync_client_subscribe_zone",
         "crdtsync_client_receive",
         "crdtsync_client_take_redirects",
         "crdtsync_client_last_seen_seq",
