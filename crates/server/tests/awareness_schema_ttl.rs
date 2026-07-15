@@ -125,6 +125,7 @@ fn subscribe(r: &mut Registry, id: ConnId, room: &[u8]) {
         Message::Subscribe {
             channel: Channel(0),
             room: room.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -160,6 +161,7 @@ fn replayed_keys(r: &mut Registry, room: &[u8]) -> Vec<Vec<u8>> {
         Message::Subscribe {
             channel: Channel(0),
             room: room.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -329,6 +331,7 @@ fn a_read_denied_subscribe_does_not_bind_the_rooms_schema() {
         Message::Subscribe {
             channel: Channel(0),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }

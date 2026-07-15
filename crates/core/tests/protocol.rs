@@ -151,6 +151,7 @@ fn subscribe_round_trips() {
         channel: Channel(1),
         room: b"room-42".to_vec(),
         branch: b"feature-x".to_vec(),
+        zone: Vec::new(),
         last_seen_seq: 1_000_000,
     });
 }
@@ -161,6 +162,7 @@ fn subscribe_with_an_empty_branch_is_main_and_round_trips() {
         channel: Channel(1),
         room: b"room-42".to_vec(),
         branch: Vec::new(),
+        zone: Vec::new(),
         last_seen_seq: 1_000_000,
     });
 }
@@ -171,6 +173,7 @@ fn subscribe_with_an_empty_room_round_trips() {
         channel: Channel(0),
         room: Vec::new(),
         branch: Vec::new(),
+        zone: Vec::new(),
         last_seen_seq: 0,
     });
 }
@@ -181,6 +184,7 @@ fn a_truncated_subscribe_is_an_error_not_a_panic() {
         channel: Channel(2),
         room: b"room".to_vec(),
         branch: b"br".to_vec(),
+        zone: Vec::new(),
         last_seen_seq: 9,
     });
     for cut in 0..bytes.len() {
@@ -197,6 +201,7 @@ fn trailing_bytes_after_a_subscribe_are_an_error() {
         channel: Channel(2),
         room: b"room".to_vec(),
         branch: b"br".to_vec(),
+        zone: Vec::new(),
         last_seen_seq: 9,
     });
     bytes.push(0);

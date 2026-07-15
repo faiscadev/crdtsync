@@ -62,6 +62,7 @@ fn subscribe(r: &mut Registry, id: ConnId, channel: u32, room: &[u8]) {
         Message::Subscribe {
             channel: Channel(channel),
             room: room.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -174,6 +175,7 @@ fn a_late_joiner_is_replayed_current_presence() {
         Message::Subscribe {
             channel: Channel(7),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -210,6 +212,7 @@ fn replay_reflects_the_latest_value_per_key() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -253,6 +256,7 @@ fn a_departed_clients_presence_is_not_replayed_after_the_grace_window() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         },
@@ -272,6 +276,7 @@ fn a_fresh_room_replays_no_presence() {
         Message::Subscribe {
             channel: Channel(1),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }

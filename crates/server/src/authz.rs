@@ -41,6 +41,13 @@ pub enum Resource<'a> {
     Room(&'a [u8]),
     /// An app, named by its `app_id` — the target of schema registration.
     App(&'a [u8]),
+    /// A schema-declared zone within a room — a separately-replicated subtree
+    /// partition, named by its room id and zone name. The subscribe gate reads
+    /// this so a zone's ops, state, structure, and very existence stay hidden from
+    /// an actor the deployment does not admit to it: a refused zone subscription is
+    /// answered with the same generic denial as a nonexistent one, never a
+    /// zone-named error that would confirm the partition is there.
+    Zone { room: &'a [u8], zone: &'a [u8] },
 }
 
 /// One layer's verdict on a request. [`Abstain`](Decision::Abstain) is "no

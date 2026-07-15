@@ -2,7 +2,8 @@
 //! replicates as.
 //!
 //! A document's lamport allocation is partitioned by zone: an op is stamped from
-//! the clock of the zone its target resolves to, so an edit in one zone never
+//! the clock of the zone it belongs to — the zone its target resolves to, or, for a
+//! container-create, the created child's zone — so an edit in one zone never
 //! advances another's. Two zones' ops are therefore concurrent by construction —
 //! no false causal edge crosses the boundary — while causal order within a zone
 //! is intact. With no schema, or a schema with no zones, every op is in the one
@@ -45,18 +46,24 @@ fn an_op_targeting_a_zoned_subtree_stamps_from_that_zones_clock() {
     let mut doc = Document::new(cid(1));
     doc.set_schema(schema_with_zones(r#"{ "board": "/board" }"#));
 
-    // First write: the create of the `board` map targets the root map (partition
-    // None), the set inside it targets `board` (zone 0). Under one global clock
-    // the set would be lamport 2; per-zone, zone 0 is fresh so it is lamport 1.
+    // First write: the create of the `board` map and the set inside it both belong
+    // to zone 0 — a container-create belongs to the *created child's* partition, so
+    // the zone owns its own root container's creation (and it is withheld from a
+    // subscriber not authorized to the zone). Zone 0 is fresh, so the create is
+    // lamport 1 and the set 2; the root partition is never touched.
     let ops = path::register_int(&mut doc, &p(&[b"board", b"x"]), 1);
     assert_eq!(ops.len(), 2, "a create then a set");
-    assert_eq!(ops[0].zone, None, "the create targets the root map");
+    assert_eq!(
+        ops[0].zone,
+        Some(0),
+        "the create belongs to the child's zone"
+    );
     assert_eq!(ops[0].stamp.lamport, 1);
     assert_eq!(ops[1].zone, Some(0), "the set targets the zoned subtree");
-    assert_eq!(ops[1].stamp.lamport, 1, "stamped from zone 0's own clock");
+    assert_eq!(ops[1].stamp.lamport, 2, "stamped from zone 0's own clock");
 
-    assert_eq!(doc.zone_clock(None), 1);
-    assert_eq!(doc.zone_clock(Some(0)), 1);
+    assert_eq!(doc.zone_clock(None), 0, "the root partition is untouched");
+    assert_eq!(doc.zone_clock(Some(0)), 2);
 }
 
 #[test]
@@ -64,26 +71,31 @@ fn an_op_in_one_zone_does_not_advance_another_zones_clock() {
     let mut doc = Document::new(cid(1));
     doc.set_schema(schema_with_zones(r#"{ "a": "/a", "b": "/b" }"#));
 
-    // Materialise both zone roots (these creates ride the root partition).
+    // Materialise both zone roots. Each seed write is a create (zone a / zone b) then
+    // a set in the same zone, so zone a and zone b each reach clock 2.
     path::register_int(&mut doc, &p(&[b"a", b"seed"]), 0);
     path::register_int(&mut doc, &p(&[b"b", b"seed"]), 0);
 
-    // Five edits inside zone a.
+    // Five more edits inside zone a — the container already lives, so each is just a
+    // set (the redundant create is elided). Zone a: 2 (seed create+set) + 5 = 7.
     for i in 0..5 {
         path::register_int(&mut doc, &p(&[b"a", b"x"]), i);
     }
-    assert_eq!(doc.zone_clock(Some(0)), 6, "seed + five edits");
-
-    // One edit inside zone b — its stamp reflects zone b's own (near-fresh) clock,
-    // never the six ops zone a has accrued. (The create-through of `b` rides the
-    // root partition; the set inside it is the zone b op.)
-    let ops = path::register_int(&mut doc, &p(&[b"b", b"x"]), 9);
-    let set = ops.iter().find(|o| o.zone == Some(1)).expect("a zone b op");
-    assert_eq!(set.stamp.lamport, 2, "zone b: seed=1, this=2");
-    assert_eq!(doc.zone_clock(Some(1)), 2);
     assert_eq!(
         doc.zone_clock(Some(0)),
-        6,
+        7,
+        "seed create+set, then five edits"
+    );
+
+    // One edit inside zone b — its stamp reflects zone b's own clock, never the ops
+    // zone a has accrued.
+    let ops = path::register_int(&mut doc, &p(&[b"b", b"x"]), 9);
+    let set = ops.iter().find(|o| o.zone == Some(1)).expect("a zone b op");
+    assert_eq!(set.stamp.lamport, 3, "zone b: seed create=1, set=2, this=3");
+    assert_eq!(doc.zone_clock(Some(1)), 3);
+    assert_eq!(
+        doc.zone_clock(Some(0)),
+        7,
         "zone a untouched by a zone b edit"
     );
 }
@@ -102,24 +114,24 @@ fn two_zones_ops_are_concurrent_by_construction() {
     let a = left.transact(|tx| tx.child(b"a").register(b"x", Scalar::Int(1)));
     let b = right.transact(|tx| tx.child(b"b").register(b"y", Scalar::Int(2)));
 
-    // The zone-carrying (non-create) op of each side.
-    let a_set = a.iter().find(|o| o.zone == Some(0)).expect("zone a set");
-    let b_set = b.iter().find(|o| o.zone == Some(1)).expect("zone b set");
-    // Both minted lamport 1 from their own fresh zone clock — same number, disjoint
-    // partitions, no ordering implied.
-    assert_eq!(a_set.stamp.lamport, 1);
-    assert_eq!(b_set.stamp.lamport, 1);
+    // Each side's whole edit is one zone's ops (create then set) — zone a for left,
+    // zone b for right. The first op of each mints lamport 1 from its own fresh zone
+    // clock: same number, disjoint partitions, no ordering implied.
+    let a_first = a.iter().find(|o| o.zone == Some(0)).expect("zone a op");
+    let b_first = b.iter().find(|o| o.zone == Some(1)).expect("zone b op");
+    assert_eq!(a_first.stamp.lamport, 1);
+    assert_eq!(b_first.stamp.lamport, 1);
 
-    // Cross-apply: each honors the other's zone from the envelope, advancing only
-    // that partition.
+    // Cross-apply: left honors zone b from the envelope, advancing only that
+    // partition (by zone b's two ops), and leaving its own zone a clock untouched.
     for o in &b {
         left.apply(o);
     }
-    assert_eq!(left.zone_clock(Some(1)), 1, "zone b advanced by the merge");
+    assert_eq!(left.zone_clock(Some(1)), 2, "zone b advanced by the merge");
     assert_eq!(
         left.zone_clock(Some(0)),
-        1,
-        "zone a untouched by a zone b op"
+        2,
+        "zone a untouched by a zone b op — still its own create+set"
     );
 }
 
@@ -130,8 +142,8 @@ fn causal_order_within_a_zone_is_intact() {
     path::register_int(&mut doc, &p(&[b"z", b"seed"]), 0);
 
     // Successive edits in the same zone strictly increase its lamport — a happens
-    // before b in zone z ⇒ b's z-lamport > a's. (The create-through rides the root
-    // partition; the set inside the zone is the zone z op.)
+    // before b in zone z ⇒ b's z-lamport > a's. (Both the create and the set belong
+    // to zone z, so the seed already advanced its clock.)
     let mut last = doc.zone_clock(Some(0));
     for i in 0..8 {
         let ops = path::register_int(&mut doc, &p(&[b"z", b"x"]), i);

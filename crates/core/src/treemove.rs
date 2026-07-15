@@ -117,6 +117,15 @@ impl TreeMoves {
         self.log.is_empty()
     }
 
+    /// Drop every logged move whose child or parent `keep` rejects — the filter a
+    /// zone-scoped snapshot projection applies to omit moves that touch a hidden
+    /// partition. Only the persisted log is filtered; the derived `tree`/`base`
+    /// relation is runtime state re-built on the next decode, so this is sound
+    /// solely as the final step before a re-encode, never on a live replica.
+    pub fn retain(&mut self, keep: impl Fn(ElementId, ElementId) -> bool) {
+        self.log.retain(|op| keep(op.child, op.parent));
+    }
+
     /// Apply one move to the live tree, returning its log entry. A move that
     /// would put `child` under itself or a descendant is a cycle: it is recorded
     /// but changes nothing, so undo restores the same state and redo skips it

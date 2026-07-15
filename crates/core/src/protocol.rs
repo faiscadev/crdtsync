@@ -128,12 +128,19 @@ pub enum Message {
         schema: Vec<u8>,
     },
     /// Joins a room on `channel`, requesting every op past `last_seen_seq`. A
-    /// subscription names its room and the `branch` within it — an empty `branch`
-    /// is the default `main`. The replication unit is `(room, branch)`.
+    /// subscription names its room, the `branch` within it — an empty `branch`
+    /// is the default `main` — and a `zone` selector scoping it to one schema-
+    /// declared partition. An empty `zone` is the whole room (every zone the actor
+    /// may read); a named `zone` scopes the stream to that partition alone (plus the
+    /// unzoned root partition it is entitled to). A room that declares no zones
+    /// ignores the selector — the whole log is one implicit root zone. The
+    /// replication unit is `(room, branch)`; the zone selects which of its
+    /// partitions the subscription carries.
     Subscribe {
         channel: Channel,
         room: Vec<u8>,
         branch: Vec<u8>,
+        zone: Vec<u8>,
         last_seen_seq: u64,
     },
     /// Leaves the room bound to `channel`, freeing the handle.
@@ -357,12 +364,14 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             channel,
             room,
             branch,
+            zone,
             last_seen_seq,
         } => {
             put_u8(&mut out, 1);
             put_u32(&mut out, channel.0);
             put_bytes(&mut out, room);
             put_bytes(&mut out, branch);
+            put_bytes(&mut out, zone);
             put_u64(&mut out, *last_seen_seq);
         }
         Message::Ops { channel, ops } => {
@@ -633,11 +642,13 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let channel = Channel(cur.u32()?);
             let room = cur.bytes()?;
             let branch = cur.bytes()?;
+            let zone = cur.bytes()?;
             let last_seen_seq = cur.u64()?;
             Message::Subscribe {
                 channel,
                 room,
                 branch,
+                zone,
                 last_seen_seq,
             }
         }

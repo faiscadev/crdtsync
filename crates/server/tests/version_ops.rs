@@ -51,6 +51,7 @@ fn joined(r: &mut Registry, client: u8) -> ConnId {
         Message::Subscribe {
             channel: CH,
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }

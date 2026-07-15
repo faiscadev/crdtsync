@@ -77,6 +77,7 @@ fn subscribe(r: &mut Registry, id: ConnId, room: &[u8]) {
         Message::Subscribe {
             channel: Channel(0),
             room: room.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -271,6 +272,7 @@ fn a_joiner_replays_the_last_broadcast_value_not_a_coalesced_one() {
         Message::Subscribe {
             channel: Channel(0),
             room: ROOM_A.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }

@@ -50,6 +50,7 @@ fn joined(r: &mut Registry, client: u8) -> ConnId {
         Message::Subscribe {
             channel: CH,
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -117,6 +118,7 @@ fn fork_creates_a_branch_a_subscribe_can_write() {
         Message::Subscribe {
             channel: ch2,
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: b"feature".to_vec(),
         }

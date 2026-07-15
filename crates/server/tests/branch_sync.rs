@@ -234,6 +234,7 @@ fn sub(room: &[u8], branch: &[u8]) -> Message {
         channel: CH,
         room: room.to_vec(),
         branch: branch.to_vec(),
+        zone: Vec::new(),
         last_seen_seq: 0,
     }
 }

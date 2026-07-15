@@ -7,11 +7,11 @@
 //! to close. Anything out of order is a protocol violation. Pure logic; the
 //! async transport drives it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crdtsync_core::protocol::PROTOCOL_VERSION;
-use crdtsync_core::{BranchInfo, Channel, ClientId, ErrorCode, Message, Op};
+use crdtsync_core::{BranchInfo, Channel, ClientId, Document, ErrorCode, Message, Op};
 
 use crdtsync_core::schema::Schema;
 
@@ -25,13 +25,38 @@ use crate::membership::Membership;
 use crate::schema_registry::{Resolution, SchemaRegistry};
 use crate::{Catchup, Hub, RoomId, StoredOp, MAIN_BRANCH};
 
-/// One channel's subscription: the room it joined and the branch within it. An
-/// empty subscribe branch is normalized to [`MAIN_BRANCH`] here, so every bound
-/// channel names a concrete branch and fan-out matches `(room, branch)` exactly.
+/// One channel's subscription: the room it joined, the branch within it, and the
+/// zone partitions it carries. An empty subscribe branch is normalized to
+/// [`MAIN_BRANCH`] here, so every bound channel names a concrete branch and fan-out
+/// matches `(room, branch)` exactly.
+///
+/// `zones` scopes the stream to a subset of the room's schema-declared partitions:
+/// `None` is no filtering (a room that declares no zones, or a relay with no schema
+/// — one implicit root partition, byte-identical to a zoneless subscribe); `Some`
+/// admits an op only if it is unzoned (the root partition, always carried) or its
+/// zone id is in the set. The set holds exactly the zones the actor is authorized
+/// to read, resolved at subscribe, so the fan-out and catch-up never deliver — and
+/// never even signal, via a clock jump or an op count — a zone this subscription
+/// may not see.
 #[derive(Clone)]
 struct Subscription {
     room: RoomId,
     branch: Vec<u8>,
+    zones: Option<HashSet<u32>>,
+}
+
+/// Whether a subscription scoped to `zones` admits an op in partition `op_zone`:
+/// the root partition (unzoned) always, and a zoned op only when its zone is in the
+/// authorized set. An unfiltered subscription (`None`) admits everything — the
+/// no-zones room and relay path, byte-identical to before zones.
+fn zone_admits(zones: &Option<HashSet<u32>>, op_zone: Option<u32>) -> bool {
+    match zones {
+        None => true,
+        Some(set) => match op_zone {
+            None => true,
+            Some(z) => set.contains(&z),
+        },
+    }
 }
 
 /// One client connection's protocol state. The handshake runs Hello → Auth →
@@ -134,6 +159,27 @@ impl Session {
             .filter(|(_, s)| s.room == room && s.branch == branch)
             .map(|(c, _)| *c)
             .collect()
+    }
+
+    /// The ops from `batch` this `channel`'s subscription admits, filtered to its
+    /// authorized zone partitions — the wire-redaction seam for per-zone streams. A
+    /// channel scoped to a subset of the room's zones receives only the root
+    /// partition's ops plus its authorized zones'; another zone's ops are wholly
+    /// omitted, so an unauthorized zone never surfaces on this stream. An unfiltered
+    /// channel (a no-zones room, or a relay) takes the whole batch. An unbound
+    /// channel admits nothing.
+    pub fn zone_filter(&self, channel: Channel, batch: &[Op]) -> Vec<Op> {
+        let Some(sub) = self.channels.get(&channel) else {
+            return Vec::new();
+        };
+        match &sub.zones {
+            None => batch.to_vec(),
+            Some(_) => batch
+                .iter()
+                .filter(|op| zone_admits(&sub.zones, op.zone))
+                .cloned()
+                .collect(),
+        }
     }
 
     /// The rooms this connection currently subscribes, one entry per channel —
@@ -300,6 +346,10 @@ pub fn step(
             // named branch serves the shared base up to its fork point plus its own
             // divergent tail.
             branch,
+            // The zone selector picks which of the room's schema-declared partitions
+            // the subscription carries. Empty is the whole room (every zone the actor
+            // may read); a named zone scopes to that partition alone.
+            zone,
             last_seen_seq,
         } => {
             let Some(identity) = session.identity() else {
@@ -373,6 +423,18 @@ pub fn step(
                     ..Response::default()
                 };
             }
+            // Zone scoping. A room with declared zones partitions into separately-
+            // replicated streams; the selector picks which the subscription carries,
+            // each gated independently so an unauthorized zone stays wholly hidden —
+            // its ops, state, structure, count, and existence absent from this
+            // stream. A refused named-zone subscribe returns the same generic denial
+            // as a nonexistent zone, so it never confirms the partition is there.
+            let zones = match zone_scope(authorizer, identity, schema, &room, &zone, may_read) {
+                Ok(zones) => zones,
+                // Every zone refusal is the one generic denial, so a nonexistent zone
+                // and an unauthorized one are indistinguishable.
+                Err(()) => return forbidden("read denied"),
+            };
             // The handshake range-check: a joiner that cannot reach the room's
             // op-version high-water across a back-compatible path is refused with
             // `onUpdateRequired` before it becomes a subscriber, so down-
@@ -427,6 +489,19 @@ pub fn step(
                             })
                             .collect()
                     };
+                    // Then keep only the ops in this subscription's authorized zones
+                    // — the root partition plus its zones — so a zone-scoped or
+                    // partially-authorized whole-room joiner catches up on exactly the
+                    // partitions it may read, an unauthorized zone's ops wholly absent.
+                    // A no-zones room (`None`) skips the filter, byte-identical to
+                    // before zones.
+                    let delta = match &zones {
+                        Some(_) => delta
+                            .into_iter()
+                            .filter(|rec| zone_admits(&zones, rec.op.zone))
+                            .collect(),
+                        None => delta,
+                    };
                     // The owning-element type of each delta op, resolved once over
                     // the room document — a type-scoped migration step narrows to the
                     // ops whose owning element is of its declared type, so the delta
@@ -440,12 +515,15 @@ pub fn step(
                         ops: catch_up_ops(registry, governing, session, delta, &types),
                     }
                 }
-                // A snapshot is the whole materialized replica; redacting it needs a
-                // state-level projection this seam does not do. A reader that does not
-                // read the *whole* document — including one carved out of a
-                // whole-document grant by a downstream read-deny — is refused rather
-                // than served subtrees it may not read; a whole-document reader, and
-                // every reader of a room with no doc-ACL state, is served as before.
+                // A snapshot is the whole materialized replica; doc-ACL redaction it
+                // needs a subtree projection this seam does not do, so a non-whole-
+                // document reader is refused rather than served subtrees it may not
+                // read. Zone scoping, by contrast, *is* a state-level projection: a
+                // zone-limited subscriber is served the replica narrowed to its
+                // authorized partitions, the hidden zones' state wholly dropped before
+                // any migration translation. A whole-document, whole-zone reader (and
+                // every reader of a room with no doc-ACL state or zones) is served as
+                // before.
                 Catchup::Snapshot { seq, state } => {
                     let reads_all = records.is_empty()
                         || reads_whole_document(
@@ -459,6 +537,7 @@ pub fn step(
                     if !reads_all {
                         return forbidden("read denied");
                     }
+                    let state = project_snapshot_zones(state, schema, &zones);
                     Message::Snapshot {
                         channel,
                         seq,
@@ -479,9 +558,14 @@ pub fn step(
                     value,
                 });
             }
-            session
-                .channels
-                .insert(channel, Subscription { room, branch });
+            session.channels.insert(
+                channel,
+                Subscription {
+                    room,
+                    branch,
+                    zones,
+                },
+            );
             Response {
                 replies,
                 ..Response::default()
@@ -503,7 +587,7 @@ pub fn step(
             let Some(client) = session.client else {
                 return violation("ops before hello");
             };
-            let Some(Subscription { room, branch }) = session.channels.get(&channel).cloned()
+            let Some(Subscription { room, branch, .. }) = session.channels.get(&channel).cloned()
             else {
                 return violation("ops on an unbound channel");
             };
@@ -886,6 +970,104 @@ pub fn step(
         // Gossip is a node-to-node membership advertisement the registry handles
         // off the client session path; a client that sends one violates.
         Message::Gossip { .. } => violation("client sent a gossip"),
+    }
+}
+
+/// Resolve a subscribe's zone selector into the set of zone partitions the
+/// subscription carries, or a refusal. `None` is no filtering — a room that
+/// declares no zones (or a relay with no schema): one implicit root partition,
+/// byte-identical to a zoneless subscribe. `Some(set)` scopes the stream; an op is
+/// carried only if it is unzoned (the root partition) or its zone id is in the set.
+///
+/// An empty selector is the whole room: every zone the actor may read, collected by
+/// gating each declared zone; an unreadable zone is silently omitted, so a
+/// partially-authorized whole-room subscriber sees its authorized zones and nothing
+/// of the rest. A named selector scopes to one zone, gated the same way — an unknown
+/// name and an unauthorized zone are both answered with one generic denial, so a
+/// refusal never reveals whether the zone exists.
+fn zone_scope(
+    authorizer: &dyn Authorizer,
+    identity: &Identity,
+    schema: Option<&Schema>,
+    room: &[u8],
+    zone: &[u8],
+    room_read: bool,
+) -> Result<Option<HashSet<u32>>, ()> {
+    let Some(schema) = schema.filter(|s| !s.zones().is_empty()) else {
+        // No declared zones: a whole-room subscribe carries the one implicit
+        // partition unfiltered; a named-zone subscribe selects a partition that does
+        // not exist — refuse, so a zoneless room is indistinguishable from one that
+        // hides the named zone.
+        return if zone.is_empty() { Ok(None) } else { Err(()) };
+    };
+    if zone.is_empty() {
+        let set = schema
+            .zones()
+            .iter()
+            .enumerate()
+            .filter(|(_, (name, _))| {
+                zone_readable(authorizer, identity, room, name.as_bytes(), room_read)
+            })
+            .map(|(i, _)| i as u32)
+            .collect();
+        Ok(Some(set))
+    } else {
+        let Some(id) = schema
+            .zones()
+            .iter()
+            .position(|(name, _)| name.as_bytes() == zone)
+        else {
+            return Err(());
+        };
+        if !zone_readable(authorizer, identity, room, zone, room_read) {
+            return Err(());
+        }
+        Ok(Some(HashSet::from([id as u32])))
+    }
+}
+
+/// Whether `identity` may read the zone named `zone` in `room`. A deployment that
+/// explicitly allows or denies the [`Resource::Zone`] decides; one that abstains
+/// inherits the room read verdict — a zone is visible by default within a readable
+/// room, and an explicit per-zone deny is what carves out an isolated partition.
+fn zone_readable(
+    authorizer: &dyn Authorizer,
+    identity: &Identity,
+    room: &[u8],
+    zone: &[u8],
+    room_read: bool,
+) -> bool {
+    match authorizer.decide(identity, Action::Read, &Resource::Zone { room, zone }) {
+        Decision::Allow => true,
+        Decision::Deny => false,
+        Decision::Abstain => room_read,
+    }
+}
+
+/// Narrow a catch-up snapshot to a zone-limited subscriber's authorized partitions,
+/// dropping every hidden zone's state so the snapshot carries no trace of it. A
+/// whole-zone subscriber (its set covers every declared zone), a no-zones room, or a
+/// relay takes the snapshot verbatim — byte-identical to a zoneless snapshot — so
+/// only a genuinely zone-limited subscriber pays the projection.
+fn project_snapshot_zones(
+    state: Vec<u8>,
+    schema: Option<&Schema>,
+    zones: &Option<HashSet<u32>>,
+) -> Vec<u8> {
+    let (Some(schema), Some(set)) = (schema, zones) else {
+        return state;
+    };
+    if schema.zones().is_empty() || set.len() == schema.zones().len() {
+        return state;
+    }
+    match Document::decode_state(&state) {
+        Ok(mut doc) => {
+            doc.project_zones(schema, set);
+            doc.encode_state()
+        }
+        // An undecodable snapshot is left as-is: it fails downstream on the same
+        // footing it would have without zones, never silently served narrowed-wrong.
+        Err(_) => state,
     }
 }
 

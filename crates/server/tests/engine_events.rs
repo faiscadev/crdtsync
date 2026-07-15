@@ -251,6 +251,7 @@ fn the_registry_emits_connect_then_subscribe() {
         Message::Subscribe {
             channel: Channel(0),
             room: ROOM.to_vec(),
+            zone: Vec::new(),
             last_seen_seq: 0,
             branch: Vec::new(),
         }
@@ -285,6 +286,7 @@ fn a_rejected_duplicate_subscribe_does_not_re_emit() {
     let sub = || Message::Subscribe {
         channel: Channel(0),
         room: ROOM.to_vec(),
+        zone: Vec::new(),
         last_seen_seq: 0,
         branch: Vec::new(),
     };

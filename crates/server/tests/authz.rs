@@ -53,6 +53,7 @@ fn sub(channel: u32, room: &[u8]) -> Message {
     Message::Subscribe {
         channel: Channel(channel),
         room: room.to_vec(),
+        zone: Vec::new(),
         last_seen_seq: 0,
         branch: Vec::new(),
     }
