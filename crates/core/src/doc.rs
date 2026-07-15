@@ -56,7 +56,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 9;
+const STATE_VERSION: u8 = 10;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -97,6 +97,21 @@ struct SlotMove {
     stamp: Stamp,
     tombstone: bool,
     body: SlotBody,
+}
+
+/// A deleted-container slot the migration resurrects, held until the second
+/// phase so a rename onto the old or new key resolves by LWW. The container
+/// itself lands live at the old key (mirroring the op seam, which carries the
+/// create verbatim there); the delete re-keys — to a fresh tombstone at the new
+/// key under a rename, or nowhere under a drop (the delete op dropped).
+struct Resurrect {
+    old_key: Vec<u8>,
+    container: Element,
+    /// The create-stamp the live container lands at the old key with.
+    create_stamp: Stamp,
+    /// The delete's destination: `(new_key, delete_stamp)` under a rename, `None`
+    /// under a drop.
+    tombstone_at: Option<(Vec<u8>, Stamp)>,
 }
 
 /// The value a renamed slot places at its new key.
@@ -513,34 +528,63 @@ impl Document {
     /// deleted container at the id its key derives, so a tombstoned slot can still
     /// carry container identity a leaf migration must not disturb.
     fn has_container_identity(&self, map_id: ElementId, key: &[u8]) -> bool {
-        let id = |kind| ElementId::derive(map_id, key, kind);
-        self.maps.contains_key(&id(ElementKind::Map))
-            || self.lists.contains_key(&id(ElementKind::List))
-            || self.texts.contains_key(&id(ElementKind::Text))
+        self.holds_any_container(map_id, key)
     }
 
-    /// Migrate a snapshot's leaf slots by `fate`, keyed on the slot key — the
+    /// Whether `key` in `map_id` currently holds a retained container of any
+    /// key-derived kind (map / list / text) — the identity a leaf migration must
+    /// not disturb.
+    fn holds_any_container(&self, map_id: ElementId, key: &[u8]) -> bool {
+        [ElementKind::Map, ElementKind::List, ElementKind::Text]
+            .into_iter()
+            .any(|kind| self.container_handle(map_id, key, kind).is_some())
+    }
+
+    /// The retained handle of the `kind` container `key` in `map_id` derives —
+    /// the exact element a snapshot migration resurrects at the old key, chosen by
+    /// the kind the deleted-container tombstone recorded (a key that hosted more
+    /// than one kind keeps each registered, so the recorded kind disambiguates).
+    /// `None` for a non-key-derived (XML) kind or one never created.
+    fn container_handle(
+        &self,
+        map_id: ElementId,
+        key: &[u8],
+        kind: ElementKind,
+    ) -> Option<Element> {
+        let id = ElementId::derive(map_id, key, kind);
+        match kind {
+            ElementKind::Map => self.maps.get(&id).map(|m| Element::Map(Rc::clone(m))),
+            ElementKind::List => self.lists.get(&id).map(|l| Element::List(Rc::clone(l))),
+            ElementKind::Text => self.texts.get(&id).map(|t| Element::Text(Rc::clone(t))),
+            _ => None,
+        }
+    }
+
+    /// Migrate a snapshot's slots by `fate`, keyed on the slot key — the
     /// state-level analogue of translating the op stream between two schema
-    /// versions, so a snapshot-served joiner converges with a peer served the
-    /// same history as a translated op delta. Across every map, each leaf slot
-    /// (scalar / register / counter, live or tombstoned) is `Keep`t, `Drop`ped,
-    /// or `Rename`d to a new key per `fate`; a container slot (map / list / text)
-    /// — live, or a tombstoned deleted one whose identity the registry still holds
-    /// — is always carried verbatim, mirroring the op seam, which carries a
-    /// container-create verbatim rather than tear its subtree. A dropped or
-    /// renamed counter's element moves with its slot — dropped from the registry,
-    /// or merged into the counter at the id its new key derives (matching the op
-    /// seam, where renamed increments merge at that shared id) — so no phantom
-    /// counter lingers. Returns whether any slot changed. `fate` is the
-    /// composition of the chain's per-step key rewrites; supplying `|_| Keep` is
-    /// a no-op.
+    /// versions, so a snapshot-served joiner converges byte-for-byte with a peer
+    /// served the same history as a translated op delta. Across every map, each
+    /// leaf slot (scalar / register / counter, live or tombstoned) is `Keep`t,
+    /// `Drop`ped, or `Rename`d to a new key per `fate`. A live container slot (map
+    /// / list / text) is carried verbatim, mirroring the op seam, which carries a
+    /// container-create verbatim rather than tear its subtree. A *deleted*
+    /// container's tombstone is re-keyed faithfully: its retained create-stamp
+    /// resurrects the container live at the old key — the create the op seam
+    /// carries verbatim there — while the delete re-keys (a fresh tombstone at the
+    /// new key under a rename, dropped under a drop), so both seams reach the same
+    /// bytes. A dropped or renamed counter's element moves with its slot — dropped
+    /// from the registry, or merged into the counter at the id its new key derives
+    /// (matching the op seam, where renamed increments merge at that shared id) —
+    /// so no phantom counter lingers. Returns whether any slot changed. `fate` is
+    /// the composition of the chain's per-step key rewrites; supplying `|_| Keep`
+    /// is a no-op.
     ///
-    /// A container field's *full* migration is out of scope here: re-keying a
-    /// deleted container to match the op seam (which resurrects the create at the
-    /// old key while re-keying the delete) needs the create's stamp, which the
-    /// materialized tombstone has dropped. Such a slot is left verbatim rather
-    /// than mis-migrated as a leaf; faithful container-field migration is the
-    /// deferred element-set-aware seam.
+    /// A deleted container whose create identity did not survive — a re-created
+    /// key a scalar or counter later displaced — cannot be resurrected faithfully
+    /// and is carried verbatim rather than mis-migrated as a leaf. An XML kind,
+    /// whose id derives by node rather than key, is not resurrectable here and
+    /// records no create identity; its deleted slot migrates as a leaf tombstone,
+    /// the pre-existing behaviour, faithful XML-field migration being out of scope.
     pub fn migrate_leaf_slots(&mut self, fate: impl Fn(&[u8]) -> SlotFate) -> bool {
         self.migrate_leaf_slots_scoped(|_, key| fate(key))
     }
@@ -568,17 +612,68 @@ impl Document {
             // slot and by commutative merge at the counter id, never by the
             // traversal order.
             let mut moved: Vec<LeafMove> = Vec::new();
+            let mut resurrects: Vec<Resurrect> = Vec::new();
             let keys = map.borrow().slot_keys();
             for key in keys {
                 let fate = match fate(map_id, &key) {
                     SlotFate::Keep => continue,
                     other => other,
                 };
+                let old_counter = ElementId::derive(map_id, &key, ElementKind::Counter);
+                // A deleted-container tombstone that recorded its create identity is
+                // re-keyed faithfully: the container lands live at the old key (the
+                // create the op seam carries verbatim there) and the delete re-keys
+                // — a tombstone at the new key under a rename, dropped under a drop.
+                // The recorded (stamp, kind) resolves the exact retained container,
+                // and is only ever set on such a tombstone, so its presence
+                // alongside a resolvable handle is the whole condition. The counter
+                // registry at the key re-homes / prunes alongside via the same
+                // machinery as a leaf, a separate identity from the container.
+                let deleted = map.borrow().slot_deleted_container(&key);
+                if let Some((create_stamp, container)) = deleted.and_then(|(stamp, kind)| {
+                    self.container_handle(map_id, &key, kind)
+                        .map(|c| (stamp, c))
+                }) {
+                    let (delete_stamp, _, _) = map
+                        .borrow_mut()
+                        .take_slot(&key)
+                        .expect("a key from slot_keys is present");
+                    changed = true;
+                    let tombstone_at = match fate {
+                        SlotFate::Rename(to) => {
+                            if let Some(captured) = self
+                                .counters
+                                .remove(&old_counter)
+                                .map(|c| c.borrow().deep_clone())
+                            {
+                                moved.push(LeafMove {
+                                    to: to.clone(),
+                                    counter: Some(captured),
+                                    slot: None,
+                                });
+                            }
+                            Some((to, delete_stamp))
+                        }
+                        SlotFate::Drop => {
+                            // The removed field's counter is dropped with it.
+                            self.counters.remove(&old_counter);
+                            None
+                        }
+                        SlotFate::Keep => unreachable!("filtered above"),
+                    };
+                    resurrects.push(Resurrect {
+                        old_key: key,
+                        container,
+                        create_stamp,
+                        tombstone_at,
+                    });
+                    continue;
+                }
                 // The slot body is carried verbatim for a container slot — a live
                 // one, or a tombstoned deleted one whose container identity the
-                // registry still holds (its value is `None`, so it would otherwise
-                // migrate as a leaf tombstone the snapshot cannot re-key faithfully,
-                // the create's stamp being gone). The COUNTER registry at the key's
+                // registry still holds but whose create-stamp is gone (a re-created
+                // key that a scalar or counter later displaced, so a faithful
+                // resurrection is impossible). The COUNTER registry at the key's
                 // derived id migrates regardless: it is a separate identity from the
                 // slot body and from any container at the key, retained across
                 // displacement, so it must prune / re-home even when the slot is
@@ -586,7 +681,6 @@ impl Document {
                 let carry_slot = map.borrow().slot_is_live_container(&key)
                     || (map.borrow().slot_is_tombstone(&key)
                         && self.has_container_identity(map_id, &key));
-                let old_counter = ElementId::derive(map_id, &key, ElementKind::Counter);
                 match fate {
                     SlotFate::Keep => unreachable!("filtered above"),
                     SlotFate::Drop => {
@@ -694,6 +788,40 @@ impl Document {
                     SlotBody::Value(other) => other,
                 };
                 map.borrow_mut().put_slot_lww(to, stamp, value, tombstone);
+            }
+            // Land each resurrected container live at its old key and re-key its
+            // delete. Both go through the LWW installer, so a rename onto either
+            // key this pass also touched resolves by stamp, order-independent with
+            // the leaf moves above.
+            for r in resurrects {
+                let Resurrect {
+                    old_key,
+                    container,
+                    create_stamp,
+                    tombstone_at,
+                } = r;
+                map.borrow_mut().put_slot_lww(
+                    old_key.clone(),
+                    create_stamp,
+                    Some(container.clone()),
+                    false,
+                );
+                // Reinstate only if the container actually won the old key; a
+                // higher-stamped rename onto it this pass leaves the container
+                // displaced, exactly as the op seam's later op at that key would.
+                let won = map
+                    .borrow()
+                    .get(&old_key)
+                    .is_some_and(|v| handles_eq(&v, &container));
+                if won {
+                    container.reinstate();
+                } else {
+                    container.displace();
+                }
+                if let Some((new_key, delete_stamp)) = tombstone_at {
+                    map.borrow_mut()
+                        .put_slot_lww(new_key, delete_stamp, None, true);
+                }
             }
         }
         changed
@@ -1437,7 +1565,7 @@ impl Document {
                         &xml_fragments,
                     )?),
                 };
-                if m.insert_decoded(slot.key, slot.stamp, value, slot.tombstone) {
+                if m.insert_decoded(slot.key, slot.stamp, value, slot.tombstone, slot.deleted) {
                     return Err(DecodeError::BadTag {
                         what: "document: duplicate map slot",
                         tag: 0,
