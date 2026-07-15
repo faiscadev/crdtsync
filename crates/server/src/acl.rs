@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use crdtsync_core::acl::{
-    decide_capability_with_authority, AclActor, AclDecision, AclRecord, Capability,
+    decide_capability_with_authority, AclActor, AclDecision, AclRecord, AclScope, Capability,
 };
 use crdtsync_core::path::encode_path;
 use crdtsync_core::schema::{
@@ -519,13 +519,14 @@ fn root_path() -> Vec<u8> {
 pub fn doc_acl_tier(
     records: &[AclRecord],
     creator: Option<&[u8]>,
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
     identity: &Identity,
     action: Action,
 ) -> Decision {
     let Some(capability) = capability_for(action) else {
         return Decision::Abstain;
     };
-    doc_acl_at(records, creator, identity, &root_path(), capability)
+    doc_acl_at(records, creator, index, identity, &root_path(), capability)
 }
 
 /// The doc-ACL tuple tier's verdict on whether `identity` holds `capability` at
@@ -538,6 +539,7 @@ pub fn doc_acl_tier(
 fn doc_acl_at(
     records: &[AclRecord],
     creator: Option<&[u8]>,
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
     identity: &Identity,
     path: &[u8],
     capability: Capability,
@@ -546,7 +548,15 @@ fn doc_acl_at(
         return Decision::Abstain;
     };
     let actor = actor_acl(identity);
-    match decide_capability_with_authority(records, actor_key(creator), &actor, path, capability) {
+    let resolve = element_resolver(index);
+    match decide_capability_with_authority(
+        records,
+        actor_key(creator),
+        &actor,
+        path,
+        capability,
+        &resolve,
+    ) {
         AclDecision::Allow => Decision::Allow,
         AclDecision::Deny => Decision::Deny,
         AclDecision::Abstain => Decision::Abstain,
@@ -561,10 +571,11 @@ fn doc_acl_at(
 pub fn doc_acl_read_at(
     records: &[AclRecord],
     creator: Option<&[u8]>,
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
     identity: &Identity,
     path: &[u8],
 ) -> Decision {
-    doc_acl_at(records, creator, identity, path, Capability::Read)
+    doc_acl_at(records, creator, index, identity, path, Capability::Read)
 }
 
 /// Whether `identity` holds doc-ACL read on the room at *any* path — the room's
@@ -576,6 +587,7 @@ pub fn doc_acl_read_at(
 pub fn has_any_read_grant(
     records: &[AclRecord],
     creator: Option<&[u8]>,
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
     identity: &Identity,
 ) -> bool {
     let Some(creator) = creator else {
@@ -586,12 +598,25 @@ pub fn has_any_read_grant(
     if actor.id == creator_key {
         return true;
     }
-    let mut paths: Vec<&[u8]> = records.iter().map(|r| r.tuple.path.as_slice()).collect();
+    let resolve = element_resolver(index);
+    // The distinct current paths the grants govern — an element scope resolved to
+    // its element's live path, an unresolvable one dropped (it grants nothing).
+    let mut paths: Vec<Vec<u8>> = records
+        .iter()
+        .filter_map(|r| scope_path(index, &r.tuple.scope))
+        .collect();
     paths.sort_unstable();
     paths.dedup();
     paths.into_iter().any(|path| {
         matches!(
-            decide_capability_with_authority(records, creator_key, &actor, path, Capability::Read),
+            decide_capability_with_authority(
+                records,
+                creator_key,
+                &actor,
+                &path,
+                Capability::Read,
+                &resolve,
+            ),
             AclDecision::Allow
         )
     })
@@ -602,16 +627,18 @@ pub fn has_any_read_grant(
 /// composes — the per-recipient outbound read check. A recipient is served an op
 /// only when this holds for the op's path, so an unauthorized subtree's ops are
 /// withheld from it while an authorized peer still receives them.
+#[allow(clippy::too_many_arguments)]
 pub fn recipient_reads_path(
     deployment: &dyn Authorizer,
     records: &[AclRecord],
     creator: Option<&[u8]>,
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
     schema: Option<&Schema>,
     identity: &Identity,
     room: &[u8],
     op_path: &[u8],
 ) -> bool {
-    let doc_acl = doc_acl_read_at(records, creator, identity, op_path);
+    let doc_acl = doc_acl_read_at(records, creator, index, identity, op_path);
     authorized(
         deployment,
         doc_acl,
@@ -640,12 +667,15 @@ pub fn reads_whole_document(
     deployment: &dyn Authorizer,
     records: &[AclRecord],
     creator: Option<&[u8]>,
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
     schema: Option<&Schema>,
     identity: &Identity,
     room: &[u8],
 ) -> bool {
     let root = encode_path(&[]);
-    if !recipient_reads_path(deployment, records, creator, schema, identity, room, &root) {
+    if !recipient_reads_path(
+        deployment, records, creator, index, schema, identity, room, &root,
+    ) {
         return false;
     }
     if matches!(
@@ -662,12 +692,23 @@ pub fn reads_whole_document(
     // not read the whole document.
     let actor = actor_acl(identity);
     let creator_key = actor_key(creator);
-    let mut paths: Vec<&[u8]> = records.iter().map(|r| r.tuple.path.as_slice()).collect();
+    let resolve = element_resolver(index);
+    let mut paths: Vec<Vec<u8>> = records
+        .iter()
+        .filter_map(|r| scope_path(index, &r.tuple.scope))
+        .collect();
     paths.sort_unstable();
     paths.dedup();
     !paths.into_iter().any(|path| {
         matches!(
-            decide_capability_with_authority(records, creator_key, &actor, path, Capability::Read),
+            decide_capability_with_authority(
+                records,
+                creator_key,
+                &actor,
+                &path,
+                Capability::Read,
+                &resolve,
+            ),
             AclDecision::Deny
         )
     })
@@ -741,16 +782,23 @@ pub fn op_read_path(
         OpKind::RangedCreate { .. }
         | OpKind::RangedSetPayload { .. }
         | OpKind::RangedDelete { .. } => root(),
-        // An ACL grant is gated by the path it governs — `AclTuple.path` is already
-        // in the same encoded-path format this returns.
-        OpKind::AclGrant { path, .. } => path.clone(),
+        // An ACL grant is gated by the path its scope governs: a fixed path directly,
+        // an element scope resolved to its element's current path through `index` (so
+        // the grant op reaches exactly the readers of the element's live location). An
+        // unresolvable element scope falls back to the root, reaching only a
+        // whole-document reader.
+        OpKind::AclGrant { scope, .. } => {
+            scope_path(index, scope).unwrap_or_else(|| encode_path(&[]))
+        }
         // A revoke names only the tombstoned tuple's id; gate it by that tuple's
         // governing path so a recipient sees the revoke exactly where it saw the
         // grant. An id resolving to no held tuple is a moot revoke → root.
         OpKind::AclRevoke { id } => records
             .iter()
             .find(|r| r.tuple.id == *id)
-            .map_or_else(root, |r| r.tuple.path.clone()),
+            .map_or_else(root, |r| {
+                scope_path(index, &r.tuple.scope).unwrap_or_else(|| encode_path(&[]))
+            }),
     }
 }
 
@@ -815,6 +863,34 @@ fn resolve_read_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, id: ElementId) ->
         || encode_path(&[]),
         |segs| encode_path(&segs.iter().map(|s| s.as_slice()).collect::<Vec<_>>()),
     )
+}
+
+/// The current path a grant's [`AclScope`] governs, or `None` when it does not
+/// resolve — a fixed [`Path`](AclScope::Path) is its own bytes; an
+/// [`Element`](AclScope::Element) resolves to the element's current path through the
+/// room's `index`, so an element-scoped grant follows the element across a tree-move.
+/// An id the index does not hold yields `None`: the grant is inert (fail-closed).
+fn scope_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, scope: &AclScope) -> Option<Vec<u8>> {
+    match scope {
+        AclScope::Path(p) => Some(p.clone()),
+        AclScope::Element(id) => index
+            .get(id)
+            .map(|segs| encode_path(&segs.iter().map(|s| s.as_slice()).collect::<Vec<_>>())),
+    }
+}
+
+/// The core [`PathResolver`] the doc-ACL evaluator resolves an element-scoped grant
+/// through: the room's element-context `index`. This is the one seam that carries
+/// element scopes into the pure evaluator, so the write gate, per-op read redaction,
+/// and snapshot projection all resolve an element to the same current path.
+fn element_resolver(
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
+) -> impl Fn(ElementId) -> Option<Vec<u8>> + '_ {
+    move |id| {
+        index
+            .get(&id)
+            .map(|segs| encode_path(&segs.iter().map(|s| s.as_slice()).collect::<Vec<_>>()))
+    }
 }
 
 /// The doc-ACL [`Capability`] a data-plane [`Action`] resolves to, or `None` for

@@ -1003,6 +1003,7 @@ impl Registry {
                                 authorizer,
                                 &records,
                                 creator.as_deref(),
+                                &index,
                                 schema.as_deref(),
                                 identity,
                                 room,

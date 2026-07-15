@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
+use crdtsync_core::acl::{AclGrant, AclScope, AclSubject, Capability};
 use crdtsync_core::path::{encode_path, xml_fragment, xml_insert_element};
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{
@@ -178,7 +178,10 @@ fn revoke(doc: &mut Document, id: ElementId) -> Vec<Op> {
 fn acl_grant_paths(ops: &[Op]) -> Vec<Vec<u8>> {
     ops.iter()
         .filter_map(|op| match &op.kind {
-            OpKind::AclGrant { path, .. } => Some(path.clone()),
+            OpKind::AclGrant {
+                scope: AclScope::Path(p),
+                ..
+            } => Some(p.clone()),
             _ => None,
         })
         .collect()
@@ -192,7 +195,14 @@ fn has_revoke(ops: &[Op]) -> bool {
 
 /// The governing paths of a decoded snapshot's live ACL tuples, sorted.
 fn acl_tuple_paths(d: &Document) -> Vec<Vec<u8>> {
-    let mut p: Vec<Vec<u8>> = d.acl_tuples().into_iter().map(|t| t.path).collect();
+    let mut p: Vec<Vec<u8>> = d
+        .acl_tuples()
+        .into_iter()
+        .filter_map(|t| match t.scope {
+            AclScope::Path(p) => Some(p),
+            AclScope::Element(_) => None,
+        })
+        .collect();
     p.sort();
     p
 }
@@ -1201,5 +1211,251 @@ fn a_partial_reader_snapshot_keeps_only_ranges_it_fully_reads() {
         ids,
         vec![mark_a],
         "bob's snapshot keeps the /a mark and drops the range spanning into unreadable /b",
+    );
+}
+
+// ---- element-scoped grants: a grant that follows a tree-move ---------------
+//
+// A doc-ACL grant keyed to a stable element id resolves to the element's CURRENT
+// path at every enforcement seam (the server injects its element-context index as
+// the resolver), so the grant moves atomically with the element across a real
+// `XmlMove`. These tests drive the three security properties over the redaction
+// seam with columns as the movable content's location:
+//
+//   1. move-safe    — a deny on a card follows it to its new column;
+//   2. no-strand    — the old column is freed when the card leaves it;
+//   3. no-exfil     — the card's column is denied wherever the card is dragged.
+
+const COL_A: &[u8] = b"colA";
+const COL_B: &[u8] = b"colB";
+
+fn col(key: &[u8]) -> Vec<u8> {
+    encode_path(&[key])
+}
+
+/// alice builds two `XmlFragment` columns (colA, colB) with one `card` element in
+/// colA. Returns the emitted ops and the card's stable element id.
+fn build_board(doc: &mut Document) -> (Vec<Op>, ElementId) {
+    let mut card = ElementId::from_bytes([0u8; 16]);
+    let ops = doc.transact(|tx| {
+        tx.xml_fragment(COL_B);
+        let mut frag = tx.xml_fragment(COL_A);
+        let mut kids = frag.children();
+        let mut c = kids.insert_element(0, b"card");
+        card = c.id();
+    });
+    (ops, card)
+}
+
+/// Append an element into the column fragment at `col_key` (so the card keeps its
+/// index). The op's read path resolves to that column.
+fn add_to_col(doc: &mut Document, col_key: &[u8], tag: &[u8]) -> Vec<Op> {
+    let p = col(col_key);
+    let idx = crdtsync_core::path::xml_children_len(doc, &p).unwrap_or(0);
+    xml_insert_element(doc, &p, idx, tag)
+}
+
+/// Move the card (index 0 of colA) to colB, a real `XmlMove`.
+fn move_card(doc: &mut Document) -> Vec<Op> {
+    crdtsync_core::path::xml_move_child(doc, &col(COL_A), 0, &col(COL_B), 0)
+}
+
+/// alice grants `subject` an element-scoped `Deny(Read)` on `id`, authored by alice
+/// (the creator).
+fn grant_deny_element(doc: &mut Document, subject: AclSubject, id: ElementId) -> Vec<Op> {
+    doc.transact(|tx| {
+        tx.acl().grant_element(
+            subject,
+            AclGrant::Capability(Capability::Read),
+            AclEffect::Deny,
+            id,
+            actor_key(b"alice"),
+        );
+    })
+}
+
+/// A room where alice (creator) built the board and granted bob read on BOTH columns
+/// minus an element `Deny(Read)` on the card. Returns the registry, alice's authoring
+/// doc + conn, and the card id.
+fn board_seeded() -> (Registry, Document, ConnId, ElementId) {
+    let mut r = registry();
+    let alice = auth(&mut r, 1, "t-alice");
+    assert!(subscribe(&mut r, alice));
+    r.take_outbox(alice);
+    let mut alice_doc = Document::new(cid(1));
+    let (board_ops, card) = build_board(&mut alice_doc);
+    submit(&mut r, alice, board_ops);
+    let bob = AclSubject::Actor(actor_key(b"bob"));
+    submit(
+        &mut r,
+        alice,
+        grant_read(&mut alice_doc, bob.clone(), &col(COL_A)),
+    );
+    submit(
+        &mut r,
+        alice,
+        grant_read(&mut alice_doc, bob.clone(), &col(COL_B)),
+    );
+    submit(&mut r, alice, grant_deny_element(&mut alice_doc, bob, card));
+    r.take_outbox(alice);
+    (r, alice_doc, alice, card)
+}
+
+#[test]
+fn an_element_deny_read_follows_the_card_across_a_move() {
+    let (mut r, mut alice_doc, alice, _card) = board_seeded();
+    let bob = join(&mut r, 2, "t-bob");
+
+    // Before the move (card in colA): a colB write reaches bob; a colA write — the
+    // card's column — is withheld (the element deny governs colA now).
+    submit(&mut r, alice, add_to_col(&mut alice_doc, COL_B, b"x"));
+    assert!(
+        !received_ops(&mut r, bob).is_empty(),
+        "bob reads colB — the card is not there"
+    );
+    submit(&mut r, alice, add_to_col(&mut alice_doc, COL_A, b"y"));
+    assert!(
+        received_ops(&mut r, bob).is_empty(),
+        "bob is denied colA — the card's current column"
+    );
+
+    // Move the card colA -> colB.
+    submit(&mut r, alice, move_card(&mut alice_doc));
+    r.take_outbox(bob);
+
+    // After the move (card in colB): the deny FOLLOWED — colB is withheld (no
+    // exfil-by-move), and colA is freed (no stranded restriction).
+    submit(&mut r, alice, add_to_col(&mut alice_doc, COL_A, b"z"));
+    assert!(
+        !received_ops(&mut r, bob).is_empty(),
+        "colA is freed — the restriction moved with the card, it did not strand"
+    );
+    submit(&mut r, alice, add_to_col(&mut alice_doc, COL_B, b"w"));
+    assert!(
+        received_ops(&mut r, bob).is_empty(),
+        "the deny followed the card to colB — relocating it did not free it"
+    );
+}
+
+#[test]
+fn a_whole_document_reader_receives_every_column_across_a_move() {
+    let (mut r, mut alice_doc, alice, _card) = board_seeded();
+    // alice's second device — the creator's actor, owns `/` — reads everything, both
+    // columns, before and after the move.
+    let alice2 = join(&mut r, 10, "t-alice2");
+    submit(&mut r, alice, add_to_col(&mut alice_doc, COL_A, b"y"));
+    assert!(
+        !received_ops(&mut r, alice2).is_empty(),
+        "the creator reads colA"
+    );
+    submit(&mut r, alice, move_card(&mut alice_doc));
+    r.take_outbox(alice2);
+    submit(&mut r, alice, add_to_col(&mut alice_doc, COL_B, b"w"));
+    assert!(
+        !received_ops(&mut r, alice2).is_empty(),
+        "the creator reads colB — the card's new column — too"
+    );
+}
+
+/// Seed the board + grants on an already-configured registry (a snapshot variant can
+/// set its compaction threshold first). The card stays in colA — the element grant is
+/// exercised on a stationary element, so the two catch-up seams are compared on the
+/// element→path resolution alone, not the separate moved-node/create-position
+/// interaction (that is what the op-seam tests above drive).
+fn seed_board(r: &mut Registry) {
+    let alice = auth(r, 1, "t-alice");
+    assert!(subscribe(r, alice));
+    r.take_outbox(alice);
+    let mut alice_doc = Document::new(cid(1));
+    let (board_ops, card) = build_board(&mut alice_doc);
+    submit(r, alice, board_ops);
+    let bob = AclSubject::Actor(actor_key(b"bob"));
+    submit(
+        r,
+        alice,
+        grant_read(&mut alice_doc, bob.clone(), &col(COL_A)),
+    );
+    submit(
+        r,
+        alice,
+        grant_read(&mut alice_doc, bob.clone(), &col(COL_B)),
+    );
+    submit(r, alice, grant_deny_element(&mut alice_doc, bob, card));
+    r.take_outbox(alice);
+}
+
+fn has_frag(d: &Document, key: &[u8]) -> bool {
+    matches!(d.get(key), Some(crdtsync_core::Element::XmlFragment(_)))
+}
+
+#[test]
+fn an_element_grant_reader_converges_op_join_with_snapshot_join() {
+    // bob reads colA + colB minus an element Deny(Read) on the card (in colA). Both an
+    // op-served bob and a snapshot-served bob resolve the element grant through the
+    // same server index to the card's column (colA), so both drop colA and keep colB —
+    // the two catch-up seams converge on the same authorized subset.
+    let ops_replica = {
+        let mut r = registry();
+        seed_board(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        let mut replica = Document::new(cid(2));
+        for op in received_ops(&mut r, bob) {
+            replica.apply(&op);
+        }
+        replica
+    };
+    let snap_replica = {
+        let mut r = registry();
+        r.set_compaction_threshold(1);
+        seed_board(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        served_snapshot(&mut r, bob).expect("a partial reader is served a projected snapshot")
+    };
+    for (label, replica) in [("op-join", &ops_replica), ("snapshot-join", &snap_replica)] {
+        assert!(
+            has_frag(replica, COL_B),
+            "{label} bob materializes colB — readable, holds no denied element"
+        );
+        assert!(
+            !has_frag(replica, COL_A),
+            "{label} bob drops colA — the element deny resolves there and hides it"
+        );
+    }
+}
+
+#[test]
+fn a_room_with_no_acl_fans_out_a_move_to_every_reader() {
+    // Regression: with no doc-ACL tuples the board + move fan out unredacted to a plain
+    // subscriber — the pre-redaction path, untouched by element scopes.
+    let mut r = Registry::new(cid(0xFF));
+    r.set_verifier(Box::new(tokens(&[("t-alice", "alice"), ("t-bob", "bob")])));
+    r.set_authorizer(Box::new(
+        Acl::new()
+            .allow(
+                Subject::Anyone,
+                Some(Action::Read),
+                ResourceMatch::Room(ROOM.to_vec()),
+            )
+            .allow(
+                Subject::Actor(b"alice".to_vec()),
+                Some(Action::Write),
+                ResourceMatch::Room(ROOM.to_vec()),
+            ),
+    ));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+    let alice = auth(&mut r, 1, "t-alice");
+    assert!(subscribe(&mut r, alice));
+    r.take_outbox(alice);
+    let mut alice_doc = Document::new(cid(1));
+    let (board_ops, _card) = build_board(&mut alice_doc);
+    submit(&mut r, alice, board_ops);
+    r.take_outbox(alice);
+    let bob = join(&mut r, 2, "t-bob");
+    submit(&mut r, alice, move_card(&mut alice_doc));
+    assert!(
+        !received_ops(&mut r, bob).is_empty(),
+        "no doc-ACL: the move fans out to bob unredacted"
     );
 }

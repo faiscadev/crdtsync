@@ -375,6 +375,12 @@ pub fn step(
             // and fan-out never disagree on doc-ACL.
             let records = hub.acl_records(&room);
             let creator = hub.room_creator(&room);
+            // The element-context index resolves an element-scoped grant to its
+            // element's current path, so a grant follows the element across a
+            // tree-move. Built once and shared by every doc-ACL read decision on this
+            // subscribe (root gate, subtree admission, per-op catch-up, whole-document
+            // snapshot check), so they all resolve an element to the same path.
+            let index = hub.element_paths(&room);
             let root_path = crdtsync_core::path::encode_path(&[]);
             // Whole-document read: the composed verdict at the root — the creator, a
             // root-level grant, or a deployment/schema room-read allow. It also
@@ -383,6 +389,7 @@ pub fn step(
                 authorizer,
                 &records,
                 creator.as_deref(),
+                &index,
                 schema,
                 identity,
                 &room,
@@ -395,7 +402,7 @@ pub fn step(
             let may_read = whole_doc_read
                 || (authorizer.decide(identity, Action::Read, &Resource::Room(&room))
                     == Decision::Abstain
-                    && has_any_read_grant(&records, creator.as_deref(), identity));
+                    && has_any_read_grant(&records, creator.as_deref(), &index, identity));
             if !may_read {
                 return forbidden("read denied");
             }
@@ -473,7 +480,6 @@ pub fn step(
                     let delta = if records.is_empty() {
                         delta
                     } else {
-                        let index = hub.element_paths(&room);
                         let ranged_anchors = hub.ranged_anchors(&room);
                         delta
                             .into_iter()
@@ -488,6 +494,7 @@ pub fn step(
                                             authorizer,
                                             &records,
                                             creator.as_deref(),
+                                            &index,
                                             schema,
                                             identity,
                                             &room,
@@ -539,6 +546,7 @@ pub fn step(
                             authorizer,
                             &records,
                             creator.as_deref(),
+                            &index,
                             schema,
                             identity,
                             &room,
@@ -634,6 +642,7 @@ pub fn step(
             let doc_acl = doc_acl_tier(
                 &hub.acl_records(&room),
                 hub.room_creator(&room).as_deref(),
+                &hub.element_paths(&room),
                 identity,
                 Action::Write,
             );
@@ -1173,12 +1182,17 @@ fn project_snapshot_reads(
 ) -> Vec<u8> {
     match Document::decode_state(&state) {
         Ok(mut doc) => {
+            // Resolve element-scoped grants against the very tree being projected, so
+            // an element's redaction path matches its position in this snapshot — the
+            // same element-context index the op fan-out resolves against, derived here
+            // from the decoded doc so it cannot drift from what is projected.
+            let index = crate::index::element_paths(&doc);
             doc.project_read_paths(|path| {
                 let encoded = crdtsync_core::path::encode_path(
                     &path.iter().map(Vec::as_slice).collect::<Vec<_>>(),
                 );
                 recipient_reads_path(
-                    authorizer, records, creator, schema, identity, room, &encoded,
+                    authorizer, records, creator, &index, schema, identity, room, &encoded,
                 )
             });
             doc.encode_state()
