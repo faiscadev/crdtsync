@@ -1440,6 +1440,32 @@ int32_t crdtsync_client_diff_result(const CrdtClient *client,
                                     uintptr_t room_len,
                                     CrdtBuf *out);
 
+// Frame a request to duplicate room `src`'s live state into a fresh room `dst`;
+// returns the frame to send. Empty on a bad handle or input. Room-keyed: a
+// client may clone a room before it subscribes any of it. The reply updates the
+// clone-result view, read with [`crdtsync_client_clone_result`].
+//
+// # Safety
+// `client` is a live handle; `src`/`src_len` and `dst`/`dst_len` follow
+// [`as_slice`].
+CrdtBuf crdtsync_client_clone_room(const CrdtClient *client,
+                                   const uint8_t *src,
+                                   uintptr_t src_len,
+                                   const uint8_t *dst,
+                                   uintptr_t dst_len);
+
+// The outcome of the last clone answered for destination `dst`, into
+// `out_created` (0 or 1). Returns 1 if a result is held, 0 if none has been
+// answered, -1 on a bad handle or input.
+//
+// # Safety
+// `client` is a live handle; `dst`/`dst_len` follow [`as_slice`]; `out_created`
+// points to a writable `i32`.
+int32_t crdtsync_client_clone_result(const CrdtClient *client,
+                                     const uint8_t *dst,
+                                     uintptr_t dst_len,
+                                     int32_t *out_created);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

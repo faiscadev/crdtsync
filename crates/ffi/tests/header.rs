@@ -151,6 +151,9 @@ fn the_header_declares_every_exported_symbol() {
         // client diff query
         "crdtsync_client_diff_query",
         "crdtsync_client_diff_result",
+        // client clone room
+        "crdtsync_client_clone_room",
+        "crdtsync_client_clone_result",
     ];
     for sym in required {
         assert!(

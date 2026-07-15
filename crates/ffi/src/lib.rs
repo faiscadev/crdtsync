@@ -3625,3 +3625,61 @@ pub unsafe extern "C" fn crdtsync_client_diff_result(
     }))
     .unwrap_or(-1)
 }
+
+// --- client clone room ---
+
+/// Frame a request to duplicate room `src`'s live state into a fresh room `dst`;
+/// returns the frame to send. Empty on a bad handle or input. Room-keyed: a
+/// client may clone a room before it subscribes any of it. The reply updates the
+/// clone-result view, read with [`crdtsync_client_clone_result`].
+///
+/// # Safety
+/// `client` is a live handle; `src`/`src_len` and `dst`/`dst_len` follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_clone_room(
+    client: *const CrdtClient,
+    src: *const u8,
+    src_len: usize,
+    dst: *const u8,
+    dst_len: usize,
+) -> CrdtBuf {
+    request_frame(client, |s| {
+        match (as_slice(src, src_len), as_slice(dst, dst_len)) {
+            (Some(src), Some(dst)) => Some(s.clone_room(src, dst)),
+            _ => None,
+        }
+    })
+}
+
+/// The outcome of the last clone answered for destination `dst`, into
+/// `out_created` (0 or 1). Returns 1 if a result is held, 0 if none has been
+/// answered, -1 on a bad handle or input.
+///
+/// # Safety
+/// `client` is a live handle; `dst`/`dst_len` follow [`as_slice`]; `out_created`
+/// points to a writable `i32`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_clone_result(
+    client: *const CrdtClient,
+    dst: *const u8,
+    dst_len: usize,
+    out_created: *mut i32,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out_created.is_null() {
+            return -1;
+        }
+        let Some(d) = as_slice(dst, dst_len) else {
+            return -1;
+        };
+        match (*client).session.clone_result(d) {
+            Some(created) => {
+                *out_created = i32::from(created);
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
