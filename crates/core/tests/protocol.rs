@@ -313,6 +313,8 @@ fn every_error_code_round_trips() {
         ErrorCode::Internal,
         ErrorCode::Forbidden,
         ErrorCode::UpdateRequired,
+        ErrorCode::NotFound,
+        ErrorCode::SchemaViolation,
     ] {
         round_trips(Message::Error {
             code,
@@ -379,6 +381,8 @@ fn ops_rejected_round_trips_every_reason_code() {
         ErrorCode::Internal,
         ErrorCode::Forbidden,
         ErrorCode::UpdateRequired,
+        ErrorCode::NotFound,
+        ErrorCode::SchemaViolation,
     ] {
         round_trips(Message::OpsRejected {
             channel: Channel(1),

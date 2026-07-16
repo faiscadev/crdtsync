@@ -1618,6 +1618,26 @@ impl Hub {
             .is_some_and(|r| index::batch_crosses_zone(&r.doc, ops, schema))
     }
 
+    /// Whether `ops` would introduce a schema violation in `room` under `schema`
+    /// that an enforcing server refuses at ingress — a runtime-kind mismatch at a
+    /// declared slot, the one unrepairable-and-inadmissible violation. The enforcing
+    /// op-ingress gate calls this before the ops commit and refuses such a batch, so
+    /// the mistyped state never enters the log and every replica converges on its
+    /// absence. Repairable violations pass through here and are folded away at read;
+    /// an undeclared map slot is admissible (a Map is an open container).
+    /// An opening write to a room the hub does not yet hold is validated against a
+    /// fresh empty document — a first write establishing a non-repairable state is
+    /// still refused. `false` for a batch that introduces no fresh non-repairable
+    /// violation.
+    pub fn batch_violates_schema(&self, room: &[u8], ops: &[Op], schema: &Schema) -> bool {
+        match self.rooms.get(room) {
+            Some(r) => index::batch_introduces_schema_violation(&r.doc, ops, schema),
+            None => {
+                index::batch_introduces_schema_violation(&Document::new(self.server), ops, schema)
+            }
+        }
+    }
+
     /// The authenticated actor that created `room` — its doc-ACL authority root — or
     /// `None` for an unknown room or one with no established creator.
     pub fn room_creator(&self, room: &[u8]) -> Option<Vec<u8>> {

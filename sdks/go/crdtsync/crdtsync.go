@@ -395,6 +395,10 @@ const (
 	// NotFound is a diff query over a version or branch the room does not have —
 	// recoverable, the connection stays open.
 	NotFound ErrorCode = 7
+	// SchemaViolation is an enforcing server refusing ops that would introduce a
+	// runtime-kind mismatch at a declared slot — recoverable, the connection stays
+	// open, the author keeps its ops.
+	SchemaViolation ErrorCode = 8
 )
 
 // Rejected is an op batch the server refused, surfaced by TakeRejected for the

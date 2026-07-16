@@ -17,8 +17,9 @@ use std::collections::{HashMap, HashSet};
 
 use crdtsync_core::op::OpKind;
 use crdtsync_core::schema::TypeDef;
+use crdtsync_core::validate::{validate, Step};
 use crdtsync_core::zone;
-use crdtsync_core::{Document, Element, ElementId, Op, Schema};
+use crdtsync_core::{Document, Element, ElementId, Op, Schema, Stamp};
 
 /// An element id mapped to its `core::path` key sequence — the projection the
 /// zone (and later type) resolution reads. A positional XML child inherits its
@@ -180,4 +181,114 @@ fn move_node(op: &Op) -> Option<ElementId> {
         OpKind::XmlMove { node, .. } => Some(*node),
         _ => None,
     }
+}
+
+/// Whether applying `ops` to `doc` would introduce a schema violation an enforcing
+/// server refuses at ingress — a runtime-kind mismatch at a declared slot, the one
+/// unrepairable-and-inadmissible violation (see
+/// [`ViolationKind::rejects_at_ingress`]). The repairable dimensions (out-of-bounds
+/// clamp, over-max truncate, disallowed/mistyped attr drop, disallowed/excess child
+/// drop, orphan wrap, cross-zone anchor drop) are folded away at read and never
+/// rejected here; an undeclared map slot is admissible (a Map is an open container).
+///
+/// The batch is simulated on an independent decoded copy — the same fold the commit
+/// performs — and the schema validated before and after. A mismatch is refused only
+/// when it stands at a *location* the pre-apply state did not already have
+/// mismatched: a mismatch already committed there (from a non-enforcing write — a
+/// relay- or foreign-app-ingested op, a branch write, pre-enforcement history) is
+/// exempt, so an unrelated edit near it never wedges. Comparing *locations* (not a
+/// bare count) is what catches a batch that heals one standing mismatch while
+/// planting a fresh one elsewhere — a count would net to zero and admit it. The
+/// location key resolves each sequence index to its stable Fugue node stamp, so an
+/// unrelated insert/delete that only renumbers a pre-existing mismatch's index does
+/// not read as a new one. `false` for a batch that plants no fresh mismatch, or one
+/// that fails to decode.
+pub fn batch_introduces_schema_violation(doc: &Document, ops: &[Op], schema: &Schema) -> bool {
+    // An empty batch changes nothing, so it cannot plant a mismatch — skip the
+    // whole simulate/validate round trip.
+    if ops.is_empty() {
+        return false;
+    }
+    // An independent copy: decode fresh bytes rather than share the live tree's
+    // handles, so the simulation never touches the committed document.
+    let bytes = doc.encode_state();
+    let Ok(mut simulated) = Document::decode_state(&bytes) else {
+        return false;
+    };
+    for op in ops {
+        simulated.apply(op);
+    }
+    let after = mismatch_keys(&simulated, schema);
+    // The common case — a conforming write — plants no rejectable mismatch at all,
+    // so the pre-state walk is paid only when the result actually carries one.
+    if after.is_empty() {
+        return false;
+    }
+    let Ok(base) = Document::decode_state(&bytes) else {
+        return false;
+    };
+    let before = mismatch_keys(&base, schema);
+    after.iter().any(|k| !before.contains(k))
+}
+
+/// One segment of a positionally-stable location key: a map/attr slot by its raw
+/// key bytes, or a sequence position by the stable Fugue node stamp of the item
+/// there — never its index, which an unrelated insert or delete renumbers.
+#[derive(PartialEq, Eq)]
+enum KeyPart {
+    Key(Vec<u8>),
+    Node(Stamp),
+}
+
+/// The stable location key of every ingress-rejectable violation in `doc` against
+/// `schema`. Two docs that hold the same mismatched element at the same tree
+/// location produce the same key even if an unrelated sequence edit shifted its
+/// index, so the before/after diff attributes a mismatch to the batch only when it
+/// is genuinely fresh.
+fn mismatch_keys(doc: &Document, schema: &Schema) -> Vec<Vec<KeyPart>> {
+    validate(doc, schema)
+        .into_iter()
+        .filter(|v| v.kind.rejects_at_ingress())
+        .filter_map(|v| stable_key(doc, &v.path))
+        .collect()
+}
+
+/// Walk `path` from the root, emitting a [`KeyPart`] per step: a map/attr key
+/// verbatim, a sequence index resolved to the node stamp of the item at that
+/// position. `None` for a path that does not resolve in `doc` (a since-changed
+/// tree), so the violation is simply omitted from the key set.
+fn stable_key(doc: &Document, path: &[Step]) -> Option<Vec<KeyPart>> {
+    let mut cur = Element::Map(doc.root());
+    let mut out = Vec::with_capacity(path.len());
+    for step in path {
+        cur = match (step, &cur) {
+            (Step::Key(k), Element::Map(m)) => {
+                out.push(KeyPart::Key(k.clone()));
+                m.borrow().get(k)?
+            }
+            (Step::Key(k), Element::XmlElement(x)) => {
+                out.push(KeyPart::Key(k.clone()));
+                x.borrow().attrs().borrow().get(k)?
+            }
+            (Step::Index(i), Element::List(l)) => {
+                let l = l.borrow();
+                out.push(KeyPart::Node(*l.node_ids(*i, 1).first()?));
+                l.get(*i)?
+            }
+            (Step::Index(i), Element::XmlElement(x)) => {
+                let kids = x.borrow().children();
+                let kids = kids.borrow();
+                out.push(KeyPart::Node(*kids.node_ids(*i, 1).first()?));
+                kids.get(*i)?
+            }
+            (Step::Index(i), Element::XmlFragment(f)) => {
+                let kids = f.borrow().children();
+                let kids = kids.borrow();
+                out.push(KeyPart::Node(*kids.node_ids(*i, 1).first()?));
+                kids.get(*i)?
+            }
+            _ => return None,
+        };
+    }
+    Some(out)
 }
