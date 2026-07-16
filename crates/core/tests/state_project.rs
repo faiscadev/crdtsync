@@ -372,6 +372,151 @@ fn a_counter_renamed_onto_an_occupied_counter_merges_at_the_shared_id() {
     assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
 }
 
+// --- rename onto a live container (LWW displacement) ---
+
+/// Build a doc holding a live container at `dst` (lower stamp) and a scalar leaf
+/// at `src` (higher stamp), returning the doc and the container handle. A rename
+/// of `src` onto `dst` lands the higher-stamped leaf in the slot, evicting the
+/// container — which the migration must DISPLACE, exactly as the op seam's renamed
+/// leaf op would through `Map::set`.
+fn container_then_leaf(build: impl FnOnce(&mut Document)) -> Document {
+    let mut d = doc();
+    build(&mut d);
+    // The leaf's higher stamp lands after the container's create.
+    d.transact(|tx| tx.set(b"src", Scalar::Int(99)));
+    d
+}
+
+#[test]
+fn a_leaf_renamed_onto_a_live_map_displaces_it() {
+    let mut d = container_then_leaf(|d| {
+        d.transact(|tx| {
+            tx.map(b"dst").set(b"inner", Scalar::Int(7));
+        });
+    });
+    let container = match d.get(b"dst") {
+        Some(Element::Map(m)) => m,
+        _ => panic!("expected the live map at dst"),
+    };
+    assert!(!container.borrow().is_displaced());
+    assert!(d.migrate_leaf_slots(rename(b"src", b"dst")));
+    assert!(
+        matches!(d.get(b"dst"), Some(Element::Scalar(Scalar::Int(99)))),
+        "the higher-stamped leaf won the slot"
+    );
+    assert!(
+        container.borrow().is_displaced(),
+        "the evicted map must be displaced, matching the op seam"
+    );
+}
+
+#[test]
+fn a_leaf_renamed_onto_a_live_list_displaces_it() {
+    let mut d = container_then_leaf(|d| {
+        d.transact(|tx| {
+            tx.list(b"dst").insert(0, Scalar::Int(7));
+        });
+    });
+    let container = match d.get(b"dst") {
+        Some(Element::List(l)) => l,
+        _ => panic!("expected the live list at dst"),
+    };
+    assert!(!container.borrow().is_displaced());
+    assert!(d.migrate_leaf_slots(rename(b"src", b"dst")));
+    assert!(matches!(
+        d.get(b"dst"),
+        Some(Element::Scalar(Scalar::Int(99)))
+    ));
+    assert!(
+        container.borrow().is_displaced(),
+        "the evicted list must be displaced, matching the op seam"
+    );
+}
+
+#[test]
+fn a_leaf_renamed_onto_a_live_text_displaces_it() {
+    let mut d = container_then_leaf(|d| {
+        d.transact(|tx| {
+            tx.text(b"dst").insert(0, "hi");
+        });
+    });
+    let container = match d.get(b"dst") {
+        Some(Element::Text(t)) => t,
+        _ => panic!("expected the live text at dst"),
+    };
+    assert!(!container.borrow().is_displaced());
+    assert!(d.migrate_leaf_slots(rename(b"src", b"dst")));
+    assert!(matches!(
+        d.get(b"dst"),
+        Some(Element::Scalar(Scalar::Int(99)))
+    ));
+    assert!(
+        container.borrow().is_displaced(),
+        "the evicted text must be displaced, matching the op seam"
+    );
+}
+
+#[test]
+fn a_leaf_renamed_onto_a_live_container_converges_with_the_op_seam() {
+    // Snapshot seam: the migration renames the leaf onto the container's key.
+    let mut snap = doc();
+    snap.transact(|tx| {
+        tx.map(b"dst").set(b"inner", Scalar::Int(7));
+    });
+    snap.transact(|tx| tx.set(b"src", Scalar::Int(99)));
+    let container = match snap.get(b"dst") {
+        Some(Element::Map(m)) => m,
+        _ => panic!("expected the live map at dst"),
+    };
+    assert!(snap.migrate_leaf_slots(rename(b"src", b"dst")));
+    assert!(
+        container.borrow().is_displaced(),
+        "the evicted map is displaced on the snapshot seam"
+    );
+
+    // Op seam: the renamed leaf op lands at dst and `Map::set` displaces the
+    // container. Same ops, same order, same client — so the two seams project the
+    // exact same snapshot bytes.
+    let mut op = doc();
+    op.transact(|tx| {
+        tx.map(b"dst").set(b"inner", Scalar::Int(7));
+    });
+    op.transact(|tx| tx.set(b"dst", Scalar::Int(99)));
+    assert_eq!(
+        snap.encode_state(),
+        op.encode_state(),
+        "the snapshot and op seams converge"
+    );
+
+    // An op targeting the detached container is dropped on the snapshot seam by the
+    // displaced guard, exactly as on the op seam — so the two stay converged rather
+    // than the snapshot seam silently mutating a container the op seam left inert.
+    let mut probe = doc();
+    probe.transact(|tx| {
+        tx.map(b"dst").set(b"inner", Scalar::Int(7));
+    });
+    // Pad the clock so the probe op's id is unseen by both seams (whose ops top out
+    // below it), then it routes rather than dedups.
+    probe.transact(|tx| tx.set(b"pad", Scalar::Int(0)));
+    probe.transact(|tx| tx.set(b"pad2", Scalar::Int(0)));
+    let late = probe.transact(|tx| {
+        tx.map(b"dst").set(b"late", Scalar::Int(1));
+    });
+    for o in &late {
+        snap.apply(o);
+        op.apply(o);
+    }
+    assert!(
+        container.borrow().get(b"late").is_none(),
+        "the detached container is not mutated by the targeting op"
+    );
+    assert_eq!(
+        snap.encode_state(),
+        op.encode_state(),
+        "the seams stay converged under an op targeting the detached container"
+    );
+}
+
 #[test]
 fn a_chained_counter_rename_is_order_independent() {
     // A non-composed fate renames a→c and c→d in one pass. Each source must
