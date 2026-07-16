@@ -1,13 +1,18 @@
 //! The blob HTTP transport — the out-of-band byte channel that turns a `POST` of
 //! bytes into a handle and serves the bytes back on `GET`.
 //!
-//! The status matrix (round-trip, unknown / malformed id, auth, body cap) is
-//! driven in-process through the axum router with `oneshot`, sharing one store so
-//! an upload's handle is fetchable by a later request. One socket test then proves
-//! `serve_blobs` wires the router to a real listener and that the store persists
-//! across requests. Every test here touches the filesystem (the store root) and/or
-//! binds a loopback socket, so each is skipped under Miri, which cannot execute
-//! those syscalls.
+//! The status matrix (round-trip, unknown / malformed id, auth, authorization,
+//! body cap) is driven in-process through the axum router with `oneshot`, sharing
+//! one store so an upload's handle is fetchable by a later request. One socket test
+//! then proves `serve_blobs` wires the router to a real listener and that the store
+//! persists across requests. Every test here touches the filesystem (the store
+//! root) and/or binds a loopback socket, so each is skipped under Miri, which
+//! cannot execute those syscalls.
+//!
+//! The reference-site authorization *policy* — which identities may fetch which
+//! blob given the doc-ACL — is proved end-to-end over the registry in `blob_acl`;
+//! here the `BlobAccess` gate is a stub, exercising only the route's wiring of it
+//! (a deny becomes `403`, an allow reaches the store).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,7 +20,10 @@ use std::sync::{Arc, Mutex};
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
 use axum::Router;
-use crdtsync_server::{blob_router, serve_blobs, BlobStore, StaticTokens, MAX_BLOB_BODY};
+use crdtsync_server::{
+    blob_router, serve_blobs, BlobAccess, BlobStore, Identity, PermitAllBlobs, StaticTokens,
+    MAX_BLOB_BODY,
+};
 use tower::ServiceExt;
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
@@ -37,8 +45,26 @@ fn verifier() -> StaticTokens {
     t
 }
 
+/// A `BlobAccess` stub that answers every fetch with a fixed verdict — the route
+/// wiring under test, not the policy (that is `blob_acl`'s job).
+struct FixedAccess(bool);
+
+#[async_trait::async_trait]
+impl BlobAccess for FixedAccess {
+    async fn may_read_blob(&self, _identity: &Identity, _blob_id: &[u8; 16]) -> bool {
+        self.0
+    }
+}
+
+/// A router whose fetch gate authorizes every request — the default for the
+/// non-authorization status-matrix tests.
 fn router(store: Arc<Mutex<BlobStore>>) -> Router {
-    blob_router(Box::new(verifier()), store)
+    blob_router(Box::new(verifier()), store, Arc::new(PermitAllBlobs))
+}
+
+/// A router whose fetch gate answers every fetch with `verdict`.
+fn router_with_access(store: Arc<Mutex<BlobStore>>, verdict: bool) -> Router {
+    blob_router(Box::new(verifier()), store, Arc::new(FixedAccess(verdict)))
 }
 
 /// Drive one request through a clone of `router` (so the shared store persists
@@ -209,6 +235,95 @@ async fn an_oversized_body_is_413() {
     assert_eq!(status, 413);
 }
 
+// --- fetch authorization wiring -------------------------------------------
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_authenticated_but_unauthorized_fetch_is_403() {
+    // The store holds the bytes and the caller authenticates, yet the reference-site
+    // gate denies: the fetch is 403, not 200 — the authenticated-but-not-authorized
+    // gap closed. The response never reaches the store.
+    let s = store();
+    let r = router_with_access(s.clone(), true);
+    let (status, handle) = upload(&r, vec![4u8; 9000]).await;
+    assert_eq!(status, 200);
+    let id = handle["id"].as_str().unwrap().to_string();
+
+    // Same store, a denying gate.
+    let denied = router_with_access(s, false);
+    let (status, _) = send(
+        &denied,
+        "GET",
+        &format!("/blobs/{id}"),
+        Some("user-cred"),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 403, "an authorized-denied fetch is forbidden");
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn an_authorized_fetch_reaches_the_bytes() {
+    // The allow verdict lets the fetch through to the store — the gate is a gate,
+    // not a wall.
+    let r = router_with_access(store(), true);
+    let payload = vec![5u8; 9000];
+    let (status, handle) = upload(&r, payload.clone()).await;
+    assert_eq!(status, 200);
+    let id = handle["id"].as_str().unwrap();
+
+    let (status, bytes) = send(
+        &r,
+        "GET",
+        &format!("/blobs/{id}"),
+        Some("user-cred"),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(bytes, payload);
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn authorization_is_checked_after_authentication() {
+    // An unauthenticated fetch is 401 even when the gate would allow — authentication
+    // is the outer gate; a missing credential never reaches the authorization check
+    // (and there is no identity to check).
+    let r = router_with_access(store(), true);
+    let (status, _) = send(
+        &r,
+        "GET",
+        "/blobs/00000000000000000000000000000000",
+        None,
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 401);
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn a_malformed_id_is_rejected_before_authorization() {
+    // A malformed id is 400 even under a denying gate — parsing precedes the
+    // reference-site check, so a bad id never becomes a lookup.
+    let r = router_with_access(store(), false);
+    let (status, _) = send(
+        &r,
+        "GET",
+        "/blobs/not-a-valid-id",
+        Some("user-cred"),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 400);
+}
+
 // --- socket integration ---------------------------------------------------
 
 use tokio::net::TcpListener;
@@ -219,7 +334,12 @@ use tokio::net::TcpListener;
 async fn serves_upload_and_fetch_over_a_socket() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_blobs(listener, Box::new(verifier()), store()));
+    tokio::spawn(serve_blobs(
+        listener,
+        Box::new(verifier()),
+        store(),
+        Arc::new(PermitAllBlobs),
+    ));
 
     let client = reqwest::Client::new();
     let payload = vec![3u8; 9000];

@@ -203,14 +203,48 @@ async fn register(
 /// slice.
 pub const MAX_BLOB_BODY: usize = 8 << 20;
 
+/// The reference-site authorization seam a blob **fetch** consults after
+/// authenticating: whether an [`Identity`] may retrieve the blob whose public
+/// handle is `blob_id`. A blob is content-addressed and immutable, so authority
+/// cannot attach to the bytes — it attaches to the paths that *reference* the
+/// blob, and the answer is yes iff the identity holds read authority on at least
+/// one live reference (resolved through the same doc-ACL evaluator op redaction
+/// uses). Fail-closed: an unreferenced or unreadable id is denied.
+///
+/// The production implementation ([`RegistryHandle`](crate::runtime::RegistryHandle))
+/// queries the running registry actor; tests supply their own. Upload is not gated
+/// here — a producer stores bytes before any reference exists; the gate is on fetch.
+#[async_trait::async_trait]
+pub trait BlobAccess: Send + Sync {
+    /// Whether `identity` may fetch the blob handle `blob_id`. Must fail closed on
+    /// every ambiguous case (unreferenced id, unreadable reference, unresolvable
+    /// lookup) — this is a security-authorization boundary, default DENY.
+    async fn may_read_blob(&self, identity: &Identity, blob_id: &[u8; 16]) -> bool;
+}
+
+/// A blob-access seam that authorizes every fetch — the dev-mode default, matching
+/// the permissive [`PermitAll`](crate::authz::PermitAll) authorizer. A deployment
+/// that wants the reference-site gate wires the registry-backed
+/// [`RegistryHandle`](crate::runtime::RegistryHandle) instead.
+pub struct PermitAllBlobs;
+
+#[async_trait::async_trait]
+impl BlobAccess for PermitAllBlobs {
+    async fn may_read_blob(&self, _identity: &Identity, _blob_id: &[u8; 16]) -> bool {
+        true
+    }
+}
+
 /// The blob store plus the credential seam every blob request authenticates
-/// against. The store is behind a mutex because an upload mutates its handle
+/// against and the reference-site [`BlobAccess`] gate a fetch is authorized
+/// through. The store is behind a mutex because an upload mutates its handle
 /// index; a fetch only reads but shares the one lock — blob traffic is
 /// out-of-band and infrequent relative to the op stream, so a single lock is
 /// enough.
 struct BlobState {
     verifier: Box<dyn Verifier + Send + Sync>,
     store: Arc<Mutex<BlobStore>>,
+    access: Arc<dyn BlobAccess>,
 }
 
 /// The handle an upload returns: the public id as lowercase hex, the byte size,
@@ -226,14 +260,22 @@ struct BlobHandle {
 /// The blob upload/fetch router: `POST /blobs` stores a body and returns its
 /// [`BlobHandle`]; `GET /blobs/{id}` serves the stored bytes. Both authenticate
 /// the `Authorization` credential through `verifier` — a missing or unknown one
-/// is `401` — mirroring the schema-register gate; per-reference authorization is
-/// a deferred slice. The upload body cap is [`MAX_BLOB_BODY`] (over it → `413`).
-/// Exposed so it can be driven in-process by tests without a socket.
+/// is `401` — mirroring the schema-register gate. A fetch is additionally
+/// authorized through `access`: an authenticated caller reaches the bytes only if
+/// it holds read authority on a live reference to the blob (else `403`); upload is
+/// authentication-only, since a producer stores bytes before any reference exists.
+/// The upload body cap is [`MAX_BLOB_BODY`] (over it → `413`). Exposed so it can be
+/// driven in-process by tests without a socket.
 pub fn blob_router(
     verifier: Box<dyn Verifier + Send + Sync>,
     store: Arc<Mutex<BlobStore>>,
+    access: Arc<dyn BlobAccess>,
 ) -> Router {
-    let state = Arc::new(BlobState { verifier, store });
+    let state = Arc::new(BlobState {
+        verifier,
+        store,
+        access,
+    });
     Router::new()
         .route("/blobs", post(blob_upload))
         .route("/blobs/{id}", get(blob_fetch))
@@ -243,20 +285,22 @@ pub fn blob_router(
 
 /// Serve the blob upload/fetch plane on `listener` — the out-of-band byte channel
 /// a client uses to store a large blob and fetch it back by handle, separate from
-/// the op-stream data plane.
+/// the op-stream data plane. `access` is the reference-site authorization gate a
+/// fetch clears (see [`blob_router`]).
 pub async fn serve_blobs(
     listener: TcpListener,
     verifier: Box<dyn Verifier + Send + Sync>,
     store: Arc<Mutex<BlobStore>>,
+    access: Arc<dyn BlobAccess>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, blob_router(verifier, store)).await
+    axum::serve(listener, blob_router(verifier, store, access)).await
 }
 
 /// Authenticate a blob request's `Authorization` credential to an [`Identity`],
 /// or the status to answer with. Mirrors the schema-register gate: no credential,
-/// or one the verifier rejects, is `401`. Per-reference authorization (the ACL
-/// seam) is a deferred slice, so an authenticated identity currently reaches
-/// every blob.
+/// or one the verifier rejects, is `401`. Authentication only — a fetch's
+/// reference-site authorization ([`BlobAccess`]) is a separate gate on the
+/// resolved identity.
 fn authenticate(state: &BlobState, headers: &HeaderMap) -> Result<Identity, StatusCode> {
     let credential = headers
         .get("authorization")
@@ -308,17 +352,29 @@ async fn blob_upload(
 /// `GET /blobs/{id}` — serve the stored bytes for a handle. A malformed id is
 /// `400` (never a panic); an unknown one is `404`. The store does not persist a
 /// blob's mime, so the bytes are served as generic `application/octet-stream`.
+///
+/// The caller must both authenticate (`401` otherwise) and be authorized to the
+/// blob through the reference-site [`BlobAccess`] gate: it may retrieve the bytes
+/// only if it holds read authority on a live reference to the id, else `403`. The
+/// gate is checked on the parsed id before the store is touched — a malformed id
+/// never reaches it, and an id no path references is denied (fail-closed) rather
+/// than `404`, so the response never distinguishes an unauthorized id from a
+/// missing one.
 async fn blob_fetch(
     State(state): State<Arc<BlobState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(status) = authenticate(&state, &headers) {
-        return status.into_response();
-    }
+    let identity = match authenticate(&state, &headers) {
+        Ok(identity) => identity,
+        Err(status) => return status.into_response(),
+    };
     let Some(id) = blobs::parse_uuid(&id) else {
         return (StatusCode::BAD_REQUEST, "malformed blob id").into_response();
     };
+    if !state.access.may_read_blob(&identity, &id).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let fetched = {
         let store = state.store.lock().unwrap_or_else(|p| p.into_inner());
         store.get(&id)

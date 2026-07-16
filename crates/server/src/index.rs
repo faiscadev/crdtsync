@@ -43,6 +43,35 @@ pub fn element_paths(doc: &Document) -> ElementPaths {
     out
 }
 
+/// A blob's public handle id mapped to the encoded `core::path`s that currently
+/// hold a live reference to it — the blob-fetch authorization index. A blob is
+/// content-addressed and immutable, so authorization cannot attach to the bytes;
+/// it attaches to the **reference site**, and this is the id → sites projection a
+/// fetch resolves read authority against (the [`recipient_reads_path`] evaluator,
+/// exactly the paths op redaction gates). A map-slot ref is keyed at its slot's
+/// leaf path (`container + key`), the same governing path a keyed op reads at; a
+/// node-addressed ref (a list item, an XML child) inherits its holding container's
+/// path, since read authority governs a whole subtree. One id may map to several
+/// paths — the same blob referenced from two slots — and a fetch is authorized on
+/// **any** readable one.
+pub type BlobRefPaths = HashMap<[u8; 16], Vec<Vec<u8>>>;
+
+/// Project `doc` to the blob-reference index: every live [`BlobRef`] slot's blob
+/// id mapped to the encoded paths that reference it. Walks the authoritative tree,
+/// so an unreferenced id is simply absent (fetch fail-closed) and a moved or
+/// deleted reference is reflected exactly. Paths per id are deduped.
+///
+/// [`BlobRef`]: crdtsync_core::BlobRef
+pub fn blob_ref_paths(doc: &Document) -> BlobRefPaths {
+    let mut out = HashMap::new();
+    crate::index_blob_refs(&Element::Map(doc.root()), &[], &mut out);
+    for paths in out.values_mut() {
+        paths.sort_unstable();
+        paths.dedup();
+    }
+    out
+}
+
 /// The zone `id` falls in under `schema`, or `None` when it is unzoned (the
 /// default region), not present in the projection, or the schema declares no
 /// zones.
