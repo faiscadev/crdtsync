@@ -189,6 +189,19 @@ impl Map {
         if self.slots.get(&key).is_some_and(|e| !stamp.gt(&e.stamp)) {
             return;
         }
+        // Displace the live composite this install evicts from the slot, mirroring
+        // `evict` — the migration re-key must displace the loser exactly as the op
+        // seam's winning `set` does, or the detached container reads installed and a
+        // later op targeting it mutates it. A same-handle re-install (the resurrect
+        // loop re-landing a container on its own key) stays installed.
+        if let Some(old) = self.slots.get(&key).and_then(|e| {
+            e.value
+                .as_ref()
+                .filter(|_| !e.tombstone)
+                .filter(|old| !value.as_ref().is_some_and(|v| same_handle(old, v)))
+        }) {
+            old.displace();
+        }
         self.slots.insert(
             key,
             Entry {
