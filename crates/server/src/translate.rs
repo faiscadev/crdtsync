@@ -426,6 +426,7 @@ fn key_probe(key: &[u8]) -> Op {
         Stamp {
             lamport: 0,
             client: ClientId::from_bytes([0; 16]),
+            offset: 0,
         },
         ElementId::from_bytes([0; 16]),
         OpKind::MapSet {

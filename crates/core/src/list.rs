@@ -176,6 +176,7 @@ impl List {
                 let prev = Stamp {
                     lamport: prev_lamport,
                     client: start.client,
+                    offset: 0,
                 };
                 if dead.contains_key(&prev) && node.parent == Some(prev) && node.side == Side::Right
                 {
@@ -187,6 +188,7 @@ impl List {
             while let Some(next_id) = cur_id.lamport.checked_add(1).map(|lamport| Stamp {
                 lamport,
                 client: cur_id.client,
+                offset: 0,
             }) {
                 match dead.get(&next_id) {
                     Some(n) if n.parent == Some(cur_id) && n.side == Side::Right => {
@@ -224,6 +226,7 @@ impl List {
                 let chunk_start = Stamp {
                     lamport,
                     client: start.client,
+                    offset: start.offset,
                 };
                 let chunk_anchor = if off == 0 {
                     *anchor
@@ -232,6 +235,7 @@ impl List {
                         parent: Some(Stamp {
                             lamport: lamport - 1,
                             client: start.client,
+                            offset: 0,
                         }),
                         side: Side::Right,
                     }
@@ -352,6 +356,7 @@ impl List {
                 let node_id = Stamp {
                     lamport,
                     client: start.client,
+                    offset: start.offset,
                 };
                 // A tombstone's value is never read; a placeholder stands in.
                 let node = Node {

@@ -112,10 +112,7 @@ impl Text {
     pub fn insert_run(&mut self, base: Stamp, s: &str, anchor: Anchor) {
         let mut anchor = anchor;
         for (k, c) in s.chars().enumerate() {
-            let char_id = Stamp {
-                lamport: base.lamport.saturating_add(k as u64),
-                client: base.client,
-            };
+            let char_id = base.run_member(k as u64);
             self.inner
                 .insert_at(char_id, Element::Scalar(Scalar::Int(c as i64)), anchor);
             anchor = Anchor {

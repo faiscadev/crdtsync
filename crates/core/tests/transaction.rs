@@ -237,12 +237,21 @@ fn ops_from_a_plain_transact_carry_no_tx() {
 }
 
 #[test]
-fn a_tx_textinsert_at_the_lamport_ceiling_does_not_overflow() {
+fn a_tx_textinsert_at_the_lamport_ceiling_keeps_every_codepoint() {
     // A complete one-member atomic tx runs the readiness check, whose TextInsert
     // arm derives a char_id stamp per codepoint from the op's wire-derived
-    // lamport. At the ceiling that derivation must saturate — not overflow-panic
-    // (checked builds) or wrap (release) — through the public apply() boundary.
+    // lamport. At the ceiling that derivation must neither overflow-panic nor
+    // collapse two codepoints onto one saturated stamp: every codepoint survives
+    // with a distinct id, through the public apply() boundary.
     let mut d = doc(1);
+    d.transact(|tx| {
+        tx.text(b"body");
+    });
+    let text_id = match d.get(b"body") {
+        Some(Element::Text(t)) => t.borrow().id(),
+        _ => panic!("text not created"),
+    };
+
     let attacker = cid(9);
     let op = Op {
         id: crdtsync_core::OpId {
@@ -252,8 +261,9 @@ fn a_tx_textinsert_at_the_lamport_ceiling_does_not_overflow() {
         stamp: crdtsync_core::Stamp {
             lamport: u64::MAX,
             client: attacker,
+            offset: 0,
         },
-        target: d.root_id(),
+        target: text_id,
         kind: crdtsync_core::OpKind::TextInsert {
             s: "ab".to_string(),
             anchor: crdtsync_core::Anchor {
@@ -267,5 +277,19 @@ fn a_tx_textinsert_at_the_lamport_ceiling_does_not_overflow() {
         }),
         zone: None,
     };
-    d.apply(&op); // must not panic
+    assert!(d.apply(&op));
+
+    let text = match d.get(b"body") {
+        Some(Element::Text(t)) => t,
+        _ => panic!("text missing"),
+    };
+    let text = text.borrow();
+    assert_eq!(text.as_string(), "ab");
+    assert_eq!(text.len(), 2);
+    let ids = text.node_ids(0, 2);
+    assert_eq!(ids.len(), 2);
+    assert_ne!(
+        ids[0], ids[1],
+        "codepoints must not collapse to one char_id"
+    );
 }

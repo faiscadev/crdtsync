@@ -750,10 +750,10 @@ fn only_a_deleted_container_tombstone_pays_the_extra_bytes() {
     // The retained create identity is a per-deleted-container-tombstone cost; a
     // leaf tombstone pays nothing new. Deleting a leaf vs an (empty) container at
     // the same key, both one tombstone slot, isolates the delta: the create
-    // identity (one stamp = u64 lamport + 16-byte client = 24 bytes, plus a 1-byte
-    // kind tag) plus the pre-existing per-container costs a leaf never had — the
-    // child-map registry entry (id + zero-slot count = 20 bytes) and its parent
-    // link (child id + parent id = 32 bytes).
+    // identity (one stamp = u64 lamport + 16-byte client + 1-byte offset flag =
+    // 25 bytes, plus a 1-byte kind tag) plus the pre-existing per-container costs
+    // a leaf never had — the child-map registry entry (id + zero-slot count = 20
+    // bytes) and its parent link (child id + parent id = 32 bytes).
     let leaf_tomb = {
         let mut d = doc();
         d.transact(|tx| tx.set(b"k", Scalar::Int(1)));
@@ -768,7 +768,7 @@ fn only_a_deleted_container_tombstone_pays_the_extra_bytes() {
         d.transact(|tx| tx.delete(b"k"));
         d.encode_state()
     };
-    const CREATE_IDENTITY: usize = 24 + 1;
+    const CREATE_IDENTITY: usize = 25 + 1;
     const CHILD_MAP_REGISTRY: usize = 16 + 4;
     const PARENT_LINK: usize = 16 + 16;
     assert_eq!(

@@ -29,6 +29,7 @@ fn set(key: &str) -> Op {
         Stamp {
             lamport: 1,
             client: cid(1),
+            offset: 0,
         },
         ElementId::from_bytes([0u8; 16]),
         OpKind::RegisterSet {

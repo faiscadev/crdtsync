@@ -116,6 +116,16 @@ pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
 pub(crate) fn put_stamp(out: &mut Vec<u8>, s: &Stamp) {
     put_u64(out, s.lamport);
     out.extend_from_slice(&s.client.as_bytes());
+    // The offset is 0 for every op stamp and every non-ceiling codepoint, so a
+    // present-flag keeps the common stamp one byte wider and only a ceiling-run
+    // id carries the u64.
+    match s.offset {
+        0 => put_u8(out, 0),
+        offset => {
+            put_u8(out, 1);
+            put_u64(out, offset);
+        }
+    }
 }
 
 pub(crate) fn put_scalar(out: &mut Vec<u8>, s: &Scalar) {
@@ -540,7 +550,15 @@ impl<'a> Cursor<'a> {
     pub(crate) fn stamp(&mut self) -> Result<Stamp, DecodeError> {
         let lamport = self.u64()?;
         let client = self.client()?;
-        Ok(Stamp { lamport, client })
+        let offset = match self.u8()? {
+            0 => 0,
+            _ => self.u64()?,
+        };
+        Ok(Stamp {
+            lamport,
+            client,
+            offset,
+        })
     }
 
     pub(crate) fn scalar(&mut self) -> Result<Scalar, DecodeError> {

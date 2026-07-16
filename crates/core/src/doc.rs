@@ -1436,6 +1436,7 @@ impl Document {
             let stamp = Stamp {
                 lamport: 0,
                 client: id.client,
+                offset: 0,
             };
             out.push(Op::new(
                 id,
@@ -2412,10 +2413,7 @@ impl Document {
                 }
                 OpKind::TextInsert { s, .. } => {
                     for k in 0..s.chars().count() as u64 {
-                        inserted.insert(Stamp {
-                            lamport: op.stamp.lamport.saturating_add(k),
-                            client: op.stamp.client,
-                        });
+                        inserted.insert(op.stamp.run_member(k));
                     }
                 }
                 OpKind::ListDelete { id } => {
@@ -2496,6 +2494,7 @@ impl Document {
         let stamp = Stamp {
             lamport: base,
             client: self.client,
+            offset: 0,
         };
         // Reserve the rest of a run's char_ids so the next op sorts after it.
         let last = base + (span(&kind) - 1);
@@ -4228,6 +4227,7 @@ impl XmlChildrenCursor<'_> {
                 let zero = Stamp {
                     lamport: 0,
                     client: ClientId::from_bytes([0u8; 16]),
+                    offset: 0,
                 };
                 return xml_child_id(self.list_id, zero, kind);
             }
@@ -4426,6 +4426,7 @@ mod tests {
         let mv = Stamp {
             lamport: 1_000,
             client: cid(1),
+            offset: 0,
         };
         assert!(d.restore_moves(&[(mv, a_id, grand_id)]).is_err());
     }

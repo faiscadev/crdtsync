@@ -224,6 +224,7 @@ fn an_unresolvable_owning_element_falls_back_to_key() {
         Stamp {
             lamport: 1,
             client: cid(1),
+            offset: 0,
         },
         ElementId::from_bytes([9u8; 16]),
         OpKind::MapSet {
