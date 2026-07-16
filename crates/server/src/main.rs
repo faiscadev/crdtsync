@@ -18,7 +18,12 @@
 //! serve the out-of-band blob upload/fetch HTTP plane there — a client stores a
 //! large blob and fetches it by handle; its store root is `CRDTSYNC_BLOB_ROOT` or
 //! a `blobs/` subdirectory of `CRDTSYNC_DATA_DIR`, and requests authenticate
-//! through the same verifier as the data plane; unset, no blob plane.
+//! through the same verifier as the data plane; unset, no blob plane. Set
+//! `CRDTSYNC_TLS_CERT` + `CRDTSYNC_TLS_KEY` to PEM cert-chain + private-key paths
+//! to terminate TLS at the listener — the wire protocol then runs over an
+//! encrypted stream (`wss://`); both must be set together, and a malformed or
+//! mismatched pair fails startup loudly rather than downgrading to plaintext.
+//! Unset, the listener binds plaintext exactly as before.
 //!
 //! A policy's `actor:` and subject-class (`authenticated` / `anonymous`) rules
 //! are only real boundaries when the actor is server-derived. With a credentials
@@ -41,10 +46,12 @@ use crdtsync_server::auth::CredentialsFileError;
 use crdtsync_server::membership::{Membership, MembershipConfigError};
 use crdtsync_server::runtime::{serve_with_authorizer, ServeConfig};
 use crdtsync_server::{
-    serve_admin, serve_blobs, AllowAll, Authorizer, BlobStore, PermitAll, SchemaRegistry,
-    StaticTokens, Store, Verifier, WebhookConfig, DEFAULT_REPLICATION_FACTOR,
+    serve_admin, serve_blobs, server_config_from_pem, AllowAll, Authorizer, BlobStore, PermitAll,
+    SchemaRegistry, StaticTokens, Store, TlsConfigError, Verifier, WebhookConfig,
+    DEFAULT_REPLICATION_FACTOR,
 };
 use tokio::net::TcpListener;
+use tokio_rustls::rustls;
 
 /// Read an environment variable that names a filesystem path, mapping absence to
 /// `None` and non-unicode to an error the caller returns.
@@ -150,6 +157,35 @@ fn membership() -> std::io::Result<Option<Membership>> {
     Ok(Some(m))
 }
 
+/// The TLS termination config for the run: a `rustls::ServerConfig` loaded from
+/// the PEM cert at `CRDTSYNC_TLS_CERT` + key at `CRDTSYNC_TLS_KEY` when both are
+/// set, else `None` (the listener binds plaintext, unchanged). Setting only one
+/// of the pair is a clean startup error — a half-configured TLS is a
+/// misconfiguration, not a plaintext fall back. A malformed or mismatched
+/// cert/key fails startup loudly rather than silently downgrading to plaintext.
+fn tls_config() -> std::io::Result<Option<Arc<rustls::ServerConfig>>> {
+    match (
+        path_var("CRDTSYNC_TLS_CERT")?,
+        path_var("CRDTSYNC_TLS_KEY")?,
+    ) {
+        (Some(cert), Some(key)) => {
+            let config = server_config_from_pem(cert, key).map_err(|e| {
+                let kind = match &e {
+                    TlsConfigError::Io { source, .. } => source.kind(),
+                    _ => std::io::ErrorKind::InvalidData,
+                };
+                std::io::Error::new(kind, e)
+            })?;
+            Ok(Some(config))
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CRDTSYNC_TLS_CERT and CRDTSYNC_TLS_KEY must both be set to enable TLS",
+        )),
+    }
+}
+
 /// The blob store root for the run: `CRDTSYNC_BLOB_ROOT` if set, else a `blobs`
 /// subdirectory of `CRDTSYNC_DATA_DIR`. Serving blobs (`CRDTSYNC_BLOB_ADDR`)
 /// without either is a clean startup error — there is nowhere to persist blob
@@ -183,8 +219,10 @@ async fn main() -> std::io::Result<()> {
         Some(dir) => Some(Store::open(dir)?),
         None => None,
     };
+    let tls = tls_config()?;
     let listener = TcpListener::bind(&addr).await?;
-    eprintln!("crdtsync serving on ws://{addr}");
+    let scheme = if tls.is_some() { "wss" } else { "ws" };
+    eprintln!("crdtsync serving on {scheme}://{addr}");
     // One schema registry, shared between the data plane (which resolves each
     // handshake against it) and the admin plane (which registers into it), so a
     // registration is at once visible to connecting clients. Empty until the
@@ -201,6 +239,7 @@ async fn main() -> std::io::Result<()> {
             schema: schema.clone(),
             webhook: webhook()?,
             membership: membership()?,
+            tls,
             ..ServeConfig::default()
         },
         verifier()?,

@@ -36,6 +36,7 @@ pub mod runtime;
 pub mod schema_registry;
 pub mod session;
 pub mod store;
+pub mod tls;
 pub mod translate;
 pub mod webhook;
 pub use admin::{
@@ -54,6 +55,7 @@ pub use registry::{ConnId, Registry};
 pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry};
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{Branch, RoomLog, RoomMeta, Snapshot, Store, StoredOp};
+pub use tls::{server_config_from_pem, TlsConfigError};
 pub use webhook::{WebhookConfig, WebhookSink};
 
 /// A room name, opaque bytes chosen by the deployment.
