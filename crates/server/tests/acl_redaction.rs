@@ -2119,6 +2119,7 @@ fn a_client_authored_reveal_op_is_rejected_as_a_protocol_violation() {
         Stamp {
             lamport: 1,
             client: cid(2),
+            offset: 0,
         },
         subtree_id(b"a"),
         OpKind::XmlReveal {

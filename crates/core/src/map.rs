@@ -676,6 +676,7 @@ mod tests {
         Stamp {
             lamport,
             client: ClientId::from_bytes([1; 16]),
+            offset: 0,
         }
     }
 

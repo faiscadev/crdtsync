@@ -26,6 +26,7 @@ pub fn stmp(lamport: u64, client_first: u8) -> Stamp {
     Stamp {
         lamport,
         client: cid(client_first),
+        offset: 0,
     }
 }
 

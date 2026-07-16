@@ -29,6 +29,7 @@ fn stamp(lamport: u64, c: u8) -> Stamp {
     Stamp {
         lamport,
         client: client(c),
+        offset: 0,
     }
 }
 

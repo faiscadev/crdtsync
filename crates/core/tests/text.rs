@@ -294,10 +294,11 @@ fn node_ids_clamps_past_the_end() {
 }
 
 #[test]
-fn an_insert_run_based_at_the_lamport_ceiling_does_not_overflow() {
+fn an_insert_run_based_at_the_lamport_ceiling_keeps_every_codepoint_distinct() {
     // `base` is an op's wire-derived stamp, so an adversarial op can set it to
-    // the lamport ceiling. Deriving consecutive char_ids must saturate rather
-    // than panic (checked builds) or wrap to a colliding low stamp (release).
+    // the lamport ceiling. Deriving one char_id per codepoint must neither panic
+    // nor collapse: the lamport cannot advance past `u64::MAX`, so the surplus
+    // carries into the stamp offset and every codepoint keeps a distinct id.
     let mut t = text();
     let anchor = Anchor {
         parent: None,
@@ -306,6 +307,57 @@ fn an_insert_run_based_at_the_lamport_ceiling_does_not_overflow() {
     let base = Stamp {
         lamport: u64::MAX,
         client: crdtsync_core::ClientId::from_bytes([7u8; 16]),
+        offset: 0,
     };
-    t.insert_run(base, "ab", anchor); // must not panic
+    t.insert_run(base, "ab", anchor);
+
+    // No collapse: both codepoints are present, in order, with distinct ids.
+    assert_eq!(t.as_string(), "ab");
+    assert_eq!(t.len(), 2);
+    let ids = t.node_ids(0, 2);
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    // Both pin to the ceiling lamport; the offset is what separates them.
+    assert_eq!(ids[0].lamport, u64::MAX);
+    assert_eq!(ids[1].lamport, u64::MAX);
+    assert_ne!(ids[0].offset, ids[1].offset);
+
+    // The distinct ids survive a snapshot round-trip.
+    let restored = Text::decode_state(&t.encode_state()).unwrap();
+    assert_eq!(restored.as_string(), "ab");
+    assert_eq!(restored.node_ids(0, 2), ids);
+
+    // Two replicas deriving the same ceiling run converge on the same ids.
+    let mut other = text();
+    other.insert_run(base, "ab", anchor);
+    assert_eq!(other.node_ids(0, 2), ids);
+    t.merge(&other);
+    assert_eq!(t.as_string(), "ab");
+    assert_eq!(t.len(), 2);
+}
+
+#[test]
+fn an_insert_run_based_at_the_offset_ceiling_stays_total_and_convergent() {
+    // A wire op can decode any offset, so an adversary can base a run at the
+    // offset ceiling too. Deriving char_ids must not panic; the offset carry
+    // saturates, so a crafted run at `(MAX, MAX)` collapses convergently rather
+    // than crashing. No legitimately minted op reaches here — a real op always
+    // bases a run at offset 0 — so no real insert loses a codepoint.
+    let anchor = Anchor {
+        parent: None,
+        side: crdtsync_core::Side::Right,
+    };
+    let base = Stamp {
+        lamport: u64::MAX,
+        client: crdtsync_core::ClientId::from_bytes([7u8; 16]),
+        offset: u64::MAX,
+    };
+    let mut a = text();
+    a.insert_run(base, "ab", anchor); // must not panic
+    let mut b = text();
+    b.insert_run(base, "ab", anchor);
+    // Deterministic across replicas: same ids, same projection, converges.
+    assert_eq!(a.node_ids(0, a.len()), b.node_ids(0, b.len()));
+    a.merge(&b);
+    assert_eq!(a.as_string(), b.as_string());
 }

@@ -240,10 +240,11 @@ fn trailing_bytes_after_one_op_are_rejected() {
 
 #[test]
 fn an_unknown_op_tag_is_an_error() {
-    // Header: 16-byte client + u64 seq + stamp(8+16) + 16-byte target, then the
-    // opkind tag. A tag past the last variant must be rejected.
+    // Header: 16-byte client + u64 seq + stamp(8 lamport + 16 client + 1
+    // offset-flag) + 16-byte target, then the opkind tag. A tag past the last
+    // variant must be rejected.
     let mut bytes = encode_op(&op(OpKind::MapCreate { key: b"n".to_vec() }));
-    let kind_tag_at = 16 + 8 + (8 + 16) + 16;
+    let kind_tag_at = 16 + 8 + (8 + 16 + 1) + 16;
     bytes[kind_tag_at] = 200;
     assert_eq!(
         decode_op(&bytes),

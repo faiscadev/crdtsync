@@ -231,7 +231,7 @@ Permanent decisions. Yjs got this wrong and pays for it forever; we do not get t
 |-------|--------|
 | CRDT identity granularity | codepoint (Unicode scalar value) |
 | Wire encoding | UTF-8 |
-| Internal storage | codepoint sequence with per-codepoint stable char_id |
+| Internal storage | codepoint sequence with per-codepoint stable char_id `(lamport, client, offset)` |
 | Public API default unit | grapheme cluster (via SDK Unicode helper) |
 | Codepoint-level API | opt-in for advanced use |
 | Unicode version mismatch | cosmetic only — codepoints stable, graphemes may render differently |
@@ -246,6 +246,10 @@ Codepoint identity + UTF-8 wire + grapheme-aware API is the only combination tha
 ## Why Codepoint Identity Works Across Unicode Versions
 
 Codepoints are universal (Unicode is append-only). What differs is grapheme cluster boundaries. Mismatched versions = cosmetic rendering differences only. Both clients converge on the same codepoint sequence, both can edit, no data corruption, no CRDT identity break. Right failure mode.
+
+## char_id has a sub-lamport offset so a run never collapses at the ceiling
+
+A char_id is `(lamport, client, offset)`. A run inserted together takes one id per codepoint by counting the lamport up from its base stamp; `offset` is `0` for every op stamp and almost every codepoint. It exists because the lamport is bounded: an op's stamp is wire-derived, so an adversarial or ceiling-clocked op can base a multi-codepoint run at `lamport == u64::MAX`, where a plain `base.lamport + k` has no distinct value to give the codepoints past the ceiling. Rather than saturate the lamport (which collapses every trailing codepoint onto one id — silent data loss, still convergent so undetectable) or reject the run (also data loss), the surplus carries into `offset`, so N codepoints yield N distinct, replica-independent ids. A minted op always bases a run at `offset == 0`, where the carry is exact for any length; the `offset` carry itself saturates only past a base `offset` within a run's length of `u64::MAX` — a corner no minted op reaches, only a crafted decoded stamp — keeping a hostile stamp total (never panics) and convergent. The total order is `(lamport, client, offset)`, so `offset` is only ever a tiebreak among a single client's ceiling-run codepoints; all other comparisons are unchanged.
 
 ## What Core Does Not Ship
 

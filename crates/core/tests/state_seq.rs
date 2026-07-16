@@ -174,7 +174,7 @@ fn a_bogus_run_length_is_rejected_not_expanded() {
     let mut bytes = l.encode_state();
     // Everything after `header - 4` (re-counting run_count as 1) is: stamp,
     // length, anchor. anchor_len = total - (header + stamp_len + 4).
-    let stamp_len = 24; // 8-byte lamport + 16-byte client id
+    let stamp_len = 25; // 8-byte lamport + 16-byte client id + 1-byte offset flag
     let anchor_len = bytes.len() - (header + stamp_len + 4);
     let len_off = bytes.len() - anchor_len - 4;
     bytes[len_off..len_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -196,7 +196,7 @@ fn an_empty_run_is_rejected() {
     l.insert(0, int(7), stmp(1, 1));
     l.delete(0);
     let mut bytes = l.encode_state();
-    let stamp_len = 24;
+    let stamp_len = 25;
     let anchor_len = bytes.len() - (header + stamp_len + 4);
     let len_off = bytes.len() - anchor_len - 4;
     bytes[len_off..len_off + 4].copy_from_slice(&0u32.to_le_bytes());
