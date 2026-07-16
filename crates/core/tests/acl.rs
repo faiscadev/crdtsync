@@ -151,6 +151,37 @@ fn a_revoke_tombstones_the_tuple() {
 }
 
 #[test]
+fn a_revoke_applied_twice_is_idempotent() {
+    // OpId dedup makes a re-delivered revoke a no-op, but pin it per-op: applying
+    // the same AclRevoke twice to one replica leaves the tuple set exactly as one
+    // revoke did — the tombstone is not resurrected and nothing else shifts.
+    let mut src = Document::new(cid(1));
+    let path = encode_path(&[b"p"]);
+    let mut id = ElementId::from_bytes([0u8; 16]);
+    let grant = src.transact(|tx| {
+        id = tx.acl().grant(
+            AclSubject::Anyone,
+            read_cap(),
+            AclEffect::Allow,
+            path,
+            cid(1),
+        );
+    });
+    let revoke = src.transact(|tx| tx.acl().revoke(id));
+
+    let mut dst = Document::new(cid(2));
+    apply_all(&mut dst, &grant);
+    apply_all(&mut dst, &revoke);
+    let after_one = dst.encode_state();
+    assert!(dst.acl_tuple(id).is_none(), "revoked");
+
+    apply_all(&mut dst, &revoke); // re-deliver
+    assert!(dst.acl_tuple(id).is_none(), "still revoked");
+    assert_eq!(dst.acl_tuples().len(), 0);
+    assert_eq!(dst.encode_state(), after_one, "re-delivery changed nothing");
+}
+
+#[test]
 fn a_revoke_waits_for_its_grant() {
     // A revoke that arrives before the grant it tombstones must buffer: applied
     // against a missing entry it would be silently lost, diverging from a replica

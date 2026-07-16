@@ -915,3 +915,77 @@ fn a_drop_by_an_upper_edge_does_not_hide_a_lower_breaking_edge() {
     // between rewrite_down_along and reachable_down.
     assert_eq!(rewrite_down_along(&chain, &reg("z")), None);
 }
+
+#[test]
+fn a_migration_then_reordered_field_ops_converge() {
+    // A migration is a per-op key transform composed *before* the merge, so it
+    // cannot disturb the CRDT's order-independence. Author a burst of field writes,
+    // rewrite each up through a rename edge (a -> b), then deliver the rewritten
+    // ops to fresh replicas in different orders: every order lands on one state.
+    // The rename also produces a concurrent LWW race on `b` (writes born on `a`
+    // now target `b`, alongside writes born on `b`), which the reorder must settle
+    // identically.
+    use crdtsync_core::doc::Document;
+
+    let chain = [edge(
+        r#"[ { "kind": "renameField", "type": "m", "from": "a", "to": "b" } ]"#,
+    )];
+
+    let mut src = Document::new(cid(1));
+    let mut pool: Vec<Op> = Vec::new();
+    pool.extend(src.transact(|tx| tx.register(b"a", Scalar::Int(1))));
+    pool.extend(src.transact(|tx| tx.register(b"b", Scalar::Int(2))));
+    pool.extend(src.transact(|tx| tx.register(b"z", Scalar::Int(3))));
+    pool.extend(src.transact(|tx| tx.register(b"a", Scalar::Int(4))));
+    pool.extend(src.transact(|tx| tx.register(b"b", Scalar::Int(5))));
+
+    // Forward-migrate every op; a rename keeps them all (none drops).
+    let migrated: Vec<Op> = pool
+        .iter()
+        .map(|o| match rewrite_up_along(&chain, o) {
+            OpRewrite::Keep(op) => op,
+            OpRewrite::Drop => panic!("a rename edge drops nothing"),
+        })
+        .collect();
+    assert_eq!(migrated.len(), pool.len());
+    assert!(
+        migrated.iter().all(|o| match &o.kind {
+            OpKind::RegisterSet { key, .. } => key.as_slice() != b"a",
+            _ => true,
+        }),
+        "no migrated op still addresses the pre-rename key `a`",
+    );
+
+    // Apply a delivery order to a fresh replica, replaying to a fixpoint so any
+    // out-of-order op that buffered still lands.
+    let replay = |order: &[usize]| -> Vec<u8> {
+        let mut d = Document::new(cid(9));
+        loop {
+            let mut progressed = false;
+            for &i in order {
+                if d.apply(&migrated[i]) {
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        d.encode_state()
+    };
+
+    let forward: Vec<usize> = (0..migrated.len()).collect();
+    let reference = replay(&forward);
+
+    let reverse: Vec<usize> = (0..migrated.len()).rev().collect();
+    assert_eq!(replay(&reverse), reference, "reversed delivery diverged");
+
+    // Interleaved (evens then odds) — a third, unrelated order.
+    let mut interleaved: Vec<usize> = (0..migrated.len()).step_by(2).collect();
+    interleaved.extend((1..migrated.len()).step_by(2));
+    assert_eq!(
+        replay(&interleaved),
+        reference,
+        "interleaved delivery diverged"
+    );
+}

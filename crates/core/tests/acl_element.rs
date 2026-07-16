@@ -685,3 +685,110 @@ impl WithGrantor for AclRecord {
         self
     }
 }
+
+/// A small linear-congruential PRNG — deterministic, seedable, reproducible.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
+    }
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 17
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() as usize) % n
+    }
+}
+
+/// A Fisher-Yates permutation of `0..len` under the PRNG.
+fn shuffle(len: usize, rng: &mut Rng) -> Vec<usize> {
+    let mut out: Vec<usize> = (0..len).collect();
+    for i in (1..out.len()).rev() {
+        out.swap(i, rng.below(i + 1));
+    }
+    out
+}
+
+#[test]
+fn element_scoped_acl_and_moves_settle_the_same_read_decision_under_reorder() {
+    // The convergence property behind element-scoped ACL: a whole-doc read allow, an
+    // element-scoped Deny(Read) on a card, an XmlMove that relocates the card, and a
+    // revoke of the deny — delivered in any order to a fresh replica — must fold to one
+    // read decision at the card's converged position. An element scope resolves against
+    // the *current* tree, so the move and the grant/revoke set must both converge for the
+    // decision to; this shuffles them together and pins that they do.
+    let mut src = Document::new(cid(1));
+    let mut pool: Vec<crdtsync_core::Op> = Vec::new();
+    pool.extend(path::xml_fragment(&mut src, &col_a()));
+    pool.extend(path::xml_fragment(&mut src, &col_b()));
+    pool.extend(path::xml_insert_element(&mut src, &col_a(), 0, b"card"));
+    let card = child_id(&src, b"colA", 0);
+
+    let mut deny_id = ElementId::from_bytes([0u8; 16]);
+    pool.extend(src.transact(|tx| {
+        tx.acl().grant(
+            AclSubject::Actor(cid(2)),
+            cap(Capability::Read),
+            AclEffect::Allow,
+            encode_path(&[]),
+            cid(1),
+        );
+        deny_id = tx.acl().grant_element(
+            AclSubject::Actor(cid(2)),
+            cap(Capability::Read),
+            AclEffect::Deny,
+            card,
+            cid(1),
+        );
+    }));
+    pool.extend(path::xml_move_child(&mut src, &col_a(), 0, &col_b(), 0));
+    pool.extend(src.transact(|tx| tx.acl().revoke(deny_id)));
+
+    // Replay one delivery order into a fresh replica, to a fixpoint so buffered
+    // (out-of-order) ops all land, then read A's decision at the card's current path.
+    let decide = |order: &[usize]| -> (Option<Vec<u8>>, bool) {
+        let mut d = Document::new(cid(9));
+        loop {
+            let mut progressed = false;
+            for &i in order {
+                if d.apply(&pool[i]) {
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        let records = d.acl_records();
+        let idx = element_paths(&d);
+        let path = idx.get(&card).cloned();
+        let resolve = |id| idx.get(&id).cloned();
+        let decision = match &path {
+            Some(p) => {
+                evaluate_with_authority(&records, cid(1), &actor(2), p, Capability::Read, &resolve)
+            }
+            None => false,
+        };
+        (path, decision)
+    };
+
+    let forward: Vec<usize> = (0..pool.len()).collect();
+    let reference = decide(&forward);
+    // The card converges under colB, and A's read of it is decided one way.
+    assert_eq!(reference.0.as_deref(), Some(col_b().as_slice()));
+
+    let reverse: Vec<usize> = (0..pool.len()).rev().collect();
+    assert_eq!(decide(&reverse), reference, "reversed order diverged");
+
+    let rounds = if cfg!(miri) { 3 } else { 40 };
+    let mut rng = Rng::new(0xE1E1);
+    for round in 0..rounds {
+        let order = shuffle(pool.len(), &mut rng);
+        assert_eq!(decide(&order), reference, "shuffle {round} diverged");
+    }
+}

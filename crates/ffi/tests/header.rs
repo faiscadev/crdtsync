@@ -61,6 +61,9 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_doc_resolve_position",
         // sync
         "crdtsync_doc_apply",
+        // state snapshot
+        "crdtsync_doc_encode_state",
+        "crdtsync_doc_decode_state",
         // diff
         "crdtsync_diff",
         "crdtsync_diff_decode",
@@ -125,6 +128,13 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_actor",
         "crdtsync_client_resume",
         "crdtsync_client_resend",
+        "crdtsync_client_take_rejected",
+        "crdtsync_client_declare_app",
+        // The trailing `(` matches the prototype so this entry is not vacuously
+        // satisfied by the `crdtsync_client_active_schema_version` declaration,
+        // which contains `crdtsync_client_active_schema` as a prefix.
+        "crdtsync_client_active_schema(",
+        "crdtsync_client_active_schema_version(",
         "crdtsync_client_outbox_len",
         "crdtsync_client_unsubscribe",
         "crdtsync_client_set_awareness",

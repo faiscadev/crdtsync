@@ -36,6 +36,36 @@ fn p(segs: &[&[u8]]) -> Vec<u8> {
     path::encode_path(segs)
 }
 
+/// A small linear-congruential PRNG — deterministic, seedable, reproducible.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 17
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() as usize) % n
+    }
+}
+
+/// A Fisher-Yates permutation of `0..len` under the PRNG.
+fn shuffle(len: usize, rng: &mut Rng) -> Vec<usize> {
+    let mut out: Vec<usize> = (0..len).collect();
+    for i in (1..out.len()).rev() {
+        out.swap(i, rng.below(i + 1));
+    }
+    out
+}
+
 /// The lamports of the ops in emission order.
 fn lamports(ops: &[Op]) -> Vec<u64> {
     ops.iter().map(|o| o.stamp.lamport).collect()
@@ -271,31 +301,49 @@ fn replicas_converge_on_state_and_per_zone_clocks() {
         d
     };
 
+    // The reference is generation order; reverse and a band of Fisher-Yates
+    // shuffles must all land on the same clocks and state.
     let forward: Vec<usize> = (0..pool.len()).collect();
-    let reverse: Vec<usize> = (0..pool.len()).rev().collect();
-    let a = replay(&forward);
-    let b = replay(&reverse);
+    let reference = replay(&forward);
 
-    for zone in [None, Some(0), Some(1), Some(2)] {
+    let assert_converges = |d: &Document, label: &str| {
+        for zone in [None, Some(0), Some(1), Some(2)] {
+            assert_eq!(
+                d.zone_clock(zone),
+                reference.zone_clock(zone),
+                "{label}: clocks converge for zone {zone:?}"
+            );
+            // And they match the source that emitted the ops.
+            assert_eq!(
+                d.zone_clock(zone),
+                src.zone_clock(zone),
+                "{label}: matches src"
+            );
+        }
+        for z in [b"a".as_slice(), b"b", b"c"] {
+            assert_eq!(
+                path::get_int(d, &p(&[z, b"x"])),
+                path::get_int(&reference, &p(&[z, b"x"])),
+                "{label}: state converges for zone {z:?}"
+            );
+        }
         assert_eq!(
-            a.zone_clock(zone),
-            b.zone_clock(zone),
-            "clocks converge for zone {zone:?}"
+            path::get_int(d, &p(&[b"loose"])),
+            path::get_int(&reference, &p(&[b"loose"])),
+            "{label}: loose slot converges"
         );
-        // And they match the source that emitted the ops.
-        assert_eq!(a.zone_clock(zone), src.zone_clock(zone));
+    };
+
+    let reverse: Vec<usize> = (0..pool.len()).rev().collect();
+    assert_converges(&replay(&reverse), "reverse");
+
+    // Miri interprets every apply, so keep its sweep short; native covers more.
+    let rounds = if cfg!(miri) { 3 } else { 40 };
+    let mut rng = Rng::new(0x513E);
+    for round in 0..rounds {
+        let order = shuffle(pool.len(), &mut rng);
+        assert_converges(&replay(&order), &format!("shuffle {round}"));
     }
-    // Observable state converges too.
-    for z in [b"a".as_slice(), b"b", b"c"] {
-        assert_eq!(
-            path::get_int(&a, &p(&[z, b"x"])),
-            path::get_int(&b, &p(&[z, b"x"]))
-        );
-    }
-    assert_eq!(
-        path::get_int(&a, &p(&[b"loose"])),
-        path::get_int(&b, &p(&[b"loose"]))
-    );
 }
 
 #[test]
