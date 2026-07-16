@@ -3,15 +3,22 @@
 //! arrival order.
 //!
 //! Several replicas each emit a burst of concurrent edits over a small, shared
-//! key vocabulary — registers, counters, nested maps, lists, text, and scalar
-//! overwrites that displace whatever a slot held. Every op they produce is
-//! pooled, then replayed into fresh replicas in many permutations. A
-//! deterministic PRNG drives generation and shuffling, so a failure names a
-//! reproducing seed. The state is read back over the fixed vocabulary and
+//! key vocabulary — registers, counters, nested maps, lists, text, xml, scalar
+//! overwrites that displace whatever a slot held, and the doc-level sets: ranged
+//! marks (create / set-payload / delete) and ACL tuples (grant / revoke). Every
+//! op they produce is pooled, then replayed into fresh replicas in many
+//! permutations. A deterministic PRNG drives generation and shuffling, so a
+//! failure names a reproducing seed. The state is read back over the fixed
+//! vocabulary — the keyed tree plus the annotation and ACL sets — and
 //! fingerprinted; every permutation must match.
 
+use crdtsync_core::acl::{AclEffect, AclGrant, AclSubject, Capability};
+use crdtsync_core::anchor::RelativePosition;
 use crdtsync_core::doc::Document;
+use crdtsync_core::elementid::{ElementId, ElementKind};
 use crdtsync_core::op::Op;
+use crdtsync_core::path::encode_path;
+use crdtsync_core::ranged::RangeAnchor;
 use crdtsync_core::{Element, Scalar};
 
 mod common;
@@ -71,12 +78,19 @@ fn text_len(d: &Document, k: &[u8]) -> usize {
     }
 }
 
+/// Mark names the ranged arm picks from — a small set so concurrent marks collide.
+const MARK_NAMES: &[&[u8]] = &[b"bold", b"link"];
+
+fn ranchor(seq: ElementId, pos: RelativePosition) -> RangeAnchor {
+    RangeAnchor { seq, pos }
+}
+
 /// Apply one random edit to a document, returning the ops it emitted. Deletes
 /// on a list or text pick a live index off the generating replica, so they are
 /// real removals; on the peers the same op waits for its target to arrive.
 fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
     let k = key(rng);
-    match rng.below(18) {
+    match rng.below(23) {
         0 => d.transact(|tx| tx.register(k, Scalar::Int(rng_val(rng)))),
         1 => d.transact(|tx| tx.inc(k, 1 + rng.below(4) as u32)),
         2 => d.transact(|tx| tx.dec(k, 1 + rng.below(4) as u32)),
@@ -154,6 +168,77 @@ fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
                 })
             }
         }
+        17 => {
+            // Mark a text body — a RangedElement in the doc's annotation set. The
+            // three shared keys are so heavily displaced that a live Text rarely
+            // survives to be marked, so force one first (an ordinary text create,
+            // itself a displacement) to keep this op family actually exercised.
+            let seq = ElementId::derive(d.root_id(), k, ElementKind::Text);
+            let name = MARK_NAMES[rng.below(MARK_NAMES.len())];
+            let needs_body = text_len(d, k) == 0;
+            d.transact(|tx| {
+                if needs_body {
+                    tx.text(k).insert(0, "z");
+                }
+                tx.ranged().mark(
+                    name,
+                    ranchor(seq, RelativePosition::Start),
+                    ranchor(seq, RelativePosition::End),
+                    Scalar::Bool(true),
+                );
+            })
+        }
+        18 => {
+            // Change the payload of a live ranged element (last-writer-wins).
+            let live = d.ranged_elements();
+            if live.is_empty() {
+                return Vec::new();
+            }
+            let rid = live[rng.below(live.len())].id;
+            let v = rng_val(rng);
+            d.transact(|tx| tx.ranged().set_payload(rid, Scalar::Int(v)))
+        }
+        19 => {
+            // Delete a live ranged element (delete-wins over a concurrent payload).
+            let live = d.ranged_elements();
+            if live.is_empty() {
+                return Vec::new();
+            }
+            let rid = live[rng.below(live.len())].id;
+            d.transact(|tx| tx.ranged().delete(rid))
+        }
+        20 => {
+            // Grant a path-scoped ACL tuple over a top-level slot.
+            let subject = if rng.below(2) == 0 {
+                AclSubject::Anyone
+            } else {
+                AclSubject::Actor(cid((1 + rng.below(3)) as u8))
+            };
+            let effect = if rng.below(2) == 0 {
+                AclEffect::Allow
+            } else {
+                AclEffect::Deny
+            };
+            let path = encode_path(&[k]);
+            d.transact(|tx| {
+                tx.acl().grant(
+                    subject,
+                    AclGrant::Capability(Capability::Read),
+                    effect,
+                    path,
+                    cid(1),
+                );
+            })
+        }
+        21 => {
+            // Revoke a live ACL tuple (tombstone, delete-wins).
+            let live = d.acl_tuples();
+            if live.is_empty() {
+                return Vec::new();
+            }
+            let id = live[rng.below(live.len())].id;
+            d.transact(|tx| tx.acl().revoke(id))
+        }
         _ => d.transact(|tx| tx.map(k).set(subkey(rng), Scalar::Bool(true))),
     }
 }
@@ -165,7 +250,8 @@ fn rng_val(rng: &mut Rng) -> i64 {
 /// A stable, order-independent rendering of a document's observable state over
 /// the fixed vocabulary — the equality oracle for convergence.
 fn fingerprint(d: &Document) -> String {
-    KEYS.iter()
+    let slots = KEYS
+        .iter()
         .map(|k| {
             let slot = d
                 .get(k)
@@ -174,7 +260,23 @@ fn fingerprint(d: &Document) -> String {
             format!("{}={}", String::from_utf8_lossy(k), slot)
         })
         .collect::<Vec<_>>()
-        .join(";")
+        .join(";");
+    // The doc-level annotation and ACL sets are order-independent by id, so a
+    // sorted rendering is the equality oracle for the tree-move / mark / ACL
+    // op families the shuffle sweep folds.
+    format!(
+        "{slots}||RANGED[{}]||ACL[{}]",
+        fp_sorted(d.ranged_elements().iter().map(|r| format!("{r:?}"))),
+        fp_sorted(d.acl_tuples().iter().map(|t| format!("{t:?}"))),
+    )
+}
+
+/// A stable rendering of a doc-level CRDT set: sort the per-entry debug strings so
+/// the result is independent of iteration order, and equal iff the sets converged.
+fn fp_sorted(entries: impl Iterator<Item = String>) -> String {
+    let mut parts: Vec<String> = entries.collect();
+    parts.sort();
+    parts.join(",")
 }
 
 fn fp_element(e: &Element) -> String {

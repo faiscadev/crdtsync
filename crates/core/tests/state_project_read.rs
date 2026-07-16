@@ -403,6 +403,33 @@ fn a_node_moved_into_a_denied_subtree_is_kept_at_its_readable_origin() {
     assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
 }
 
+#[test]
+fn a_born_denied_then_moved_in_snapshot_decodes_without_panic() {
+    // Known-limitation guard (DECISIONS.md, reveal-on-move-in): a `card` born under the
+    // DENIED /b fragment then moved into readable /a. We do not assert convergence here —
+    // only that projecting to the reader's readable paths and round-tripping the snapshot
+    // through `encode_state`/`decode_state` never panics. The mirror direction (a node
+    // moved INTO a denied subtree) once crashed the decoder (#293); this pins that a
+    // silent regression to a decode crash in this direction is caught.
+    let mut d = doc();
+    xml_fragment(&mut d, &encode_path(&[b"a"]));
+    xml_fragment(&mut d, &encode_path(&[b"b"]));
+    xml_insert_element(&mut d, &encode_path(&[b"b"]), 0, b"card");
+    xml_move_child(&mut d, &encode_path(&[b"b"]), 0, &encode_path(&[b"a"]), 0);
+
+    d.project_read_paths(reads_top(false, &[b"a"]));
+    let bytes = d.encode_state();
+    let back =
+        Document::decode_state(&bytes).expect("the projected snapshot decodes without panic");
+    // Canonical re-encode is the decoder's own convergence invariant; assert only that
+    // it holds, not any particular reader-visible placement of the revealed node.
+    assert_eq!(
+        back.encode_state(),
+        bytes,
+        "re-encode of the decoded snapshot is canonical"
+    );
+}
+
 /// The live-children count of the first XML child under the fragment at raw map-slot key
 /// `key` — the grandchildren of a `frag(card(...))` shape — or `None` if the shape differs.
 fn first_child_grandchildren(d: &Document, key: &[u8]) -> Option<usize> {

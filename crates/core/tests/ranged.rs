@@ -197,6 +197,37 @@ fn a_delete_wins_over_a_concurrent_payload_change() {
 }
 
 #[test]
+fn a_ranged_delete_applied_twice_is_idempotent() {
+    // OpId dedup makes a re-delivered delete a no-op, but pin it per-op: applying
+    // the same RangedDelete twice to one replica leaves the set exactly as one
+    // delete did — no resurrection, no second tombstone effect.
+    let mut src = Document::new(cid(1));
+    let build = build_text(&mut src, b"t", "x");
+    let seq = text_id(&src, b"t");
+    let mut rid = ElementId::from_bytes([0u8; 16]);
+    let create = src.transact(|tx| {
+        rid = tx.ranged().create(
+            at(seq, RelativePosition::Start),
+            at(seq, RelativePosition::End),
+            Scalar::Int(0),
+        );
+    });
+    let del = src.transact(|tx| tx.ranged().delete(rid));
+
+    let mut dst = Document::new(cid(2));
+    apply_all(&mut dst, &build);
+    apply_all(&mut dst, &create);
+    apply_all(&mut dst, &del);
+    let after_one = dst.encode_state();
+    assert!(dst.ranged_element(rid).is_none(), "deleted");
+
+    apply_all(&mut dst, &del); // re-deliver
+    assert!(dst.ranged_element(rid).is_none(), "still deleted");
+    assert_eq!(dst.ranged_elements().len(), 0);
+    assert_eq!(dst.encode_state(), after_one, "re-delivery changed nothing");
+}
+
+#[test]
 fn a_payload_change_waits_for_its_create() {
     // A payload change (or delete) that arrives before the create it depends on
     // must buffer until the create lands — applied against a missing entry it
