@@ -65,6 +65,7 @@ pub enum ErrorCode {
     Forbidden = 5,
     UpdateRequired = 6,
     NotFound = 7,
+    SchemaViolation = 8,
 }
 
 impl From<CoreErrorCode> for ErrorCode {
@@ -78,6 +79,7 @@ impl From<CoreErrorCode> for ErrorCode {
             CoreErrorCode::Forbidden => ErrorCode::Forbidden,
             CoreErrorCode::UpdateRequired => ErrorCode::UpdateRequired,
             CoreErrorCode::NotFound => ErrorCode::NotFound,
+            CoreErrorCode::SchemaViolation => ErrorCode::SchemaViolation,
         }
     }
 }

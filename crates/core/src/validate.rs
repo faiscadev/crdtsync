@@ -84,6 +84,36 @@ pub enum ViolationKind {
     CrossZoneAnchor { id: ElementId },
 }
 
+impl ViolationKind {
+    /// Whether an enforcing server refuses, at op-ingress, the op that introduces
+    /// this violation — the producer-reject boundary that keeps a plainly-invalid op
+    /// out of the log.
+    ///
+    /// Only a runtime-kind mismatch at a *declared* slot qualifies. The schema's
+    /// violation set is closed: every declarable dimension — a bound, a sequence
+    /// length, a disallowed/mistyped attr, a disallowed/excess xml child, an orphan
+    /// inline, a cross-zone anchor — has a convergent read-time [repair](crate::repair),
+    /// so those are never rejected; they are folded away at read, which is what preserves
+    /// convergence under concurrency. A **kind mismatch** has no such read-repair —
+    /// a counter cannot be read as the register its slot declares — and, unlike an
+    /// undeclared slot, it stands at a slot the schema *declared*, so it is
+    /// inadmissible: an op that installs the wrong element kind at a declared slot
+    /// against clean state is refused before it enters the log. An **undeclared map
+    /// slot** is *equally* unrepairable but *not* rejected: a Map is an open
+    /// container — slot membership is not a schema dimension — so an untyped extra
+    /// slot is admissible, not a violation to enforce. That admissibility, not
+    /// repairability, is what separates the two. A mismatch *already standing* in
+    /// committed state (put there by a
+    /// non-enforcing write) is left as-is — the enforcing gate refuses only a batch
+    /// that *adds* one, never wedging an unrelated edit on a pre-existing one, and
+    /// however a committed mismatch renders is the Map slot's own last-writer-wins
+    /// concern (§Invariant Repair, "Map slot type mismatch handled by the
+    /// algorithm, not repair"), not this classifier's.
+    pub fn rejects_at_ingress(&self) -> bool {
+        matches!(self, ViolationKind::KindMismatch { .. })
+    }
+}
+
 /// A single constraint violation at a located element.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Violation {

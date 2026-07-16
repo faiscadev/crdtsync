@@ -87,6 +87,13 @@ pub enum ErrorCode {
     /// A named resource the request addressed does not exist — a diff query over
     /// an absent version or branch. Recoverable: the connection stays open.
     NotFound,
+    /// The submitted ops would introduce a runtime-kind mismatch at a declared slot
+    /// — an element of the wrong kind for its schema type — which read-time invariant
+    /// repair cannot normalize. An enforcing server refuses the batch at ingress so
+    /// the state never enters the log; the author keeps its ops and surfaces the
+    /// rejection. Distinct from [`Forbidden`](ErrorCode::Forbidden), which is an
+    /// authorization denial. Recoverable: the connection stays open.
+    SchemaViolation,
 }
 
 /// Which pair of named states a [`Message::DiffQuery`] compares: two saved
@@ -1040,6 +1047,7 @@ fn error_code_tag(code: ErrorCode) -> u16 {
         ErrorCode::Forbidden => 5,
         ErrorCode::UpdateRequired => 6,
         ErrorCode::NotFound => 7,
+        ErrorCode::SchemaViolation => 8,
     }
 }
 
@@ -1053,6 +1061,7 @@ fn error_code(tag: u16) -> Result<ErrorCode, ProtocolError> {
         5 => Ok(ErrorCode::Forbidden),
         6 => Ok(ErrorCode::UpdateRequired),
         7 => Ok(ErrorCode::NotFound),
+        8 => Ok(ErrorCode::SchemaViolation),
         tag => Err(ProtocolError::BadTag {
             what: "error code",
             tag: tag as u8,

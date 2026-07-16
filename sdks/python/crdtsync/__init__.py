@@ -103,6 +103,7 @@ class ErrorCode(enum.IntEnum):
     FORBIDDEN = 5
     UPDATE_REQUIRED = 6
     NOT_FOUND = 7
+    SCHEMA_VIOLATION = 8
 
 
 class DiffKind(enum.IntEnum):

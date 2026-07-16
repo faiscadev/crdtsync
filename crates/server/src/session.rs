@@ -766,6 +766,23 @@ pub fn step(
                     if hub.batch_crosses_zone(&room, &ops, schema) {
                         return ops_rejected(channel, &ops, ErrorCode::Forbidden);
                     }
+                    // The enforcing tier is the authoritative reject boundary: a
+                    // batch that would introduce a runtime-kind mismatch at a declared
+                    // slot — the one unrepairable-and-inadmissible schema violation —
+                    // is refused at ingress. The op never enters the log, so every
+                    // replica converges on its absence; the author keeps its ops and
+                    // surfaces the rejection. A relay connection carries no schema
+                    // (`None`), so a relay tier never validates — it passes the batch
+                    // through unvalidated. The repairable violations are not checked
+                    // here (they are folded away convergently at read), and an
+                    // undeclared map slot is admissible (a Map is an open container).
+                    // Gated to `main` like the cross-zone check above: enforcement
+                    // resolves against the room's materialized document, which a
+                    // branch's divergent tree is not part of, so branch-scoped schema
+                    // enforcement waits on the same per-zone/branch stream work.
+                    if hub.batch_violates_schema(&room, &ops, schema) {
+                        return ops_rejected(channel, &ops, ErrorCode::SchemaViolation);
+                    }
                 }
             }
             // The batch's highest per-client op sequence: the frontier the author

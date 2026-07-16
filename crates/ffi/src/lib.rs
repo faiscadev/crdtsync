@@ -2058,7 +2058,9 @@ pub unsafe extern "C" fn crdtsync_client_subscribe_zone(
 /// the wire tags so every SDK decodes it identically: `0` ProtocolViolation, `1`
 /// UnsupportedVersion, `2` AuthFailed, `3` UnknownRoom, `4` Internal, `5`
 /// Forbidden, `6` UpdateRequired — the `onUpdateRequired` signal — `7` NotFound,
-/// a diff query over an absent version or branch.
+/// a diff query over an absent version or branch, `8` SchemaViolation — the
+/// enforcing server refused ops that would introduce a non-repairable schema
+/// violation.
 fn error_code_discriminant(code: ErrorCode) -> i32 {
     match code {
         ErrorCode::ProtocolViolation => 0,
@@ -2069,6 +2071,7 @@ fn error_code_discriminant(code: ErrorCode) -> i32 {
         ErrorCode::Forbidden => 5,
         ErrorCode::UpdateRequired => 6,
         ErrorCode::NotFound => 7,
+        ErrorCode::SchemaViolation => 8,
     }
 }
 
