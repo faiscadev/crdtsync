@@ -398,6 +398,17 @@ fn put_opkind(out: &mut Vec<u8>, kind: &OpKind) {
             put_u8(out, 20);
             out.extend_from_slice(&id.as_bytes());
         }
+        OpKind::XmlReveal { node, tag } => {
+            put_u8(out, 21);
+            out.extend_from_slice(&node.as_bytes());
+            match tag {
+                Some(t) => {
+                    put_u8(out, 1);
+                    put_bytes(out, t);
+                }
+                None => put_u8(out, 0),
+            }
+        }
     }
 }
 
@@ -798,6 +809,20 @@ impl<'a> Cursor<'a> {
             20 => OpKind::AclRevoke {
                 id: self.element_id()?,
             },
+            21 => {
+                let node = self.element_id()?;
+                let tag = match self.u8()? {
+                    0 => None,
+                    1 => Some(self.bytes()?),
+                    other => {
+                        return Err(DecodeError::BadTag {
+                            what: "xml reveal tag present-flag",
+                            tag: other,
+                        })
+                    }
+                };
+                OpKind::XmlReveal { node, tag }
+            }
             tag => {
                 return Err(DecodeError::BadTag {
                     what: "opkind",

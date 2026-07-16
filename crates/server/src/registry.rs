@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crdtsync_core::schema::Trigger;
-use crdtsync_core::{ClientId, ErrorCode, MemberState, Message, Op, Schema};
+use crdtsync_core::{ClientId, ElementId, ErrorCode, MemberState, Message, Op, OpKind, Schema};
 
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
@@ -981,6 +981,23 @@ impl Registry {
             .as_ref()
             .map(|(app, from)| self.resolve_chains(&writer, app, *from));
         let authorizer = &*self.authorizer;
+        // The nodes this batch relocates. A move that carries a node into a subtree a
+        // recipient can read, out of one it could not, reveals a born-denied node to
+        // that recipient (reveal-on-move-in) — a shell must precede the move so the
+        // recipient can materialize it, mirroring the catch-up seam.
+        let hub = &self.hub;
+        // Each relocated node paired with its move's zone: a reveal shell (and its
+        // back-filled content) is stamped with the move's zone so the per-channel zone
+        // filter co-travels them — a shell never rides to a channel whose zone filter
+        // drops its placing move (which would strand an unplaced node). For a room with no
+        // zones every zone is `None`, so this is a no-op.
+        let moved_nodes: Vec<(ElementId, Option<u32>)> = broadcast
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::XmlMove { node, .. } => Some((*node, op.zone)),
+                _ => None,
+            })
+            .collect();
         for (peer, conn) in self.conns.iter_mut() {
             if *peer == writer {
                 continue;
@@ -1017,6 +1034,83 @@ impl Registry {
             if readable.is_empty() {
                 continue;
             }
+            // Reveal-on-move-in: for every node this batch moves into a position this
+            // recipient can read but was born where it could not, prepend a shell so the
+            // recipient materializes the node and the (readable) move folds it into place
+            // — the live-fan-out mirror of the catch-up reveal, derived from the same read
+            // predicate. A recipient reading the node's origin all along gets no shell
+            // (`reveal_ops` returns it only when the birth path is denied). Shells lead so
+            // the move lands onto them.
+            let readable = if moved_nodes.is_empty() {
+                readable
+            } else {
+                let shells: Vec<Op> = hub
+                    .reveal_ops(
+                        room,
+                        crate::acl::recipient_reads_predicate(
+                            authorizer,
+                            &records,
+                            creator.as_deref(),
+                            &index,
+                            schema.as_deref(),
+                            identity,
+                            room,
+                        ),
+                    )
+                    .into_iter()
+                    .filter_map(|mut op| match &op.kind {
+                        OpKind::XmlReveal { node, .. } => moved_nodes
+                            .iter()
+                            .find(|(n, _)| n == node)
+                            .map(|(_, zone)| {
+                                op.zone = *zone;
+                                op
+                            }),
+                        _ => None,
+                    })
+                    .collect();
+                if shells.is_empty() {
+                    readable
+                } else {
+                    // Each revealed node's shell, then its now-readable subtree content
+                    // replayed from the log — content authored while the subtree was
+                    // private is withheld on the live stream and absent from this batch,
+                    // so without the back-fill a live reader would materialize an empty
+                    // node and diverge from a fresh/snapshot joiner. The shell + content
+                    // lead the delta; the readable move (in `readable`) then folds them
+                    // into place. The shell and content carry the move's zone so the
+                    // per-channel zone filter keeps them together.
+                    let mut prefix: Vec<Op> = Vec::new();
+                    for shell in shells {
+                        let OpKind::XmlReveal { node, .. } = &shell.kind else {
+                            continue;
+                        };
+                        let node = *node;
+                        let zone = shell.zone;
+                        prefix.push(shell);
+                        prefix.extend(
+                            hub.reveal_backfill(room, node, &records, |p| {
+                                crate::acl::recipient_reads_path(
+                                    authorizer,
+                                    &records,
+                                    creator.as_deref(),
+                                    &index,
+                                    schema.as_deref(),
+                                    identity,
+                                    room,
+                                    p,
+                                )
+                            })
+                            .into_iter()
+                            .map(|mut op| {
+                                op.zone = zone;
+                                op
+                            }),
+                        );
+                    }
+                    prefix.into_iter().chain(readable).collect()
+                }
+            };
             // Translate the surviving subset to the recipient's version, or send it
             // verbatim (a same-version, relay, or foreign-app recipient). An
             // unresolved chain drops the batch, fail-closed, pending the handshake

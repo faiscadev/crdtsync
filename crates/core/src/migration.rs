@@ -153,6 +153,7 @@ fn op_key(op: &Op) -> Option<&[u8]> {
         | OpKind::TextDelete { .. }
         | OpKind::XmlInsertChild { .. }
         | OpKind::XmlMove { .. }
+        | OpKind::XmlReveal { .. }
         | OpKind::RangedCreate { .. }
         | OpKind::RangedSetPayload { .. }
         | OpKind::RangedDelete { .. }

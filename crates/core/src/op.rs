@@ -174,6 +174,20 @@ pub enum OpKind {
     AclRevoke {
         id: ElementId,
     },
+    /// Reveal a movable node's shell — its stable [`ElementId`] and current `tag`
+    /// (an element for `Some`, a text run for `None`) — with no placement. This is a
+    /// **redaction-time synthesis**, never authored and never persisted: the server
+    /// injects it into a partial reader's op stream to reveal a node born in a subtree
+    /// that reader cannot read, once an [`XmlMove`](Self::XmlMove) relocates the node
+    /// into one it can (reveal-on-move-in). Applying it materializes the node shell so
+    /// the (readable) move can place it and the node's readable content ops drain onto
+    /// it — the op-stream analogue of the snapshot projection keeping the node at its
+    /// readable current position. It carries only the node's current identity and tag,
+    /// so no op of the node's private origin leaks.
+    XmlReveal {
+        node: ElementId,
+        tag: Option<Vec<u8>>,
+    },
 }
 
 impl OpKind {
@@ -192,7 +206,11 @@ impl OpKind {
             | OpKind::TextCreate { .. }
             | OpKind::XmlElementCreate { .. }
             | OpKind::XmlFragmentCreate { .. }
-            | OpKind::XmlInsertChild { .. } => true,
+            | OpKind::XmlInsertChild { .. }
+            // A reveal installs a movable node whose attrs Map and children List are
+            // addressed by derived id — the same subtree-anchoring property, so a
+            // translation that cannot rewrite a container-create cannot rewrite it.
+            | OpKind::XmlReveal { .. } => true,
             // A composite RangedElement create installs its payload container at a
             // derived id later ops target keylessly; a scalar create installs no
             // container.

@@ -18,8 +18,10 @@
 use std::sync::Arc;
 
 use crdtsync_core::acl::{AclGrant, AclScope, AclSubject, Capability};
+use crdtsync_core::op::OpId;
 use crdtsync_core::path::{encode_path, xml_fragment, xml_insert_element};
 use crdtsync_core::protocol::Channel;
+use crdtsync_core::stamp::Stamp;
 use crdtsync_core::{
     AclEffect, ClientId, Document, ElementId, ElementKind, ErrorCode, Message, Op, OpKind,
     RangeAnchor, Scalar, Side,
@@ -1241,7 +1243,7 @@ fn build_board(doc: &mut Document) -> (Vec<Op>, ElementId) {
         tx.xml_fragment(COL_B);
         let mut frag = tx.xml_fragment(COL_A);
         let mut kids = frag.children();
-        let mut c = kids.insert_element(0, b"card");
+        let c = kids.insert_element(0, b"card");
         card = c.id();
     });
     (ops, card)
@@ -1458,6 +1460,23 @@ fn assert_reencodes(d: &Document, label: &str) {
     );
 }
 
+/// Two catch-up joiners converge: the materialized tree renders identically, and each
+/// re-encodes canonically (no dangling reference). This is the load-bearing convergence
+/// bar — the op-served and snapshot-served replicas hold byte-identical materialized
+/// content; they differ only in each replica's own identity header and its causal
+/// frontier (`seen`), which the snapshot projection deliberately clears for a partial
+/// reader, so literal whole-state byte-equality is not the invariant, materialized
+/// convergence is.
+fn assert_converges(op_join: &Document, snap_join: &Document, label: &str) {
+    assert_eq!(
+        board_render(op_join),
+        board_render(snap_join),
+        "{label}: op-join and snapshot-join diverge on the materialized tree",
+    );
+    assert_reencodes(op_join, &format!("{label} op-join"));
+    assert_reencodes(snap_join, &format!("{label} snapshot-join"));
+}
+
 /// alice builds two columns (card born in colA) then moves the card colA -> colB.
 /// Authored as separate transactions so a partial-transaction confound never masks the
 /// redaction under test (a single cross-column transaction would strand its readable
@@ -1651,6 +1670,464 @@ fn an_element_grant_reader_converges_op_join_with_snapshot_join() {
             "{label} bob drops colA — the element deny resolves there and hides it"
         );
     }
+}
+
+// ---- reveal on move-in: a node born in a denied subtree, moved into a readable one -
+//
+// The MIRROR of the move-into-denied case. A `card` is born in colB (DENIED to bob) —
+// bob never receives its create — then moved into colA (READABLE). The chosen semantics
+// is REVEAL ON MOVE-IN: a node whose CURRENT position is readable becomes visible to the
+// reader at that position, so an op-catch-up joiner, a snapshot joiner, and a mid-session
+// live reader all converge on "card present at colA". Only the node's current state is
+// revealed — no op from its private colB history leaks.
+
+/// alice builds colA (readable) and colB (denied), a `card` element BORN in colB, then
+/// moves it into colA. The mirror of `build_and_move`. Returns the card's element id.
+fn build_and_move_mirror(r: &mut Registry, alice: ConnId, alice_doc: &mut Document) -> ElementId {
+    submit(r, alice, xml_fragment(alice_doc, &col(COL_A)));
+    submit(r, alice, xml_fragment(alice_doc, &col(COL_B)));
+    submit(
+        r,
+        alice,
+        xml_insert_element(alice_doc, &col(COL_B), 0, b"card"),
+    );
+    let card = xml_child_id(alice_doc, COL_B, 0);
+    submit(
+        r,
+        alice,
+        crdtsync_core::path::xml_move_child(alice_doc, &col(COL_B), 0, &col(COL_A), 0),
+    );
+    card
+}
+
+/// Every element id in the colB subtree of `alice_doc` — the fragment and its children
+/// list — so a reader's received ops can be checked to name none of them (no history
+/// leak of the private origin).
+fn colb_subtree_ids(alice_doc: &Document) -> Vec<ElementId> {
+    let frag = frag_id(alice_doc, COL_B);
+    vec![frag, crdtsync_core::xml::XmlFragment::children_id(frag)]
+}
+
+/// Assert `ops` names no colB-subtree element as a target — the reader learns nothing of
+/// the card's private origin. (The card's own create, an `XmlInsertChild` into colB's
+/// children list, is the op that would leak the origin.)
+fn assert_no_colb_leak(ops: &[Op], alice_doc: &Document, label: &str) {
+    let denied = colb_subtree_ids(alice_doc);
+    for op in ops {
+        assert!(
+            !denied.contains(&op.target),
+            "{label}: an op targeting the denied colB origin leaked: {:?}",
+            op.kind,
+        );
+    }
+}
+
+#[test]
+fn a_node_born_denied_then_revealed_by_a_move_converges_op_join_with_snapshot_join() {
+    // Path scope. bob reads colA only. The card is born in colB (denied — bob never gets
+    // its create) then moved into colA (readable). Reveal-on-move-in: an op-served bob
+    // must materialize the card at colA, byte-identical to a snapshot-served bob, and
+    // learn nothing of the card's colB origin.
+    let seed = |r: &mut Registry| {
+        let alice = auth(r, 1, "t-alice");
+        assert!(subscribe(r, alice));
+        r.take_outbox(alice);
+        let mut alice_doc = Document::new(cid(1));
+        submit(
+            r,
+            alice,
+            grant_read(
+                &mut alice_doc,
+                AclSubject::Actor(actor_key(b"bob")),
+                &col(COL_A),
+            ),
+        );
+        let card = build_and_move_mirror(r, alice, &mut alice_doc);
+        r.take_outbox(alice);
+        (alice_doc, card)
+    };
+
+    let (alice_doc, received, ops_replica) = {
+        let mut r = registry();
+        let (alice_doc, _card) = seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        let received = received_ops(&mut r, bob);
+        let mut replica = Document::new(cid(2));
+        for op in &received {
+            replica.apply(op);
+        }
+        (alice_doc, received, replica)
+    };
+    let snap_replica = {
+        let mut r = registry();
+        r.set_compaction_threshold(1);
+        seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        served_snapshot(&mut r, bob).expect("a partial reader is served a projected snapshot")
+    };
+
+    assert_eq!(
+        board_render(&ops_replica),
+        "colA=frag(card()) colB=absent",
+        "op-join bob is revealed the card at colA — its readable current position",
+    );
+    assert_converges(&ops_replica, &snap_replica, "path-scope reveal");
+    assert_no_colb_leak(&received, &alice_doc, "path-scope catch-up");
+}
+
+#[test]
+fn a_born_denied_node_reveals_its_whole_current_subtree_not_its_origin() {
+    // Depth: the card is born in colB (denied) WITH a `gc` grandchild, then moved into
+    // colA. The reveal shell materializes the card; the grandchild's create — whose
+    // current read path is /colA/card once the card lands there — flows on the ordinary
+    // redacted stream and folds onto the shell. So the op joiner is revealed the card's
+    // whole CURRENT subtree (card(gc())), converging with the snapshot joiner, and never
+    // an op of the colB origin.
+    let seed = |r: &mut Registry| {
+        let alice = auth(r, 1, "t-alice");
+        assert!(subscribe(r, alice));
+        r.take_outbox(alice);
+        let mut alice_doc = Document::new(cid(1));
+        submit(
+            r,
+            alice,
+            grant_read(
+                &mut alice_doc,
+                AclSubject::Actor(actor_key(b"bob")),
+                &col(COL_A),
+            ),
+        );
+        submit(r, alice, xml_fragment(&mut alice_doc, &col(COL_A)));
+        // colB + a card carrying a `gc` grandchild, all born in the denied column.
+        let born = alice_doc.transact(|tx| {
+            let mut fb = tx.xml_fragment(COL_B);
+            let mut kids = fb.children();
+            let mut card = kids.insert_element(0, b"card");
+            card.children().insert_element(0, b"gc");
+        });
+        submit(r, alice, born);
+        submit(
+            r,
+            alice,
+            crdtsync_core::path::xml_move_child(&mut alice_doc, &col(COL_B), 0, &col(COL_A), 0),
+        );
+        r.take_outbox(alice);
+        alice_doc
+    };
+
+    let (alice_doc, received, ops_replica) = {
+        let mut r = registry();
+        let alice_doc = seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        let received = received_ops(&mut r, bob);
+        let mut replica = Document::new(cid(2));
+        for op in &received {
+            replica.apply(op);
+        }
+        (alice_doc, received, replica)
+    };
+    let snap_replica = {
+        let mut r = registry();
+        r.set_compaction_threshold(1);
+        seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        served_snapshot(&mut r, bob).expect("a partial reader is served a projected snapshot")
+    };
+
+    assert_eq!(
+        board_render(&ops_replica),
+        "colA=frag(card(gc())) colB=absent",
+        "op-join bob is revealed the card's whole current subtree at colA",
+    );
+    assert_converges(&ops_replica, &snap_replica, "deep-subtree reveal");
+    assert_no_colb_leak(&received, &alice_doc, "deep catch-up");
+}
+
+#[test]
+fn an_element_grant_reveals_a_born_denied_node_op_join_with_snapshot_join() {
+    // Element scope. bob's read is an element-scoped Allow(Read) on the colA fragment,
+    // which the server resolves to path colA — so bob reads colA and not colB, via an
+    // element grant that must resolve identically on the op fan-out and the snapshot
+    // projection. The card is born in colB (denied) then moved into colA (readable):
+    // reveal-on-move-in converges both seams, no colB origin leaks.
+    let seed = |r: &mut Registry| {
+        let alice = auth(r, 1, "t-alice");
+        assert!(subscribe(r, alice));
+        r.take_outbox(alice);
+        let mut alice_doc = Document::new(cid(1));
+        submit(r, alice, xml_fragment(&mut alice_doc, &col(COL_A)));
+        submit(r, alice, xml_fragment(&mut alice_doc, &col(COL_B)));
+        let cola = frag_id(&alice_doc, COL_A);
+        submit(
+            r,
+            alice,
+            grant_read_element(&mut alice_doc, AclSubject::Actor(actor_key(b"bob")), cola),
+        );
+        submit(
+            r,
+            alice,
+            xml_insert_element(&mut alice_doc, &col(COL_B), 0, b"card"),
+        );
+        submit(
+            r,
+            alice,
+            crdtsync_core::path::xml_move_child(&mut alice_doc, &col(COL_B), 0, &col(COL_A), 0),
+        );
+        r.take_outbox(alice);
+        alice_doc
+    };
+
+    let (alice_doc, received, ops_replica) = {
+        let mut r = registry();
+        let alice_doc = seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        let received = received_ops(&mut r, bob);
+        let mut replica = Document::new(cid(2));
+        for op in &received {
+            replica.apply(op);
+        }
+        (alice_doc, received, replica)
+    };
+    let snap_replica = {
+        let mut r = registry();
+        r.set_compaction_threshold(1);
+        seed(&mut r);
+        let bob = auth(&mut r, 2, "t-bob");
+        assert!(subscribe(&mut r, bob));
+        served_snapshot(&mut r, bob).expect("a partial reader is served a projected snapshot")
+    };
+
+    assert_eq!(
+        board_render(&ops_replica),
+        "colA=frag(card()) colB=absent",
+        "op-join bob is revealed the card at colA via the element grant on colA",
+    );
+    assert_converges(&ops_replica, &snap_replica, "element-scope reveal");
+    assert_no_colb_leak(&received, &alice_doc, "element-scope catch-up");
+}
+
+#[test]
+fn a_live_reader_is_revealed_a_born_denied_node_on_the_move_in() {
+    // Mid-session reveal. bob subscribes while the card is still in colB (denied) — his
+    // catch-up holds colA empty, no card. When alice then moves the card into colA
+    // (readable), the live fan-out must reveal it to bob, so a live reader converges with
+    // a fresh joiner. No colB origin leaks on the reveal.
+    let mut r = registry();
+    let alice = auth(&mut r, 1, "t-alice");
+    assert!(subscribe(&mut r, alice));
+    r.take_outbox(alice);
+    let mut alice_doc = Document::new(cid(1));
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"bob")),
+            &col(COL_A),
+        ),
+    );
+    submit(&mut r, alice, xml_fragment(&mut alice_doc, &col(COL_A)));
+    submit(&mut r, alice, xml_fragment(&mut alice_doc, &col(COL_B)));
+    submit(
+        &mut r,
+        alice,
+        xml_insert_element(&mut alice_doc, &col(COL_B), 0, b"card"),
+    );
+    r.take_outbox(alice);
+
+    // bob joins now — card still in colB, invisible to him.
+    let bob = auth(&mut r, 2, "t-bob");
+    assert!(subscribe(&mut r, bob));
+    let mut replica = Document::new(cid(2));
+    for op in received_ops(&mut r, bob) {
+        replica.apply(&op);
+    }
+    assert_eq!(
+        board_render(&replica),
+        "colA=frag() colB=absent",
+        "before the move-in, bob sees colA empty and no card",
+    );
+
+    // alice moves the card colB -> colA. The live fan-out reveals it to bob.
+    submit(
+        &mut r,
+        alice,
+        crdtsync_core::path::xml_move_child(&mut alice_doc, &col(COL_B), 0, &col(COL_A), 0),
+    );
+    let revealed = received_ops(&mut r, bob);
+    assert!(
+        !revealed.is_empty(),
+        "the move-in reveals the card to the live reader",
+    );
+    assert_no_colb_leak(&revealed, &alice_doc, "live reveal");
+    for op in &revealed {
+        replica.apply(op);
+    }
+    assert_eq!(
+        board_render(&replica),
+        "colA=frag(card()) colB=absent",
+        "after the move-in, the live reader holds the card at colA",
+    );
+}
+
+#[test]
+fn a_live_reader_is_revealed_a_born_denied_nodes_whole_subtree_on_the_move_in() {
+    // Depth on the LIVE seam. A `card` is born in colB (denied) WITH a `gc` grandchild in
+    // an earlier batch — bob (subscribed, reads colA) receives none of it. When alice
+    // moves the card into colA, the live fan-out must reveal the card AND back-fill its
+    // now-readable subtree content from the log (the grandchild's create, withheld while
+    // private), so a live reader converges with a fresh/snapshot joiner rather than
+    // materializing an empty card. No colB origin leaks.
+    let mut r = registry();
+    let alice = auth(&mut r, 1, "t-alice");
+    assert!(subscribe(&mut r, alice));
+    r.take_outbox(alice);
+    let mut alice_doc = Document::new(cid(1));
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"bob")),
+            &col(COL_A),
+        ),
+    );
+    submit(&mut r, alice, xml_fragment(&mut alice_doc, &col(COL_A)));
+    // colB + a card carrying a `gc` grandchild, born in the denied column (one batch).
+    let born = alice_doc.transact(|tx| {
+        let mut fb = tx.xml_fragment(COL_B);
+        let mut kids = fb.children();
+        let mut card = kids.insert_element(0, b"card");
+        card.children().insert_element(0, b"gc");
+    });
+    submit(&mut r, alice, born);
+    r.take_outbox(alice);
+
+    // bob joins now — the card (and its grandchild) sit in colB, invisible to him.
+    let bob = auth(&mut r, 2, "t-bob");
+    assert!(subscribe(&mut r, bob));
+    let mut replica = Document::new(cid(2));
+    for op in received_ops(&mut r, bob) {
+        replica.apply(&op);
+    }
+    assert_eq!(
+        board_render(&replica),
+        "colA=frag() colB=absent",
+        "before the move-in, bob sees colA empty",
+    );
+
+    // alice moves the card colB -> colA. The live fan-out reveals the card AND back-fills
+    // its grandchild from the log.
+    submit(
+        &mut r,
+        alice,
+        crdtsync_core::path::xml_move_child(&mut alice_doc, &col(COL_B), 0, &col(COL_A), 0),
+    );
+    let revealed = received_ops(&mut r, bob);
+    assert_no_colb_leak(&revealed, &alice_doc, "live deep reveal");
+    for op in &revealed {
+        replica.apply(op);
+    }
+    assert_eq!(
+        board_render(&replica),
+        "colA=frag(card(gc())) colB=absent",
+        "the live reader holds the card's WHOLE current subtree, not an empty shell",
+    );
+}
+
+#[test]
+fn a_whole_document_reader_receives_a_born_denied_node_unredacted() {
+    // Regression: the creator (owns `/`) reads every column, so a born-in-colB card is
+    // delivered by its ordinary create + move — never a reveal synthesis — and converges
+    // op-join with snapshot-join.
+    let seed = |r: &mut Registry| {
+        let alice = auth(r, 1, "t-alice");
+        assert!(subscribe(r, alice));
+        r.take_outbox(alice);
+        let mut alice_doc = Document::new(cid(1));
+        build_and_move_mirror(r, alice, &mut alice_doc);
+        r.take_outbox(alice);
+    };
+    let ops_replica = {
+        let mut r = registry();
+        seed(&mut r);
+        let alice2 = auth(&mut r, 10, "t-alice2");
+        assert!(subscribe(&mut r, alice2));
+        let mut replica = Document::new(cid(10));
+        for op in received_ops(&mut r, alice2) {
+            replica.apply(&op);
+        }
+        replica
+    };
+    let snap_replica = {
+        let mut r = registry();
+        r.set_compaction_threshold(1);
+        seed(&mut r);
+        let alice2 = auth(&mut r, 10, "t-alice2");
+        assert!(subscribe(&mut r, alice2));
+        served_snapshot(&mut r, alice2).expect("the creator is served the snapshot")
+    };
+    assert_eq!(
+        board_render(&ops_replica),
+        "colA=frag(card()) colB=frag()",
+        "the whole-document reader holds the card at colA and the empty colB origin",
+    );
+    // A whole-document reader is served the snapshot verbatim (no projection clears its
+    // frontier) and joins the same op set, so op-join and snapshot-join are byte-identical
+    // except for each replica's own identity header (its owning client id).
+    assert_eq!(
+        ops_replica.encode_state()[17..],
+        snap_replica.encode_state()[17..],
+        "whole-document op-join and snapshot-join are byte-identical past the identity header",
+    );
+}
+
+#[test]
+fn a_client_authored_reveal_op_is_rejected_as_a_protocol_violation() {
+    // A reveal is a redaction-time synthesis the server injects into a reader's stream,
+    // never authored. A client that submits one — attempting to inject an unplaced,
+    // arbitrarily-identified node shell into the authoritative document — is rejected as a
+    // protocol violation, so the op never enters the log or the doc.
+    let mut r = registry();
+    let alice = auth(&mut r, 1, "t-alice");
+    assert!(subscribe(&mut r, alice));
+    r.take_outbox(alice);
+    let mut alice_doc = Document::new(cid(1));
+    submit(&mut r, alice, write_subtree(&mut alice_doc, b"a", 1));
+    r.take_outbox(alice);
+
+    let bob = join(&mut r, 2, "t-bob");
+    let forged = Op::new(
+        OpId {
+            client: cid(2),
+            seq: 1,
+        },
+        Stamp {
+            lamport: 1,
+            client: cid(2),
+        },
+        subtree_id(b"a"),
+        OpKind::XmlReveal {
+            node: ElementId::from_bytes([7u8; 16]),
+            tag: Some(b"card".to_vec()),
+        },
+    );
+    let kept_open = r.deliver(
+        bob,
+        Message::Ops {
+            channel: Channel(0),
+            ops: vec![forged],
+        },
+    );
+    assert!(
+        !kept_open,
+        "a client-authored reveal op is a protocol violation that closes the connection",
+    );
 }
 
 #[test]
