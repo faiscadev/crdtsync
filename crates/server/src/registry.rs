@@ -876,6 +876,53 @@ impl Registry {
         self.parsed_schema(&app)
     }
 
+    /// Whether `identity` may fetch the blob whose public handle is `blob_id` — the
+    /// out-of-band blob-fetch authorization. A blob is content-addressed and
+    /// immutable, so authority cannot attach to the bytes: it attaches to the
+    /// **reference site**. The fetch is allowed iff `identity` holds READ authority
+    /// on at least one live `core::path` that currently references `blob_id`,
+    /// resolved through the SAME per-recipient read evaluator op redaction uses
+    /// ([`recipient_reads_path`](crate::acl::recipient_reads_path)) — deployment
+    /// policy, doc-ACL tuples, and schema grants composed exactly as the op stream
+    /// composes them. A blob's handle is room-independent, so every room is scanned
+    /// and the first readable reference grants.
+    ///
+    /// Fail-closed on every ambiguous case: a blob no live path references (a leaked
+    /// or guessed id, a since-deleted reference), or one referenced only under paths
+    /// `identity` cannot read (a redacted or denied position), is **denied** — even
+    /// for an authenticated caller, and even for the room creator who owns `/` (an
+    /// owner still cannot fetch a blob nothing in the document references). This
+    /// mirrors the element-id redaction model: a reference the recipient cannot see
+    /// must not be fetchable (the drag-to-exfil analogue for blobs).
+    pub fn authorize_blob_fetch(&mut self, identity: &Identity, blob_id: &[u8; 16]) -> bool {
+        for room in self.hub.room_ids() {
+            let refs = self.hub.blob_ref_paths(&room);
+            let Some(paths) = refs.get(blob_id) else {
+                continue;
+            };
+            let records = self.hub.acl_records(&room);
+            let creator = self.hub.room_creator(&room);
+            let index = self.hub.element_paths(&room);
+            let schema = self.governing_schema(&room);
+            let authorizer = &*self.authorizer;
+            if paths.iter().any(|path| {
+                crate::acl::recipient_reads_path(
+                    authorizer,
+                    &records,
+                    creator.as_deref(),
+                    &index,
+                    schema.as_deref(),
+                    identity,
+                    &room,
+                    path,
+                )
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The `(app, version)` a broadcast is translated *from*, or `None` when it
     /// needs no translation. Migration translation walks the room's governing
     /// app's chain, so it applies only when the write carried a version and the

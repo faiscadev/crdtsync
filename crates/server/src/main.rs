@@ -44,7 +44,7 @@ use crdtsync_core::ClientId;
 use crdtsync_server::acl::{Acl, PolicyFileError};
 use crdtsync_server::auth::CredentialsFileError;
 use crdtsync_server::membership::{Membership, MembershipConfigError};
-use crdtsync_server::runtime::{serve_with_authorizer, ServeConfig};
+use crdtsync_server::runtime::{serve_with_authorizer_handle, ServeConfig};
 use crdtsync_server::{
     serve_admin, serve_blobs, server_config_from_pem, AllowAll, Authorizer, BlobStore, PermitAll,
     SchemaRegistry, StaticTokens, Store, TlsConfigError, Verifier, WebhookConfig,
@@ -231,7 +231,10 @@ async fn main() -> std::io::Result<()> {
     // The server never mints ops; its replicas only merge, so a fixed id is fine.
     // Both seams default to their permissive dev-mode value when unconfigured, so
     // one serve path covers every combination.
-    let data = serve_with_authorizer(
+    // A handle onto the running registry accompanies the data plane: the blob
+    // plane, an out-of-band listener that owns no replicas, resolves each fetch's
+    // reference-site read authorization through it against the same live rooms.
+    let (blob_authority, data) = serve_with_authorizer_handle(
         listener,
         ClientId::from_bytes([0; 16]),
         store,
@@ -244,7 +247,8 @@ async fn main() -> std::io::Result<()> {
         },
         verifier()?,
         authorizer()?,
-    );
+    )
+    .await?;
 
     // Every plane the node serves runs concurrently over the shared runtime;
     // the first to error stops the process. The data plane always runs; the
@@ -276,7 +280,12 @@ async fn main() -> std::io::Result<()> {
         let store = Arc::new(Mutex::new(BlobStore::open(blob_root()?)?));
         let blob_listener = TcpListener::bind(&blob_addr).await?;
         eprintln!("crdtsync blobs on http://{blob_addr}");
-        servers.push(Box::pin(serve_blobs(blob_listener, verifier()?, store)));
+        servers.push(Box::pin(serve_blobs(
+            blob_listener,
+            verifier()?,
+            store,
+            Arc::new(blob_authority),
+        )));
     }
 
     futures_util::future::try_join_all(servers).await?;

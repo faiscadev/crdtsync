@@ -40,8 +40,8 @@ pub mod tls;
 pub mod translate;
 pub mod webhook;
 pub use admin::{
-    admin_router, blob_router, register_schema, serve_admin, serve_blobs, RegisterOutcome,
-    RegisterRequest, MAX_BLOB_BODY,
+    admin_router, blob_router, register_schema, serve_admin, serve_blobs, BlobAccess,
+    PermitAllBlobs, RegisterOutcome, RegisterRequest, MAX_BLOB_BODY,
 };
 pub use auth::{AllowAll, Identity, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};
@@ -327,6 +327,70 @@ pub(crate) fn index_container(
             index_container(&Element::List(f.children()), path, out);
         }
         Element::Scalar(_) | Element::Register(_) | Element::Counter(_) => {}
+    }
+}
+
+/// Walk `elem` and every container it holds, mapping each live [`BlobRef`] leaf's
+/// blob id to the encoded `core::path` that references it — the recursive core of
+/// [`Hub::blob_ref_paths`], mirroring [`index_container`]. A map-slot ref (a bare
+/// scalar slot or a register payload) is recorded at its slot's leaf path
+/// (`path + [key]`), the governing read path a keyed op resolves to; a list item
+/// or an XML child ref inherits the holding container's `path`, since read
+/// authority governs a whole subtree. A non-blob leaf and a non-blob register are
+/// skipped. `out` accumulates duplicates; the public projection dedups them.
+pub(crate) fn index_blob_refs(
+    elem: &Element,
+    path: &[Vec<u8>],
+    out: &mut HashMap<[u8; 16], Vec<Vec<u8>>>,
+) {
+    use crdtsync_core::path::encode_path;
+    use crdtsync_core::Scalar;
+    fn record(out: &mut HashMap<[u8; 16], Vec<Vec<u8>>>, id: [u8; 16], segs: &[Vec<u8>]) {
+        let encoded = encode_path(&segs.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        out.entry(id).or_default().push(encoded);
+    }
+    match elem {
+        Element::Map(m) => {
+            let m = m.borrow();
+            let mut child_path = path.to_vec();
+            for key in m.keys() {
+                let Some(child) = m.get(&key) else { continue };
+                child_path.push(key.clone());
+                match &child {
+                    Element::Scalar(Scalar::BlobRef(b)) => record(out, b.id, &child_path),
+                    Element::Register(r) => {
+                        if let Scalar::BlobRef(b) = r.borrow().read() {
+                            record(out, b.id, &child_path)
+                        }
+                    }
+                    _ if child.is_container() => index_blob_refs(&child, &child_path, out),
+                    _ => {}
+                }
+                child_path.pop();
+            }
+        }
+        Element::List(l) => {
+            let l = l.borrow();
+            for child in l.values() {
+                match &child {
+                    // A node-addressed item ref inherits the list's path — read
+                    // authority governs the whole sequence subtree.
+                    Element::Scalar(Scalar::BlobRef(b)) => record(out, b.id, path),
+                    _ if child.is_container() => index_blob_refs(&child, path, out),
+                    _ => {}
+                }
+            }
+        }
+        Element::XmlElement(x) => {
+            let x = x.borrow();
+            index_blob_refs(&Element::Map(x.attrs()), path, out);
+            index_blob_refs(&Element::List(x.children()), path, out);
+        }
+        Element::XmlFragment(f) => {
+            let f = f.borrow();
+            index_blob_refs(&Element::List(f.children()), path, out);
+        }
+        Element::Text(_) | Element::Scalar(_) | Element::Register(_) | Element::Counter(_) => {}
     }
 }
 
@@ -1428,6 +1492,25 @@ impl Hub {
             .get(room)
             .map(|r| index::element_paths(&r.doc))
             .unwrap_or_default()
+    }
+
+    /// Every live blob reference in `room`'s document, its blob id mapped to the
+    /// encoded `core::path`s that hold it — the index a blob-fetch authorization
+    /// resolves read authority against (see
+    /// [`index::blob_ref_paths`](crate::index::blob_ref_paths)). Empty for an
+    /// unknown room, so a fetch against one is fail-closed (no referencing site).
+    pub fn blob_ref_paths(&self, room: &[u8]) -> index::BlobRefPaths {
+        self.rooms
+            .get(room)
+            .map(|r| index::blob_ref_paths(&r.doc))
+            .unwrap_or_default()
+    }
+
+    /// The name of every room this hub holds — the set a blob-fetch authorization
+    /// scans, since a blob's public handle is room-independent and may be
+    /// referenced from any room's document.
+    pub fn room_ids(&self) -> Vec<RoomId> {
+        self.rooms.keys().cloned().collect()
     }
 
     /// The synthetic [`XmlReveal`](crdtsync_core::op::OpKind::XmlReveal) shell ops that

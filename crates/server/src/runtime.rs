@@ -177,6 +177,16 @@ enum Cmd {
         peer: NodeId,
         learned: Option<Vec<GossipWireMember>>,
     },
+    /// The blob-fetch plane asks whether `identity` may retrieve blob `blob_id`,
+    /// resolved against the live rooms' references (see
+    /// [`Registry::authorize_blob_fetch`]). The out-of-band blob plane holds only a
+    /// [`RegistryHandle`], so it round-trips the read-authority decision to the
+    /// actor that owns the replicas.
+    AuthorizeBlob {
+        identity: Identity,
+        blob_id: [u8; 16],
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// What the actor makes of a connect request after weighing any upgrade
@@ -256,10 +266,47 @@ pub async fn serve_with_authorizer(
     verifier: Box<dyn Verifier + Send + Sync>,
     authorizer: Box<dyn Authorizer + Send + Sync>,
 ) -> std::io::Result<()> {
-    // Replay the persisted log here, before serving: a corrupt log fails
-    // startup rather than panicking inside the detached actor thread and
-    // leaving a live port with no registry behind it. The read is blocking, so
-    // it runs on the blocking pool to keep the runtime free for other tasks.
+    let (cmds, acceptor) = start_registry(server, store, config, verifier, authorizer).await?;
+    accept_loop(listener, cmds, acceptor).await
+}
+
+/// Serve the wire protocol as [`serve_with_authorizer`] does, additionally handing
+/// back a [`RegistryHandle`] onto the running registry actor. The handle lets a
+/// second, out-of-band plane — the blob-fetch route — resolve reference-site read
+/// authorization against the same live replicas without owning them: it is the
+/// [`BlobAccess`](crate::admin::BlobAccess) gate a deployment wires into
+/// [`serve_blobs`](crate::admin::serve_blobs). The returned future is the accept
+/// loop; the actor is already running when this resolves, so the handle answers
+/// immediately.
+pub async fn serve_with_authorizer_handle(
+    listener: TcpListener,
+    server: ClientId,
+    store: Option<Store>,
+    config: ServeConfig,
+    verifier: Box<dyn Verifier + Send + Sync>,
+    authorizer: Box<dyn Authorizer + Send + Sync>,
+) -> std::io::Result<(
+    RegistryHandle,
+    impl std::future::Future<Output = std::io::Result<()>>,
+)> {
+    let (cmds, acceptor) = start_registry(server, store, config, verifier, authorizer).await?;
+    let handle = RegistryHandle { cmds: cmds.clone() };
+    Ok((handle, accept_loop(listener, cmds, acceptor)))
+}
+
+/// Replay any persisted log and spawn the registry actor on its dedicated thread,
+/// returning the command sender that reaches it. The replay is done here — before
+/// the actor is detached — so a corrupt log fails startup rather than panicking
+/// inside the detached thread and leaving a live port with no registry behind it.
+async fn start_registry(
+    server: ClientId,
+    store: Option<Store>,
+    config: ServeConfig,
+    verifier: Box<dyn Verifier + Send + Sync>,
+    authorizer: Box<dyn Authorizer + Send + Sync>,
+) -> std::io::Result<(UnboundedSender<Cmd>, Option<TlsAcceptor>)> {
+    // The read is blocking, so it runs on the blocking pool to keep the runtime
+    // free for other tasks.
     let (rooms, store) = match store {
         Some(store) => {
             let (result, store) = tokio::task::spawn_blocking(move || {
@@ -305,7 +352,18 @@ pub async fn serve_with_authorizer(
             server, rooms, store, config, verifier, authorizer, webhook, peer_conns, cmd_rx,
         ));
     });
+    Ok((cmds, acceptor))
+}
 
+/// Accept connections forever, spawning a task to drive each over the wire
+/// protocol against the registry actor `cmds` reaches. `acceptor` wraps each
+/// socket in a rustls session when TLS is configured; without it the raw
+/// `TcpStream` is handed straight to the wire protocol.
+async fn accept_loop(
+    listener: TcpListener,
+    cmds: UnboundedSender<Cmd>,
+    acceptor: Option<TlsAcceptor>,
+) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let cmds = cmds.clone();
@@ -329,6 +387,37 @@ pub async fn serve_with_authorizer(
                 tokio::spawn(handle(stream, cmds));
             }
         }
+    }
+}
+
+/// A cloneable handle onto the running registry actor for the out-of-band
+/// blob-fetch plane. It carries only the actor's command sender, so it holds no
+/// replica state itself: a blob-fetch read-authorization query round-trips to the
+/// actor that owns the replicas (see [`Registry::authorize_blob_fetch`]).
+#[derive(Clone)]
+pub struct RegistryHandle {
+    cmds: UnboundedSender<Cmd>,
+}
+
+#[async_trait::async_trait]
+impl crate::admin::BlobAccess for RegistryHandle {
+    /// Round-trip the reference-site read-authorization decision to the registry
+    /// actor. Fail-closed if the actor is gone or drops the reply — a blob-fetch
+    /// authorization is a security boundary, so an unreachable decider denies.
+    async fn may_read_blob(&self, identity: &Identity, blob_id: &[u8; 16]) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .cmds
+            .send(Cmd::AuthorizeBlob {
+                identity: identity.clone(),
+                blob_id: *blob_id,
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 }
 
@@ -469,6 +558,15 @@ async fn registry_actor(
                             }
                             None => reg.note_gossip_probe(peer, false),
                         }
+                    }
+                    Cmd::AuthorizeBlob {
+                        identity,
+                        blob_id,
+                        reply,
+                    } => {
+                        // A read-only query over the live replicas — no state
+                        // changes, so no flush.
+                        let _ = reply.send(reg.authorize_blob_fetch(&identity, &blob_id));
                     }
                 }
             }
