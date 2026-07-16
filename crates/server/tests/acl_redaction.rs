@@ -1710,7 +1710,9 @@ fn colb_subtree_ids(alice_doc: &Document) -> Vec<ElementId> {
 
 /// Assert `ops` names no colB-subtree element as a target — the reader learns nothing of
 /// the card's private origin. (The card's own create, an `XmlInsertChild` into colB's
-/// children list, is the op that would leak the origin.)
+/// children list, is the op that would leak the origin.) A reveal shell must also carry a
+/// synthetic stamp, not the node's birth stamp — the birth stamp names the origin author,
+/// which a reader who could not read the origin must not learn.
 fn assert_no_colb_leak(ops: &[Op], alice_doc: &Document, label: &str) {
     let denied = colb_subtree_ids(alice_doc);
     for op in ops {
@@ -1719,6 +1721,13 @@ fn assert_no_colb_leak(ops: &[Op], alice_doc: &Document, label: &str) {
             "{label}: an op targeting the denied colB origin leaked: {:?}",
             op.kind,
         );
+        if matches!(op.kind, OpKind::XmlReveal { .. }) {
+            assert_eq!(
+                (op.stamp.lamport, op.stamp.client),
+                (0, op.id.client),
+                "{label}: a reveal shell must carry its own synthetic stamp, not the origin author's birth stamp",
+            );
+        }
     }
 }
 

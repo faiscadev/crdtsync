@@ -1426,9 +1426,20 @@ impl Document {
                     .map(|x| x.borrow().tag().to_vec()),
                 _ => None,
             };
+            // The shell's stamp advances only the reader's clock, and the readable move
+            // that places the node always carries a later lamport (it follows the birth),
+            // so the shell's own lamport is subsumed and need not — must not — be the
+            // birth stamp: the birth stamp names the origin author, which a reader who
+            // could not read the origin must not learn. A zero lamport under the shell's
+            // own reveal client leaks nothing and advances no clock.
+            let id = reveal_op_id(*node);
+            let stamp = Stamp {
+                lamport: 0,
+                client: id.client,
+            };
             out.push(Op::new(
-                reveal_op_id(*node),
-                birth.stamp,
+                id,
+                stamp,
                 root,
                 OpKind::XmlReveal { node: *node, tag },
             ));
