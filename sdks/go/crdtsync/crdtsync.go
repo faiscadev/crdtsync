@@ -21,8 +21,15 @@ package crdtsync
 import "C"
 
 import (
+	"bytes"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"unsafe"
 )
 
@@ -245,6 +252,50 @@ func decodeBlobRef(b []byte) BlobRef {
 		ref.Inline = append([]byte(nil), b[i:i+n]...)
 	}
 	return ref
+}
+
+// UploadBlob POSTs raw bytes to the server's POST /blobs and returns the 16-byte
+// blob handle, ready to pass to SetBlobRef. baseURL is the origin of the blob
+// plane (e.g. "http://host:6060"); the bytes POST to baseURL+"/blobs".
+// credential authenticates through the Authorization header — the same
+// credential the wire client sends in Auth — and mime sets Content-Type.
+// Whether upload is permitted is whatever POST /blobs enforces. Errors on a
+// non-200 response or a handle that is not a 16-byte hex id.
+func UploadBlob(baseURL, credential, mime string, data []byte) ([16]byte, error) {
+	var id [16]byte
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(baseURL, "/")+"/blobs", bytes.NewReader(data))
+	if err != nil {
+		return id, err
+	}
+	req.Header.Set("Authorization", credential)
+	req.Header.Set("Content-Type", mime)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return id, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return id, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return id, fmt.Errorf("blob upload: %s: %s", resp.Status, bytes.TrimSpace(body))
+	}
+	var handle struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &handle); err != nil {
+		return id, fmt.Errorf("blob upload: decode handle: %w", err)
+	}
+	raw, err := hex.DecodeString(handle.ID)
+	if err != nil {
+		return id, fmt.Errorf("blob upload: handle %q: %w", handle.ID, err)
+	}
+	if len(raw) != 16 {
+		return id, fmt.Errorf("blob upload: handle is %d bytes, want 16", len(raw))
+	}
+	copy(id[:], raw)
+	return id, nil
 }
 
 // --- list ---

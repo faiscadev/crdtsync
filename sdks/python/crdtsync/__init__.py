@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import ctypes
 import enum
+import json
 import os
 import platform
 import struct
+import urllib.request
 from typing import List, NamedTuple, Optional, Tuple
 
 __all__ = [
@@ -37,6 +39,7 @@ __all__ = [
     "diff",
     "diff_decode",
     "encode_path",
+    "upload_blob",
 ]
 
 Path = List[bytes]
@@ -748,6 +751,38 @@ def diff_decode(data: bytes) -> list:
     if rc != 1:
         raise ValueError("malformed change list")
     return _decode_changes(_take_buf(out))
+
+
+def upload_blob(
+    base_url: str,
+    data: bytes,
+    credential: bytes,
+    mime: str = "application/octet-stream",
+) -> bytes:
+    """Upload raw bytes to the server's ``POST /blobs`` and return the 16-byte
+    blob handle, ready to pass to :meth:`Document.set_blob_ref`.
+
+    ``base_url`` is the origin of the blob plane (e.g. ``"http://host:6060"``);
+    the bytes POST to ``{base_url}/blobs``. ``credential`` authenticates through
+    the ``Authorization`` header — the same credential the wire client sends in
+    :meth:`Client.auth` — and ``mime`` sets ``Content-Type``. Whether upload is
+    permitted is whatever ``POST /blobs`` enforces. Raises on a non-2xx response
+    or a handle that is not a 16-byte hex id."""
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/blobs",
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": credential.decode("latin-1"),
+            "Content-Type": mime,
+        },
+    )
+    with urllib.request.urlopen(request) as response:
+        handle = json.loads(response.read())
+    blob_id = bytes.fromhex(handle["id"])
+    if len(blob_id) != 16:
+        raise ValueError(f"server returned a {len(blob_id)}-byte handle, want 16")
+    return blob_id
 
 
 class Document:
