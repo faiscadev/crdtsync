@@ -309,6 +309,8 @@ Rejected: explicit per-op dependency lists (Automerge-style hashes), vector cloc
 
 Kleppmann 2021 ("A highly-available move operation for replicated trees"). Lamport-ordered apply, undo-and-replay on out-of-order receive, bounded undo log. Guarantees: exactly one parent per node, no cycles, no duplication, deterministic convergence.
 
+The fold is a pure function of the move-set + tombstone-set, **independent of the transient displaced/installed state of any parent at apply time.** A child insert, a move, or a child delete into a *materialised-but-displaced* children sequence (its holding container lost its map slot to a concurrent scalar/other create) is applied and retained hidden — never buffered-forever or dropped — exactly as **Displacement retains, it does not forget** requires. Gating these on the parent being *installed* would drop them whenever the parent lost its slot before the op arrived, folding the same op set to different trees by arrival order: an insert lost while a concurrent move relocates the node elsewhere; a delete lost while it must still win over that move. A parent is only truly unready when its container is *unmaterialised* (its create unseen), which still buffers.
+
 ## List
 
 **Fugue** (Weidner & Kleppmann 2023, "The Art of the Fugue"). Tree-based, formally proven no-interleaving on concurrent inserts at the same point. Same algorithm reused for Text.

@@ -455,6 +455,182 @@ fn a_deleted_never_moved_node_keeps_its_placement_across_a_snapshot() {
     );
 }
 
+#[test]
+fn a_move_out_survives_the_source_parents_displacement() {
+    // A child is inserted into a source parent (`span` at key `c`) and moved into a
+    // live destination (`div` at key `b`), while a scalar concurrently overwrites
+    // key `c` with a higher stamp — displacing the source parent. The explicit
+    // reparent must win: the child lands under `b` and survives its birth parent's
+    // displacement, in every arrival order. The failure mode is arrival-ordered: if
+    // the displacing scalar is applied first, the source parent is born displaced,
+    // and the child's insert (into a now-displaced sequence) is lost — so the move
+    // never materialises and the child vanishes on that replica alone.
+    let mut author = Document::new(cid(1));
+    // The move destination — created first so it exists on every replica.
+    let base = author.transact(|tx| {
+        tx.xml_element(b"b", b"div");
+    });
+    let b_id = match author.get(b"b") {
+        Some(Element::XmlElement(x)) => x.borrow().id(),
+        _ => panic!("b is not an element"),
+    };
+    // Source parent `span` at key `c`, with a child inserted into its sequence.
+    let mut s_id = zero_id();
+    let build_src = author.transact(|tx| {
+        let mut e = tx.xml_element(b"c", b"span");
+        let mut ec = e.children();
+        let s = ec.insert_element(0, b"span");
+        s_id = s.id();
+    });
+    let mv = author.transact(|tx| tx.move_xml(s_id, b_id, 0));
+
+    // A peer that has seen the source parent overwrites key `c` with a scalar — a
+    // higher stamp than the create, so it displaces the source parent everywhere.
+    let mut peer = Document::new(cid(2));
+    apply_all(&mut peer, &base);
+    apply_all(&mut peer, &build_src);
+    let displace = peer.transact(|tx| tx.set(b"c", Scalar::Int(67)));
+
+    // Pool every op; apply in generation order and in reverse to fresh replicas.
+    let mut pool = Vec::new();
+    pool.extend(base.clone());
+    pool.extend(build_src.clone());
+    pool.extend(mv.clone());
+    pool.extend(displace.clone());
+
+    let mut fwd = Document::new(cid(3));
+    apply_all(&mut fwd, &pool);
+    let mut rev = Document::new(cid(4));
+    let mut reversed = pool.clone();
+    reversed.reverse();
+    apply_all(&mut rev, &reversed);
+
+    // The scalar won slot `c`, so the source parent is displaced on both.
+    assert!(
+        matches!(fwd.get(b"c"), Some(Element::Scalar(_))),
+        "scalar must win slot c to displace the source parent"
+    );
+    assert_eq!(tree(&fwd, b"b"), tree(&rev, b"b"), "replicas diverged");
+    assert_eq!(
+        tree(&fwd, b"b"),
+        "div(span())",
+        "moved child lost when its birth parent was displaced before the insert"
+    );
+}
+
+#[test]
+fn a_move_into_a_displaced_destination_converges() {
+    // The mirror case: a child is moved from a live parent (`div` at `b`) into a
+    // destination (`span` at `c`) that a concurrent higher-stamped scalar displaces.
+    // The move must land in the log identically in every arrival order — the child
+    // renders hidden under the displaced destination, but both replicas must agree.
+    // If the displacing scalar is applied first, the destination is born displaced,
+    // and the move must still record (not be dropped by a live-only gate).
+    let mut author = Document::new(cid(1));
+    let mut s_id = zero_id();
+    let base = author.transact(|tx| {
+        let mut e = tx.xml_element(b"b", b"div");
+        let mut ec = e.children();
+        let s = ec.insert_element(0, b"span");
+        s_id = s.id();
+    });
+    let create_c = author.transact(|tx| {
+        tx.xml_element(b"c", b"span");
+    });
+    let c_id = match author.get(b"c") {
+        Some(Element::XmlElement(x)) => x.borrow().id(),
+        _ => panic!("c is not an element"),
+    };
+    let mv = author.transact(|tx| tx.move_xml(s_id, c_id, 0));
+
+    // A peer that has seen the destination overwrites key `c` with a scalar — a
+    // higher stamp than the create, displacing the move's destination everywhere.
+    let mut peer = Document::new(cid(2));
+    apply_all(&mut peer, &base);
+    apply_all(&mut peer, &create_c);
+    let displace = peer.transact(|tx| tx.set(b"c", Scalar::Int(9)));
+
+    let mut pool = Vec::new();
+    pool.extend(base.clone());
+    pool.extend(create_c.clone());
+    pool.extend(mv.clone());
+    pool.extend(displace.clone());
+
+    let mut fwd = Document::new(cid(3));
+    apply_all(&mut fwd, &pool);
+    let mut rev = Document::new(cid(4));
+    let mut reversed = pool.clone();
+    reversed.reverse();
+    apply_all(&mut rev, &reversed);
+
+    // The scalar won slot `c`, so the destination is displaced on both.
+    assert!(
+        matches!(fwd.get(b"c"), Some(Element::Scalar(_))),
+        "scalar must win slot c to displace the destination"
+    );
+    // The move logged identically in both orders: the child moved away from `b` and
+    // renders hidden under the displaced destination — the same on every replica.
+    assert_eq!(tree(&fwd, b"b"), tree(&rev, b"b"), "replicas diverged");
+    assert_eq!(
+        tree(&fwd, b"b"),
+        "div()",
+        "child must move away from b on both replicas, never dropped-move-only on one"
+    );
+}
+
+#[test]
+fn a_concurrent_delete_still_wins_over_a_move_when_the_source_parent_is_displaced() {
+    // Delete-wins-over-move must hold even when the moved node's birth parent is
+    // displaced. A child `C` born under `b` is concurrently moved into a live `q`,
+    // deleted from `b`, and `b` is displaced by a higher-stamped scalar. The delete
+    // must win — `C` gone on every replica — regardless of arrival order. If the
+    // delete (targeting the now-displaced birth list) is buffered while the move
+    // (into a live parent) commits, one replica keeps `C` under `q` and another
+    // deletes it: a convergence violation of the same class this fix removes.
+    let mut author = Document::new(cid(1));
+    let mut c_id = zero_id();
+    let base = author.transact(|tx| {
+        tx.xml_element(b"q", b"div");
+        let mut e = tx.xml_element(b"b", b"div");
+        let mut ec = e.children();
+        let c = ec.insert_element(0, b"span");
+        c_id = c.id();
+    });
+    let q_id = match author.get(b"q") {
+        Some(Element::XmlElement(x)) => x.borrow().id(),
+        _ => panic!("q is not an element"),
+    };
+    let mv = author.transact(|tx| tx.move_xml(c_id, q_id, 0));
+
+    let mut deleter = Document::new(cid(2));
+    apply_all(&mut deleter, &base);
+    let del = deleter.transact(|tx| tx.xml_element(b"b", b"div").children().delete(0));
+
+    let mut peer = Document::new(cid(3));
+    apply_all(&mut peer, &base);
+    let displace = peer.transact(|tx| tx.set(b"b", Scalar::Int(5)));
+
+    let mut pool = Vec::new();
+    pool.extend(base.clone());
+    pool.extend(mv.clone());
+    pool.extend(del.clone());
+    pool.extend(displace.clone());
+
+    let mut fwd = Document::new(cid(4));
+    apply_all(&mut fwd, &pool);
+    let mut rev = Document::new(cid(5));
+    let mut reversed = pool.clone();
+    reversed.reverse();
+    apply_all(&mut rev, &reversed);
+
+    assert_eq!(tree(&fwd, b"q"), tree(&rev, b"q"), "replicas diverged");
+    assert_eq!(
+        tree(&fwd, b"q"),
+        "div()",
+        "delete must win over the move on every replica, never resurrect C under q"
+    );
+}
+
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {

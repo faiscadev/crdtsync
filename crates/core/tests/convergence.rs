@@ -85,12 +85,79 @@ fn ranchor(seq: ElementId, pos: RelativePosition) -> RangeAnchor {
     RangeAnchor { seq, pos }
 }
 
+/// Collect, from the live tree under the shared keys, every movable xml node (an
+/// element or text run that lives in a children sequence) and every xml container
+/// that can host a move (an element or fragment). Ids are stable across replicas,
+/// so the generating replica's pick names the same nodes everywhere.
+fn xml_move_targets(d: &Document) -> (Vec<ElementId>, Vec<ElementId>) {
+    fn walk(
+        children: &std::rc::Rc<std::cell::RefCell<crdtsync_core::list::List>>,
+        movable: &mut Vec<ElementId>,
+        parents: &mut Vec<ElementId>,
+    ) {
+        for child in children.borrow().values() {
+            match child {
+                Element::XmlElement(x) => {
+                    let x = x.borrow();
+                    movable.push(x.id());
+                    parents.push(x.id());
+                    walk(&x.children(), movable, parents);
+                }
+                Element::Text(t) => movable.push(t.borrow().id()),
+                _ => {}
+            }
+        }
+    }
+    let mut movable = Vec::new();
+    let mut parents = Vec::new();
+    for k in KEYS {
+        match d.get(k) {
+            Some(Element::XmlElement(x)) => {
+                let x = x.borrow();
+                parents.push(x.id());
+                walk(&x.children(), &mut movable, &mut parents);
+            }
+            Some(Element::XmlFragment(f)) => {
+                let f = f.borrow();
+                parents.push(f.id());
+                walk(&f.children(), &mut movable, &mut parents);
+            }
+            _ => {}
+        }
+    }
+    (movable, parents)
+}
+
+/// A top-level xml container at `k`, with the info a child-delete needs: the
+/// element's tag (to re-address it) or that it is a fragment, plus its live child
+/// count. `None` if `k` holds no xml container.
+enum TopXml {
+    Element(Vec<u8>),
+    Fragment,
+}
+
+fn top_xml(d: &Document, k: &[u8]) -> Option<(TopXml, usize)> {
+    match d.get(k) {
+        Some(Element::XmlElement(x)) => {
+            let x = x.borrow();
+            Some((
+                TopXml::Element(x.tag().to_vec()),
+                x.children().borrow().len(),
+            ))
+        }
+        Some(Element::XmlFragment(f)) => {
+            Some((TopXml::Fragment, f.borrow().children().borrow().len()))
+        }
+        _ => None,
+    }
+}
+
 /// Apply one random edit to a document, returning the ops it emitted. Deletes
 /// on a list or text pick a live index off the generating replica, so they are
 /// real removals; on the peers the same op waits for its target to arrive.
 fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
     let k = key(rng);
-    match rng.below(23) {
+    match rng.below(25) {
         0 => d.transact(|tx| tx.register(k, Scalar::Int(rng_val(rng)))),
         1 => d.transact(|tx| tx.inc(k, 1 + rng.below(4) as u32)),
         2 => d.transact(|tx| tx.dec(k, 1 + rng.below(4) as u32)),
@@ -238,6 +305,40 @@ fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
             }
             let id = live[rng.below(live.len())].id;
             d.transact(|tx| tx.acl().revoke(id))
+        }
+        22 => {
+            // Reparent an xml node: move a movable node under a new xml parent —
+            // the displacing tree-move family. Node and parent are picked off the
+            // generating replica's live tree; a move under the node's own
+            // descendant is dropped as a cycle at apply time.
+            let (movable, parents) = xml_move_targets(d);
+            if movable.is_empty() || parents.is_empty() {
+                return Vec::new();
+            }
+            let node = movable[rng.below(movable.len())];
+            let parent = parents[rng.below(parents.len())];
+            let idx = rng.below(2);
+            d.transact(|tx| tx.move_xml(node, parent, idx))
+        }
+        23 => {
+            // Delete an xml child by index — exercises delete-wins-over-move and a
+            // delete into a displaced children sequence (the birth list of a moved
+            // node whose slot a scalar later displaces).
+            let Some((which, len)) = top_xml(d, k) else {
+                return Vec::new();
+            };
+            if len == 0 {
+                return Vec::new();
+            }
+            let idx = rng.below(len);
+            match which {
+                TopXml::Element(tag) => d.transact(|tx| {
+                    tx.xml_element(k, &tag).children().delete(idx);
+                }),
+                TopXml::Fragment => d.transact(|tx| {
+                    tx.xml_fragment(k).children().delete(idx);
+                }),
+            }
         }
         _ => d.transact(|tx| tx.map(k).set(subkey(rng), Scalar::Bool(true))),
     }

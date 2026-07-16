@@ -2284,25 +2284,51 @@ impl Document {
     /// the nodes it removes are present. A delete of a not-yet-inserted node
     /// would silently no-op and be lost, so it waits for the insert.
     fn ready(&self, op: &Op) -> bool {
+        // An XmlInsertChild materialises a movable node into a parent's children
+        // sequence. A displaced parent still retains that sequence, so the child is
+        // materialised-but-hidden rather than buffered forever — else a concurrent
+        // move that reparents the child into a live container would be lost the
+        // moment the birth parent loses its slot (its create landing after a
+        // scalar at the same key). Readiness needs only the sequence materialised;
+        // the child's visibility is then the move log's concern, not this gate's.
+        if let OpKind::XmlInsertChild { .. } = &op.kind {
+            return self.lists.contains_key(&op.target);
+        }
+        // A move is a tree-relation edit that must be logged regardless of the
+        // destination parent's transient displacement: a displaced parent retains
+        // its children sequence, so the move records and folds against the live
+        // move-set and the node renders hidden if its effective parent is
+        // displaced — consistent on every replica. Gating on the destination being
+        // *installed* would instead drop the move whenever the destination lost its
+        // slot before the move arrived, so the same op set folds to different trees
+        // by arrival order. Needs only the destination sequence materialised and the
+        // moved node present (its create may still be in flight) or a reveal shell.
+        if let OpKind::XmlMove { node, .. } = &op.kind {
+            return self.lists.contains_key(&op.target)
+                && (self.placements.contains_key(node) || self.revealed_pending.contains(node));
+        }
+        // A ListDelete tombstones a sequence node, so it must apply into a
+        // materialised-but-displaced sequence too — symmetric with the insert/move
+        // above. A moved node keeps a live placement under its new parent even while
+        // its birth sequence is displaced; buffering the delete of that birth
+        // placement (which never re-installs) would let the delete lose to the move
+        // on this replica while winning on one that saw the delete before the
+        // displacement — a delete-wins-over-move divergence. Needs only the node
+        // present in its (possibly displaced) list.
+        if let OpKind::ListDelete { id } = &op.kind {
+            return self
+                .lists
+                .get(&op.target)
+                .is_some_and(|l| l.borrow().contains(*id));
+        }
         if !self.resolvable(op.target) {
             return false;
         }
         match &op.kind {
-            OpKind::ListDelete { id } => self
-                .lists
-                .get(&op.target)
-                .is_some_and(|l| l.borrow().contains(*id)),
             OpKind::TextDelete { ids } => self.texts.get(&op.target).is_some_and(|t| {
                 let t = t.borrow();
                 ids.iter().all(|id| t.contains(*id))
             }),
-            // A move waits until the node it relocates has been materialised — its
-            // create may still be in flight — so the relocation is never lost. A
-            // reveal shell (no placement yet) satisfies it: the move lands the shell's
-            // first placement.
-            OpKind::XmlMove { node, .. } => {
-                self.placements.contains_key(node) || self.revealed_pending.contains(node)
-            }
             // A payload change or delete waits for the RangedElement's create — a
             // create carries the entry, a set/delete only mutate it, so applied
             // against a missing entry they would be silently lost. A create itself
@@ -2363,7 +2389,19 @@ impl Document {
         // missing entry and is lost.
         let mut created_acl: HashSet<ElementId> = HashSet::new();
         for op in &ordered {
-            let target_ok = self.resolvable(op.target) || created.contains(&op.target);
+            // An XmlInsertChild / XmlMove / ListDelete commits into a
+            // materialised-but-displaced sequence (see `ready`), so a displaced
+            // parent does not stall the group and the move / delete still lands in
+            // the log — else the group would fold to different trees by arrival
+            // order.
+            let target_ok = match &op.kind {
+                OpKind::XmlInsertChild { .. }
+                | OpKind::XmlMove { .. }
+                | OpKind::ListDelete { .. } => {
+                    self.lists.contains_key(&op.target) || created.contains(&op.target)
+                }
+                _ => self.resolvable(op.target) || created.contains(&op.target),
+            };
             if !target_ok {
                 return false;
             }
@@ -2601,7 +2639,11 @@ impl Document {
                 return;
             }
             OpKind::ListDelete { id } => {
-                if let Some(list) = self.live_list(target) {
+                // Tombstone into the sequence even when its holding container is
+                // displaced: the moved node it deletes still renders under its new
+                // parent, so the delete must land to win over the move regardless of
+                // the birth list's slot state.
+                if let Some(list) = self.lists.get(&target).cloned() {
                     list.borrow_mut().delete_id(*id);
                 }
                 // A delete of a moved node's placement makes the delete win over a
@@ -2834,6 +2876,12 @@ impl Document {
     /// and insert its handle as a sequence node keyed by the op's stamp. The
     /// child's element id derives from that stamp, so every replica builds the
     /// same child; `insert_at` is idempotent on the stamp, so a replay is inert.
+    ///
+    /// Inserts into the sequence even when its holding element is displaced: a
+    /// displaced parent retains its children, so the child materialises hidden and
+    /// a later move can relocate it into a live parent. Losing the child here would
+    /// drop a move whose source parent was displaced before the child arrived,
+    /// diverging by arrival order.
     fn insert_xml_child(
         &mut self,
         list_id: ElementId,
@@ -2841,7 +2889,7 @@ impl Document {
         anchor: Anchor,
         stamp: Stamp,
     ) {
-        let Some(list) = self.live_list(list_id) else {
+        let Some(list) = self.lists.get(&list_id).cloned() else {
             return;
         };
         let (kind, container) = match tag {
@@ -2885,7 +2933,12 @@ impl Document {
         if !self.placements.contains_key(&node) && !revealing {
             return;
         }
-        let Some(list) = self.live_list(dest_list) else {
+        // Record into the destination sequence even when its holding container is
+        // displaced: the move must land in the lamport-ordered log regardless of
+        // the destination's transient slot state, or the log — and so the folded
+        // tree — would differ by arrival order. A move onto a displaced parent
+        // renders hidden; the fold re-derives visibility from the move-set.
+        let Some(list) = self.lists.get(&dest_list).cloned() else {
             return;
         };
         let Some(&owner) = self.parents.get(&dest_list) else {
