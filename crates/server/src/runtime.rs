@@ -266,8 +266,8 @@ pub async fn serve_with_authorizer(
     verifier: Box<dyn Verifier + Send + Sync>,
     authorizer: Box<dyn Authorizer + Send + Sync>,
 ) -> std::io::Result<()> {
-    let cmds = start_registry(server, store, config, verifier, authorizer).await?;
-    accept_loop(listener, cmds).await
+    let (cmds, acceptor) = start_registry(server, store, config, verifier, authorizer).await?;
+    accept_loop(listener, cmds, acceptor).await
 }
 
 /// Serve the wire protocol as [`serve_with_authorizer`] does, additionally handing
@@ -289,9 +289,9 @@ pub async fn serve_with_authorizer_handle(
     RegistryHandle,
     impl std::future::Future<Output = std::io::Result<()>>,
 )> {
-    let cmds = start_registry(server, store, config, verifier, authorizer).await?;
+    let (cmds, acceptor) = start_registry(server, store, config, verifier, authorizer).await?;
     let handle = RegistryHandle { cmds: cmds.clone() };
-    Ok((handle, accept_loop(listener, cmds)))
+    Ok((handle, accept_loop(listener, cmds, acceptor)))
 }
 
 /// Replay any persisted log and spawn the registry actor on its dedicated thread,
@@ -304,7 +304,7 @@ async fn start_registry(
     config: ServeConfig,
     verifier: Box<dyn Verifier + Send + Sync>,
     authorizer: Box<dyn Authorizer + Send + Sync>,
-) -> std::io::Result<UnboundedSender<Cmd>> {
+) -> std::io::Result<(UnboundedSender<Cmd>, Option<TlsAcceptor>)> {
     // The read is blocking, so it runs on the blocking pool to keep the runtime
     // free for other tasks.
     let (rooms, store) = match store {
@@ -352,12 +352,18 @@ async fn start_registry(
             server, rooms, store, config, verifier, authorizer, webhook, peer_conns, cmd_rx,
         ));
     });
-    Ok(cmds)
+    Ok((cmds, acceptor))
 }
 
 /// Accept connections forever, spawning a task to drive each over the wire
-/// protocol against the registry actor `cmds` reaches.
-async fn accept_loop(listener: TcpListener, cmds: UnboundedSender<Cmd>) -> std::io::Result<()> {
+/// protocol against the registry actor `cmds` reaches. `acceptor` wraps each
+/// socket in a rustls session when TLS is configured; without it the raw
+/// `TcpStream` is handed straight to the wire protocol.
+async fn accept_loop(
+    listener: TcpListener,
+    cmds: UnboundedSender<Cmd>,
+    acceptor: Option<TlsAcceptor>,
+) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let cmds = cmds.clone();
