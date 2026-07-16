@@ -649,6 +649,30 @@ pub fn recipient_reads_path(
     )
 }
 
+/// A path *predicate* over `core::path` **segments** — [`recipient_reads_path`] with its
+/// authority context bound, bridging the segment form the core read projections
+/// ([`Document::project_read_paths`](crdtsync_core::Document::project_read_paths),
+/// [`reveal_ops`](crdtsync_core::Document::reveal_ops)) call to the encoded path the
+/// verdict is computed at. The one place the encode-then-decide bridge lives, so the
+/// snapshot projection, the catch-up reveal, and the live-fan-out reveal cannot drift
+/// apart — the property their op-join≡snapshot-join convergence rests on.
+pub fn recipient_reads_predicate<'a>(
+    deployment: &'a dyn Authorizer,
+    records: &'a [AclRecord],
+    creator: Option<&'a [u8]>,
+    index: &'a HashMap<ElementId, Vec<Vec<u8>>>,
+    schema: Option<&'a Schema>,
+    identity: &'a Identity,
+    room: &'a [u8],
+) -> impl Fn(&[Vec<u8>]) -> bool + 'a {
+    move |path: &[Vec<u8>]| {
+        let encoded = encode_path(&path.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        recipient_reads_path(
+            deployment, records, creator, index, schema, identity, room, &encoded,
+        )
+    }
+}
+
 /// Whether `identity` may read the **entire** document — the gate for serving it an
 /// unredacted whole-replica snapshot. Whole-document root read is necessary but not
 /// sufficient: a downstream `Deny(Read)` (or `Deny(Own)`) carves a subtree out of an
@@ -782,6 +806,10 @@ pub fn op_read_path(
         OpKind::RangedCreate { .. }
         | OpKind::RangedSetPayload { .. }
         | OpKind::RangedDelete { .. } => root(),
+        // An `XmlReveal` is a redaction-time synthesis injected for a specific reader
+        // (reveal-on-move-in), never a committed op the redaction filters gate — but as
+        // the strictest read authority it folds to root here, so it can never leak.
+        OpKind::XmlReveal { .. } => root(),
         // An ACL grant is gated by the path its scope governs: a fixed path directly,
         // an element scope resolved to its element's current path through `index` (so
         // the grant op reaches exactly the readers of the element's live location). An

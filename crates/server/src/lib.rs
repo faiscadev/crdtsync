@@ -1428,6 +1428,60 @@ impl Hub {
             .unwrap_or_default()
     }
 
+    /// The synthetic [`XmlReveal`](crdtsync_core::op::OpKind::XmlReveal) shell ops that
+    /// reveal, to a reader admitted by `reads`, every movable node born in a subtree the
+    /// reader may not read but whose current position it may — the op-stream half of
+    /// reveal-on-move-in (see [`Document::reveal_ops`](crdtsync_core::Document::reveal_ops)).
+    /// Derived from `room`'s live document with the same read predicate the snapshot
+    /// projection uses, so a node revealed on the op stream is exactly one the projected
+    /// snapshot keeps — the two catch-up seams converge. Empty for an unknown room.
+    pub fn reveal_ops(&self, room: &[u8], reads: impl Fn(&[Vec<u8>]) -> bool) -> Vec<Op> {
+        self.rooms
+            .get(room)
+            .map(|r| r.doc.reveal_ops(reads))
+            .unwrap_or_default()
+    }
+
+    /// The room-log content ops in `node`'s current subtree that a reader admitted by
+    /// `reads` (an encoded-`core::path` predicate, the [`recipient_reads_path`] verdict)
+    /// may see — the **live-reveal back-fill**. When an `XmlMove` reveals a node born in a
+    /// subtree the reader could not read, the node's content (authored while private, so
+    /// withheld on the live stream and not in the move's batch) must still reach the
+    /// reader so it converges with a fresh joiner. This replays that content from the log:
+    /// the ops targeting a container in the node's current subtree whose read paths the
+    /// reader may now read, in log order. Gated by the same `op_read_paths` authority the
+    /// fan-out applies, so a deep deny inside the revealed subtree drops the same slots the
+    /// snapshot projection does. Empty for an unknown room or a node with no subtree.
+    ///
+    /// [`recipient_reads_path`]: crate::acl::recipient_reads_path
+    pub fn reveal_backfill(
+        &self,
+        room: &[u8],
+        node: ElementId,
+        records: &[crdtsync_core::acl::AclRecord],
+        reads: impl Fn(&[u8]) -> bool,
+    ) -> Vec<Op> {
+        let Some(r) = self.rooms.get(room) else {
+            return Vec::new();
+        };
+        let subtree = r.doc.movable_subtree_containers(node);
+        if subtree.is_empty() {
+            return Vec::new();
+        }
+        let index = index::element_paths(&r.doc);
+        let ranged = r.doc.ranged_anchors();
+        r.log
+            .iter()
+            .filter(|rec| subtree.contains(&rec.op.target))
+            .filter(|rec| {
+                crate::acl::op_read_paths(&index, &ranged, records, &rec.op)
+                    .iter()
+                    .all(|p| reads(p))
+            })
+            .map(|rec| rec.op.clone())
+            .collect()
+    }
+
     /// Project `room`'s document to `RangedElement id → (start seq, end seq)`,
     /// tombstoned ranges included — the anchor resolution the per-recipient redaction
     /// gates a `RangedSetPayload`/`RangedDelete` by

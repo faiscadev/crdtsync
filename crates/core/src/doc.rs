@@ -195,6 +195,14 @@ pub struct Document {
     /// Ops whose target isn't reachable yet, held until a create makes it so.
     buffer: Vec<Op>,
     buffered: HashSet<OpId>,
+    /// Movable nodes revealed by an [`XmlReveal`](crate::op::OpKind::XmlReveal) shell
+    /// but not yet placed — a node materialized (identity + tag) with no placement,
+    /// awaiting the [`XmlMove`](crate::op::OpKind::XmlMove) that will position it. A
+    /// move of such a node lands its first placement (the reveal-on-move-in seam),
+    /// where a move of any other placement-less node (a keyed root) is a no-op. Cleared
+    /// once the node is placed; never persisted (a placed node is an ordinary moved
+    /// node, so a snapshot holds no pending reveal).
+    revealed_pending: HashSet<ElementId>,
     orphans: Vec<OrphanEvent>,
     /// Ops emitted by the transact currently in progress.
     pending: Vec<Op>,
@@ -257,6 +265,7 @@ impl Document {
             seen: HashSet::new(),
             buffer: Vec::new(),
             buffered: HashSet::new(),
+            revealed_pending: HashSet::new(),
             orphans: Vec::new(),
             pending: Vec::new(),
             schema: None,
@@ -1365,6 +1374,107 @@ impl Document {
         }
     }
 
+    /// The synthetic [`XmlReveal`](crate::op::OpKind::XmlReveal) shell ops that reveal,
+    /// to a reader admitted by `reads`, every movable node **born in a subtree the reader
+    /// may not read but whose current position it may** — the op-stream half of
+    /// reveal-on-move-in. This is the exact mirror of [`project_read_paths`], which keeps
+    /// these same nodes at their readable current position: a node born readable is
+    /// delivered by its ordinary create (no shell); a node whose current position is
+    /// denied stays hidden (no shell); a node born denied but now readable gets a shell
+    /// so the reader materializes it and the reader's (readable) move + content ops fold
+    /// it into place. So an op-served reader given these shells converges with a
+    /// snapshot-served one, which materializes the identical nodes.
+    ///
+    /// Each shell carries only the node's current identity and `tag` — never an op of its
+    /// private origin — and is stamped from the node's birth stamp (so the reader's clock
+    /// reaches what the origin advanced) under an id derived from the node (unique, and
+    /// never a real authored op, which the reader could not have seen anyway since its
+    /// origin was denied). The server injects these into a partial reader's catch-up
+    /// delta and live fan-out; they are never authored, logged, or persisted.
+    pub fn reveal_ops(&self, reads: impl Fn(&[Vec<u8>]) -> bool) -> Vec<Op> {
+        let paths = self.element_paths();
+        let root = self.root_id();
+        let denied = |path: &[Vec<u8>]| (1..=path.len()).any(|i| !reads(&path[..i]));
+        let list_denied = |list: &ElementId| paths.get(list).is_none_or(|p| denied(p));
+        // Deterministic order so a re-derivation on either seam emits the same sequence.
+        let mut nodes: Vec<(&ElementId, &Vec<Placement>)> = self.placements.iter().collect();
+        nodes.sort_by_key(|(id, _)| id.as_bytes());
+        let mut out = Vec::new();
+        for (node, places) in nodes {
+            let Some(kind) = self.node_kind(*node) else {
+                continue;
+            };
+            let Some(birth) = birth_placement(*node, places, kind) else {
+                continue;
+            };
+            // Born readable → an ordinary create carries it; no reveal.
+            if !list_denied(&birth.list) {
+                continue;
+            }
+            // Current position denied → the node stays hidden, matching the snapshot
+            // projection (which purges it by current position).
+            let Some(cur) = paths.get(node) else {
+                continue;
+            };
+            if denied(cur) {
+                continue;
+            }
+            let tag = match kind {
+                ElementKind::XmlElement => self
+                    .xml_elements
+                    .get(node)
+                    .map(|x| x.borrow().tag().to_vec()),
+                _ => None,
+            };
+            // The shell's stamp advances only the reader's clock, and the readable move
+            // that places the node always carries a later lamport (it follows the birth),
+            // so the shell's own lamport is subsumed and need not — must not — be the
+            // birth stamp: the birth stamp names the origin author, which a reader who
+            // could not read the origin must not learn. A zero lamport under the shell's
+            // own reveal client leaks nothing and advances no clock.
+            let id = reveal_op_id(*node);
+            let stamp = Stamp {
+                lamport: 0,
+                client: id.client,
+            };
+            out.push(Op::new(
+                id,
+                stamp,
+                root,
+                OpKind::XmlReveal { node: *node, tag },
+            ));
+        }
+        out
+    }
+
+    /// The container ids in a movable node's **current** subtree — its attrs Map and
+    /// children List, and recursively those of every descendant element (a text run has
+    /// neither). These are the targets of the node's content ops; a live reveal replays
+    /// the ones a reader may now read from the room log so a mid-session reader sees the
+    /// node's full current state, not just its shell — the ops the catch-up seam already
+    /// delivers by re-filtering the whole delta against the node's now-readable position.
+    pub fn movable_subtree_containers(&self, node: ElementId) -> HashSet<ElementId> {
+        let mut out = HashSet::new();
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            // Only an XmlElement carries an attrs Map + children List; a text run has none.
+            if !self.xml_elements.contains_key(&n) {
+                continue;
+            }
+            out.insert(XmlElement::attrs_id(n));
+            let children = XmlElement::children_id(n);
+            out.insert(children);
+            if let Some(list) = self.lists.get(&children) {
+                for child in list.borrow().values() {
+                    if let Element::XmlElement(x) = child {
+                        stack.push(x.borrow().id());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Rebuild the tree-move fold on a projected copy so its derived parent relation and
     /// `moved_away` overlay match the filtered move log a reload replays — the same
     /// reconstruction [`restore_moves`](Self::restore_moves) runs on decode, minus the
@@ -1793,6 +1903,7 @@ impl Document {
             seen,
             buffer,
             buffered,
+            revealed_pending: HashSet::new(),
             orphans: Vec::new(),
             pending: Vec::new(),
             schema: None,
@@ -2185,8 +2296,12 @@ impl Document {
                 ids.iter().all(|id| t.contains(*id))
             }),
             // A move waits until the node it relocates has been materialised — its
-            // create may still be in flight — so the relocation is never lost.
-            OpKind::XmlMove { node, .. } => self.placements.contains_key(node),
+            // create may still be in flight — so the relocation is never lost. A
+            // reveal shell (no placement yet) satisfies it: the move lands the shell's
+            // first placement.
+            OpKind::XmlMove { node, .. } => {
+                self.placements.contains_key(node) || self.revealed_pending.contains(node)
+            }
             // A payload change or delete waits for the RangedElement's create — a
             // create carries the entry, a set/delete only mutate it, so applied
             // against a missing entry they would be silently lost. A create itself
@@ -2507,6 +2622,10 @@ impl Document {
                 self.apply_move(target, *node, *anchor, stamp);
                 return;
             }
+            OpKind::XmlReveal { node, tag } => {
+                self.apply_reveal(*node, tag.clone());
+                return;
+            }
             // RangedElements live in a document-level set, not under `target`.
             OpKind::RangedCreate {
                 start,
@@ -2756,12 +2875,15 @@ impl Document {
     /// move in the lamport-ordered log, then re-folds so exactly one placement of
     /// the node renders — Kleppmann convergence, a cycle move left inert.
     fn apply_move(&mut self, dest_list: ElementId, node: ElementId, anchor: Anchor, stamp: Stamp) {
-        // Only a node that lives in a children sequence is movable: it must
-        // already hold a placement. A node created straight into a map slot (a
-        // document root) is keyed, not positioned, so a move of it is a no-op —
-        // and the same no-op on every replica, since the local emit path reaches
-        // here directly, bypassing the `ready` gate remotes apply.
-        if !self.placements.contains_key(&node) {
+        // Only a node that lives in a children sequence is movable: it must already
+        // hold a placement — or be a reveal shell awaiting its first placement (a
+        // node born in a subtree this reader could not read, revealed here as it
+        // moves into one it can). A node created straight into a map slot (a document
+        // root) is keyed, not positioned, so a move of it is a no-op — and the same
+        // no-op on every replica, since the local emit path reaches here directly,
+        // bypassing the `ready` gate remotes apply.
+        let revealing = self.revealed_pending.contains(&node);
+        if !self.placements.contains_key(&node) && !revealing {
             return;
         }
         let Some(list) = self.live_list(dest_list) else {
@@ -2780,7 +2902,29 @@ impl Document {
         });
         self.placement_index.insert((dest_list, stamp));
         self.moves.apply(stamp, node, owner);
+        // The shell is now placed — an ordinary moved node from here on.
+        self.revealed_pending.remove(&node);
         self.refold_moves();
+    }
+
+    /// Materialize a movable node's shell — its identity and current `tag` (an
+    /// `XmlElement` for `Some`, a `Text` run for `None`) — with no placement, and
+    /// record it as awaiting the move that will place it. The op-stream analogue of
+    /// the snapshot projection keeping a born-denied node at its readable current
+    /// position: it registers the node's attrs Map and children List (by derived id)
+    /// so the node's readable content ops resolve and drain onto it, then the readable
+    /// move lands its first placement. Idempotent — a node already materialized (its
+    /// real create arrived, or a duplicate reveal) is left as it is.
+    fn apply_reveal(&mut self, node: ElementId, tag: Option<Vec<u8>>) {
+        if self.node_element(node).is_some() {
+            return;
+        }
+        let container = match tag {
+            Some(t) => Container::XmlElement(t),
+            None => Container::Text,
+        };
+        self.registered_handle(node, container);
+        self.revealed_pending.insert(node);
     }
 
     /// Re-derive, for every movable node, which of its placements renders: the
@@ -3177,6 +3321,23 @@ fn birth_placement(node: ElementId, places: &[Placement], kind: ElementKind) -> 
 fn ranged_id(stamp: Stamp) -> ElementId {
     let ns = ElementId::from_bytes(*b"crdtsync\0ranged\0");
     ElementId::derive(ns, &stamp_key(stamp), ElementKind::Scalar)
+}
+
+/// The [`OpId`] a reveal shell for `node` carries. A reveal is a redaction-time
+/// synthesis, not an authored op, so it has no real `(client, seq)` — but it must
+/// dedup stably (a resumed catch-up re-derives the same shell) and never collide with a
+/// real authored op the reader also receives. The client is derived from the node under
+/// a fixed reveal namespace: deterministic and unique per node (so two revealed nodes
+/// never alias), and a derived id (UUIDv5) is disjoint from a real replica's ClientId
+/// (UUIDv7), so it can never equal a real op's id. `seq` is 0 — the derived client is a
+/// namespace of one.
+fn reveal_op_id(node: ElementId) -> OpId {
+    let ns = ElementId::from_bytes(*b"crdtsync\0reveal\0");
+    let derived = ElementId::derive(ns, &node.as_bytes(), ElementKind::XmlElement);
+    OpId {
+        client: ClientId::from_bytes(derived.as_bytes()),
+        seq: 0,
+    }
 }
 
 /// The id of the ACL tuple a grant at `stamp` mints. Derived under a fixed

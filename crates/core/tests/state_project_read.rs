@@ -15,7 +15,7 @@ use crdtsync_core::path::{
     encode_path, parse_path, xml_children_len, xml_fragment, xml_insert_element, xml_move_child,
 };
 use crdtsync_core::{
-    zone, AclEffect, Document, Element, ElementId, Op, RangeAnchor, Scalar, Schema, Side,
+    zone, AclEffect, Document, Element, ElementId, Op, OpKind, RangeAnchor, Scalar, Schema, Side,
 };
 
 mod common;
@@ -458,6 +458,106 @@ fn a_node_kept_at_its_origin_drops_the_subtree_it_grew_in_the_denied_position() 
         "the grandchild grown in the denied /b is dropped — the card's subtree is empty",
     );
     assert_eq!(back.encode_state(), bytes, "re-encode is not canonical");
+}
+
+#[test]
+fn reveal_ops_reveals_a_born_denied_node_and_converges_with_the_projection() {
+    // The mirror of `a_node_moved_into_a_denied_subtree_is_kept_at_its_readable_origin`:
+    // a `card` born under the DENIED /b fragment (its create's read path is /b, withheld)
+    // then moved into readable /a. Op catch-up withholds the create, so the reader's
+    // readable move op cannot materialize the card — `reveal_ops` supplies a shell that
+    // does. The projection keeps the card at /a; an op joiner given the shell + the
+    // readable move converges with it, learning nothing of the /b origin.
+    let reads = reads_top(false, &[b"a"]);
+
+    // Author the scenario, capturing the ops per step so the readable subset can be
+    // replayed without the denied ones.
+    let mut author = doc();
+    let a = xml_fragment(&mut author, &encode_path(&[b"a"]));
+    let b = xml_fragment(&mut author, &encode_path(&[b"b"]));
+    let birth = xml_insert_element(&mut author, &encode_path(&[b"b"]), 0, b"card");
+    let mv = xml_move_child(
+        &mut author,
+        &encode_path(&[b"b"]),
+        0,
+        &encode_path(&[b"a"]),
+        0,
+    );
+
+    // The projection keeps the card at its readable current position /a.
+    let mut snap = doc();
+    for op in a.iter().chain(&b).chain(&birth).chain(&mv) {
+        snap.apply(op);
+    }
+    snap.project_read_paths(&reads);
+    let back = Document::decode_state(&snap.encode_state()).expect("projected snapshot decodes");
+    assert_eq!(xml_children_len(&back, &encode_path(&[b"a"])), Some(1));
+    assert!(back.get(b"b").is_none());
+
+    // `reveal_ops` yields exactly one shell — the born-denied, now-readable card — and it
+    // is an `XmlReveal` carrying only the node's identity and tag (no /b origin op).
+    let shells = author.reveal_ops(&reads);
+    assert_eq!(
+        shells.len(),
+        1,
+        "one shell: the born-denied, now-readable card"
+    );
+    assert!(
+        matches!(&shells[0].kind, OpKind::XmlReveal { tag, .. } if tag.as_deref() == Some(b"card")),
+        "the shell reveals the card's current tag",
+    );
+
+    // A born-READABLE node is delivered by its ordinary create — no shell — and a
+    // whole-document reader has nothing denied, so it too gets none.
+    let mut fwd = doc();
+    for op in a.iter().chain(&b) {
+        fwd.apply(op);
+    }
+    for op in &xml_insert_element(&mut fwd, &encode_path(&[b"a"]), 0, b"card") {
+        fwd.apply(op);
+    }
+    for op in &xml_move_child(&mut fwd, &encode_path(&[b"a"]), 0, &encode_path(&[b"b"]), 0) {
+        fwd.apply(op);
+    }
+    assert!(
+        fwd.reveal_ops(&reads).is_empty(),
+        "a node born readable then moved into denied is not revealed (it is kept at origin)",
+    );
+    assert!(
+        author.reveal_ops(|_| true).is_empty(),
+        "a whole-document reader is revealed nothing",
+    );
+
+    // Op-join: a fresh reader applies only its readable ops — the /a create, the shell,
+    // and the readable move — never the /b creates or the card's denied birth. It
+    // converges with the projection on the materialized tree and re-encodes canonically.
+    let mut op_join = doc();
+    for op in a.iter() {
+        op_join.apply(op);
+    }
+    for op in shells.iter().chain(&mv) {
+        op_join.apply(op);
+    }
+    assert_eq!(
+        xml_children_len(&op_join, &encode_path(&[b"a"])),
+        Some(1),
+        "the op joiner is revealed the card at /a",
+    );
+    assert!(
+        op_join.get(b"b").is_none(),
+        "the op joiner never learns of /b"
+    );
+    assert_eq!(
+        xml_children_len(&op_join, &encode_path(&[b"a"])),
+        xml_children_len(&back, &encode_path(&[b"a"])),
+        "op-join and snapshot-join converge on the card at /a",
+    );
+    let bytes = op_join.encode_state();
+    assert_eq!(
+        Document::decode_state(&bytes).unwrap().encode_state(),
+        bytes,
+        "the op-joined replica re-encodes canonically",
+    );
 }
 
 #[test]

@@ -12,7 +12,9 @@ use std::sync::Mutex;
 
 use crdtsync_core::diff::encode_changes;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
-use crdtsync_core::{BranchInfo, Channel, ClientId, DiffKind, Document, ErrorCode, Message, Op};
+use crdtsync_core::{
+    BranchInfo, Channel, ClientId, DiffKind, Document, ErrorCode, Message, Op, OpKind,
+};
 
 use crdtsync_core::schema::Schema;
 
@@ -522,6 +524,63 @@ pub fn step(
                             .collect(),
                         None => delta,
                     };
+                    // Reveal-on-move-in: prepend a shell for every movable node born in
+                    // a subtree this reader may not read but whose current position it
+                    // may (a node dragged out of a private space into a shared one). The
+                    // op stream withholds such a node's create (its birth path is
+                    // denied), so without a shell the reader's readable move op could
+                    // not materialize it — while the snapshot projection keeps it. The
+                    // shells are derived from the same read predicate the snapshot
+                    // projection uses, so an op joiner converges with a snapshot joiner.
+                    // A whole-document reader (nothing denied) gets none. Shells lead the
+                    // delta so the readable move + content ops fold onto them.
+                    let delta = if records.is_empty() {
+                        delta
+                    } else {
+                        // A shell is delivered only for a node whose placing move survives
+                        // into this delta — so a shell never rides without the move that
+                        // would place it (e.g. a move dropped by the zone filter above,
+                        // where the node lives in a partition this subscription omits). An
+                        // orphan shell would materialize an unplaced node the reader can
+                        // never fold, stranding stray registry state; gating on the move's
+                        // presence keeps the two in lockstep, at the cost of not revealing
+                        // a node whose zone this subscriber cannot read (a doc-ACL × zones
+                        // case left out of scope — see DECISIONS).
+                        let moved_in_delta: std::collections::HashSet<_> = delta
+                            .iter()
+                            .filter_map(|rec| match &rec.op.kind {
+                                crdtsync_core::OpKind::XmlMove { node, .. } => Some(*node),
+                                _ => None,
+                            })
+                            .collect();
+                        let reveals = hub
+                            .reveal_ops(
+                                &room,
+                                crate::acl::recipient_reads_predicate(
+                                    authorizer,
+                                    &records,
+                                    creator.as_deref(),
+                                    &index,
+                                    schema,
+                                    identity,
+                                    &room,
+                                ),
+                            )
+                            .into_iter()
+                            .filter(|op| match &op.kind {
+                                crdtsync_core::OpKind::XmlReveal { node, .. } => {
+                                    moved_in_delta.contains(node)
+                                }
+                                _ => false,
+                            });
+                        // A reveal shell has no schema-keyed field, so translation is a
+                        // no-op on it — tag it relay-style (`None`) so no version rewrite
+                        // is attempted.
+                        reveals
+                            .map(|op| StoredOp::new(op, None))
+                            .chain(delta)
+                            .collect()
+                    };
                     // The owning-element type of each delta op, resolved once over
                     // the room document — a type-scoped migration step narrows to the
                     // ops whose owning element is of its declared type, so the delta
@@ -629,6 +688,18 @@ pub fn step(
             // this driver only enforces consistency.
             if ops.iter().any(|op| op.id.client != client) {
                 return violation("op client mismatch");
+            }
+            // An `XmlReveal` is a redaction-time synthesis the server injects into a
+            // partial reader's stream — never an authored op. A client that submits one
+            // is rejected outright: applied to the authoritative document it would inject
+            // an unplaced, arbitrarily-identified node shell, so it must never enter the
+            // log. A well-behaved client never authors one, so this is a protocol
+            // violation, not a recoverable authz refusal.
+            if ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::XmlReveal { .. }))
+            {
+                return violation("client authored a reveal op");
             }
             // A write is served only by the room's leader. A subscribe to a
             // non-led room is already redirected, so a bound channel here implies
@@ -1200,14 +1271,9 @@ fn project_snapshot_reads(
             // same element-context index the op fan-out resolves against, derived here
             // from the decoded doc so it cannot drift from what is projected.
             let index = crate::index::element_paths(&doc);
-            doc.project_read_paths(|path| {
-                let encoded = crdtsync_core::path::encode_path(
-                    &path.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-                );
-                recipient_reads_path(
-                    authorizer, records, creator, &index, schema, identity, room, &encoded,
-                )
-            });
+            doc.project_read_paths(crate::acl::recipient_reads_predicate(
+                authorizer, records, creator, &index, schema, identity, room,
+            ));
             doc.encode_state()
         }
         Err(_) => state,
