@@ -23,11 +23,14 @@ use crdtsync_core::{
     Message,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::{
     channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
 };
 use tokio::sync::oneshot;
+use tokio_rustls::rustls;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, COOKIE, SEC_WEBSOCKET_PROTOCOL};
@@ -63,6 +66,11 @@ const PEER_FRAME_CAPACITY: usize = 1024;
 /// enough to reconverge promptly once it returns.
 const PEER_REDIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How long a TLS handshake may take before the connection is dropped — bounds a
+/// pre-auth blocking point so a client that connects and then stalls cannot pin
+/// a spawned task and socket indefinitely.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Runtime policy: how the ephemeral-awareness sweep runs (how long a
 /// disconnected client's presence lingers, and how often the sweep checks), and
 /// whether a connection with no credential is admitted anonymously. The defaults
@@ -89,6 +97,11 @@ pub struct ServeConfig {
     /// node holds its member view; routing on it is Unit 3, so a set membership
     /// changes nothing here yet.
     pub membership: Option<Membership>,
+    /// TLS termination for the listener. `Some` wraps every accepted socket in a
+    /// rustls session, so the wire protocol runs over an encrypted stream;
+    /// `None` (the default) binds plaintext, unchanged. Build it with
+    /// [`server_config_from_pem`](crate::tls::server_config_from_pem).
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Default for ServeConfig {
@@ -100,6 +113,7 @@ impl Default for ServeConfig {
             schema: Arc::default(),
             webhook: None,
             membership: None,
+            tls: None,
         }
     }
 }
@@ -276,6 +290,11 @@ pub async fn serve_with_authorizer(
     // booted knowing only a seed converges on the full cluster. Single-node (no
     // membership) spawns no gossip task.
     spawn_gossip(server, config.membership.as_ref(), &cmds);
+    // Wrap each accepted socket in a rustls session when TLS is configured, so the
+    // wire protocol runs over an encrypted stream; without it the accept loop
+    // hands the raw TcpStream straight to `handle`, unchanged. Built before the
+    // config moves onto the registry thread.
+    let acceptor = config.tls.clone().map(TlsAcceptor::from);
     // The replicas are single-threaded; keep them on one dedicated thread.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -290,7 +309,26 @@ pub async fn serve_with_authorizer(
     loop {
         let (stream, _) = listener.accept().await?;
         let cmds = cmds.clone();
-        tokio::spawn(handle(stream, cmds));
+        match acceptor.clone() {
+            // A failed TLS handshake (a plaintext client, a bad cert, a scan)
+            // drops the connection — it never reaches the wire protocol. The
+            // handshake is bounded so a client that connects and then dribbles
+            // (or sends no ClientHello at all) can't pin a task + socket
+            // indefinitely: TLS adds a pre-auth blocking point, so a slow-loris
+            // there must not accumulate into FD exhaustion.
+            Some(acceptor) => {
+                tokio::spawn(async move {
+                    if let Ok(Ok(tls)) =
+                        tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+                    {
+                        handle(tls, cmds).await;
+                    }
+                });
+            }
+            None => {
+                tokio::spawn(handle(stream, cmds));
+            }
+        }
     }
 }
 
@@ -739,7 +777,12 @@ fn query_credential(req: &Request) -> Option<Vec<u8>> {
 }
 
 /// Drive one connection: handshake, then the message loop, then teardown.
-async fn handle(stream: TcpStream, cmds: UnboundedSender<Cmd>) {
+/// Generic over the transport so the same driver serves a plaintext `TcpStream`
+/// and a TLS-wrapped stream — the wire protocol is transport-agnostic.
+async fn handle<S>(stream: S, cmds: UnboundedSender<Cmd>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Read any credential off the upgrade request across the supported carriers.
     // The callback runs during the accept, so it stashes the bytes for the
     // connect that follows, and echoes the app subprotocol when the client

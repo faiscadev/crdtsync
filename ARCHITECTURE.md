@@ -699,7 +699,7 @@ Blob ref slot reserved in op envelope from v0.1, even though full implementation
 
 ## Transport
 
-WebSocket. WSS over TLS in production.
+WebSocket. WSS over TLS in production. *As built:* TLS is **terminated at the server's own listener** (terminate-at-server, not an assumed external proxy) via **rustls** (pure-Rust, ring provider — no OpenSSL/system dep, hermetic build). It is **config-gated and opt-in**: `CRDTSYNC_TLS_CERT` + `CRDTSYNC_TLS_KEY` name PEM cert-chain + private-key paths that load a `rustls::ServerConfig` at startup, wrapping every accepted socket in a rustls session before the unchanged, transport-agnostic wire protocol runs over it (`wss://`); with neither set the listener binds plaintext exactly as before (dev stays frictionless). A configured-but-broken cert/key (missing, empty, mismatched) is a **loud startup error — never a silent downgrade to plaintext**, which would turn a deployment that asked for encryption into an unencrypted one. The `ServerConfig` is built with `with_no_client_auth()`, the seam a later **mTLS** unit replaces with a client-cert verifier without touching cert/key loading. The TLS handshake is bounded (a pre-auth blocking point) so a stalled client cannot pin a task + FD.
 
 ## Connection / Multiplexing
 
