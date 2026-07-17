@@ -46,9 +46,9 @@ use crdtsync_server::auth::CredentialsFileError;
 use crdtsync_server::membership::{Membership, MembershipConfigError};
 use crdtsync_server::runtime::{serve_with_authorizer_handle, ServeConfig};
 use crdtsync_server::{
-    serve_admin, serve_blobs, server_config_from_pem, AllowAll, Authorizer, BlobStore, PermitAll,
-    SchemaRegistry, StaticTokens, Store, TlsConfigError, Verifier, WebhookConfig,
-    DEFAULT_REPLICATION_FACTOR,
+    serve_admin, serve_blobs, server_config_from_pem, server_config_from_pem_with_client_ca,
+    AllowAll, Authorizer, BlobStore, PermitAll, SchemaRegistry, StaticTokens, Store,
+    TlsConfigError, Verifier, WebhookConfig, DEFAULT_REPLICATION_FACTOR,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::rustls;
@@ -163,21 +163,36 @@ fn membership() -> std::io::Result<Option<Membership>> {
 /// of the pair is a clean startup error — a half-configured TLS is a
 /// misconfiguration, not a plaintext fall back. A malformed or mismatched
 /// cert/key fails startup loudly rather than silently downgrading to plaintext.
+///
+/// Setting `CRDTSYNC_TLS_CLIENT_CA` to a PEM trust-anchor bundle additionally
+/// turns on mTLS: every client must then present a certificate that chains to one
+/// of those roots, verified at the handshake (fail-closed), and its SAN/CN becomes
+/// the connection's authenticated actor. It requires TLS to be enabled — a client
+/// CA with no server cert/key is a clean startup error.
 fn tls_config() -> std::io::Result<Option<Arc<rustls::ServerConfig>>> {
+    let client_ca = path_var("CRDTSYNC_TLS_CLIENT_CA")?;
+    let build = |e: TlsConfigError| {
+        let kind = match &e {
+            TlsConfigError::Io { source, .. } => source.kind(),
+            _ => std::io::ErrorKind::InvalidData,
+        };
+        std::io::Error::new(kind, e)
+    };
     match (
         path_var("CRDTSYNC_TLS_CERT")?,
         path_var("CRDTSYNC_TLS_KEY")?,
     ) {
         (Some(cert), Some(key)) => {
-            let config = server_config_from_pem(cert, key).map_err(|e| {
-                let kind = match &e {
-                    TlsConfigError::Io { source, .. } => source.kind(),
-                    _ => std::io::ErrorKind::InvalidData,
-                };
-                std::io::Error::new(kind, e)
-            })?;
+            let config = match client_ca {
+                Some(ca) => server_config_from_pem_with_client_ca(cert, key, ca).map_err(build)?,
+                None => server_config_from_pem(cert, key).map_err(build)?,
+            };
             Ok(Some(config))
         }
+        (None, None) if client_ca.is_some() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CRDTSYNC_TLS_CLIENT_CA requires CRDTSYNC_TLS_CERT and CRDTSYNC_TLS_KEY (mTLS needs TLS)",
+        )),
         (None, None) => Ok(None),
         (Some(_), None) | (None, Some(_)) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
