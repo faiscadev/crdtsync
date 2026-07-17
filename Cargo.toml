@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/ffi", "crates/server"]
+members = ["crates/codegen", "crates/core", "crates/ffi", "crates/server"]
 # The wasm SDK targets wasm32 and is built/tested with wasm-pack, not the
 # native workspace test run.
 exclude = ["crates/wasm"]

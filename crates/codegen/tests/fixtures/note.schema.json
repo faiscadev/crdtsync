@@ -1,0 +1,20 @@
+{
+    "schema": "note",
+    "version": 1,
+    "root": "Note",
+    "types": {
+        "Note": { "kind": "map", "children": {
+            "title": "Title",
+            "views": "Views",
+            "tags": "Tags",
+            "meta": "Meta"
+        } },
+        "Title": { "kind": "text", "max": 280 },
+        "Views": { "kind": "counter", "min": 0, "max": 1000000 },
+        "Tags": { "kind": "list", "items": "Title", "max": 16 },
+        "Meta": { "kind": "map", "children": {
+            "priority": "Priority"
+        } },
+        "Priority": { "kind": "register", "min": 0, "max": 5 }
+    }
+}

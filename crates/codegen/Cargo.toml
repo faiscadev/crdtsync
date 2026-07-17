@@ -1,0 +1,12 @@
+[package]
+name = "crdtsync-codegen"
+version = "0.0.0"
+edition = "2021"
+description = "Generate typed SDK accessors from a registered crdtsync Schema."
+
+[[bin]]
+name = "crdtsync-codegen"
+path = "src/main.rs"
+
+[dependencies]
+crdtsync-core = { path = "../core" }
