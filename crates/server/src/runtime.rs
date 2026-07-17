@@ -136,11 +136,14 @@ enum Cmd {
     /// Open a connection, registering its outbound sink and a one-shot the actor
     /// fires to close a dropped connection. Any credential presented at the
     /// upgrade travels with it; the actor verifies it and replies with the
-    /// [`ConnOutcome`].
+    /// [`ConnOutcome`]. `cert_actor` is the identity a verified mTLS client cert
+    /// already established at the transport — when set it authenticates the
+    /// connection directly, ahead of any in-band credential.
     Connect {
         writer: Sender<Message>,
         closer: oneshot::Sender<()>,
         credential: Option<Vec<u8>>,
+        cert_actor: Option<Vec<u8>>,
         reply: oneshot::Sender<ConnOutcome>,
     },
     /// Route one inbound message, replying whether the connection stays open.
@@ -379,14 +382,43 @@ async fn accept_loop(
                     if let Ok(Ok(tls)) =
                         tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
                     {
-                        handle(tls, cmds).await;
+                        // When mTLS is configured the handshake has already
+                        // verified the client cert chains to a trusted root, so a
+                        // peer cert here is trusted: map it to an actor. A trusted
+                        // cert carrying no usable identity (no SAN, no CN) is a
+                        // rejection, not an anonymous session — drop it rather than
+                        // fall through. No peer cert means server-auth-only TLS, so
+                        // there is no cert actor and the credential path applies.
+                        let cert_actor = match peer_cert_actor(&tls) {
+                            Ok(actor) => actor,
+                            Err(()) => return,
+                        };
+                        handle(tls, cmds, cert_actor).await;
                     }
                 });
             }
             None => {
-                tokio::spawn(handle(stream, cmds));
+                tokio::spawn(handle(stream, cmds, None));
             }
         }
+    }
+}
+
+/// The authenticated actor a verified mTLS client cert establishes for its
+/// connection, read off the accepted TLS session's peer certificates.
+///
+/// `Ok(None)` is server-auth-only TLS: the peer presented no cert (mTLS is not
+/// configured, so none was required), and the connection authenticates through the
+/// credential path instead. `Ok(Some(actor))` is a verified client cert whose
+/// leaf yields a SAN/CN identity. `Err(())` is the fail-closed case: a trusted
+/// cert that carries no usable identity — rejected, never admitted anonymously.
+fn peer_cert_actor(
+    tls: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> Result<Option<Vec<u8>>, ()> {
+    let (_, conn) = tls.get_ref();
+    match conn.peer_certificates() {
+        None | Some([]) => Ok(None),
+        Some([leaf, ..]) => crate::tls::actor_from_client_cert(leaf).map(Some).ok_or(()),
     }
 }
 
@@ -477,14 +509,25 @@ async fn registry_actor(
                         writer,
                         closer,
                         credential,
+                        cert_actor,
                         reply,
                     } => {
-                        // A credential presented at the upgrade is verified now,
-                        // so a good one skips the in-band Auth phase; a bad one is
-                        // refused. With no credential the connection is anonymous
-                        // if policy allows, else it must authenticate in band.
-                        let outcome = match credential {
-                            Some(cred) => match reg.verify_credential(&cred) {
+                        // A verified mTLS client cert has already established this
+                        // connection's actor at the transport — it authenticates
+                        // directly, the same authenticated-actor path a fast-path
+                        // credential takes, ahead of (and overriding) any in-band
+                        // credential. Otherwise a credential presented at the
+                        // upgrade is verified now, so a good one skips the in-band
+                        // Auth phase; a bad one is refused. With neither the
+                        // connection is anonymous if policy allows, else it must
+                        // authenticate in band.
+                        let outcome = match (cert_actor, credential) {
+                            (Some(actor), _) => ConnOutcome::Open {
+                                id: reg
+                                    .connect_authenticated(Identity::new(actor.clone())),
+                                authok: Some(actor),
+                            },
+                            (None, Some(cred)) => match reg.verify_credential(&cred) {
                                 Some(identity) => {
                                     let actor = identity.actor().to_vec();
                                     ConnOutcome::Open {
@@ -494,14 +537,14 @@ async fn registry_actor(
                                 }
                                 None => ConnOutcome::Refused,
                             },
-                            None if config.anonymous => {
+                            (None, None) if config.anonymous => {
                                 let actor = anon_actor();
                                 ConnOutcome::Open {
                                     id: reg.connect_authenticated(Identity::new(actor.clone())),
                                     authok: Some(actor),
                                 }
                             }
-                            None => ConnOutcome::Open {
+                            (None, None) => ConnOutcome::Open {
                                 id: reg.connect(),
                                 authok: None,
                             },
@@ -876,8 +919,10 @@ fn query_credential(req: &Request) -> Option<Vec<u8>> {
 
 /// Drive one connection: handshake, then the message loop, then teardown.
 /// Generic over the transport so the same driver serves a plaintext `TcpStream`
-/// and a TLS-wrapped stream — the wire protocol is transport-agnostic.
-async fn handle<S>(stream: S, cmds: UnboundedSender<Cmd>)
+/// and a TLS-wrapped stream — the wire protocol is transport-agnostic. `cert_actor`
+/// is the identity a verified mTLS client cert established at the transport, if
+/// any; it authenticates the connection ahead of any in-band credential.
+async fn handle<S>(stream: S, cmds: UnboundedSender<Cmd>, cert_actor: Option<Vec<u8>>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -912,6 +957,7 @@ where
             writer: out.clone(),
             closer: close_tx,
             credential,
+            cert_actor,
             reply: reply_tx,
         })
         .is_err()

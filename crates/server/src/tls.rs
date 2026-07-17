@@ -10,17 +10,25 @@
 //! to plaintext — a silent downgrade turns a deployment that asked for encryption
 //! into an unencrypted one, a security regression.
 //!
-//! The client-cert-verifier slot is [`with_no_client_auth`]: mTLS (verifying a
-//! client certificate) replaces that call with a client-cert verifier without
-//! touching the cert/key loading here.
+//! mTLS (client-cert authentication) is opt-in on top of that: configure a
+//! trust-anchor bundle and [`server_config_from_pem_with_client_ca`] swaps the
+//! `with_no_client_auth` slot for a [`WebPkiClientVerifier`] against those roots.
+//! It is fail-closed by construction — a client presenting no cert, or one that
+//! does not chain to a configured root, is rejected at the handshake and never
+//! reaches the wire protocol. A verified client cert's identity (its SAN, falling
+//! back to CN) is extracted with [`actor_from_client_cert`] and bound as the
+//! connection's authenticated actor — the same ACL principal an in-band credential
+//! establishes, reached over the transport instead.
 //!
-//! [`with_no_client_auth`]: rustls::ConfigBuilder::with_no_client_auth
+//! [`WebPkiClientVerifier`]: rustls::server::WebPkiClientVerifier
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::{self, ServerConfig};
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
+use tokio_rustls::rustls::{self, RootCertStore, ServerConfig};
+use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 /// Why building a [`ServerConfig`] from PEM files failed. Each arm names the file
 /// at fault so a misconfigured deployment reads a precise startup error rather
@@ -36,6 +44,12 @@ pub enum TlsConfigError {
     NoCertificate(PathBuf),
     /// The key file held no PEM private key.
     NoPrivateKey(PathBuf),
+    /// The client-CA trust bundle held no certificate — mTLS was asked for with
+    /// nothing to anchor client certs to. Never fall through to server-auth-only
+    /// (a silent drop of the client-auth requirement is a security regression).
+    NoClientCa(PathBuf),
+    /// rustls rejected building the client-cert verifier from the trust bundle.
+    ClientVerifier(rustls::server::VerifierBuilderError),
     /// rustls rejected the cert/key pair (e.g. the key does not match the cert).
     Rustls(rustls::Error),
 }
@@ -52,6 +66,14 @@ impl std::fmt::Display for TlsConfigError {
             TlsConfigError::NoPrivateKey(path) => {
                 write!(f, "TLS key file {} holds no private key", path.display())
             }
+            TlsConfigError::NoClientCa(path) => write!(
+                f,
+                "TLS client-CA file {} holds no certificate",
+                path.display()
+            ),
+            TlsConfigError::ClientVerifier(e) => {
+                write!(f, "building TLS client-cert verifier: {e}")
+            }
             TlsConfigError::Rustls(e) => write!(f, "building TLS config: {e}"),
         }
     }
@@ -62,22 +84,60 @@ impl std::error::Error for TlsConfigError {
         match self {
             TlsConfigError::Io { source, .. } => Some(source),
             TlsConfigError::Rustls(e) => Some(e),
-            TlsConfigError::NoCertificate(_) | TlsConfigError::NoPrivateKey(_) => None,
+            TlsConfigError::ClientVerifier(e) => Some(e),
+            TlsConfigError::NoCertificate(_)
+            | TlsConfigError::NoPrivateKey(_)
+            | TlsConfigError::NoClientCa(_) => None,
         }
     }
 }
 
-/// Build a [`ServerConfig`] from a PEM certificate chain and private key on disk.
-/// The result is shared behind an `Arc` because one config backs every accepted
-/// connection. Errors loudly — a missing, empty, or mismatched cert/key is a
-/// startup failure, not a plaintext fall back.
+/// Build a [`ServerConfig`] from a PEM certificate chain and private key on disk,
+/// server-authenticated only (no client cert required — the [`with_no_client_auth`]
+/// slot). The result is shared behind an `Arc` because one config backs every
+/// accepted connection. Errors loudly — a missing, empty, or mismatched cert/key
+/// is a startup failure, not a plaintext fall back.
+///
+/// [`with_no_client_auth`]: rustls::ConfigBuilder::with_no_client_auth
 pub fn server_config_from_pem(
     cert_path: impl AsRef<Path>,
     key_path: impl AsRef<Path>,
 ) -> Result<Arc<ServerConfig>, TlsConfigError> {
-    let cert_path = cert_path.as_ref();
-    let key_path = key_path.as_ref();
+    build_server_config(cert_path.as_ref(), key_path.as_ref(), None)
+}
 
+/// Build a [`ServerConfig`] as [`server_config_from_pem`] does, additionally
+/// *requiring* every client to present a certificate that chains to a trust anchor
+/// in the PEM bundle at `client_ca_path` — mutual TLS. The client-cert verifier
+/// takes the `with_no_client_auth` slot, so this is fail-closed at the handshake:
+/// a client presenting no cert, or one that does not chain to a configured root,
+/// is rejected by rustls before the connection ever reaches the wire protocol. A
+/// verified connection's peer cert is later mapped to an actor by
+/// [`actor_from_client_cert`].
+///
+/// An empty client-CA bundle is a loud [`NoClientCa`](TlsConfigError::NoClientCa)
+/// error, never a silent fall back to server-auth-only: a deployment that asked
+/// for mTLS must not quietly run without it.
+pub fn server_config_from_pem_with_client_ca(
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+    client_ca_path: impl AsRef<Path>,
+) -> Result<Arc<ServerConfig>, TlsConfigError> {
+    build_server_config(
+        cert_path.as_ref(),
+        key_path.as_ref(),
+        Some(client_ca_path.as_ref()),
+    )
+}
+
+/// Build the [`ServerConfig`], with a required client-cert verifier when
+/// `client_ca` is set and [`with_no_client_auth`](rustls::ConfigBuilder::with_no_client_auth)
+/// when it is not.
+fn build_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca: Option<&Path>,
+) -> Result<Arc<ServerConfig>, TlsConfigError> {
     let cert_bytes = std::fs::read(cert_path).map_err(|source| TlsConfigError::Io {
         path: cert_path.to_path_buf(),
         source,
@@ -103,17 +163,79 @@ pub fn server_config_from_pem(
         })?
         .ok_or_else(|| TlsConfigError::NoPrivateKey(key_path.to_path_buf()))?;
 
-    // Pin the ring provider explicitly rather than lean on a process-default
-    // that other TLS users (reqwest) in the same binary may or may not have
-    // installed. `with_no_client_auth` is the mTLS seam — a later unit swaps it
-    // for a client-cert verifier.
+    // Pin the ring provider explicitly rather than lean on a process-default that
+    // other TLS users (reqwest) in the same binary may or may not have installed.
+    // The verifier shares it so both halves of the handshake speak the same crypto.
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = ServerConfig::builder_with_provider(provider)
+    let builder = ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .map_err(TlsConfigError::Rustls)?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
         .map_err(TlsConfigError::Rustls)?;
+    let config = match client_ca {
+        Some(ca_path) => {
+            let roots = load_client_roots(ca_path)?;
+            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(TlsConfigError::ClientVerifier)?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    }
+    .with_single_cert(certs, key)
+    .map_err(TlsConfigError::Rustls)?;
 
     Ok(Arc::new(config))
+}
+
+/// Load the client-cert trust anchors from the PEM bundle at `path` into a
+/// [`RootCertStore`]. An unreadable file is an [`Io`](TlsConfigError::Io) error and
+/// a bundle holding no usable certificate is a
+/// [`NoClientCa`](TlsConfigError::NoClientCa) error — mTLS never silently degrades
+/// to server-auth-only.
+fn load_client_roots(path: &Path) -> Result<RootCertStore, TlsConfigError> {
+    let bytes = std::fs::read(path).map_err(|source| TlsConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let cas: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut bytes.as_slice())
+        .collect::<Result<_, _>>()
+        .map_err(|source| TlsConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut roots = RootCertStore::empty();
+    let (added, _) = roots.add_parsable_certificates(cas);
+    if added == 0 {
+        return Err(TlsConfigError::NoClientCa(path.to_path_buf()));
+    }
+    Ok(roots)
+}
+
+/// The actor identity a verified client certificate authenticates as: the leaf
+/// cert's Subject Alternative Name (the first DNS, email, or URI entry), falling
+/// back to its Subject Common Name. `None` when the cert parses but carries
+/// neither — the caller treats that as a rejection, never as an anonymous or
+/// default actor, so an identity-less cert cannot slip past authentication.
+///
+/// The returned bytes are the UTF-8 of the name, fed into the same
+/// authenticated-actor plumbing an in-band credential's actor uses.
+pub fn actor_from_client_cert(leaf: &CertificateDer<'_>) -> Option<Vec<u8>> {
+    let (_, cert) = X509Certificate::from_der(leaf.as_ref()).ok()?;
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            let value = match name {
+                GeneralName::DNSName(s) | GeneralName::RFC822Name(s) | GeneralName::URI(s) => *s,
+                _ => continue,
+            };
+            if !value.is_empty() {
+                return Some(value.as_bytes().to_vec());
+            }
+        }
+    }
+    let cn = cert
+        .subject()
+        .iter_common_name()
+        .filter_map(|cn| cn.as_str().ok())
+        .find(|cn| !cn.is_empty())
+        .map(|cn| cn.as_bytes().to_vec());
+    cn
 }

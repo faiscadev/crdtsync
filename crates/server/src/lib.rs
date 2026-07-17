@@ -55,7 +55,10 @@ pub use registry::{ConnId, Registry};
 pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry};
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{Branch, RoomLog, RoomMeta, Snapshot, Store, StoredOp};
-pub use tls::{server_config_from_pem, TlsConfigError};
+pub use tls::{
+    actor_from_client_cert, server_config_from_pem, server_config_from_pem_with_client_ca,
+    TlsConfigError,
+};
 pub use webhook::{WebhookConfig, WebhookSink};
 
 /// A room name, opaque bytes chosen by the deployment.
