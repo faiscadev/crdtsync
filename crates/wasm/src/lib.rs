@@ -20,6 +20,7 @@ use crdtsync_core::{
     Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
 /// The browser's crypto RNG for the inline blob producer, which mints a blob's
 /// handle from it. The blob path never reads the clock.
@@ -82,6 +83,105 @@ impl From<CoreErrorCode> for ErrorCode {
             CoreErrorCode::SchemaViolation => ErrorCode::SchemaViolation,
         }
     }
+}
+
+/// The global `fetch`, resolved off `globalThis` so the helper works in a
+/// browser, a worker, and Node alike (rather than through `window`, which a
+/// worker lacks).
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = fetch)]
+    fn global_fetch(input: &web_sys::Request) -> js_sys::Promise;
+}
+
+/// Upload raw bytes to the server's `POST /blobs` and resolve to the 16-byte
+/// blob handle, ready to pass to [`WasmDocument::set_blob_ref`].
+///
+/// `baseUrl` is the origin of the blob plane (e.g. `"https://host:6060"`); the
+/// bytes POST to `{baseUrl}/blobs`. `credential` authenticates through the
+/// `Authorization` header — the same credential the wire client sends in its
+/// `auth` frame — and `mime` sets `Content-Type` (defaulting to
+/// `application/octet-stream`). Whether upload is permitted is whatever
+/// `POST /blobs` enforces. Rejects on a non-2xx response or a handle that is not
+/// a 32-char hex id.
+#[wasm_bindgen(js_name = uploadBlob)]
+pub async fn upload_blob(
+    base_url: String,
+    data: Vec<u8>,
+    credential: String,
+    mime: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    let mime = mime.unwrap_or_else(|| "application/octet-stream".to_string());
+    let url = format!("{}/blobs", base_url.trim_end_matches('/'));
+
+    let headers = web_sys::Headers::new().map_err(js_err)?;
+    headers.set("Authorization", &credential).map_err(js_err)?;
+    headers.set("Content-Type", &mime).map_err(js_err)?;
+
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_headers(&headers);
+    init.set_body(&js_sys::Uint8Array::from(data.as_slice()));
+
+    let request = web_sys::Request::new_with_str_and_init(&url, &init).map_err(js_err)?;
+    let response: web_sys::Response = wasm_bindgen_futures::JsFuture::from(global_fetch(&request))
+        .await
+        .map_err(js_err)?
+        .dyn_into()
+        .map_err(js_err)?;
+    if !response.ok() {
+        return Err(JsError::new(&format!(
+            "blob upload: server returned HTTP {}",
+            response.status()
+        )));
+    }
+    let body = wasm_bindgen_futures::JsFuture::from(response.text().map_err(js_err)?)
+        .await
+        .map_err(js_err)?
+        .as_string()
+        .ok_or_else(|| JsError::new("blob upload: response body was not text"))?;
+    parse_blob_handle(&body)
+}
+
+/// Turn a `POST /blobs` JSON handle body (`{id, size, inline}`) into the 16-byte
+/// blob id, hex-decoding `id`. The pure parse/decode core of [`upload_blob`],
+/// isolated so it can be unit-tested without a live server.
+fn parse_blob_handle(body: &str) -> Result<Vec<u8>, JsError> {
+    let parsed = js_sys::JSON::parse(body)
+        .map_err(|_| JsError::new("blob upload: response body was not JSON"))?;
+    let id = js_sys::Reflect::get(&parsed, &JsValue::from_str("id"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .ok_or_else(|| JsError::new("blob upload: response has no string `id`"))?;
+    hex_decode_id(&id)
+}
+
+/// Decode a 32-char lowercase-hex blob id to its 16 bytes, guarding the length
+/// (the handle is a 16-byte id) so a malformed id is a clean error, not a panic.
+fn hex_decode_id(hex: &str) -> Result<Vec<u8>, JsError> {
+    if hex.len() != 32 {
+        return Err(JsError::new(&format!(
+            "blob upload: handle is {} hex chars, want 32",
+            hex.len()
+        )));
+    }
+    let nibble = |b: u8| -> Result<u8, JsError> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err(JsError::new("blob upload: handle is not hex")),
+        }
+    };
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect()
+}
+
+/// Surface a `JsValue` error (from a `web-sys` / `js-sys` call) as a `JsError`.
+fn js_err(value: JsValue) -> JsError {
+    JsError::new(&format!("{value:?}"))
 }
 
 /// A CRDT replica for one 16-byte client id.
@@ -1336,7 +1436,11 @@ impl WasmClient {
         let kind = match kind {
             0 => DiffKind::Versions,
             1 => DiffKind::Branches,
-            _ => return Err(JsError::new("diff kind must be 0 (versions) or 1 (branches)")),
+            _ => {
+                return Err(JsError::new(
+                    "diff kind must be 0 (versions) or 1 (branches)",
+                ))
+            }
         };
         Ok(encode_message(&self.inner.diff_query(room, kind, a, b)))
     }
@@ -1719,4 +1823,62 @@ fn set_mark_head(obj: &js_sys::Object, id: &ElementId, seq: &ElementId, name: &[
         &js_sys::Uint8Array::from(&seq.as_bytes()[..]).into(),
     );
     set(obj, "name", &js_sys::Uint8Array::from(name).into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hex_decode_id, parse_blob_handle};
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    fn hex_decodes_a_32_char_id_to_16_bytes() {
+        let id = "000102030405060708090a0b0c0d0e0f";
+        assert_eq!(hex_decode_id(id).unwrap(), (0u8..16).collect::<Vec<u8>>());
+    }
+
+    #[wasm_bindgen_test]
+    fn hex_decode_accepts_uppercase() {
+        assert_eq!(
+            hex_decode_id("FFEEDDCCBBAA00112233445566778899").unwrap(),
+            vec![
+                0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99
+            ]
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn hex_decode_rejects_a_wrong_length() {
+        assert!(hex_decode_id("00").is_err());
+        assert!(hex_decode_id("000102030405060708090a0b0c0d0e0f00").is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn hex_decode_rejects_a_non_hex_char() {
+        assert!(hex_decode_id("000102030405060708090a0b0c0d0e0z").is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn parses_a_server_handle_to_16_bytes() {
+        let body = r#"{"id":"0f0e0d0c0b0a09080706050403020100","size":42,"inline":true}"#;
+        assert_eq!(
+            parse_blob_handle(body).unwrap(),
+            (0u8..16).rev().collect::<Vec<u8>>()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn parse_rejects_non_json() {
+        assert!(parse_blob_handle("not json").is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn parse_rejects_a_missing_id() {
+        assert!(parse_blob_handle(r#"{"size":42}"#).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn parse_rejects_a_short_id() {
+        assert!(parse_blob_handle(r#"{"id":"00ff"}"#).is_err());
+    }
 }
