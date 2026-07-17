@@ -394,6 +394,10 @@ Every schema declares a version; every Document records the `schema_version` it 
 
 Schema-driven events the engine detects and surfaces as SDK callbacks — the engine observes, the app decides UX (never an override, never a hard crash): `onRepaired` (invariant repair ran on a merge — offer undo / "we resolved a concurrent edit"), `onOpsRejected` (server rejected the client's ops — auth revoked while offline, or schema-invalid — app shows / discards / exports them), `onUpdateRequired` (the client's version range cannot bridge the document's version across a breaking gap — app prompts an update / falls back to read-only).
 
+## Typed SDK API (Codegen)
+
+A schema can be *consumed at build time* to generate a typed accessor layer, so a typed client calls `note.get_title()` / `note.meta().set_priority(4)` instead of raw path strings. The generator (`crdtsync-codegen`, an in-repo tool) reads a schema JSON, validates it through the **core `Schema` parser** (the sole validator — codegen never re-implements schema semantics), and emits a source file per target SDK language. The emitted code is a **thin facade over the SDK's existing path surface**: one wrapper class per declared map type (holding a document + the path prefix it lives at), each slot a typed accessor that forwards to the existing path method with the slot's path key + type baked in — register → int get/set, counter → get/inc/dec, text → get/len/insert/delete, list → len/get/insert/delete, nested map → an accessor returning the nested wrapper at the extended path. Because it forwards to primitives core already implements, codegen adds **no runtime behavior** and nothing new to keep convergent across languages — it is a convenience surface, never a second source of truth. Output is **deterministic** (declaration-order emission, no timestamp) so a checked-in generated artifact regenerates as a no-op diff. Codegen only *reads* the schema; it never alters the `Schema` type or the wire format (§Schema Is Code). **Python is the first target; Go / TypeScript follow the same per-language emitter shape.** Xml typed accessors are a follow-on.
+
 ---
 
 # Invariant Repair

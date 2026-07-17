@@ -235,6 +235,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crdtsync-codegen"
+version = "0.0.0"
+dependencies = [
+ "crdtsync-core",
+]
+
+[[package]]
 name = "crdtsync-core"
 version = "0.0.0"
 dependencies = [
