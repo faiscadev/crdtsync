@@ -1,0 +1,16 @@
+{
+  "schema": "collide",
+  "version": 1,
+  "root": "C",
+  "types": {
+    "C": {
+      "kind": "map",
+      "children": {
+        "a-b": "Ctr",
+        "a_b": "Ctr",
+        "a b": "Ctr"
+      }
+    },
+    "Ctr": { "kind": "counter" }
+  }
+}

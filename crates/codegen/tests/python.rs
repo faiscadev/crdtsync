@@ -8,8 +8,34 @@ use crdtsync_core::schema::Schema;
 const SCHEMA_SRC: &str = include_str!("fixtures/note.schema.json");
 const GOLDEN: &str = include_str!("fixtures/note_generated.py");
 
+const COLLIDE_SRC: &str = include_str!("fixtures/collide.schema.json");
+const COLLIDE_GOLDEN: &str = include_str!("fixtures/collide_generated.py");
+
 fn schema() -> Schema {
     Schema::parse(SCHEMA_SRC).expect("fixture schema parses")
+}
+
+/// Every emitted `def`, qualified by its enclosing class (`Class.method`; a
+/// module-level `def` like `bind` is `.name`). Qualifying keeps the same method name
+/// on two different classes — e.g. each class's own `__init__` — from reading as a
+/// collision; a real duplicate is two identical `Class.method` entries.
+fn python_defs(src: &str) -> Vec<String> {
+    let mut class = String::new();
+    let mut defs = Vec::new();
+    for line in src.lines() {
+        if let Some(rest) = line.strip_prefix("class ") {
+            class = rest.trim_end_matches(':').to_string();
+        } else if let Some(rest) = line.strip_prefix("    def ") {
+            if let Some(end) = rest.find('(') {
+                defs.push(format!("{class}.{}", &rest[..end]));
+            }
+        } else if let Some(rest) = line.strip_prefix("def ") {
+            if let Some(end) = rest.find('(') {
+                defs.push(format!(".{}", &rest[..end]));
+            }
+        }
+    }
+    defs
 }
 
 #[test]
@@ -69,4 +95,133 @@ fn an_unusual_slot_name_becomes_a_safe_identifier_and_byte_key() {
     let out = generate_python(&Schema::parse(src).unwrap());
     assert!(out.contains("def get_a_b(self)"));
     assert!(out.contains("self._path + [b\"a-b\"]"));
+}
+
+#[test]
+fn colliding_slot_names_get_unique_deterministic_accessors() {
+    // `a-b`, `a_b`, `a b` all sanitize to the identifier `a_b`; without
+    // disambiguation the three counters emit duplicate `get_a_b`/`inc_a_b`/`dec_a_b`
+    // methods (uncompilable). Each must get a unique method name yet keep forwarding
+    // to its own distinct byte key.
+    let a = generate_python(&Schema::parse(COLLIDE_SRC).unwrap());
+    let b = generate_python(&Schema::parse(COLLIDE_SRC).unwrap());
+    assert_eq!(a, b, "collision disambiguation must be deterministic");
+
+    let defs = python_defs(&a);
+    // Three counters × get/inc/dec = 9 accessors, plus __init__ and bind: a lower
+    // bound so the dedup check below can't pass vacuously on a parser/emitter drift.
+    assert!(defs.len() >= 9, "expected ≥9 defs, parsed {}", defs.len());
+    let mut unique = defs.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        defs.len(),
+        unique.len(),
+        "every generated accessor identifier must be unique; got {defs:?}"
+    );
+
+    // Each disambiguated accessor still forwards to its own field's exact bytes.
+    assert!(a.contains("    def get_a_b(self) -> Optional[int]:\n        return self._doc.get_counter(self._path + [b\"a-b\"])"));
+    assert!(a.contains("    def get_a_b_2(self) -> Optional[int]:\n        return self._doc.get_counter(self._path + [b\"a_b\"])"));
+    assert!(a.contains("    def get_a_b_3(self) -> Optional[int]:\n        return self._doc.get_counter(self._path + [b\"a b\"])"));
+}
+
+#[test]
+fn a_bare_map_accessor_does_not_collide_with_a_prefixed_accessor() {
+    // A map slot's accessor is the bare identifier, while other kinds are verb-
+    // prefixed — so a map slot literally named `get_title` derives the same name a
+    // register slot `title` derives for its getter. Dedup is at the fully-emitted
+    // method name, so the second-declared slot's accessor is suffixed and each still
+    // forwards to its own field.
+    let src = r#"{
+        "schema": "s", "version": 1, "root": "R",
+        "types": {
+            "R": { "kind": "map", "children": { "title": "Reg", "get_title": "N" } },
+            "Reg": { "kind": "register" },
+            "N": { "kind": "map", "children": {} }
+        }
+    }"#;
+    let out = generate_python(&Schema::parse(src).unwrap());
+    let defs = python_defs(&out);
+    let mut unique = defs.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        defs.len(),
+        unique.len(),
+        "bare/prefixed names must not collide"
+    );
+    // register `title` keeps get_title/set_title; the map slot `get_title` is bumped.
+    assert!(out.contains("    def get_title(self) -> Optional[int]:\n        return self._doc.get_int(self._path + [b\"title\"])"));
+    assert!(out.contains("    def get_title_2(self) -> \"N\":\n        return N(self._doc, self._path + [b\"get_title\"])"));
+}
+
+#[test]
+fn a_slot_named_like_the_constructor_does_not_shadow_it() {
+    // A map slot literally named `__init__` would emit a second `def __init__`,
+    // shadowing the class constructor. The reserved set is seeded with the
+    // structural members, so the slot accessor is bumped and the constructor stands.
+    let src = r#"{
+        "schema": "s", "version": 1, "root": "R",
+        "types": {
+            "R": { "kind": "map", "children": { "__init__": "N" } },
+            "N": { "kind": "map", "children": {} }
+        }
+    }"#;
+    let out = generate_python(&Schema::parse(src).unwrap());
+    let defs = python_defs(&out);
+    let mut unique = defs.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        defs.len(),
+        unique.len(),
+        "a slot must not duplicate __init__"
+    );
+    // R's constructor keeps its signature; the slot accessor is disambiguated.
+    assert!(out.contains("class R:"));
+    assert!(
+        out.contains("    def __init__(self, doc, path: Optional[List[bytes]] = None) -> None:")
+    );
+    assert!(out.contains(
+        "    def __init___2(self) -> \"N\":\n        return N(self._doc, self._path + [b\"__init__\"])"
+    ));
+}
+
+#[test]
+fn a_natural_name_equal_to_a_disambiguated_form_is_pushed_past() {
+    // `a-b` and `a_b` both sanitize to `a_b`, so the second becomes `a_b_2`; a third
+    // slot literally named `a_b_2` must not reuse that — the retry loop steps past it.
+    let src = r#"{
+        "schema": "s", "version": 1, "root": "R",
+        "types": {
+            "R": { "kind": "map", "children": { "a-b": "Ctr", "a_b": "Ctr", "a_b_2": "Ctr" } },
+            "Ctr": { "kind": "counter" }
+        }
+    }"#;
+    let out = generate_python(&Schema::parse(src).unwrap());
+    let defs = python_defs(&out);
+    let mut unique = defs.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        defs.len(),
+        unique.len(),
+        "retry must skip an already-claimed suffix"
+    );
+    assert!(out.contains("def get_a_b(self)")); // a-b
+    assert!(out.contains("        return self._doc.get_counter(self._path + [b\"a_b\"])")); // a_b -> a_b_2
+    assert!(out.contains("        return self._doc.get_counter(self._path + [b\"a_b_2\"])")); // a_b_2 -> a_b_2_2
+    assert!(out.contains("def get_a_b_2_2(self)"));
+}
+
+#[test]
+fn colliding_output_matches_the_committed_golden() {
+    // If this fails, regenerate:
+    //   cargo run -p crdtsync-codegen -- crates/codegen/tests/fixtures/collide.schema.json \
+    //     -o crates/codegen/tests/fixtures/collide_generated.py
+    assert_eq!(
+        generate_python(&Schema::parse(COLLIDE_SRC).unwrap()),
+        COLLIDE_GOLDEN
+    );
 }

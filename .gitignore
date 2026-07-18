@@ -21,6 +21,10 @@ build/
 # Rust
 /target
 
+# Python
+__pycache__/
+*.pyc
+
 # clang-format venv (legacy C tooling)
 /.venv-fmt/
 *.dSYM/

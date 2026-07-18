@@ -79,11 +79,19 @@ fn emit_python_class(
     out.push_str("        self._doc = doc\n");
     out.push_str("        self._path = list(path) if path else []\n");
 
+    // Seed the reserved set with the class's structural members so a slot named
+    // `__init__` cannot re-emit the constructor (a duplicate `def` shadows it); slot
+    // accessors disambiguate against them too. (Go needs no equivalent: its methods
+    // are exported, disjoint from the unexported `doc`/`path` fields and the
+    // package-level `Bind`/`joinPath` funcs.)
+    let mut used: Vec<String> = vec!["__init__".to_string()];
+    used.reserve(children.len());
     for (slot, slot_type) in children {
         out.push('\n');
         let key = py_bytes_literal(slot);
-        let ident = py_ident(slot);
-        match schema.type_def(slot_type) {
+        let def = schema.type_def(slot_type);
+        let ident = disambiguate(&py_ident(slot), py_accessor_prefixes(def), &mut used);
+        match def {
             Some(TypeDef::Register { .. }) => {
                 emit_line(out, &format!("# slot {slot:?}: register {slot_type:?}"));
                 emit_getter(
@@ -247,6 +255,77 @@ fn py_class_name(type_name: &str) -> String {
     py_ident(type_name)
 }
 
+/// Choose a suffix for `base` so that every accessor a slot generates from it —
+/// `prefix + base` for each `prefix` in `prefixes` — is free of any name already
+/// emitted in this wrapper, then reserve all of them in `used`.
+///
+/// Identifier sanitization is many-to-one (case or non-identifier-char normalization
+/// collapses `foo-bar`, `foo_bar`, `foo bar` onto one name; Go also folds first-letter
+/// case), so distinct slots can derive the same base — and a slot's bare-named map
+/// accessor can even match another slot's *prefixed* accessor (a map slot `get_title`
+/// against a register's `get_title`). Emitting either duplicate produces uncompilable
+/// or silently-shadowing code. Dedup therefore happens at the fully-emitted method
+/// name: `prefixes` is the slot kind's verb set (e.g. `["get_", "set_"]`); a map slot
+/// passes `[""]` (its accessor is the bare base); a slot that emits no accessor passes
+/// `[]`.
+///
+/// The first slot to claim a name keeps its base verbatim; each later collision
+/// appends the smallest free `_N` (`_2`, `_3`, …). Declaration order drives the suffix,
+/// so the mapping is deterministic and stable — a regenerate is byte-identical, and a
+/// new colliding slot appended to a type takes the next suffix without renaming the
+/// slots already declared before it. Only the method name changes: the path key each
+/// accessor forwards to is the original slot name, untouched.
+fn disambiguate(base: &str, prefixes: &[&str], used: &mut Vec<String>) -> String {
+    let free = |candidate: &str, used: &[String]| {
+        prefixes
+            .iter()
+            .all(|p| !used.iter().any(|u| *u == format!("{p}{candidate}")))
+    };
+    let chosen = if free(base, used) {
+        base.to_string()
+    } else {
+        let mut n = 2u32;
+        loop {
+            let candidate = format!("{base}_{n}");
+            if free(&candidate, used) {
+                break candidate;
+            }
+            n += 1;
+        }
+    };
+    for p in prefixes {
+        used.push(format!("{p}{chosen}"));
+    }
+    chosen
+}
+
+/// The Python accessor verb prefixes a slot of `def`'s kind emits (a map slot's
+/// accessor is the bare identifier → `""`; a kind that emits no accessor → none).
+/// The set the disambiguator reserves so no two emitted method names collide.
+fn py_accessor_prefixes(def: Option<&TypeDef>) -> &'static [&'static str] {
+    match def {
+        Some(TypeDef::Register { .. }) => &["get_", "set_"],
+        Some(TypeDef::Counter { .. }) => &["get_", "inc_", "dec_"],
+        Some(TypeDef::Text { .. }) => &["get_", "len_", "insert_", "delete_"],
+        Some(TypeDef::List { .. }) => &["len_", "get_", "insert_", "delete_"],
+        Some(TypeDef::Map { .. }) => &[""],
+        _ => &[],
+    }
+}
+
+/// The Go accessor verb prefixes a slot of `def`'s kind emits — the Go analogue of
+/// [`py_accessor_prefixes`] (exported, no underscore separator).
+fn go_accessor_prefixes(def: Option<&TypeDef>) -> &'static [&'static str] {
+    match def {
+        Some(TypeDef::Register { .. }) => &["Get", "Set"],
+        Some(TypeDef::Counter { .. }) => &["Get", "Inc", "Dec"],
+        Some(TypeDef::Text { .. }) => &["Get", "Len", "Insert", "Delete"],
+        Some(TypeDef::List { .. }) => &["Len", "Get", "Insert", "Delete"],
+        Some(TypeDef::Map { .. }) => &[""],
+        _ => &[],
+    }
+}
+
 /// Sanitize an arbitrary schema name into a valid Python identifier: non-`[A-Za-z0-9_]`
 /// becomes `_`, and a leading digit is prefixed with `_`. Deterministic.
 fn py_ident(name: &str) -> String {
@@ -357,11 +436,17 @@ fn emit_go_struct(
     out.push_str("\tpath [][]byte\n");
     out.push_str("}\n");
 
+    let mut used: Vec<String> = Vec::with_capacity(children.len());
     for (slot, slot_type) in children {
         out.push('\n');
         let key = go_bytes_literal(slot);
-        let name = go_ident_exported(slot);
-        match schema.type_def(slot_type) {
+        let def = schema.type_def(slot_type);
+        let name = disambiguate(
+            &go_ident_exported(slot),
+            go_accessor_prefixes(def),
+            &mut used,
+        );
+        match def {
             Some(TypeDef::Register { .. }) => {
                 emit_go_comment(out, &format!("slot {slot:?}: register {slot_type:?}"));
                 emit_go_getter(
