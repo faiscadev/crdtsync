@@ -79,7 +79,13 @@ fn emit_python_class(
     out.push_str("        self._doc = doc\n");
     out.push_str("        self._path = list(path) if path else []\n");
 
-    let mut used: Vec<String> = Vec::with_capacity(children.len());
+    // Seed the reserved set with the class's structural members so a slot named
+    // `__init__` cannot re-emit the constructor (a duplicate `def` shadows it); slot
+    // accessors disambiguate against them too. (Go needs no equivalent: its methods
+    // are exported, disjoint from the unexported `doc`/`path` fields and the
+    // package-level `Bind`/`joinPath` funcs.)
+    let mut used: Vec<String> = vec!["__init__".to_string()];
+    used.reserve(children.len());
     for (slot, slot_type) in children {
         out.push('\n');
         let key = py_bytes_literal(slot);

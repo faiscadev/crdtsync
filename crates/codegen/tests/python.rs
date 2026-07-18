@@ -157,6 +157,38 @@ fn a_bare_map_accessor_does_not_collide_with_a_prefixed_accessor() {
 }
 
 #[test]
+fn a_slot_named_like_the_constructor_does_not_shadow_it() {
+    // A map slot literally named `__init__` would emit a second `def __init__`,
+    // shadowing the class constructor. The reserved set is seeded with the
+    // structural members, so the slot accessor is bumped and the constructor stands.
+    let src = r#"{
+        "schema": "s", "version": 1, "root": "R",
+        "types": {
+            "R": { "kind": "map", "children": { "__init__": "N" } },
+            "N": { "kind": "map", "children": {} }
+        }
+    }"#;
+    let out = generate_python(&Schema::parse(src).unwrap());
+    let defs = python_defs(&out);
+    let mut unique = defs.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        defs.len(),
+        unique.len(),
+        "a slot must not duplicate __init__"
+    );
+    // R's constructor keeps its signature; the slot accessor is disambiguated.
+    assert!(out.contains("class R:"));
+    assert!(
+        out.contains("    def __init__(self, doc, path: Optional[List[bytes]] = None) -> None:")
+    );
+    assert!(out.contains(
+        "    def __init___2(self) -> \"N\":\n        return N(self._doc, self._path + [b\"__init__\"])"
+    ));
+}
+
+#[test]
 fn a_natural_name_equal_to_a_disambiguated_form_is_pushed_past() {
     // `a-b` and `a_b` both sanitize to `a_b`, so the second becomes `a_b_2`; a third
     // slot literally named `a_b_2` must not reuse that — the retry loop steps past it.
