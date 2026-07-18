@@ -1,9 +1,11 @@
 //! `crdtsync-codegen` — emit typed SDK accessors from a schema JSON file.
 //!
-//! Usage: `crdtsync-codegen <schema.json> [--lang python] [-o <out>]`
+//! Usage: `crdtsync-codegen <schema.json> [--lang python|go] [--package <name>] [-o <out>]`
 //!
 //! Reads the schema file, validates it through the core [`Schema`] parser (the
 //! sole validator), and writes the generated accessor source to `-o` or stdout.
+//! `--package` names the emitted Go package (default: the sanitized schema name);
+//! it is ignored by targets without a package concept.
 
 use crdtsync_core::schema::Schema;
 use std::process::ExitCode;
@@ -12,6 +14,7 @@ fn main() -> ExitCode {
     let mut input: Option<String> = None;
     let mut lang = String::from("python");
     let mut output: Option<String> = None;
+    let mut package: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -20,12 +23,18 @@ fn main() -> ExitCode {
                 Some(v) => lang = v,
                 None => return fail("--lang needs a value"),
             },
+            "--package" => match args.next() {
+                Some(v) => package = Some(v),
+                None => return fail("--package needs a value"),
+            },
             "-o" | "--out" => match args.next() {
                 Some(v) => output = Some(v),
                 None => return fail("-o needs a value"),
             },
             "-h" | "--help" => {
-                eprintln!("usage: crdtsync-codegen <schema.json> [--lang python] [-o <out>]");
+                eprintln!(
+                    "usage: crdtsync-codegen <schema.json> [--lang python|go] [--package <name>] [-o <out>]"
+                );
                 return ExitCode::SUCCESS;
             }
             other if input.is_none() => input = Some(other.to_string()),
@@ -47,7 +56,11 @@ fn main() -> ExitCode {
 
     let generated = match lang.as_str() {
         "python" | "py" => crdtsync_codegen::generate_python(&schema),
-        other => return fail(&format!("unknown --lang {other:?} (supported: python)")),
+        "go" => {
+            let package = package.unwrap_or_else(|| schema.name().to_string());
+            crdtsync_codegen::generate_go(&schema, &package)
+        }
+        other => return fail(&format!("unknown --lang {other:?} (supported: python, go)")),
     };
 
     match output {
