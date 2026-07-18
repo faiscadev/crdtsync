@@ -11,22 +11,32 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crdtsync_core::diff::encode_changes;
+use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
+use crdtsync_core::zone;
 use crdtsync_core::{
-    BranchInfo, Channel, ClientId, DiffKind, Document, ErrorCode, Message, Op, OpKind,
+    BranchInfo, Channel, ClientId, DiffKind, Document, ElementId, ErrorCode, Message, Op, OpKind,
 };
 
 use crdtsync_core::schema::Schema;
 
 use crate::acl::{
-    authorized, doc_acl_tier, has_any_read_grant, op_read_paths, reads_whole_document,
-    recipient_reads_path,
+    authorized, doc_acl_tier, doc_acl_write_at, has_any_read_grant, op_read_paths,
+    reads_whole_document, recipient_reads_path,
 };
 use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Decision, Resource};
 use crate::membership::Membership;
 use crate::schema_registry::{Resolution, SchemaRegistry};
+use crate::zonetoken::CrossZoneGrant;
 use crate::{Catchup, DiffError, Hub, RoomId, StoredOp, MAIN_BRANCH};
+
+/// How long a freshly issued cross-zone-move capability token stays valid, in the
+/// wall-clock milliseconds the session's `now` carries. A short life is sufficient —
+/// a client requests a token and immediately redeems it in the same interaction — and
+/// combined with the token's `(actor, element, src, dst)` binding and the op-id dedup
+/// it bounds replay to this window.
+const CROSS_ZONE_TOKEN_TTL_MILLIS: u64 = 30_000;
 
 /// One channel's subscription: the room it joined, the branch within it, and the
 /// zone partitions it carries. An empty subscribe branch is normalized to
@@ -671,182 +681,38 @@ pub fn step(
             }
             Response::default()
         }
-        Message::Ops { channel, ops } => {
-            if session.actor().is_none() {
-                return violation("ops before auth");
-            }
-            let Some(client) = session.client else {
-                return violation("ops before hello");
-            };
-            let Some(Subscription { room, branch, .. }) = session.channels.get(&channel).cloned()
-            else {
-                return violation("ops on an unbound channel");
-            };
-            // Every op must carry the client declared at Hello, so a
-            // connection's ops stay self-consistent. Authenticating that the
-            // client is who it claims is the transport's credential check;
-            // this driver only enforces consistency.
-            if ops.iter().any(|op| op.id.client != client) {
-                return violation("op client mismatch");
-            }
-            // An `XmlReveal` is a redaction-time synthesis the server injects into a
-            // partial reader's stream — never an authored op. A client that submits one
-            // is rejected outright: applied to the authoritative document it would inject
-            // an unplaced, arbitrarily-identified node shell, so it must never enter the
-            // log. A well-behaved client never authors one, so this is a protocol
-            // violation, not a recoverable authz refusal.
-            if ops
-                .iter()
-                .any(|op| matches!(op.kind, OpKind::XmlReveal { .. }))
-            {
-                return violation("client authored a reveal op");
-            }
-            // A write is served only by the room's leader. A subscribe to a
-            // non-led room is already redirected, so a bound channel here implies
-            // leadership; the guard still holds if a write reaches a non-leader —
-            // it is redirected, not ingested, so a follower never folds a stray
-            // write.
-            if let Some(redirect) = redirect_response(membership, &room) {
-                return redirect;
-            }
-            let identity = session.identity().expect("identity set, checked above");
-            // The doc-ACL tuple tier gates the write between the deployment and
-            // schema tiers: the room creator owns `/`, and its grants let others
-            // in. A first write to a fresh room finds no creator and no tuples, so
-            // the tier abstains and the deployment/schema tiers bootstrap it; that
-            // authorized first writer then becomes the creator (below).
-            // Element scopes resolve through the room's element-context index; a room
-            // with no doc-ACL records has none to resolve, so skip the tree walk.
-            let records = hub.acl_records(&room);
-            let index = if records.is_empty() {
-                HashMap::new()
-            } else {
-                hub.element_paths(&room)
-            };
-            let doc_acl = doc_acl_tier(
-                &records,
-                hub.room_creator(&room).as_deref(),
-                &index,
-                identity,
-                Action::Write,
-            );
-            if !authorized(
-                authorizer,
-                doc_acl,
-                schema,
-                identity,
-                Action::Write,
-                &Resource::Room(&room),
-            ) {
-                // Authored ops sit in the client's outbox until acknowledged, so a
-                // refusal must be recoverable rather than a connection close: name
-                // the rejected ops, keep the connection open, ingest and ack
-                // nothing. The client drains them from its outbox and surfaces the
-                // rejection for the app to show, discard, or export.
-                return ops_rejected(channel, &ops, ErrorCode::Forbidden);
-            }
-            // A published branch is a read-only publish target — its HEAD is advanced
-            // only by `publish`, never by a client write. Refuse recoverably, as the
-            // authz denial above does: the author keeps its ops and surfaces the
-            // rejection rather than losing the connection.
-            if hub.is_published(&room, &branch) {
-                return ops_rejected(channel, &ops, ErrorCode::Forbidden);
-            }
-            // A cross-zone tree move is inadmissible: the per-zone clocks never
-            // order across zones, and the crossing is not detectable from the
-            // post-move tree, so it is caught here at the op against the room's
-            // pre-move document. Refused recoverably like an authz denial — the op
-            // never enters the log, so every replica converges on its absence.
-            // Gated to `main`: the enforcement resolves against the room's
-            // materialized document, which a branch's divergent tree is not part
-            // of, so branch-scoped move enforcement waits on the per-zone stream
-            // work that models branch/zone interaction.
-            if branch == MAIN_BRANCH {
-                if let Some(schema) = schema {
-                    if hub.batch_crosses_zone(&room, &ops, schema) {
-                        return ops_rejected(channel, &ops, ErrorCode::Forbidden);
-                    }
-                    // The enforcing tier is the authoritative reject boundary: a
-                    // batch that would introduce a runtime-kind mismatch at a declared
-                    // slot — the one unrepairable-and-inadmissible schema violation —
-                    // is refused at ingress. The op never enters the log, so every
-                    // replica converges on its absence; the author keeps its ops and
-                    // surfaces the rejection. A relay connection carries no schema
-                    // (`None`), so a relay tier never validates — it passes the batch
-                    // through unvalidated. The repairable violations are not checked
-                    // here (they are folded away convergently at read), and an
-                    // undeclared map slot is admissible (a Map is an open container).
-                    // Gated to `main` like the cross-zone check above: enforcement
-                    // resolves against the room's materialized document, which a
-                    // branch's divergent tree is not part of, so branch-scoped schema
-                    // enforcement waits on the same per-zone/branch stream work.
-                    if hub.batch_violates_schema(&room, &ops, schema) {
-                        return ops_rejected(channel, &ops, ErrorCode::SchemaViolation);
-                    }
-                }
-            }
-            // The batch's highest per-client op sequence: the frontier the author
-            // is acknowledged through once the ops are durably logged, so it can
-            // prune its outbox. Computed over the whole submitted batch, not just
-            // the fresh ops, so a resent op the hub already holds is still acked
-            // and pruned. An empty batch acknowledges nothing.
-            let through = ops.iter().map(|op| op.id.seq).max();
-            // The op's creation version is recorded only when the writer speaks
-            // the room's governing app — its version number lives in that app's
-            // space. A foreign-app writer's version is a different space and must
-            // never drive this room's chain, so its ops are logged untagged
-            // (`None`, relay-like) and pass verbatim on both the live and the
-            // catch-up seam, exactly as the fan-out already leaves them.
-            let write_version = governing_target(governing, session).map(|(_, _, client)| client);
-            // The deduped ops fan out to the `(room, branch)` stream's other
-            // subscribers; nothing echoes back to the sender. A `main` write
-            // appends to the room's log as today; a branch write appends to that
-            // branch's divergent tail, advancing its head, never main's. A hub that
-            // cannot durably record the ops rejects the write rather than
-            // advertising an unpersisted one.
-            let applied = if branch == MAIN_BRANCH {
-                // Only an authenticated actor may become the creator: an anonymous
-                // id is ephemeral per-connection, so it could never re-present to
-                // exercise the ownership, and set-once would then wedge the room's
-                // authority root on a dead principal.
-                let creator = crate::acl::is_authenticated(identity.actor())
-                    .then(|| identity.actor().to_vec());
-                let applied = hub.ingest(&room, ops, write_version);
-                // The first authenticated actor to write a room establishes it, so it
-                // becomes the room's creator — the doc-ACL authority root that owns
-                // `/`. Set-once: a later writer never displaces it. A branch write
-                // presupposes an already-established (forked) room, so it never
-                // bootstraps a creator.
-                if let (Ok(_), Some(creator)) = (&applied, creator) {
-                    hub.ensure_creator(&room, &creator);
-                }
-                applied
-            } else {
-                hub.ingest_branch(&room, &branch, ops, write_version)
-            };
-            match applied {
-                Ok(applied) => Response {
-                    replies: through
-                        .map(|through| Message::Accepted { channel, through })
-                        .into_iter()
-                        .collect(),
-                    broadcast: applied,
-                    broadcast_room: Some(room),
-                    broadcast_branch: Some(branch),
-                    broadcast_version: write_version,
-                    ..Response::default()
-                },
-                Err(_) => Response {
-                    replies: vec![Message::Error {
-                        code: ErrorCode::Internal,
-                        message: "failed to persist ops".to_string(),
-                        details: Vec::new(),
-                    }],
-                    close: true,
-                    ..Response::default()
-                },
-            }
-        }
+        // An ordinary write carries no token, so any cross-zone crossing it
+        // contains stays rejected (the token-free path, unchanged).
+        Message::Ops { channel, ops } => handle_ops(
+            hub, session, authorizer, schema, governing, membership, now, channel, ops, None,
+        ),
+        // A tokened write redeems a cross-zone capability token: the one cross-zone
+        // crossing the token authorizes is admitted, every other check unchanged.
+        Message::CrossZoneOps {
+            channel,
+            ops,
+            token,
+        } => handle_ops(
+            hub,
+            session,
+            authorizer,
+            schema,
+            governing,
+            membership,
+            now,
+            channel,
+            ops,
+            Some(token),
+        ),
+        Message::CrossZoneToken {
+            room,
+            element,
+            dst_zone,
+        } => issue_cross_zone_token(
+            hub, session, authorizer, schema, membership, now, room, element, dst_zone,
+        ),
+        // A token grant only travels server-to-client.
+        Message::CrossZoneTokenGrant { .. } => violation("client sent a cross-zone token grant"),
         Message::Snapshot { .. } => violation("client sent a snapshot"),
         Message::Error { .. } => violation("client sent an error"),
         Message::AuthOk { .. } => violation("client sent an authok"),
@@ -1159,6 +1025,373 @@ pub fn step(
         // Gossip is a node-to-node membership advertisement the registry handles
         // off the client session path; a client that sends one violates.
         Message::Gossip { .. } => violation("client sent a gossip"),
+    }
+}
+
+/// Fold an op batch into `channel`'s room — the shared body of the plain
+/// [`Message::Ops`] path (`token` `None`) and the tokened
+/// [`Message::CrossZoneOps`] path (`token` `Some`). Every gate but the cross-zone
+/// one is identical across the two: a cross-zone crossing is admitted only when a
+/// valid capability token authorizes exactly it, so an ordinary write (no token)
+/// keeps the crossing rejected, and a tokened write admits precisely the move its
+/// token binds.
+#[allow(clippy::too_many_arguments)]
+fn handle_ops(
+    hub: &mut Hub,
+    session: &Session,
+    authorizer: &dyn Authorizer,
+    schema: Option<&Schema>,
+    governing: Option<(&[u8], u32)>,
+    membership: Option<&Membership>,
+    now: u64,
+    channel: Channel,
+    ops: Vec<Op>,
+    token: Option<Vec<u8>>,
+) -> Response {
+    if session.actor().is_none() {
+        return violation("ops before auth");
+    }
+    let Some(client) = session.client else {
+        return violation("ops before hello");
+    };
+    let Some(Subscription { room, branch, .. }) = session.channels.get(&channel).cloned() else {
+        return violation("ops on an unbound channel");
+    };
+    // Every op must carry the client declared at Hello, so a connection's ops stay
+    // self-consistent. Authenticating that the client is who it claims is the
+    // transport's credential check; this driver only enforces consistency.
+    if ops.iter().any(|op| op.id.client != client) {
+        return violation("op client mismatch");
+    }
+    // An `XmlReveal` is a redaction-time synthesis the server injects into a partial
+    // reader's stream — never an authored op. A client that submits one is rejected
+    // outright: applied to the authoritative document it would inject an unplaced,
+    // arbitrarily-identified node shell, so it must never enter the log. A
+    // well-behaved client never authors one, so this is a protocol violation, not a
+    // recoverable authz refusal.
+    if ops
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::XmlReveal { .. }))
+    {
+        return violation("client authored a reveal op");
+    }
+    // A write is served only by the room's leader. A subscribe to a non-led room is
+    // already redirected, so a bound channel here implies leadership; the guard still
+    // holds if a write reaches a non-leader — it is redirected, not ingested, so a
+    // follower never folds a stray write.
+    if let Some(redirect) = redirect_response(membership, &room) {
+        return redirect;
+    }
+    let identity = session.identity().expect("identity set, checked above");
+    // The doc-ACL tuple tier gates the write between the deployment and schema tiers:
+    // the room creator owns `/`, and its grants let others in. A first write to a
+    // fresh room finds no creator and no tuples, so the tier abstains and the
+    // deployment/schema tiers bootstrap it; that authorized first writer then becomes
+    // the creator (below). Element scopes resolve through the room's element-context
+    // index; a room with no doc-ACL records has none to resolve, so skip the tree walk.
+    let records = hub.acl_records(&room);
+    let index = if records.is_empty() {
+        HashMap::new()
+    } else {
+        hub.element_paths(&room)
+    };
+    let doc_acl = doc_acl_tier(
+        &records,
+        hub.room_creator(&room).as_deref(),
+        &index,
+        identity,
+        Action::Write,
+    );
+    if !authorized(
+        authorizer,
+        doc_acl,
+        schema,
+        identity,
+        Action::Write,
+        &Resource::Room(&room),
+    ) {
+        // Authored ops sit in the client's outbox until acknowledged, so a refusal
+        // must be recoverable rather than a connection close: name the rejected ops,
+        // keep the connection open, ingest and ack nothing. The client drains them
+        // from its outbox and surfaces the rejection for the app to show, discard, or
+        // export.
+        return ops_rejected(channel, &ops, ErrorCode::Forbidden);
+    }
+    // A published branch is a read-only publish target — its HEAD is advanced only by
+    // `publish`, never by a client write. Refuse recoverably, as the authz denial
+    // above does: the author keeps its ops and surfaces the rejection rather than
+    // losing the connection.
+    if hub.is_published(&room, &branch) {
+        return ops_rejected(channel, &ops, ErrorCode::Forbidden);
+    }
+    // A cross-zone tree move is inadmissible by default: the per-zone clocks never
+    // order across zones, and the crossing is not detectable from the post-move tree,
+    // so it is caught here at the op against the room's pre-move document. The one
+    // authorized bypass is a server-sealed capability token that authorizes exactly
+    // one crossing — so the crossing is admitted only when the batch carries a
+    // token whose sealed binding matches its actual `(actor, element, src, dst)` move
+    // and has not expired; an un-tokened, forged, expired, or mismatched crossing
+    // stays rejected recoverably, the op never entering the log so every replica
+    // converges on its absence. Gated to `main`: the enforcement resolves against the
+    // room's materialized document, which a branch's divergent tree is not part of, so
+    // branch-scoped move enforcement waits on the per-zone stream work that models
+    // branch/zone interaction.
+    if branch == MAIN_BRANCH {
+        if let Some(schema) = schema {
+            let crossings = hub.batch_zone_crossings(&room, &ops, schema);
+            if !crossings.is_empty()
+                && !cross_zone_move_authorized(
+                    hub,
+                    schema,
+                    identity.actor(),
+                    &room,
+                    token.as_deref(),
+                    &crossings,
+                    now,
+                )
+            {
+                return ops_rejected(channel, &ops, ErrorCode::Forbidden);
+            }
+            // The enforcing tier is the authoritative reject boundary: a batch that
+            // would introduce a runtime-kind mismatch at a declared slot — the one
+            // unrepairable-and-inadmissible schema violation — is refused at ingress.
+            // The op never enters the log, so every replica converges on its absence;
+            // the author keeps its ops and surfaces the rejection. A relay connection
+            // carries no schema (`None`), so a relay tier never validates — it passes
+            // the batch through unvalidated. The repairable violations are not checked
+            // here (they are folded away convergently at read), and an undeclared map
+            // slot is admissible (a Map is an open container).
+            if hub.batch_violates_schema(&room, &ops, schema) {
+                return ops_rejected(channel, &ops, ErrorCode::SchemaViolation);
+            }
+        }
+    }
+    // The batch's highest per-client op sequence: the frontier the author is
+    // acknowledged through once the ops are durably logged, so it can prune its
+    // outbox. Computed over the whole submitted batch, not just the fresh ops, so a
+    // resent op the hub already holds is still acked and pruned. An empty batch
+    // acknowledges nothing.
+    let through = ops.iter().map(|op| op.id.seq).max();
+    // The op's creation version is recorded only when the writer speaks the room's
+    // governing app — its version number lives in that app's space. A foreign-app
+    // writer's version is a different space and must never drive this room's chain, so
+    // its ops are logged untagged (`None`, relay-like) and pass verbatim on both the
+    // live and the catch-up seam, exactly as the fan-out already leaves them.
+    let write_version = governing_target(governing, session).map(|(_, _, client)| client);
+    // The deduped ops fan out to the `(room, branch)` stream's other subscribers;
+    // nothing echoes back to the sender. A `main` write appends to the room's log as
+    // today; a branch write appends to that branch's divergent tail, advancing its
+    // head, never main's. A hub that cannot durably record the ops rejects the write
+    // rather than advertising an unpersisted one.
+    let applied = if branch == MAIN_BRANCH {
+        // Only an authenticated actor may become the creator: an anonymous id is
+        // ephemeral per-connection, so it could never re-present to exercise the
+        // ownership, and set-once would then wedge the room's authority root on a dead
+        // principal.
+        let creator =
+            crate::acl::is_authenticated(identity.actor()).then(|| identity.actor().to_vec());
+        let applied = hub.ingest(&room, ops, write_version);
+        // The first authenticated actor to write a room establishes it, so it becomes
+        // the room's creator — the doc-ACL authority root that owns `/`. Set-once: a
+        // later writer never displaces it. A branch write presupposes an
+        // already-established (forked) room, so it never bootstraps a creator.
+        if let (Ok(_), Some(creator)) = (&applied, creator) {
+            hub.ensure_creator(&room, &creator);
+        }
+        applied
+    } else {
+        hub.ingest_branch(&room, &branch, ops, write_version)
+    };
+    match applied {
+        Ok(applied) => Response {
+            replies: through
+                .map(|through| Message::Accepted { channel, through })
+                .into_iter()
+                .collect(),
+            broadcast: applied,
+            broadcast_room: Some(room),
+            broadcast_branch: Some(branch),
+            broadcast_version: write_version,
+            ..Response::default()
+        },
+        Err(_) => Response {
+            replies: vec![Message::Error {
+                code: ErrorCode::Internal,
+                message: "failed to persist ops".to_string(),
+                details: Vec::new(),
+            }],
+            close: true,
+            ..Response::default()
+        },
+    }
+}
+
+/// Whether every cross-zone crossing a batch performs is authorized by `token` — the
+/// redemption check. A valid token opens (under the room's zone key) to a binding
+/// that matches the crossing's actual `(room, actor, element, src zone, dst zone)`
+/// and has not expired. Every crossing must be authorized by the one token: a single
+/// token binds exactly one move, so a batch straddling more than one distinct
+/// crossing cannot be authorized by it. Fail-closed at every ambiguous case — no
+/// token, no zone key, or a forged / expired / mismatched token yields `false`, so
+/// the crossing stays rejected exactly as an un-tokened one.
+fn cross_zone_move_authorized(
+    hub: &Hub,
+    schema: &Schema,
+    actor: &[u8],
+    room: &[u8],
+    token: Option<&[u8]>,
+    crossings: &[crate::index::ZoneCrossing],
+    now: u64,
+) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+    let Some(grant) = hub.open_cross_zone_token(token) else {
+        return false;
+    };
+    if !grant.is_live(now) {
+        return false;
+    }
+    crossings.iter().all(|c| {
+        grant.authorizes(
+            room,
+            actor,
+            c.node,
+            &zone_name(schema, c.from),
+            &zone_name(schema, c.to),
+        )
+    })
+}
+
+/// The name bytes of the zone with compact id `id` — the schema's declared zone name
+/// for a zoned partition, or the empty string for the unzoned root partition
+/// (`None`). An out-of-range id (never produced by the crossings, which resolve
+/// under the same schema) maps to the root, so the match fails closed.
+fn zone_name(schema: &Schema, id: Option<u32>) -> Vec<u8> {
+    match id {
+        Some(i) => schema
+            .zones()
+            .get(i as usize)
+            .map(|(name, _)| name.as_bytes().to_vec())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Issue a cross-zone-move capability token for `room`: ACL-authorize the request
+/// and, if allowed, seal the token binding `(room, actor, element, src zone, dst
+/// zone, expiry)`. The actor must hold **move authority on the element** (write where
+/// the element currently lives) *and* **write authority to the destination zone** —
+/// both composed through the same [`authorized`] evaluator the write gate uses, never
+/// a parallel check. Fail-closed: an unresolvable element, an undeclared destination
+/// zone, a denied authority, or no configured zone key all mint no token and answer
+/// `Forbidden`. Served by the room's leader, whose authoritative document the element
+/// path and ACL resolve against.
+#[allow(clippy::too_many_arguments)]
+fn issue_cross_zone_token(
+    hub: &Hub,
+    session: &Session,
+    authorizer: &dyn Authorizer,
+    schema: Option<&Schema>,
+    membership: Option<&Membership>,
+    now: u64,
+    room: Vec<u8>,
+    element: ElementId,
+    dst_zone: Vec<u8>,
+) -> Response {
+    let Some(identity) = session.identity() else {
+        return violation("cross-zone token request before auth");
+    };
+    if let Some(redirect) = redirect_response(membership, &room) {
+        return redirect;
+    }
+    // A relay / zoneless connection declares no zones, so there is nothing to cross —
+    // nothing to authorize, fail-closed.
+    let Some(schema) = schema else {
+        return forbidden("cross-zone token denied");
+    };
+    // The element's current location fixes its source zone; an element the room's
+    // index does not hold (unknown or already deleted) cannot be moved — deny.
+    let paths = hub.element_paths(&room);
+    let Some(element_segs) = paths.get(&element) else {
+        return forbidden("cross-zone token denied");
+    };
+    let element_path = encode_path(&element_segs.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let src_zone = zone::zone_of(schema, element_segs)
+        .map(|name| name.as_bytes().to_vec())
+        .unwrap_or_default();
+    // The destination is the unzoned root (empty selector) or a declared zone; an
+    // undeclared name names no partition, so deny rather than mint a token for a
+    // destination that does not exist. The destination's authority path is that
+    // partition's subtree root.
+    let dst_path = if dst_zone.is_empty() {
+        encode_path(&[])
+    } else {
+        let Ok(dst_name) = std::str::from_utf8(&dst_zone) else {
+            return forbidden("cross-zone token denied");
+        };
+        let Some(keys) = zone::zone_root_keys(schema, dst_name) else {
+            return forbidden("cross-zone token denied");
+        };
+        encode_path(&keys.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    };
+    let records = hub.acl_records(&room);
+    let creator = hub.room_creator(&room);
+    // Move authority on the element: the actor may write where the element lives,
+    // composed through the deployment / doc-ACL / schema tiers exactly as the write
+    // gate composes, at the element's own path.
+    let move_ok = authorized(
+        authorizer,
+        doc_acl_write_at(
+            &records,
+            creator.as_deref(),
+            &paths,
+            identity,
+            &element_path,
+        ),
+        Some(schema),
+        identity,
+        Action::Write,
+        &Resource::Room(&room),
+    );
+    // Write authority to the destination: a named zone gates on `Resource::Zone`, the
+    // unzoned root on the room itself; the doc-ACL tier evaluates write at the
+    // destination subtree's root path.
+    let dst_resource = if dst_zone.is_empty() {
+        Resource::Room(&room)
+    } else {
+        Resource::Zone {
+            room: &room,
+            zone: &dst_zone,
+        }
+    };
+    let dst_ok = authorized(
+        authorizer,
+        doc_acl_write_at(&records, creator.as_deref(), &paths, identity, &dst_path),
+        Some(schema),
+        identity,
+        Action::Write,
+        &dst_resource,
+    );
+    if !(move_ok && dst_ok) {
+        return forbidden("cross-zone token denied");
+    }
+    let grant = CrossZoneGrant {
+        room: room.clone(),
+        actor: identity.actor().to_vec(),
+        element,
+        src_zone,
+        dst_zone,
+        expiry: now.saturating_add(CROSS_ZONE_TOKEN_TTL_MILLIS),
+    };
+    // Seal binds the whole tuple under the zone key; with no key configured no token
+    // can be minted (the escape hatch is off) — fail-closed.
+    match hub.seal_cross_zone_token(&grant) {
+        Some(token) => Response {
+            replies: vec![Message::CrossZoneTokenGrant { room, token }],
+            ..Response::default()
+        },
+        None => forbidden("cross-zone token denied"),
     }
 }
 

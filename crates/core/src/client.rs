@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diff::{decode_changes, Change};
 use crate::doc::MapCursor;
-use crate::{BranchInfo, Channel, ClientId, DiffKind, Document, ErrorCode, Message, Op};
+use crate::{BranchInfo, Channel, ClientId, DiffKind, Document, ElementId, ErrorCode, Message, Op};
 
 /// Why an inbound message could not be folded into a replica.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -108,6 +108,12 @@ pub struct ClientSession {
     /// so a client reads the result of the clone it issued. Empty until a clone is
     /// answered.
     clone_results: HashMap<Vec<u8>, bool>,
+    /// The opaque cross-zone-move token the server last granted for each room, keyed
+    /// by room — the sealed capability a [`Message::CrossZoneTokenGrant`] carried.
+    /// The client cannot read or forge it; it attaches it to a
+    /// [`Message::CrossZoneOps`] batch to redeem the authorized move. Empty until a
+    /// token request is granted.
+    cross_zone_tokens: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl ClientSession {
@@ -127,6 +133,7 @@ impl ClientSession {
             branches: HashMap::new(),
             diffs: HashMap::new(),
             clone_results: HashMap::new(),
+            cross_zone_tokens: HashMap::new(),
         }
     }
 
@@ -543,6 +550,52 @@ impl ClientSession {
         self.clone_results.get(dst).copied()
     }
 
+    /// Request a cross-zone-move capability token for `channel`'s room: a token
+    /// authorizing the relocation of `element` into `dst_zone` (empty = the unzoned
+    /// root partition). Returns the request frame, or `None` if the channel isn't
+    /// held. The server ACL-authorizes the request; a granted token folds into the
+    /// [`cross_zone_token`](Self::cross_zone_token) view keyed by the room, and a
+    /// denial arrives as an `OpsRejected`/`Error` the app surfaces.
+    pub fn request_cross_zone_token(
+        &self,
+        channel: Channel,
+        element: ElementId,
+        dst_zone: &[u8],
+    ) -> Option<Message> {
+        let room = self.rooms.get(&channel)?.room.clone();
+        Some(Message::CrossZoneToken {
+            room,
+            element,
+            dst_zone: dst_zone.to_vec(),
+        })
+    }
+
+    /// The opaque cross-zone-move token the server last granted for `room`, if any.
+    /// The client cannot read or forge it — it only relays it back on a
+    /// [`cross_zone_edit`](Self::cross_zone_edit) to redeem the authorized move.
+    pub fn cross_zone_token(&self, room: &[u8]) -> Option<&[u8]> {
+        self.cross_zone_tokens.get(room).map(Vec::as_slice)
+    }
+
+    /// Apply a local edit to `channel`'s room and frame the resulting ops as a
+    /// tokened [`Message::CrossZoneOps`] redeeming `token` — the counterpart of
+    /// [`edit`](Self::edit) for the one cross-zone move the token authorizes. The
+    /// ops still enter the outbox for acknowledgement and resend. `None` if the
+    /// channel isn't held.
+    pub fn cross_zone_edit<F>(&mut self, channel: Channel, token: &[u8], f: F) -> Option<Message>
+    where
+        F: FnOnce(&mut MapCursor),
+    {
+        let ops = self.rooms.get_mut(&channel)?.doc.transact(f);
+        let room = self.rooms.get_mut(&channel)?;
+        room.outbox.extend(ops.iter().cloned());
+        Some(Message::CrossZoneOps {
+            channel,
+            ops,
+            token: token.to_vec(),
+        })
+    }
+
     /// Leave the room on `channel`, dropping its replica. Returns the Unsubscribe
     /// frame to send, or `None` if the channel isn't held.
     pub fn unsubscribe(&mut self, channel: Channel) -> Option<Message> {
@@ -749,6 +802,20 @@ impl ClientSession {
                 self.clone_results.insert(dst, created);
                 Ok(())
             }
+            // The server granted a cross-zone-move token for a room; store the
+            // opaque bytes so the app can attach them to the move batch. The latest
+            // grant for a room wins.
+            Message::CrossZoneTokenGrant { room, token } => {
+                self.cross_zone_tokens.insert(room, token);
+                Ok(())
+            }
+            // A token request and a tokened op batch only travel client-to-server.
+            Message::CrossZoneToken { .. } => Err(ClientError::UnexpectedMessage(
+                "server sent a cross-zone token request",
+            )),
+            Message::CrossZoneOps { .. } => Err(ClientError::UnexpectedMessage(
+                "server sent a cross-zone op batch",
+            )),
             // Branch and diff requests only travel client-to-server.
             Message::BranchList { .. }
             | Message::BranchFork { .. }

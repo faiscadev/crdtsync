@@ -45,6 +45,10 @@ rustls-pemfile = "2"
 # leaf cert's SAN/CN is parsed into the connection's authenticated actor. x509-parser
 # is a mature pure-Rust X.509 reader — no OpenSSL, never the core.
 x509-parser = "0.16"
+# Cross-zone capability tokens are AEAD-sealed under the server's zone-master key.
+# ChaCha20-Poly1305 (RustCrypto) is constant-time in software with no AES-NI
+# dependency; the crypto lives in the server, never the wasm-embeddable core.
+chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }

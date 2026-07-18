@@ -10,6 +10,7 @@ use crate::clientid::ClientId;
 use crate::codec::{
     decode_ops, encode_ops, put_bytes, put_u16, put_u32, put_u64, put_u8, Cursor, DecodeError,
 };
+use crate::elementid::ElementId;
 use crate::op::Op;
 
 /// Identifies a crdtsync stream, so a foreign connection is rejected at once.
@@ -372,6 +373,41 @@ pub enum Message {
     /// `dst` was minted from `src`'s state, `false` when the clone was a no-op
     /// (`src` unknown or `dst` already present).
     CloneRoomResult { dst: Vec<u8>, created: bool },
+    /// A client's request for a cross-zone-move capability token: it names the
+    /// `room`, the `element` it wants to relocate, and the `dst_zone` it wants to
+    /// move it into (empty = the unzoned root partition). The server ACL-authorizes
+    /// the request — the actor must hold move authority on the element and write
+    /// authority to the destination zone — and, if allowed, replies with a
+    /// [`CrossZoneTokenGrant`](Message::CrossZoneTokenGrant) carrying the opaque
+    /// sealed token. A denied request is answered with an
+    /// [`Error`](Message::Error) `Forbidden`, minting no token. Room-keyed like the
+    /// other management requests, runnable before any subscription.
+    CrossZoneToken {
+        room: Vec<u8>,
+        element: ElementId,
+        dst_zone: Vec<u8>,
+    },
+    /// The server's grant of a [`CrossZoneToken`](Message::CrossZoneToken) request:
+    /// the opaque sealed `token` the client attaches to a
+    /// [`CrossZoneOps`](Message::CrossZoneOps) batch carrying the cross-zone move.
+    /// The token is opaque to the client — it can neither read nor forge it, and the
+    /// zone key never leaves the server.
+    CrossZoneTokenGrant { room: Vec<u8>, token: Vec<u8> },
+    /// An op batch that redeems a cross-zone capability `token` — the tokened
+    /// counterpart of [`Ops`](Message::Ops), carrying one cross-zone tree move the
+    /// token authorizes. At ingress the server decrypts and authenticates the token
+    /// under its zone key and checks its sealed binding matches the batch's actual
+    /// `(actor, element, src zone, dst zone)` crossing and has not expired; a match
+    /// admits the otherwise-forbidden cross-zone move, any mismatch/forgery/expiry
+    /// rejects it exactly as an un-tokened cross-zone move is rejected. The token is
+    /// consumed at ingress — it never enters the log and never fans out, so the
+    /// committed move op stays token-free and an ordinary [`Ops`](Message::Ops)
+    /// write is entirely unchanged.
+    CrossZoneOps {
+        channel: Channel,
+        ops: Vec<Op>,
+        token: Vec<u8>,
+    },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -698,6 +734,33 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, dst);
             put_u8(&mut out, u8::from(*created));
         }
+        Message::CrossZoneToken {
+            room,
+            element,
+            dst_zone,
+        } => {
+            put_u8(&mut out, 44);
+            put_bytes(&mut out, room);
+            out.extend_from_slice(&element.as_bytes());
+            put_bytes(&mut out, dst_zone);
+        }
+        Message::CrossZoneTokenGrant { room, token } => {
+            put_u8(&mut out, 45);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, token);
+        }
+        // The token is length-framed before the op batch consumes the remainder,
+        // mirroring the plain `Ops` tail.
+        Message::CrossZoneOps {
+            channel,
+            ops,
+            token,
+        } => {
+            put_u8(&mut out, 46);
+            put_u32(&mut out, channel.0);
+            put_bytes(&mut out, token);
+            out.extend_from_slice(&encode_ops(ops));
+        }
     }
     out
 }
@@ -1003,6 +1066,32 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let dst = cur.bytes()?;
             let created = cur.u8()? != 0;
             Message::CloneRoomResult { dst, created }
+        }
+        44 => {
+            let room = cur.bytes()?;
+            let element = cur.element_id()?;
+            let dst_zone = cur.bytes()?;
+            Message::CrossZoneToken {
+                room,
+                element,
+                dst_zone,
+            }
+        }
+        45 => {
+            let room = cur.bytes()?;
+            let token = cur.bytes()?;
+            Message::CrossZoneTokenGrant { room, token }
+        }
+        // The op batch consumes the remainder after the channel and the token, so
+        // decoding it is already total.
+        46 => {
+            let channel = Channel(cur.u32()?);
+            let token = cur.bytes()?;
+            return Ok(Message::CrossZoneOps {
+                channel,
+                token,
+                ops: decode_ops(cur.rest()).map_err(ProtocolError::Op)?,
+            });
         }
         tag => {
             return Err(ProtocolError::BadTag {
