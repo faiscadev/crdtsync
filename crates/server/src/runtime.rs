@@ -102,6 +102,11 @@ pub struct ServeConfig {
     /// `None` (the default) binds plaintext, unchanged. Build it with
     /// [`server_config_from_pem`](crate::tls::server_config_from_pem).
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// The 32-byte zone-master key sealing cross-zone-move capability tokens
+    /// (Zones-4). `Some` enables the authorized cross-zone-move escape hatch;
+    /// `None` (the default) leaves it off, so every cross-zone move stays rejected.
+    /// Server config, like the TLS cert — the key never leaves the server.
+    pub zone_key: Option<[u8; 32]>,
 }
 
 impl Default for ServeConfig {
@@ -114,6 +119,7 @@ impl Default for ServeConfig {
             webhook: None,
             membership: None,
             tls: None,
+            zone_key: None,
         }
     }
 }
@@ -484,6 +490,12 @@ async fn registry_actor(
     let mut hub = crate::Hub::from_rooms(server, rooms).expect("startup validated the store");
     if let Some(store) = store {
         hub.attach_store(store);
+    }
+    // The zone-master key, if configured, enables cross-zone-move token issuance and
+    // redemption; unset, the cross-zone escape hatch stays off (every crossing
+    // rejected).
+    if let Some(key) = config.zone_key {
+        hub.set_zone_key(key);
     }
     let mut reg = Registry::from_hub(hub);
     reg.set_verifier(verifier);

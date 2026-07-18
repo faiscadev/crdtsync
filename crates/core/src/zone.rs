@@ -36,6 +36,18 @@ fn is_prefix(root: &[Vec<u8>], path: &[Vec<u8>]) -> bool {
     root.len() <= path.len() && root.iter().zip(path).all(|(a, b)| a == b)
 }
 
+/// The key-path segments of the declared root of the zone named `name`, or `None`
+/// when the schema declares no zone by that name. `/board` → `[b"board"]`; the doc
+/// root `/` → `[]` (the empty key path). The cross-zone-move token's destination
+/// authority check resolves a zone name to the subtree it governs through this.
+pub fn zone_root_keys(schema: &Schema, name: &str) -> Option<Vec<Vec<u8>>> {
+    schema
+        .zones()
+        .iter()
+        .find(|(zone_name, _)| zone_name == name)
+        .map(|(_, root)| root_keys(root))
+}
+
 /// The zone a doc location falls in: the zone whose root path is the *longest*
 /// prefix of `path_keys` (the innermost, most-specific zone when zones nest). A
 /// location under no zone root is unzoned (the default region) → `None`. On a tie

@@ -1254,9 +1254,15 @@ impl Registry {
             Message::Gossip { members } => return self.apply_gossip(id, members),
             other => other,
         };
-        // Only an awareness set consults the clock (to stamp last-seen), so the
-        // op hot path never reads wall time.
-        let now = if matches!(msg, Message::AwarenessSet { .. }) {
+        // An awareness set consults the clock (to stamp last-seen); a cross-zone
+        // token request stamps the token's expiry and its redemption checks that
+        // expiry — so those three read wall time. The ordinary op hot path does not.
+        let now = if matches!(
+            msg,
+            Message::AwarenessSet { .. }
+                | Message::CrossZoneToken { .. }
+                | Message::CrossZoneOps { .. }
+        ) {
             self.clock.now_millis()
         } else {
             0
@@ -1283,7 +1289,11 @@ impl Registry {
         // self-declared app, which a foreign connection could pick to escalate.
         let authz_room: Option<RoomId> = match &msg {
             Message::Subscribe { .. } => subscribed_room.clone(),
+            // Room-keyed like branch/clone management: the token request names its
+            // room directly, so its schema binds off the frame's room.
+            Message::CrossZoneToken { room, .. } => Some(room.clone()),
             Message::Ops { channel, .. }
+            | Message::CrossZoneOps { channel, .. }
             | Message::AwarenessSet { channel, .. }
             | Message::VersionCreate { channel, .. }
             | Message::VersionRename { channel, .. }
@@ -1334,7 +1344,10 @@ impl Registry {
         // translate the log along the wrong chain.
         let governing = match room_binding {
             Some(Some((app, version)))
-                if matches!(msg, Message::Subscribe { .. } | Message::Ops { .. }) =>
+                if matches!(
+                    msg,
+                    Message::Subscribe { .. } | Message::Ops { .. } | Message::CrossZoneOps { .. }
+                ) =>
             {
                 Some((app, version))
             }
@@ -1345,7 +1358,7 @@ impl Registry {
         // that peer is re-checked and evicted below — captured pre-step so the
         // lift is the pre/post delta.
         let lift_room: Option<(RoomId, Option<u32>)> = match &msg {
-            Message::Ops { .. } => authz_room
+            Message::Ops { .. } | Message::CrossZoneOps { .. } => authz_room
                 .as_ref()
                 .map(|room| (room.clone(), self.hub.max_op_version(room))),
             _ => None,
@@ -1353,7 +1366,7 @@ impl Registry {
         // A write's `Accepted` is the one reply gated on majority replication, so
         // it is pulled out of the step's replies below and released only once the
         // room's replica set confirms the write durable.
-        let is_ops_write = matches!(msg, Message::Ops { .. });
+        let is_ops_write = matches!(msg, Message::Ops { .. } | Message::CrossZoneOps { .. });
         let (
             broadcast,
             broadcast_version,

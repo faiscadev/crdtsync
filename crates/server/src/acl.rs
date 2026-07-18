@@ -578,6 +578,21 @@ pub fn doc_acl_read_at(
     doc_acl_at(records, creator, index, identity, path, Capability::Read)
 }
 
+/// The doc-ACL tuple tier's **Write** verdict for `identity` at `path`, over the
+/// room's live `records` and `creator` — the per-path form the cross-zone-move token
+/// issuance evaluates against the element's location and the destination zone's root.
+/// The creator owns `/` and so writes every path; a room with no creator abstains
+/// (no authority root). Mirrors [`doc_acl_read_at`] but with [`Capability::Write`].
+pub fn doc_acl_write_at(
+    records: &[AclRecord],
+    creator: Option<&[u8]>,
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
+    identity: &Identity,
+    path: &[u8],
+) -> Decision {
+    doc_acl_at(records, creator, index, identity, path, Capability::Write)
+}
+
 /// Whether `identity` holds doc-ACL read on the room at *any* path — the room's
 /// creator (owns `/`), or the subject of a rooted read/own grant on some subtree.
 /// The room-connect read gate widens to this: a subtree-scoped reader that abstains

@@ -132,10 +132,27 @@ pub fn element_types(doc: &Document, schema: &Schema) -> ElementTypes {
     out
 }
 
+/// A node the batch relocates across a zone boundary: the moved `node` and the
+/// compact zone ids it moves `from` and `to` (`None` = the unzoned root partition).
+/// The redemption gate reads these to check a cross-zone-move token's sealed binding
+/// against the batch's *actual* crossing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ZoneCrossing {
+    pub node: ElementId,
+    pub from: Option<u32>,
+    pub to: Option<u32>,
+}
+
 /// Whether applying `ops` to `doc` relocates any node across a zone boundary —
 /// the cross-zone tree move the per-zone clocks cannot order, and which is not
 /// detectable from the post-move tree (the moved node simply renders under its
-/// new parent).
+/// new parent). Thin wrapper over [`batch_zone_crossings`].
+pub fn batch_crosses_zone(doc: &Document, ops: &[Op], schema: &Schema) -> bool {
+    !batch_zone_crossings(doc, ops, schema).is_empty()
+}
+
+/// The cross-zone relocations applying `ops` to `doc` performs — one
+/// [`ZoneCrossing`] per moved node whose zone changes across the batch.
 ///
 /// A moved node that lives both before and after the batch crosses when its zone
 /// changes: a move to a different zone (the unzoned region counting as distinct
@@ -147,32 +164,38 @@ pub fn element_types(doc: &Document, schema: &Schema) -> ElementTypes {
 /// document, so a destination created within the same batch resolves and the real
 /// fold (readiness buffering, Kleppmann move refold, slot LWW) decides the
 /// outcome — the check reflects exactly what the document will hold, never a
-/// divergent re-derivation. `false` when the batch moves nothing or the schema
+/// divergent re-derivation. Empty when the batch moves nothing or the schema
 /// declares no zones (every path resolving unzoned).
-pub fn batch_crosses_zone(doc: &Document, ops: &[Op], schema: &Schema) -> bool {
+pub fn batch_zone_crossings(doc: &Document, ops: &[Op], schema: &Schema) -> Vec<ZoneCrossing> {
     let movers: Vec<ElementId> = ops.iter().filter_map(move_node).collect();
     if movers.is_empty() {
-        return false;
+        return Vec::new();
     }
     let before = element_paths(doc);
     // An independent copy: decode fresh bytes rather than share the live tree's
     // handles, so the simulation never touches the committed document.
     let Ok(mut simulated) = Document::decode_state(&doc.encode_state()) else {
-        return false;
+        return Vec::new();
     };
     for op in ops {
         simulated.apply(op);
     }
     let after = element_paths(&simulated);
-    movers.iter().any(|node| {
-        // Compare zones only for a mover that lives on both sides — a node absent
-        // before (created this batch) or after (deleted this batch) is not a
-        // committed crossing, and "absent" must not read as "unzoned".
-        match (before.get(node), after.get(node)) {
-            (Some(from), Some(to)) => zone::zone_of(schema, from) != zone::zone_of(schema, to),
-            _ => false,
-        }
-    })
+    movers
+        .iter()
+        .filter_map(|node| {
+            // Compare zones only for a mover that lives on both sides — a node
+            // absent before (created this batch) or after (deleted this batch) is
+            // not a committed crossing, and "absent" must not read as "unzoned".
+            let (from, to) = (before.get(node)?, after.get(node)?);
+            let (from, to) = (zone::zone_id_of(schema, from), zone::zone_id_of(schema, to));
+            (from != to).then_some(ZoneCrossing {
+                node: *node,
+                from,
+                to,
+            })
+        })
+        .collect()
 }
 
 /// The node a tree move relocates, or `None` for any other op.

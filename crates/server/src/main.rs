@@ -23,7 +23,10 @@
 //! to terminate TLS at the listener — the wire protocol then runs over an
 //! encrypted stream (`wss://`); both must be set together, and a malformed or
 //! mismatched pair fails startup loudly rather than downgrading to plaintext.
-//! Unset, the listener binds plaintext exactly as before.
+//! Unset, the listener binds plaintext exactly as before. Set `CRDTSYNC_ZONE_KEY`
+//! to 64 hex digits (a 32-byte zone-master key) to enable the authorized
+//! cross-zone-move escape hatch — the server seals a capability token per
+//! authorized move under it; unset, every cross-zone move stays rejected.
 //!
 //! A policy's `actor:` and subject-class (`authenticated` / `anonymous`) rules
 //! are only real boundaries when the actor is server-derived. With a credentials
@@ -201,6 +204,32 @@ fn tls_config() -> std::io::Result<Option<Arc<rustls::ServerConfig>>> {
     }
 }
 
+/// The zone-master key for the run: the 32 bytes sealing cross-zone-move capability
+/// tokens, read from `CRDTSYNC_ZONE_KEY` as 64 hex digits, else `None` (the
+/// cross-zone-move escape hatch stays off — every crossing rejected). A key of the
+/// wrong length or with a non-hex digit is a clean startup error, not a silent
+/// disable — a misconfigured secret must fail loudly. Server config, like the TLS
+/// cert; the key never leaves the server.
+fn zone_key() -> std::io::Result<Option<[u8; 32]>> {
+    let Some(hex) = path_var("CRDTSYNC_ZONE_KEY")? else {
+        return Ok(None);
+    };
+    let invalid =
+        |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string());
+    if hex.len() != 64 {
+        return Err(invalid(
+            "CRDTSYNC_ZONE_KEY must be 64 hex digits (32 bytes)",
+        ));
+    }
+    let mut key = [0u8; 32];
+    for (i, byte) in key.iter_mut().enumerate() {
+        let pair = &hex[i * 2..i * 2 + 2];
+        *byte = u8::from_str_radix(pair, 16)
+            .map_err(|_| invalid("CRDTSYNC_ZONE_KEY must be valid hex"))?;
+    }
+    Ok(Some(key))
+}
+
 /// The blob store root for the run: `CRDTSYNC_BLOB_ROOT` if set, else a `blobs`
 /// subdirectory of `CRDTSYNC_DATA_DIR`. Serving blobs (`CRDTSYNC_BLOB_ADDR`)
 /// without either is a clean startup error — there is nowhere to persist blob
@@ -258,6 +287,7 @@ async fn main() -> std::io::Result<()> {
             webhook: webhook()?,
             membership: membership()?,
             tls,
+            zone_key: zone_key()?,
             ..ServeConfig::default()
         },
         verifier()?,

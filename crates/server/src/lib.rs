@@ -39,6 +39,7 @@ pub mod store;
 pub mod tls;
 pub mod translate;
 pub mod webhook;
+pub mod zonetoken;
 pub use admin::{
     admin_router, blob_router, register_schema, serve_admin, serve_blobs, BlobAccess,
     PermitAllBlobs, RegisterOutcome, RegisterRequest, MAX_BLOB_BODY,
@@ -60,6 +61,7 @@ pub use tls::{
     TlsConfigError,
 };
 pub use webhook::{WebhookConfig, WebhookSink};
+pub use zonetoken::{CrossZoneGrant, ZoneSealer};
 
 /// A room name, opaque bytes chosen by the deployment.
 pub type RoomId = Vec<u8>;
@@ -659,6 +661,11 @@ pub struct Hub {
     /// The engine event sinks, notified of each lifecycle moment. Empty by
     /// default — no sink, no emission cost.
     sinks: Vec<Box<dyn EventSink>>,
+    /// The server's cross-zone capability-token sealer, holding the zone-master key
+    /// (server config, like the TLS cert). `None` until a key is configured — with
+    /// no key no token can be issued and every cross-zone move stays rejected
+    /// (fail-closed), so the escape hatch is opt-in and off by default.
+    zone_sealer: Option<ZoneSealer>,
 }
 
 impl Hub {
@@ -678,6 +685,7 @@ impl Hub {
             branch_bases: HashMap::new(),
             active_branch: HashMap::new(),
             sinks: Vec::new(),
+            zone_sealer: None,
         }
     }
 
@@ -1619,6 +1627,50 @@ impl Hub {
         self.rooms
             .get(room)
             .is_some_and(|r| index::batch_crosses_zone(&r.doc, ops, schema))
+    }
+
+    /// The cross-zone relocations `ops` performs in `room` under `schema` — the
+    /// moved nodes whose zone the batch changes, each with the zone ids it moves
+    /// between. The redemption gate reads these to check a cross-zone-move token's
+    /// binding against the batch's actual crossing. Empty for an unknown room, a
+    /// batch that moves nothing, or a schema with no zones.
+    pub fn batch_zone_crossings(
+        &self,
+        room: &[u8],
+        ops: &[Op],
+        schema: &Schema,
+    ) -> Vec<index::ZoneCrossing> {
+        self.rooms
+            .get(room)
+            .map(|r| index::batch_zone_crossings(&r.doc, ops, schema))
+            .unwrap_or_default()
+    }
+
+    /// Install the server's zone-master key, enabling cross-zone-move token
+    /// issuance and redemption. Server config (like the TLS cert); the key never
+    /// leaves the server. With no key configured, every cross-zone move stays
+    /// rejected (fail-closed).
+    pub fn set_zone_key(&mut self, key: [u8; 32]) {
+        self.zone_sealer = Some(ZoneSealer::new(key));
+    }
+
+    /// Whether a zone-master key is configured — whether the cross-zone-move escape
+    /// hatch is enabled at all.
+    pub fn has_zone_key(&self) -> bool {
+        self.zone_sealer.is_some()
+    }
+
+    /// Seal a cross-zone-move `grant` into an opaque token, or `None` when no zone
+    /// key is configured (issuance disabled → no token minted).
+    pub fn seal_cross_zone_token(&self, grant: &CrossZoneGrant) -> Option<Vec<u8>> {
+        self.zone_sealer.as_ref().map(|s| s.seal(grant))
+    }
+
+    /// Open and authenticate a cross-zone-move `token`, recovering its sealed
+    /// binding. `None` when no zone key is configured or the token is absent,
+    /// forged, tampered, or malformed — fail-closed at every ambiguous case.
+    pub fn open_cross_zone_token(&self, token: &[u8]) -> Option<CrossZoneGrant> {
+        self.zone_sealer.as_ref().and_then(|s| s.open(token))
     }
 
     /// Whether `ops` would introduce a schema violation in `room` under `schema`
