@@ -24,7 +24,12 @@ use crate::acl::{
     authorized, doc_acl_tier, doc_acl_write_at, has_any_read_grant, op_read_paths,
     reads_whole_document, recipient_reads_path,
 };
+use crate::auth::{Identity, Verifier};
+use crate::authz::{Action, Authorizer, Decision, Resource};
+use crate::membership::Membership;
+use crate::schema_registry::{Resolution, SchemaRegistry};
 use crate::zonetoken::CrossZoneGrant;
+use crate::{Catchup, DiffError, Hub, RoomId, StoredOp, MAIN_BRANCH};
 
 /// How long a freshly issued cross-zone-move capability token stays valid, in the
 /// wall-clock milliseconds the session's `now` carries. A short life is sufficient —
@@ -32,11 +37,6 @@ use crate::zonetoken::CrossZoneGrant;
 /// combined with the token's `(actor, element, src, dst)` binding and the op-id dedup
 /// it bounds replay to this window.
 const CROSS_ZONE_TOKEN_TTL_MILLIS: u64 = 30_000;
-use crate::auth::{Identity, Verifier};
-use crate::authz::{Action, Authorizer, Decision, Resource};
-use crate::membership::Membership;
-use crate::schema_registry::{Resolution, SchemaRegistry};
-use crate::{Catchup, DiffError, Hub, RoomId, StoredOp, MAIN_BRANCH};
 
 /// One channel's subscription: the room it joined, the branch within it, and the
 /// zone partitions it carries. An empty subscribe branch is normalized to
@@ -1126,9 +1126,9 @@ fn handle_ops(
     }
     // A cross-zone tree move is inadmissible by default: the per-zone clocks never
     // order across zones, and the crossing is not detectable from the post-move tree,
-    // so it is caught here at the op against the room's pre-move document. Zones-4's
-    // one authorized bypass is a server-sealed capability token that authorizes
-    // exactly one crossing — so the crossing is admitted only when the batch carries a
+    // so it is caught here at the op against the room's pre-move document. The one
+    // authorized bypass is a server-sealed capability token that authorizes exactly
+    // one crossing — so the crossing is admitted only when the batch carries a
     // token whose sealed binding matches its actual `(actor, element, src, dst)` move
     // and has not expired; an un-tokened, forged, expired, or mismatched crossing
     // stays rejected recoverably, the op never entering the log so every replica

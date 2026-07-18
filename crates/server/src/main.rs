@@ -211,23 +211,40 @@ fn tls_config() -> std::io::Result<Option<Arc<rustls::ServerConfig>>> {
 /// disable — a misconfigured secret must fail loudly. Server config, like the TLS
 /// cert; the key never leaves the server.
 fn zone_key() -> std::io::Result<Option<[u8; 32]>> {
-    let Some(hex) = path_var("CRDTSYNC_ZONE_KEY")? else {
-        return Ok(None);
-    };
+    match path_var("CRDTSYNC_ZONE_KEY")? {
+        Some(hex) => decode_zone_key(&hex).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Decode a 64-hex-digit zone-master key to its 32 bytes. Total — a value of the
+/// wrong length, or one holding any non-hex byte (a non-ASCII byte included), is a
+/// clean `InvalidInput`, never a panic: the length gate counts bytes and the pairs
+/// are sliced off the byte string, so a multi-byte character neither passes the
+/// length check nor splits a hex pair at a char boundary.
+fn decode_zone_key(hex: &str) -> std::io::Result<[u8; 32]> {
     let invalid =
         |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string());
-    if hex.len() != 64 {
+    let digits = hex.as_bytes();
+    if digits.len() != 64 {
         return Err(invalid(
             "CRDTSYNC_ZONE_KEY must be 64 hex digits (32 bytes)",
         ));
     }
+    let unhex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
     let mut key = [0u8; 32];
-    for (i, byte) in key.iter_mut().enumerate() {
-        let pair = &hex[i * 2..i * 2 + 2];
-        *byte = u8::from_str_radix(pair, 16)
-            .map_err(|_| invalid("CRDTSYNC_ZONE_KEY must be valid hex"))?;
+    for (byte, pair) in key.iter_mut().zip(digits.chunks_exact(2)) {
+        let (Some(hi), Some(lo)) = (unhex(pair[0]), unhex(pair[1])) else {
+            return Err(invalid("CRDTSYNC_ZONE_KEY must be valid hex"));
+        };
+        *byte = (hi << 4) | lo;
     }
-    Ok(Some(key))
+    Ok(key)
 }
 
 /// The blob store root for the run: `CRDTSYNC_BLOB_ROOT` if set, else a `blobs`
@@ -335,4 +352,45 @@ async fn main() -> std::io::Result<()> {
 
     futures_util::future::try_join_all(servers).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_zone_key;
+
+    #[test]
+    fn a_valid_64_hex_key_decodes() {
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let key = decode_zone_key(hex).expect("valid hex decodes");
+        assert_eq!(key[0], 0x00);
+        assert_eq!(key[1], 0x11);
+        assert_eq!(key[31], 0xff);
+    }
+
+    #[test]
+    fn a_wrong_length_key_is_a_clean_error() {
+        assert!(decode_zone_key("").is_err());
+        assert!(decode_zone_key("abcd").is_err());
+        // 63 and 65 digits both rejected.
+        assert!(decode_zone_key(&"a".repeat(63)).is_err());
+        assert!(decode_zone_key(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn a_non_hex_digit_is_a_clean_error() {
+        // 64 ASCII chars, one not a hex digit.
+        let mut hex = "a".repeat(63);
+        hex.push('g');
+        assert!(decode_zone_key(&hex).is_err());
+    }
+
+    #[test]
+    fn a_non_ascii_64_byte_value_errors_without_panicking() {
+        // 62 ASCII hex digits + one 2-byte char = 64 bytes but a non-hex,
+        // multi-byte tail. Must be a clean error, never a char-boundary panic.
+        let mut hex = "a".repeat(62);
+        hex.push('é'); // 2 bytes (0xC3 0xA9)
+        assert_eq!(hex.len(), 64);
+        assert!(decode_zone_key(&hex).is_err());
+    }
 }

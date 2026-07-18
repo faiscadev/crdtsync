@@ -102,10 +102,10 @@ pub struct ServeConfig {
     /// `None` (the default) binds plaintext, unchanged. Build it with
     /// [`server_config_from_pem`](crate::tls::server_config_from_pem).
     pub tls: Option<Arc<rustls::ServerConfig>>,
-    /// The 32-byte zone-master key sealing cross-zone-move capability tokens
-    /// (Zones-4). `Some` enables the authorized cross-zone-move escape hatch;
-    /// `None` (the default) leaves it off, so every cross-zone move stays rejected.
-    /// Server config, like the TLS cert — the key never leaves the server.
+    /// The 32-byte zone-master key sealing cross-zone-move capability tokens.
+    /// `Some` enables the authorized cross-zone-move escape hatch; `None` (the
+    /// default) leaves it off, so every cross-zone move stays rejected. Server
+    /// config, like the TLS cert — the key never leaves the server.
     pub zone_key: Option<[u8; 32]>,
 }
 

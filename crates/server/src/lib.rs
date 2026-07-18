@@ -1654,12 +1654,6 @@ impl Hub {
         self.zone_sealer = Some(ZoneSealer::new(key));
     }
 
-    /// Whether a zone-master key is configured — whether the cross-zone-move escape
-    /// hatch is enabled at all.
-    pub fn has_zone_key(&self) -> bool {
-        self.zone_sealer.is_some()
-    }
-
     /// Seal a cross-zone-move `grant` into an opaque token, or `None` when no zone
     /// key is configured (issuance disabled → no token minted).
     pub fn seal_cross_zone_token(&self, grant: &CrossZoneGrant) -> Option<Vec<u8>> {

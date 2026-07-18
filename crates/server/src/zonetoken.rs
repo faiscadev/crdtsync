@@ -1,11 +1,10 @@
 //! Cross-zone capability tokens — the AEAD-sealed escape hatch for an authorized
 //! cross-zone tree move.
 //!
-//! A cross-zone move is rejected at op-ingress by default (Zones 1b-ii-b): the
-//! per-zone lamport clocks never order across zones. Zones-4 is the one authorized
-//! bypass — a server-sealed capability token that authorizes exactly **one**
-//! cross-zone move and cannot be forged, reused for a different move, or read by a
-//! client.
+//! A cross-zone move is rejected at op-ingress by default: the per-zone lamport
+//! clocks never order across zones. This module is the one authorized bypass — a
+//! server-sealed capability token that authorizes exactly **one** cross-zone move
+//! and cannot be forged, reused for a different move, or read by a client.
 //!
 //! The token seals a [`CrossZoneGrant`] — the binding tuple
 //! `(room, actor, element, src_zone, dst_zone, expiry)` — under the server's
