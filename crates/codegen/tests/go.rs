@@ -10,8 +10,27 @@ const SCHEMA_SRC: &str = include_str!("fixtures/note.schema.json");
 const GOLDEN: &str = include_str!("../../../sdks/go/notegen/note_generated.go");
 const PACKAGE: &str = "notegen";
 
+const COLLIDE_SRC: &str = include_str!("fixtures/collide.schema.json");
+const COLLIDE_GOLDEN: &str = include_str!("../../../sdks/go/collidegen/collide_generated.go");
+
 fn schema() -> Schema {
     Schema::parse(SCHEMA_SRC).expect("fixture schema parses")
+}
+
+/// Every method emitted by a `func (x *T) <Name>(` receiver, qualified as
+/// `T.Name`. Qualifying by receiver keeps the same method name on two different
+/// structs from reading as a collision (Go allows it); a real duplicate — which Go
+/// rejects — is two identical `T.Name` entries.
+fn go_methods(src: &str) -> Vec<String> {
+    src.lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("func (x *")?;
+            let recv_end = rest.find(')')?;
+            let recv = &rest[..recv_end];
+            let after = rest[recv_end + 1..].trim_start();
+            Some(format!("{recv}.{}", &after[..after.find('(')?]))
+        })
+        .collect()
 }
 
 #[test]
@@ -75,4 +94,103 @@ fn an_unusual_slot_name_becomes_a_safe_exported_identifier_and_byte_key() {
     let out = generate_go(&Schema::parse(src).unwrap(), "gen");
     assert!(out.contains("func (x *R) GetA_b() (int64, bool)"));
     assert!(out.contains("joinPath(x.path, []byte(\"a-b\"))"));
+}
+
+#[test]
+fn colliding_slot_names_get_unique_deterministic_methods() {
+    // `a-b`, `a_b`, `a b` all sanitize to `A_b`; without disambiguation the three
+    // counters emit duplicate `GetA_b`/`IncA_b`/`DecA_b` methods (uncompilable).
+    let a = generate_go(&Schema::parse(COLLIDE_SRC).unwrap(), "collidegen");
+    let b = generate_go(&Schema::parse(COLLIDE_SRC).unwrap(), "collidegen");
+    assert_eq!(a, b, "collision disambiguation must be deterministic");
+
+    let methods = go_methods(&a);
+    // Three counters × Get/Inc/Dec = 9 methods: a lower bound so the dedup check
+    // below can't pass vacuously on a parser/emitter drift.
+    assert!(
+        methods.len() >= 9,
+        "expected ≥9 methods, parsed {}",
+        methods.len()
+    );
+    let mut unique = methods.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        methods.len(),
+        unique.len(),
+        "every generated method identifier must be unique; got {methods:?}"
+    );
+
+    // Each disambiguated method still forwards to its own field's exact bytes.
+    assert!(a.contains("func (x *C) GetA_b() (int64, bool) {\n\treturn x.doc.GetCounter(joinPath(x.path, []byte(\"a-b\")))"));
+    assert!(a.contains("func (x *C) GetA_b_2() (int64, bool) {\n\treturn x.doc.GetCounter(joinPath(x.path, []byte(\"a_b\")))"));
+    assert!(a.contains("func (x *C) GetA_b_3() (int64, bool) {\n\treturn x.doc.GetCounter(joinPath(x.path, []byte(\"a b\")))"));
+}
+
+#[test]
+fn go_case_fold_collision_is_disambiguated() {
+    // Go exports by upper-casing the first letter, so `fooBar` and `FooBar` both
+    // become `FooBar` — a collision Python (case-preserving) does not have. The
+    // exported-name disambiguation must cover it too.
+    let src = r#"{
+        "schema": "s", "version": 1, "root": "R",
+        "types": {
+            "R": { "kind": "map", "children": { "fooBar": "Ctr", "FooBar": "Ctr" } },
+            "Ctr": { "kind": "counter" }
+        }
+    }"#;
+    let out = generate_go(&Schema::parse(src).unwrap(), "gen");
+    let methods = go_methods(&out);
+    let mut unique = methods.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        methods.len(),
+        unique.len(),
+        "case-fold names must not collide"
+    );
+    // First declaration keeps the bare exported name; the second is suffixed, and
+    // each forwards to its own distinct byte key.
+    assert!(out.contains("func (x *R) GetFooBar() (int64, bool) {\n\treturn x.doc.GetCounter(joinPath(x.path, []byte(\"fooBar\")))"));
+    assert!(out.contains("func (x *R) GetFooBar_2() (int64, bool) {\n\treturn x.doc.GetCounter(joinPath(x.path, []byte(\"FooBar\")))"));
+}
+
+#[test]
+fn a_bare_map_method_does_not_collide_with_a_prefixed_method() {
+    // A map slot's method is the bare exported name, while other kinds are verb-
+    // prefixed — so a map slot `getX` derives the same name a register slot `x`
+    // derives for its getter (`GetX`). Dedup at the fully-emitted method name bumps
+    // the second, and each still forwards to its own field. (Left unfixed this is a
+    // hard Go compile error: `method GetX already declared`.)
+    let src = r#"{
+        "schema": "s", "version": 1, "root": "R",
+        "types": {
+            "R": { "kind": "map", "children": { "x": "Reg", "getX": "N" } },
+            "Reg": { "kind": "register" },
+            "N": { "kind": "map", "children": {} }
+        }
+    }"#;
+    let out = generate_go(&Schema::parse(src).unwrap(), "gen");
+    let methods = go_methods(&out);
+    let mut unique = methods.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        methods.len(),
+        unique.len(),
+        "bare/prefixed names must not collide"
+    );
+    assert!(out.contains("func (x *R) GetX() (int64, bool) {\n\treturn x.doc.GetInt(joinPath(x.path, []byte(\"x\")))"));
+    assert!(out.contains("func (x *R) GetX_2() *N {\n\treturn &N{doc: x.doc, path: joinPath(x.path, []byte(\"getX\"))}"));
+}
+
+#[test]
+fn colliding_output_matches_the_committed_golden() {
+    // If this fails, regenerate:
+    //   cargo run -p crdtsync-codegen -- crates/codegen/tests/fixtures/collide.schema.json \
+    //     --lang go --package collidegen -o sdks/go/collidegen/collide_generated.go
+    assert_eq!(
+        generate_go(&Schema::parse(COLLIDE_SRC).unwrap(), "collidegen"),
+        COLLIDE_GOLDEN
+    );
 }

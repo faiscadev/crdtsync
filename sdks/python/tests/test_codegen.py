@@ -24,12 +24,16 @@ _FIXTURES = os.path.join(
 )
 
 
-def _load_generated():
-    path = os.path.join(_FIXTURES, "note_generated.py")
-    spec = importlib.util.spec_from_file_location("note_generated", path)
+def _load_module(filename, module_name):
+    path = os.path.join(_FIXTURES, filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_generated():
+    return _load_module("note_generated.py", "note_generated")
 
 
 def cid(first: int) -> bytes:
@@ -83,3 +87,22 @@ def test_nested_map_slot_forwards_to_the_nested_path():
         assert note.meta().get_priority() == 4
         # the nested wrapper addresses the extended path
         assert doc.get_int([b"meta", b"priority"]) == 4
+
+
+def test_colliding_slots_import_and_stay_independent():
+    # `a-b`, `a_b`, `a b` all sanitize to `a_b`; the disambiguated module must
+    # import (no duplicate methods) and each accessor forward to its own field.
+    gen = _load_module("collide_generated.py", "collide_generated")
+    with Document(cid(1)) as doc:
+        c = gen.bind(doc)
+        c.inc_a_b(1)
+        c.inc_a_b_2(2)
+        c.inc_a_b_3(3)
+        # each accessor round-trips to its own distinct field, unaffected by the others
+        assert c.get_a_b() == 1
+        assert c.get_a_b_2() == 2
+        assert c.get_a_b_3() == 3
+        # and forwards to the exact byte key the schema declared
+        assert doc.get_counter([b"a-b"]) == 1
+        assert doc.get_counter([b"a_b"]) == 2
+        assert doc.get_counter([b"a b"]) == 3
