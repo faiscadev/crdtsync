@@ -135,6 +135,16 @@ impl Registry {
         // no further wiring.
         let auto_version = Rc::new(AutoVersionState::default());
         hub.add_event_sink(Box::new(AutoVersionSink(auto_version.clone())));
+        // Restore the persisted split-brain fence: seed the live leadership epochs
+        // from the epochs the store carried across the load seam, so a restarted node
+        // remembers the highest epoch it had seen per room and cannot re-accept a
+        // demoted leader's stale-epoch frames it would have fenced before the restart.
+        // A store-less or never-led hub carries none, leaving the fence at its
+        // in-memory default.
+        let mut epochs = LeadershipEpochs::default();
+        for (room, epoch) in hub.loaded_epochs() {
+            epochs.observe(room, *epoch);
+        }
         Self {
             hub,
             conns: HashMap::new(),
@@ -152,7 +162,7 @@ impl Registry {
             schedule_fires: HashMap::new(),
             membership: None,
             replication: Replication::default(),
-            epochs: LeadershipEpochs::default(),
+            epochs,
             pending_acks: Vec::new(),
         }
     }
@@ -261,8 +271,12 @@ impl Registry {
             return;
         }
         let base_seq = self.hub.base_seq(room);
-        // Stamp the frames with this node's leadership epoch for the room.
+        // Stamp the frames with this node's leadership epoch for the room. A
+        // promotion opens a fresh (higher) epoch — persist the advance so the fence
+        // survives a restart and this node never re-leads at a stale epoch.
+        let before = self.epochs.highest_seen(room);
         let epoch = self.epochs.claim_leadership(room);
+        self.persist_epoch_if_advanced(room, before);
         for follower in followers {
             self.replication.enqueue(
                 follower,
@@ -327,9 +341,13 @@ impl Registry {
             return false;
         }
         // Committed to apply: step down if superseded, and record the leader's epoch
-        // as this room's highest seen so later frames below it are fenced.
+        // as this room's highest seen so later frames below it are fenced. Persist the
+        // advance so a restart reloads the fence — a follower that forgot the highest
+        // epoch it had seen would re-accept a demoted leader's stale-epoch writes.
+        let before = self.epochs.highest_seen(&room);
         self.epochs.supersede_if_leading(&room, epoch);
         self.epochs.observe(&room, epoch);
+        self.persist_epoch_if_advanced(&room, before);
         // `base_seq` is the leader's compaction floor, carried so a future
         // snapshot-based catch-up can align a late follower's sequence space. Unit
         // 4 replicates the whole log from the first op, so the follower's own head
@@ -346,6 +364,18 @@ impl Registry {
             conn.outbox.push(Message::ReplicaAck { room, through_seq });
         }
         true
+    }
+
+    /// Persist `room`'s leadership epoch when it advanced past `before` — the
+    /// highest-seen value the caller captured before mutating the fence. Monotone by
+    /// construction (the fence never lowers), so this writes only on a genuine
+    /// advance, keeping the blocking store write off the steady-state path. A
+    /// store-less hub is a no-op, so an in-memory deployment is unchanged.
+    fn persist_epoch_if_advanced(&mut self, room: &[u8], before: u64) {
+        let now = self.epochs.highest_seen(room);
+        if now > before {
+            self.hub.persist_epoch(room, now);
+        }
     }
 
     /// This node's known cluster members, each with its dial address — the member
@@ -534,6 +564,14 @@ impl Registry {
     /// a later majority-ack durability unit reads. `0` if nothing yet.
     pub fn replica_watermark(&self, room: &[u8], follower: &NodeId) -> u64 {
         self.replication.watermark(room, follower)
+    }
+
+    /// The highest leadership epoch this node has seen for `room` — the split-brain
+    /// fence value ([`LeadershipEpochs::highest_seen`]). `0` for a room whose
+    /// leadership has never changed. Restored from the store on startup, so it
+    /// survives a restart.
+    pub fn highest_epoch(&self, room: &[u8]) -> u64 {
+        self.epochs.highest_seen(room)
     }
 
     /// Auto-compact a room once its retained log reaches `threshold` ops, so a

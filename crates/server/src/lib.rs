@@ -666,6 +666,14 @@ pub struct Hub {
     /// no key no token can be issued and every cross-zone move stays rejected
     /// (fail-closed), so the escape hatch is opt-in and off by default.
     zone_sealer: Option<ZoneSealer>,
+    /// The per-room leadership epochs restored from the store on load — the
+    /// split-brain fence values (Unit 6b) a restart must not forget. Populated by
+    /// [`install_room`](Hub::install_room) and drained by the registry into its live
+    /// [`LeadershipEpochs`](crate::leadership::LeadershipEpochs) at construction; the
+    /// hub itself never consults them (leadership is a registry concern), it only
+    /// carries them across the load seam and persists advances through
+    /// [`persist_epoch`](Hub::persist_epoch).
+    loaded_epochs: HashMap<RoomId, u64>,
 }
 
 impl Hub {
@@ -686,6 +694,7 @@ impl Hub {
             active_branch: HashMap::new(),
             sinks: Vec::new(),
             zone_sealer: None,
+            loaded_epochs: HashMap::new(),
         }
     }
 
@@ -1085,6 +1094,12 @@ impl Hub {
                 }
             }
         }
+        // Carry the room's persisted leadership epoch across the load seam for the
+        // registry to drain into its live fence. A `0` (or absent) epoch is the
+        // never-led sentinel and seeds nothing.
+        if let Some(epoch) = log.epoch.filter(|&e| e > 0) {
+            self.loaded_epochs.insert(room.clone(), epoch);
+        }
         Ok(())
     }
 
@@ -1093,6 +1108,28 @@ impl Hub {
     /// leaves them — this only redirects new writes to disk.
     pub fn attach_store(&mut self, store: Store) {
         self.store = Some(store);
+    }
+
+    /// The per-room leadership epochs restored from the store on load — the fence
+    /// values a restart must not forget. Drained by the registry into its live
+    /// [`LeadershipEpochs`](crate::leadership::LeadershipEpochs) at construction;
+    /// empty for a store-less or never-led hub.
+    pub(crate) fn loaded_epochs(&self) -> &HashMap<RoomId, u64> {
+        &self.loaded_epochs
+    }
+
+    /// Persist `room`'s leadership epoch — the split-brain fence value (Unit 6b) —
+    /// so a restart reloads it and a stale-epoch leader cannot rejoin under it.
+    /// Called only when the epoch advances (a leadership change), so the blocking
+    /// write is off every hot path. A store-less hub is a no-op — the fence is then
+    /// purely in-memory, as before.
+    pub(crate) fn persist_epoch(&mut self, room: &[u8], epoch: u64) {
+        if let Some(store) = self.store.as_mut() {
+            // A persist failure degrades to a durability-cache miss (the fence
+            // rebuilds from live replication on the next leadership change), so it is
+            // logged-and-swallowed rather than failing the delivery that advanced it.
+            let _ = store.write_epoch(room, epoch);
+        }
     }
 
     /// Apply a client's ops to `room` (creating it if new), tagging each with
