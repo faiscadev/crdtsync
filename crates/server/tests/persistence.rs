@@ -67,6 +67,7 @@ fn one_room_log(room: &[u8], ops: Vec<Op>) -> Vec<(RoomId, RoomLog)> {
             branch_ops: Vec::new(),
             branch_bases: Vec::new(),
             active_branch: None,
+            epoch: None,
         },
     )]
 }
@@ -185,6 +186,7 @@ fn from_rooms_replays_independent_rooms() {
                 branch_ops: Vec::new(),
                 branch_bases: Vec::new(),
                 active_branch: None,
+                epoch: None,
             },
         ),
         (
@@ -198,6 +200,7 @@ fn from_rooms_replays_independent_rooms() {
                 branch_ops: Vec::new(),
                 branch_bases: Vec::new(),
                 active_branch: None,
+                epoch: None,
             },
         ),
     ];

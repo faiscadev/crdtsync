@@ -122,6 +122,12 @@ pub struct RoomLog {
     /// follows after a restore-as-branch switched it. `None` when the store holds
     /// none (the room has never been restored, so the default `main` is served).
     pub active_branch: Option<Vec<u8>>,
+    /// The room's persisted leadership epoch — the highest split-brain fence value
+    /// this node has observed for the room (Unit 6b). `None` when the store holds
+    /// none (a room whose leadership never changed). Reloaded into the node's
+    /// in-memory fence on startup so a restarted node cannot rejoin at a stale epoch
+    /// and re-accept a demoted leader's writes it would otherwise fence.
+    pub epoch: Option<u64>,
 }
 
 /// A directory of per-room logs and snapshots.
@@ -368,6 +374,24 @@ impl Store {
         )
     }
 
+    /// Persist `room`'s leadership epoch — the highest split-brain fence value the
+    /// node has observed for it (Unit 6b) — as an 8-byte little-endian record, so a
+    /// restart reloads the fence and a stale-epoch leader cannot rejoin under it. The
+    /// file lands atomically (temp, flushed, renamed, directory flushed), so a crash
+    /// never leaves a torn record. Called only when the epoch advances, which is rare
+    /// (a leadership change), so the per-write cost is not on any hot path. Epoch `0`
+    /// is the never-led sentinel and removes the file.
+    pub fn write_epoch(&mut self, room: &[u8], epoch: u64) -> io::Result<()> {
+        if epoch == 0 {
+            return self.remove_if_present(&self.epoch_path(room));
+        }
+        self.atomic_write(
+            &self.epoch_path(room),
+            &self.epoch_tmp_path(room),
+            &epoch.to_le_bytes(),
+        )
+    }
+
     /// Write `buf` to `path` atomically: fill `tmp`, flush it, rename it into
     /// place, then flush the directory so the rename itself is crash-durable. A
     /// reader sees either the whole prior file or the whole new one, never a torn
@@ -439,6 +463,10 @@ impl Store {
                 FileKind::BranchBase(branch) => slot.branch_bases.push((branch, bytes)),
                 // The active-HEAD branch name, stored verbatim.
                 FileKind::Active => slot.active_branch = Some(bytes),
+                // The leadership epoch — an 8-byte little-endian fence value. A
+                // malformed record loads as absent (the fence rebuilds from live
+                // replication), never fatal.
+                FileKind::Epoch => slot.epoch = parse_epoch(&bytes),
             }
         }
         Ok(rooms.into_iter().collect())
@@ -537,6 +565,18 @@ impl Store {
         ))
     }
 
+    /// The leadership-epoch file backing `room`.
+    fn epoch_path(&self, room: &[u8]) -> PathBuf {
+        self.root.join(format!("{}.epoch", Self::hex_name(room)))
+    }
+
+    /// The in-progress epoch temp for `room`, renamed onto `epoch_path` once
+    /// durable.
+    fn epoch_tmp_path(&self, room: &[u8]) -> PathBuf {
+        self.root
+            .join(format!("{}.epoch.tmp", Self::hex_name(room)))
+    }
+
     /// The active-HEAD file backing `room`.
     fn active_path(&self, room: &[u8]) -> PathBuf {
         self.root.join(format!("{}.active", Self::hex_name(room)))
@@ -570,6 +610,7 @@ enum FileKind {
     BranchLog(Vec<u8>),
     BranchBase(Vec<u8>),
     Active,
+    Epoch,
 }
 
 /// Recover a room id and file kind from a path, or `None` if it is not one of
@@ -593,6 +634,7 @@ fn classify(path: &Path) -> Option<(RoomId, FileKind)> {
         "meta" => FileKind::Meta,
         "branches" => FileKind::Branches,
         "active" => FileKind::Active,
+        "epoch" => FileKind::Epoch,
         _ => return None,
     };
     Some((decode_hex(stem)?, kind))
@@ -608,6 +650,14 @@ fn decode_hex(hex: &str) -> Option<RoomId> {
     hex.chunks(2)
         .map(|pair| Some(unhex(pair[0])? << 4 | unhex(pair[1])?))
         .collect()
+}
+
+/// Parse a leadership-epoch record: exactly an 8-byte little-endian `u64`. A
+/// wrong-length record is treated as absent (the fence rebuilds from live
+/// replication), matching the other durability-cache records that never fail the
+/// load.
+fn parse_epoch(bytes: &[u8]) -> Option<u64> {
+    bytes.try_into().ok().map(u64::from_le_bytes)
 }
 
 /// Parse a snapshot record: an 8-byte little-endian base sequence, then the

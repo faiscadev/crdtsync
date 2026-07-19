@@ -380,6 +380,72 @@ fn a_malformed_metadata_record_loads_as_absent_and_never_panics() {
     assert_eq!(rl.ops.len(), 1, "the log still loads");
 }
 
+// --- leadership epoch persistence ---
+
+#[test]
+fn an_epoch_round_trips_through_the_store() {
+    let tmp = tempdir();
+    {
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.write_epoch(ROOM, 7).unwrap();
+    }
+    let loaded = Store::open(tmp.path()).unwrap().load().unwrap();
+    let (_, rl) = loaded.iter().find(|(r, _)| r == ROOM).unwrap();
+    assert_eq!(rl.epoch, Some(7), "the persisted epoch reloads");
+}
+
+#[test]
+fn a_higher_epoch_overwrites_the_persisted_one() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.write_epoch(ROOM, 3).unwrap();
+    store.write_epoch(ROOM, 9).unwrap();
+    let loaded = Store::open(tmp.path()).unwrap().load().unwrap();
+    let (_, rl) = loaded.iter().find(|(r, _)| r == ROOM).unwrap();
+    assert_eq!(
+        rl.epoch,
+        Some(9),
+        "the latest written epoch is what reloads"
+    );
+}
+
+#[test]
+fn a_zero_epoch_removes_the_record() {
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    store.write_epoch(ROOM, 5).unwrap();
+    store.write_epoch(ROOM, 0).unwrap();
+    let loaded = Store::open(tmp.path()).unwrap().load().unwrap();
+    // The room may not exist at all (only the epoch file was written), or exist
+    // with no epoch — either way, no epoch survives.
+    let epoch = loaded
+        .iter()
+        .find(|(r, _)| r == ROOM)
+        .and_then(|(_, rl)| rl.epoch);
+    assert_eq!(epoch, None, "the never-led sentinel leaves no record");
+}
+
+#[test]
+fn a_malformed_epoch_record_loads_as_absent() {
+    let tmp = tempdir();
+    {
+        let store = Store::open(tmp.path()).unwrap();
+        let _ = store;
+    }
+    let epoch_file = {
+        let hex: String = ROOM.iter().map(|b| format!("{b:02x}")).collect();
+        tmp.path().join(format!("{hex}.epoch"))
+    };
+    // A wrong-length record (not 8 bytes) is a durability-cache miss, not fatal.
+    fs::write(&epoch_file, [1u8, 2, 3]).unwrap();
+    let loaded = Store::open(tmp.path()).unwrap().load().unwrap();
+    let epoch = loaded
+        .iter()
+        .find(|(r, _)| r == ROOM)
+        .and_then(|(_, rl)| rl.epoch);
+    assert_eq!(epoch, None, "a malformed epoch record loads as absent");
+}
+
 // --- a tempdir without pulling in a dev-dependency ---
 
 struct TempDir(std::path::PathBuf);
