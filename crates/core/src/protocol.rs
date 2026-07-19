@@ -408,6 +408,19 @@ pub enum Message {
         ops: Vec<Op>,
         token: Vec<u8>,
     },
+    /// A SWIM indirect-probe request: the sender's direct gossip probe to the
+    /// member at `target` (its advertise address) timed out, so it asks this relay
+    /// to probe that member on its behalf. The relay does a fresh liveness probe to
+    /// `target` and answers with a [`PingAck`](Message::PingAck). Node-to-node —
+    /// never a client frame; a client that sends one commits a protocol violation.
+    PingReq { target: Vec<u8> },
+    /// The relay's answer to a [`PingReq`](Message::PingReq): `reachable` is whether
+    /// its fresh probe of the target member succeeded. The requester disregards its
+    /// own direct-probe failure when any relay reports the target reachable, so a
+    /// member reachable through an intermediary is not falsely suspected. Node-to-
+    /// node — never a client frame; a client that sends one commits a protocol
+    /// violation.
+    PingAck { reachable: bool },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -761,6 +774,14 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, token);
             out.extend_from_slice(&encode_ops(ops));
         }
+        Message::PingReq { target } => {
+            put_u8(&mut out, 47);
+            put_bytes(&mut out, target);
+        }
+        Message::PingAck { reachable } => {
+            put_u8(&mut out, 48);
+            put_u8(&mut out, u8::from(*reachable));
+        }
     }
     out
 }
@@ -1093,6 +1114,12 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 ops: decode_ops(cur.rest()).map_err(ProtocolError::Op)?,
             });
         }
+        47 => Message::PingReq {
+            target: cur.bytes()?,
+        },
+        48 => Message::PingAck {
+            reachable: cur.u8()? != 0,
+        },
         tag => {
             return Err(ProtocolError::BadTag {
                 what: "message",

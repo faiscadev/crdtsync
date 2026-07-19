@@ -838,6 +838,12 @@ impl ClientSession {
                 Err(ClientError::UnexpectedMessage("server sent a replica ack"))
             }
             Message::Gossip { .. } => Err(ClientError::UnexpectedMessage("server sent a gossip")),
+            Message::PingReq { .. } => {
+                Err(ClientError::UnexpectedMessage("server sent a ping-req"))
+            }
+            Message::PingAck { .. } => {
+                Err(ClientError::UnexpectedMessage("server sent a ping-ack"))
+            }
         }
     }
 

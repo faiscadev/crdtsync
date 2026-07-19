@@ -21,12 +21,26 @@
 //! excluded from room leadership through [`Membership::is_live`]; it stays in the
 //! member set (permanent eviction/reaping is a follow-on).
 //!
-//! Scope of this cut: detection + dissemination + refutation over the gossip
-//! exchange. Not here: SWIM indirect probing (ping-req via k relays), a separate
-//! failure-detector socket, and member *removal* from the set — all refinements.
-//! The per-follower replication peer-connections are still dialed from the static
-//! boot set; wiring those to a member learned *after* boot is a follow-on, but its
-//! liveness now converges through gossip rather than staying optimistically live.
+//! SWIM indirect probing hardens the detector against a single bad link: when a
+//! node's *direct* gossip probe to a member fails, it asks up to
+//! [`INDIRECT_PROBE_COUNT`] other members for a second opinion on that member
+//! ([`Message::PingReq`]/[`Message::PingAck`]) before counting the failure. Each
+//! relay answers from its own liveness view (its gossip state + relay link for the
+//! target) — an independent vantage the failing direct path does not share, kept
+//! fresh by the relay's own ~1s gossip cadence. A target any relay still reaches
+//! ([`probe_outcome`]) is credited alive and its suspicion clock reset, so a
+//! transient or asymmetric blip on one node's path does not falsely escalate it;
+//! only a member every relay *also* reports unreachable counts toward
+//! `Suspect`/`Dead`. The relay answers synchronously from the registry actor (it
+//! never dials on a requester's behalf), so a ping-req is neither a task-spawn nor
+//! an outbound-dial amplification surface.
+//!
+//! Scope of this cut: detection (direct + indirect) + dissemination + refutation
+//! over the gossip exchange. Not here: a separate failure-detector socket, and
+//! member *removal* from the set — refinements. The per-follower replication
+//! peer-connections are still dialed from the static boot set; wiring those to a
+//! member learned *after* boot is a follow-on, but its liveness now converges
+//! through gossip rather than staying optimistically live.
 
 use std::time::Duration;
 
@@ -57,6 +71,16 @@ pub const GOSSIP_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a gossip round waits for a peer's reply before abandoning it and
 /// redialing next round — a slow or dead peer must not wedge the gossip loop.
 pub const GOSSIP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many other members a node asks to probe a target on its behalf when its own
+/// direct probe fails — the SWIM ping-req fan-out. A handful is enough that a
+/// target reachable through *any* live path is very likely confirmed, few enough
+/// that the indirect round stays cheap.
+pub const INDIRECT_PROBE_COUNT: usize = 3;
+
+/// How long an indirect probe waits for a relay's [`Message::PingAck`] before
+/// abandoning it — a relay that is itself slow or down must not wedge the round.
+pub const PING_REQ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build the [`Message::Gossip`] frame advertising `members` — the liveness tuples
 /// a node knows, as raw bytes for the wire.
@@ -121,6 +145,80 @@ pub fn choose_peer(members: &[GossipMember], self_id: &NodeId) -> Option<(NodeId
     Some((node.clone(), addr.clone()))
 }
 
+/// Pick up to `k` members to ask to probe `target` on this node's behalf — the
+/// SWIM ping-req relays — excluding `self_id`, the `target` itself, and any member
+/// gossip already holds `Dead` (asking a dead relay wastes a probe). Returns each
+/// chosen relay's `(node_id, advertise_addr)`. The choice is randomized (drawn from
+/// system entropy, kept out of the deterministic membership logic) and without
+/// replacement, so distinct relays are asked; fewer than `k` are returned when
+/// fewer are eligible.
+pub fn choose_relays(
+    members: &[GossipMember],
+    self_id: &NodeId,
+    target: &NodeId,
+    k: usize,
+) -> Vec<(NodeId, Vec<u8>)> {
+    let mut eligible: Vec<(NodeId, Vec<u8>)> = members
+        .iter()
+        .filter(|(node, _, _, state)| {
+            node != self_id && node != target && *state != MemberState::Dead
+        })
+        .map(|(node, addr, ..)| (node.clone(), addr.clone()))
+        .collect();
+    let take = k.min(eligible.len());
+    // Partial Fisher-Yates: draw `take` distinct relays by swapping a random
+    // remaining candidate into each front slot, so the prefix is a uniform sample
+    // without replacement.
+    for i in 0..take {
+        let span = (eligible.len() - i) as u64;
+        let mut bytes = [0u8; 8];
+        getrandom::getrandom(&mut bytes).expect("system entropy is available");
+        let j = i + (u64::from_le_bytes(bytes) % span) as usize;
+        eligible.swap(i, j);
+    }
+    eligible.truncate(take);
+    eligible
+}
+
+/// Whether an indirect probe round confirmed the target reachable: any relay that
+/// answered `Some(true)`. A relay this node could not reach (`None`) or that
+/// reported the target unreachable (`Some(false)`) is no evidence of life.
+pub fn indirect_reachable(results: &[Option<bool>]) -> bool {
+    results.iter().any(|r| *r == Some(true))
+}
+
+/// The reachability verdict for one SWIM probe round, folding the direct probe and
+/// the indirect (ping-req) fallback: reachable iff the direct probe succeeded, or
+/// any relay confirmed the target. A node feeds this to the failure detector —
+/// [`Membership::note_gossip_reachable`] when `true`, `note_gossip_unreachable`
+/// when `false` — so a direct-probe failure escalates suspicion only after every
+/// indirect probe *also* fails.
+pub fn probe_outcome(direct_reachable: bool, indirect: &[Option<bool>]) -> bool {
+    direct_reachable || indirect_reachable(indirect)
+}
+
+/// Ask the relay at `relay_addr` to report whether it can reach `target_addr` on
+/// this node's behalf: dial it, send a [`Message::PingReq`], and read back the
+/// [`Message::PingAck`]'s verdict. `Some(reachable)` is the relay's answer — its
+/// own liveness view of the target; `None` means the relay itself was unreachable
+/// (or replied nothing within [`PING_REQ_TIMEOUT`]), which is no evidence either
+/// way and the round simply consults the next relay.
+pub async fn ping_req_exchange(
+    relay_addr: &str,
+    server: ClientId,
+    target_addr: &[u8],
+) -> Option<bool> {
+    let frame = Message::PingReq {
+        target: target_addr.to_vec(),
+    };
+    relay_roundtrip(relay_addr, server, frame, PING_REQ_TIMEOUT, |m| match m {
+        Message::PingAck { reachable } => Some(reachable),
+        _ => None,
+    })
+    .await
+    .flatten()
+}
+
 /// Dial `addr` as a relay peer, push this node's `frame`, and pull the peer's
 /// [`Message::Gossip`] reply — the members it knows back. `None` on a dial,
 /// handshake, or send failure, or if the peer sends no gossip within
@@ -132,6 +230,30 @@ pub async fn gossip_exchange(
     server: ClientId,
     frame: Message,
 ) -> Option<Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>> {
+    relay_roundtrip(addr, server, frame, GOSSIP_TIMEOUT, |m| match m {
+        Message::Gossip { members } => Some(members),
+        _ => None,
+    })
+    .await
+    .flatten()
+}
+
+/// Open an ephemeral relay connection to `addr`, push one `frame`, and pull the
+/// peer's reply, returning the first inbound message `extract` accepts. Shared by
+/// the node-to-node exchanges (gossip anti-entropy and ping-req): the 8-byte
+/// header, the empty-`app_id` Hello that resolves to a relay so the peer accepts
+/// the node frame that follows, the send, then the read loop that skips control
+/// frames until `extract` yields. `None` on any dial/handshake/send failure, on a
+/// close before a match, or if nothing matches within `timeout`. The outer `Option`
+/// (from the timeout) and the inner (from the read) both collapse to "no reply", so
+/// callers `.flatten()`.
+async fn relay_roundtrip<T>(
+    addr: &str,
+    server: ClientId,
+    frame: Message,
+    timeout: Duration,
+    extract: impl Fn(Message) -> Option<T>,
+) -> Option<Option<T>> {
     let fut = async {
         let url = format!("ws://{addr}/");
         let (ws, _) = connect_async(&url).await.ok()?;
@@ -155,12 +277,13 @@ pub async fn gossip_exchange(
             .send(WsMessage::Binary(encode_message(&frame)))
             .await
             .ok()?;
-        // Read past control frames and the relay handshake for the gossip reply.
         loop {
             match read.next().await?.ok()? {
                 WsMessage::Binary(bytes) => {
-                    if let Ok(Message::Gossip { members }) = decode_message(&bytes) {
-                        return Some(members);
+                    if let Ok(msg) = decode_message(&bytes) {
+                        if let Some(value) = extract(msg) {
+                            return Some(value);
+                        }
                     }
                 }
                 WsMessage::Close(_) => return None,
@@ -168,8 +291,5 @@ pub async fn gossip_exchange(
             }
         }
     };
-    tokio::time::timeout(GOSSIP_TIMEOUT, fut)
-        .await
-        .ok()
-        .flatten()
+    tokio::time::timeout(timeout, fut).await.ok()
 }
