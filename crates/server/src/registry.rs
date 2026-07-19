@@ -417,6 +417,29 @@ impl Registry {
         true
     }
 
+    /// Answer a SWIM indirect-probe request on peer connection `id`: report this
+    /// node's own liveness view of the member at advertise address `target` as a
+    /// [`Message::PingAck`]. The requester's direct probe of the target failed, so it
+    /// asks this relay for a second opinion — reachable iff `target` is a member this
+    /// node knows **and** its own liveness ([`is_live`](Membership::is_live) — relay
+    /// link up and gossip has not declared it `Dead`) says it is up. A target this
+    /// node has never learned is answered unreachable, not optimistically alive, so
+    /// the relay never vouches for (nor is induced to dial) an address outside its
+    /// member set. Honored only in cluster mode — a ping-req on a single-node
+    /// deployment (no membership) is a stray frame and the connection is dropped.
+    /// Returns whether the connection stays open.
+    fn apply_ping_req(&mut self, id: ConnId, target: Vec<u8>) -> bool {
+        let Some(membership) = &self.membership else {
+            return false;
+        };
+        let node = NodeId::from(target);
+        let reachable = membership.is_member(&node) && membership.is_live(&node);
+        if let Some(conn) = self.conns.get_mut(&id) {
+            conn.outbox.push(Message::PingAck { reachable });
+        }
+        true
+    }
+
     /// Take every replication frame queued since the last drain — the transport
     /// routes each to its follower's peer connection.
     pub fn take_replication(&mut self) -> Vec<(NodeId, Message)> {
@@ -1252,6 +1275,13 @@ impl Registry {
                 epoch,
             } => return self.apply_replicate(id, room, branch, ops, base_seq, epoch),
             Message::Gossip { members } => return self.apply_gossip(id, members),
+            // A ping-req arrives node-to-node on a peer connection asking this relay
+            // for its liveness view of a third member; answer it off the client
+            // session path. A ping-ack is only ever read inline by the requester that
+            // sent the ping-req (never delivered), so one reaching here is unsolicited
+            // — drop the connection.
+            Message::PingReq { target } => return self.apply_ping_req(id, target),
+            Message::PingAck { .. } => return false,
             other => other,
         };
         // An awareness set consults the clock (to stamp last-seen); a cross-zone

@@ -260,6 +260,14 @@ impl Membership {
         &self.self_id == node
     }
 
+    /// Whether `node` is a member this view knows — in the canonical member set.
+    /// A node this view has never learned is not one it can vouch for, so an
+    /// indirect probe about it is answered unreachable rather than optimistically
+    /// alive.
+    pub fn is_member(&self, node: &NodeId) -> bool {
+        self.addrs.contains_key(node)
+    }
+
     /// The per-room replication factor this view places with.
     pub fn replication_factor(&self) -> usize {
         self.replication_factor

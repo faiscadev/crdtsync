@@ -822,6 +822,8 @@ Leader dies → followers elect new leader → clients reconnect → resume from
 
 Static join via CLI flag, or gossip-based for liveness / room ownership / replication state / membership.
 
+Failure detection is SWIM-style over the gossip exchange: a missed direct probe escalates a member `Alive → Suspect → Dead`, disseminated by anti-entropy and refutable by incarnation bump. **Indirect probing** hardens it against a single bad link — a failed direct probe consults up to k other members (`PingReq`/`PingAck`) before counting the failure, so a member reachable through any relay is not falsely suspected. Each relay answers from its own cached liveness view (an independent vantage), synchronously off the registry actor — never a fresh outbound dial on a requester's behalf, so a ping-req is neither a task-spawn nor an SSRF surface.
+
 ---
 
 # Awareness

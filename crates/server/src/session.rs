@@ -1025,6 +1025,10 @@ pub fn step(
         // Gossip is a node-to-node membership advertisement the registry handles
         // off the client session path; a client that sends one violates.
         Message::Gossip { .. } => violation("client sent a gossip"),
+        // Ping-req/-ack are node-to-node SWIM indirect-probe frames the transport
+        // services off the client session path; a client that sends one violates.
+        Message::PingReq { .. } => violation("client sent a ping-req"),
+        Message::PingAck { .. } => violation("client sent a ping-ack"),
     }
 }
 

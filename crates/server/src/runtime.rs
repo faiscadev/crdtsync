@@ -742,13 +742,66 @@ async fn gossip_loop(server: ClientId, self_id: NodeId, cmds: UnboundedSender<Cm
         };
         let addr = String::from_utf8_lossy(&peer_addr).into_owned();
         let frame = crate::gossip::gossip_frame(&members);
-        // A successful round is first-hand proof the peer is alive and carries the
-        // liveness it advertised back; a failed one counts toward suspecting it.
-        let learned = crate::gossip::gossip_exchange(&addr, server, frame).await;
+        // A successful direct round is first-hand proof the peer is alive and
+        // carries the liveness it advertised back.
+        let direct = crate::gossip::gossip_exchange(&addr, server, frame).await;
+        // On a direct failure, ask a few other members for a second opinion (SWIM
+        // ping-req) before counting the failure toward suspicion: a peer any relay
+        // still reaches is not falsely suspected. The direct and indirect signals
+        // fold through the same `probe_outcome` the spec tests drive.
+        let indirect = if direct.is_some() {
+            Vec::new()
+        } else {
+            indirect_probe(server, &members, &self_id, &peer, &peer_addr).await
+        };
+        let reachable = crate::gossip::probe_outcome(direct.is_some(), &indirect);
+        // A direct success carries the liveness the peer advertised back; an
+        // indirect-only success reports the peer reachable but has nothing to merge
+        // (an empty learned set); an all-failed round reports it unreachable (`None`).
+        let learned = match direct {
+            Some(members) => Some(members),
+            None => reachable.then(Vec::new),
+        };
         if cmds.send(Cmd::GossipRound { peer, learned }).is_err() {
             return;
         }
     }
+}
+
+/// Probe `peer` indirectly after a direct round failed: ask up to
+/// [`INDIRECT_PROBE_COUNT`](crate::gossip::INDIRECT_PROBE_COUNT) other members for
+/// their liveness view of it, returning each relay's answer. The relays are probed
+/// *concurrently* and the round short-circuits as soon as one confirms the peer
+/// reachable, so one confirming relay bounds the round at a single
+/// [`PING_REQ_TIMEOUT`](crate::gossip::PING_REQ_TIMEOUT) — a slow or dead relay
+/// never serializes onto the gossip loop's tick budget. A `None` answer (the relay
+/// itself unreachable) is no evidence either way.
+async fn indirect_probe(
+    server: ClientId,
+    members: &[GossipMember],
+    self_id: &NodeId,
+    peer: &NodeId,
+    peer_addr: &[u8],
+) -> Vec<Option<bool>> {
+    let relays =
+        crate::gossip::choose_relays(members, self_id, peer, crate::gossip::INDIRECT_PROBE_COUNT);
+    let mut probes: futures_util::stream::FuturesUnordered<_> = relays
+        .into_iter()
+        .map(|(_relay, relay_addr)| {
+            let relay_addr = String::from_utf8_lossy(&relay_addr).into_owned();
+            let peer_addr = peer_addr.to_vec();
+            async move { crate::gossip::ping_req_exchange(&relay_addr, server, &peer_addr).await }
+        })
+        .collect();
+    let mut results = Vec::new();
+    while let Some(result) = probes.next().await {
+        results.push(result);
+        // A single confirming relay is enough — stop consulting the rest.
+        if result == Some(true) {
+            break;
+        }
+    }
+    results
 }
 
 /// Own the socket to one follower: dial it, relay the replication frames that
