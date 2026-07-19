@@ -58,7 +58,7 @@ pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{Branch, RoomLog, RoomMeta, Snapshot, Store, StoredOp};
 pub use tls::{
     actor_from_client_cert, server_config_from_pem, server_config_from_pem_with_client_ca,
-    TlsConfigError,
+    server_config_from_pem_with_client_ca_mode, ClientAuthMode, TlsConfigError,
 };
 pub use webhook::{WebhookConfig, WebhookSink};
 pub use zonetoken::{CrossZoneGrant, ZoneSealer};

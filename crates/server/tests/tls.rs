@@ -17,7 +17,8 @@ use crdtsync_core::protocol::{Channel, PROTOCOL_VERSION};
 use crdtsync_core::{decode_message, encode_header, encode_message, ClientId, Message};
 use crdtsync_server::runtime::{serve_with, serve_with_authorizer, ServeConfig};
 use crdtsync_server::{
-    server_config_from_pem, server_config_from_pem_with_client_ca, Action, AllowAll, Authorizer,
+    server_config_from_pem, server_config_from_pem_with_client_ca,
+    server_config_from_pem_with_client_ca_mode, Action, AllowAll, Authorizer, ClientAuthMode,
     Identity, PermitAll, Resource, TlsConfigError,
 };
 
@@ -399,6 +400,42 @@ async fn start_mtls_server(ca: &TestCa, authorizer: Box<dyn Authorizer + Send + 
     }
 }
 
+/// Start a server in mTLS **request** mode against `ca`: it presents a cert
+/// request and validates any cert a client presents, but a client presenting *no*
+/// cert is admitted (opportunistic mTLS) and falls through to the certless session
+/// path. An in-band credential is verified through `AllowAll`.
+async fn start_mtls_request_server(
+    ca: &TestCa,
+    authorizer: Box<dyn Authorizer + Send + Sync>,
+) -> Server {
+    let cert = test_cert();
+    let tls = server_config_from_pem_with_client_ca_mode(
+        &cert.cert_path,
+        &cert.key_path,
+        &ca.ca_pem_path,
+        ClientAuthMode::Request,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(serve_with_authorizer(
+        listener,
+        cid(0xFF),
+        None,
+        ServeConfig {
+            tls: Some(tls),
+            ..ServeConfig::default()
+        },
+        Box::new(AllowAll),
+        authorizer,
+    ));
+    Server {
+        addr,
+        cert_der: cert.cert_der.clone(),
+        task,
+    }
+}
+
 /// Complete a TLS handshake to `server`, optionally presenting `client` as the
 /// client certificate. Returns the handshake result — `Err` is a rejected
 /// handshake (the fail-closed path), `Ok` a live encrypted WebSocket. A rejected
@@ -615,6 +652,78 @@ async fn a_server_with_no_client_ca_still_accepts_a_certless_client() {
     );
 }
 
+// --- mTLS request mode: opportunistic (authenticate-if-presented) --------------
+
+/// Request mode still binds a presented valid cert's identity exactly as require
+/// mode: authenticate-if-presented. A client offering a CA-signed cert is
+/// authenticated as its SAN without any in-band Auth.
+#[tokio::test]
+async fn a_request_mode_client_with_a_valid_cert_binds_its_identity() {
+    let ca = test_ca();
+    let server = start_mtls_request_server(&ca, Box::new(PermitAll)).await;
+    let mut ws = open_client(&server, Some(ca.issue(&["alice"], Some("ignored-cn"))))
+        .await
+        .expect("a CA-signed cert handshakes in request mode");
+    assert_eq!(
+        cert_authok_actor(&mut ws).await,
+        b"alice".to_vec(),
+        "a presented valid cert authenticates as its SAN, as in require mode"
+    );
+}
+
+/// The relaxation: a client presenting NO cert is admitted in request mode (not
+/// rejected at the handshake) and falls through to the ordinary certless session
+/// path — it authenticates in band exactly as a non-mTLS connection does.
+#[tokio::test]
+async fn a_request_mode_certless_client_connects_and_authenticates_in_band() {
+    let ca = test_ca();
+    let server = start_mtls_request_server(&ca, Box::new(PermitAll)).await;
+    let mut ws = open_client(&server, None)
+        .await
+        .expect("request mode admits a client presenting no cert (not rejected)");
+    ws.send(WsMessage::Binary(encode_header(PROTOCOL_VERSION).to_vec()))
+        .await
+        .unwrap();
+    send(
+        &mut ws,
+        &Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0,
+        },
+    )
+    .await;
+    send(
+        &mut ws,
+        &Message::Auth {
+            credential: b"cred".to_vec(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv(&mut ws).await,
+        Message::AuthOk {
+            actor: b"cred".to_vec(),
+        },
+        "a certless request-mode client falls through to the in-band credential path"
+    );
+}
+
+/// The boundary that must hold: request mode relaxes cert *absence* only. A client
+/// that *presents* a cert not chaining to the configured CA is STILL rejected at
+/// the handshake — a bad presented cert is never treated as anonymous.
+#[tokio::test]
+async fn a_request_mode_untrusted_cert_is_still_rejected() {
+    let trusted = test_ca();
+    let rogue = test_ca();
+    let server = start_mtls_request_server(&trusted, Box::new(PermitAll)).await;
+    let result = open_client(&server, Some(rogue.issue(&["mallory"], None))).await;
+    assert!(
+        result.is_err(),
+        "request mode validates a presented cert: an untrusted one is still rejected"
+    );
+}
+
 // --- mTLS ServerConfig construction (no socket) ---
 
 #[test]
@@ -648,4 +757,60 @@ fn a_missing_client_ca_path_is_a_loud_error() {
     )
     .expect_err("a missing client-CA file must fail");
     assert!(matches!(err, TlsConfigError::Io { .. }), "got {err:?}");
+}
+
+#[test]
+fn a_request_mode_client_ca_builds_an_mtls_server_config() {
+    let cert = test_cert();
+    let ca = test_ca();
+    assert!(
+        server_config_from_pem_with_client_ca_mode(
+            &cert.cert_path,
+            &cert.key_path,
+            &ca.ca_pem_path,
+            ClientAuthMode::Request,
+        )
+        .is_ok(),
+        "request mode builds a valid mTLS config"
+    );
+}
+
+// --- client-auth mode parsing: default is the secure `require` -----------------
+
+#[test]
+fn absent_client_auth_mode_defaults_to_require() {
+    assert_eq!(
+        ClientAuthMode::parse(None).unwrap(),
+        ClientAuthMode::Require,
+        "an unset CRDTSYNC_TLS_CLIENT_AUTH is the secure require default"
+    );
+    assert_eq!(ClientAuthMode::default(), ClientAuthMode::Require);
+}
+
+#[test]
+fn client_auth_mode_parses_require_and_request_case_insensitively() {
+    for v in ["require", "REQUIRE", " Require "] {
+        assert_eq!(
+            ClientAuthMode::parse(Some(v)).unwrap(),
+            ClientAuthMode::Require,
+            "{v:?} parses as require"
+        );
+    }
+    for v in ["request", "REQUEST", " Request "] {
+        assert_eq!(
+            ClientAuthMode::parse(Some(v)).unwrap(),
+            ClientAuthMode::Request,
+            "{v:?} parses as request"
+        );
+    }
+}
+
+#[test]
+fn an_unrecognized_client_auth_mode_is_a_loud_error_not_the_permissive_mode() {
+    let err = ClientAuthMode::parse(Some("allow-any"))
+        .expect_err("an unknown mode must fail, never resolve to the permissive request mode");
+    assert!(
+        matches!(err, TlsConfigError::BadClientAuthMode(ref v) if v == "allow-any"),
+        "got {err:?}"
+    );
 }
