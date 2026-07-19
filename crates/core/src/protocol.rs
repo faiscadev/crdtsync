@@ -290,6 +290,26 @@ pub enum Message {
     /// watermark the leader records per follower. Node-to-node — never a client
     /// frame; a client that sends one commits a protocol violation.
     ReplicaAck { room: Vec<u8>, through_seq: u64 },
+    /// A room's leader hands a below-floor follower a whole-replica snapshot the
+    /// ops path cannot carry. A follower whose acknowledged watermark sits below
+    /// the leader's compaction floor — a brand-new replica at `0`, or one whose
+    /// acked position predates a compaction — is missing ops that have been folded
+    /// away, so a [`Replicate`](Message::Replicate) delta cannot converge it. The
+    /// leader instead sends the current whole-replica `state` (the `encode_state`
+    /// snapshot) tagged with `seq`, the server sequence it represents (the leader's
+    /// head). The follower `decode_state`-loads it, *replacing* its replica — so a
+    /// re-sent snapshot is idempotent — lands its sequence at `seq`, acks it, and
+    /// resumes the ops tail above the floor via the steady replication path. `epoch`
+    /// is the leader's leadership generation, fenced exactly as a `Replicate`, so a
+    /// stale leader's snapshot cannot resurrect. Node-to-node — never a client
+    /// frame; a client that sends one commits a protocol violation.
+    ReplicateSnapshot {
+        room: Vec<u8>,
+        branch: Vec<u8>,
+        seq: u64,
+        state: Vec<u8>,
+        epoch: u64,
+    },
     /// A node's advertisement of the cluster members it knows, for gossip
     /// membership discovery and SWIM-style failure detection: `members` is a set of
     /// `(node_id, advertise_addr, incarnation, state)` tuples — the node id a peer
@@ -654,6 +674,20 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, room);
             put_u64(&mut out, *through_seq);
         }
+        Message::ReplicateSnapshot {
+            room,
+            branch,
+            seq,
+            state,
+            epoch,
+        } => {
+            put_u8(&mut out, 49);
+            put_bytes(&mut out, room);
+            put_bytes(&mut out, branch);
+            put_u64(&mut out, *seq);
+            put_u64(&mut out, *epoch);
+            put_bytes(&mut out, state);
+        }
         Message::Gossip { members } => {
             put_u8(&mut out, 26);
             put_u32(
@@ -988,6 +1022,20 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let room = cur.bytes()?;
             let through_seq = cur.u64()?;
             Message::ReplicaAck { room, through_seq }
+        }
+        49 => {
+            let room = cur.bytes()?;
+            let branch = cur.bytes()?;
+            let seq = cur.u64()?;
+            let epoch = cur.u64()?;
+            let state = cur.bytes()?;
+            Message::ReplicateSnapshot {
+                room,
+                branch,
+                seq,
+                state,
+                epoch,
+            }
         }
         26 => {
             let count = cur.u32()?;
