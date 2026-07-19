@@ -265,15 +265,16 @@ fn commit_follower_state(r: &mut Registry, room: &[u8]) {
     r.take_outbox(peer);
 }
 
-// --- the below-floor boundary: a compacted room is not ops-caught-up (follow-on) ---
+// --- the below-floor boundary: a compacted room is caught up by a snapshot ---
 
 #[test]
-fn a_below_floor_follower_is_not_partially_dialed() {
+fn a_below_floor_follower_is_dialed_a_snapshot_not_a_partial_delta() {
     // A brand-new follower (watermark 0) joining a room the leader has compacted is
     // below the floor — the ops it needs are folded into a snapshot the ops path
     // cannot carry. The dial must NOT send a partial post-floor delta (which would
-    // leave the follower divergent); the whole-replica snapshot transfer is a
-    // documented follow-on, so the room is skipped.
+    // leave the follower divergent); it sends the whole-replica snapshot instead (the
+    // state-transfer catch-up). The snapshot path itself is exercised in depth in
+    // `snapshot_transfer.rs`.
     let room = room_led_by_a_with_b_follower();
     let b = NodeId::from_addr(B);
     let mut leader = node(Some(A));
@@ -286,12 +287,20 @@ fn a_below_floor_follower_is_not_partially_dialed() {
         "the room compacted above the floor"
     );
 
-    // A brand-new follower is below the floor — no ops frame is dialed.
+    // A brand-new follower is below the floor — a snapshot frame is dialed, never a
+    // partial ops delta.
     leader.catch_up_follower(&b);
-    let dialed = leader.take_replication().into_iter().any(|(n, _)| n == b);
+    let frames: Vec<Message> = leader
+        .take_replication()
+        .into_iter()
+        .filter(|(n, _)| *n == b)
+        .map(|(_, f)| f)
+        .collect();
+    assert_eq!(frames.len(), 1, "one catch-up frame for B, got {frames:?}");
     assert!(
-        !dialed,
-        "a below-floor follower is not served a partial delta (snapshot transfer is a follow-on)"
+        matches!(frames[0], Message::ReplicateSnapshot { .. }),
+        "a below-floor follower is served a snapshot, not a partial delta: {:?}",
+        frames[0]
     );
 }
 

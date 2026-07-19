@@ -1439,14 +1439,33 @@ impl Hub {
         if self.rooms.contains_key(room) {
             return Ok(false);
         }
+        // The whole imported history is folded into the snapshot, so its floor sits at
+        // the op count (`None`) — a fresh subscriber lands below it and is served the
+        // state rather than an empty delta. Sequences renumber from here; they are
+        // server-local, so a move never collides with the origin's.
+        self.install_room_state(room, state, None)?;
+        Ok(true)
+    }
+
+    /// Decode `state` and install it as `room`'s replica, *replacing* any existing room
+    /// — the shared body of [`import_room`](Hub::import_room) (which guards create-only
+    /// first) and [`install_snapshot`](Hub::install_snapshot). `floor` is the compaction
+    /// floor to land it at: `Some(seq)` pins it (a snapshot state-transfer lands at the
+    /// leader's head), `None` floors it at the op count (a room move renumbers its
+    /// sequences server-local). The merged state, element/client identities, and dedup
+    /// set come back, so a client resending its ops is deduped exactly as against the
+    /// origin. Malformed bytes are an `InvalidData` error; with a store attached the
+    /// snapshot is persisted before the room commits, so the install survives a restart.
+    fn install_room_state(
+        &mut self,
+        room: &[u8],
+        state: &[u8],
+        floor: Option<u64>,
+    ) -> io::Result<()> {
         let doc = Document::decode_state(state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
         let seen: HashSet<OpId> = doc.seen().collect();
-        // The whole imported history is folded into the snapshot, so its floor
-        // sits at the op count — a fresh subscriber lands below it and is served
-        // the state rather than an empty delta. Sequences renumber from here;
-        // they are server-local, so a move never collides with the origin's.
-        let base_seq = seen.len() as u64;
+        let base_seq = floor.unwrap_or(seen.len() as u64);
         if let Some(store) = self.store.as_mut() {
             store.compact(room, base_seq, state)?;
         }
@@ -1461,7 +1480,26 @@ impl Hub {
                 creator: None,
             },
         );
-        Ok(true)
+        Ok(())
+    }
+
+    /// Install `state` — a whole-replica snapshot produced by [`export_room`](Hub::export_room)
+    /// or [`catch_up`](Hub::catch_up)'s [`Catchup::Snapshot`] — as `room`'s replica,
+    /// landing its high-water at server sequence `seq` (the leader head the snapshot
+    /// represents). This is the follower-side of the below-floor state-transfer
+    /// catch-up: a follower whose acked watermark fell below the leader's compaction
+    /// floor cannot be converged by an ops delta (the ops it needs are compacted
+    /// away), so it decodes the leader's snapshot instead.
+    ///
+    /// Unlike [`import_room`](Hub::import_room), which is create-only, this *replaces*
+    /// any existing room: a re-sent snapshot decodes over the stale replica, so the
+    /// transfer is idempotent. The floor is pinned to `seq` (not renumbered from the op
+    /// count, as `import_room` does for a room *move*), so the follower's head equals
+    /// the leader's and later replicated ops — carried in the leader's sequence space
+    /// — place correctly above it. Malformed bytes are an `InvalidData` error; with a
+    /// store attached the snapshot is persisted before the room commits.
+    pub fn install_snapshot(&mut self, room: &[u8], state: &[u8], seq: u64) -> io::Result<()> {
+        self.install_room_state(room, state, Some(seq))
     }
 
     /// Clone `src`'s live state into a fresh room `dst` — "duplicate this doc as a

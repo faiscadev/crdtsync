@@ -120,6 +120,22 @@ pub struct Registry {
     pending_acks: Vec<PendingAck>,
 }
 
+/// The disposition of a node-to-node replication frame for a room, decided by the
+/// shared membership + leadership-epoch fence — see
+/// [`gate_replica_frame`](Registry::gate_replica_frame).
+enum ReplicaGate {
+    /// A stray frame — the node lacks membership, does not hold the room, leads it
+    /// without being superseded, or it names a non-`main` branch: drop the connection.
+    Reject,
+    /// A stale-epoch frame from a demoted-then-recovered leader: no apply, but the
+    /// connection stays open (the stale leader steps down when it observes the higher
+    /// epoch on the new leader's stream).
+    Fenced,
+    /// Committed to apply — the fence has been advanced and persisted, so the caller
+    /// folds the frame's payload into the replica.
+    Apply,
+}
+
 impl Registry {
     /// An in-memory registry whose hub's replicas are owned by `server`.
     pub fn new(server: ClientId) -> Self {
@@ -304,8 +320,10 @@ impl Registry {
     ///
     /// A follower below the compaction floor (a brand-new follower joining a room the
     /// leader has since compacted) needs a whole-replica snapshot the ops path cannot
-    /// carry; that state-transfer catch-up is a documented follow-on, so such a room
-    /// is skipped rather than served a partial delta that would leave it divergent.
+    /// carry: the pre-floor ops are gone, so a delta would leave it divergent. Such a
+    /// room is caught up by a [`Message::ReplicateSnapshot`] state-transfer instead —
+    /// the leader branches on the follower's watermark versus the room's floor, which
+    /// [`Hub::catch_up`](crate::Hub::catch_up) folds into its reply.
     ///
     /// The catch-up ranges from the follower's *acknowledged* watermark, which is its
     /// durable position under the same persist-before-ack assumption the majority-ack
@@ -337,42 +355,93 @@ impl Registry {
             .collect();
         for room in rooms {
             let watermark = self.replication.watermark(&room, follower);
-            let ops: Vec<Op> = match self.hub.catch_up(&room, watermark) {
-                Catchup::Ops(records) => records.into_iter().map(|rec| rec.op).collect(),
-                // Below the floor: a whole-replica snapshot the ops path cannot carry
-                // (the pre-floor ops are compacted away) — the state-transfer catch-up
-                // is a follow-on, so skip rather than send a partial delta.
-                Catchup::Snapshot { .. } => continue,
-            };
-            if ops.is_empty() {
-                continue;
-            }
-            let base_seq = self.hub.base_seq(&room);
-            // Stamp the catch-up with this node's leadership epoch, as the steady path
-            // does; a steady leader keeps its stable epoch (no spurious bump), and any
-            // advance is persisted.
-            let before = self.epochs.highest_seen(&room);
-            let epoch = self.epochs.claim_leadership(&room);
-            self.persist_epoch_if_advanced(&room, before);
-            self.replication.enqueue(
-                follower.clone(),
-                Message::Replicate {
+            // The frame to dial, or `None` when there is nothing to send (the follower
+            // is already at the head). The leader branches by comparing the follower's
+            // watermark to the room's compaction floor, which `catch_up` folds into its
+            // reply: at or above the floor it yields the ops past the watermark (an
+            // ordinary delta), below it — the ops the follower needs are compacted away
+            // — it yields the whole-replica snapshot at the head. So a follower below
+            // the floor is caught up by a state-transfer rather than a futile ops-replay
+            // that would leave it divergent; one at or above it keeps the ops-tail path.
+            let frame = match self.hub.catch_up(&room, watermark) {
+                Catchup::Ops(records) => {
+                    let ops: Vec<Op> = records.into_iter().map(|rec| rec.op).collect();
+                    if ops.is_empty() {
+                        continue;
+                    }
+                    let base_seq = self.hub.base_seq(&room);
+                    Message::Replicate {
+                        room: room.clone(),
+                        branch: MAIN_BRANCH.to_vec(),
+                        ops,
+                        base_seq,
+                        epoch: self.claim_and_persist_epoch(&room),
+                    }
+                }
+                // Below the floor: send the whole-replica snapshot the ops path cannot
+                // carry, tagged with the sequence it lands the follower at. The follower
+                // decodes it, converging before it serves; the steady path resumes the
+                // tail above it.
+                Catchup::Snapshot { seq, state } => Message::ReplicateSnapshot {
                     room: room.clone(),
                     branch: MAIN_BRANCH.to_vec(),
-                    ops,
-                    base_seq,
-                    epoch,
+                    seq,
+                    state,
+                    epoch: self.claim_and_persist_epoch(&room),
                 },
-            );
+            };
+            self.replication.enqueue(follower.clone(), frame);
         }
+    }
+
+    /// Claim this node's leadership epoch for `room` and persist it when it advances
+    /// — the stamp a catch-up frame carries, as the steady replication path does. A
+    /// steady leader keeps its stable epoch (no spurious bump); any advance is written
+    /// through so a restart reloads the fence.
+    fn claim_and_persist_epoch(&mut self, room: &[u8]) -> u64 {
+        let before = self.epochs.highest_seen(room);
+        let epoch = self.epochs.claim_leadership(room);
+        self.persist_epoch_if_advanced(room, before);
+        epoch
+    }
+
+    /// The shared membership + leadership-epoch fence for a node-to-node replication
+    /// frame (`Replicate` and `ReplicateSnapshot`) for `room` on `branch` stamped
+    /// `epoch`. A frame is applied only while this node merely *follows* `room`: it
+    /// must hold the room (placement) and not itself lead it, unless a strictly higher
+    /// `epoch` supersedes that leadership (the recovered-stale-leader reconciliation),
+    /// and it must name the `main` stream (a leader replicates only `main`). A frame
+    /// below the highest epoch this node has seen is fenced — it comes from a demoted
+    /// leader that missed the promotion, and applying it would resurrect its writes.
+    /// On [`Apply`](ReplicaGate::Apply) the fence is advanced (stepping down if
+    /// superseded) and persisted, so a restart reloads it and a later lower-epoch frame
+    /// is fenced; the step-down is deferred to here so a rejected frame never churns
+    /// this node's leadership epoch.
+    fn gate_replica_frame(&mut self, room: &[u8], branch: &[u8], epoch: u64) -> ReplicaGate {
+        let Some(membership) = &self.membership else {
+            return ReplicaGate::Reject;
+        };
+        let owns = membership.owns(room);
+        let leads = membership.is_effective_primary_for(room);
+        if epoch < self.epochs.highest_seen(room) {
+            return ReplicaGate::Fenced;
+        }
+        let supersedes = self.epochs.leads_below(room, epoch);
+        if !owns || (leads && !supersedes) || branch != MAIN_BRANCH {
+            return ReplicaGate::Reject;
+        }
+        let before = self.epochs.highest_seen(room);
+        self.epochs.supersede_if_leading(room, epoch);
+        self.epochs.observe(room, epoch);
+        self.persist_epoch_if_advanced(room, before);
+        ReplicaGate::Apply
     }
 
     /// Apply a leader's replicated `ops` into this node's follower replica of
     /// `room`, queueing a [`Message::ReplicaAck`] on the peer connection `id` with
-    /// the sequence the replica has reached. Honored only on a node that holds
-    /// `room` as a follower — without membership (single-node), or for a room this
-    /// node does not replicate, or one it leads, a Replicate is a stray frame and
-    /// the connection is dropped. Returns whether the connection stays open.
+    /// the sequence the replica has reached. Gated by [`gate_replica_frame`](Registry::gate_replica_frame):
+    /// a stray frame drops the connection, a stale-epoch one is fenced. Returns
+    /// whether the connection stays open.
     fn apply_replicate(
         &mut self,
         id: ConnId,
@@ -382,57 +451,53 @@ impl Registry {
         base_seq: u64,
         epoch: u64,
     ) -> bool {
-        let Some(membership) = &self.membership else {
-            return false;
-        };
-        let owns = membership.owns(&room);
-        let leads = membership.is_effective_primary_for(&room);
-        // Fence a stale leader: a frame below the highest epoch this node has seen
-        // for the room comes from a demoted-then-recovered primary that missed the
-        // promotion. Drop it — no apply, no ack — so its writes cannot resurrect.
-        // The connection stays open; the stale leader steps down when it in turn
-        // observes the higher epoch on the new leader's stream.
-        if epoch < self.epochs.highest_seen(&room) {
-            return true;
+        match self.gate_replica_frame(&room, &branch, epoch) {
+            ReplicaGate::Reject => return false,
+            ReplicaGate::Fenced => return true,
+            ReplicaGate::Apply => {}
         }
-        // A frame at a strictly higher epoch than this node leads at supersedes its
-        // leadership, so it converges on the new leader's stream even as the
-        // placement primary — the recovered-stale-leader reconciliation. The
-        // step-down itself is deferred until the frame is committed to below, so a
-        // frame this node rejects never churns its leadership epoch.
-        let supersedes = self.epochs.leads_below(&room, epoch);
-        // A node applies a Replicate only while it merely follows the room: it must
-        // hold the room (placement) and not itself lead it, unless a strictly
-        // higher epoch supersedes that leadership.
-        if !owns {
-            return false;
-        }
-        if leads && !supersedes {
-            return false;
-        }
-        // A leader replicates only the `main` stream (see `enqueue_replication`),
-        // so a non-`main` frame is anomalous — drop it rather than misapply it to
-        // a branch the follower may not hold.
-        if branch != MAIN_BRANCH {
-            return false;
-        }
-        // Committed to apply: step down if superseded, and record the leader's epoch
-        // as this room's highest seen so later frames below it are fenced. Persist the
-        // advance so a restart reloads the fence — a follower that forgot the highest
-        // epoch it had seen would re-accept a demoted leader's stale-epoch writes.
-        let before = self.epochs.highest_seen(&room);
-        self.epochs.supersede_if_leading(&room, epoch);
-        self.epochs.observe(&room, epoch);
-        self.persist_epoch_if_advanced(&room, before);
-        // `base_seq` is the leader's compaction floor, carried so a future
-        // snapshot-based catch-up can align a late follower's sequence space. Unit
-        // 4 replicates the whole log from the first op, so the follower's own head
-        // already equals the leader's and the ack needs no adjustment.
+        // `base_seq` is the leader's compaction floor. Unit 4 replicates the whole log
+        // from the first op, so a follower on the ops path already tracks the leader's
+        // sequence space (a below-floor follower takes the snapshot path instead), and
+        // the ack needs no adjustment.
         let _ = base_seq;
-        // Ingest through the same path a client `Ops` write uses. A replicated
-        // write carries no schema version — the leader logs its writers' ops
-        // untagged on the relay seam, and the follower mirrors them verbatim.
+        // Ingest through the same path a client `Ops` write uses. A replicated write
+        // carries no schema version — the leader logs its writers' ops untagged on the
+        // relay seam, and the follower mirrors them verbatim.
         if self.hub.ingest(&room, ops, None).is_err() {
+            return false;
+        }
+        let through_seq = self.hub.seq(&room);
+        if let Some(conn) = self.conns.get_mut(&id) {
+            conn.outbox.push(Message::ReplicaAck { room, through_seq });
+        }
+        true
+    }
+
+    /// Install a leader's whole-replica `state` snapshot into this node's follower
+    /// replica of `room` — the below-floor state-transfer catch-up. A follower whose
+    /// acked watermark fell below the leader's compaction floor is missing ops that
+    /// have been compacted away, so a `Replicate` delta cannot converge it; the leader
+    /// sends the snapshot instead, and the follower `decode_state`-loads it, landing
+    /// its sequence at `seq` and acking it. Replaces any existing replica, so a
+    /// re-sent snapshot is idempotent. Gated by [`gate_replica_frame`](Registry::gate_replica_frame),
+    /// exactly as [`apply_replicate`](Registry::apply_replicate). Returns whether the
+    /// connection stays open.
+    fn apply_replicate_snapshot(
+        &mut self,
+        id: ConnId,
+        room: RoomId,
+        branch: Vec<u8>,
+        seq: u64,
+        state: Vec<u8>,
+        epoch: u64,
+    ) -> bool {
+        match self.gate_replica_frame(&room, &branch, epoch) {
+            ReplicaGate::Reject => return false,
+            ReplicaGate::Fenced => return true,
+            ReplicaGate::Apply => {}
+        }
+        if self.hub.install_snapshot(&room, &state, seq).is_err() {
             return false;
         }
         let through_seq = self.hub.seq(&room);
@@ -1399,6 +1464,13 @@ impl Registry {
                 base_seq,
                 epoch,
             } => return self.apply_replicate(id, room, branch, ops, base_seq, epoch),
+            Message::ReplicateSnapshot {
+                room,
+                branch,
+                seq,
+                state,
+                epoch,
+            } => return self.apply_replicate_snapshot(id, room, branch, seq, state, epoch),
             Message::Gossip { members } => return self.apply_gossip(id, members),
             // A ping-req arrives node-to-node on a peer connection asking this relay
             // for its liveness view of a third member; answer it off the client

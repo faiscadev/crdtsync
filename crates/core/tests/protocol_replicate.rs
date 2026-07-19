@@ -170,6 +170,69 @@ fn a_corrupt_op_batch_in_a_replicate_is_an_error() {
     ));
 }
 
+// --- ReplicateSnapshot ---
+
+#[test]
+fn replicate_snapshot_round_trips() {
+    round_trips(Message::ReplicateSnapshot {
+        room: b"room-42".to_vec(),
+        branch: b"main".to_vec(),
+        seq: 12,
+        state: vec![1, 2, 3, 4, 5],
+        epoch: 4,
+    });
+}
+
+#[test]
+fn replicate_snapshot_round_trips_the_extremes() {
+    // The sequence and epoch are carried verbatim at their extremes, and an empty
+    // state (a snapshot of an empty room) round-trips.
+    round_trips(Message::ReplicateSnapshot {
+        room: Vec::new(),
+        branch: Vec::new(),
+        seq: 0,
+        state: Vec::new(),
+        epoch: 0,
+    });
+    round_trips(Message::ReplicateSnapshot {
+        room: vec![0, 1, 2, 255],
+        branch: vec![0xFF, 0x00, 0x80, 0x7F],
+        seq: u64::MAX,
+        state: vec![0xAB; 300],
+        epoch: u64::MAX,
+    });
+}
+
+#[test]
+fn a_truncated_replicate_snapshot_is_an_error_not_a_panic() {
+    let bytes = encode_message(&Message::ReplicateSnapshot {
+        room: b"room".to_vec(),
+        branch: b"main".to_vec(),
+        seq: 9,
+        state: vec![7, 8, 9],
+        epoch: 3,
+    });
+    for cut in 0..bytes.len() {
+        assert!(
+            decode_message(&bytes[..cut]).is_err(),
+            "truncating to {cut} bytes must error, not panic",
+        );
+    }
+}
+
+#[test]
+fn trailing_bytes_after_a_replicate_snapshot_are_an_error() {
+    let mut bytes = encode_message(&Message::ReplicateSnapshot {
+        room: b"room".to_vec(),
+        branch: b"main".to_vec(),
+        seq: 9,
+        state: vec![7, 8, 9],
+        epoch: 3,
+    });
+    bytes.push(0);
+    assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
+}
+
 // --- ReplicaAck ---
 
 #[test]
