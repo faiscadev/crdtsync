@@ -380,6 +380,17 @@ impl Registry {
         }
     }
 
+    /// Run one reap check over the cluster membership: remove members that have
+    /// stayed `Dead` past the bounded dead-time ([`Membership::reap_dead`]), so a
+    /// durably-departed node stops lingering as a placement replica. Driven once per
+    /// membership sweep. Inert in single-node mode (no membership); the next delivery
+    /// recomputes placement over the reaped roster, so nothing needs flushing here.
+    pub fn reap_dead_members(&mut self) {
+        if let Some(membership) = &mut self.membership {
+            membership.reap_dead();
+        }
+    }
+
     /// Record the outcome of a direct gossip round to `node`: a success is
     /// first-hand proof it is alive, a failure counts toward suspicion (escalating
     /// it `Alive → Suspect → Dead` over enough rounds). Inert in single-node mode.

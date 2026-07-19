@@ -54,24 +54,36 @@ pub const SUSPECT_AFTER_FAILURES: u32 = 3;
 /// rounds to bump its incarnation and re-disseminate `Alive` before it is evicted.
 pub const DEAD_AFTER_FAILURES: u32 = 6;
 
+/// How many reap checks a member must stay `Dead` through before it is reaped —
+/// removed from the roster entirely. One reap check runs per membership sweep, so
+/// this is a dead-time in sweep intervals. Comfortably longer than the death and
+/// refutation windows above, so a flapping or briefly-partitioned node reclaims its
+/// place (its incarnation refutation resets the clock) long before it would be
+/// reaped; only a durably-gone node crosses it.
+pub const REAP_AFTER_DEAD_TICKS: u32 = 30;
+
 /// A member's gossip liveness: its SWIM state, the incarnation that state was
-/// asserted at, and this node's count of consecutive failed direct probes to it
-/// (the local escalation clock — reset by any success or fresher gossip).
+/// asserted at, this node's count of consecutive failed direct probes to it (the
+/// local escalation clock — reset by any success or fresher gossip), and the count
+/// of reap checks it has stayed `Dead` through (the reap clock — zero unless `Dead`,
+/// reset whenever it leaves `Dead`).
 #[derive(Clone, Debug)]
 struct MemberLiveness {
     incarnation: u64,
     state: MemberState,
     failed_probes: u32,
+    dead_ticks: u32,
 }
 
 impl MemberLiveness {
     /// A freshly-learned member: alive at the incarnation it was advertised with,
-    /// with no failed probes yet.
+    /// with no failed probes and no reap clock yet.
     fn new(incarnation: u64, state: MemberState) -> Self {
         Self {
             incarnation,
             state,
             failed_probes: 0,
+            dead_ticks: 0,
         }
     }
 }
@@ -133,6 +145,18 @@ pub struct Membership {
     /// its address (every seed peer) maps to that address verbatim; `self` maps to
     /// its configured advertise address when one was given, else its node-id bytes.
     addrs: HashMap<NodeId, Vec<u8>>,
+    /// Reaped members — a tombstone that makes reaping convergent and fail-safe. A
+    /// node that has reaped a member ignores any gossip re-advertising it as
+    /// `Dead`/`Suspect`, so a peer that has not yet reaped it cannot resurrect it (no
+    /// reap-then-resurrect flapping). The escape is *state-based*: a member re-learned
+    /// `Alive` — a genuinely-live return, which only a reachable node produces —
+    /// leaves the tombstone and rejoins, at whatever incarnation it advertises. A
+    /// crash-restarted node comes back at incarnation 0 (it cannot know the
+    /// incarnation it was reaped at), so an incarnation gate would exclude it forever;
+    /// keying the escape on liveness, not incarnation, lets it rejoin, and the SWIM
+    /// merge (`Dead > Alive` at equal incarnation, refutation on a higher one)
+    /// reconciles any lingering `Dead` view from a peer mid-reap.
+    reaped: HashSet<NodeId>,
 }
 
 impl Membership {
@@ -165,6 +189,7 @@ impl Membership {
             relay_down: HashSet::new(),
             liveness,
             addrs,
+            reaped: HashSet::new(),
         }
     }
 
@@ -223,7 +248,14 @@ impl Membership {
     pub fn add_members(&mut self, members: impl IntoIterator<Item = (NodeId, Vec<u8>)>) {
         let mut added = false;
         for (node, addr) in members {
-            if node.as_bytes().is_empty() || self.addrs.contains_key(&node) {
+            // A reaped member is never re-added by a plain re-advertise: only a live
+            // return (an `Alive` tuple through `merge_liveness`) escapes the
+            // tombstone, so a bare gossip of the member's address — which carries no
+            // liveness — cannot resurrect it.
+            if node.as_bytes().is_empty()
+                || self.addrs.contains_key(&node)
+                || self.reaped.contains(&node)
+            {
                 continue;
             }
             self.liveness
@@ -388,6 +420,7 @@ impl Membership {
         if let Some(m) = self.liveness.get_mut(node) {
             m.failed_probes = 0;
             m.state = MemberState::Alive;
+            m.dead_ticks = 0;
         }
     }
 
@@ -411,6 +444,40 @@ impl Membership {
         } else if m.failed_probes >= SUSPECT_AFTER_FAILURES {
             m.state = MemberState::Suspect;
         }
+    }
+
+    /// Run one reap check, removing every member that has stayed `Dead` through
+    /// [`REAP_AFTER_DEAD_TICKS`] checks, and return the ids reaped. Each check ages
+    /// the reap clock of every `Dead` member by one; a member crossing the threshold
+    /// is dropped from the roster (liveness, address, relay-link) and tombstoned, so
+    /// stale `Dead` gossip cannot resurrect it and the placement is rebuilt over the
+    /// survivors. `self` and any non-`Dead` member are untouched.
+    /// Deterministic (tick-driven, no wall clock) and convergent: every replica reaps
+    /// the same durably-gone member off its own `Dead` observation, and the tombstone
+    /// makes the removal monotonic. Idempotent once a member is gone — a later check
+    /// reaps it no further.
+    pub fn reap_dead(&mut self) -> Vec<NodeId> {
+        let me = self.self_id.clone();
+        let mut to_reap = Vec::new();
+        for (node, m) in self.liveness.iter_mut() {
+            if node == &me || m.state != MemberState::Dead {
+                continue;
+            }
+            m.dead_ticks = m.dead_ticks.saturating_add(1);
+            if m.dead_ticks >= REAP_AFTER_DEAD_TICKS {
+                to_reap.push(node.clone());
+            }
+        }
+        for node in &to_reap {
+            self.reaped.insert(node.clone());
+            self.liveness.remove(node);
+            self.addrs.remove(node);
+            self.relay_down.remove(node);
+        }
+        if !to_reap.is_empty() {
+            self.cluster = Cluster::new(self.addrs.keys().cloned());
+        }
+        to_reap
     }
 
     /// Merge a gossiped liveness payload into this node's view — the SWIM anti-
@@ -445,6 +512,21 @@ impl Membership {
                 self.refute_if_stale(incarnation, state);
                 continue;
             }
+            // A reaped member stays out unless it returns `Alive` — a genuinely-live
+            // node, which only a reachable member produces (a truly-gone member is
+            // only ever gossiped `Dead`). That escapes the tombstone and falls through
+            // to be re-learned below; a `Dead`/`Suspect` re-advertisement from a peer
+            // still holding the reaped member is ignored, so it cannot resurrect it
+            // and no reap-then-resurrect flap occurs. Keying on liveness, not
+            // incarnation, lets a crash-restarted node (back at incarnation 0) rejoin;
+            // the SWIM merge then reconciles any peer still mid-reap.
+            if self.reaped.contains(&node) {
+                if state == MemberState::Alive {
+                    self.reaped.remove(&node);
+                } else {
+                    continue;
+                }
+            }
             match self.liveness.get_mut(&node) {
                 None => {
                     self.liveness
@@ -457,6 +539,7 @@ impl Membership {
                         m.incarnation = incarnation;
                         m.state = state;
                         m.failed_probes = 0;
+                        m.dead_ticks = 0;
                     } else if incarnation == m.incarnation && state > m.state {
                         m.state = state;
                     }
