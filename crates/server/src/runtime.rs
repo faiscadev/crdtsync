@@ -599,7 +599,15 @@ async fn registry_actor(
                     Cmd::PeerLive { node, live } => {
                         // The next client delivery recomputes leadership off the
                         // updated view, so there is nothing to flush here.
-                        reg.set_peer_liveness(node, live);
+                        reg.set_peer_liveness(node.clone(), live);
+                        // A follower's link coming up is the late-joiner catch-up
+                        // trigger: dial the backlog it missed to it, so a follower
+                        // that connected after the leader advanced converges before it
+                        // is routed to. Route the catch-up frames it queued.
+                        if live {
+                            reg.catch_up_follower(&node);
+                            dispatch_replication(&mut reg, &peer_conns);
+                        }
                     }
                     Cmd::GossipSnapshot { reply } => {
                         let _ = reply.send(reg.known_liveness());
