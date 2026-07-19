@@ -28,8 +28,8 @@ use crate::placement::NodeId;
 use crate::replication::Replication;
 use crate::schema_registry::SchemaRegistry;
 use crate::{
-    step, AwarenessPolicy, EngineEvent, EventSink, Hub, RoomId, SchemaAwarenessPolicy, Session,
-    Store, MAIN_BRANCH,
+    step, AwarenessPolicy, Catchup, EngineEvent, EventSink, Hub, RoomId, SchemaAwarenessPolicy,
+    Session, Store, MAIN_BRANCH,
 };
 
 /// How long a departed client's presence is retained before a sweep clears it,
@@ -284,6 +284,82 @@ impl Registry {
                     room: room.to_vec(),
                     branch: branch.to_vec(),
                     ops: ops.to_vec(),
+                    base_seq,
+                    epoch,
+                },
+            );
+        }
+    }
+
+    /// Catch a just-(re)connected `follower` up to this leader's state for every
+    /// room this node leads that the follower replicates — the late-joiner
+    /// replication dial. The steady replication path (`enqueue_replication`) mirrors
+    /// only *fresh* commits, so a follower dialed after the leader advanced never
+    /// received the backlog. On its link coming up, the leader sends it the ops it is
+    /// missing — from the follower's acknowledged watermark, so a store-backed
+    /// reconnecting follower gets only its tail and a brand-new one (watermark `0`)
+    /// gets the whole retained log — which the follower ingests and dedups exactly as
+    /// a live commit, converging it before it is routed to. Inert without membership
+    /// (single-node) and on a node that does not lead the room.
+    ///
+    /// A follower below the compaction floor (a brand-new follower joining a room the
+    /// leader has since compacted) needs a whole-replica snapshot the ops path cannot
+    /// carry; that state-transfer catch-up is a documented follow-on, so such a room
+    /// is skipped rather than served a partial delta that would leave it divergent.
+    ///
+    /// The catch-up ranges from the follower's *acknowledged* watermark, which is its
+    /// durable position under the same persist-before-ack assumption the majority-ack
+    /// durability layer already relies on (a follower appends an op to its store
+    /// before it acks the sequence). So this introduces no new durability assumption:
+    /// a follower that loses durable state *below* an acked watermark — a store-less
+    /// node, a wiped disk, a restore from an older backup — is a non-durable
+    /// configuration whose earlier acks were themselves not durable, and it is
+    /// under-served here exactly as it already undercounts toward quorum durability.
+    /// Making a wiped follower self-heal (it reports its true head on reconnect, or
+    /// the leader re-sends from the floor and leans on op-dedup) is a follow-on.
+    pub fn catch_up_follower(&mut self, follower: &NodeId) {
+        let Some(membership) = &self.membership else {
+            return;
+        };
+        if membership.is_self(follower) {
+            return;
+        }
+        // The rooms this node leads that the follower replicates. Collected up front
+        // so the membership borrow is released before the hub/replication mutations.
+        let rooms: Vec<RoomId> = self
+            .hub
+            .room_ids()
+            .into_iter()
+            .filter(|room| {
+                membership.is_effective_primary_for(room)
+                    && membership.replicas_for(room).contains(follower)
+            })
+            .collect();
+        for room in rooms {
+            let watermark = self.replication.watermark(&room, follower);
+            let ops: Vec<Op> = match self.hub.catch_up(&room, watermark) {
+                Catchup::Ops(records) => records.into_iter().map(|rec| rec.op).collect(),
+                // Below the floor: a whole-replica snapshot the ops path cannot carry
+                // (the pre-floor ops are compacted away) — the state-transfer catch-up
+                // is a follow-on, so skip rather than send a partial delta.
+                Catchup::Snapshot { .. } => continue,
+            };
+            if ops.is_empty() {
+                continue;
+            }
+            let base_seq = self.hub.base_seq(&room);
+            // Stamp the catch-up with this node's leadership epoch, as the steady path
+            // does; a steady leader keeps its stable epoch (no spurious bump), and any
+            // advance is persisted.
+            let before = self.epochs.highest_seen(&room);
+            let epoch = self.epochs.claim_leadership(&room);
+            self.persist_epoch_if_advanced(&room, before);
+            self.replication.enqueue(
+                follower.clone(),
+                Message::Replicate {
+                    room: room.clone(),
+                    branch: MAIN_BRANCH.to_vec(),
+                    ops,
                     base_seq,
                     epoch,
                 },

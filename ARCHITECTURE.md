@@ -833,6 +833,8 @@ Failure detection is SWIM-style over the gossip exchange: a missed direct probe 
 
 The per-room leadership epoch (the split-brain fence) is **persisted** to the durable store as it advances and reloaded on startup, so a restarted node cannot forget the highest epoch it had seen and re-accept a demoted leader's stale-epoch writes it would otherwise fence; the fence is monotone across a restart.
 
+A **late-joining follower** (one whose link comes up after the leader advanced) is **caught up**: on its link-up the leader dials the ops it is missing (from its acknowledged watermark — the whole retained log for a brand-new follower, the tail for a reconnecting one), which it ingests and dedups, converging before it is routed to or promoted over. Catch-up rides the ops path (CRDT idempotency), so a follower below the compaction floor needs a whole-replica snapshot transfer that is a documented follow-on.
+
 **Member reaping** bounds the roster: a member that stays `Dead` past a bounded dead-time (a per-sweep tick count) is removed entirely, so departed nodes do not accumulate as placement replicas. Reaping is convergent, resurrection-proof, and rejoin-safe — a reaped member is tombstoned so a peer still gossiping it `Dead` cannot re-add it, while a genuinely-live return (an `Alive` tuple, which only a reachable node produces) escapes the tombstone and rejoins regardless of its incarnation, so a crash-restarted node (back at incarnation 0) is not permanently exiled. Only a `Dead` member is ever reaped, never a live or reachable-through-a-relay one.
 
 ---
