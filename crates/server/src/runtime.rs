@@ -393,8 +393,9 @@ async fn accept_loop(
                         // peer cert here is trusted: map it to an actor. A trusted
                         // cert carrying no usable identity (no SAN, no CN) is a
                         // rejection, not an anonymous session — drop it rather than
-                        // fall through. No peer cert means server-auth-only TLS, so
-                        // there is no cert actor and the credential path applies.
+                        // fall through. No peer cert means server-auth-only TLS or a
+                        // request-mode certless client, so there is no cert actor and
+                        // the credential/anonymous path applies.
                         let cert_actor = match peer_cert_actor(&tls) {
                             Ok(actor) => actor,
                             Err(()) => return,
@@ -413,9 +414,10 @@ async fn accept_loop(
 /// The authenticated actor a verified mTLS client cert establishes for its
 /// connection, read off the accepted TLS session's peer certificates.
 ///
-/// `Ok(None)` is server-auth-only TLS: the peer presented no cert (mTLS is not
-/// configured, so none was required), and the connection authenticates through the
-/// credential path instead. `Ok(Some(actor))` is a verified client cert whose
+/// `Ok(None)` is a certless connection: the peer presented no cert — either mTLS
+/// is not configured (server-auth-only TLS) or it is configured in request mode
+/// (which admits cert absence) — and the connection authenticates through the
+/// credential/anonymous path instead. `Ok(Some(actor))` is a verified client cert whose
 /// leaf yields a SAN/CN identity. `Err(())` is the fail-closed case: a trusted
 /// cert that carries no usable identity — rejected, never admitted anonymously.
 fn peer_cert_actor(

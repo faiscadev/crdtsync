@@ -13,12 +13,24 @@
 //! mTLS (client-cert authentication) is opt-in on top of that: configure a
 //! trust-anchor bundle and [`server_config_from_pem_with_client_ca`] swaps the
 //! `with_no_client_auth` slot for a [`WebPkiClientVerifier`] against those roots.
-//! It is fail-closed by construction — a client presenting no cert, or one that
-//! does not chain to a configured root, is rejected at the handshake and never
-//! reaches the wire protocol. A verified client cert's identity (its SAN, falling
-//! back to CN) is extracted with [`actor_from_client_cert`] and bound as the
-//! connection's authenticated actor — the same ACL principal an in-band credential
-//! establishes, reached over the transport instead.
+//! A verified client cert's identity (its SAN, falling back to CN) is extracted
+//! with [`actor_from_client_cert`] and bound as the connection's authenticated
+//! actor — the same ACL principal an in-band credential establishes, reached over
+//! the transport instead.
+//!
+//! [`ClientAuthMode`] selects how strict the client-cert requirement is:
+//!
+//! - [`Require`](ClientAuthMode::Require) (the secure default): fail-closed by
+//!   construction — a client presenting no cert, or one that does not chain to a
+//!   configured root, is rejected at the handshake and never reaches the wire
+//!   protocol.
+//! - [`Request`](ClientAuthMode::Request): opportunistic mTLS — the server still
+//!   *validates* a presented cert against the roots (an untrusted/invalid presented
+//!   cert is still rejected), but a client presenting *no* cert is allowed through
+//!   (`allow_unauthenticated` on the verifier builder) and falls through to the
+//!   ordinary certless session path (in-band credential / anonymous rules). Only
+//!   true *absence* of a cert is admitted — a bad presented cert is never treated
+//!   as anonymous.
 //!
 //! [`WebPkiClientVerifier`]: rustls::server::WebPkiClientVerifier
 
@@ -52,6 +64,45 @@ pub enum TlsConfigError {
     ClientVerifier(rustls::server::VerifierBuilderError),
     /// rustls rejected the cert/key pair (e.g. the key does not match the cert).
     Rustls(rustls::Error),
+    /// `CRDTSYNC_TLS_CLIENT_AUTH` held a value that is neither `require` nor
+    /// `request` — an unrecognized mode is a loud startup error, never silently
+    /// resolved to the permissive `request` mode.
+    BadClientAuthMode(String),
+}
+
+/// How strictly the server enforces client-cert authentication when a client-CA
+/// trust bundle is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClientAuthMode {
+    /// Require a valid client cert: a client presenting no cert, or one that does
+    /// not chain to a configured root, is rejected at the handshake. The secure
+    /// default when a client-CA is set.
+    #[default]
+    Require,
+    /// Opportunistic mTLS: authenticate-if-presented, don't-require. A presented
+    /// cert is still validated against the roots (an untrusted/invalid one is
+    /// rejected), but a client presenting *no* cert is allowed to connect and falls
+    /// through to the ordinary certless session path. Only cert *absence* is
+    /// relaxed — a bad presented cert is never admitted.
+    Request,
+}
+
+impl ClientAuthMode {
+    /// Parse the `CRDTSYNC_TLS_CLIENT_AUTH` value. Absence (`None`) resolves to the
+    /// secure default [`Require`](ClientAuthMode::Require); `"require"` / `"request"`
+    /// select the mode (case-insensitively). Any other value is a
+    /// [`BadClientAuthMode`](TlsConfigError::BadClientAuthMode) error — an
+    /// unrecognized mode never silently degrades to the permissive one.
+    pub fn parse(value: Option<&str>) -> Result<Self, TlsConfigError> {
+        match value {
+            None => Ok(ClientAuthMode::Require),
+            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "require" => Ok(ClientAuthMode::Require),
+                "request" => Ok(ClientAuthMode::Request),
+                _ => Err(TlsConfigError::BadClientAuthMode(v.to_string())),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for TlsConfigError {
@@ -75,6 +126,10 @@ impl std::fmt::Display for TlsConfigError {
                 write!(f, "building TLS client-cert verifier: {e}")
             }
             TlsConfigError::Rustls(e) => write!(f, "building TLS config: {e}"),
+            TlsConfigError::BadClientAuthMode(value) => write!(
+                f,
+                "CRDTSYNC_TLS_CLIENT_AUTH must be `require` or `request`, got `{value}`"
+            ),
         }
     }
 }
@@ -87,7 +142,8 @@ impl std::error::Error for TlsConfigError {
             TlsConfigError::ClientVerifier(e) => Some(e),
             TlsConfigError::NoCertificate(_)
             | TlsConfigError::NoPrivateKey(_)
-            | TlsConfigError::NoClientCa(_) => None,
+            | TlsConfigError::NoClientCa(_)
+            | TlsConfigError::BadClientAuthMode(_) => None,
         }
     }
 }
@@ -108,35 +164,64 @@ pub fn server_config_from_pem(
 
 /// Build a [`ServerConfig`] as [`server_config_from_pem`] does, additionally
 /// *requiring* every client to present a certificate that chains to a trust anchor
-/// in the PEM bundle at `client_ca_path` — mutual TLS. The client-cert verifier
-/// takes the `with_no_client_auth` slot, so this is fail-closed at the handshake:
-/// a client presenting no cert, or one that does not chain to a configured root,
-/// is rejected by rustls before the connection ever reaches the wire protocol. A
-/// verified connection's peer cert is later mapped to an actor by
-/// [`actor_from_client_cert`].
+/// in the PEM bundle at `client_ca_path` — mutual TLS in [`Require`] mode. This is
+/// fail-closed at the handshake: a client presenting no cert, or one that does not
+/// chain to a configured root, is rejected by rustls before the connection ever
+/// reaches the wire protocol. A verified connection's peer cert is later mapped to
+/// an actor by [`actor_from_client_cert`].
 ///
 /// An empty client-CA bundle is a loud [`NoClientCa`](TlsConfigError::NoClientCa)
 /// error, never a silent fall back to server-auth-only: a deployment that asked
 /// for mTLS must not quietly run without it.
+///
+/// [`Require`]: ClientAuthMode::Require
 pub fn server_config_from_pem_with_client_ca(
     cert_path: impl AsRef<Path>,
     key_path: impl AsRef<Path>,
     client_ca_path: impl AsRef<Path>,
 ) -> Result<Arc<ServerConfig>, TlsConfigError> {
-    build_server_config(
-        cert_path.as_ref(),
-        key_path.as_ref(),
-        Some(client_ca_path.as_ref()),
+    server_config_from_pem_with_client_ca_mode(
+        cert_path,
+        key_path,
+        client_ca_path,
+        ClientAuthMode::Require,
     )
 }
 
-/// Build the [`ServerConfig`], with a required client-cert verifier when
-/// `client_ca` is set and [`with_no_client_auth`](rustls::ConfigBuilder::with_no_client_auth)
-/// when it is not.
+/// Build an mTLS [`ServerConfig`] as [`server_config_from_pem_with_client_ca`]
+/// does, with an explicit [`ClientAuthMode`] selecting how strict the client-cert
+/// requirement is:
+///
+/// - [`Require`](ClientAuthMode::Require) rejects a certless/untrusted client at
+///   the handshake (fail-closed).
+/// - [`Request`](ClientAuthMode::Request) is opportunistic — a *presented* cert is
+///   still validated against the roots (an untrusted/invalid one is still
+///   rejected), but a client presenting *no* cert is allowed through and falls
+///   through to the ordinary certless session path.
+///
+/// The trust bundle is validated identically in both modes; the only relaxation in
+/// `Request` is admitting cert *absence*.
+pub fn server_config_from_pem_with_client_ca_mode(
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+    client_ca_path: impl AsRef<Path>,
+    mode: ClientAuthMode,
+) -> Result<Arc<ServerConfig>, TlsConfigError> {
+    build_server_config(
+        cert_path.as_ref(),
+        key_path.as_ref(),
+        Some((client_ca_path.as_ref(), mode)),
+    )
+}
+
+/// Build the [`ServerConfig`], with a client-cert verifier when `client_ca` is set
+/// (its [`ClientAuthMode`] selecting require vs. request) and
+/// [`with_no_client_auth`](rustls::ConfigBuilder::with_no_client_auth) when it is
+/// not.
 fn build_server_config(
     cert_path: &Path,
     key_path: &Path,
-    client_ca: Option<&Path>,
+    client_ca: Option<(&Path, ClientAuthMode)>,
 ) -> Result<Arc<ServerConfig>, TlsConfigError> {
     let cert_bytes = std::fs::read(cert_path).map_err(|source| TlsConfigError::Io {
         path: cert_path.to_path_buf(),
@@ -171,9 +256,19 @@ fn build_server_config(
         .with_safe_default_protocol_versions()
         .map_err(TlsConfigError::Rustls)?;
     let config = match client_ca {
-        Some(ca_path) => {
+        Some((ca_path, mode)) => {
             let roots = load_client_roots(ca_path)?;
-            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+            let verifier_builder =
+                WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider);
+            // Both modes validate a *presented* cert against the trust anchors; in
+            // request mode `allow_unauthenticated` additionally admits a client that
+            // presents no cert at all, so an untrusted/invalid presented cert is
+            // still rejected while cert absence falls through to the certless path.
+            let verifier_builder = match mode {
+                ClientAuthMode::Require => verifier_builder,
+                ClientAuthMode::Request => verifier_builder.allow_unauthenticated(),
+            };
+            let verifier = verifier_builder
                 .build()
                 .map_err(TlsConfigError::ClientVerifier)?;
             builder.with_client_cert_verifier(verifier)
