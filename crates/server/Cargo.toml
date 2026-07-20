@@ -6,6 +6,9 @@ description = "Single-node sync server: per-room op logs, idempotent ingest, cat
 
 [dependencies]
 crdtsync-core = { path = "../core" }
+# The read-only replay CLI (`crdtsync-replay` bin) parses its arguments with clap.
+# A server-side operator tool, never the wasm-embeddable core.
+clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
@@ -49,6 +52,15 @@ x509-parser = "0.16"
 # ChaCha20-Poly1305 (RustCrypto) is constant-time in software with no AES-NI
 # dependency; the crypto lives in the server, never the wasm-embeddable core.
 chacha20poly1305 = "0.10"
+
+[[bin]]
+name = "crdtsync-server"
+path = "src/main.rs"
+
+# The read-only point-in-time replay / diff operator tool.
+[[bin]]
+name = "crdtsync-replay"
+path = "src/bin/replay.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
