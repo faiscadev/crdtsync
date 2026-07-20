@@ -1597,21 +1597,23 @@ fn read_redirect_response(
     room: &[u8],
     floor: u64,
 ) -> Option<Response> {
-    let membership = membership?;
-    let leader = membership
-        .effective_primary_for(room)
-        .or_else(|| membership.primary_for(room))?;
-    if membership.is_self(&leader) {
-        return None;
-    }
-    if membership.owns(room) && hub.holds_room(room) && hub.seq(room) >= floor {
-        return None;
+    // A read resolves the leader exactly as a write does — `None` when this node
+    // serves the room as its leader (single-node, or the room's effective primary).
+    // Sharing that one resolution is what keeps read routing from ever diverging
+    // from write routing as the election rule evolves.
+    let redirect = redirect_if_not_leader(membership, room)?;
+    // This node is a follower of the room. It serves the read from its own replica
+    // — bounded staleness — only when it holds a materialized, caught-up copy whose
+    // committed watermark is at least the client's floor (the read-your-writes /
+    // monotonicity gate). Failing that it redirects, so an uncaught, non-replica, or
+    // past-the-floor read fails safe to the leader.
+    if let Some(membership) = membership {
+        if membership.owns(room) && hub.holds_room(room) && hub.seq(room) >= floor {
+            return None;
+        }
     }
     Some(Response {
-        replies: vec![Message::Redirect {
-            room: room.to_vec(),
-            leader_addr: leader.as_bytes().to_vec(),
-        }],
+        replies: vec![redirect],
         ..Response::default()
     })
 }
