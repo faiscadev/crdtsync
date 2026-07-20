@@ -371,11 +371,13 @@ pub fn step(
             if session.channels.contains_key(&channel) {
                 return violation("channel already subscribed");
             }
-            // This node serves a room only if it leads it. A subscribe to a room
-            // led elsewhere is answered with the leader's address instead of a
-            // catch-up, so the client reconnects there — a follower does not serve
-            // the room directly. Single-node (no membership) leads every room.
-            if let Some(redirect) = redirect_response(membership, &room) {
+            // A read is served by the room's leader, or by a caught-up follower from
+            // its own replica (bounded staleness). The follower serves only when it
+            // holds the room and its committed watermark is at least the client's
+            // `last_seen_seq` floor — the read-your-writes / monotonicity gate;
+            // otherwise, and for a room led elsewhere it does not replicate, it
+            // redirects to the leader. Single-node (no membership) leads every room.
+            if let Some(redirect) = read_redirect_response(membership, hub, &room, last_seen_seq) {
                 return redirect;
             }
             // A subscription reads the room; the server never serves a room the
@@ -1559,13 +1561,57 @@ fn redirect_if_not_leader(membership: Option<&Membership>, room: &[u8]) -> Optio
 }
 
 /// The [`Response`] declining to serve `room` here — a lone [`Message::Redirect`]
-/// to its leader — or `None` to serve the request as usual. The one gate the
-/// room-serving requests (Subscribe, an ops write, a durable version mutation)
-/// share, so a follower never subscribes, ingests, or persists a room it does
-/// not lead; it points the client at the leader instead.
+/// to its leader — or `None` to serve the request as usual. The gate the room-
+/// serving *writes* (an ops write, a durable version mutation) share, so a follower
+/// never ingests or persists a room it does not lead; it points the client at the
+/// leader instead. Reads use [`read_redirect_response`], which lets a caught-up
+/// follower serve.
 fn redirect_response(membership: Option<&Membership>, room: &[u8]) -> Option<Response> {
     redirect_if_not_leader(membership, room).map(|redirect| Response {
         replies: vec![redirect],
+        ..Response::default()
+    })
+}
+
+/// The [`Response`] redirecting a READ (a Subscribe) this node cannot serve
+/// locally, or `None` to serve it from local state. Unlike a write, a follower
+/// MAY serve a read — the transparent-proxy consistency model is bounded-staleness
+/// with read-your-writes / monotonicity via `floor` (the client's highest observed
+/// server sequence, its `last_seen_seq`):
+///
+/// - The room's leader always serves (single-node, being primary, or the effective
+///   primary on failover) — `None`.
+/// - A follower serves the read from its own replica only when it (1) is a replica
+///   of the room, (2) holds a materialized copy — it has been caught up, so the
+///   state is whole, never torn — and (3) its committed watermark ([`Hub::seq`]) is
+///   at least `floor`. The watermark-≥-floor test is the read-your-writes and
+///   monotonicity gate: a read whose floor is ahead of the follower would be stale
+///   relative to what the client already wrote or saw.
+/// - Failing any of those, it redirects to the leader — which is by definition at
+///   or ahead of the floor. Every unsafe read (uncaught, non-replica, past the
+///   floor) fails safe to the leader, so a follower never serves a torn,
+///   missing-a-just-written-op, or backwards-in-time read.
+fn read_redirect_response(
+    membership: Option<&Membership>,
+    hub: &Hub,
+    room: &[u8],
+    floor: u64,
+) -> Option<Response> {
+    let membership = membership?;
+    let leader = membership
+        .effective_primary_for(room)
+        .or_else(|| membership.primary_for(room))?;
+    if membership.is_self(&leader) {
+        return None;
+    }
+    if membership.owns(room) && hub.holds_room(room) && hub.seq(room) >= floor {
+        return None;
+    }
+    Some(Response {
+        replies: vec![Message::Redirect {
+            room: room.to_vec(),
+            leader_addr: leader.as_bytes().to_vec(),
+        }],
         ..Response::default()
     })
 }

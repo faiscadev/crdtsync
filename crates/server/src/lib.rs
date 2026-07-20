@@ -1529,6 +1529,14 @@ impl Hub {
         self.rooms.get(room).map_or(0, Room::head)
     }
 
+    /// Whether this hub holds a materialized replica of `room` — the room is
+    /// present, distinct from one never seen (both report [`seq`](Hub::seq) `0`).
+    /// A follower serves a read only from a room it holds, so it never answers
+    /// from an absent or not-yet-caught-up replica.
+    pub fn holds_room(&self, room: &[u8]) -> bool {
+        self.rooms.contains_key(room)
+    }
+
     /// The room's compaction floor — the count of server sequences already
     /// compacted away (`0` for an uncompacted or unseen room). A replicated
     /// commit carries it so a follower places the ops in the same sequence space.
