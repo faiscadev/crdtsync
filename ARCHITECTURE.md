@@ -921,6 +921,8 @@ Lightweight dashboard. Rooms, connected users, ops/sec, snapshot size, replicati
 
 CRDT systems are difficult to debug. Tooling: op inspection, replay, timeline visualization, causal graph visualization, room export / import.
 
+**Replay tool (as built).** A `crdtsync-replay` bin in the server crate reconstructs a room's exact state as of any past server sequence and diffs two such points — the non-UI vertical slice of the above. It is **read-only over the durable room data**: it opens the same `<room>.log` + `<room>.snap` files the server persists, rebuilds in memory, and never writes back — no watermark advances, no byte changes. Reconstruction reuses the server's own restore path (`Hub::from_rooms` over a log truncated to the target sequence): the nearest snapshot at or below the target seeds the state, then the retained op tail replays up to it, so the result is byte-identical to what the room held at that sequence — across a compaction floor, leveraging op-join ≡ snapshot-join. A target below the compaction floor is rejected (its ops are folded away); the floor itself reconstructs from the snapshot alone. The reconstruction/diff logic lives as library functions (`server::replay::{reconstruct_at, diff_at}`) with the bin a thin CLI over them. Reconstructing a no-snapshot room's exact leading replica id needs that node's server id (an optional flag); a snapshot-backed room pins it. Richer CLI UX (op inspection, timeline/causal-graph visualization) and the **admin-UI dashboard** (§Admin UI) stay deferred/last.
+
 ---
 
 # Authentication

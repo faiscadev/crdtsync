@@ -31,6 +31,7 @@ pub mod leadership;
 pub mod membership;
 pub mod placement;
 pub mod registry;
+pub mod replay;
 pub mod replication;
 pub mod runtime;
 pub mod schema_registry;
