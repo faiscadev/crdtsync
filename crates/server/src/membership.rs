@@ -62,6 +62,19 @@ pub const DEAD_AFTER_FAILURES: u32 = 6;
 /// reaped; only a durably-gone node crosses it.
 pub const REAP_AFTER_DEAD_TICKS: u32 = 30;
 
+/// How many reap checks a reap *tombstone* is retained before it is pruned — the
+/// reaped member forgotten entirely. A tombstone keeps stale `Dead`/`Suspect` gossip
+/// from resurrecting a reaped member (no reap-then-resurrect flap); it must outlive
+/// any such in-flight gossip. This retention is an order of magnitude past
+/// [`REAP_AFTER_DEAD_TICKS`], and a reaped member is dropped from the roster so it is
+/// no longer gossiped — so by the time a tombstone is pruned every replica has long
+/// since reaped the member and stopped referencing it, and no live gossip can still
+/// name it. A member that reappears after its tombstone is pruned is treated as a
+/// fresh join, which is safe: only a reachable node produces an `Alive` return, and
+/// the SWIM incarnation/liveness merge reconciles it as a new member. Pruning is
+/// convergent (every replica prunes on the same tick-count rule) and idempotent.
+pub const TOMBSTONE_RETENTION_TICKS: u32 = 300;
+
 /// A member's gossip liveness: its SWIM state, the incarnation that state was
 /// asserted at, this node's count of consecutive failed direct probes to it (the
 /// local escalation clock — reset by any success or fresher gossip), and the count
@@ -145,8 +158,9 @@ pub struct Membership {
     /// its address (every seed peer) maps to that address verbatim; `self` maps to
     /// its configured advertise address when one was given, else its node-id bytes.
     addrs: HashMap<NodeId, Vec<u8>>,
-    /// Reaped members — a tombstone that makes reaping convergent and fail-safe. A
-    /// node that has reaped a member ignores any gossip re-advertising it as
+    /// Reaped members — a tombstone that makes reaping convergent and fail-safe,
+    /// mapped to the count of reap checks it has been retained through (its prune
+    /// clock). A node that has reaped a member ignores any gossip re-advertising it as
     /// `Dead`/`Suspect`, so a peer that has not yet reaped it cannot resurrect it (no
     /// reap-then-resurrect flapping). The escape is *state-based*: a member re-learned
     /// `Alive` — a genuinely-live return, which only a reachable node produces —
@@ -156,7 +170,13 @@ pub struct Membership {
     /// keying the escape on liveness, not incarnation, lets it rejoin, and the SWIM
     /// merge (`Dead > Alive` at equal incarnation, refutation on a higher one)
     /// reconciles any lingering `Dead` view from a peer mid-reap.
-    reaped: HashSet<NodeId>,
+    ///
+    /// The tombstone is not kept forever: a reap check ages every tombstone by one,
+    /// and one past [`TOMBSTONE_RETENTION_TICKS`] is pruned — the reaped member
+    /// forgotten — so the set stays bounded on a long-lived cluster with churn. The
+    /// retention outlives any in-flight gossip that could reference the member, so the
+    /// prune never resurrects it.
+    reaped: HashMap<NodeId, u32>,
 }
 
 impl Membership {
@@ -189,7 +209,7 @@ impl Membership {
             relay_down: HashSet::new(),
             liveness,
             addrs,
-            reaped: HashSet::new(),
+            reaped: HashMap::new(),
         }
     }
 
@@ -254,7 +274,7 @@ impl Membership {
             // liveness — cannot resurrect it.
             if node.as_bytes().is_empty()
                 || self.addrs.contains_key(&node)
-                || self.reaped.contains(&node)
+                || self.reaped.contains_key(&node)
             {
                 continue;
             }
@@ -456,7 +476,21 @@ impl Membership {
     /// the same durably-gone member off its own `Dead` observation, and the tombstone
     /// makes the removal monotonic. Idempotent once a member is gone — a later check
     /// reaps it no further.
+    ///
+    /// The same check also ages every tombstone by one and prunes any past
+    /// [`TOMBSTONE_RETENTION_TICKS`], so the tombstone set stays bounded on a
+    /// long-lived cluster. Pruning changes no roster (a tombstoned member is already
+    /// off it) — it only forgets the member, convergently (the retention is a shared
+    /// tick-count rule every replica applies) and safely (the retention outlives any
+    /// gossip that could still name the member, so a pruned member only ever reappears
+    /// as a fresh join).
     pub fn reap_dead(&mut self) -> Vec<NodeId> {
+        // Age and prune tombstones first — one tick per reap check, independent of
+        // whether anything is reaped this round.
+        self.reaped.retain(|_node, age| {
+            *age = age.saturating_add(1);
+            *age < TOMBSTONE_RETENTION_TICKS
+        });
         let me = self.self_id.clone();
         let mut to_reap = Vec::new();
         for (node, m) in self.liveness.iter_mut() {
@@ -469,7 +503,7 @@ impl Membership {
             }
         }
         for node in &to_reap {
-            self.reaped.insert(node.clone());
+            self.reaped.insert(node.clone(), 0);
             self.liveness.remove(node);
             self.addrs.remove(node);
             self.relay_down.remove(node);
@@ -478,6 +512,14 @@ impl Membership {
             self.cluster = Cluster::new(self.addrs.keys().cloned());
         }
         to_reap
+    }
+
+    /// Whether `node` is currently tombstoned — reaped and not yet pruned. Stale
+    /// `Dead`/`Suspect` gossip about a tombstoned member is ignored; once the
+    /// tombstone is pruned (past [`TOMBSTONE_RETENTION_TICKS`]) the member is
+    /// forgotten and a later reappearance is a fresh join.
+    pub fn is_tombstoned(&self, node: &NodeId) -> bool {
+        self.reaped.contains_key(node)
     }
 
     /// Merge a gossiped liveness payload into this node's view — the SWIM anti-
@@ -520,7 +562,7 @@ impl Membership {
             // and no reap-then-resurrect flap occurs. Keying on liveness, not
             // incarnation, lets a crash-restarted node (back at incarnation 0) rejoin;
             // the SWIM merge then reconciles any peer still mid-reap.
-            if self.reaped.contains(&node) {
+            if self.reaped.contains_key(&node) {
                 if state == MemberState::Alive {
                     self.reaped.remove(&node);
                 } else {
