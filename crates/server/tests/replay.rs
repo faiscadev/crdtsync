@@ -202,6 +202,70 @@ fn unknown_room_has_no_log() {
     assert!(load_room(&store, b"no-such-room").unwrap().is_none());
 }
 
+// --- crash-left snapshot/log overlap ---
+
+fn snap_path(root: &Path, room: &[u8]) -> std::path::PathBuf {
+    let hex: String = room.iter().map(|b| format!("{b:02x}")).collect();
+    root.join(format!("{hex}.snap"))
+}
+
+/// Write a snapshot file directly — an 8-byte little-endian base sequence then
+/// the state — without touching the log, staging the crash window between a
+/// snapshot write and the log truncation.
+fn write_snapshot(root: &Path, room: &[u8], base_seq: u64, state: &[u8]) {
+    let mut bytes = base_seq.to_le_bytes().to_vec();
+    bytes.extend_from_slice(state);
+    fs::write(snap_path(root, room), bytes).unwrap();
+}
+
+#[test]
+fn reconstruct_is_correct_when_the_snapshot_and_log_overlap() {
+    let dir = tempdir();
+    let golden = persist_history(dir.path()); // seqs 1..=6, no snapshot yet
+
+    // Stage a crash between snapshot-write and log-truncate: drop in a snapshot
+    // covering the first 3 ops while the whole log stays on disk. The store now
+    // holds a snapshot (base 3) beside a log whose first 3 records carry seqs the
+    // snapshot already covers.
+    let (seq3, state3) = &golden[2];
+    assert_eq!(*seq3, 3);
+    write_snapshot(dir.path(), ROOM, 3, state3);
+
+    let log = load_room(&Store::open(dir.path()).unwrap(), ROOM)
+        .unwrap()
+        .unwrap();
+    // The floor is the snapshot base; the head is the floor plus only the
+    // non-overlapping tail — not floor + every raw log record.
+    assert_eq!(head_seq(&log), 6);
+
+    // Every point at or above the floor still reconstructs to the true state at
+    // that seq, and the overlapping prefix does not shift the labels.
+    for (seq, state) in &golden {
+        if *seq < 3 {
+            continue;
+        }
+        let got = reconstruct_at(&log, ROOM, *seq, cid(SERVER)).unwrap();
+        assert_eq!(&got.state, state, "overlap: state at seq {seq}");
+    }
+    // The inflated raw-length head would have accepted seq 7; the deduped head
+    // rejects it.
+    assert!(matches!(
+        reconstruct_at(&log, ROOM, 7, cid(SERVER)),
+        Err(ReplayError::PastHead {
+            head: 6,
+            requested: 7
+        })
+    ));
+    // Below the floor stays rejected.
+    assert!(matches!(
+        reconstruct_at(&log, ROOM, 2, cid(SERVER)),
+        Err(ReplayError::BelowFloor {
+            floor: 3,
+            requested: 2
+        })
+    ));
+}
+
 // --- diff two points ---
 
 #[test]

@@ -151,13 +151,52 @@ fn parse_server_id(arg: Option<&str>) -> Result<[u8; 16], String> {
     }
 }
 
-/// Decode an even-length hex string to bytes, or `None` if malformed.
+/// Decode an even-length hex string to bytes, or `None` if malformed (odd length
+/// or any non-hex byte). Works over raw bytes, so non-ASCII input is rejected
+/// cleanly rather than panicking on a char boundary.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_hex, parse_server_id, DEFAULT_REPLAY_SERVER};
+
+    #[test]
+    fn decode_hex_round_trips_and_rejects_malformed() {
+        assert_eq!(decode_hex("00ff10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(decode_hex(""), Some(vec![]));
+        assert_eq!(decode_hex("abc"), None); // odd length
+        assert_eq!(decode_hex("zz"), None); // non-hex ascii
+    }
+
+    #[test]
+    fn decode_hex_rejects_non_ascii_without_panicking() {
+        // A multi-byte char must not slice off a UTF-8 boundary — reject cleanly.
+        assert_eq!(decode_hex("a€"), None);
+        assert_eq!(decode_hex("€"), None);
+    }
+
+    #[test]
+    fn parse_server_id_defaults_and_validates_length() {
+        assert_eq!(parse_server_id(None).unwrap(), DEFAULT_REPLAY_SERVER);
+        let hex = "000102030405060708090a0b0c0d0e0f";
+        assert_eq!(
+            parse_server_id(Some(hex)).unwrap(),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert!(parse_server_id(Some("00")).is_err()); // too short
+        assert!(parse_server_id(Some("€€…")).is_err()); // non-ascii, no panic
+    }
 }
