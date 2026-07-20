@@ -336,62 +336,133 @@ impl Registry {
     /// Making a wiped follower self-heal (it reports its true head on reconnect, or
     /// the leader re-sends from the floor and leans on op-dedup) is a follow-on.
     pub fn catch_up_follower(&mut self, follower: &NodeId) {
+        for room in self.rooms_led_for(follower) {
+            let floor = self.replication.watermark(&room, follower);
+            if let Some(frame) = self.catch_up_room_frame(&room, floor) {
+                self.replication.enqueue(follower.clone(), frame);
+            }
+        }
+    }
+
+    /// Catch a follower up from the durable heads it *reported* on (re)join, honoring
+    /// each reported head over any acknowledged watermark this leader remembers — the
+    /// wiped-follower self-heal. A follower whose durable state was wiped below its
+    /// last ack reports its true (lower) current head per room; the leader uses that
+    /// as the catch-up floor, so the follower is re-converged from where it actually
+    /// is (an ops tail, or a snapshot when the reported head is below the compaction
+    /// floor) rather than trusted at a stale ack it can no longer honor and left with
+    /// a silent gap. Fail-closed: a room this node leads that the follower replicates
+    /// but that is ABSENT from `heads` (a fully-wiped room the follower no longer
+    /// holds) is treated as head `0`, so it gets a full catch-up rather than being
+    /// trusted at its remembered watermark. The reported head also *replaces* the
+    /// leader's watermark for the follower (it may move it DOWN), so majority-ack
+    /// durability stops counting the follower toward quorum for data it can no longer
+    /// prove. The reported head is **clamped to this leader's own head** before it
+    /// sets the watermark: a follower can only durably hold ops the leader produced,
+    /// so a report above the leader's head (e.g. a freshly-promoted lagging leader
+    /// hearing a head from an older, higher log) must never credit the follower past
+    /// what this leader has, which would falsely satisfy quorum and prematurely
+    /// release an `Accepted`. Inert without membership (single-node) and on a room
+    /// this node does not lead.
+    pub fn catch_up_follower_reporting(&mut self, follower: &NodeId, heads: &[(RoomId, u64)]) {
+        let reported: HashMap<&[u8], u64> = heads.iter().map(|(r, h)| (r.as_slice(), *h)).collect();
+        for room in self.rooms_led_for(follower) {
+            // The reported head is authoritative — a room the follower did not name is
+            // one it can no longer prove any of, so its floor is 0 (fail-closed) —
+            // but never trusted ABOVE this leader's own head: a follower cannot hold
+            // ops this leader never produced, so crediting it past our head would
+            // falsely satisfy majority-ack durability.
+            let reported_head = reported.get(room.as_slice()).copied().unwrap_or(0);
+            let floor = reported_head.min(self.hub.seq(&room));
+            // Honor the report over the remembered ack, moving the watermark to the
+            // reported head even when that lowers it.
+            self.replication
+                .set_watermark(follower.clone(), &room, floor);
+            if let Some(frame) = self.catch_up_room_frame(&room, floor) {
+                self.replication.enqueue(follower.clone(), frame);
+            }
+        }
+    }
+
+    /// The rooms this node effectively leads that `follower` replicates — the set a
+    /// catch-up ranges over. Collected up front so the membership borrow is released
+    /// before the hub/replication mutations. Empty without membership, and for a
+    /// catch-up targeting this node itself.
+    fn rooms_led_for(&self, follower: &NodeId) -> Vec<RoomId> {
         let Some(membership) = &self.membership else {
-            return;
+            return Vec::new();
         };
         if membership.is_self(follower) {
-            return;
+            return Vec::new();
         }
-        // The rooms this node leads that the follower replicates. Collected up front
-        // so the membership borrow is released before the hub/replication mutations.
-        let rooms: Vec<RoomId> = self
-            .hub
+        self.hub
             .room_ids()
             .into_iter()
             .filter(|room| {
                 membership.is_effective_primary_for(room)
                     && membership.replicas_for(room).contains(follower)
             })
-            .collect();
-        for room in rooms {
-            let watermark = self.replication.watermark(&room, follower);
-            // The frame to dial, or `None` when there is nothing to send (the follower
-            // is already at the head). The leader branches by comparing the follower's
-            // watermark to the room's compaction floor, which `catch_up` folds into its
-            // reply: at or above the floor it yields the ops past the watermark (an
-            // ordinary delta), below it — the ops the follower needs are compacted away
-            // — it yields the whole-replica snapshot at the head. So a follower below
-            // the floor is caught up by a state-transfer rather than a futile ops-replay
-            // that would leave it divergent; one at or above it keeps the ops-tail path.
-            let frame = match self.hub.catch_up(&room, watermark) {
-                Catchup::Ops(records) => {
-                    let ops: Vec<Op> = records.into_iter().map(|rec| rec.op).collect();
-                    if ops.is_empty() {
-                        continue;
-                    }
-                    let base_seq = self.hub.base_seq(&room);
-                    Message::Replicate {
-                        room: room.clone(),
-                        branch: MAIN_BRANCH.to_vec(),
-                        ops,
-                        base_seq,
-                        epoch: self.claim_and_persist_epoch(&room),
-                    }
+            .collect()
+    }
+
+    /// The catch-up frame that lands a follower at `room`'s head from `floor`, or
+    /// `None` when it is already at the head (an empty ops tail). The leader branches
+    /// by comparing `floor` to the room's compaction floor, which `catch_up` folds
+    /// into its reply: at or above the floor it yields the ops past `floor` (an
+    /// ordinary delta), below it — the ops the follower needs are compacted away — it
+    /// yields the whole-replica snapshot at the head. So a follower below the floor is
+    /// caught up by a state-transfer rather than a futile ops-replay that would leave
+    /// it divergent; one at or above it keeps the ops-tail path. The frame is stamped
+    /// with this node's leadership epoch, fenced exactly as a steady replication frame.
+    fn catch_up_room_frame(&mut self, room: &[u8], floor: u64) -> Option<Message> {
+        match self.hub.catch_up(room, floor) {
+            Catchup::Ops(records) => {
+                let ops: Vec<Op> = records.into_iter().map(|rec| rec.op).collect();
+                if ops.is_empty() {
+                    return None;
                 }
-                // Below the floor: send the whole-replica snapshot the ops path cannot
-                // carry, tagged with the sequence it lands the follower at. The follower
-                // decodes it, converging before it serves; the steady path resumes the
-                // tail above it.
-                Catchup::Snapshot { seq, state } => Message::ReplicateSnapshot {
-                    room: room.clone(),
+                let base_seq = self.hub.base_seq(room);
+                Some(Message::Replicate {
+                    room: room.to_vec(),
                     branch: MAIN_BRANCH.to_vec(),
-                    seq,
-                    state,
-                    epoch: self.claim_and_persist_epoch(&room),
-                },
-            };
-            self.replication.enqueue(follower.clone(), frame);
+                    ops,
+                    base_seq,
+                    epoch: self.claim_and_persist_epoch(room),
+                })
+            }
+            // Below the floor: send the whole-replica snapshot the ops path cannot
+            // carry, tagged with the sequence it lands the follower at. The follower
+            // decodes it, converging before it serves; the steady path resumes the
+            // tail above it.
+            Catchup::Snapshot { seq, state } => Some(Message::ReplicateSnapshot {
+                room: room.to_vec(),
+                branch: MAIN_BRANCH.to_vec(),
+                seq,
+                state,
+                epoch: self.claim_and_persist_epoch(room),
+            }),
         }
+    }
+
+    /// This node's durable-verified heads — the current server sequence it can prove
+    /// it holds for each room it replicates, read from its own state (not a remembered
+    /// ack). A (re)joining follower reports these to its leader so the leader catches
+    /// it up from where it actually is; a follower whose state was wiped reports its
+    /// true (lower) head, or omits a room it no longer holds entirely (fail-closed —
+    /// the leader treats an omitted room as head `0`). Empty without membership.
+    pub fn durable_heads(&self) -> Vec<(RoomId, u64)> {
+        let Some(membership) = &self.membership else {
+            return Vec::new();
+        };
+        self.hub
+            .room_ids()
+            .into_iter()
+            .filter(|room| membership.owns(room))
+            .map(|room| {
+                let head = self.hub.seq(&room);
+                (room, head)
+            })
+            .collect()
     }
 
     /// Claim this node's leadership epoch for `room` and persist it when it advances
@@ -597,6 +668,43 @@ impl Registry {
             conn.outbox.push(reply);
         }
         true
+    }
+
+    /// Apply an inbound [`Message::FollowerHeads`]: catch the reporting follower up
+    /// from the durable heads it named, honoring them over any remembered ack (the
+    /// wiped-follower self-heal). Self-describing — the follower's id rides the frame
+    /// — so this needs no connection→node mapping, exactly like a Gossip. Honored only
+    /// in cluster mode; a report on a single-node deployment is a stray frame and the
+    /// connection is dropped. The catch-up frames are queued for the follower and the
+    /// transport routes them over its peer connection. Returns whether the connection
+    /// stays open.
+    fn apply_follower_heads(&mut self, reporter: Vec<u8>, heads: Vec<(RoomId, u64)>) -> bool {
+        if self.membership.is_none() {
+            return false;
+        }
+        let follower = NodeId::from(reporter);
+        self.catch_up_follower_reporting(&follower, &heads);
+        true
+    }
+
+    /// Queue this node's durable-head report for `leader` — the (re)join handshake
+    /// that lets `leader` catch this node up from where it actually is (the
+    /// wiped-follower self-heal), honoring the reported heads over any ack it
+    /// remembers. Sent when this node's peer link to `leader` comes up; `leader`
+    /// filters the report to the rooms it actually leads that this node replicates.
+    /// Inert without membership (single-node) and toward this node itself.
+    pub fn report_heads_to(&mut self, leader: &NodeId) {
+        let Some(membership) = &self.membership else {
+            return;
+        };
+        if membership.is_self(leader) {
+            return;
+        }
+        let frame = Message::FollowerHeads {
+            reporter: membership.self_id().as_bytes().to_vec(),
+            heads: self.durable_heads(),
+        };
+        self.replication.enqueue(leader.clone(), frame);
     }
 
     /// Answer a SWIM indirect-probe request on peer connection `id`: report this
@@ -1472,6 +1580,13 @@ impl Registry {
                 epoch,
             } => return self.apply_replicate_snapshot(id, room, branch, seq, state, epoch),
             Message::Gossip { members } => return self.apply_gossip(id, members),
+            // A follower's durable-head report arrives node-to-node on a peer
+            // connection; catch it up from the reported heads off the client session
+            // path. Self-describing (it names the reporting node), so no connection
+            // identity is needed — handled exactly as a Gossip.
+            Message::FollowerHeads { reporter, heads } => {
+                return self.apply_follower_heads(reporter, heads)
+            }
             // A ping-req arrives node-to-node on a peer connection asking this relay
             // for its liveness view of a third member; answer it off the client
             // session path. A ping-ack is only ever read inline by the requester that

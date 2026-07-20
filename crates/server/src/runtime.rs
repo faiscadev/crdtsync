@@ -600,12 +600,18 @@ async fn registry_actor(
                         // The next client delivery recomputes leadership off the
                         // updated view, so there is nothing to flush here.
                         reg.set_peer_liveness(node.clone(), live);
-                        // A follower's link coming up is the late-joiner catch-up
-                        // trigger: dial the backlog it missed to it, so a follower
-                        // that connected after the leader advanced converges before it
-                        // is routed to. Route the catch-up frames it queued.
+                        // A peer link coming up drives the late-joiner catch-up in
+                        // both directions: (1) as a leader, dial the backlog this
+                        // node's follower `node` missed, so a follower that connected
+                        // after the leader advanced converges before it is routed to;
+                        // (2) as a follower, report this node's durable heads to `node`
+                        // (which may be its leader) so a wiped node self-heals from its
+                        // true head rather than being trusted at a stale ack — the peer
+                        // filters the report to the rooms it actually leads. Route the
+                        // frames both queued.
                         if live {
                             reg.catch_up_follower(&node);
+                            reg.report_heads_to(&node);
                             dispatch_replication(&mut reg, &peer_conns);
                         }
                     }
