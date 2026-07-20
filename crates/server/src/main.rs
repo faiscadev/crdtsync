@@ -49,9 +49,10 @@ use crdtsync_server::auth::CredentialsFileError;
 use crdtsync_server::membership::{Membership, MembershipConfigError};
 use crdtsync_server::runtime::{serve_with_authorizer_handle, ServeConfig};
 use crdtsync_server::{
-    serve_admin, serve_blobs, server_config_from_pem, server_config_from_pem_with_client_ca_mode,
-    AllowAll, Authorizer, BlobStore, ClientAuthMode, PermitAll, SchemaRegistry, StaticTokens,
-    Store, TlsConfigError, Verifier, WebhookConfig, DEFAULT_REPLICATION_FACTOR,
+    serve_admin, serve_audit, serve_blobs, server_config_from_pem,
+    server_config_from_pem_with_client_ca_mode, AllowAll, AuditLog, Authorizer, BlobStore,
+    ClientAuthMode, PermitAll, SchemaRegistry, StaticTokens, Store, SystemClock, TlsConfigError,
+    Verifier, WebhookConfig, DEFAULT_REPLICATION_FACTOR,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::rustls;
@@ -296,6 +297,15 @@ async fn main() -> std::io::Result<()> {
     // registration is at once visible to connecting clients. Empty until the
     // admin plane writes it — with no admin plane, every connection is a relay.
     let schema = Arc::new(Mutex::new(SchemaRegistry::new()));
+    // The append-only audit trail, enabled only when CRDTSYNC_AUDIT_LOG names its
+    // file. One shared handle backs three planes: the data plane (its Audited
+    // authorizer persists each security-relevant decision + the connect / export /
+    // version-read events), the blob plane (records an export on each fetch), and the
+    // operator query plane below. Unset, the node runs unaudited.
+    let audit_log = match path_var("CRDTSYNC_AUDIT_LOG")? {
+        Some(path) => Some(Arc::new(AuditLog::open(path, Arc::new(SystemClock))?)),
+        None => None,
+    };
     // The server never mints ops; its replicas only merge, so a fixed id is fine.
     // Both seams default to their permissive dev-mode value when unconfigured, so
     // one serve path covers every combination.
@@ -312,6 +322,7 @@ async fn main() -> std::io::Result<()> {
             membership: membership()?,
             tls,
             zone_key: zone_key()?,
+            audit_log: audit_log.clone(),
             ..ServeConfig::default()
         },
         verifier()?,
@@ -354,6 +365,23 @@ async fn main() -> std::io::Result<()> {
             verifier()?,
             store,
             Arc::new(blob_authority),
+            audit_log.clone(),
+        )));
+    }
+
+    // The operator audit-query plane is a read-only control-plane listener over the
+    // append-only trail, enabled only when both a trail (CRDTSYNC_AUDIT_LOG) and its
+    // address (CRDTSYNC_AUDIT_ADDR) are set. It gates each query through the same
+    // verifier + policy as the data plane, requiring Read on the reserved `$audit`
+    // app resource — so the trail is never exposed to an app client.
+    if let (Some(audit_addr), Some(log)) = (path_var("CRDTSYNC_AUDIT_ADDR")?, audit_log) {
+        let audit_listener = TcpListener::bind(&audit_addr).await?;
+        eprintln!("crdtsync audit query on http://{audit_addr}");
+        servers.push(Box::pin(serve_audit(
+            audit_listener,
+            verifier()?,
+            authorizer()?,
+            log,
         )));
     }
 

@@ -41,8 +41,13 @@ pub mod translate;
 pub mod webhook;
 pub mod zonetoken;
 pub use admin::{
-    admin_router, blob_router, register_schema, serve_admin, serve_blobs, BlobAccess,
-    PermitAllBlobs, RegisterOutcome, RegisterRequest, MAX_BLOB_BODY,
+    admin_router, audit_router, blob_router, register_schema, serve_admin, serve_audit,
+    serve_blobs, BlobAccess, PermitAllBlobs, RegisterOutcome, RegisterRequest, AUDIT_APP,
+    MAX_BLOB_BODY,
+};
+pub use audit::{
+    AccessLog, AccessRecord, AuditLog, AuditQuery, AuditRecord, AuditResource, Audited,
+    Decision as AuditDecision, DurableAccessLog,
 };
 pub use auth::{AllowAll, Identity, StaticTokens, Verifier};
 pub use authz::{Action, Authorizer, PermitAll, Resource};

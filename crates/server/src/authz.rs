@@ -30,6 +30,19 @@ pub enum Action {
     /// Register (or migrate) an app's schema — the app-admin meta-auth on an
     /// [`Resource::App`], distinct from any data-plane room action.
     RegisterSchema,
+    /// A client authenticated and connected — the identity seam admitted a
+    /// credential. Not a gate (a rejected credential closes the connection
+    /// upstream); it names the auditable connect event so the access log records
+    /// who joined and when.
+    Connect,
+    /// A state, blob, or snapshot export left the server — bytes an actor carried
+    /// out of band. Names the auditable export event; the audit trail records the
+    /// exfiltration surface a path-scoped read gate alone would not.
+    Export,
+    /// A branch/version/version-diff read — an actor fetched a captured version's
+    /// state. Distinct from a live room [`Read`](Action::Read) so the audit trail
+    /// separates history reads from the ongoing subscribe stream.
+    VersionRead,
 }
 
 /// What an [`Action`] targets: a room (the data plane) or an app (the schema

@@ -59,12 +59,17 @@ impl BlobAccess for FixedAccess {
 /// A router whose fetch gate authorizes every request — the default for the
 /// non-authorization status-matrix tests.
 fn router(store: Arc<Mutex<BlobStore>>) -> Router {
-    blob_router(Box::new(verifier()), store, Arc::new(PermitAllBlobs))
+    blob_router(Box::new(verifier()), store, Arc::new(PermitAllBlobs), None)
 }
 
 /// A router whose fetch gate answers every fetch with `verdict`.
 fn router_with_access(store: Arc<Mutex<BlobStore>>, verdict: bool) -> Router {
-    blob_router(Box::new(verifier()), store, Arc::new(FixedAccess(verdict)))
+    blob_router(
+        Box::new(verifier()),
+        store,
+        Arc::new(FixedAccess(verdict)),
+        None,
+    )
 }
 
 /// Drive one request through a clone of `router` (so the shared store persists
@@ -339,6 +344,7 @@ async fn serves_upload_and_fetch_over_a_socket() {
         Box::new(verifier()),
         store(),
         Arc::new(PermitAllBlobs),
+        None,
     ));
 
     let client = reqwest::Client::new();

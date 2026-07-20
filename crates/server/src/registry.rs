@@ -863,6 +863,11 @@ impl Registry {
     /// path (credential verified at accept) or anonymous mode (a minted actor).
     /// Its client skips the in-band Auth phase.
     pub fn connect_authenticated(&mut self, identity: Identity) -> ConnId {
+        // The upgrade fast path authenticates at accept, ahead of any in-band Auth —
+        // record the connect here (the app is not yet known, so its resource is the
+        // empty app) so a fast-path connect is audited the same as an in-band one.
+        self.authorizer
+            .observe(&identity, Action::Connect, &Resource::App(&[]), true);
         self.insert_conn(Session::authenticated(identity))
     }
 
@@ -1709,6 +1714,14 @@ impl Registry {
         // it is pulled out of the step's replies below and released only once the
         // room's replica set confirms the write durable.
         let is_ops_write = matches!(msg, Message::Ops { .. } | Message::CrossZoneOps { .. });
+        // Whether this connection was already authenticated before the step, so an
+        // in-band Auth that just admitted a credential is told from a later message
+        // on an already-authenticated session — only the transition is the auditable
+        // connect event.
+        let was_authed = self
+            .conns
+            .get(&id)
+            .is_some_and(|c| c.session.identity().is_some());
         let (
             broadcast,
             broadcast_version,
@@ -1820,6 +1833,23 @@ impl Registry {
         // clear once it re-authenticates, so its presence survives the gap.
         if let Some(client) = authed_client {
             self.stale.remove(&client);
+        }
+        // An in-band Auth that just admitted a credential is a security-relevant
+        // connect: record it once, on the transition, through the audit seam (the
+        // authorizer's observe, which a durable-audited deployment persists). The
+        // event names the connection's app as its resource; a rejected credential
+        // never authenticates, so it takes the connection-closing error path above
+        // rather than an audited connect.
+        if !was_authed {
+            let connected = self.conns.get(&id).and_then(|c| {
+                c.session
+                    .identity()
+                    .map(|identity| (identity.clone(), c.session.app_id().to_vec()))
+            });
+            if let Some((identity, app)) = connected {
+                self.authorizer
+                    .observe(&identity, Action::Connect, &Resource::App(&app), true);
+            }
         }
         // Bind the subscribed room to the enforcing app governing it, so both the
         // schema-authorization tier and (with no injected policy) presence expiry

@@ -852,6 +852,18 @@ pub fn step(
             };
             match hub.version_state(&room, &name) {
                 Some(state) => {
+                    // A version's captured state is served — an auditable history
+                    // read, distinct from the live subscribe stream. Record it
+                    // through the audit seam (the read was already authorized by
+                    // `version_room` above, so the verdict is granted).
+                    if let Some(identity) = session.identity() {
+                        authorizer.observe(
+                            identity,
+                            Action::VersionRead,
+                            &Resource::Room(&room),
+                            true,
+                        );
+                    }
                     let seq = hub.version_seq(&room, &name).unwrap_or(0);
                     let state = state.to_vec();
                     Response {
