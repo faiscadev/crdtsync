@@ -16,6 +16,7 @@
 use crdtsync_core::{ClientId, MemberState};
 use crdtsync_server::membership::{
     Membership, DEAD_AFTER_FAILURES, REAP_AFTER_DEAD_TICKS, SUSPECT_AFTER_FAILURES,
+    TOMBSTONE_RETENTION_TICKS,
 };
 use crdtsync_server::placement::NodeId;
 use crdtsync_server::Registry;
@@ -270,6 +271,108 @@ fn a_crash_restarted_member_rejoins_at_incarnation_zero() {
         "a crash-restarted node at incarnation 0 still rejoins"
     );
     assert_eq!(m.gossip_state(&d), MemberState::Alive);
+}
+
+// --- tombstone pruning: the reap tombstone is bounded, convergent, resurrection-safe ---
+
+/// Reap D, then run `n` further reap checks (aging its tombstone).
+fn reap_then_age(m: &mut Membership, n: u32) {
+    let d = nid(D);
+    kill(m, &d);
+    reap_n(m, REAP_AFTER_DEAD_TICKS);
+    assert!(m.is_tombstoned(&d), "D is tombstoned right after reaping");
+    reap_n(m, n);
+}
+
+#[test]
+fn a_tombstone_within_retention_still_blocks_resurrection() {
+    let mut m = cluster();
+    let d = nid(D);
+    let d_inc = m.incarnation(&d);
+    // Age the tombstone to just shy of the retention threshold.
+    reap_then_age(&mut m, TOMBSTONE_RETENTION_TICKS - 1);
+    assert!(
+        m.is_tombstoned(&d),
+        "the tombstone is retained below the threshold"
+    );
+    // Stale Dead gossip within retention still cannot resurrect it.
+    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), d_inc, MemberState::Dead)]);
+    assert!(
+        !m.is_member(&d),
+        "a retained tombstone still blocks stale-gossip resurrection"
+    );
+}
+
+#[test]
+fn a_tombstone_past_retention_is_pruned() {
+    let mut m = cluster();
+    let d = nid(D);
+    reap_then_age(&mut m, TOMBSTONE_RETENTION_TICKS);
+    assert!(
+        !m.is_tombstoned(&d),
+        "the tombstone is pruned past the retention threshold"
+    );
+    assert!(
+        !m.is_member(&d),
+        "the pruned member is still gone from the roster"
+    );
+}
+
+#[test]
+fn pruning_is_idempotent_and_order_independent() {
+    let mut m = cluster();
+    let d = nid(D);
+    reap_then_age(&mut m, TOMBSTONE_RETENTION_TICKS);
+    let before = m.members().to_vec();
+    // Further checks after the prune neither resurrect the member nor churn the roster.
+    reap_n(&mut m, TOMBSTONE_RETENTION_TICKS);
+    assert!(!m.is_tombstoned(&d));
+    assert_eq!(m.members().to_vec(), before, "no churn after pruning");
+}
+
+#[test]
+fn pruning_converges_across_replicas() {
+    // Two independent views both reap D and, after the same retention, both prune its
+    // tombstone — converging on the same roster with no lingering tombstone.
+    let mut a = seeded(A, &format!("{B},{C},{D}"));
+    let mut b = seeded(B, &format!("{A},{C},{D}"));
+    let d = nid(D);
+    for m in [&mut a, &mut b] {
+        kill(m, &d);
+        reap_n(m, REAP_AFTER_DEAD_TICKS + TOMBSTONE_RETENTION_TICKS);
+    }
+    assert!(!a.is_tombstoned(&d) && !b.is_tombstoned(&d), "both pruned");
+    assert_eq!(
+        a.members().to_vec(),
+        b.members().to_vec(),
+        "both replicas converge on the same roster"
+    );
+    assert!(!a.is_member(&d) && !b.is_member(&d));
+}
+
+#[test]
+fn a_pruned_member_reappearing_is_a_fresh_join() {
+    let mut m = cluster();
+    let d = nid(D);
+    reap_then_age(&mut m, TOMBSTONE_RETENTION_TICKS);
+    assert!(!m.is_tombstoned(&d));
+    // With the tombstone gone, D returning Alive at incarnation 0 is a plain fresh
+    // join — no resurrection gate, and it is not tombstoned again.
+    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), 0, MemberState::Alive)]);
+    assert!(m.is_member(&d), "a pruned member rejoins as a fresh member");
+    assert_eq!(m.gossip_state(&d), MemberState::Alive);
+    assert!(!m.is_tombstoned(&d));
+}
+
+#[test]
+fn a_live_member_is_never_tombstoned() {
+    // Running many reap checks over a healthy cluster tombstones nobody.
+    let mut m = cluster();
+    reap_n(&mut m, REAP_AFTER_DEAD_TICKS + TOMBSTONE_RETENTION_TICKS);
+    for addr in [A, B, C, D] {
+        assert!(!m.is_tombstoned(&nid(addr)), "{addr} is never tombstoned");
+    }
+    assert_eq!(m.members().len(), 4);
 }
 
 #[test]
