@@ -330,6 +330,36 @@ fn a_non_replica_redirects() {
     );
 }
 
+#[test]
+fn a_named_branch_read_on_a_follower_redirects() {
+    // A leader mirrors only `main` to its followers — branch data is never
+    // replicated. A caught-up follower must therefore redirect a named-branch read
+    // to the leader (which holds every branch), never serve its own `main` replica
+    // for it nor answer a spurious "unknown branch".
+    let room = room_led_by_a_with_b_follower();
+    let leader_addr = NodeId::from_addr(A).as_bytes().to_vec();
+    let mut leader = node(Some(A));
+    let mut follower = caught_up_follower(&mut leader, &room, 3);
+
+    let c = client_as(&mut follower, 9);
+    let branch_sub = Message::Subscribe {
+        channel: CH,
+        room: room.clone(),
+        branch: b"feature".to_vec(),
+        zone: Vec::new(),
+        last_seen_seq: 0,
+    };
+    assert!(follower.deliver(c, branch_sub));
+    assert_eq!(
+        follower.take_outbox(c),
+        vec![Message::Redirect {
+            room: room.clone(),
+            leader_addr,
+        }],
+        "a named-branch read redirects — the follower replicates only main",
+    );
+}
+
 // --- writes always redirect on a follower (unchanged) ---
 
 #[test]

@@ -377,7 +377,9 @@ pub fn step(
             // `last_seen_seq` floor — the read-your-writes / monotonicity gate;
             // otherwise, and for a room led elsewhere it does not replicate, it
             // redirects to the leader. Single-node (no membership) leads every room.
-            if let Some(redirect) = read_redirect_response(membership, hub, &room, last_seen_seq) {
+            if let Some(redirect) =
+                read_redirect_response(membership, hub, &room, &branch, last_seen_seq)
+            {
                 return redirect;
             }
             // A subscription reads the room; the server never serves a room the
@@ -1595,6 +1597,7 @@ fn read_redirect_response(
     membership: Option<&Membership>,
     hub: &Hub,
     room: &[u8],
+    branch: &[u8],
     floor: u64,
 ) -> Option<Response> {
     // A read resolves the leader exactly as a write does — `None` when this node
@@ -1605,10 +1608,14 @@ fn read_redirect_response(
     // This node is a follower of the room. It serves the read from its own replica
     // — bounded staleness — only when it holds a materialized, caught-up copy whose
     // committed watermark is at least the client's floor (the read-your-writes /
-    // monotonicity gate). Failing that it redirects, so an uncaught, non-replica, or
-    // past-the-floor read fails safe to the leader.
+    // monotonicity gate), and only for the `main` stream: a leader mirrors only
+    // `main` to its followers (branch replication is a later unit), so a named-branch
+    // read must redirect to the leader, which holds every branch. Failing any of
+    // those it redirects, so an uncaught, non-replica, past-the-floor, or non-main
+    // read fails safe to the leader.
+    let main_stream = branch.is_empty() || branch == MAIN_BRANCH;
     if let Some(membership) = membership {
-        if membership.owns(room) && hub.holds_room(room) && hub.seq(room) >= floor {
+        if main_stream && membership.owns(room) && hub.holds_room(room) && hub.seq(room) >= floor {
             return None;
         }
     }
