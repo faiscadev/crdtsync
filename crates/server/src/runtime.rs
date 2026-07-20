@@ -107,6 +107,12 @@ pub struct ServeConfig {
     /// default) leaves it off, so every cross-zone move stays rejected. Server
     /// config, like the TLS cert — the key never leaves the server.
     pub zone_key: Option<[u8; 32]>,
+    /// The shared append-only audit trail. `Some` composes an
+    /// [`Audited`](crate::audit::Audited) authorizer over the deployment's, so every
+    /// security-relevant access decision (denials, writes, connects, exports,
+    /// version-reads) is persisted; the same handle backs the operator query plane.
+    /// `None` (the default) runs unaudited — no per-decision persistence cost.
+    pub audit_log: Option<Arc<crate::audit::AuditLog>>,
 }
 
 impl Default for ServeConfig {
@@ -120,6 +126,7 @@ impl Default for ServeConfig {
             membership: None,
             tls: None,
             zone_key: None,
+            audit_log: None,
         }
     }
 }
@@ -501,6 +508,18 @@ async fn registry_actor(
     }
     let mut reg = Registry::from_hub(hub);
     reg.set_verifier(verifier);
+    // Compose the durable audit sink over the deployment authorizer when a trail is
+    // configured, so every security-relevant decision (and the connect / export /
+    // version-read events routed through the same observe seam) is persisted. The
+    // registry actor runs on a current-thread runtime, so the composed authorizer
+    // need not be `Send`.
+    let authorizer: Box<dyn crate::Authorizer> = match &config.audit_log {
+        Some(log) => Box::new(crate::audit::Audited::new(
+            authorizer,
+            Box::new(crate::audit::DurableAccessLog::new(log.clone())),
+        )),
+        None => authorizer,
+    };
     reg.set_authorizer(authorizer);
     reg.set_schema_registry(config.schema.clone());
     reg.set_grace_millis(config.grace.as_millis() as u64);

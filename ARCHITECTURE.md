@@ -1056,6 +1056,12 @@ SDK won't let a client construct an op targeting elements / paths / zones it can
 
 Op log is the authoritative record. Every op has `actor_id` + lamport + timestamp. Audit = log query. Separate access log for read-only actions (connect, snapshot export, branch read) since those don't generate ops.
 
+**As built — the audit trail + operator query surface.** The read-only-action access log is durable: a single append-only structured file-log (`AuditLog`), the same durability shape the op store uses — one length-framed record per event (`u64` timestamp, action + decision tags, length-prefixed actor, tagged resource), flushed before the append returns, never mutated or removed. It is *not* a DB (deferred — see Revisit). Records are the security-relevant events: every **denied** access decision and every **write** (the ACL grant/revoke mutations ride the write path), plus three read-only-action variants added to the `Action` enum — **`Connect`** (a client authenticated), **`Export`** (a blob/state/snapshot left the server), **`VersionRead`** (a captured version's state was fetched). Routine *permitted* reads and awareness publishes are not persisted — the trail is refusals, mutations, and the explicit events, not the read stream.
+
+Auditing is wired at the existing seams: the durable log is an `AccessLog` sink composed under an `Audited` authorizer, so every enforced decision persists at the point it is enforced; `Connect` and `VersionRead` route through the authorizer's `observe` at the connect/auth site (registry) and the version-fetch site (session); `Export` is recorded at the blob-fetch route. A failed append is fail-loud — it returns the IO error to a direct caller and latches a health flag the query surface reports (a `500`), never silently dropping a security event.
+
+The **query surface** is an operator admin-HTTP endpoint (`GET /audit`, its own `serve_audit` listener) — the operator→admin-HTTP audience side, never the app→wire client path. It is gated by the same verifier + authorizer as the schema-registration plane, requiring `Read` on the reserved `$audit` app resource, so the trail is never exposed to an app client. It filters by actor / action / room / time-range (half-open `[since, until)`) and returns the matching records as JSON. The query is a straight scan over the whole log (v1); a rebuildable in-memory index is a scale follow-on. The path is strictly read-only — it never writes, mutates, or removes a record.
+
 ## Hard Problems
 
 ### Offline Edits + Permission Revocation

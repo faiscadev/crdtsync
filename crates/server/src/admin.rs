@@ -21,15 +21,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::timeout::TimeoutLayer;
 
+use crate::audit::{AuditLog, AuditQuery, AuditResource, Decision};
 use crate::auth::{Identity, Verifier};
 use crate::authz::{Action, Authorizer, Resource};
 use crate::blobs::{self, BlobStore};
@@ -245,6 +246,9 @@ struct BlobState {
     verifier: Box<dyn Verifier + Send + Sync>,
     store: Arc<Mutex<BlobStore>>,
     access: Arc<dyn BlobAccess>,
+    /// The audit trail a blob fetch — a bytes-out-of-band export — records to, when
+    /// the deployment enables auditing. `None` leaves the fetch unaudited.
+    audit: Option<Arc<AuditLog>>,
 }
 
 /// The handle an upload returns: the public id as lowercase hex, the byte size,
@@ -270,11 +274,13 @@ pub fn blob_router(
     verifier: Box<dyn Verifier + Send + Sync>,
     store: Arc<Mutex<BlobStore>>,
     access: Arc<dyn BlobAccess>,
+    audit: Option<Arc<AuditLog>>,
 ) -> Router {
     let state = Arc::new(BlobState {
         verifier,
         store,
         access,
+        audit,
     });
     Router::new()
         .route("/blobs", post(blob_upload))
@@ -292,8 +298,9 @@ pub async fn serve_blobs(
     verifier: Box<dyn Verifier + Send + Sync>,
     store: Arc<Mutex<BlobStore>>,
     access: Arc<dyn BlobAccess>,
+    audit: Option<Arc<AuditLog>>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, blob_router(verifier, store, access)).await
+    axum::serve(listener, blob_router(verifier, store, access, audit)).await
 }
 
 /// Authenticate a blob request's `Authorization` credential to an [`Identity`],
@@ -372,7 +379,26 @@ async fn blob_fetch(
     let Some(id) = blobs::parse_uuid(&id) else {
         return (StatusCode::BAD_REQUEST, "malformed blob id").into_response();
     };
-    if !state.access.may_read_blob(&identity, &id).await {
+    let permitted = state.access.may_read_blob(&identity, &id).await;
+    // A blob fetch is a bytes-out-of-band export — an auditable exfiltration
+    // surface. Record the attempt (permitted or denied) before answering, so the
+    // trail captures who tried to carry which blob out, not only who succeeded.
+    if let Some(audit) = &state.audit {
+        let decision = if permitted {
+            Decision::Permitted
+        } else {
+            Decision::Denied
+        };
+        if let Err(err) = audit.record(
+            identity.actor(),
+            Action::Export,
+            AuditResource::App(id.to_vec()),
+            decision,
+        ) {
+            eprintln!("audit: failed to persist a blob-export event: {err}");
+        }
+    }
+    if !permitted {
         return StatusCode::FORBIDDEN.into_response();
     }
     let fetched = {
@@ -385,5 +411,200 @@ async fn blob_fetch(
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "blob store read failed").into_response(),
+    }
+}
+
+// --- audit query surface --------------------------------------------------
+
+/// The reserved app id the audit-query gate authorizes against: an operator reads
+/// the trail only if the deployment grants [`Read`](Action::Read) on
+/// `Resource::App("$audit")`. This reuses the admin-plane trust seams (verifier +
+/// authorizer) so the audit trail is never exposed to an app client — only an
+/// operator the deployment admits to this reserved resource. The `$` prefix is not a
+/// legal app id, so it cannot collide with a real app.
+pub const AUDIT_APP: &[u8] = b"$audit";
+
+/// The audit-query plane's state: the trust seams every request clears and the
+/// shared, append-only [`AuditLog`] a request reads (never writes).
+struct AuditState {
+    verifier: Box<dyn Verifier + Send + Sync>,
+    authorizer: Box<dyn Authorizer + Send + Sync>,
+    log: Arc<AuditLog>,
+}
+
+/// The operator audit-query router: the single read-only `GET /audit` route,
+/// filtered by actor / action / room / time-range. `log` is the shared append-only
+/// trail; this surface only reads it. Exposed so it can be driven in-process by
+/// tests without a socket.
+pub fn audit_router(
+    verifier: Box<dyn Verifier + Send + Sync>,
+    authorizer: Box<dyn Authorizer + Send + Sync>,
+    log: Arc<AuditLog>,
+) -> Router {
+    let state = Arc::new(AuditState {
+        verifier,
+        authorizer,
+        log,
+    });
+    Router::new()
+        .route("/audit", get(audit_query))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
+        .with_state(state)
+}
+
+/// Serve the operator audit-query plane on `listener` — a read-only control-plane
+/// endpoint over the append-only audit trail, gated by the same verifier +
+/// authorizer as the schema-registration admin plane.
+pub async fn serve_audit(
+    listener: TcpListener,
+    verifier: Box<dyn Verifier + Send + Sync>,
+    authorizer: Box<dyn Authorizer + Send + Sync>,
+    log: Arc<AuditLog>,
+) -> std::io::Result<()> {
+    axum::serve(listener, audit_router(verifier, authorizer, log)).await
+}
+
+/// The query-string filters of an audit query. Every field is optional; an empty
+/// query returns every record (bounded by the log's size).
+#[derive(Deserialize)]
+struct AuditQueryParams {
+    /// Only records whose actor equals this (matched as bytes).
+    actor: Option<String>,
+    /// Only records of this action keyword — `read`, `write`, `publish_awareness`,
+    /// `register_schema`, `connect`, `export`, `version_read`.
+    action: Option<String>,
+    /// Only records naming this room (a room or a zone within it).
+    room: Option<String>,
+    /// Only records at or after this wall-clock millisecond (inclusive).
+    since: Option<u64>,
+    /// Only records strictly before this wall-clock millisecond (exclusive).
+    until: Option<u64>,
+}
+
+/// One audit record rendered for the operator response.
+#[derive(Serialize)]
+struct AuditRecordJson {
+    timestamp: u64,
+    actor: String,
+    action: &'static str,
+    resource: AuditResourceJson,
+    decision: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum AuditResourceJson {
+    Room { room: String },
+    App { app: String },
+    Zone { room: String, zone: String },
+}
+
+/// The action keyword an [`Action`] renders as, and its inverse.
+fn action_keyword(action: Action) -> &'static str {
+    match action {
+        Action::Read => "read",
+        Action::Write => "write",
+        Action::PublishAwareness => "publish_awareness",
+        Action::RegisterSchema => "register_schema",
+        Action::Connect => "connect",
+        Action::Export => "export",
+        Action::VersionRead => "version_read",
+    }
+}
+
+fn action_from_keyword(keyword: &str) -> Option<Action> {
+    Some(match keyword {
+        "read" => Action::Read,
+        "write" => Action::Write,
+        "publish_awareness" => Action::PublishAwareness,
+        "register_schema" => Action::RegisterSchema,
+        "connect" => Action::Connect,
+        "export" => Action::Export,
+        "version_read" => Action::VersionRead,
+        _ => return None,
+    })
+}
+
+/// `GET /audit` — the read-only operator query over the append-only trail. The
+/// caller must authenticate (`401` on a missing/invalid credential) and be
+/// authorized [`Read`](Action::Read) on the reserved [`AUDIT_APP`] resource (`403`
+/// otherwise), so the trail is never exposed to an app client. A malformed `action`
+/// keyword is `400`; a latched audit-write failure is `500` (a dropped security
+/// event must surface, never be hidden behind a clean read). The response is a JSON
+/// array of the matching records, in time order.
+async fn audit_query(
+    State(state): State<Arc<AuditState>>,
+    headers: HeaderMap,
+    Query(params): Query<AuditQueryParams>,
+) -> Response {
+    let Some(credential) = headers.get("authorization").map(|v| v.as_bytes()) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(identity) = state.verifier.verify(credential) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if !state
+        .authorizer
+        .authorize(&identity, Action::Read, &Resource::App(AUDIT_APP))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let action = match &params.action {
+        Some(keyword) => match action_from_keyword(keyword) {
+            Some(action) => Some(action),
+            None => return (StatusCode::BAD_REQUEST, "unknown action keyword").into_response(),
+        },
+        None => None,
+    };
+    let query = AuditQuery {
+        actor: params.actor.map(String::into_bytes),
+        action,
+        room: params.room.map(String::into_bytes),
+        since: params.since,
+        until: params.until,
+    };
+
+    // A latched append failure means a security event was dropped — surface it
+    // rather than serving a clean-looking (but incomplete) read.
+    if !state.log.healthy() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit log has a dropped record",
+        )
+            .into_response();
+    }
+    match state.log.query(&query) {
+        Ok(records) => Json(records.iter().map(render_record).collect::<Vec<_>>()).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "audit log read failed").into_response(),
+    }
+}
+
+fn render_record(record: &crate::audit::AuditRecord) -> AuditRecordJson {
+    let render_bytes = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    let resource = match &record.resource {
+        AuditResource::Room(room) => AuditResourceJson::Room {
+            room: render_bytes(room),
+        },
+        AuditResource::App(app) => AuditResourceJson::App {
+            app: render_bytes(app),
+        },
+        AuditResource::Zone { room, zone } => AuditResourceJson::Zone {
+            room: render_bytes(room),
+            zone: render_bytes(zone),
+        },
+    };
+    AuditRecordJson {
+        timestamp: record.timestamp,
+        actor: render_bytes(&record.actor),
+        action: action_keyword(record.action),
+        resource,
+        decision: match record.decision {
+            Decision::Permitted => "permitted",
+            Decision::Denied => "denied",
+        },
     }
 }

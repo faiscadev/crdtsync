@@ -944,7 +944,9 @@ fn capability_for(action: Action) -> Option<Capability> {
         Action::Read => Some(Capability::Read),
         Action::Write => Some(Capability::Write),
         Action::PublishAwareness => Some(Capability::PublishAwareness),
-        Action::RegisterSchema => None,
+        // The audit-only operator actions carry no doc-level capability form —
+        // they name auditable events, not doc-ACL-governed subtree powers.
+        Action::RegisterSchema | Action::Connect | Action::Export | Action::VersionRead => None,
     }
 }
 
@@ -1032,7 +1034,9 @@ fn schema_action(action: Action) -> Option<SchemaAction> {
         Action::Read => Some(SchemaAction::Read),
         Action::Write => Some(SchemaAction::Write),
         Action::PublishAwareness => Some(SchemaAction::PublishAwareness),
-        Action::RegisterSchema => None,
+        // The audit-only operator actions are not schema-grantable — they never
+        // resolve through the `@auth` grant tier.
+        Action::RegisterSchema | Action::Connect | Action::Export | Action::VersionRead => None,
     }
 }
 
