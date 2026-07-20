@@ -313,8 +313,16 @@ impl AuditLog {
 
     /// Every stored record, in append (time) order. Reopens the file so it sees
     /// every flushed append. A torn trailing record (a crash mid-append) is dropped;
-    /// a complete but undecodable record is [`io::ErrorKind::InvalidData`].
+    /// a complete but undecodable record body is [`io::ErrorKind::InvalidData`].
+    /// (A corrupted *length* prefix that overruns the file is indistinguishable from
+    /// a crash-torn tail and is likewise dropped — the append log is not
+    /// tamper-evident; a hash-chained record is the follow-on for that.)
+    ///
+    /// The read holds the append lock, so it never observes a frame mid-write: a
+    /// query racing an in-flight append sees the trail either before or after that
+    /// record, never a half-written one it would mistake for a torn tail.
     pub fn read_all(&self) -> io::Result<Vec<AuditRecord>> {
+        let _writing = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         let mut bytes = Vec::new();
         File::open(&self.path)?.read_to_end(&mut bytes)?;
         let mut records = Vec::new();

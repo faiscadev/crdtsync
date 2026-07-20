@@ -379,26 +379,25 @@ async fn blob_fetch(
     let Some(id) = blobs::parse_uuid(&id) else {
         return (StatusCode::BAD_REQUEST, "malformed blob id").into_response();
     };
-    let permitted = state.access.may_read_blob(&identity, &id).await;
     // A blob fetch is a bytes-out-of-band export — an auditable exfiltration
-    // surface. Record the attempt (permitted or denied) before answering, so the
-    // trail captures who tried to carry which blob out, not only who succeeded.
-    if let Some(audit) = &state.audit {
-        let decision = if permitted {
-            Decision::Permitted
-        } else {
-            Decision::Denied
-        };
-        if let Err(err) = audit.record(
-            identity.actor(),
-            Action::Export,
-            AuditResource::App(id.to_vec()),
-            decision,
-        ) {
-            eprintln!("audit: failed to persist a blob-export event: {err}");
+    // surface. Record a `Denied` export when access is refused, and a `Permitted`
+    // one only once bytes actually leave the server (below), so the trail's
+    // `Export` records mean an export happened — a 404 / read-error transfers
+    // nothing and is not recorded as one.
+    let audit_export = |decision: Decision| {
+        if let Some(audit) = &state.audit {
+            if let Err(err) = audit.record(
+                identity.actor(),
+                Action::Export,
+                AuditResource::App(id.to_vec()),
+                decision,
+            ) {
+                eprintln!("audit: failed to persist a blob-export event: {err}");
+            }
         }
-    }
-    if !permitted {
+    };
+    if !state.access.may_read_blob(&identity, &id).await {
+        audit_export(Decision::Denied);
         return StatusCode::FORBIDDEN.into_response();
     }
     let fetched = {
@@ -407,6 +406,7 @@ async fn blob_fetch(
     };
     match fetched {
         Ok(Some(bytes)) => {
+            audit_export(Decision::Permitted);
             ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),

@@ -19,10 +19,11 @@ use axum::http::Request;
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Op, Scalar};
 use crdtsync_server::{
-    audit_router, Action, AuditDecision, AuditLog, AuditQuery, AuditResource, Audited, Authorizer,
-    ConnId, DurableAccessLog, Identity, ManualClock, PermitAll, Registry, Resource, StaticTokens,
-    AUDIT_APP,
+    audit_router, blob_router, Action, AuditDecision, AuditLog, AuditQuery, AuditResource, Audited,
+    Authorizer, BlobAccess, BlobStore, ConnId, DurableAccessLog, Identity, ManualClock, PermitAll,
+    PermitAllBlobs, Registry, Resource, StaticTokens, AUDIT_APP,
 };
+use std::sync::Mutex;
 use tower::ServiceExt;
 
 // --- fixtures -------------------------------------------------------------
@@ -483,6 +484,116 @@ async fn the_query_is_read_only_and_operator_authorized() {
         before,
         "a query never mutates the log"
     );
+}
+
+/// A blob-fetch gate that denies every fetch — to drive the denied-export path.
+struct DenyBlobs;
+
+#[async_trait::async_trait]
+impl BlobAccess for DenyBlobs {
+    async fn may_read_blob(&self, _identity: &Identity, _blob_id: &[u8; 16]) -> bool {
+        false
+    }
+}
+
+fn hex16(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tokio::test]
+async fn a_blob_fetch_records_an_export_only_when_bytes_actually_leave() {
+    let (log, _clock, _tmp) = new_log();
+    let btmp = tempdir();
+    let store = Arc::new(Mutex::new(BlobStore::open(btmp.0.join("blobs")).unwrap()));
+    let id = store
+        .lock()
+        .unwrap()
+        .put_fetchable(b"payload", "text/plain")
+        .unwrap()
+        .id;
+
+    // A permitted fetch of an existing blob records a Permitted export.
+    let router = blob_router(
+        Box::new(verifier()),
+        store.clone(),
+        Arc::new(PermitAllBlobs),
+        Some(log.clone()),
+    );
+    let status = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/blobs/{}", hex16(&id)))
+                .header("authorization", "op-cred")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 200);
+
+    // A permitted fetch of a MISSING blob (404) records no export — nothing left.
+    let router = blob_router(
+        Box::new(verifier()),
+        store.clone(),
+        Arc::new(PermitAllBlobs),
+        Some(log.clone()),
+    );
+    let missing = hex16(&[0xAB; 16]);
+    let status = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/blobs/{missing}"))
+                .header("authorization", "op-cred")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 404);
+
+    // A denied fetch records a Denied export (the refused exfiltration attempt).
+    let router = blob_router(
+        Box::new(verifier()),
+        store,
+        Arc::new(DenyBlobs),
+        Some(log.clone()),
+    );
+    let status = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/blobs/{}", hex16(&id)))
+                .header("authorization", "op-cred")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 403);
+
+    let exports = log
+        .query(&AuditQuery {
+            action: Some(Action::Export),
+            ..AuditQuery::default()
+        })
+        .unwrap();
+    assert_eq!(
+        exports.len(),
+        2,
+        "one served + one denied, never the 404: {exports:?}"
+    );
+    assert!(exports
+        .iter()
+        .any(|e| e.decision == AuditDecision::Permitted));
+    assert!(exports.iter().any(|e| e.decision == AuditDecision::Denied));
 }
 
 #[tokio::test]
