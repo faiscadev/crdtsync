@@ -240,12 +240,21 @@ impl AuditLog {
     /// them.
     pub fn open(path: impl AsRef<Path>, clock: Arc<dyn Clock>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
                 std::fs::create_dir_all(parent)?;
+                Some(parent.to_path_buf())
             }
-        }
+            _ => None,
+        };
         let writer = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Flush the parent directory so a freshly-created log's directory entry is
+        // itself crash-durable — else a power loss before the OS flushes the
+        // directory loses the whole trail even though the first append fsync'd the
+        // file (the same crash-durability the op store's atomic writes take).
+        if let Some(parent) = parent {
+            File::open(&parent)?.sync_all()?;
+        }
         Ok(Self {
             path,
             writer: Mutex::new(writer),
@@ -258,6 +267,13 @@ impl AuditLog {
     /// returns so the record survives a crash. On an IO failure the error is
     /// returned *and* the failure flag latched — a security event is never dropped
     /// silently.
+    ///
+    /// Once an append has failed the log is refused further writes: a partial
+    /// `write_all` can strand a fraction of a frame on disk, and a later append
+    /// landing after it would make its bogus length prefix consume the following
+    /// real records — corrupting the whole readable trail, not just a torn tail. So
+    /// the readable prefix is frozen (and the latched flag keeps surfacing the
+    /// failure) rather than compounded.
     pub fn record(
         &self,
         actor: &[u8],
@@ -280,7 +296,14 @@ impl AuditLog {
 
         let result = {
             let mut file = self.writer.lock().unwrap_or_else(|p| p.into_inner());
-            file.write_all(&framed).and_then(|()| file.sync_all())
+            if self.failed.load(Ordering::SeqCst) {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "audit log is in a failed state; refusing further appends",
+                ))
+            } else {
+                file.write_all(&framed).and_then(|()| file.sync_all())
+            }
         };
         if result.is_err() {
             self.failed.store(true, Ordering::SeqCst);

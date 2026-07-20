@@ -1,3 +1,6 @@
+// Real filesystem I/O and loopback sockets, which Miri does not model.
+#![cfg(not(miri))]
+
 //! The audit trail — an append-only structured file-log of security-relevant
 //! events, and the read-only operator query surface over it.
 //!
