@@ -233,6 +233,62 @@ fn trailing_bytes_after_a_replicate_snapshot_are_an_error() {
     assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
 }
 
+// --- FollowerHeads ---
+
+#[test]
+fn follower_heads_round_trips() {
+    round_trips(Message::FollowerHeads {
+        reporter: b"10.0.0.2:9000".to_vec(),
+        heads: vec![(b"room-a".to_vec(), 5), (b"room-b".to_vec(), 0)],
+    });
+}
+
+#[test]
+fn follower_heads_round_trips_an_empty_manifest() {
+    // A fully-wiped node reports no held rooms — the leader fail-closes every led
+    // room to head 0. An empty reporter (defensive) round-trips too.
+    round_trips(Message::FollowerHeads {
+        reporter: b"node".to_vec(),
+        heads: Vec::new(),
+    });
+    round_trips(Message::FollowerHeads {
+        reporter: Vec::new(),
+        heads: vec![(Vec::new(), u64::MAX)],
+    });
+}
+
+#[test]
+fn follower_heads_round_trips_a_binary_room() {
+    round_trips(Message::FollowerHeads {
+        reporter: vec![0, 1, 2, 255],
+        heads: vec![(vec![0xFF, 0x00, 0x80], u64::MAX)],
+    });
+}
+
+#[test]
+fn a_truncated_follower_heads_is_an_error_not_a_panic() {
+    let bytes = encode_message(&Message::FollowerHeads {
+        reporter: b"node".to_vec(),
+        heads: vec![(b"room".to_vec(), 3)],
+    });
+    for cut in 0..bytes.len() {
+        assert!(
+            decode_message(&bytes[..cut]).is_err(),
+            "truncating to {cut} bytes must error, not panic",
+        );
+    }
+}
+
+#[test]
+fn trailing_bytes_after_follower_heads_are_an_error() {
+    let mut bytes = encode_message(&Message::FollowerHeads {
+        reporter: b"node".to_vec(),
+        heads: vec![(b"room".to_vec(), 3)],
+    });
+    bytes.push(0);
+    assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
+}
+
 // --- ReplicaAck ---
 
 #[test]

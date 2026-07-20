@@ -1027,6 +1027,7 @@ pub fn step(
         Message::Replicate { .. } => violation("client sent a replicate"),
         Message::ReplicaAck { .. } => violation("client sent a replica ack"),
         Message::ReplicateSnapshot { .. } => violation("client sent a replicate snapshot"),
+        Message::FollowerHeads { .. } => violation("client sent follower heads"),
         // Gossip is a node-to-node membership advertisement the registry handles
         // off the client session path; a client that sends one violates.
         Message::Gossip { .. } => violation("client sent a gossip"),

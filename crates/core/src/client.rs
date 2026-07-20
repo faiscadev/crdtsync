@@ -840,6 +840,9 @@ impl ClientSession {
             Message::ReplicateSnapshot { .. } => Err(ClientError::UnexpectedMessage(
                 "server sent a replicate snapshot",
             )),
+            Message::FollowerHeads { .. } => {
+                Err(ClientError::UnexpectedMessage("server sent follower heads"))
+            }
             Message::Gossip { .. } => Err(ClientError::UnexpectedMessage("server sent a gossip")),
             Message::PingReq { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent a ping-req"))

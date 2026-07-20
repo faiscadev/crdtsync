@@ -30,9 +30,12 @@ pub struct Replication {
     /// order. Drained by the transport after each delivery and sent over that
     /// follower's peer connection.
     pending: Vec<(NodeId, Message)>,
-    /// The highest server sequence each follower has confirmed for a room. Unit 5
-    /// reads this to gate a client ack on a majority having the write; this unit
-    /// only advances it as acks arrive.
+    /// The server sequence each follower has confirmed for a room. Majority-ack
+    /// durability reads this to gate a client's write-ack on a majority of replicas
+    /// holding the write, so it must never claim a follower holds more than the leader
+    /// produced. Advanced monotonically by [`record_ack`](Self::record_ack) as acks
+    /// arrive; set outright (and possibly lowered) by [`set_watermark`](Self::set_watermark)
+    /// when a rejoining follower reports its true durable head.
     acked: HashMap<(RoomId, NodeId), u64>,
 }
 
@@ -53,6 +56,19 @@ impl Replication {
     pub fn record_ack(&mut self, follower: NodeId, room: &[u8], through_seq: u64) {
         let entry = self.acked.entry((room.to_vec(), follower)).or_insert(0);
         *entry = (*entry).max(through_seq);
+    }
+
+    /// Set `follower`'s watermark for `room` to exactly `through_seq`, replacing the
+    /// recorded value even when that LOWERS it. Unlike [`record_ack`](Self::record_ack)
+    /// this is not monotonic: it exists for the wiped-follower self-heal, where a
+    /// follower reports a durable head below what it had previously acked and the
+    /// leader must honor that true head over the stale ack — so majority-ack durability
+    /// stops counting the follower toward quorum for data it can no longer prove. The
+    /// caller must pass a value no greater than the leader's own head (a follower
+    /// cannot hold ops the leader never produced); crediting it higher would falsely
+    /// satisfy quorum.
+    pub fn set_watermark(&mut self, follower: NodeId, room: &[u8], through_seq: u64) {
+        self.acked.insert((room.to_vec(), follower), through_seq);
     }
 
     /// The server sequence `follower` has acknowledged for `room` — `0` if it has

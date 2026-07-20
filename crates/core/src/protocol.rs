@@ -310,6 +310,25 @@ pub enum Message {
         state: Vec<u8>,
         epoch: u64,
     },
+    /// A (re)joining follower's report of the durable head it can actually prove it
+    /// holds for each room it replicates. `reporter` is the reporting node's id (the
+    /// frame is self-describing — the leader reads it off the frame, exactly as it
+    /// does a [`Gossip`](Message::Gossip)'s members, rather than from any connection
+    /// identity); `heads` is a set of `(room, head)` pairs, the follower's *current*
+    /// server sequence per room — read from its own persistence, not a remembered ack.
+    /// The leader treats a reported head as the authoritative catch-up floor, honoring
+    /// it over any acknowledged watermark it remembers: a follower whose durable state
+    /// was wiped BELOW its last ack reports its true (lower) head and is caught up from
+    /// there (an ops tail, or a snapshot if the reported head is below the compaction
+    /// floor), instead of being trusted at a stale ack it can no longer honor and left
+    /// with a silent gap. The manifest is complete for the rooms the follower holds: a
+    /// room the leader leads that is ABSENT from `heads` is treated as head `0`
+    /// (fail-closed — a fully-wiped room gets a full catch-up). Node-to-node — never a
+    /// client frame; a client that sends one commits a protocol violation.
+    FollowerHeads {
+        reporter: Vec<u8>,
+        heads: Vec<(Vec<u8>, u64)>,
+    },
     /// A node's advertisement of the cluster members it knows, for gossip
     /// membership discovery and SWIM-style failure detection: `members` is a set of
     /// `(node_id, advertise_addr, incarnation, state)` tuples — the node id a peer
@@ -688,6 +707,18 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u64(&mut out, *epoch);
             put_bytes(&mut out, state);
         }
+        Message::FollowerHeads { reporter, heads } => {
+            put_u8(&mut out, 50);
+            put_bytes(&mut out, reporter);
+            put_u32(
+                &mut out,
+                u32::try_from(heads.len()).expect("head count exceeds u32"),
+            );
+            for (room, head) in heads {
+                put_bytes(&mut out, room);
+                put_u64(&mut out, *head);
+            }
+        }
         Message::Gossip { members } => {
             put_u8(&mut out, 26);
             put_u32(
@@ -1036,6 +1067,20 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 state,
                 epoch,
             }
+        }
+        50 => {
+            let reporter = cur.bytes()?;
+            let count = cur.u32()?;
+            // Grow as pairs are read rather than trusting `count` to size the
+            // allocation — a bogus count then fails on the missing bytes, not on a
+            // giant up-front reservation.
+            let mut heads = Vec::new();
+            for _ in 0..count {
+                let room = cur.bytes()?;
+                let head = cur.u64()?;
+                heads.push((room, head));
+            }
+            Message::FollowerHeads { reporter, heads }
         }
         26 => {
             let count = cur.u32()?;
