@@ -1203,6 +1203,31 @@ impl WasmClient {
             .map(|d| d.encode_state())
     }
 
+    /// Capture a stable position in the List or Text at a path in `channel`'s room
+    /// — the encoded `RelativePosition` bytes, resolved later with `resolvePosition`.
+    /// `side` is 0 (left of `index`) or 1 (right).
+    #[wasm_bindgen(js_name = relativePosition)]
+    pub fn relative_position(
+        &self,
+        channel: u32,
+        path: &[u8],
+        index: usize,
+        side: u32,
+    ) -> Option<Vec<u8>> {
+        let side = side_from_u32(side)?;
+        let doc = self.inner.document(Channel(channel))?;
+        path::relative_position(doc, path, index, side).map(|p| p.encode())
+    }
+
+    /// Resolve a captured position back to a live index in the List or Text at a
+    /// path in `channel`'s room.
+    #[wasm_bindgen(js_name = resolvePosition)]
+    pub fn resolve_position(&self, channel: u32, path: &[u8], pos: &[u8]) -> Option<usize> {
+        let position = RelativePosition::decode(pos).ok()?;
+        let doc = self.inner.document(Channel(channel))?;
+        path::resolve_position(doc, path, &position)
+    }
+
     /// Install an `XmlElement` with `tag` at a path in `channel`'s room. Returns
     /// the Ops frame to send; empty if the channel isn't held.
     #[wasm_bindgen(js_name = xmlElement)]

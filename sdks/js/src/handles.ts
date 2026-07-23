@@ -12,6 +12,20 @@ import { type Key, encodePath, keyString } from "./path.js";
 /** A value read from a slot: a marshaled scalar, or a nested container handle. */
 export type Value = ScalarValue | CrdtMap | CrdtList | CrdtText;
 
+/** An opaque, stable position in a sequence — a cursor captured with
+ * `relativePosition` and resolved back to a live index with `resolve`. It tracks
+ * its spot across concurrent inserts and deletes, the anchor collaborative
+ * editors bind a selection to. */
+export type RelativePosition = Uint8Array & { readonly __rel: unique symbol };
+
+/** Which side of the index a captured position anchors to: `"before"` stays left
+ * of the index (a left-gravity anchor), `"after"` stays right of it. */
+export type CursorSide = "before" | "after";
+
+function sideCode(side: CursorSide): number {
+  return side === "after" ? 1 : 0;
+}
+
 /** A live handle to a Map slot, addressed by ergonomic keys. */
 export class CrdtMap {
   /** @internal */
@@ -175,6 +189,18 @@ export class CrdtList {
     for (let i = 0; i < n; i++) yield this.get(i);
   }
 
+  /** Capture a stable cursor at a live index, resolved later with `resolve`. */
+  relativePosition(index: number, side: CursorSide = "before"): RelativePosition | undefined {
+    return this.ctx.backend.relativePosition(this.self, index, sideCode(side)) as
+      | RelativePosition
+      | undefined;
+  }
+
+  /** Resolve a captured cursor back to a live index, or `undefined` if it can't. */
+  resolve(pos: RelativePosition): number | undefined {
+    return this.ctx.backend.resolvePosition(this.self, pos);
+  }
+
   /** Observe changes to this list (local edits and remote updates). Returns an
    * unsubscribe function. */
   observe(listener: ChangeListener): () => void {
@@ -216,6 +242,19 @@ export class CrdtText {
   /** The codepoint length. */
   get length(): number {
     return this.ctx.backend.textLen(this.self) ?? 0;
+  }
+
+  /** Capture a stable cursor at a codepoint index, resolved later with `resolve`.
+   * The cursor tracks its spot as text is inserted and deleted around it. */
+  relativePosition(index: number, side: CursorSide = "before"): RelativePosition | undefined {
+    return this.ctx.backend.relativePosition(this.self, index, sideCode(side)) as
+      | RelativePosition
+      | undefined;
+  }
+
+  /** Resolve a captured cursor back to a live codepoint index, or `undefined`. */
+  resolve(pos: RelativePosition): number | undefined {
+    return this.ctx.backend.resolvePosition(this.self, pos);
   }
 
   /** Observe changes to this text (local edits and remote updates). Returns an
