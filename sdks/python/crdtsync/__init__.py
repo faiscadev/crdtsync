@@ -25,6 +25,7 @@ __all__ = [
     "BlobRef",
     "Branch",
     "Capability",
+    "ChangeEvent",
     "Client",
     "CrdtList",
     "CrdtMap",
@@ -37,6 +38,7 @@ __all__ = [
     "Key",
     "Redirect",
     "Rejected",
+    "RepairEvent",
     "ServerError",
     "Side",
     "SubjectKind",
@@ -2130,16 +2132,158 @@ def _decode_value(data: bytes):
     return bytes(data)
 
 
+# --- reactivity: diff-derived ergonomic change events -------------------------
+#
+# A change event is a plain dict (mirroring the module-level `diff()` shape,
+# Pythonic + directly comparable): a `kind`, an ergonomic key/index target path,
+# and native `old`/`new` values — re-marshaled from the core `diff` the SDK
+# already decodes. A snapshot+diff is taken only when something is observing, so
+# an unobserved document pays nothing.
+
+
+def _decode_path(data: bytes) -> List[str]:
+    """Decode a length-framed path buffer (as the diff machinery reports) into its
+    keys, rendered best-effort as utf-8 strings."""
+    keys: List[str] = []
+    i, n = 0, len(data)
+    while i < n:
+        length = struct.unpack_from("<I", data, i)[0]
+        i += 4
+        keys.append(_key_string(data[i : i + length]))
+        i += length
+    return keys
+
+
+def _path_starts_with(whole: bytes, prefix: bytes) -> bool:
+    """Whether ``whole``'s framed bytes begin with ``prefix`` — a key-path prefix
+    test, sound because each key is self-delimiting (length + bytes)."""
+    return whole[: len(prefix)] == prefix
+
+
+def _native_from_diff_scalar(s: dict):
+    """Convert a diff-reported map-leaf scalar (a tagged ``{t, v}`` dict) to a
+    native value. A map leaf's bytes carry the SDK string/binary discriminator; a
+    list item's enveloped scalar bytes instead decode through
+    :func:`_decode_value`."""
+    t = s["t"]
+    if t == "null":
+        return None
+    if t in ("bool", "int"):
+        return s["v"]
+    if t == "bytes":
+        payload = s["v"]
+        if payload[:1] == bytes([_STRING]):
+            return payload[1:].decode("utf-8")
+        if payload[:1] == bytes([_BINARY]):
+            return bytes(payload[1:])
+        return bytes(payload)
+    # blobref / elementref: no native leaf form — hand back the raw bytes.
+    return s.get("v")
+
+
+def _list_item_value(item: dict):
+    """A list-change item: a native scalar for a leaf, or a container marker."""
+    if "scalar" in item:
+        return _decode_value(item["scalar"]["v"])
+    return {"container": item.get("kind", "unknown")}
+
+
+def _mark_change(raw: dict) -> dict:
+    name = _key_string(raw["name"])
+    if raw["op"] == "markAdded":
+        return {
+            "kind": "mark",
+            "op": "add",
+            "name": name,
+            "new": _native_from_diff_scalar(raw["value"]),
+        }
+    if raw["op"] == "markRemoved":
+        return {
+            "kind": "mark",
+            "op": "remove",
+            "name": name,
+            "old": _native_from_diff_scalar(raw["value"]),
+        }
+    return {
+        "kind": "mark",
+        "op": "change",
+        "name": name,
+        "old": _native_from_diff_scalar(raw["old"]),
+        "new": _native_from_diff_scalar(raw["new"]),
+    }
+
+
+def _remarshal_change(raw: dict) -> Tuple[bytes, dict]:
+    """Re-marshal one raw diff change (byte-path + tagged scalars) into an ergonomic
+    change (native values, key/index target) plus its raw byte-path for observer
+    prefix matching. A mark change carries no path (empty)."""
+    op = raw["op"]
+    if op in ("markAdded", "markRemoved", "markChanged"):
+        return b"", _mark_change(raw)
+    path_bytes = raw.get("path", b"")
+    path = _decode_path(path_bytes)
+    if op == "value":
+        change = {
+            "kind": "update",
+            "path": path,
+            "old": _native_from_diff_scalar(raw["old"]),
+            "new": _native_from_diff_scalar(raw["new"]),
+        }
+    elif op == "counter":
+        change = {"kind": "counter", "path": path, "old": raw["old"], "new": raw["new"]}
+    elif op in ("listInsert", "listDelete"):
+        kind = "list_insert" if op == "listInsert" else "list_delete"
+        change = {
+            "kind": kind,
+            "path": path,
+            "index": raw["index"],
+            "values": [_list_item_value(i) for i in raw.get("items", [])],
+        }
+    elif op in ("textInsert", "textDelete"):
+        kind = "text_insert" if op == "textInsert" else "text_delete"
+        change = {"kind": kind, "path": path, "index": raw["index"], "text": raw["text"]}
+    elif op == "remove":
+        change = {"kind": "remove", "path": path, "value_kind": raw.get("kind", "unknown")}
+    else:  # "add" and any future path-bearing op
+        change = {"kind": "add", "path": path, "value_kind": raw.get("kind", op)}
+    return path_bytes, change
+
+
+def _repair_step(step: dict):
+    """One repair-path step: a map-slot key (str) or a sequence index (int)."""
+    return _key_string(step["key"]) if "key" in step else step["index"]
+
+
 @dataclass(frozen=True)
 class UpdateEvent:
     """An applied change delivered to :meth:`Doc.on_update`. ``origin`` is
     ``"local"`` for an edit on this replica, ``"remote"`` for an applied peer
     update; ``ops`` are the wire-bound bytes the edit produced; ``changes`` are the
-    structural change events (empty until reactivity is observed)."""
+    diff-derived change dicts (empty when nothing is observing)."""
 
     origin: str
     ops: bytes
     changes: tuple = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class ChangeEvent:
+    """A change notification for an observed subtree, delivered to
+    :meth:`CrdtMap.observe` (and the list/text handles). Carries the same
+    ``origin`` and the ``changes`` under the observed subtree."""
+
+    origin: str
+    changes: tuple = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class RepairEvent:
+    """The schema-repair signal delivered to :meth:`Doc.on_repair`: the located
+    ``paths`` whose repaired reading changed against the bound schema after an
+    edit, each a list of steps (a map key ``str`` or a sequence index ``int``). A
+    repair names a *location* to re-read, not an edit, so it carries no origin."""
+
+    paths: tuple = field(default_factory=tuple)
 
 
 class CrdtMap:
@@ -2236,6 +2380,11 @@ class CrdtMap:
         """A nested Text handle at ``key``."""
         return CrdtText(self._doc, self._child(key))
 
+    def observe(self, callback: "Callable[[ChangeEvent], None]") -> Callable[[], None]:
+        """Observe changes to this map's subtree (local edits and applied remote
+        updates); returns a function that unsubscribes."""
+        return self._doc._add_observer(encode_path(list(self._path)), callback)
+
 
 class CrdtList:
     """A live handle to a List of scalar items, addressed by live index."""
@@ -2290,6 +2439,11 @@ class CrdtList:
             raise IndexError("list index out of range")
         return index
 
+    def observe(self, callback: "Callable[[ChangeEvent], None]") -> Callable[[], None]:
+        """Observe changes to this list (local edits and applied remote updates);
+        returns a function that unsubscribes."""
+        return self._doc._add_observer(encode_path(list(self._path)), callback)
+
 
 class CrdtText:
     """A live handle to a collaborative Text run, indexed by codepoint."""
@@ -2318,6 +2472,11 @@ class CrdtText:
     def __len__(self) -> int:
         return self._doc._backend.text_len(self._self) or 0
 
+    def observe(self, callback: "Callable[[ChangeEvent], None]") -> Callable[[], None]:
+        """Observe changes to this text (local edits and applied remote updates);
+        returns a function that unsubscribes."""
+        return self._doc._add_observer(encode_path(list(self._path)), callback)
+
 
 _HANDLE_CTORS = {"map": CrdtMap, "list": CrdtList, "text": CrdtText}
 
@@ -2330,7 +2489,12 @@ class Doc:
 
     def __init__(self, client_id: Optional[bytes] = None):
         self._backend = Document(client_id if client_id is not None else os.urandom(16))
+        self._init_listeners()
+
+    def _init_listeners(self) -> None:
         self._update_listeners: List[Callable[[UpdateEvent], None]] = []
+        self._repair_listeners: List[Callable[[RepairEvent], None]] = []
+        self._observers: List[Tuple[bytes, Callable[[ChangeEvent], None]]] = []
         self._transacting = False
 
     def get_map(self, key: Key) -> CrdtMap:
@@ -2358,11 +2522,33 @@ class Doc:
 
         return off
 
+    def on_repair(self, callback: Callable[[RepairEvent], None]) -> Callable[[], None]:
+        """Subscribe to the schema-repair signal (fires only once a schema is bound):
+        the located paths whose repaired reading changed against the schema after an
+        edit. Returns a function that unsubscribes."""
+        self._repair_listeners.append(callback)
+
+        def off() -> None:
+            try:
+                self._repair_listeners.remove(callback)
+            except ValueError:
+                pass
+
+        return off
+
+    def set_schema(self, schema: bytes) -> bool:
+        """Bind a schema (its JSON, as bytes) to this replica, returning whether it
+        bound. A bound schema gives named marks their declared flavor and turns on
+        the :meth:`on_repair` signal."""
+        return self._backend.set_schema(schema)
+
     def apply_update(self, ops: bytes) -> int:
         """Fold a peer's update ops into this replica; returns the count applied."""
+        before = self._backend.encode_state() if self._observing() else None
         applied = self._backend.apply(ops)
         if applied > 0:
-            self._dispatch("remote", ops)
+            self._dispatch("remote", ops, before)
+            self._emit_repairs()
         return applied
 
     def encode_state(self) -> bytes:
@@ -2374,8 +2560,7 @@ class Doc:
         """Open a ``Doc`` from a snapshot produced by :meth:`encode_state`."""
         obj = cls.__new__(cls)
         obj._backend = Document.decode_state(state)
-        obj._update_listeners = []
-        obj._transacting = False
+        obj._init_listeners()
         return obj
 
     def close(self) -> None:
@@ -2393,13 +2578,72 @@ class Doc:
         except Exception:
             pass
 
+    def _add_observer(
+        self, prefix: bytes, callback: "Callable[[ChangeEvent], None]"
+    ) -> Callable[[], None]:
+        observer = (prefix, callback)
+        self._observers.append(observer)
+
+        def off() -> None:
+            try:
+                self._observers.remove(observer)
+            except ValueError:
+                pass
+
+        return off
+
+    def _observing(self) -> bool:
+        return bool(self._update_listeners) or bool(self._observers)
+
     def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
+        # Inside a transaction the edit just accumulates; the commit dispatches.
+        if self._transacting:
+            run(self._backend)
+            return b""
+        before = self._backend.encode_state() if self._observing() else None
         ops = run(self._backend)
-        if ops:
-            self._dispatch("local", ops)
+        if not ops:
+            return ops
+        self._dispatch("local", ops, before)
+        self._emit_repairs()
         return ops
 
-    def _dispatch(self, origin: str, ops: bytes) -> None:
-        event = UpdateEvent(origin=origin, ops=ops, changes=())
-        for listener in list(self._update_listeners):
+    def _dispatch(self, origin: str, ops: bytes, before: Optional[bytes]) -> None:
+        raws = [] if before is None else self._compute_changes(before)
+        changes = [change for _pb, change in raws]
+        # A remote frame that changed nothing (an ack) fires no update; a local edit
+        # always reports its ops. Snapshot the listener sets so one subscribed during
+        # dispatch does not receive this in-flight event.
+        if origin == "local" or changes:
+            event = UpdateEvent(origin=origin, ops=ops, changes=tuple(changes))
+            for listener in list(self._update_listeners):
+                listener(event)
+        for prefix, listener in list(self._observers):
+            matched = [c for pb, c in raws if _path_starts_with(pb, prefix)]
+            if matched:
+                listener(ChangeEvent(origin=origin, changes=tuple(matched)))
+
+    def _compute_changes(self, before: bytes) -> List[Tuple[bytes, dict]]:
+        after = self._backend.encode_state()
+        # A missing state is not a decodable snapshot; treat it as no changes rather
+        # than letting the diff raise.
+        if not before or not after:
+            return []
+        raw = _diff_raw(before, after)
+        if not raw:
+            return []
+        return [_remarshal_change(d) for d in _decode_changes(raw)]
+
+    def _emit_repairs(self) -> None:
+        # Drain the schema-repair signal only when observed — the drain reseeds the
+        # baseline, so draining unobserved would lose the signal; an unobserved doc
+        # pays nothing (and take_repairs is empty until a schema is bound).
+        if not self._repair_listeners:
+            return
+        raw = self._backend.take_repairs()
+        if not raw:
+            return
+        paths = [[_repair_step(step) for step in path] for path in raw]
+        event = RepairEvent(paths=paths)
+        for listener in list(self._repair_listeners):
             listener(event)
