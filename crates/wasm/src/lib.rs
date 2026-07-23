@@ -523,11 +523,15 @@ impl WasmDocument {
         end_side: u32,
         name: &[u8],
         value: &[u8],
-    ) -> Option<Vec<u8>> {
-        let start = side_from_u32(start_side)?;
-        let end = side_from_u32(end_side)?;
-        let scalar = Scalar::decode_state(value).ok()?;
-        let (_ops, id) = path::mark(
+    ) -> JsValue {
+        let (Some(start), Some(end), Ok(scalar)) = (
+            side_from_u32(start_side),
+            side_from_u32(end_side),
+            Scalar::decode_state(value),
+        ) else {
+            return mark_result(None, Vec::new());
+        };
+        let (ops, id) = path::mark(
             &mut self.inner,
             seq_path,
             start_index,
@@ -537,7 +541,7 @@ impl WasmDocument {
             name,
             scalar,
         );
-        id
+        mark_result(id, encode_ops(&ops))
     }
 
     /// Change the scalar payload of the mark handle `mark_id` to the encoded
@@ -1344,11 +1348,17 @@ impl WasmClient {
         end_side: u32,
         name: &[u8],
         value: &[u8],
-    ) -> Option<Vec<u8>> {
-        let start = side_from_u32(start_side)?;
-        let end = side_from_u32(end_side)?;
-        let scalar = Scalar::decode_state(value).ok()?;
-        let doc = self.inner.document_mut(Channel(channel))?;
+    ) -> JsValue {
+        let (Some(start), Some(end), Ok(scalar)) = (
+            side_from_u32(start_side),
+            side_from_u32(end_side),
+            Scalar::decode_state(value),
+        ) else {
+            return mark_result(None, Vec::new());
+        };
+        let Some(doc) = self.inner.document_mut(Channel(channel)) else {
+            return mark_result(None, Vec::new());
+        };
         let (ops, id) = path::mark(
             doc,
             seq_path,
@@ -1359,8 +1369,11 @@ impl WasmClient {
             name,
             scalar,
         );
-        self.inner.enqueue_ops(Channel(channel), ops);
-        id
+        let frame = match self.inner.enqueue_ops(Channel(channel), ops) {
+            Some(msg) => encode_message(&msg),
+            None => Vec::new(),
+        };
+        mark_result(id, frame)
     }
 
     /// Change the payload of the mark handle `mark_id` in `channel`'s room, routed
@@ -1678,6 +1691,22 @@ impl WasmClient {
 /// Set an own property on a plain object; infallible for a fresh `Object`.
 fn set(obj: &js_sys::Object, key: &str, val: &JsValue) {
     js_sys::Reflect::set(obj, &JsValue::from_str(key), val).unwrap();
+}
+
+/// A mark authoring result as `{ id: Uint8Array | undefined, ops: Uint8Array }` —
+/// the mark's handle and the ops/frame to broadcast. `ops` is empty and `id` is
+/// `undefined` when the author was inert (a non-sequence path, an unknown side, or
+/// a malformed value). The ergonomic SDK needs both: the id to reference the mark
+/// later, and the ops so a local mark actually syncs.
+fn mark_result(id: Option<Vec<u8>>, ops: Vec<u8>) -> JsValue {
+    let obj = js_sys::Object::new();
+    let id_val = match id {
+        Some(bytes) => js_sys::Uint8Array::from(bytes.as_slice()).into(),
+        None => JsValue::UNDEFINED,
+    };
+    set(&obj, "id", &id_val);
+    set(&obj, "ops", &js_sys::Uint8Array::from(ops.as_slice()).into());
+    obj.into()
 }
 
 /// The gravity `Side` a `0`/`1` endpoint code names — `None` for any other code,

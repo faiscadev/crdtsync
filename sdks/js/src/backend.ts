@@ -29,6 +29,20 @@ export interface Backend {
   setBlobRef(path: Uint8Array, id: Uint8Array, mime: string, size: bigint): Uint8Array;
   getBlob(path: Uint8Array): unknown;
 
+  /** Author a mark; returns its handle id and the ops/frame to broadcast. */
+  mark(
+    path: Uint8Array,
+    startIndex: number,
+    startSide: number,
+    endIndex: number,
+    endSide: number,
+    name: Uint8Array,
+    value: Uint8Array,
+  ): { id?: Uint8Array; ops: Uint8Array };
+  markSetValue(markId: Uint8Array, value: Uint8Array): Uint8Array;
+  markDelete(markId: Uint8Array): Uint8Array;
+  marksAt(path: Uint8Array, index: number): unknown;
+
   xmlElement(path: Uint8Array, tag: Uint8Array): Uint8Array;
   xmlFragment(path: Uint8Array): Uint8Array;
   xmlTag(path: Uint8Array): Uint8Array | undefined;
@@ -120,6 +134,35 @@ export class ClientBackend implements Backend {
   }
   getBlob(path: Uint8Array): unknown {
     return this.client.getBlob(this.channel, path);
+  }
+  mark(
+    path: Uint8Array,
+    startIndex: number,
+    startSide: number,
+    endIndex: number,
+    endSide: number,
+    name: Uint8Array,
+    value: Uint8Array,
+  ): { id?: Uint8Array; ops: Uint8Array } {
+    return this.client.mark(
+      this.channel,
+      path,
+      startIndex,
+      startSide,
+      endIndex,
+      endSide,
+      name,
+      value,
+    );
+  }
+  markSetValue(markId: Uint8Array, value: Uint8Array): Uint8Array {
+    return this.client.markSetValue(this.channel, markId, value);
+  }
+  markDelete(markId: Uint8Array): Uint8Array {
+    return this.client.markDelete(this.channel, markId);
+  }
+  marksAt(path: Uint8Array, index: number): unknown {
+    return this.client.marksAt(this.channel, path, index);
   }
 
   xmlElement(path: Uint8Array, tag: Uint8Array): Uint8Array {

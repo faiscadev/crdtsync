@@ -74,6 +74,7 @@ export class Doc {
     this.ctx = {
       backend,
       mutate: (run) => this.mutate(run),
+      mutateReturning: (run) => this.mutateReturning(run),
       observe: (prefix, listener) => this.addObserver(prefix, listener),
     };
   }
@@ -163,6 +164,20 @@ export class Doc {
     if (outbound.length === 0) return;
     this.wire?.(outbound);
     this.dispatch("local", outbound, before);
+  }
+
+  private mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T {
+    if (this.transacting) {
+      const [value] = run(this.backend);
+      return value;
+    }
+    const before = this.observing() ? this.backend.encodeState() : undefined;
+    const [value, outbound] = run(this.backend);
+    if (outbound.length > 0) {
+      this.wire?.(outbound);
+      this.dispatch("local", outbound, before);
+    }
+    return value;
   }
 
   private addObserver(prefix: Uint8Array, listener: ChangeListener): () => void {

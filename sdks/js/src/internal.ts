@@ -20,6 +20,8 @@ export interface HandleContext {
   readonly backend: Backend;
   /** Run a local edit; route its ops/frame + diff-derived changes to observers/sync. */
   mutate(run: (backend: Backend) => Uint8Array): void;
+  /** Run a local edit that also yields a value (e.g. a mark id); route the ops. */
+  mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T;
   /** Observe changes to the subtree at `pathBytes`; returns an unsubscribe. */
   observe(pathBytes: Uint8Array, listener: ChangeListener): () => void;
 }
