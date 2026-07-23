@@ -1097,6 +1097,112 @@ impl WasmClient {
             .and_then(|d| path::get_bytes(d, path))
     }
 
+    // The per-channel scalar/list/text edit+read methods mirror the WasmDocument
+    // surface so the ergonomic SDK can back a networked document with a channel's
+    // replica — one replica, framed and outboxed. Edits return the Ops frame to
+    // send; reads query the channel's local replica.
+
+    /// Install-or-set a Register from an encoded `Scalar` at a path in `channel`'s
+    /// room. Returns the Ops frame to send.
+    #[wasm_bindgen(js_name = setScalar)]
+    pub fn set_scalar(&mut self, channel: u32, path: &[u8], scalar: &[u8]) -> Vec<u8> {
+        let Ok(value) = Scalar::decode_state(scalar) else {
+            return Vec::new();
+        };
+        self.ops_frame(channel, |d| path::register(d, path, value))
+    }
+
+    /// Read the Register at a path in `channel`'s room as an encoded `Scalar`.
+    #[wasm_bindgen(js_name = getScalar)]
+    pub fn get_scalar(&self, channel: u32, path: &[u8]) -> Option<Vec<u8>> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::get_register(d, path))
+            .map(|s| s.encode_state())
+    }
+
+    /// The live slot keys of the Map at a path in `channel`'s room.
+    #[wasm_bindgen(js_name = mapKeys)]
+    pub fn map_keys(&self, channel: u32, path: &[u8]) -> Option<Vec<js_sys::Uint8Array>> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::map_keys(d, path))
+            .map(|keys| {
+                keys.iter()
+                    .map(|k| js_sys::Uint8Array::from(k.as_slice()))
+                    .collect()
+            })
+    }
+
+    /// Insert a scalar item at a live index in the List at a path in `channel`'s
+    /// room. Returns the Ops frame to send.
+    #[wasm_bindgen(js_name = listInsert)]
+    pub fn list_insert(&mut self, channel: u32, path: &[u8], index: usize, value: &[u8]) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::list_insert(d, path, index, value))
+    }
+
+    /// Tombstone the live item at an index in the List at a path in `channel`'s room.
+    #[wasm_bindgen(js_name = listDelete)]
+    pub fn list_delete(&mut self, channel: u32, path: &[u8], index: usize) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::list_delete(d, path, index))
+    }
+
+    /// Read the live length of the List at a path in `channel`'s room.
+    #[wasm_bindgen(js_name = listLen)]
+    pub fn list_len(&self, channel: u32, path: &[u8]) -> Option<usize> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::list_len(d, path))
+    }
+
+    /// Read the item bytes at a live index in the List at a path in `channel`'s room.
+    #[wasm_bindgen(js_name = listGet)]
+    pub fn list_get(&self, channel: u32, path: &[u8], index: usize) -> Option<Vec<u8>> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::list_get(d, path, index))
+    }
+
+    /// Insert text at a codepoint index in the Text at a path in `channel`'s room.
+    /// Returns the Ops frame to send.
+    #[wasm_bindgen(js_name = textInsert)]
+    pub fn text_insert(&mut self, channel: u32, path: &[u8], index: usize, s: &str) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::text_insert(d, path, index, s))
+    }
+
+    /// Tombstone `count` codepoints from an index in the Text at a path in
+    /// `channel`'s room.
+    #[wasm_bindgen(js_name = textDelete)]
+    pub fn text_delete(&mut self, channel: u32, path: &[u8], index: usize, count: usize) -> Vec<u8> {
+        self.ops_frame(channel, |d| path::text_delete(d, path, index, count))
+    }
+
+    /// Read the codepoint length of the Text at a path in `channel`'s room.
+    #[wasm_bindgen(js_name = textLen)]
+    pub fn text_len(&self, channel: u32, path: &[u8]) -> Option<usize> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::text_len(d, path))
+    }
+
+    /// Read the Text at a path in `channel`'s room as a string.
+    #[wasm_bindgen(js_name = textGet)]
+    pub fn text_get(&self, channel: u32, path: &[u8]) -> Option<String> {
+        self.inner
+            .document(Channel(channel))
+            .and_then(|d| path::text_get(d, path))
+    }
+
+    /// Snapshot `channel`'s room replica to a canonical state buffer — the
+    /// before/after the ergonomic SDK diffs to derive change events, since an
+    /// inbound frame does not surface the ops it applied.
+    #[wasm_bindgen(js_name = channelState)]
+    pub fn channel_state(&self, channel: u32) -> Option<Vec<u8>> {
+        self.inner
+            .document(Channel(channel))
+            .map(|d| d.encode_state())
+    }
+
     /// Install an `XmlElement` with `tag` at a path in `channel`'s room. Returns
     /// the Ops frame to send; empty if the channel isn't held.
     #[wasm_bindgen(js_name = xmlElement)]
@@ -1582,6 +1688,14 @@ fn acl_effect_from(effect: u32) -> Option<AclEffect> {
         1 => Some(AclEffect::Deny),
         _ => None,
     }
+}
+
+/// The 8-byte protocol header a client sends once, before its Hello, to open a
+/// wire connection at the SDK's protocol version. The sync provider writes this
+/// as the first frame on a fresh socket.
+#[wasm_bindgen(js_name = protocolHeader)]
+pub fn protocol_header() -> Vec<u8> {
+    crdtsync_core::protocol::encode_header(crdtsync_core::protocol::PROTOCOL_VERSION).to_vec()
 }
 
 /// Derive the doc-ACL actor key for a credential `actor`: the fixed 16-byte SHA-256

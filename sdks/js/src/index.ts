@@ -15,3 +15,5 @@ export { CrdtMap, CrdtList, CrdtText } from "./handles.js";
 export type { Value } from "./handles.js";
 export type { Key } from "./path.js";
 export type { ScalarValue } from "./marshal.js";
+export { connect, Provider } from "./provider.js";
+export type { ConnectionState, ProviderOptions, StateListener } from "./provider.js";
