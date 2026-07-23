@@ -61,17 +61,47 @@ export function decodeValue(bytes: Uint8Array): ScalarValue {
     case "bool":
       return s.value;
     case "int":
-      // A value inside the safe-integer range reads back as a `number` (the
-      // common case); a larger magnitude keeps full fidelity as a `bigint`.
-      return withinSafeInteger(s.value) ? Number(s.value) : s.value;
-    case "bytes": {
-      const [tag, rest] = unprefix(s.value);
-      if (tag === STRING) return decoder.decode(rest);
-      // Binary, or foreign untagged bytes from a non-handle writer: hand back
-      // the raw bytes.
-      return rest;
-    }
+      return intToNative(s.value);
+    case "bytes":
+      return bytesToNative(s.value);
   }
+}
+
+/** A scalar as the wasm `diff` machinery reports it: a `{ t, v }` tagged object. */
+export interface DiffScalar {
+  readonly t: string;
+  readonly v?: unknown;
+}
+
+/** Convert a diff-reported map-leaf scalar (a native `Scalar`) to a native value.
+ * Distinct from `decodeValue`, which reads a list item's enveloped scalar bytes. */
+export function nativeFromDiffScalar(s: DiffScalar): ScalarValue {
+  switch (s.t) {
+    case "null":
+      return null;
+    case "bool":
+      return s.v as boolean;
+    case "int":
+      return intToNative(s.v as bigint);
+    case "bytes":
+      return bytesToNative(s.v as Uint8Array);
+    default:
+      // blobref / elementref: no native leaf form yet — hand back the raw bytes.
+      return s.v as Uint8Array;
+  }
+}
+
+// A value inside the safe-integer range reads back as a `number` (the common
+// case); a larger magnitude keeps full fidelity as a `bigint`.
+export function intToNative(v: bigint): number | bigint {
+  return withinSafeInteger(v) ? Number(v) : v;
+}
+
+// A `Scalar::Bytes` payload carries the SDK's one-byte string/binary tag; strip
+// it back to a string or the raw bytes (foreign untagged bytes read as binary).
+function bytesToNative(payload: Uint8Array): string | Uint8Array {
+  const [tag, rest] = unprefix(payload);
+  return tag === STRING ? decoder.decode(rest) : rest;
 }
 
 function prefix(tag: number, body: Uint8Array): Uint8Array {

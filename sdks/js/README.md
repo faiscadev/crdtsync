@@ -14,9 +14,16 @@ root.getList("todos").push("write docs");
 root.getText("body").insert(0, "collaborative text");
 
 // Observe applied changes (local edits and remote updates).
-doc.on("update", ({ origin, ops }) => {
-  /* broadcast `ops` when origin === "local"; apply peers' with doc.applyUpdate(ops) */
+doc.on("update", ({ origin, ops, changes }) => {
+  /* broadcast `ops` when origin === "local"; apply peers' with doc.applyUpdate(ops).
+     `changes` are diff-derived: { kind, path (ergonomic keys), old/new native values }. */
 });
+
+// Or observe just one handle's subtree:
+const off = root.observe(({ origin, changes }) => {
+  /* fires only for changes under `root` */
+});
+off(); // unsubscribe
 ```
 
 ## Model
@@ -28,6 +35,10 @@ doc.on("update", ({ origin, ops }) => {
   `Uint8Array` map to CRDT scalars. Containers are created with the explicit
   `getMap`/`getList`/`getText` accessors — a plain object/array passed to `set` is a
   type error (the explicit leaf-vs-container boundary; no implicit deep-seed).
+- **Reactivity.** `Doc.on("update", cb)` fires on every applied change; `handle.observe(cb)`
+  fires only for a subtree. Change events are re-marshaled from the core diff into
+  ergonomic key/index targets and native before/after values, with a `local`/`remote`
+  origin. (Creating a container reports one `add`; subsequent edits are fine-grained.)
 
 ## Development
 
