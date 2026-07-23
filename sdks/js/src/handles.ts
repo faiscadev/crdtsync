@@ -5,7 +5,7 @@
 // key. Reads reflect the current converged state; writes apply immediately and
 // their ops flow to observers and any bound provider through the context.
 
-import type { HandleContext } from "./internal.js";
+import type { ChangeListener, HandleContext } from "./internal.js";
 import { type ScalarValue, decodeValue, encodeValue } from "./marshal.js";
 import { type Key, encodePath, keyString } from "./path.js";
 
@@ -27,7 +27,9 @@ export class CrdtMap {
   /** Set a leaf to a native scalar value. Rejects a plain object/array — a
    * nested container is created with `getMap`/`getList`/`getText`. */
   set(key: Key, value: ScalarValue): this {
-    this.ctx.emit(this.ctx.wasm.setScalar(this.slot(key), encodeValue(value)));
+    const slot = this.slot(key);
+    const bytes = encodeValue(value);
+    this.ctx.mutate((w) => w.setScalar(slot, bytes));
     return this;
   }
 
@@ -65,7 +67,8 @@ export class CrdtMap {
 
   /** Tombstone the slot at `key`. */
   delete(key: Key): this {
-    this.ctx.emit(this.ctx.wasm.delete(this.slot(key)));
+    const slot = this.slot(key);
+    this.ctx.mutate((w) => w.delete(slot));
     return this;
   }
 
@@ -109,6 +112,12 @@ export class CrdtMap {
   [Symbol.iterator](): IterableIterator<[string, Value | undefined]> {
     return this.entries()[Symbol.iterator]();
   }
+
+  /** Observe changes to this map's subtree (local edits and remote updates).
+   * Returns an unsubscribe function. */
+  observe(listener: ChangeListener): () => void {
+    return this.ctx.observe(encodePath(this.path), listener);
+  }
 }
 
 /** A live handle to a List of scalar items, addressed by live index. */
@@ -127,7 +136,9 @@ export class CrdtList {
    * item's bytes; a list holds opaque item bytes, so the value's type is carried
    * by the SDK encoding, not a native register. */
   insert(index: number, value: ScalarValue): this {
-    this.ctx.emit(this.ctx.wasm.listInsert(this.self, index, encodeValue(value)));
+    const self = this.self;
+    const bytes = encodeValue(value);
+    this.ctx.mutate((w) => w.listInsert(self, index, bytes));
     return this;
   }
 
@@ -138,7 +149,8 @@ export class CrdtList {
 
   /** Tombstone the live item at `index`. */
   delete(index: number): this {
-    this.ctx.emit(this.ctx.wasm.listDelete(this.self, index));
+    const self = this.self;
+    this.ctx.mutate((w) => w.listDelete(self, index));
     return this;
   }
 
@@ -162,6 +174,12 @@ export class CrdtList {
     const n = this.length;
     for (let i = 0; i < n; i++) yield this.get(i);
   }
+
+  /** Observe changes to this list (local edits and remote updates). Returns an
+   * unsubscribe function. */
+  observe(listener: ChangeListener): () => void {
+    return this.ctx.observe(this.self, listener);
+  }
 }
 
 /** A live handle to a collaborative Text run, indexed by codepoint. */
@@ -178,13 +196,15 @@ export class CrdtText {
 
   /** Insert `str` at a codepoint index. */
   insert(index: number, str: string): this {
-    this.ctx.emit(this.ctx.wasm.textInsert(this.self, index, str));
+    const self = this.self;
+    this.ctx.mutate((w) => w.textInsert(self, index, str));
     return this;
   }
 
   /** Tombstone `count` codepoints from `index`. */
   delete(index: number, count: number): this {
-    this.ctx.emit(this.ctx.wasm.textDelete(this.self, index, count));
+    const self = this.self;
+    this.ctx.mutate((w) => w.textDelete(self, index, count));
     return this;
   }
 
@@ -196,5 +216,11 @@ export class CrdtText {
   /** The codepoint length. */
   get length(): number {
     return this.ctx.wasm.textLen(this.self) ?? 0;
+  }
+
+  /** Observe changes to this text (local edits and remote updates). Returns an
+   * unsubscribe function. */
+  observe(listener: ChangeListener): () => void {
+    return this.ctx.observe(this.self, listener);
   }
 }

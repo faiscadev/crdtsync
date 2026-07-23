@@ -19,6 +19,31 @@ export function keyString(bytes: Uint8Array): string {
   return decoder.decode(bytes);
 }
 
+/** Decode a length-framed path buffer (as the diff machinery reports) into its
+ * keys, rendered as best-effort utf-8 strings. */
+export function decodePath(bytes: Uint8Array): string[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const keys: string[] = [];
+  let i = 0;
+  while (i < bytes.length) {
+    const len = view.getUint32(i, true);
+    i += 4;
+    keys.push(keyString(bytes.subarray(i, i + len)));
+    i += len;
+  }
+  return keys;
+}
+
+/** Whether `whole`'s framed bytes begin with `prefix` — a key-path prefix test,
+ * sound because each key is self-delimiting (length + bytes). */
+export function pathStartsWith(whole: Uint8Array, prefix: Uint8Array): boolean {
+  if (prefix.length > whole.length) return false;
+  for (let i = 0; i < prefix.length; i++) {
+    if (whole[i] !== prefix[i]) return false;
+  }
+  return true;
+}
+
 /** Encode a key path to the length-framed buffer the wasm methods expect. */
 export function encodePath(keys: readonly Key[]): Uint8Array {
   const parts = keys.map(keyBytes);
