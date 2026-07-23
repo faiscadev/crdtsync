@@ -26,6 +26,33 @@ const off = root.observe(({ origin, changes }) => {
 off(); // unsubscribe
 ```
 
+## Cursors & transactions
+
+```ts
+const text = doc.getText("body");
+text.insert(0, "hello");
+const cursor = text.relativePosition(5); // a stable anchor
+text.insert(0, ">> ");
+text.resolve(cursor); // 8 — the cursor tracked the insert
+
+doc.transact(() => {
+  // one atomic batch → one update, one wire frame
+  doc.getMap("root").set("a", 1).set("b", 2);
+});
+```
+
+## XML
+
+```ts
+const el = doc.getXml("doc");
+el.element("doc").insertElement(0, "p").insertText(1, "text");
+el.move(0, doc.getXml("other").element("other"), 0); // identity-preserving tree move
+```
+
+Children are addressed by live index (`insertElement`/`insertText`/`deleteChild`/`move`).
+The handle edits a node's direct children; recursing into a child element's contents is a
+core follow-on (matching the Python/Go XML surface).
+
 ## Sync
 
 Bind a document to a crdtsync server over a WebSocket with `connect`:
