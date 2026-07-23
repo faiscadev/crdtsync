@@ -1239,7 +1239,7 @@ type Change struct {
 	Name   []byte
 }
 
-var kindNames = [...]string{"scalar", "register", "counter", "map", "list", "text"}
+var kindNames = [...]string{"scalar", "register", "counter", "map", "list", "text", "xmlElement", "xmlFragment"}
 
 // changeReader reads the change-list byte format the core emits (little-endian).
 type changeReader struct {
