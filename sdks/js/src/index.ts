@@ -11,7 +11,7 @@ export type {
   UpdateEvent,
   UpdateListener,
 } from "./doc.js";
-export { CrdtMap, CrdtList, CrdtText } from "./handles.js";
+export { CrdtMap, CrdtList, CrdtText, CrdtXml } from "./handles.js";
 export type { CursorSide, RelativePosition, Value } from "./handles.js";
 export type { Key } from "./path.js";
 export type { ScalarValue } from "./marshal.js";

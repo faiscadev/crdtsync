@@ -11,7 +11,7 @@
 
 import { type Backend, localBackend } from "./backend.js";
 import { type Change, remarshalChange } from "./changes.js";
-import { CrdtList, CrdtMap, CrdtText } from "./handles.js";
+import { CrdtList, CrdtMap, CrdtText, CrdtXml } from "./handles.js";
 import type { ChangeEvent, ChangeListener, HandleContext } from "./internal.js";
 import { type Key, pathStartsWith } from "./path.js";
 import { WasmDocument } from "./wasm/crdtsync_wasm.js";
@@ -91,6 +91,11 @@ export class Doc {
   /** A live root Text handle at `key`. */
   getText(key: Key): CrdtText {
     return new CrdtText(this.ctx, [key]);
+  }
+
+  /** A live root Xml handle at `key`. */
+  getXml(key: Key): CrdtXml {
+    return new CrdtXml(this.ctx, [key]);
   }
 
   /** Fold a peer's update ops into this replica; returns the count applied.

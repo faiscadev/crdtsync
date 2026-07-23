@@ -25,6 +25,20 @@ export interface Backend {
   textInsert(path: Uint8Array, index: number, s: string): Uint8Array;
   textDelete(path: Uint8Array, index: number, count: number): Uint8Array;
 
+  xmlElement(path: Uint8Array, tag: Uint8Array): Uint8Array;
+  xmlFragment(path: Uint8Array): Uint8Array;
+  xmlTag(path: Uint8Array): Uint8Array | undefined;
+  xmlChildrenLen(path: Uint8Array): number | undefined;
+  xmlInsertElement(path: Uint8Array, index: number, tag: Uint8Array): Uint8Array;
+  xmlInsertText(path: Uint8Array, index: number, s: string): Uint8Array;
+  xmlChildDelete(path: Uint8Array, index: number): Uint8Array;
+  xmlMove(
+    parent: Uint8Array,
+    childIndex: number,
+    newParent: Uint8Array,
+    destIndex: number,
+  ): Uint8Array;
+
   /** Begin an atomic group; edits accumulate until `commitAtomic`. */
   beginAtomic(): void;
   /** Commit the atomic group, returning its combined ops/frame. */
@@ -92,6 +106,36 @@ export class ClientBackend implements Backend {
   }
   textDelete(path: Uint8Array, index: number, count: number): Uint8Array {
     return this.client.textDelete(this.channel, path, index, count);
+  }
+
+  xmlElement(path: Uint8Array, tag: Uint8Array): Uint8Array {
+    return this.client.xmlElement(this.channel, path, tag);
+  }
+  xmlFragment(path: Uint8Array): Uint8Array {
+    return this.client.xmlFragment(this.channel, path);
+  }
+  xmlTag(path: Uint8Array): Uint8Array | undefined {
+    return this.client.xmlTag(this.channel, path);
+  }
+  xmlChildrenLen(path: Uint8Array): number | undefined {
+    return this.client.xmlChildrenLen(this.channel, path);
+  }
+  xmlInsertElement(path: Uint8Array, index: number, tag: Uint8Array): Uint8Array {
+    return this.client.xmlInsertElement(this.channel, path, index, tag);
+  }
+  xmlInsertText(path: Uint8Array, index: number, s: string): Uint8Array {
+    return this.client.xmlInsertText(this.channel, path, index, s);
+  }
+  xmlChildDelete(path: Uint8Array, index: number): Uint8Array {
+    return this.client.xmlChildDelete(this.channel, path, index);
+  }
+  xmlMove(
+    parent: Uint8Array,
+    childIndex: number,
+    newParent: Uint8Array,
+    destIndex: number,
+  ): Uint8Array {
+    return this.client.xmlMove(this.channel, parent, childIndex, newParent, destIndex);
   }
 
   beginAtomic(): void {
