@@ -149,6 +149,23 @@ func TestReactivityRemoteOrigin(t *testing.T) {
 	}
 }
 
+// Doc update listeners fire in registration order (deterministic across runs).
+func TestReactivityListenersFireInOrder(t *testing.T) {
+	d := newErgoDoc(t, 1)
+	defer d.Close()
+	var order []int
+	for i := 0; i < 5; i++ {
+		i := i
+		d.OnUpdate(func(UpdateEvent) { order = append(order, i) })
+	}
+	d.GetMap("m").Set("a", int64(1))
+	for i := 0; i < 5; i++ {
+		if order[i] != i {
+			t.Fatalf("listener order: %v", order)
+		}
+	}
+}
+
 var repairSchema = []byte(`{
     "schema": "notes", "version": 1, "root": "Doc",
     "types": {

@@ -150,18 +150,60 @@ type observer struct {
 	cb     func(ChangeEvent)
 }
 
+// idListener pairs a callback with a stable id for ordered removal.
+type idListener[T any] struct {
+	id int
+	cb T
+}
+
+// listenerList holds callbacks in registration order so they fire
+// deterministically (matching the JS/Python reference, which iterate an
+// insertion-ordered list — a Go map would randomize the order). add returns an
+// unsubscribe func; snapshot copies the current callbacks so subscribing or
+// unsubscribing during a fire is safe.
+type listenerList[T any] struct {
+	next  int
+	items []idListener[T]
+}
+
+func (l *listenerList[T]) add(cb T) func() {
+	id := l.next
+	l.next++
+	l.items = append(l.items, idListener[T]{id: id, cb: cb})
+	return func() {
+		for i, it := range l.items {
+			if it.id == id {
+				// Shift the tail down and clear the vacated slot so the removed
+				// callback's closure is released for GC, not pinned by the array.
+				copy(l.items[i:], l.items[i+1:])
+				var zero idListener[T]
+				l.items[len(l.items)-1] = zero
+				l.items = l.items[:len(l.items)-1]
+				return
+			}
+		}
+	}
+}
+
+func (l *listenerList[T]) len() int { return len(l.items) }
+
+func (l *listenerList[T]) snapshot() []T {
+	out := make([]T, len(l.items))
+	for i, it := range l.items {
+		out[i] = it.cb
+	}
+	return out
+}
+
 // Doc is a local CRDT replica with a single root map, edited through live typed
 // handles. Two docs that exchange each other's update ops (forwarded via
 // OnUpdate) converge. The low-level path API stays available on the wrapped
 // Document for power users (Doc.Backend()).
 type Doc struct {
 	backend         *Document
-	updateListeners map[int]func(UpdateEvent)
-	nextListenerID  int
-	observers       map[int]observer
-	nextObserverID  int
-	repairListeners map[int]func(RepairEvent)
-	nextRepairID    int
+	updateListeners listenerList[func(UpdateEvent)]
+	observers       listenerList[observer]
+	repairListeners listenerList[func(RepairEvent)]
 	transacting     bool
 }
 
@@ -250,26 +292,14 @@ func (d *Doc) Transact(fn func()) {
 // OnUpdate subscribes to applied changes to the document; returns a function
 // that unsubscribes.
 func (d *Doc) OnUpdate(cb func(UpdateEvent)) func() {
-	if d.updateListeners == nil {
-		d.updateListeners = map[int]func(UpdateEvent){}
-	}
-	id := d.nextListenerID
-	d.nextListenerID++
-	d.updateListeners[id] = cb
-	return func() { delete(d.updateListeners, id) }
+	return d.updateListeners.add(cb)
 }
 
 // OnRepair subscribes to the schema-repair signal (fires only once a schema is
 // bound via SetSchema): the located paths whose repaired reading changed against
 // the schema after an edit. Returns a function that unsubscribes.
 func (d *Doc) OnRepair(cb func(RepairEvent)) func() {
-	if d.repairListeners == nil {
-		d.repairListeners = map[int]func(RepairEvent){}
-	}
-	id := d.nextRepairID
-	d.nextRepairID++
-	d.repairListeners[id] = cb
-	return func() { delete(d.repairListeners, id) }
+	return d.repairListeners.add(cb)
 }
 
 // SetSchema binds a schema (its JSON, as bytes) to this replica, returning
@@ -315,7 +345,7 @@ func (d *Doc) mutate(run func(*Document) []byte) []byte {
 // observing reports whether any update listener or subtree observer is
 // subscribed — a snapshot+diff runs only then, so an unobserved doc pays nothing.
 func (d *Doc) observing() bool {
-	return len(d.updateListeners) > 0 || len(d.observers) > 0
+	return d.updateListeners.len() > 0 || d.observers.len() > 0
 }
 
 func (d *Doc) dispatch(origin string, ops []byte, before []byte) {
@@ -331,11 +361,11 @@ func (d *Doc) dispatch(origin string, ops []byte, before []byte) {
 	// always reports its ops.
 	if origin == "local" || len(changes) > 0 {
 		event := UpdateEvent{Origin: origin, Ops: ops, Changes: changes}
-		for _, l := range snapshotUpdateListeners(d.updateListeners) {
+		for _, l := range d.updateListeners.snapshot() {
 			l(event)
 		}
 	}
-	for _, obs := range snapshotObservers(d.observers) {
+	for _, obs := range d.observers.snapshot() {
 		var matched []EventChange
 		for _, r := range raws {
 			if pathStartsWith(r.pathBytes, obs.prefix) {
@@ -376,7 +406,7 @@ func (d *Doc) emitRepairs() {
 	// Drain only when observed — the drain reseeds the baseline, so draining
 	// unobserved would lose the signal (and take_repairs is empty until a schema
 	// is bound).
-	if len(d.repairListeners) == 0 {
+	if d.repairListeners.len() == 0 {
 		return
 	}
 	raw := d.backend.TakeRepairs()
@@ -396,45 +426,13 @@ func (d *Doc) emitRepairs() {
 		paths[i] = steps
 	}
 	event := RepairEvent{Paths: paths}
-	for _, l := range snapshotRepairListeners(d.repairListeners) {
+	for _, l := range d.repairListeners.snapshot() {
 		l(event)
 	}
 }
 
 func (d *Doc) addObserver(prefix []byte, cb func(ChangeEvent)) func() {
-	if d.observers == nil {
-		d.observers = map[int]observer{}
-	}
-	id := d.nextObserverID
-	d.nextObserverID++
-	d.observers[id] = observer{prefix: prefix, cb: cb}
-	return func() { delete(d.observers, id) }
-}
-
-// snapshotUpdateListeners copies the listener set so one subscribed or removed
-// during dispatch does not perturb this in-flight fire.
-func snapshotUpdateListeners(m map[int]func(UpdateEvent)) []func(UpdateEvent) {
-	out := make([]func(UpdateEvent), 0, len(m))
-	for _, l := range m {
-		out = append(out, l)
-	}
-	return out
-}
-
-func snapshotObservers(m map[int]observer) []observer {
-	out := make([]observer, 0, len(m))
-	for _, o := range m {
-		out = append(out, o)
-	}
-	return out
-}
-
-func snapshotRepairListeners(m map[int]func(RepairEvent)) []func(RepairEvent) {
-	out := make([]func(RepairEvent), 0, len(m))
-	for _, l := range m {
-		out = append(out, l)
-	}
-	return out
+	return d.observers.add(observer{prefix: prefix, cb: cb})
 }
 
 func (d *Doc) containerKind(slot [][]byte) string {
