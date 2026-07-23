@@ -2,12 +2,11 @@ package crdtsync
 
 // The ergonomic handle-graph surface (§SDK-Ergonomic-Surface): a Doc wraps the
 // low-level Document additively and exposes live typed handles — CrdtMap /
-// CrdtList / CrdtText (CrdtXml lands with the rich-content surface) — addressed
-// by ergonomic string keys, never byte-paths. A handle holds its logical path
-// (a sequence of keys) and re-resolves it on every operation, so it stays valid
-// as the document mutates and converges — a view, never a cached pointer.
-// Handles compose. The byte-path Document stays available as the low-level
-// power-user surface.
+// CrdtList / CrdtText / CrdtXml — addressed by ergonomic string keys, never
+// byte-paths. A handle holds its logical path (a sequence of keys) and
+// re-resolves it on every operation, so it stays valid as the document mutates
+// and converges — a view, never a cached pointer. Handles compose. The
+// byte-path Document stays available as the low-level power-user surface.
 //
 // Native value marshaling matches the JS/Python boundary exactly (the pinned
 // cross-SDK contract): string <-> Scalar::Bytes (utf-8), int64 <-> Scalar::Int,
@@ -39,29 +38,41 @@ const (
 // explicit accessor). i64 is Go's native int64 so no overflow guard is needed,
 // unlike Python's arbitrary int or JS's number.
 func marshalValue(value any) ([]byte, error) {
+	s, err := marshalScalar(value)
+	if err != nil {
+		return nil, err
+	}
+	return encodeScalar(s), nil
+}
+
+// marshalScalar maps a native scalar to a tagged Scalar (a string/[]byte payload
+// prefixed with the string/binary discriminator). It is the shared seam behind
+// marshalValue (leaf writes) and mark authoring (a mark value marshals like a
+// leaf so it round-trips a native value cross-SDK).
+func marshalScalar(value any) (Scalar, error) {
 	switch v := value.(type) {
 	case nil:
-		return encodeScalar(Scalar{T: "null"}), nil
+		return Scalar{T: "null"}, nil
 	case bool:
-		return encodeScalar(Scalar{T: "bool", Bool: v}), nil
+		return Scalar{T: "bool", Bool: v}, nil
 	case int:
-		return encodeScalar(Scalar{T: "int", Int: int64(v)}), nil
+		return Scalar{T: "int", Int: int64(v)}, nil
 	case int64:
-		return encodeScalar(Scalar{T: "int", Int: v}), nil
+		return Scalar{T: "int", Int: v}, nil
 	case int32:
-		return encodeScalar(Scalar{T: "int", Int: int64(v)}), nil
+		return Scalar{T: "int", Int: int64(v)}, nil
 	case int16:
-		return encodeScalar(Scalar{T: "int", Int: int64(v)}), nil
+		return Scalar{T: "int", Int: int64(v)}, nil
 	case int8:
-		return encodeScalar(Scalar{T: "int", Int: int64(v)}), nil
+		return Scalar{T: "int", Int: int64(v)}, nil
 	case string:
-		return encodeScalar(Scalar{T: "bytes", Bytes: withDiscriminator(discString, []byte(v))}), nil
+		return Scalar{T: "bytes", Bytes: withDiscriminator(discString, []byte(v))}, nil
 	case []byte:
-		return encodeScalar(Scalar{T: "bytes", Bytes: withDiscriminator(discBinary, v)}), nil
+		return Scalar{T: "bytes", Bytes: withDiscriminator(discBinary, v)}, nil
 	default:
-		return nil, fmt.Errorf(
+		return Scalar{}, fmt.Errorf(
 			"crdtsync: value must be string, int64, bool, []byte, or nil (got %T); "+
-				"create a nested container with GetMap/GetList/GetText", value)
+				"create a nested container with GetMap/GetList/GetText/GetXml", value)
 	}
 }
 
@@ -151,6 +162,7 @@ type Doc struct {
 	nextObserverID  int
 	repairListeners map[int]func(RepairEvent)
 	nextRepairID    int
+	transacting     bool
 }
 
 // NewDoc opens a Doc for a fresh random 16-byte client id.
@@ -205,6 +217,36 @@ func (d *Doc) GetText(key string) *CrdtText {
 	return &CrdtText{doc: d, path: [][]byte{[]byte(key)}}
 }
 
+// GetXml returns a live root Xml handle at key (an XML element or fragment).
+func (d *Doc) GetXml(key string) *CrdtXml {
+	return &CrdtXml{doc: d, path: [][]byte{[]byte(key)}}
+}
+
+// Transact runs fn's edits as one atomic group — they apply together on every
+// replica, ride the wire as a single batch, and fire one update. Nested calls
+// flatten into the outermost transaction.
+func (d *Doc) Transact(fn func()) {
+	if d.transacting {
+		fn()
+		return
+	}
+	var before []byte
+	if d.observing() {
+		before = d.backend.EncodeState()
+	}
+	d.transacting = true
+	d.backend.BeginAtomic()
+	defer func() {
+		d.transacting = false
+		ops := d.backend.CommitAtomic()
+		if len(ops) > 0 {
+			d.dispatch("local", ops, before)
+			d.emitRepairs()
+		}
+	}()
+	fn()
+}
+
 // OnUpdate subscribes to applied changes to the document; returns a function
 // that unsubscribes.
 func (d *Doc) OnUpdate(cb func(UpdateEvent)) func() {
@@ -250,8 +292,13 @@ func (d *Doc) ApplyUpdate(ops []byte) int {
 	return applied
 }
 
-// mutate runs one edit and dispatches its ops as a local update.
+// mutate runs one edit and dispatches its ops as a local update. Inside a
+// transaction the edit just accumulates; Transact's commit dispatches once.
 func (d *Doc) mutate(run func(*Document) []byte) []byte {
+	if d.transacting {
+		run(d.backend)
+		return nil
+	}
 	var before []byte
 	if d.observing() {
 		before = d.backend.EncodeState()
@@ -400,6 +447,9 @@ func (d *Doc) containerKind(slot [][]byte) string {
 	if _, ok := d.backend.TextLen(slot); ok {
 		return "text"
 	}
+	if _, ok := d.backend.XmlChildrenLen(slot); ok {
+		return "xml"
+	}
 	return ""
 }
 
@@ -411,6 +461,8 @@ func (d *Doc) handleFor(kind string, path [][]byte) any {
 		return &CrdtList{doc: d, path: path}
 	case "text":
 		return &CrdtText{doc: d, path: path}
+	case "xml":
+		return &CrdtXml{doc: d, path: path}
 	}
 	return nil
 }
@@ -523,6 +575,40 @@ func (m *CrdtMap) GetList(key string) *CrdtList {
 // GetText returns a nested Text handle at key.
 func (m *CrdtMap) GetText(key string) *CrdtText {
 	return &CrdtText{doc: m.doc, path: m.slot(key)}
+}
+
+// GetXml returns a nested Xml handle at key.
+func (m *CrdtMap) GetXml(key string) *CrdtXml {
+	return &CrdtXml{doc: m.doc, path: m.slot(key)}
+}
+
+// SetBlob stores a small blob inline at key, minting its public handle. Returns
+// false when data exceeds the inline ceiling — upload it out of band with
+// UploadBlob and set the returned handle via SetBlobRef.
+func (m *CrdtMap) SetBlob(key, mime string, data []byte) bool {
+	slot := m.slot(key)
+	ok := false
+	m.doc.mutate(func(b *Document) []byte {
+		ops, inlined := b.SetBlob(slot, mime, data)
+		if !inlined {
+			return nil
+		}
+		ok = true
+		return ops
+	})
+	return ok
+}
+
+// SetBlobRef sets a store-backed blob ref at key from a 16-byte id handle, mime,
+// and size — the content is fetched by id, not carried in the op.
+func (m *CrdtMap) SetBlobRef(key string, id [16]byte, mime string, size uint64) {
+	slot := m.slot(key)
+	m.doc.mutate(func(b *Document) []byte { return b.SetBlobRef(slot, id, mime, size) })
+}
+
+// GetBlob reads the BlobRef at key, or false when the slot holds no blob.
+func (m *CrdtMap) GetBlob(key string) (BlobRef, bool) {
+	return m.doc.backend.GetBlob(m.slot(key))
 }
 
 // Observe subscribes to changes under this map's subtree (local edits and
