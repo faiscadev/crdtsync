@@ -25,6 +25,10 @@ export interface Backend {
   textInsert(path: Uint8Array, index: number, s: string): Uint8Array;
   textDelete(path: Uint8Array, index: number, count: number): Uint8Array;
 
+  setBlob(path: Uint8Array, mime: string, bytes: Uint8Array): Uint8Array | undefined;
+  setBlobRef(path: Uint8Array, id: Uint8Array, mime: string, size: bigint): Uint8Array;
+  getBlob(path: Uint8Array): unknown;
+
   xmlElement(path: Uint8Array, tag: Uint8Array): Uint8Array;
   xmlFragment(path: Uint8Array): Uint8Array;
   xmlTag(path: Uint8Array): Uint8Array | undefined;
@@ -106,6 +110,16 @@ export class ClientBackend implements Backend {
   }
   textDelete(path: Uint8Array, index: number, count: number): Uint8Array {
     return this.client.textDelete(this.channel, path, index, count);
+  }
+
+  setBlob(path: Uint8Array, mime: string, bytes: Uint8Array): Uint8Array | undefined {
+    return this.client.setBlob(this.channel, path, mime, bytes);
+  }
+  setBlobRef(path: Uint8Array, id: Uint8Array, mime: string, size: bigint): Uint8Array {
+    return this.client.setBlobRef(this.channel, path, id, mime, size);
+  }
+  getBlob(path: Uint8Array): unknown {
+    return this.client.getBlob(this.channel, path);
   }
 
   xmlElement(path: Uint8Array, tag: Uint8Array): Uint8Array {
