@@ -844,6 +844,8 @@ The load-bearing feature for JS collaboration. Two observation entry points:
 
 The **event shape** is derived from the diff/changes machinery the core already exposes (`core::diff`, the wasm `diff`/`diffEncoded`/`decodeChanges` seam): a change event carries the structural change list — for each change, its **kind** (add / remove / value / counter / listInsert / listDelete / textInsert / textDelete / mark\*), its **target** (as an ergonomic path — a key/index sequence, not raw path bytes), and the **before/after** values (marshaled scalars, not `{t,v}` byte tags). An event also flags its **origin** (local vs remote) so a binding can avoid echoing its own edits. The SDK computes the diff by snapshotting before/after an applied batch (or consuming the provider's inbound diff), so reactivity needs no new core surface — it re-marshals the existing change objects into ergonomic events.
 
+**Schema binding** — `doc.setSchema(schema)` binds a schema (its JSON, as bytes) to the replica. Two effects, no core change: a named mark reads with its schema-declared **flavor** (boolean / value / object) rather than the default object-flavor range annotation (`marks_at` already resolves flavor from the bound schema); and the **repair signal** turns on — `doc.on("repair", cb)` delivers the locations whose repaired reading changed against the schema after an edit (each a step path of map keys + sequence indices). A repair names a *location* to re-read, not an edit, so its event carries **no origin**. Emitted from every mutation path, drained only when observed.
+
 ## Sync Provider
 
 An ergonomic transport binding wraps the low-level `WasmClient` op-flow (which is pure framing — it holds no socket; §Networking-Layer) plus a real WebSocket:
