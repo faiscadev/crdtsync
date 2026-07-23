@@ -30,6 +30,7 @@ __all__ = [
     "CrdtList",
     "CrdtMap",
     "CrdtText",
+    "CrdtXml",
     "DiffKind",
     "Doc",
     "Document",
@@ -504,7 +505,7 @@ def actor_key(actor: bytes) -> bytes:
     return _take_buf(out)
 
 
-_KINDS = ("scalar", "register", "counter", "map", "list", "text")
+_KINDS = ("scalar", "register", "counter", "map", "list", "text", "xmlElement", "xmlFragment")
 
 
 class _Reader:
@@ -1067,12 +1068,21 @@ class Document:
         handle a later :meth:`mark_set_value`/:meth:`mark_delete` names it by — and
         the ops to broadcast. ``mark_id`` is ``None`` and ``ops`` empty when the
         author was inert (a non-sequence path, an unknown side, or a bad value)."""
+        return self._mark_encoded(
+            seq_path, start_index, start_side, end_index, end_side, name, _encode_scalar(value)
+        )
+
+    def _mark_encoded(
+        self, seq_path, start_index, start_side, end_index, end_side, name, scalar: bytes
+    ) -> Tuple[Optional[bytes], bytes]:
+        """Author a mark whose payload is already encoded ``Scalar`` bytes — the seam
+        the ergonomic handle layer marshals a native value through (:meth:`mark`
+        encodes the value itself)."""
         _usize("start_index", start_index)
         _usize("end_index", end_index)
         _u32("start_side", int(start_side))
         _u32("end_side", int(end_side))
         p = encode_path(seq_path)
-        v = _encode_scalar(value)
         out = _CrdtBuf()
         ops = _take_buf(
             _LIB.crdtsync_doc_mark(
@@ -1085,8 +1095,8 @@ class Document:
                 int(end_side),
                 name,
                 len(name),
-                v,
-                len(v),
+                scalar,
+                len(scalar),
                 ctypes.byref(out),
             )
         )
@@ -1096,9 +1106,12 @@ class Document:
     def mark_set_value(self, mark_id: bytes, value) -> bytes:
         """Change the scalar payload of the mark handle ``mark_id`` to ``value``;
         return the ops (empty if the handle names no live mark or the value is bad)."""
-        v = _encode_scalar(value)
+        return self._mark_set_value_encoded(mark_id, _encode_scalar(value))
+
+    def _mark_set_value_encoded(self, mark_id: bytes, scalar: bytes) -> bytes:
+        """Change a mark's payload from already-encoded ``Scalar`` bytes."""
         return _take_buf(
-            _LIB.crdtsync_doc_mark_set_value(self._handle, mark_id, len(mark_id), v, len(v))
+            _LIB.crdtsync_doc_mark_set_value(self._handle, mark_id, len(mark_id), scalar, len(scalar))
         )
 
     def mark_delete(self, mark_id: bytes) -> bytes:
@@ -2254,6 +2267,19 @@ def _repair_step(step: dict):
     return _key_string(step["key"]) if "key" in step else step["index"]
 
 
+def _mark_info(m: dict) -> dict:
+    """Re-marshal a raw mark (from ``marks_at``) into an ergonomic ``{name, value}``:
+    a boolean for a boolean mark, a native scalar for a value mark, or the covering
+    element ids for an object mark (the default with no bound schema)."""
+    name = _key_string(m["name"])
+    flavor = m["flavor"]
+    if flavor == "boolean":
+        return {"name": name, "value": m["value"]}
+    if flavor == "object":
+        return {"name": name, "value": m["ids"]}
+    return {"name": name, "value": _native_from_diff_scalar(m["value"])}
+
+
 @dataclass(frozen=True)
 class UpdateEvent:
     """An applied change delivered to :meth:`Doc.on_update`. ``origin`` is
@@ -2333,6 +2359,8 @@ class CrdtMap:
             return "list"
         if backend.text_len(slot) is not None:
             return "text"
+        if backend.xml_children_len(slot) is not None:
+            return "xml"
         return None
 
     def delete(self, key: Key) -> "CrdtMap":
@@ -2379,6 +2407,39 @@ class CrdtMap:
     def get_text(self, key: Key) -> "CrdtText":
         """A nested Text handle at ``key``."""
         return CrdtText(self._doc, self._child(key))
+
+    def get_xml(self, key: Key) -> "CrdtXml":
+        """A nested Xml handle at ``key`` (an XML element or fragment)."""
+        return CrdtXml(self._doc, self._child(key))
+
+    def set_blob(self, key: Key, mime: str, data: bytes) -> bool:
+        """Store a small blob inline at ``key``, minting its public handle. Returns
+        ``False`` when ``data`` exceeds the inline ceiling — upload it out of band
+        with :func:`upload_blob` and set the returned handle via :meth:`set_blob_ref`."""
+        slot = self._slot(key)
+        holder = {"ok": False}
+
+        def run(b: Document) -> bytes:
+            ops = b.set_blob(slot, mime, data)
+            if ops is None:
+                return b""  # over the inline ceiling — nothing enqueued
+            holder["ok"] = True
+            return ops
+
+        self._doc._mutate(run)
+        return holder["ok"]
+
+    def set_blob_ref(self, key: Key, blob_id: bytes, mime: str, size: int) -> "CrdtMap":
+        """Set a store-backed blob ref at ``key`` from a 16-byte ``blob_id`` handle,
+        ``mime``, and ``size`` — the content is fetched by id, not carried in the op."""
+        slot = self._slot(key)
+        self._doc._mutate(lambda b: b.set_blob_ref(slot, blob_id, mime, size))
+        return self
+
+    def get_blob(self, key: Key) -> "Optional[BlobRef]":
+        """Read the :class:`BlobRef` at ``key``, or ``None`` when the slot holds no
+        blob."""
+        return self._doc._backend.get_blob(self._slot(key))
 
     def observe(self, callback: "Callable[[ChangeEvent], None]") -> Callable[[], None]:
         """Observe changes to this map's subtree (local edits and applied remote
@@ -2444,6 +2505,17 @@ class CrdtList:
         returns a function that unsubscribes."""
         return self._doc._add_observer(encode_path(list(self._path)), callback)
 
+    def relative_position(self, index: int, side: str = "before") -> Optional[bytes]:
+        """Capture a stable cursor at a live ``index`` (``side`` ``"before"`` is
+        left-gravity, ``"after"`` right-gravity), resolved later with
+        :meth:`resolve`. ``None`` for a bad or non-sequence path."""
+        s = Side.RIGHT if side == "after" else Side.LEFT
+        return self._doc._backend.relative_position(self._self, index, s)
+
+    def resolve(self, pos: bytes) -> Optional[int]:
+        """Resolve a captured cursor back to a live index, or ``None`` if it can't."""
+        return self._doc._backend.resolve_position(self._self, pos)
+
 
 class CrdtText:
     """A live handle to a collaborative Text run, indexed by codepoint."""
@@ -2477,8 +2549,126 @@ class CrdtText:
         returns a function that unsubscribes."""
         return self._doc._add_observer(encode_path(list(self._path)), callback)
 
+    def relative_position(self, index: int, side: str = "before") -> Optional[bytes]:
+        """Capture a stable cursor at a codepoint ``index`` (``side`` ``"before"`` is
+        left-gravity, ``"after"`` right-gravity). The cursor tracks its spot as text
+        is inserted and deleted around it. ``None`` for a bad path."""
+        s = Side.RIGHT if side == "after" else Side.LEFT
+        return self._doc._backend.relative_position(self._self, index, s)
 
-_HANDLE_CTORS = {"map": CrdtMap, "list": CrdtList, "text": CrdtText}
+    def resolve(self, pos: bytes) -> Optional[int]:
+        """Resolve a captured cursor back to a live codepoint index, or ``None``."""
+        return self._doc._backend.resolve_position(self._self, pos)
+
+    def mark(
+        self,
+        start: int,
+        end: int,
+        name: Key,
+        value,
+        start_side: str = "before",
+        end_side: str = "after",
+    ) -> Optional[bytes]:
+        """Author a mark named ``name`` with native ``value`` over ``[start, end)``,
+        returning the mark's handle (or ``None`` if the author was inert). By default
+        the range grows with text inserted at its edges (start left-gravity, end
+        right-gravity)."""
+        n = _key_bytes(name)
+        scalar = _encode_value(value)
+        ss = Side.RIGHT if start_side == "after" else Side.LEFT
+        es = Side.RIGHT if end_side == "after" else Side.LEFT
+        holder: dict = {}
+
+        def run(b: Document) -> bytes:
+            mark_id, ops = b._mark_encoded(self._self, start, ss, end, es, n, scalar)
+            holder["id"] = mark_id
+            return ops
+
+        self._doc._mutate(run)
+        return holder.get("id")
+
+    def set_mark_value(self, mark_id: bytes, value) -> "CrdtText":
+        """Change the native ``value`` of the mark ``mark_id``."""
+        scalar = _encode_value(value)
+        self._doc._mutate(lambda b: b._mark_set_value_encoded(mark_id, scalar))
+        return self
+
+    def delete_mark(self, mark_id: bytes) -> "CrdtText":
+        """Tombstone the mark ``mark_id``."""
+        self._doc._mutate(lambda b: b.mark_delete(mark_id))
+        return self
+
+    def marks_at(self, index: int) -> List[dict]:
+        """The marks covering the character at ``index``, each an ergonomic
+        ``{name, value}`` dict."""
+        return [_mark_info(m) for m in self._doc._backend.marks_at(self._self, index)]
+
+
+class CrdtXml:
+    """A live handle to an XML element or fragment. Children are addressed by live
+    index — the core stores a child with no path of its own, so this handle edits a
+    node's direct children (insert element/text, delete, tree-move) but does not
+    recurse into a child element's contents (deep XML navigation is a core
+    follow-on, matching the JS/Go SDKs' XML surface)."""
+
+    def __init__(self, doc: "Doc", path: Tuple[bytes, ...]):
+        self._doc = doc
+        self._path = tuple(path)
+
+    @property
+    def _self(self) -> Path:
+        return list(self._path)
+
+    def element(self, tag: str) -> "CrdtXml":
+        """Install a tagged XML element at this slot."""
+        t = _key_bytes(tag)
+        self._doc._mutate(lambda b: b.xml_element(self._self, t))
+        return self
+
+    def fragment(self) -> "CrdtXml":
+        """Install a tagless XML fragment at this slot."""
+        self._doc._mutate(lambda b: b.xml_fragment(self._self))
+        return self
+
+    @property
+    def tag(self) -> Optional[str]:
+        """This element's tag, or ``None`` for a fragment or an absent node."""
+        t = self._doc._backend.xml_tag(self._self)
+        return None if t is None else _key_string(t)
+
+    def __len__(self) -> int:
+        return self._doc._backend.xml_children_len(self._self) or 0
+
+    def insert_element(self, index: int, tag: str) -> "CrdtXml":
+        """Insert a child element with ``tag`` at a live child ``index``."""
+        t = _key_bytes(tag)
+        self._doc._mutate(lambda b: b.xml_insert_element(self._self, index, t))
+        return self
+
+    def insert_text(self, index: int, text: str) -> "CrdtXml":
+        """Insert a text-run child holding ``text`` at a live child ``index``."""
+        self._doc._mutate(lambda b: b.xml_insert_text(self._self, index, text))
+        return self
+
+    def delete_child(self, index: int) -> "CrdtXml":
+        """Tombstone the child at a live ``index``."""
+        self._doc._mutate(lambda b: b.xml_child_delete(self._self, index))
+        return self
+
+    def move(self, child_index: int, new_parent: "CrdtXml", dest_index: int) -> "CrdtXml":
+        """Relocate this node's child at ``child_index`` to ``dest_index`` in
+        ``new_parent``'s children — an identity-preserving tree move."""
+        dest = new_parent._self
+        self._doc._mutate(lambda b: b.xml_move(self._self, child_index, dest, dest_index))
+        return self
+
+    def observe(self, callback: "Callable[[ChangeEvent], None]") -> Callable[[], None]:
+        """Observe changes to this node's children (local edits and applied remote
+        updates); returns a function that unsubscribes."""
+        return self._doc._add_observer(encode_path(list(self._path)), callback)
+
+
+_HANDLE_CTORS = {"map": CrdtMap, "list": CrdtList, "text": CrdtText, "xml": CrdtXml}
 
 
 class Doc:
@@ -2508,6 +2698,29 @@ class Doc:
     def get_text(self, key: Key) -> CrdtText:
         """A live root Text handle at ``key``."""
         return CrdtText(self, (_key_bytes(key),))
+
+    def get_xml(self, key: Key) -> CrdtXml:
+        """A live root Xml handle at ``key``."""
+        return CrdtXml(self, (_key_bytes(key),))
+
+    def transact(self, fn: Callable[[], object]) -> None:
+        """Run ``fn``'s edits as one atomic group — they apply together on every
+        replica, ride the wire as a single batch, and fire one update. Nested calls
+        flatten into the outermost transaction."""
+        if self._transacting:
+            fn()
+            return
+        before = self._backend.encode_state() if self._observing() else None
+        self._transacting = True
+        self._backend.begin_atomic()
+        try:
+            fn()
+        finally:
+            self._transacting = False
+            ops = self._backend.commit_atomic()
+            if ops:
+                self._dispatch("local", ops, before)
+                self._emit_repairs()
 
     def on_update(self, callback: Callable[[UpdateEvent], None]) -> Callable[[], None]:
         """Subscribe to every applied change to the document; returns a function
