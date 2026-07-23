@@ -105,6 +105,18 @@ fn encode_blob_ref(blob: &BlobRef) -> Vec<u8> {
     out
 }
 
+/// Frame a list of byte keys the SDKs decode: a `u32` count then each key a
+/// `u32`-length prefix and its bytes. The inverse of the SDK's key-list reader.
+fn encode_key_list(keys: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        out.extend_from_slice(key);
+    }
+    out
+}
+
 /// Open a document for the 16-byte client id at `client`. Null on a bad handle.
 ///
 /// # Safety
@@ -267,6 +279,71 @@ pub unsafe extern "C" fn crdtsync_doc_get_bytes(
     out: *mut CrdtBuf,
 ) -> i32 {
     read_buf(doc, path, path_len, out, path::get_bytes)
+}
+
+/// Install-or-set a Register holding any scalar at a path, from an encoded
+/// [`Scalar`] payload. The ergonomic SDK marshals a native value (int, bool, null,
+/// string/bytes) to a `Scalar` and sets it here, so a leaf keeps its type across a
+/// round trip rather than collapsing every value to bytes. Returns the ops to
+/// broadcast; empty on a bad handle, path, or malformed payload.
+///
+/// # Safety
+/// `doc` is a live handle; `path`/`path_len` and `scalar`/`scalar_len` each follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_set_scalar(
+    doc: *mut CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    scalar: *const u8,
+    scalar_len: usize,
+) -> CrdtBuf {
+    let Some(value) = decode_scalar(scalar, scalar_len) else {
+        return CrdtBuf::empty();
+    };
+    edit(doc, path, path_len, move |d, p| path::register(d, p, value))
+}
+
+/// Read the Register at a path as an encoded [`Scalar`], whatever its type, into
+/// `out` (a fresh buffer the caller frees). The inverse of
+/// [`crdtsync_doc_set_scalar`] — the SDK decodes the payload back to a native
+/// value. Returns 1 when the slot holds a register, 0 when absent or another
+/// element, -1 on a bad handle.
+///
+/// # Safety
+/// `doc` is a live handle or null; `path`/`path_len` follow [`as_slice`]; `out`
+/// points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_get_scalar(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    read_buf(doc, path, path_len, out, |d, p| {
+        path::get_register(d, p).map(|s| s.encode_state())
+    })
+}
+
+/// Read the live slot keys of the Map at a path into `out` (a fresh buffer the
+/// caller frees), framed as a `u32` count then each key `u32`-length-prefixed. An
+/// empty path names the root map. The ergonomic SDK enumerates a map handle's
+/// entries through this. Returns 1 when the path is a live Map (even with no keys),
+/// 0 when it is not a Map, -1 on a bad handle.
+///
+/// # Safety
+/// `doc` is a live handle or null; `path`/`path_len` follow [`as_slice`]; `out`
+/// points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_map_keys(
+    doc: *const CrdtDoc,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    read_buf(doc, path, path_len, out, |d, p| {
+        path::map_keys(d, p).map(|keys| encode_key_list(&keys))
+    })
 }
 
 /// Set an inline blob at a path from `mime` and `bytes`, minting the blob's public

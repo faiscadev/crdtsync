@@ -20,10 +20,13 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_doc_inc",
         "crdtsync_doc_dec",
         "crdtsync_doc_set_bytes",
+        "crdtsync_doc_set_scalar",
         "crdtsync_doc_delete",
         "crdtsync_doc_get_int",
         "crdtsync_doc_get_counter",
         "crdtsync_doc_get_bytes",
+        "crdtsync_doc_get_scalar",
+        "crdtsync_doc_map_keys",
         // blobs
         "crdtsync_doc_set_blob",
         "crdtsync_doc_set_blob_ref",

@@ -18,23 +18,30 @@ import os
 import platform
 import struct
 import urllib.request
-from typing import List, NamedTuple, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Callable, List, NamedTuple, Optional, Tuple, Union
 
 __all__ = [
     "BlobRef",
     "Branch",
     "Capability",
     "Client",
+    "CrdtList",
+    "CrdtMap",
+    "CrdtText",
     "DiffKind",
+    "Doc",
     "Document",
     "Effect",
     "ErrorCode",
+    "Key",
     "Redirect",
     "Rejected",
     "ServerError",
     "Side",
     "SubjectKind",
     "Undo",
+    "UpdateEvent",
     "actor_key",
     "diff",
     "diff_decode",
@@ -43,6 +50,9 @@ __all__ = [
 ]
 
 Path = List[bytes]
+
+#: An ergonomic map key: a ``str`` (utf-8) or raw ``bytes``. Byte-paths stay hidden.
+Key = Union[str, bytes]
 
 
 class Side(enum.IntEnum):
@@ -215,10 +225,13 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_inc, [doc, cbytes, size, c.c_uint32], buf)
     sig(lib.crdtsync_doc_dec, [doc, cbytes, size, c.c_uint32], buf)
     sig(lib.crdtsync_doc_set_bytes, [doc, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_doc_set_scalar, [doc, cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_doc_delete, [doc, cbytes, size], buf)
     sig(lib.crdtsync_doc_get_int, [doc, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
     sig(lib.crdtsync_doc_get_counter, [doc, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
     sig(lib.crdtsync_doc_get_bytes, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_doc_get_scalar, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_doc_map_keys, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
     sig(
         lib.crdtsync_doc_set_blob,
         [doc, cbytes, size, cbytes, size, cbytes, size, c.POINTER(buf)],
@@ -721,6 +734,15 @@ def _decode_redirects(data: bytes) -> List[Redirect]:
     return [Redirect(room=r.blob(), leader_addr=r.blob()) for _ in range(r.u32())]
 
 
+def _decode_key_list(data: bytes) -> List[bytes]:
+    """Decode a ``map_keys`` buffer: a ``u32`` count, then each key a
+    ``u32``-length-prefixed byte string."""
+    if not data:
+        return []
+    r = _Reader(data)
+    return [r.blob() for _ in range(r.u32())]
+
+
 def _diff_raw(old_state: bytes, new_state: bytes) -> bytes:
     """The raw encoded change list turning ``old_state`` into ``new_state`` — the
     canonical buffer :func:`diff_decode` reads. Empty on a malformed snapshot."""
@@ -832,9 +854,34 @@ class Document:
             _LIB.crdtsync_doc_set_bytes(self._handle, p, len(p), value, len(value))
         )
 
+    def set_scalar(self, path: Path, scalar: bytes) -> bytes:
+        """Install-or-set a Register holding any encoded ``Scalar`` at a path — the
+        typed-leaf seam the ergonomic handle layer marshals native values through,
+        so a leaf keeps its type across a round trip. Returns the ops to broadcast
+        (empty on a malformed payload)."""
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_doc_set_scalar(self._handle, p, len(p), scalar, len(scalar))
+        )
+
     def delete(self, path: Path) -> bytes:
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_doc_delete(self._handle, p, len(p)))
+
+    def get_scalar(self, path: Path) -> Optional[bytes]:
+        """The encoded ``Scalar`` bytes of the Register at a path, whatever its type,
+        or ``None`` when the slot holds no register. The inverse of
+        :meth:`set_scalar`."""
+        return self._read_buf(_LIB.crdtsync_doc_get_scalar, path)
+
+    def map_keys(self, path: Path) -> Optional[List[bytes]]:
+        """The live slot keys of the Map at a path, or ``None`` when the path is not
+        a live Map (an empty path names the root map). An empty map reads back as an
+        empty list, distinct from ``None``."""
+        p = encode_path(path)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_doc_map_keys(self._handle, p, len(p), ctypes.byref(out))
+        return _decode_key_list(_take_buf(out)) if rc == 1 else None
 
     def get_int(self, path: Path) -> Optional[int]:
         return self._read_i64(_LIB.crdtsync_doc_get_int, path)
@@ -1988,3 +2035,371 @@ class Client:
         if rc != 1:
             return None
         return created.value == 1
+
+
+# --- ergonomic handle-graph layer ---------------------------------------------
+#
+# A `Doc` is a local replica with a single root map, edited through live typed
+# handles (`get_map`/`get_list`/`get_text`) rather than byte-paths. A handle owns
+# its logical path (a sequence of ergonomic keys) and re-resolves it on every
+# operation, so it stays valid as the document mutates and converges — a view,
+# never a cached pointer. Handles compose. The byte-path core (`Document`) stays
+# available as the low-level power-user surface; this layer marshals native values
+# and hides paths/ops on top of it.
+#
+# Native value marshaling matches the JS boundary exactly (the pinned cross-SDK
+# contract): `str` <-> Scalar::Bytes (utf-8), `int` <-> Scalar::Int, `bool` <->
+# Scalar::Bool, `None` <-> Scalar::Null, `bytes` <-> Scalar::Bytes (raw). A leaf is
+# written with an explicit native scalar; a container is created only with an
+# explicit `get_map`/`get_list`/`get_text` accessor — passing a dict/list to `set`
+# is a `TypeError`, never an implicit subtree (Automerge-style deep-seed is a
+# rejected non-goal). `str` and `bytes` both land in Scalar::Bytes, which the core
+# cannot itself tell apart, so the SDK prefixes the payload with a one-byte
+# discriminator (string vs binary) — an SDK framing detail, invisible to the value
+# the caller reads back.
+
+_BINARY = 0x00
+_STRING = 0x01
+
+_I64_MIN = -(2**63)
+_I64_MAX = 2**63 - 1
+
+
+def _key_bytes(key: Key) -> bytes:
+    if isinstance(key, str):
+        return key.encode("utf-8")
+    if isinstance(key, (bytes, bytearray)):
+        return bytes(key)
+    raise TypeError(f"key must be str or bytes, got {type(key).__name__}")
+
+
+def _key_string(key: bytes) -> str:
+    """A best-effort utf-8 rendering of a slot key (a binary key's value is still
+    read by its raw bytes, so nothing is lost)."""
+    return key.decode("utf-8", "replace")
+
+
+def _encode_value(value) -> bytes:
+    """Marshal a native scalar into the encoded ``Scalar`` bytes a leaf stores.
+    Rejects a plain ``dict``/``list`` and a non-integer ``float`` (create a nested
+    container with ``get_map``/``get_list``/``get_text``); raises ``OverflowError``
+    on an ``int`` outside the signed 64-bit range rather than wrapping."""
+    if value is None:
+        return b"\x00"
+    # `bool` is a subclass of `int`, so it must be checked first.
+    if isinstance(value, bool):
+        return b"\x01" + (b"\x01" if value else b"\x00")
+    if isinstance(value, int):
+        if not _I64_MIN <= value <= _I64_MAX:
+            raise OverflowError(
+                f"integer {value} is outside the signed 64-bit range storable as a scalar"
+            )
+        return b"\x02" + struct.pack("<q", value)
+    if isinstance(value, str):
+        body = bytes([_STRING]) + value.encode("utf-8")
+        return b"\x03" + struct.pack("<I", len(body)) + body
+    if isinstance(value, (bytes, bytearray)):
+        body = bytes([_BINARY]) + bytes(value)
+        return b"\x03" + struct.pack("<I", len(body)) + body
+    raise TypeError(
+        f"value must be str, int, bool, bytes, or None (got {type(value).__name__}); "
+        "create a nested container with get_map/get_list/get_text"
+    )
+
+
+def _decode_value(data: bytes):
+    """Read encoded ``Scalar`` bytes back into a native value — the inverse of
+    :func:`_encode_value`."""
+    tag = data[0]
+    if tag == 0x00:
+        return None
+    if tag == 0x01:
+        return data[1] != 0
+    if tag == 0x02:
+        return struct.unpack_from("<q", data, 1)[0]
+    if tag == 0x03:
+        length = struct.unpack_from("<I", data, 1)[0]
+        body = data[5 : 5 + length]
+        if body[:1] == bytes([_STRING]):
+            return body[1:].decode("utf-8")
+        if body[:1] == bytes([_BINARY]):
+            return bytes(body[1:])
+        return bytes(body)  # foreign untagged bytes read as binary
+    # A blob/element ref has no native leaf form here — the ergonomic reads for
+    # these are get_blob / a dedicated accessor; hand back the opaque encoding.
+    return bytes(data)
+
+
+@dataclass(frozen=True)
+class UpdateEvent:
+    """An applied change delivered to :meth:`Doc.on_update`. ``origin`` is
+    ``"local"`` for an edit on this replica, ``"remote"`` for an applied peer
+    update; ``ops`` are the wire-bound bytes the edit produced; ``changes`` are the
+    structural change events (empty until reactivity is observed)."""
+
+    origin: str
+    ops: bytes
+    changes: tuple = field(default_factory=tuple)
+
+
+class CrdtMap:
+    """A live handle to a Map slot, addressed by ergonomic keys (``str`` or
+    ``bytes``)."""
+
+    def __init__(self, doc: "Doc", path: Tuple[bytes, ...]):
+        self._doc = doc
+        self._path = tuple(path)
+
+    def _slot(self, key: Key) -> Path:
+        return list(self._path) + [_key_bytes(key)]
+
+    def _child(self, key: Key) -> Tuple[bytes, ...]:
+        return self._path + (_key_bytes(key),)
+
+    def set(self, key: Key, value) -> "CrdtMap":
+        """Set a leaf at ``key`` to a native scalar. A ``dict``/``list`` raises a
+        ``TypeError`` — a nested container is created with ``get_map``/``get_list``/
+        ``get_text``."""
+        slot = self._slot(key)
+        scalar = _encode_value(value)
+        self._doc._mutate(lambda b: b.set_scalar(slot, scalar))
+        return self
+
+    def get(self, key: Key):
+        """Read ``key``: a native scalar for a leaf, a :class:`BlobRef` for a blob, a
+        nested handle for a container slot, or ``None`` when the slot is empty."""
+        slot = self._slot(key)
+        backend = self._doc._backend
+        blob = backend.get_blob(slot)
+        if blob is not None:
+            return blob
+        scalar = backend.get_scalar(slot)
+        if scalar is not None:
+            return _decode_value(scalar)
+        kind = self._container_kind(slot)
+        if kind is None:
+            return None
+        return _HANDLE_CTORS[kind](self._doc, self._child(key))
+
+    def _container_kind(self, slot: Path) -> Optional[str]:
+        backend = self._doc._backend
+        if backend.map_keys(slot) is not None:
+            return "map"
+        if backend.list_len(slot) is not None:
+            return "list"
+        if backend.text_len(slot) is not None:
+            return "text"
+        return None
+
+    def delete(self, key: Key) -> "CrdtMap":
+        """Tombstone the slot at ``key``."""
+        slot = self._slot(key)
+        self._doc._mutate(lambda b: b.delete(slot))
+        return self
+
+    def __contains__(self, key: Key) -> bool:
+        slot = self._slot(key)
+        backend = self._doc._backend
+        return (
+            backend.get_scalar(slot) is not None
+            or backend.get_blob(slot) is not None
+            or self._container_kind(slot) is not None
+        )
+
+    def _raw_keys(self) -> List[bytes]:
+        return self._doc._backend.map_keys(list(self._path)) or []
+
+    def keys(self) -> List[str]:
+        """The live slot keys, rendered best-effort as utf-8 strings."""
+        return [_key_string(k) for k in self._raw_keys()]
+
+    def items(self) -> List[Tuple[str, object]]:
+        """The live ``(key, value)`` pairs. Values are read by the raw key bytes, so
+        a non-utf-8 (binary) key's value is never lost."""
+        return [(_key_string(k), self.get(k)) for k in self._raw_keys()]
+
+    def __len__(self) -> int:
+        return len(self._raw_keys())
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def get_map(self, key: Key) -> "CrdtMap":
+        """A nested Map handle at ``key``."""
+        return CrdtMap(self._doc, self._child(key))
+
+    def get_list(self, key: Key) -> "CrdtList":
+        """A nested List handle at ``key``."""
+        return CrdtList(self._doc, self._child(key))
+
+    def get_text(self, key: Key) -> "CrdtText":
+        """A nested Text handle at ``key``."""
+        return CrdtText(self._doc, self._child(key))
+
+
+class CrdtList:
+    """A live handle to a List of scalar items, addressed by live index."""
+
+    def __init__(self, doc: "Doc", path: Tuple[bytes, ...]):
+        self._doc = doc
+        self._path = tuple(path)
+
+    @property
+    def _self(self) -> Path:
+        return list(self._path)
+
+    def insert(self, index: int, value) -> "CrdtList":
+        """Insert a scalar item at a live ``index`` (clamped into range)."""
+        n = len(self)
+        if index < 0:
+            index = max(0, n + index)
+        index = min(index, n)
+        item = _encode_value(value)
+        self._doc._mutate(lambda b: b.list_insert(self._self, index, item))
+        return self
+
+    def append(self, value) -> "CrdtList":
+        """Append a scalar item."""
+        return self.insert(len(self), value)
+
+    def delete(self, index: int) -> "CrdtList":
+        """Tombstone the live item at ``index``."""
+        idx = self._checked(index)
+        self._doc._mutate(lambda b: b.list_delete(self._self, idx))
+        return self
+
+    def __getitem__(self, index: int):
+        idx = self._checked(index)
+        item = self._doc._backend.list_get(self._self, idx)
+        if item is None:
+            raise IndexError("list index out of range")
+        return _decode_value(item)
+
+    def __len__(self) -> int:
+        return self._doc._backend.list_len(self._self) or 0
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def _checked(self, index: int) -> int:
+        n = len(self)
+        if index < 0:
+            index += n
+        if index < 0 or index >= n:
+            raise IndexError("list index out of range")
+        return index
+
+
+class CrdtText:
+    """A live handle to a collaborative Text run, indexed by codepoint."""
+
+    def __init__(self, doc: "Doc", path: Tuple[bytes, ...]):
+        self._doc = doc
+        self._path = tuple(path)
+
+    @property
+    def _self(self) -> Path:
+        return list(self._path)
+
+    def insert(self, index: int, text: str) -> "CrdtText":
+        """Insert ``text`` at a codepoint ``index``."""
+        self._doc._mutate(lambda b: b.text_insert(self._self, index, text))
+        return self
+
+    def delete(self, index: int, count: int) -> "CrdtText":
+        """Tombstone ``count`` codepoints from ``index``."""
+        self._doc._mutate(lambda b: b.text_delete(self._self, index, count))
+        return self
+
+    def __str__(self) -> str:
+        return self._doc._backend.text_get(self._self) or ""
+
+    def __len__(self) -> int:
+        return self._doc._backend.text_len(self._self) or 0
+
+
+_HANDLE_CTORS = {"map": CrdtMap, "list": CrdtList, "text": CrdtText}
+
+
+class Doc:
+    """A local CRDT replica with a single root map, edited through live typed
+    handles. A ``Doc`` is a pure local replica: two docs that exchange each other's
+    update ops (forwarded via :meth:`on_update`) converge. The low-level path API
+    stays available on the wrapped :class:`Document` for power users."""
+
+    def __init__(self, client_id: Optional[bytes] = None):
+        self._backend = Document(client_id if client_id is not None else os.urandom(16))
+        self._update_listeners: List[Callable[[UpdateEvent], None]] = []
+        self._transacting = False
+
+    def get_map(self, key: Key) -> CrdtMap:
+        """A live root Map handle at ``key``."""
+        return CrdtMap(self, (_key_bytes(key),))
+
+    def get_list(self, key: Key) -> CrdtList:
+        """A live root List handle at ``key``."""
+        return CrdtList(self, (_key_bytes(key),))
+
+    def get_text(self, key: Key) -> CrdtText:
+        """A live root Text handle at ``key``."""
+        return CrdtText(self, (_key_bytes(key),))
+
+    def on_update(self, callback: Callable[[UpdateEvent], None]) -> Callable[[], None]:
+        """Subscribe to every applied change to the document; returns a function
+        that unsubscribes."""
+        self._update_listeners.append(callback)
+
+        def off() -> None:
+            try:
+                self._update_listeners.remove(callback)
+            except ValueError:
+                pass
+
+        return off
+
+    def apply_update(self, ops: bytes) -> int:
+        """Fold a peer's update ops into this replica; returns the count applied."""
+        applied = self._backend.apply(ops)
+        if applied > 0:
+            self._dispatch("remote", ops)
+        return applied
+
+    def encode_state(self) -> bytes:
+        """Serialize the whole replica to a canonical snapshot."""
+        return self._backend.encode_state()
+
+    @classmethod
+    def decode_state(cls, state: bytes) -> "Doc":
+        """Open a ``Doc`` from a snapshot produced by :meth:`encode_state`."""
+        obj = cls.__new__(cls)
+        obj._backend = Document.decode_state(state)
+        obj._update_listeners = []
+        obj._transacting = False
+        return obj
+
+    def close(self) -> None:
+        self._backend.close()
+
+    def __enter__(self) -> "Doc":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
+        ops = run(self._backend)
+        if ops:
+            self._dispatch("local", ops)
+        return ops
+
+    def _dispatch(self, origin: str, ops: bytes) -> None:
+        event = UpdateEvent(origin=origin, ops=ops, changes=())
+        for listener in list(self._update_listeners):
+            listener(event)
