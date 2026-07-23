@@ -259,6 +259,40 @@ impl WasmDocument {
         encode_ops(&path::set_bytes(&mut self.inner, path, value))
     }
 
+    /// Install-or-set a Register holding any scalar at a path, from an encoded
+    /// [`Scalar`] payload. The ergonomic SDK marshals a native value (int, bool,
+    /// null, string/bytes) to a `Scalar` and sets it here, so a leaf keeps its
+    /// type across a round trip rather than collapsing every value to bytes.
+    /// Returns the ops to broadcast; empty on a malformed payload.
+    #[wasm_bindgen(js_name = setScalar)]
+    pub fn set_scalar(&mut self, path: &[u8], scalar: &[u8]) -> Vec<u8> {
+        let Ok(value) = Scalar::decode_state(scalar) else {
+            return Vec::new();
+        };
+        encode_ops(&path::register(&mut self.inner, path, value))
+    }
+
+    /// Read the Register at a path as an encoded [`Scalar`], whatever its type, or
+    /// `undefined` when the slot holds no register. The inverse of
+    /// [`setScalar`](Self::set_scalar) — the ergonomic SDK decodes the payload back
+    /// to a native value.
+    #[wasm_bindgen(js_name = getScalar)]
+    pub fn get_scalar(&self, path: &[u8]) -> Option<Vec<u8>> {
+        path::get_register(&self.inner, path).map(|s| s.encode_state())
+    }
+
+    /// The live slot keys of the Map at a path, as an array of `Uint8Array`, or
+    /// `undefined` if the path is not a live Map (an empty path names the root map).
+    /// The ergonomic SDK enumerates a map handle's entries through this.
+    #[wasm_bindgen(js_name = mapKeys)]
+    pub fn map_keys(&self, path: &[u8]) -> Option<Vec<js_sys::Uint8Array>> {
+        path::map_keys(&self.inner, path).map(|keys| {
+            keys.iter()
+                .map(|k| js_sys::Uint8Array::from(k.as_slice()))
+                .collect()
+        })
+    }
+
     /// Tombstone the slot at a path.
     pub fn delete(&mut self, path: &[u8]) -> Vec<u8> {
         encode_ops(&path::delete(&mut self.inner, path))

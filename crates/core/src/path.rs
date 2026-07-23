@@ -362,6 +362,14 @@ pub fn get_int(doc: &Document, path: &[u8]) -> Option<i64> {
     })
 }
 
+/// The live slot keys of the Map at a path (sorted, as [`Map::keys`]), or `None`
+/// if the path is not a live Map. An empty path names the root map. The ergonomic
+/// SDK reads this to enumerate a map handle's entries.
+pub fn map_keys(doc: &Document, path: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let keys = parse_path(path)?;
+    resolve_map(doc, &keys).map(|m| m.borrow().keys())
+}
+
 /// Read a Register's scalar at a path, whatever its type.
 pub fn get_register(doc: &Document, path: &[u8]) -> Option<Scalar> {
     slot(doc, path).and_then(|e| match e {
