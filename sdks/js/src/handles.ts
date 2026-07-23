@@ -7,10 +7,10 @@
 
 import type { ChangeListener, HandleContext } from "./internal.js";
 import { type ScalarValue, decodeValue, encodeValue } from "./marshal.js";
-import { type Key, encodePath, keyString } from "./path.js";
+import { type Key, encodePath, keyBytes, keyString } from "./path.js";
 
 /** A value read from a slot: a marshaled scalar, or a nested container handle. */
-export type Value = ScalarValue | CrdtMap | CrdtList | CrdtText;
+export type Value = ScalarValue | CrdtMap | CrdtList | CrdtText | CrdtXml;
 
 /** An opaque, stable position in a sequence — a cursor captured with
  * `relativePosition` and resolved back to a live index with `resolve`. It tracks
@@ -48,10 +48,11 @@ export class CrdtMap {
   }
 
   /** The container kind a slot holds, or `undefined` if it holds no container. */
-  private containerKind(slot: Uint8Array): "map" | "list" | "text" | undefined {
+  private containerKind(slot: Uint8Array): "map" | "list" | "text" | "xml" | undefined {
     if (this.ctx.backend.mapKeys(slot) !== undefined) return "map";
     if (this.ctx.backend.listLen(slot) !== undefined) return "list";
     if (this.ctx.backend.textLen(slot) !== undefined) return "text";
+    if (this.ctx.backend.xmlChildrenLen(slot) !== undefined) return "xml";
     return undefined;
   }
 
@@ -68,6 +69,8 @@ export class CrdtMap {
         return new CrdtList(this.ctx, child);
       case "text":
         return new CrdtText(this.ctx, child);
+      case "xml":
+        return new CrdtXml(this.ctx, child);
       default:
         return undefined;
     }
@@ -99,6 +102,11 @@ export class CrdtMap {
   /** A nested Text handle at `key`. */
   getText(key: Key): CrdtText {
     return new CrdtText(this.ctx, [...this.path, key]);
+  }
+
+  /** A nested Xml handle at `key` (an XML element or fragment). */
+  getXml(key: Key): CrdtXml {
+    return new CrdtXml(this.ctx, [...this.path, key]);
   }
 
   /** The raw live slot keys, as the core stores them. */
@@ -259,6 +267,85 @@ export class CrdtText {
 
   /** Observe changes to this text (local edits and remote updates). Returns an
    * unsubscribe function. */
+  observe(listener: ChangeListener): () => void {
+    return this.ctx.observe(this.self, listener);
+  }
+}
+
+/** A live handle to an XML element or fragment. Children are addressed by live
+ * index — the core stores a child with no path of its own, so this handle edits a
+ * node's direct children (insert element/text, delete, tree-move) but does not
+ * recurse into a child element's contents (deep XML navigation is a core follow-on,
+ * matching the Python/Go SDKs' XML surface). */
+export class CrdtXml {
+  /** @internal */
+  constructor(
+    private readonly ctx: HandleContext,
+    private readonly path: readonly Key[],
+  ) {}
+
+  private get self(): Uint8Array {
+    return encodePath(this.path);
+  }
+
+  /** Install a tagged XML element at this slot. */
+  element(tag: string): this {
+    const self = this.self;
+    const t = keyBytes(tag);
+    this.ctx.mutate((b) => b.xmlElement(self, t));
+    return this;
+  }
+
+  /** Install a tagless XML fragment at this slot. */
+  fragment(): this {
+    const self = this.self;
+    this.ctx.mutate((b) => b.xmlFragment(self));
+    return this;
+  }
+
+  /** This element's tag, or `undefined` for a fragment or an absent node. */
+  get tag(): string | undefined {
+    const t = this.ctx.backend.xmlTag(this.self);
+    return t === undefined ? undefined : keyString(t);
+  }
+
+  /** The number of live children. */
+  get length(): number {
+    return this.ctx.backend.xmlChildrenLen(this.self) ?? 0;
+  }
+
+  /** Insert a child element with `tag` at a live child index. */
+  insertElement(index: number, tag: string): this {
+    const self = this.self;
+    const t = keyBytes(tag);
+    this.ctx.mutate((b) => b.xmlInsertElement(self, index, t));
+    return this;
+  }
+
+  /** Insert a text-run child holding `text` at a live child index. */
+  insertText(index: number, text: string): this {
+    const self = this.self;
+    this.ctx.mutate((b) => b.xmlInsertText(self, index, text));
+    return this;
+  }
+
+  /** Tombstone the child at a live index. */
+  deleteChild(index: number): this {
+    const self = this.self;
+    this.ctx.mutate((b) => b.xmlChildDelete(self, index));
+    return this;
+  }
+
+  /** Relocate this node's child at `childIndex` to `destIndex` in `newParent`'s
+   * children — an identity-preserving tree move. */
+  move(childIndex: number, newParent: CrdtXml, destIndex: number): this {
+    const self = this.self;
+    const dest = newParent.self;
+    this.ctx.mutate((b) => b.xmlMove(self, childIndex, dest, destIndex));
+    return this;
+  }
+
+  /** Observe changes to this node's children (local edits and remote updates). */
   observe(listener: ChangeListener): () => void {
     return this.ctx.observe(this.self, listener);
   }
