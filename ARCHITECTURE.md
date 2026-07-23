@@ -396,7 +396,7 @@ Schema-driven events the engine detects and surfaces as SDK callbacks — the en
 
 ## Typed SDK API (Codegen)
 
-A schema can be *consumed at build time* to generate a typed accessor layer, so a typed client calls `note.get_title()` / `note.meta().set_priority(4)` instead of raw path strings. The generator (`crdtsync-codegen`, an in-repo tool) reads a schema JSON, validates it through the **core `Schema` parser** (the sole validator — codegen never re-implements schema semantics), and emits a source file per target SDK language. The emitted code is a **thin facade over the SDK's existing path surface**: one wrapper class per declared map type (holding a document + the path prefix it lives at), each slot a typed accessor that forwards to the existing path method with the slot's path key + type baked in — register → int get/set, counter → get/inc/dec, text → get/len/insert/delete, list → len/get/insert/delete, nested map → an accessor returning the nested wrapper at the extended path. Because it forwards to primitives core already implements, codegen adds **no runtime behavior** and nothing new to keep convergent across languages — it is a convenience surface, never a second source of truth. Output is **deterministic** (declaration-order emission, no timestamp) so a checked-in generated artifact regenerates as a no-op diff. Codegen only *reads* the schema; it never alters the `Schema` type or the wire format (§Schema Is Code). **Python and Go are shipped targets** (`generate_python`, `generate_go`), each a language target on the same per-language emitter — Go emits exported PascalCase methods with `(value, ok)` getters and a copying `joinPath` helper so nested/sibling accessors never alias a shared path slice. A **TypeScript-for-wasm target is deliberately not generated**: the wasm SDK is already statically typed by wasm-bindgen, and its methods take a pre-encoded opaque path buffer rather than the append-a-key list façade the Python/Go targets forward to, so there is no natural surface to wrap (revisit if a first-class TS package lands). Xml typed accessors are a follow-on.
+A schema can be *consumed at build time* to generate a typed accessor layer, so a typed client calls `note.get_title()` / `note.meta().set_priority(4)` instead of raw path strings. The generator (`crdtsync-codegen`, an in-repo tool) reads a schema JSON, validates it through the **core `Schema` parser** (the sole validator — codegen never re-implements schema semantics), and emits a source file per target SDK language. The emitted code is a **thin facade over the SDK's existing path surface**: one wrapper class per declared map type (holding a document + the path prefix it lives at), each slot a typed accessor that forwards to the existing path method with the slot's path key + type baked in — register → int get/set, counter → get/inc/dec, text → get/len/insert/delete, list → len/get/insert/delete, nested map → an accessor returning the nested wrapper at the extended path. Because it forwards to primitives core already implements, codegen adds **no runtime behavior** and nothing new to keep convergent across languages — it is a convenience surface, never a second source of truth. Output is **deterministic** (declaration-order emission, no timestamp) so a checked-in generated artifact regenerates as a no-op diff. Codegen only *reads* the schema; it never alters the `Schema` type or the wire format (§Schema Is Code). **Python and Go are shipped targets** (`generate_python`, `generate_go`), each a language target on the same per-language emitter — Go emits exported PascalCase methods with `(value, ok)` getters and a copying `joinPath` helper so nested/sibling accessors never alias a shared path slice. A **TypeScript-for-wasm target is deliberately not generated**: the wasm SDK is already statically typed by wasm-bindgen, and its methods take a pre-encoded opaque path buffer rather than the append-a-key list façade the Python/Go targets forward to, so there is no natural surface to wrap. (A first-class ergonomic TS package now lands separately — §SDK-Ergonomic-Surface — but it is a *hand-written* handle-graph layer, not a schema-codegen target; codegen over its handle surface is a possible later target, not this codegen unit.) Xml typed accessors are a follow-on.
 
 ---
 
@@ -796,6 +796,72 @@ SDKs are thin wrappers over the ABI.
 # SDK Philosophy
 
 SDKs contain serialization, networking, reconnect logic, API ergonomics. SDKs do NOT contain merge logic, causality logic, CRDT internals.
+
+---
+
+# SDK Ergonomic Surface
+
+The §SDK-Philosophy and §Multi-Language-Support intent ("edit the same document naturally", "high-level editing intentions, CRDT internals stay hidden") pins a *philosophy* but not a concrete API *shape*. This section pins the shape: the **handle-graph model** every first-class SDK realizes. It is a language-agnostic contract with a per-language reference realization; **JavaScript/TypeScript is the reference** (the first SDK built to this shape), and **Python/Go are lifted to it later** (enumerated in KANBAN, not built by the JS epic).
+
+The layering is unchanged: an SDK is still a thin wrapper over the wasm/C-ABI core (§Portable-CRDT-Core). The core surface (`WasmDocument`/`WasmClient`, the FFI) is **byte-path + bytes-valued** — a path is an opaque length-framed key buffer, every value crosses as a `Scalar` byte payload, every edit returns raw op bytes. That surface is correct but not ergonomic; it stays as the **low-level seam**. The ergonomic layer is a hand-written package *on top of* it — not codegen (§Typed-SDK-API is a separate, schema-driven convenience). No core CRDT logic moves into the SDK; the handle layer only marshals values and hides path/op bytes.
+
+## The Handle-Graph Model (language-agnostic contract)
+
+A `Doc` is a local replica with a single root map. Editing is done through **live typed handles** into that root, never through byte-paths:
+
+- **`Doc.getMap(key)` / `getList(key)` / `getText(key)` / `getXml(key)`** return a live handle — `CrdtMap` / `CrdtList` / `CrdtText` / `CrdtXml` — addressed by an **ergonomic key** (a language-native map key: a JS string, a Python `str`, a Go string), never a byte-path. The handle **owns its path internally** and **re-resolves on every operation** — it holds the logical path (a sequence of keys / a container identity), not a cached pointer into the value graph, so it stays valid as the document mutates and converges. Requesting a container handle installs that container if the slot is empty and it is convergent to do so (idempotent install, the existing `path::*` install-or-get semantics).
+- **Nested handles compose.** `doc.getMap("a").getMap("b").getText("body")` walks the graph; each step extends the parent's internal path by one key. A list/text handle is obtained from its parent map by key; a list yields child handles by index where the child is a container.
+- A handle is a **view, not a snapshot**: reads reflect the current converged state, writes apply immediately (locally) and — when the `Doc` is bound to a provider — flow to peers.
+
+This is the Yjs `Y.Map`/`Y.Array`/`Y.Text` shape, chosen (user decision, 2026-07-22) because it is the model JS collaboration developers already know and the one editors bind to.
+
+## Native Value Marshaling
+
+A language's native scalars map to CRDT `Scalar`s, so the developer never hand-encodes bytes:
+
+- **JS:** `string` ↔ a UTF-8 `Scalar::Bytes` (the SDK owns the encoding), `number` (integer) ↔ `Scalar::Int`, `boolean` ↔ `Scalar::Bool`, `Uint8Array` ↔ raw `Scalar::Bytes`, `null` ↔ `Scalar::Null`. A non-integer `number` is rejected (the core `Scalar::Int` is 64-bit integer; a float has no lossless scalar — the SDK throws rather than silently truncate). `bigint` covers the full 64-bit `Int` range.
+- **The leaf/container boundary is explicit, not inferred by shape — a permanent design principle.** A **leaf** is written with `map.set(key, scalar)` / `list.insert(i, scalar)` and holds one `Scalar`. A **container** is created with the explicit `getMap` / `getList` / `getText` / `getXml` accessor. The SDK does **not** deep-seed a nested container from a plain object/array passed to `set` — `set(k, {a:1})` is a **type error**, never an implicit `getMap(k)` + recursion. This is the load-bearing marshaling rule every SDK must match, and it is **permanent, not a v1 simplification**: **native scalar ⇒ leaf; explicit accessor ⇒ container.** It is what makes marshaling total and unambiguous (a JS value is a leaf or it is nothing — there is no third "is this a subtree?" case to disambiguate) and what keeps the surface statically type-safe.
+- **Rejected non-goal: Automerge-style deep-seed.** Implicitly converting a passed plain object/array into a nested `CrdtMap`/`CrdtList` subtree (Automerge's `doc.map = {a: {b: 1}}`) is a **rejected alternative, not a deferred feature** (user preference, 2026-07-22). It trades the explicit/type-safe boundary above for a guess about whether a value is a leaf or a container, which erodes type-safety and makes marshaling non-total. Containers are always created explicitly. This rejection is **cross-SDK** — the Python/Go lift keeps the same explicit boundary; no SDK offers deep-seed.
+- A blob is set through a dedicated handle method (`map.setBlob` / `setBlobRef`, wrapping the existing inline/out-of-band split), not through scalar marshaling — a blob is a value type, not a CRDT primitive (§Binary-Blobs).
+
+## Handle Methods (idiomatic per type)
+
+Method *names* are idiomatic per language; the *semantics* are the contract. The reference (JS) surface:
+
+- **`CrdtMap`**: `.set(key, value)`, `.get(key)`, `.delete(key)`, `.has(key)`, `.keys()`, `.entries()`, `.size`, plus the container accessors `.getMap/.getList/.getText/.getXml(key)`. `.get` returns a marshaled scalar for a leaf, or a handle for a container slot.
+- **`CrdtList`**: `.insert(index, value)`, `.push(value)`, `.delete(index)`, `.get(index)`, `.length`, and iteration (`[Symbol.iterator]` in JS). Container items yield child handles.
+- **`CrdtText`**: `.insert(index, str)`, `.delete(index, count)`, `.toString()`, `.length`, plus **cursors**: `.relativePosition(index, side?)` captures a stable position and `.resolve(pos)` reads it back to a live index (wrapping the core `RelativePosition`). Cursors are the feature editors require to keep selections stable under concurrent edits.
+- **`CrdtXml`**: element/fragment construction, typed child insert (element / text-run), child delete, **tree-move** (Kleppmann, identity-preserving), tag/children reads, and **marks** (author / set-value / delete / read `marksAt`) — to full parity with the core XML + marks surface.
+
+Indices are **live indices** over the current sequence (the core semantics), codepoint-based for text.
+
+## Reactivity
+
+The load-bearing feature for JS collaboration. Two observation entry points:
+
+- **`handle.observe(cb)`** — fires when *that handle's* subtree changes, whether from a local edit or an applied remote op.
+- **`Doc.on("update", cb)`** — fires on every applied change to the document.
+
+The **event shape** is derived from the diff/changes machinery the core already exposes (`core::diff`, the wasm `diff`/`diffEncoded`/`decodeChanges` seam): a change event carries the structural change list — for each change, its **kind** (add / remove / value / counter / listInsert / listDelete / textInsert / textDelete / mark\*), its **target** (as an ergonomic path — a key/index sequence, not raw path bytes), and the **before/after** values (marshaled scalars, not `{t,v}` byte tags). An event also flags its **origin** (local vs remote) so a binding can avoid echoing its own edits. The SDK computes the diff by snapshotting before/after an applied batch (or consuming the provider's inbound diff), so reactivity needs no new core surface — it re-marshals the existing change objects into ergonomic events.
+
+## Sync Provider
+
+An ergonomic transport binding wraps the low-level `WasmClient` op-flow (which is pure framing — it holds no socket; §Networking-Layer) plus a real WebSocket:
+
+- **`connect(url, room)` → a `Provider`** (or `new Provider(url, room)`), which a `Doc` binds to. The provider owns the socket, drives the handshake (`hello` → optional `auth` → `subscribe`), sends outbound ops framed by `WasmClient`, applies inbound frames back into the `Doc` (firing reactivity), and handles **catch-up / resume / reconnect** (re-`subscribe` from `last_seen_seq`, `resend` the unacked outbox) and the **offline op queue** (§Offline-First) transparently.
+- It exposes **connection state** (an observable `connecting`/`connected`/`disconnected`, plus the `onUpdateRequired` / `onOpsRejected` / redirect signals the core surfaces) and **awareness** (ephemeral presence: set the local entry, observe peers').
+- **Node + browser.** The WebSocket implementation is detected/injected — the platform `WebSocket` in a browser, an injected `ws` in Node — so one package serves both. The blob upload helper (`uploadBlob`, already in wasm) is wrapped for the out-of-band large-blob path.
+
+Binding a `Doc` to a provider is the only networked entry point; an unbound `Doc` is a pure local replica (the two-doc convergence model, exchanging op bytes directly, still holds and is the base test).
+
+## Language-Agnostic Contract vs JS-Specific Choices
+
+Pinned so Python/Go lift to the *same* model, not a JS transliteration:
+
+- **Language-agnostic (the contract every SDK realizes):** the handle-graph model (root map → live typed handles → nested composition, handles own+re-resolve their path); the native-scalar-to-`Scalar` marshaling table and the **explicit leaf-vs-container boundary**; the per-type method semantics (Map/List/Text/Xml + cursors + marks); the reactivity event model (diff-derived change events with kind/target/before-after/origin, plus per-handle and per-doc observation); and the provider model (transport-wrapping sync object owning handshake/reconnect/catch-up/awareness, `Doc` binds to it).
+- **JS-specific (reference realizations of the above, other languages substitute their idiom):** `Symbol.iterator` for list/map iteration; `Promise`-based `connect`; `Uint8Array` as the bytes scalar; `bigint` for the full `Int` range; ESM + `.d.ts` types; npm packaging; browser/Node WebSocket detection. Python would use `__iter__`/`__len__`/`__getitem__`, `async def connect`, `bytes`, context managers; Go would use exported methods, channels for observation, an `io`-shaped transport.
+
+The JS epic ships the reference implementation and this contract; **lifting Python and Go to the handle-graph shape is a follow-on epic** (they remain path-based + bytes-valued until then).
 
 ---
 
@@ -1212,7 +1278,7 @@ Websocket sync, room support, op log, snapshots, embedded persistence, TS SDK, s
 
 ## v0.2 — Developer Experience
 
-Declarative policy file with audit log, awareness subsystem (TTL + throttle + auth filtering + reconnect grace), reconnect, compaction with tombstone GC watermark, admin dashboard, replay tooling, UndoManager for v0.1 primitives, composition cookbook, named versions + auto-version triggers.
+Declarative policy file with audit log, awareness subsystem (TTL + throttle + auth filtering + reconnect grace), reconnect, compaction with tombstone GC watermark, admin dashboard, replay tooling, UndoManager for v0.1 primitives, composition cookbook, named versions + auto-version triggers, ergonomic JS/TS SDK (handle-graph surface, §SDK-Ergonomic-Surface).
 
 ## v0.3 — Portable Runtime + Interop
 
