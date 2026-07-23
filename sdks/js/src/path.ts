@@ -44,6 +44,38 @@ export function pathStartsWith(whole: Uint8Array, prefix: Uint8Array): boolean {
   return true;
 }
 
+/** One step of a repair path: a map-slot key (string) or a sequence index (number). */
+export type RepairStep = string | number;
+
+// Repair-path step tags — the core's `path::encode_repair_path`.
+const STEP_KEY = 0x00;
+const STEP_INDEX = 0x01;
+
+/** Decode a repair path (as `takeRepairs` reports) into its steps. Unlike a key
+ * path, a repair location can descend a sequence index (a bounded list item, an
+ * xml child), so a step is either a key or an index. */
+export function decodeRepairPath(bytes: Uint8Array): RepairStep[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const steps: RepairStep[] = [];
+  let i = 0;
+  while (i < bytes.length) {
+    const tag = bytes[i];
+    i += 1;
+    if (tag === STEP_KEY) {
+      const len = view.getUint32(i, true);
+      i += 4;
+      steps.push(keyString(bytes.subarray(i, i + len)));
+      i += len;
+    } else if (tag === STEP_INDEX) {
+      steps.push(Number(view.getBigUint64(i, true)));
+      i += 8;
+    } else {
+      throw new Error(`crdtsync: unknown repair-path step tag ${tag}`);
+    }
+  }
+  return steps;
+}
+
 /** Encode a key path to the length-framed buffer the wasm methods expect. */
 export function encodePath(keys: readonly Key[]): Uint8Array {
   const parts = keys.map(keyBytes);

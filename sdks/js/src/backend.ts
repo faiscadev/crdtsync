@@ -62,6 +62,11 @@ export interface Backend {
   /** Commit the atomic group, returning its combined ops/frame. */
   commitAtomic(): Uint8Array;
 
+  /** Bind a schema (JSON bytes) for repair observation + mark flavors; whether it bound. */
+  setSchema(schema: Uint8Array): boolean;
+  /** Drain the repair paths that newly changed against the bound schema. */
+  takeRepairs(): Uint8Array[];
+
   /** Fold a peer's ops in (local only); a client backend syncs through its provider. */
   apply(ops: Uint8Array): number;
 }
@@ -200,6 +205,13 @@ export class ClientBackend implements Backend {
   }
   commitAtomic(): Uint8Array {
     return this.client.commitAtomic(this.channel);
+  }
+
+  setSchema(schema: Uint8Array): boolean {
+    return this.client.setSchema(this.channel, schema);
+  }
+  takeRepairs(): Uint8Array[] {
+    return this.client.takeRepairs(this.channel) as Uint8Array[];
   }
 
   apply(_ops: Uint8Array): number {

@@ -1565,6 +1565,34 @@ impl WasmClient {
         }
     }
 
+    /// Parse schema JSON bytes and bind the schema to `channel`'s replica for
+    /// `onRepaired` observation and schema-typed mark flavors, returning whether it
+    /// bound. `false` when the channel isn't held, or the bytes are non-UTF-8 or
+    /// not a valid schema (binding nothing), matching [`WasmDocument::set_schema`].
+    #[wasm_bindgen(js_name = setSchema)]
+    pub fn set_schema(&mut self, channel: u32, schema_bytes: &[u8]) -> bool {
+        match self.inner.document_mut(Channel(channel)) {
+            Some(d) => path::set_schema(d, schema_bytes),
+            None => false,
+        }
+    }
+
+    /// The located paths whose repaired reading has newly changed against
+    /// `channel`'s bound schema since the last call — the `onRepaired` signal, as
+    /// an array of `Uint8Array` (each an encoded repair path). Empty when the
+    /// channel isn't held, no schema is bound, or nothing newly needs repair.
+    #[wasm_bindgen(js_name = takeRepairs)]
+    pub fn take_repairs(&mut self, channel: u32) -> JsValue {
+        match self.inner.document_mut(Channel(channel)) {
+            Some(d) => path::take_repairs(d)
+                .iter()
+                .map(|p| js_sys::Uint8Array::from(p.as_slice()))
+                .collect::<js_sys::Array>()
+                .into(),
+            None => js_sys::Array::new().into(),
+        }
+    }
+
     /// Publish an ephemeral awareness entry `key` on `channel`'s room; returns
     /// the frame to send. `None` if the channel isn't held.
     #[wasm_bindgen(js_name = setAwareness)]

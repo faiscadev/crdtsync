@@ -762,6 +762,20 @@ fn get_bytes_field(obj: &wasm_bindgen::JsValue, key: &str) -> Vec<u8> {
     js_sys::Uint8Array::new(&v).to_vec()
 }
 
+/// The 16-byte handle from a `{ id, ops }` mark result, asserting the mark authored.
+fn mark_id(result: &wasm_bindgen::JsValue) -> Vec<u8> {
+    let id = js_sys::Reflect::get(result, &wasm_bindgen::JsValue::from_str("id")).unwrap();
+    assert!(!id.is_undefined(), "mark should have authored an id");
+    js_sys::Uint8Array::new(&id).to_vec()
+}
+
+/// Whether a `{ id, ops }` mark result was inert — no handle authored.
+fn mark_inert(result: &wasm_bindgen::JsValue) -> bool {
+    js_sys::Reflect::get(result, &wasm_bindgen::JsValue::from_str("id"))
+        .unwrap()
+        .is_undefined()
+}
+
 // A schema declaring the mark flavors over a top-level "body" text, so the read
 // model resolves boolean/value marks (an undeclared name defaults to object).
 const MARK_SCHEMA: &[u8] = br#"{
@@ -778,7 +792,7 @@ fn a_mark_is_authored_read_changed_and_deleted() {
     a.text_insert(&t, 0, "hello world");
     // A boolean mark over [0,5) — the mark id is the handle.
     let on = Scalar::Bool(true).encode_state();
-    let id = a.mark(&t, 0, 0, 5, 1, b"bold", &on).expect("mark authored");
+    let id = mark_id(&a.mark(&t, 0, 0, 5, 1, b"bold", &on));
     assert_eq!(id.len(), 16);
 
     let marks = js_sys::Array::from(&a.marks_at(&t, 0));
@@ -797,9 +811,9 @@ fn a_mark_is_authored_read_changed_and_deleted() {
     // A non-sequence path yields no handle, an unknown side is rejected, and a
     // malformed value is rejected.
     a.register_int(&path(&["n"]), 1);
-    assert!(a.mark(&path(&["n"]), 0, 0, 1, 1, b"x", &on).is_none());
-    assert!(a.mark(&t, 0, 9, 5, 1, b"x", &on).is_none());
-    assert!(a.mark(&t, 0, 0, 5, 1, b"x", &[0xFF, 0xFF]).is_none());
+    assert!(mark_inert(&a.mark(&path(&["n"]), 0, 0, 1, 1, b"x", &on)));
+    assert!(mark_inert(&a.mark(&t, 0, 9, 5, 1, b"x", &on)));
+    assert!(mark_inert(&a.mark(&t, 0, 0, 5, 1, b"x", &[0xFF, 0xFF])));
     assert_eq!(
         js_sys::Array::from(&a.marks_at(&path(&["n"]), 0)).length(),
         0
@@ -813,7 +827,7 @@ fn a_value_mark_reads_as_a_tagged_scalar() {
     let t = path(&["body"]);
     a.text_insert(&t, 0, "abc");
     let payload = Scalar::Int(7).encode_state();
-    a.mark(&t, 0, 0, 3, 1, b"link", &payload).expect("authored");
+    mark_id(&a.mark(&t, 0, 0, 3, 1, b"link", &payload));
 
     let marks = js_sys::Array::from(&a.marks_at(&t, 1));
     assert_eq!(marks.length(), 1);
@@ -870,10 +884,33 @@ fn a_client_mark_over_a_non_sequence_is_inert() {
     a.xml_fragment(sa.channel(), &t);
     let outbox = a.outbox_len(sa.channel());
     let on = Scalar::Bool(true).encode_state();
-    assert!(a.mark(sa.channel(), &t, 0, 0, 0, 1, b"c", &on).is_none());
+    assert!(mark_inert(&a.mark(sa.channel(), &t, 0, 0, 0, 1, b"c", &on)));
     assert_eq!(a.outbox_len(sa.channel()), outbox);
     // An unheld channel is likewise inert.
-    assert!(a.mark(9, &t, 0, 0, 0, 1, b"c", &on).is_none());
+    assert!(mark_inert(&a.mark(9, &t, 0, 0, 0, 1, b"c", &on)));
+}
+
+#[wasm_bindgen_test]
+fn a_client_binds_a_channel_schema_and_drains_repairs() {
+    const BOUNDED: &[u8] = br#"{ "schema": "n", "version": 1, "root": "Doc",
+        "types": { "Doc": { "kind": "map", "children": { "body": "Body" } },
+                   "Body": { "kind": "text", "max": 5 } } }"#;
+    let mut a = wasm_client(1);
+    let sa = a.subscribe(b"room-1");
+    let ch = sa.channel();
+    // A well-formed schema binds to the channel replica; a malformed one or an
+    // unheld channel binds nothing.
+    assert!(a.set_schema(ch, BOUNDED));
+    assert!(!a.set_schema(ch, b"not json"));
+    assert!(!a.set_schema(99, BOUNDED));
+    // Overflowing the bound body needs a repair; the drain reports it once, then
+    // reseeds — a second drain is empty.
+    let t = path(&["body"]);
+    a.text_insert(ch, &t, 0, "hello world");
+    assert_eq!(js_sys::Array::from(&a.take_repairs(ch)).length(), 1);
+    assert_eq!(js_sys::Array::from(&a.take_repairs(ch)).length(), 0);
+    // An unheld channel drains nothing.
+    assert_eq!(js_sys::Array::from(&a.take_repairs(99)).length(), 0);
 }
 
 // --- blobs ---

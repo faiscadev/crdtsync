@@ -8,6 +8,9 @@ export type {
   ChangeEvent,
   ChangeListener,
   DocOptions,
+  RepairEvent,
+  RepairListener,
+  RepairStep,
   UpdateEvent,
   UpdateListener,
 } from "./doc.js";

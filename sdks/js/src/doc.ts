@@ -13,11 +13,12 @@ import { type Backend, localBackend } from "./backend.js";
 import { type Change, remarshalChange } from "./changes.js";
 import { CrdtList, CrdtMap, CrdtText, CrdtXml } from "./handles.js";
 import type { ChangeEvent, ChangeListener, HandleContext } from "./internal.js";
-import { type Key, pathStartsWith } from "./path.js";
+import { type Key, type RepairStep, decodeRepairPath, pathStartsWith } from "./path.js";
 import { WasmDocument } from "./wasm/crdtsync_wasm.js";
 
 export type { Change } from "./changes.js";
 export type { ChangeEvent, ChangeListener } from "./internal.js";
+export type { RepairStep } from "./path.js";
 
 const EMPTY = new Uint8Array();
 
@@ -33,6 +34,18 @@ export interface UpdateEvent {
 
 export type UpdateListener = (event: UpdateEvent) => void;
 
+/** The `onRepaired` signal: locations whose repaired reading changed against the
+ * bound schema after an edit. A path names a *location*, not a value — read the
+ * fresh repaired value at it rather than caching. A repair belongs to a location,
+ * not to whoever's edit surfaced it (local or remote, possibly batched across
+ * several), so the event carries no origin. Empty until a schema is bound. */
+export interface RepairEvent {
+  /** The repaired locations, each a step path of map keys and sequence indices. */
+  readonly paths: RepairStep[][];
+}
+
+export type RepairListener = (event: RepairEvent) => void;
+
 export interface DocOptions {
   /** A fixed 16-byte replica id; a random one is minted when omitted. */
   clientId?: Uint8Array;
@@ -47,6 +60,7 @@ export class Doc {
   private backend!: Backend;
   private wire?: (bytes: Uint8Array) => void;
   private updateListeners!: Set<UpdateListener>;
+  private repairListeners!: Set<RepairListener>;
   private observers!: Set<Observer>;
   private ctx!: HandleContext;
   private transacting = false;
@@ -70,6 +84,7 @@ export class Doc {
     this.backend = backend;
     this.wire = wire;
     this.updateListeners = new Set();
+    this.repairListeners = new Set();
     this.observers = new Set();
     this.ctx = {
       backend,
@@ -104,7 +119,10 @@ export class Doc {
   applyUpdate(ops: Uint8Array): number {
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const applied = this.backend.apply(ops);
-    if (applied > 0) this.dispatch("remote", ops, before);
+    if (applied > 0) {
+      this.dispatch("remote", ops, before);
+      this.emitRepairs();
+    }
     return applied;
   }
 
@@ -113,16 +131,34 @@ export class Doc {
     const before = this.observing() ? this.backend.encodeState() : undefined;
     receive();
     if (before !== undefined) this.dispatch("remote", EMPTY, before);
+    this.emitRepairs();
   }
 
-  /** Subscribe to applied changes to the whole document. */
-  on(event: "update", listener: UpdateListener): void {
-    if (event === "update") this.updateListeners.add(listener);
+  /** Subscribe to applied changes to the whole document (`"update"`), or to the
+   * schema-repair signal (`"repair"`, fires only once a schema is bound). */
+  on(event: "update", listener: UpdateListener): void;
+  on(event: "repair", listener: RepairListener): void;
+  on(event: "update" | "repair", listener: UpdateListener | RepairListener): void {
+    if (event === "update") this.updateListeners.add(listener as UpdateListener);
+    else if (event === "repair") this.repairListeners.add(listener as RepairListener);
   }
 
   /** Unsubscribe a listener registered with `on`. */
-  off(event: "update", listener: UpdateListener): void {
-    if (event === "update") this.updateListeners.delete(listener);
+  off(event: "update", listener: UpdateListener): void;
+  off(event: "repair", listener: RepairListener): void;
+  off(event: "update" | "repair", listener: UpdateListener | RepairListener): void {
+    if (event === "update") this.updateListeners.delete(listener as UpdateListener);
+    else if (event === "repair") this.repairListeners.delete(listener as RepairListener);
+  }
+
+  /** Bind a schema (its JSON, as UTF-8 bytes) to this replica, returning whether
+   * it bound. A bound schema gives named marks their declared formatting flavor —
+   * a boolean, value, or object mark instead of the default object-flavor range
+   * annotation — and turns on the `"repair"` signal: after an edit, the locations
+   * whose repaired reading changed against the schema are delivered to `on("repair")`.
+   * Non-UTF-8 or invalid-schema bytes bind nothing and return `false`. */
+  setSchema(schema: Uint8Array): boolean {
+    return this.backend.setSchema(schema);
   }
 
   /** Serialize the whole replica to a canonical snapshot. */
@@ -149,6 +185,7 @@ export class Doc {
       if (outbound.length > 0) {
         this.wire?.(outbound);
         this.dispatch("local", outbound, before);
+        this.emitRepairs();
       }
     }
   }
@@ -164,6 +201,7 @@ export class Doc {
     if (outbound.length === 0) return;
     this.wire?.(outbound);
     this.dispatch("local", outbound, before);
+    this.emitRepairs();
   }
 
   private mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T {
@@ -176,6 +214,7 @@ export class Doc {
     if (outbound.length > 0) {
       this.wire?.(outbound);
       this.dispatch("local", outbound, before);
+      this.emitRepairs();
     }
     return value;
   }
@@ -188,6 +227,18 @@ export class Doc {
 
   private observing(): boolean {
     return this.updateListeners.size > 0 || this.observers.size > 0;
+  }
+
+  // Drain the schema-repair signal after a state change and deliver it. Only runs
+  // when a `"repair"` listener is attached — the drain reseeds the baseline, so
+  // draining unobserved would lose the signal; an unobserved doc pays nothing (and
+  // `takeRepairs` is empty until a schema is bound).
+  private emitRepairs(): void {
+    if (this.repairListeners.size === 0) return;
+    const raw = this.backend.takeRepairs();
+    if (raw.length === 0) return;
+    const paths = raw.map(decodeRepairPath);
+    for (const listener of [...this.repairListeners]) listener({ paths });
   }
 
   private dispatch(origin: ChangeEvent["origin"], ops: Uint8Array, before?: Uint8Array): void {
