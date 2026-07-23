@@ -6,7 +6,13 @@
 // their ops flow to observers and any bound provider through the context.
 
 import type { ChangeListener, HandleContext } from "./internal.js";
-import { type ScalarValue, decodeValue, encodeValue } from "./marshal.js";
+import {
+  type DiffScalar,
+  type ScalarValue,
+  decodeValue,
+  encodeValue,
+  nativeFromDiffScalar,
+} from "./marshal.js";
 import { type Key, encodePath, keyBytes, keyString } from "./path.js";
 
 /** A reference to out-of-band binary content. `inline` carries the bytes for a
@@ -34,6 +40,29 @@ export type CursorSide = "before" | "after";
 
 function sideCode(side: CursorSide): number {
   return side === "after" ? 1 : 0;
+}
+
+/** An opaque handle to an authored mark, named by `setMarkValue` / `deleteMark`. */
+export type MarkId = Uint8Array & { readonly __mark: unique symbol };
+
+/** A mark covering a character, read from `marksAt`. `value` is a boolean for a
+ * boolean mark, a native scalar for a value mark, or the covering element ids for
+ * an object mark. */
+export interface MarkInfo {
+  readonly name: string;
+  readonly value: boolean | ScalarValue | Uint8Array[];
+}
+
+interface RawMark {
+  name: Uint8Array;
+  kind: "boolean" | "value" | "object";
+  value: boolean | DiffScalar | Uint8Array[];
+}
+
+function markInfo(m: RawMark): MarkInfo {
+  if (m.kind === "boolean") return { name: keyString(m.name), value: m.value as boolean };
+  if (m.kind === "object") return { name: keyString(m.name), value: m.value as Uint8Array[] };
+  return { name: keyString(m.name), value: nativeFromDiffScalar(m.value as DiffScalar) };
 }
 
 /** A live handle to a Map slot, addressed by ergonomic keys. */
@@ -309,6 +338,46 @@ export class CrdtText {
   /** Resolve a captured cursor back to a live codepoint index, or `undefined`. */
   resolve(pos: RelativePosition): number | undefined {
     return this.ctx.backend.resolvePosition(this.self, pos);
+  }
+
+  /** Author a mark named `name` with `value` over `[start, end)`. Returns the
+   * mark's handle, or `undefined` if the author was inert. By default the range
+   * grows with text inserted at its edges (start left-gravity, end right-gravity). */
+  mark(
+    start: number,
+    end: number,
+    name: string,
+    value: ScalarValue,
+    sides: { start?: CursorSide; end?: CursorSide } = {},
+  ): MarkId | undefined {
+    const seq = this.self;
+    const n = keyBytes(name);
+    const v = encodeValue(value);
+    const ss = sideCode(sides.start ?? "before");
+    const es = sideCode(sides.end ?? "after");
+    return this.ctx.mutateReturning((b) => {
+      const { id, ops } = b.mark(seq, start, ss, end, es, n, v);
+      return [id as MarkId | undefined, ops];
+    });
+  }
+
+  /** Change the value of the mark `id`. */
+  setMarkValue(id: MarkId, value: ScalarValue): this {
+    const v = encodeValue(value);
+    this.ctx.mutate((b) => b.markSetValue(id, v));
+    return this;
+  }
+
+  /** Tombstone the mark `id`. */
+  deleteMark(id: MarkId): this {
+    this.ctx.mutate((b) => b.markDelete(id));
+    return this;
+  }
+
+  /** The marks covering the character at `index`. */
+  marksAt(index: number): MarkInfo[] {
+    const raw = this.ctx.backend.marksAt(this.self, index) as RawMark[] | undefined;
+    return (raw ?? []).map(markInfo);
   }
 
   /** Observe changes to this text (local edits and remote updates). Returns an

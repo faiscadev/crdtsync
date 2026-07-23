@@ -12,7 +12,14 @@ export type {
   UpdateListener,
 } from "./doc.js";
 export { CrdtMap, CrdtList, CrdtText, CrdtXml } from "./handles.js";
-export type { BlobRef, CursorSide, RelativePosition, Value } from "./handles.js";
+export type {
+  BlobRef,
+  CursorSide,
+  MarkId,
+  MarkInfo,
+  RelativePosition,
+  Value,
+} from "./handles.js";
 export { uploadBlob } from "./wasm/crdtsync_wasm.js";
 export type { Key } from "./path.js";
 export type { ScalarValue } from "./marshal.js";
