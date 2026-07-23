@@ -9,6 +9,8 @@ const TAG_NULL = 0x00;
 const TAG_BOOL = 0x01;
 const TAG_INT = 0x02;
 const TAG_BYTES = 0x03;
+const TAG_BLOBREF = 0x04;
+const TAG_ELEMENTREF = 0x05;
 
 const INT_MIN = -(2n ** 63n);
 const INT_MAX = 2n ** 63n - 1n;
@@ -61,6 +63,12 @@ export function decodeScalar(bytes: Uint8Array): Scalar {
       const len = view.getUint32(1, true);
       return { type: "bytes", value: bytes.slice(5, 5 + len) };
     }
+    case TAG_BLOBREF:
+    case TAG_ELEMENTREF:
+      // A blob/element ref has no native leaf form here — the ergonomic reads for
+      // these are `getBlob` / a dedicated accessor. Hand back the raw encoding as
+      // opaque bytes so a generic `get` never crashes on such a slot.
+      return { type: "bytes", value: bytes.slice() };
     default:
       throw new Error(`crdtsync: unsupported scalar tag ${tag}`);
   }

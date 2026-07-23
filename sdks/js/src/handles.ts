@@ -9,8 +9,18 @@ import type { ChangeListener, HandleContext } from "./internal.js";
 import { type ScalarValue, decodeValue, encodeValue } from "./marshal.js";
 import { type Key, encodePath, keyBytes, keyString } from "./path.js";
 
-/** A value read from a slot: a marshaled scalar, or a nested container handle. */
-export type Value = ScalarValue | CrdtMap | CrdtList | CrdtText | CrdtXml;
+/** A reference to out-of-band binary content. `inline` carries the bytes for a
+ * small blob that rides in the ref; it is `null` for a store-backed ref fetched
+ * by `id`. */
+export interface BlobRef {
+  readonly id: Uint8Array;
+  readonly mime: string;
+  readonly size: number;
+  readonly inline: Uint8Array | null;
+}
+
+/** A value read from a slot: a marshaled scalar, a blob ref, or a nested handle. */
+export type Value = ScalarValue | BlobRef | CrdtMap | CrdtList | CrdtText | CrdtXml;
 
 /** An opaque, stable position in a sequence — a cursor captured with
  * `relativePosition` and resolved back to a live index with `resolve`. It tracks
@@ -56,11 +66,13 @@ export class CrdtMap {
     return undefined;
   }
 
-  /** Read a slot: a scalar value, a nested container handle, or `undefined`. */
+  /** Read a slot: a scalar value, a blob ref, a nested container handle, or `undefined`. */
   get(key: Key): Value | undefined {
     const slot = this.slot(key);
     const scalar = this.ctx.backend.getScalar(slot);
     if (scalar !== undefined) return decodeValue(scalar);
+    const blob = this.getBlob(key);
+    if (blob !== undefined) return blob;
     const child: readonly Key[] = [...this.path, key];
     switch (this.containerKind(slot)) {
       case "map":
@@ -76,10 +88,14 @@ export class CrdtMap {
     }
   }
 
-  /** Whether the key names a live slot (scalar or container). */
+  /** Whether the key names a live slot (scalar, blob, or container). */
   has(key: Key): boolean {
     const slot = this.slot(key);
-    return this.ctx.backend.getScalar(slot) !== undefined || this.containerKind(slot) !== undefined;
+    return (
+      this.ctx.backend.getScalar(slot) !== undefined ||
+      this.getBlob(key) !== undefined ||
+      this.containerKind(slot) !== undefined
+    );
   }
 
   /** Tombstone the slot at `key`. */
@@ -87,6 +103,36 @@ export class CrdtMap {
     const slot = this.slot(key);
     this.ctx.mutate((w) => w.delete(slot));
     return this;
+  }
+
+  /** Store a small blob inline at `key`, minting its public handle. Returns `false`
+   * when `bytes` exceeds the inline ceiling — upload it out of band with
+   * `uploadBlob` and set the returned handle via `setBlobRef`. */
+  setBlob(key: Key, mime: string, bytes: Uint8Array): boolean {
+    const slot = this.slot(key);
+    let ok = false;
+    this.ctx.mutate((b) => {
+      const ops = b.setBlob(slot, mime, bytes);
+      if (ops === undefined || ops.length === 0) return new Uint8Array();
+      ok = true;
+      return ops;
+    });
+    return ok;
+  }
+
+  /** Set a store-backed blob ref at `key` from a 16-byte `id` handle, `mime`, and
+   * `size` — the content is fetched by id, not carried in the op. */
+  setBlobRef(key: Key, id: Uint8Array, mime: string, size: number): this {
+    const slot = this.slot(key);
+    const sz = BigInt(size);
+    this.ctx.mutate((b) => b.setBlobRef(slot, id, mime, sz));
+    return this;
+  }
+
+  /** Read the blob ref at `key`, or `undefined` when the slot holds no blob. */
+  getBlob(key: Key): BlobRef | undefined {
+    const ref = this.ctx.backend.getBlob(this.slot(key)) as BlobRef | null;
+    return ref ?? undefined;
   }
 
   /** A nested Map handle at `key` (materializes on first nested write). */

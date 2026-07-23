@@ -1228,6 +1228,20 @@ impl WasmClient {
         path::resolve_position(doc, path, &position)
     }
 
+    /// Read the blob ref at a path in `channel`'s room as `{ id, mime, size, inline }`,
+    /// or `null` when the slot holds no blob ref or the channel isn't held.
+    #[wasm_bindgen(js_name = getBlob)]
+    pub fn get_blob(&self, channel: u32, path: &[u8]) -> JsValue {
+        match self
+            .inner
+            .document(Channel(channel))
+            .and_then(|d| path::get_blob(d, path))
+        {
+            Some(blob) => blob_ref_to_js(&blob),
+            None => JsValue::NULL,
+        }
+    }
+
     /// Install an `XmlElement` with `tag` at a path in `channel`'s room. Returns
     /// the Ops frame to send; empty if the channel isn't held.
     #[wasm_bindgen(js_name = xmlElement)]
