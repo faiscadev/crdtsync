@@ -114,6 +114,49 @@ int32_t crdtsync_doc_get_bytes(const CrdtDoc *doc,
                                uintptr_t path_len,
                                CrdtBuf *out);
 
+// Install-or-set a Register holding any scalar at a path, from an encoded
+// [`Scalar`] payload. The ergonomic SDK marshals a native value (int, bool, null,
+// string/bytes) to a `Scalar` and sets it here, so a leaf keeps its type across a
+// round trip rather than collapsing every value to bytes. Returns the ops to
+// broadcast; empty on a bad handle, path, or malformed payload.
+//
+// # Safety
+// `doc` is a live handle; `path`/`path_len` and `scalar`/`scalar_len` each follow
+// [`as_slice`].
+CrdtBuf crdtsync_doc_set_scalar(CrdtDoc *doc,
+                                const uint8_t *path,
+                                uintptr_t path_len,
+                                const uint8_t *scalar,
+                                uintptr_t scalar_len);
+
+// Read the Register at a path as an encoded [`Scalar`], whatever its type, into
+// `out` (a fresh buffer the caller frees). The inverse of
+// [`crdtsync_doc_set_scalar`] — the SDK decodes the payload back to a native
+// value. Returns 1 when the slot holds a register, 0 when absent or another
+// element, -1 on a bad handle.
+//
+// # Safety
+// `doc` is a live handle or null; `path`/`path_len` follow [`as_slice`]; `out`
+// points to a writable `CrdtBuf`.
+int32_t crdtsync_doc_get_scalar(const CrdtDoc *doc,
+                                const uint8_t *path,
+                                uintptr_t path_len,
+                                CrdtBuf *out);
+
+// Read the live slot keys of the Map at a path into `out` (a fresh buffer the
+// caller frees), framed as a `u32` count then each key `u32`-length-prefixed. An
+// empty path names the root map. The ergonomic SDK enumerates a map handle's
+// entries through this. Returns 1 when the path is a live Map (even with no keys),
+// 0 when it is not a Map, -1 on a bad handle.
+//
+// # Safety
+// `doc` is a live handle or null; `path`/`path_len` follow [`as_slice`]; `out`
+// points to a writable `CrdtBuf`.
+int32_t crdtsync_doc_map_keys(const CrdtDoc *doc,
+                              const uint8_t *path,
+                              uintptr_t path_len,
+                              CrdtBuf *out);
+
 // Set an inline blob at a path from `mime` and `bytes`, minting the blob's public
 // handle from system entropy. Writes the ops to broadcast into `out_ops`. Returns
 // 1 when the blob was inlined, 0 when `bytes` exceeds the inline ceiling (nothing

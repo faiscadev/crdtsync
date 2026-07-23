@@ -2244,3 +2244,89 @@ fn actor_key_is_deterministic_and_16_bytes() {
         crdtsync_buf_free(c);
     }
 }
+
+// --- ergonomic-SDK scalar + map-key surface ---
+//
+// The handle-graph SDKs marshal a native value to a `Scalar`, set it as a
+// register keeping its type, read it back, and enumerate a map's live keys.
+
+#[test]
+fn set_scalar_keeps_a_typed_leaf_across_a_round_trip() {
+    unsafe {
+        let c = client(1);
+        let a = crdtsync_doc_new(c.as_ptr());
+        let b = crdtsync_doc_new(client(2).as_ptr());
+        let p = path(&[b"root", b"flag"]);
+
+        // A bool scalar (tag 0x01) — the C ABI has no typed bool setter otherwise.
+        let scalar = Scalar::Bool(true).encode_state();
+        let ops = crdtsync_doc_set_scalar(a, p.as_ptr(), p.len(), scalar.as_ptr(), scalar.len());
+        exchange(b, &ops);
+
+        let mut out = out_buf();
+        let rc = crdtsync_doc_get_scalar(a, p.as_ptr(), p.len(), &mut out);
+        assert_eq!(rc, 1);
+        let got = Scalar::decode_state(std::slice::from_raw_parts(out.ptr, out.len)).unwrap();
+        assert_eq!(got, Scalar::Bool(true));
+
+        // The peer converged to the same typed leaf.
+        let mut out_b = out_buf();
+        assert_eq!(
+            crdtsync_doc_get_scalar(b, p.as_ptr(), p.len(), &mut out_b),
+            1
+        );
+        let got_b = Scalar::decode_state(std::slice::from_raw_parts(out_b.ptr, out_b.len)).unwrap();
+        assert_eq!(got_b, Scalar::Bool(true));
+
+        // A malformed payload authors nothing (empty ops).
+        let bad = crdtsync_doc_set_scalar(a, p.as_ptr(), p.len(), [0xEE].as_ptr(), 1);
+        assert_eq!(bad.len, 0);
+
+        crdtsync_buf_free(ops);
+        crdtsync_buf_free(out);
+        crdtsync_buf_free(out_b);
+        crdtsync_buf_free(bad);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(b);
+    }
+}
+
+#[test]
+fn map_keys_enumerates_live_slots() {
+    unsafe {
+        let c = client(1);
+        let a = crdtsync_doc_new(c.as_ptr());
+        crdtsync_buf_free(register_int(a, &path(&[b"m", b"x"]), 1));
+        crdtsync_buf_free(register_int(a, &path(&[b"m", b"y"]), 2));
+
+        let mp = path(&[b"m"]);
+        let mut out = out_buf();
+        let rc = crdtsync_doc_map_keys(a, mp.as_ptr(), mp.len(), &mut out);
+        assert_eq!(rc, 1, "a live map reports its keys");
+        let raw = std::slice::from_raw_parts(out.ptr, out.len);
+        // u32 count, then each key u32-length-prefixed.
+        let count = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+        assert_eq!(count, 2);
+        let mut keys = Vec::new();
+        let mut i = 4;
+        for _ in 0..count {
+            let len = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            keys.push(raw[i..i + len].to_vec());
+            i += len;
+        }
+        keys.sort();
+        assert_eq!(keys, vec![b"x".to_vec(), b"y".to_vec()]);
+        crdtsync_buf_free(out);
+
+        // A non-map path reports 0 (distinct from an empty map, which reports 1).
+        let leaf = path(&[b"m", b"x"]);
+        let mut out2 = out_buf();
+        assert_eq!(
+            crdtsync_doc_map_keys(a, leaf.as_ptr(), leaf.len(), &mut out2),
+            0
+        );
+
+        crdtsync_doc_free(a);
+    }
+}
