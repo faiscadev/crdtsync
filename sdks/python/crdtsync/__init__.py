@@ -37,6 +37,7 @@ __all__ = [
     "Effect",
     "ErrorCode",
     "Key",
+    "Provider",
     "Redirect",
     "Rejected",
     "RepairEvent",
@@ -2860,3 +2861,98 @@ class Doc:
         event = RepairEvent(paths=paths)
         for listener in list(self._repair_listeners):
             listener(event)
+
+
+
+class Provider:
+    """An ergonomic, offline-first sync binding over a :class:`Doc`'s apply/emit
+    seam — the Python realization of the §SDK-Ergonomic-Surface provider model.
+
+    The Python SDK is embedded/offline-first: unlike the JS provider it owns no
+    socket loop, so the app supplies the transport. Bind a ``Doc`` with a ``send``
+    callback (invoked with each local edit's ops to transmit), and feed a peer's
+    ops to :meth:`receive`. The provider owns the connection state and an offline
+    outbox, so edits made while disconnected queue and flush on reconnect; inbound
+    ops apply and fire the doc's reactivity as ``remote``. A remote apply never
+    re-emits as a local edit, so a pair of linked providers can't loop.
+
+    The fully-networked provider that owns a socket and backs the ``Doc`` with a
+    single wire-client replica (the JS ``connect(url, room)`` model, with awareness
+    and the operator-tier request/reply surface) is a documented follow-on: the
+    Python ``Client`` wire surface does not yet expose the per-channel
+    list/text/scalar/map-key handle ops a single-replica networked handle graph
+    needs. Until then this seam plus the low-level :class:`Client` cover sync.
+    """
+
+    def __init__(self, doc: "Doc", send: "Callable[[bytes], None]", *, connected: bool = False):
+        self.doc = doc
+        self._send = send
+        self._state = "connected" if connected else "disconnected"
+        self._outbox: List[bytes] = []
+        self._state_listeners: List[Callable[[str], None]] = []
+        self._unsub = doc.on_update(self._on_update)
+
+    def _on_update(self, event: "UpdateEvent") -> None:
+        # Only a local edit is transmitted; a remote apply must not echo (or a pair
+        # of linked providers would loop forever).
+        if event.origin != "local":
+            return
+        if self._state == "connected":
+            self._send(event.ops)
+        else:
+            self._outbox.append(event.ops)
+
+    def receive(self, ops: bytes) -> int:
+        """Fold a peer's ops into the bound doc (firing ``remote`` reactivity);
+        returns the count applied."""
+        return self.doc.apply_update(ops)
+
+    @property
+    def state(self) -> str:
+        """The connection state: ``"connected"`` or ``"disconnected"``."""
+        return self._state
+
+    @property
+    def outbox_len(self) -> int:
+        """How many local edits are queued awaiting a reconnect flush."""
+        return len(self._outbox)
+
+    def connect(self) -> None:
+        """Mark the transport connected and flush the offline outbox in order."""
+        self._set_state("connected")
+        pending, self._outbox = self._outbox, []
+        for ops in pending:
+            self._send(ops)
+
+    def disconnect(self) -> None:
+        """Mark the transport disconnected; subsequent local edits queue."""
+        self._set_state("disconnected")
+
+    def on_state(self, callback: "Callable[[str], None]") -> Callable[[], None]:
+        """Observe connection-state changes; returns a function that unsubscribes."""
+        self._state_listeners.append(callback)
+
+        def off() -> None:
+            try:
+                self._state_listeners.remove(callback)
+            except ValueError:
+                pass
+
+        return off
+
+    def close(self) -> None:
+        """Unbind from the doc; local edits stop being forwarded/queued."""
+        self._unsub()
+
+    def __enter__(self) -> "Provider":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _set_state(self, state: str) -> None:
+        if state == self._state:
+            return
+        self._state = state
+        for listener in list(self._state_listeners):
+            listener(state)
