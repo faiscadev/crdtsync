@@ -14,6 +14,8 @@ export interface Backend {
   listGet(path: Uint8Array, index: number): Uint8Array | undefined;
   textLen(path: Uint8Array): number | undefined;
   textGet(path: Uint8Array): string | undefined;
+  relativePosition(path: Uint8Array, index: number, side: number): Uint8Array | undefined;
+  resolvePosition(path: Uint8Array, pos: Uint8Array): number | undefined;
   encodeState(): Uint8Array;
 
   setScalar(path: Uint8Array, scalar: Uint8Array): Uint8Array;
@@ -22,6 +24,11 @@ export interface Backend {
   listDelete(path: Uint8Array, index: number): Uint8Array;
   textInsert(path: Uint8Array, index: number, s: string): Uint8Array;
   textDelete(path: Uint8Array, index: number, count: number): Uint8Array;
+
+  /** Begin an atomic group; edits accumulate until `commitAtomic`. */
+  beginAtomic(): void;
+  /** Commit the atomic group, returning its combined ops/frame. */
+  commitAtomic(): Uint8Array;
 
   /** Fold a peer's ops in (local only); a client backend syncs through its provider. */
   apply(ops: Uint8Array): number;
@@ -58,6 +65,12 @@ export class ClientBackend implements Backend {
   textGet(path: Uint8Array): string | undefined {
     return this.client.textGet(this.channel, path);
   }
+  relativePosition(path: Uint8Array, index: number, side: number): Uint8Array | undefined {
+    return this.client.relativePosition(this.channel, path, index, side);
+  }
+  resolvePosition(path: Uint8Array, pos: Uint8Array): number | undefined {
+    return this.client.resolvePosition(this.channel, path, pos);
+  }
   encodeState(): Uint8Array {
     return this.client.channelState(this.channel) ?? new Uint8Array();
   }
@@ -79,6 +92,13 @@ export class ClientBackend implements Backend {
   }
   textDelete(path: Uint8Array, index: number, count: number): Uint8Array {
     return this.client.textDelete(this.channel, path, index, count);
+  }
+
+  beginAtomic(): void {
+    this.client.beginAtomic(this.channel);
+  }
+  commitAtomic(): Uint8Array {
+    return this.client.commitAtomic(this.channel);
   }
 
   apply(_ops: Uint8Array): number {

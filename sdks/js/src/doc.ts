@@ -49,6 +49,7 @@ export class Doc {
   private updateListeners!: Set<UpdateListener>;
   private observers!: Set<Observer>;
   private ctx!: HandleContext;
+  private transacting = false;
 
   constructor(options: DocOptions = {}) {
     const clientId = options.clientId ?? randomClientId();
@@ -123,7 +124,35 @@ export class Doc {
     return this.backend.encodeState();
   }
 
+  /** Run `fn`'s edits as one atomic group — they apply together on every replica
+   * and ride the wire as a single batch, firing one update. Nested calls flatten
+   * into the outermost transaction. */
+  transact(fn: () => void): void {
+    if (this.transacting) {
+      fn();
+      return;
+    }
+    const before = this.observing() ? this.backend.encodeState() : undefined;
+    this.transacting = true;
+    this.backend.beginAtomic();
+    try {
+      fn();
+    } finally {
+      this.transacting = false;
+      const outbound = this.backend.commitAtomic();
+      if (outbound.length > 0) {
+        this.wire?.(outbound);
+        this.dispatch("local", outbound, before);
+      }
+    }
+  }
+
   private mutate(run: (backend: Backend) => Uint8Array): void {
+    // Inside a transaction the edit just accumulates; the commit sends + dispatches.
+    if (this.transacting) {
+      run(this.backend);
+      return;
+    }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const outbound = run(this.backend);
     if (outbound.length === 0) return;
