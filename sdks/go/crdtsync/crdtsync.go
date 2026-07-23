@@ -173,6 +173,56 @@ func (d *Document) GetBytes(path [][]byte) ([]byte, bool) {
 	return takeBuf(out), true
 }
 
+// SetScalar sets an encoded Scalar at path, whatever its tagged type. The
+// ergonomic handle layer marshals a native value (int, bool, null, string,
+// bytes) to a Scalar and sets it here, so a leaf keeps its type across a round
+// trip rather than collapsing to bytes. Returns the ops to broadcast.
+func (d *Document) SetScalar(path [][]byte, scalar []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	sp, sl := bytesArg(scalar)
+	return takeBuf(C.crdtsync_doc_set_scalar(d.h, pp, pl, sp, sl))
+}
+
+// GetScalar reads the Register at path as an encoded Scalar, whatever its type —
+// the inverse of SetScalar. The bool is false when the slot is absent or holds
+// another element.
+func (d *Document) GetScalar(path [][]byte) ([]byte, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_doc_get_scalar(d.h, pp, pl, &out) != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// MapKeys reads the live slot keys of the Map at path, framed as a u32 count then
+// each key u32-length-prefixed. An empty path names the root map. The bool is
+// false when the path is not a live Map (a map with no keys returns an empty
+// slice and true).
+func (d *Document) MapKeys(path [][]byte) ([][]byte, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_doc_map_keys(d.h, pp, pl, &out) != 1 {
+		return nil, false
+	}
+	return decodeKeyList(takeBuf(out)), true
+}
+
+// decodeKeyList reads a map-keys buffer: a u32 count then each key a u32-length
+// prefix and its bytes.
+func decodeKeyList(data []byte) [][]byte {
+	r := &changeReader{d: data}
+	n := int(r.u32())
+	keys := make([][]byte, 0, n)
+	for k := 0; k < n && r.err == nil; k++ {
+		keys = append(keys, r.blob())
+	}
+	if r.err != nil {
+		return nil
+	}
+	return keys
+}
+
 // --- blobs ---
 
 // BlobRef is a reference to out-of-band binary content read back by GetBlob. ID
