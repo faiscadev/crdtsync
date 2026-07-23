@@ -20,8 +20,10 @@ export type {
   RelativePosition,
   Value,
 } from "./handles.js";
-export { uploadBlob } from "./wasm/crdtsync_wasm.js";
+export { actorKey, uploadBlob } from "./wasm/crdtsync_wasm.js";
 export type { Key } from "./path.js";
 export type { ScalarValue } from "./marshal.js";
 export { connect, Provider } from "./provider.js";
 export type { ConnectionState, ProviderOptions, StateListener } from "./provider.js";
+export { Capability, DiffKind, Effect, SubjectKind } from "./operator.js";
+export type { AclGrant, AclSubject, Branch } from "./operator.js";

@@ -43,7 +43,12 @@ describe("marks", () => {
     expect(id).toBeDefined();
 
     // Before the fix, WasmDocument.mark discarded the ops, so nothing reached b.
-    expect(b.getText("t").marksAt(1).map((m) => m.name)).toContain("comment");
+    expect(
+      b
+        .getText("t")
+        .marksAt(1)
+        .map((m) => m.name),
+    ).toContain("comment");
   });
 
   it("reports a mark change through reactivity", () => {

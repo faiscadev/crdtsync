@@ -7,11 +7,30 @@
 // converge once the link returns.
 
 import { ClientBackend } from "./backend.js";
+import { type Change, remarshalChange } from "./changes.js";
 import { Doc } from "./doc.js";
-import { keyBytes } from "./path.js";
-import { WasmClient, protocolHeader } from "./wasm/crdtsync_wasm.js";
+import { type AclGrant, type Branch, type DiffKind, resolveGrant } from "./operator.js";
+import { type Key, keyBytes, keyString } from "./path.js";
+import { WasmClient, actorKey, protocolHeader } from "./wasm/crdtsync_wasm.js";
 
 export type ConnectionState = "connecting" | "connected" | "disconnected";
+
+// One reply-frame notification `WasmClient.takeReplies` drains, correlating an
+// awaited operator request to the reply that satisfies it.
+type ReplyTag =
+  | { kind: "versions"; channel: number }
+  | { kind: "versionState"; channel: number; name: Uint8Array }
+  | { kind: "branches"; room: Uint8Array }
+  | { kind: "diff"; room: Uint8Array }
+  | { kind: "clone"; dst: Uint8Array };
+
+// An operator request awaiting its reply. `matches` tests whether a drained reply
+// tag satisfies it; `settle` reads the result and resolves; `fail` rejects.
+interface PendingRequest {
+  matches(tag: ReplyTag): boolean;
+  settle(): void;
+  fail(err: Error): void;
+}
 
 // The minimal WebSocket surface the provider drives — the browser `WebSocket`
 // and the Node `ws` package both satisfy it.
@@ -42,6 +61,9 @@ export interface ProviderOptions {
   maxReconnectDelayMs?: number;
   /** How long the first connection may take before `whenConnected` rejects (default 15000). */
   connectTimeoutMs?: number;
+  /** How long an operator request (version/branch/diff/clone) waits for its reply
+   * before it rejects (default 15000). */
+  requestTimeoutMs?: number;
   /** A server Error mid-session — the code is the server `ErrorCode` (6 is UpdateRequired). */
   onError?: (code: number) => void;
   /** Op batches the server refused since the last frame (`{ channel, reason, ops }`). */
@@ -68,8 +90,14 @@ export class Provider {
 
   private readonly client: WasmClient;
   private readonly channel: number;
+  private readonly room: Uint8Array;
   private readonly subscribeFrame: Uint8Array;
   private readonly credential: Uint8Array;
+  private readonly requestTimeoutMs: number;
+  // Operator requests awaiting a reply, oldest first. The server answers one
+  // socket's requests in order, so the oldest pending is the one an out-of-band
+  // error or a socket close belongs to.
+  private readonly pending: PendingRequest[] = [];
   private readonly WebSocketImpl: WebSocketCtor;
   private readonly url: string;
   private readonly reconnectEnabled: boolean;
@@ -102,6 +130,7 @@ export class Provider {
     }
     this.WebSocketImpl = impl;
     this.url = url;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
     this.reconnectEnabled = options.reconnect ?? true;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 10_000;
     this.onError = options.onError;
@@ -116,7 +145,8 @@ export class Provider {
 
     const clientId = options.clientId ?? randomClientId();
     this.client = new WasmClient(clientId);
-    const sub = this.client.subscribe(keyBytes(room));
+    this.room = keyBytes(room);
+    const sub = this.client.subscribe(this.room);
     this.channel = sub.channel;
     this.subscribeFrame = sub.frame;
     this.doc = Doc.networked(new ClientBackend(this.client, this.channel), (frame) =>
@@ -157,6 +187,241 @@ export class Provider {
     if (frame) this.sendIfOpen(frame);
   }
 
+  // ── Operator-tier surface: versions, branches, ACL, diff, clone ──────────────
+  // Each of these (bar ACL, which rides the op path) is an async request/reply:
+  // frame a request, send it, await the matching reply, read the result back. The
+  // room this provider is subscribed to is the implicit target.
+
+  /** The room's saved version names, in order. */
+  listVersions(): Promise<string[]> {
+    return this.request(
+      this.client.listVersions(this.channel),
+      (t) => t.kind === "versions" && t.channel === this.channel,
+      () => this.readVersions(),
+    );
+  }
+
+  /** Capture the room's current state as version `name`; resolves to the room's
+   * version names after the capture. */
+  createVersion(name: Key): Promise<string[]> {
+    return this.request(
+      this.client.createVersion(this.channel, keyBytes(name)),
+      (t) => t.kind === "versions" && t.channel === this.channel,
+      () => this.readVersions(),
+    );
+  }
+
+  /** Rename version `from` to `to`; resolves to the room's version names after. */
+  renameVersion(from: Key, to: Key): Promise<string[]> {
+    return this.request(
+      this.client.renameVersion(this.channel, keyBytes(from), keyBytes(to)),
+      (t) => t.kind === "versions" && t.channel === this.channel,
+      () => this.readVersions(),
+    );
+  }
+
+  /** Delete version `name`; resolves to the room's version names after. */
+  deleteVersion(name: Key): Promise<string[]> {
+    return this.request(
+      this.client.deleteVersion(this.channel, keyBytes(name)),
+      (t) => t.kind === "versions" && t.channel === this.channel,
+      () => this.readVersions(),
+    );
+  }
+
+  /** The captured snapshot of version `name` (a canonical state buffer). Rejects
+   * if the room has no such version. */
+  fetchVersion(name: Key): Promise<Uint8Array> {
+    const nameBytes = keyBytes(name);
+    return this.request(
+      this.client.fetchVersion(this.channel, nameBytes),
+      // A hit answers with the state; a miss with the version list — accept both,
+      // then a missing cached state is the not-found error.
+      (t) =>
+        (t.kind === "versionState" &&
+          t.channel === this.channel &&
+          bytesEqual(t.name, nameBytes)) ||
+        (t.kind === "versions" && t.channel === this.channel),
+      () => {
+        const state = this.client.versionState(this.channel, nameBytes);
+        if (!state) throw new Error(`crdtsync: no version named ${describe(name)}`);
+        return state;
+      },
+    );
+  }
+
+  /** The room's branches, in order. */
+  listBranches(): Promise<Branch[]> {
+    return this.request(this.client.listBranches(this.room), this.branchReply, () =>
+      this.readBranches(),
+    );
+  }
+
+  /** Fork branch `name` off branch `from`'s HEAD; resolves to the room's branches. */
+  forkBranch(name: Key, from: Key): Promise<Branch[]> {
+    return this.request(
+      this.client.forkBranch(this.room, keyBytes(name), keyBytes(from)),
+      this.branchReply,
+      () => this.readBranches(),
+    );
+  }
+
+  /** Fork branch `name` off the snapshot of `version`; resolves to the branches. */
+  forkBranchFromVersion(name: Key, version: Key): Promise<Branch[]> {
+    return this.request(
+      this.client.forkBranchFromVersion(this.room, keyBytes(name), keyBytes(version)),
+      this.branchReply,
+      () => this.readBranches(),
+    );
+  }
+
+  /** Restore the room to `version` as a fresh branch `name`; resolves to the
+   * branches. */
+  restoreBranch(name: Key, version: Key): Promise<Branch[]> {
+    return this.request(
+      this.client.restoreBranch(this.room, keyBytes(name), keyBytes(version)),
+      this.branchReply,
+      () => this.readBranches(),
+    );
+  }
+
+  /** Publish the room's active editor branch onto the read-only `published`
+   * branch; resolves to the branches. */
+  publishBranch(published: Key): Promise<Branch[]> {
+    return this.request(
+      this.client.publishBranch(this.room, keyBytes(published)),
+      this.branchReply,
+      () => this.readBranches(),
+    );
+  }
+
+  /** Delete branch `name` (the default `main` is never deletable); resolves to
+   * the branches. */
+  deleteBranch(name: Key): Promise<Branch[]> {
+    return this.request(this.client.deleteBranch(this.room, keyBytes(name)), this.branchReply, () =>
+      this.readBranches(),
+    );
+  }
+
+  /** The structural diff turning state `a` into state `b`, over the room's saved
+   * versions (`DiffKind.Versions`) or its branches' HEADs (`DiffKind.Branches`). */
+  diff(kind: DiffKind, a: Key, b: Key): Promise<Change[]> {
+    return this.request(
+      this.client.diffQuery(this.room, kind, keyBytes(a), keyBytes(b)),
+      (t) => t.kind === "diff" && bytesEqual(t.room, this.room),
+      () => this.readDiff(),
+    );
+  }
+
+  /** Duplicate the room's live state into a fresh room `dst`. Resolves to whether
+   * `dst` was created (`false` when it already existed). */
+  cloneRoom(dst: Key): Promise<boolean> {
+    const dstBytes = keyBytes(dst);
+    return this.request(
+      this.client.cloneRoom(this.room, dstBytes),
+      (t) => t.kind === "clone" && bytesEqual(t.dst, dstBytes),
+      () => this.client.cloneResult(dstBytes) === true,
+    );
+  }
+
+  /** Author a doc-ACL grant over the room, routed through the op path (acked and
+   * resent like an edit). Returns the tuple id `revokeAcl` names it by. */
+  aclGrant(grant: AclGrant): Uint8Array {
+    const g = resolveGrant(grant);
+    // The grantor is a 16-byte doc-ACL actor key: default to this connection's
+    // authenticated actor, keyed the same way a matched `Actor` subject is.
+    const actor = this.client.actor();
+    const grantor = grant.grantor ?? (actor ? actorKey(actor) : undefined);
+    if (!grantor) {
+      throw new Error("crdtsync: no authenticated actor to credit the grant; pass grant.grantor");
+    }
+    const result = this.client.aclGrant(
+      this.channel,
+      g.subjectKind,
+      g.subject,
+      g.grantKind,
+      g.capability,
+      g.role,
+      g.effect,
+      g.path,
+      grantor,
+    ) as { id: Uint8Array; frame: Uint8Array } | undefined;
+    if (!result) throw new Error("crdtsync: the room's channel is not held");
+    this.sendIfOpen(result.frame);
+    return result.id;
+  }
+
+  /** Revoke a doc-ACL tuple by the id `aclGrant` returned, routed through the op
+   * path. */
+  aclRevoke(tupleId: Uint8Array): void {
+    this.sendIfOpen(this.client.aclRevoke(this.channel, tupleId));
+  }
+
+  private readonly branchReply = (t: ReplyTag): boolean =>
+    t.kind === "branches" && bytesEqual(t.room, this.room);
+
+  private readVersions(): string[] {
+    return this.client.versions(this.channel).map(keyString);
+  }
+
+  private readBranches(): Branch[] {
+    const raw = this.client.branches(this.room) as RawBranch[];
+    return raw.map((b) => ({
+      name: keyString(b.name),
+      forkPoint: b.forkPoint,
+      head: b.head,
+      published: b.published,
+    }));
+  }
+
+  private readDiff(): Change[] {
+    const raw = this.client.diff(this.room) as unknown[] | null;
+    if (!raw) return [];
+    return raw.map((r) => remarshalChange(r as never).change);
+  }
+
+  // Frame + send an operator request and await the reply that satisfies `matches`,
+  // returning what `read` extracts at the moment the reply folds. Rejects if the
+  // channel isn't held, the provider isn't connected, or the reply never comes.
+  private request<T>(
+    frame: Uint8Array | undefined,
+    matches: (tag: ReplyTag) => boolean,
+    read: () => T,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      if (frame === undefined) {
+        reject(new Error("crdtsync: the room's channel is not held"));
+        return;
+      }
+      if (this.phase !== "ready" || this.ws?.readyState !== WS_OPEN) {
+        reject(new Error("crdtsync: not connected"));
+        return;
+      }
+      const timer = setTimeout(() => {
+        const i = this.pending.indexOf(entry);
+        if (i >= 0) this.pending.splice(i, 1);
+        reject(new Error("crdtsync: operator request timed out"));
+      }, this.requestTimeoutMs);
+      const entry: PendingRequest = {
+        matches,
+        settle: () => {
+          clearTimeout(timer);
+          try {
+            resolve(read());
+          } catch (e) {
+            reject(e as Error);
+          }
+        },
+        fail: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      };
+      this.pending.push(entry);
+      this.sendIfOpen(frame);
+    });
+  }
+
   /** Close the connection and stop reconnecting. */
   close(): void {
     if (this.closed) return;
@@ -164,6 +429,7 @@ export class Provider {
     clearTimeout(this.connectTimer);
     this.ws?.close();
     this.setState("disconnected");
+    this.failAllPending(new Error("crdtsync: closed"));
     this.reject(new Error("crdtsync: closed before it synced"));
   }
 
@@ -212,7 +478,22 @@ export class Provider {
     this.doc.applyRemote(() => {
       err = this.receive(data);
     });
-    if (err !== null) this.handleServerError(err);
+    if (err !== null) {
+      // A version/branch/diff/clone request the server refused answers with an
+      // Error, not a reply, so it rejects the request awaiting it. The room's
+      // leader answers that room's requests over this one socket in order, so the
+      // refused request is the oldest still pending. The only mid-session Error
+      // that is *not* a request refusal is UpdateRequired (6), a session-level
+      // push — it routes to onError instead (edits refuse via onOpsRejected, never
+      // an Error frame; handshake errors land before any request can be pending).
+      if (err !== 6 && this.pending.length > 0) {
+        this.pending.shift()?.fail(new Error(`crdtsync: server refused the request (code ${err})`));
+      } else {
+        this.handleServerError(err);
+      }
+    } else {
+      this.drainReplies();
+    }
     this.drainSignals();
 
     // The subscribe reply (a catch-up Ops/Snapshot) advances last_seen_seq; a bare
@@ -245,7 +526,32 @@ export class Provider {
     const rejected = this.client.takeRejected() as unknown[];
     if (Array.isArray(rejected) && rejected.length > 0) this.onOpsRejected?.(rejected);
     const redirects = this.client.takeRedirects() as unknown[];
-    if (Array.isArray(redirects) && redirects.length > 0) this.onRedirect?.(redirects);
+    if (Array.isArray(redirects) && redirects.length > 0) {
+      // A version/branch mutation routed to a non-leader is redirected, not
+      // answered — reject the request awaiting it so it doesn't hang to timeout.
+      if (this.pending.length > 0) {
+        this.pending.shift()?.fail(new Error("crdtsync: request redirected to the room's leader"));
+      }
+      this.onRedirect?.(redirects);
+    }
+  }
+
+  // Match each drained reply to the oldest pending request that accepts it, then
+  // settle that request by reading the reply's result.
+  private drainReplies(): void {
+    const replies = this.client.takeReplies() as ReplyTag[];
+    for (const tag of replies) {
+      const index = this.pending.findIndex((p) => p.matches(tag));
+      if (index >= 0) {
+        const [entry] = this.pending.splice(index, 1);
+        entry.settle();
+      }
+    }
+  }
+
+  private failAllPending(err: Error): void {
+    const entries = this.pending.splice(0);
+    for (const entry of entries) entry.fail(err);
   }
 
   private markConnected(): void {
@@ -278,6 +584,9 @@ export class Provider {
 
   private onClose(): void {
     if (this.closed) return;
+    // A dropped socket abandons any request awaiting a reply — it was never
+    // outboxed, so the next socket won't answer it.
+    this.failAllPending(new Error("crdtsync: connection lost before the reply arrived"));
     this.setState("disconnected");
     if (!this.reconnectEnabled) {
       if (!this.connectedOnce) this.reject(new Error("crdtsync: closed before it synced"));
@@ -312,6 +621,27 @@ export class Provider {
     this.stateValue = state;
     for (const listener of [...this.stateListeners]) listener(state);
   }
+}
+
+// The branch record shape `WasmClient.branches` yields, before ergonomic naming.
+interface RawBranch {
+  name: Uint8Array;
+  forkPoint: number;
+  head: number;
+  published: boolean;
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/** Render a key for an error message — a string as itself, bytes as their length. */
+function describe(key: Key): string {
+  return typeof key === "string" ? `"${key}"` : `${key.length} bytes`;
 }
 
 function toBytes(data: unknown): Uint8Array {

@@ -16,8 +16,8 @@ use crdtsync_core::op::Op;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_op, encode_ops, path, AclEffect, AclGrant,
     AclSubject, BlobRef, BranchInfo, Capability, Channel, ClientError, ClientId, ClientSession,
-    DiffKind, Document, ErrorCode as CoreErrorCode, Host, Redirect, Rejected, RelativePosition,
-    Scalar, UndoManager,
+    DiffKind, Document, ErrorCode as CoreErrorCode, Host, Message, Redirect, Rejected,
+    RelativePosition, Scalar, UndoManager,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -840,6 +840,68 @@ impl WasmSubscription {
 #[wasm_bindgen]
 pub struct WasmClient {
     inner: ClientSession,
+    // Reply-frame notifications folded by `receive` since the last `takeReplies`
+    // drain — the request/reply correlation seam. A version/branch/diff/clone
+    // request folds its reply's authoritative view into `inner`; this records
+    // *that* it landed (and its key) so an async caller awaiting the matching
+    // reply resolves precisely, told apart from an ordinary sync frame.
+    replies: Vec<ReplyTag>,
+}
+
+/// A reply frame `receive` folded, tagged with the request category and the key
+/// (channel or room, plus a version name) an awaiting caller correlates against.
+enum ReplyTag {
+    Versions { channel: u32 },
+    VersionState { channel: u32, name: Vec<u8> },
+    Branches { room: Vec<u8> },
+    Diff { room: Vec<u8> },
+    Clone { dst: Vec<u8> },
+}
+
+impl ReplyTag {
+    /// The tag a just-decoded reply message carries, or `None` for a frame that is
+    /// not a request reply (an Ops/Snapshot/awareness/ack sync frame).
+    fn of(message: &Message) -> Option<ReplyTag> {
+        Some(match message {
+            Message::Versions { channel, .. } => ReplyTag::Versions { channel: channel.0 },
+            Message::VersionState { channel, name, .. } => ReplyTag::VersionState {
+                channel: channel.0,
+                name: name.clone(),
+            },
+            Message::Branches { room, .. } => ReplyTag::Branches { room: room.clone() },
+            Message::DiffResult { room, .. } => ReplyTag::Diff { room: room.clone() },
+            Message::CloneRoomResult { dst, .. } => ReplyTag::Clone { dst: dst.clone() },
+            _ => return None,
+        })
+    }
+
+    fn to_js(&self) -> JsValue {
+        let obj = js_sys::Object::new();
+        match self {
+            ReplyTag::Versions { channel } => {
+                set(&obj, "kind", &JsValue::from_str("versions"));
+                set(&obj, "channel", &JsValue::from_f64(*channel as f64));
+            }
+            ReplyTag::VersionState { channel, name } => {
+                set(&obj, "kind", &JsValue::from_str("versionState"));
+                set(&obj, "channel", &JsValue::from_f64(*channel as f64));
+                set(&obj, "name", &js_sys::Uint8Array::from(name.as_slice()).into());
+            }
+            ReplyTag::Branches { room } => {
+                set(&obj, "kind", &JsValue::from_str("branches"));
+                set(&obj, "room", &js_sys::Uint8Array::from(room.as_slice()).into());
+            }
+            ReplyTag::Diff { room } => {
+                set(&obj, "kind", &JsValue::from_str("diff"));
+                set(&obj, "room", &js_sys::Uint8Array::from(room.as_slice()).into());
+            }
+            ReplyTag::Clone { dst } => {
+                set(&obj, "kind", &JsValue::from_str("clone"));
+                set(&obj, "dst", &js_sys::Uint8Array::from(dst.as_slice()).into());
+            }
+        }
+        obj.into()
+    }
 }
 
 #[wasm_bindgen]
@@ -852,6 +914,7 @@ impl WasmClient {
             .map_err(|_| JsError::new("client id must be 16 bytes"))?;
         Ok(WasmClient {
             inner: ClientSession::new(ClientId::from_bytes(bytes)),
+            replies: Vec::new(),
         })
     }
 
@@ -965,13 +1028,42 @@ impl WasmClient {
         let Ok(message) = decode_message(msg) else {
             return Ok(false);
         };
+        // Read the reply tag before the message is consumed, so a caller awaiting
+        // a version/branch/diff/clone reply can correlate it once it folds.
+        let tag = ReplyTag::of(&message);
         match self.inner.receive(message) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                if let Some(tag) = tag {
+                    self.replies.push(tag);
+                }
+                Ok(true)
+            }
             Err(ClientError::Server { code, .. }) => {
                 Err(JsValue::from(ErrorCode::from(code) as i32))
             }
             Err(_) => Ok(false),
         }
+    }
+
+    /// Drain the request-reply notifications folded since the last call — the
+    /// version/branch/diff/clone request/reply correlation seam, mirroring
+    /// [`takeRejected`](Self::take_rejected) — as an array of tagged objects:
+    /// `{ kind: "versions", channel }`, `{ kind: "versionState", channel, name }`,
+    /// `{ kind: "branches", room }`, `{ kind: "diff", room }`, or
+    /// `{ kind: "clone", dst }` (`name`/`room`/`dst` a `Uint8Array`). The result
+    /// itself is read with the matching reader (`versions`/`versionState`/
+    /// `branches`/`diff`/`cloneResult`). Empty when none arrived; draining, so a
+    /// second call is empty.
+    #[wasm_bindgen(js_name = takeReplies)]
+    pub fn take_replies(&mut self) -> JsValue {
+        let out = self
+            .replies
+            .iter()
+            .map(ReplyTag::to_js)
+            .collect::<js_sys::Array>()
+            .into();
+        self.replies.clear();
+        out
     }
 
     /// Drain the op batches the server refused since the last call — the
