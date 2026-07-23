@@ -35,16 +35,16 @@ export class CrdtMap {
 
   /** The container kind a slot holds, or `undefined` if it holds no container. */
   private containerKind(slot: Uint8Array): "map" | "list" | "text" | undefined {
-    if (this.ctx.wasm.mapKeys(slot) !== undefined) return "map";
-    if (this.ctx.wasm.listLen(slot) !== undefined) return "list";
-    if (this.ctx.wasm.textLen(slot) !== undefined) return "text";
+    if (this.ctx.backend.mapKeys(slot) !== undefined) return "map";
+    if (this.ctx.backend.listLen(slot) !== undefined) return "list";
+    if (this.ctx.backend.textLen(slot) !== undefined) return "text";
     return undefined;
   }
 
   /** Read a slot: a scalar value, a nested container handle, or `undefined`. */
   get(key: Key): Value | undefined {
     const slot = this.slot(key);
-    const scalar = this.ctx.wasm.getScalar(slot);
+    const scalar = this.ctx.backend.getScalar(slot);
     if (scalar !== undefined) return decodeValue(scalar);
     const child: readonly Key[] = [...this.path, key];
     switch (this.containerKind(slot)) {
@@ -62,7 +62,7 @@ export class CrdtMap {
   /** Whether the key names a live slot (scalar or container). */
   has(key: Key): boolean {
     const slot = this.slot(key);
-    return this.ctx.wasm.getScalar(slot) !== undefined || this.containerKind(slot) !== undefined;
+    return this.ctx.backend.getScalar(slot) !== undefined || this.containerKind(slot) !== undefined;
   }
 
   /** Tombstone the slot at `key`. */
@@ -89,7 +89,7 @@ export class CrdtMap {
 
   /** The raw live slot keys, as the core stores them. */
   private rawKeys(): Uint8Array[] {
-    return this.ctx.wasm.mapKeys(encodePath(this.path)) ?? [];
+    return this.ctx.backend.mapKeys(encodePath(this.path)) ?? [];
   }
 
   /** The live slot keys, as strings (utf-8). */
@@ -156,13 +156,13 @@ export class CrdtList {
 
   /** Read the scalar item at a live index, or `undefined`. */
   get(index: number): ScalarValue | undefined {
-    const item = this.ctx.wasm.listGet(this.self, index);
+    const item = this.ctx.backend.listGet(this.self, index);
     return item === undefined ? undefined : decodeValue(item);
   }
 
   /** The number of live items. */
   get length(): number {
-    return this.ctx.wasm.listLen(this.self) ?? 0;
+    return this.ctx.backend.listLen(this.self) ?? 0;
   }
 
   /** A plain array snapshot of the live items. */
@@ -210,12 +210,12 @@ export class CrdtText {
 
   /** The current text. */
   toString(): string {
-    return this.ctx.wasm.textGet(this.self) ?? "";
+    return this.ctx.backend.textGet(this.self) ?? "";
   }
 
   /** The codepoint length. */
   get length(): number {
-    return this.ctx.wasm.textLen(this.self) ?? 0;
+    return this.ctx.backend.textLen(this.self) ?? 0;
   }
 
   /** Observe changes to this text (local edits and remote updates). Returns an

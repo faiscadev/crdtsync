@@ -115,6 +115,9 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      # The provider integration test spins up the real server binary.
+      - name: Build the server binary
+        run: cargo build -p crdtsync-server
       - name: Install deps
         run: npm ci
         working-directory: sdks/js

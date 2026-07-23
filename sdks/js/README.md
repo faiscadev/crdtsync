@@ -26,6 +26,26 @@ const off = root.observe(({ origin, changes }) => {
 off(); // unsubscribe
 ```
 
+## Sync
+
+Bind a document to a crdtsync server over a WebSocket with `connect`:
+
+```ts
+import { connect } from "@crdtsync/client";
+
+const provider = await connect("ws://localhost:9000", "my-room");
+provider.doc.getMap("root").set("title", "shared"); // sent to peers
+provider.onState((s) => console.log(s)); // "connecting" | "connected" | "disconnected"
+provider.setAwareness("cursor", "42"); // ephemeral presence
+```
+
+The provider owns the WebSocket + wire session and keeps `provider.doc` in sync:
+local edits are framed and sent, inbound updates fold in and fire reactivity, and
+a dropped socket reconnects — resuming the channel and resending unacked edits, so
+edits made offline converge once the link returns. In a browser the global
+`WebSocket` is used; on Node before v22 pass one: `connect(url, room, { WebSocket })`
+from the `ws` package.
+
 ## Model
 
 - **Handles.** `Doc.getMap/getList/getText(key)` return live `CrdtMap` / `CrdtList` /
