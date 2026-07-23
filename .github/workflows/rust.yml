@@ -101,3 +101,32 @@ jobs:
       - name: Test
         run: wasm-pack test --node
         working-directory: crates/wasm
+
+  js-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # The ergonomic package wraps the wasm bindings; build them with wasm-pack,
+      # then lint, typecheck, and run the package's tests.
+      - name: Install the wasm target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Install deps
+        run: npm ci
+        working-directory: sdks/js
+      - name: Build the wasm bindings
+        run: npm run build:wasm
+        working-directory: sdks/js
+      - name: Lint + format check
+        run: npm run check
+        working-directory: sdks/js
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: sdks/js
+      - name: Test
+        run: npm test
+        working-directory: sdks/js

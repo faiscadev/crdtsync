@@ -1,0 +1,30 @@
+{
+  "name": "@crdtsync/client",
+  "version": "0.0.0",
+  "description": "Ergonomic JavaScript/TypeScript SDK for crdtsync — a handle-graph over the CRDT core.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": ["./dist/wasm/*.js"],
+  "scripts": {
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "build": "tsc && cp -r src/wasm dist/wasm",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "biome check src test",
+    "format": "biome format --write src test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "typescript": "^5.6.3",
+    "vite-plugin-top-level-await": "^1.4.4",
+    "vite-plugin-wasm": "^3.3.0",
+    "vitest": "^2.1.8"
+  }
+}
