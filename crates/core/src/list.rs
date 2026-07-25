@@ -19,19 +19,14 @@ use crate::stamp::Stamp;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// The most tombstones one encoded run record may reconstruct. A run longer
-/// than this is split into chained records on encode, so this only rejects a
-/// crafted record — bounding the decompression a single record can drive.
+/// The most ids one encoded run record may cover. The encoder splits a longer
+/// run into chained records, so a record above this is malformed. It bounds the
+/// record shape, not memory: a run costs one `DeadRun` however many ids it
+/// covers, so decode allocates per record — and the record count is bounded by
+/// the input length — leaving no ratio for a decompression bomb to exploit. A
+/// sequence's total deleted count is therefore deliberately unbounded: a
+/// long-lived document must be able to load its own snapshot back.
 const MAX_TOMBSTONE_RUN: u32 = 1 << 20;
-
-/// The most tombstones a whole decoded sequence may reconstruct across every
-/// run. The per-record cap alone bounds one record but not their sum, so a
-/// small stream of many records could still claim a huge id count on untrusted
-/// input; this ceiling bounds total decode memory. Run-length compression is
-/// inherently high-ratio, so a bytes-based ratio cannot separate a bomb from a
-/// legitimately dense snapshot — an absolute ceiling is the meaningful guard. A
-/// document compacts far below this.
-const MAX_TOMBSTONE_TOTAL: u64 = 1 << 22;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Side {
@@ -62,8 +57,12 @@ fn seq_stamp(key: &SeqKey) -> Stamp {
     }
 }
 
-/// The id `i` places after a run head.
-fn run_member(head: Stamp, i: u64) -> Stamp {
+/// The id `i` places after a run head — a plain lamport step, since a run's ids
+/// share a client and offset. A text run that reaches the lamport ceiling carries
+/// its surplus ids in a higher offset ([`Stamp::run_member`]), which is a
+/// different key group, so no run can span the ceiling and the step never
+/// overflows.
+fn run_id(head: Stamp, i: u64) -> Stamp {
     Stamp {
         lamport: head
             .lamport
@@ -116,8 +115,9 @@ struct Node {
     /// Suppressed by a tree move: the node still anchors the Fugue tree but a live
     /// read skips it, because the element it holds now renders under a different
     /// parent. Unlike a delete this is reversible — the document sets it from
-    /// the move-log fold, so an undo-and-replay can re-instate the placement, and
-    /// a suppressed node is never folded into a deleted run.
+    /// the move-log fold, so an undo-and-replay can re-instate the placement.
+    /// That is why a suppressed node stays a node while it is live; deleting it
+    /// folds it into a run like any other, the delete being terminal.
     moved_away: bool,
 }
 
@@ -172,7 +172,7 @@ impl Span {
     fn last(self) -> Stamp {
         match self {
             Span::Node(id) => id,
-            Span::Dead { head, len } => run_member(head, len - 1),
+            Span::Dead { head, len } => run_id(head, len - 1),
         }
     }
 }
@@ -256,11 +256,11 @@ impl List {
                     *anchor
                 } else {
                     Anchor {
-                        parent: Some(run_member(*start, off - 1)),
+                        parent: Some(run_id(*start, off - 1)),
                         side: Side::Right,
                     }
                 };
-                put_stamp(&mut chunks, &run_member(*start, off));
+                put_stamp(&mut chunks, &run_id(*start, off));
                 put_u32(&mut chunks, chunk_len as u32);
                 put_anchor(&mut chunks, &chunk_anchor);
                 chunk_count += 1;
@@ -330,32 +330,21 @@ impl List {
             }
         }
 
-        // Read every run record and validate its declared size before
-        // reconstructing any id, so a crafted stream is rejected on its declared
-        // lengths rather than by materialising the bomb it describes. Each
-        // record consumes real bytes, so the record count is itself bounded by
-        // the input length.
+        // Read every run record and check its declared length before installing
+        // anything, so a malformed stream is rejected on the record rather than
+        // part-way through building the sequence.
         let run_count = cur.u32()?;
         let mut runs = Vec::new();
-        let mut total_tombstones: u64 = 0;
         for _ in 0..run_count {
             let start = cur.stamp()?;
             let length = cur.u32()?;
             let anchor = cur.anchor()?;
-            // A run reconstructs `length` ids from a fixed record, so an
-            // unbounded length is a decompression bomb; the encoder splits past
-            // the per-record cap and never emits an empty run, so a length
-            // outside `1..=MAX_TOMBSTONE_RUN` is malformed.
+            // The encoder splits past the per-record cap and never emits an
+            // empty run, so a length outside `1..=MAX_TOMBSTONE_RUN` is
+            // malformed.
             if length == 0 || length > MAX_TOMBSTONE_RUN {
                 return Err(DecodeError::BadTag {
                     what: "list: tombstone run length",
-                    tag: 0,
-                });
-            }
-            total_tombstones += length as u64;
-            if total_tombstones > MAX_TOMBSTONE_TOTAL {
-                return Err(DecodeError::BadTag {
-                    what: "list: tombstone total exceeds decode budget",
                     tag: 0,
                 });
             }
@@ -600,8 +589,7 @@ impl List {
 
     /// The number of live items strictly before `id` in sequence order, and
     /// whether `id` itself is live — or `None` if `id` is not in the sequence.
-    /// One traversal of the order (no repeated `live_index` scans, which made the
-    /// earlier resolution quadratic in traversals).
+    /// One traversal of the order, so resolving a position costs a single walk.
     fn live_rank(&self, id: Stamp) -> Option<(usize, bool)> {
         let mut before = 0;
         for span in self.tree_order() {
@@ -671,11 +659,13 @@ impl List {
         self.add_dead(id, 1, node.parent, node.side);
     }
 
+    /// Fold another replica's sequence in. Delete wins, and it is terminal: an id
+    /// deleted here stays deleted and keeps no value, so the peer's copy of a
+    /// deleted node is dropped rather than folded — a snapshot round-trip already
+    /// leaves exactly that, and a composite's content lives in the document's
+    /// per-id registry, not in the node.
     pub fn merge(&mut self, other: &Self) {
         for (key, on) in &other.nodes {
-            // A delete is monotonic and terminal, so a deleted id stays deleted
-            // and its value stays gone — exactly what a snapshot round-trip
-            // already leaves behind.
             if self.dead_run(on.id).is_some() {
                 continue;
             }
@@ -771,7 +761,7 @@ impl List {
             if parent == Some(prev) && side == Side::Right {
                 if let Some((phead, prun)) = self.dead_run(prev) {
                     let (plen, pparent, pside) = (prun.len, prun.parent, prun.side);
-                    if run_member(phead, plen - 1) == prev {
+                    if run_id(phead, plen - 1) == prev {
                         self.dead.remove(&seq_key(&phead));
                         head = phead;
                         len += plen;
@@ -782,7 +772,7 @@ impl List {
             }
         }
 
-        let last = run_member(head, len - 1);
+        let last = run_id(head, len - 1);
         if let Some(next) = last
             .lamport
             .checked_add(1)
@@ -807,7 +797,7 @@ impl List {
     fn bury(&mut self, head: Stamp, len: u64, parent: Option<Stamp>, side: Side) {
         let mut i = 0u64;
         while i < len {
-            let id = run_member(head, i);
+            let id = run_id(head, i);
             if let Some((h, run)) = self.dead_run(id) {
                 i += run.len - (id.lamport - h.lamport);
                 continue;
@@ -821,7 +811,7 @@ impl List {
             let (p, s) = if i == 0 {
                 (parent, side)
             } else {
-                (Some(run_member(head, i - 1)), Side::Right)
+                (Some(run_id(head, i - 1)), Side::Right)
             };
             self.add_dead(id, unseen, p, s);
             i += unseen;
@@ -897,10 +887,10 @@ impl List {
             let ends = cuts.get(key).unwrap_or(&uncut);
             for &end in ends.iter().chain(std::iter::once(&run.len)) {
                 map.entry(anchor).or_default().push(Span::Dead {
-                    head: run_member(head, start),
+                    head: run_id(head, start),
                     len: end - start,
                 });
-                anchor = (Some(run_member(head, end - 1)), Side::Right);
+                anchor = (Some(run_id(head, end - 1)), Side::Right);
                 start = end;
             }
         }
@@ -954,15 +944,11 @@ impl List {
             .collect()
     }
 
-    /// The ids bracketing the gap before live position `index`.
-    fn gap(&self, order: &[Span], index: usize) -> (Option<Stamp>, Option<Stamp>) {
-        self.gap_excluding(order, index, None)
-    }
-
-    /// [`gap`](Self::gap), counting `exclude` (if present) as not live — so a node
-    /// being re-placed within its own list does not shift the target index. The
-    /// gap always falls on a record boundary: only a live node advances the
-    /// count, so the boundary lands right after one, never inside a run.
+    /// The ids bracketing the gap before live position `index`, counting
+    /// `exclude` (if present) as not live — so a node being re-placed within its
+    /// own list does not shift the target index. The gap always falls on a record
+    /// boundary: only a live node advances the count, so the boundary lands right
+    /// after one, never inside a run.
     fn gap_excluding(
         &self,
         order: &[Span],
@@ -1002,7 +988,7 @@ impl List {
     fn has_right_child(&self, parent: Stamp) -> bool {
         if let Some((head, run)) = self.dead_run(parent) {
             // Every id in a run but the last chains to its successor.
-            if parent != run_member(head, run.len - 1) {
+            if parent != run_id(head, run.len - 1) {
                 return true;
             }
         }

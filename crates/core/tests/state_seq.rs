@@ -207,11 +207,10 @@ fn an_empty_run_is_rejected() {
 }
 
 #[test]
-fn many_capped_runs_exceed_the_global_decode_budget() {
-    // The per-record cap bounds one run but not their sum: a small stream of
-    // many records, each at the per-record cap, could still claim an enormous
-    // node count. Assemble such a stream directly and confirm decode rejects it
-    // on the declared total — quickly, without materialising the nodes.
+fn run_records_covering_the_same_ids_are_rejected() {
+    // Two records claiming the same ids describe one id twice, which no encoder
+    // produces and which would silently drop one record's placement. Assemble
+    // such a stream directly and confirm decode rejects it.
     let empty = List::new(eid(1, 1)).encode_state();
     let header = empty.len(); // id + live_count(0) + run_count(0)
 
@@ -226,9 +225,9 @@ fn many_capped_runs_exceed_the_global_decode_budget() {
     let len_off = stamp_len; // length sits right after the start stamp
     record[len_off..len_off + 4].copy_from_slice(&(1u32 << 20).to_le_bytes());
 
-    // Many records at the per-record cap (1<<20 each) sum far past the global
-    // budget, so decode must reject on the declared total.
-    let runs = 17u32;
+    // The same record repeated: every copy after the first covers ids the
+    // sequence already holds.
+    let runs = 3u32;
     let mut bytes = one_run[..header].to_vec();
     bytes[header - 4..].copy_from_slice(&runs.to_le_bytes()); // run_count
     for _ in 0..runs {
@@ -236,7 +235,7 @@ fn many_capped_runs_exceed_the_global_decode_budget() {
     }
     assert!(
         List::decode_state(&bytes).is_err(),
-        "the summed run lengths exceed the decode budget and must be rejected"
+        "overlapping run records must be rejected as duplicate ids"
     );
 }
 

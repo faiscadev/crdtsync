@@ -371,6 +371,91 @@ fn the_sequence_encoding_is_unchanged_by_the_in_memory_collapse() {
     assert_eq!(hex(&t.encode_state()), "00000000000000020000000000000002060000000100000000000000010000000000000000000000000000000000026800000000000000000102000000000000000100000000000000000000000000000000000265000000000000000101000000000000000100000000000000000000000000000000010800000000000000010000000000000000000000000000000000026f0000000000000001070000000000000001000000000000000000000000000000000109000000000000000100000000000000000000000000000000000272000000000000000108000000000000000100000000000000000000000000000000010a00000000000000010000000000000000000000000000000000026c000000000000000109000000000000000100000000000000000000000000000000010b00000000000000010000000000000000000000000000000000026400000000000000010a00000000000000010000000000000000000000000000000001010000000300000000000000010000000000000000000000000000000005000000010200000000000000010000000000000000000000000000000001");
 }
 
+/// Assemble a list snapshot holding no live items and the given chained run
+/// records — the shape the encoder emits once a run passes the per-record cap.
+/// Written out by hand so a run of any length can be exercised without paying
+/// for the inserts: an id count is what the representation is meant to make free.
+fn chained_run_snapshot(id: ElementId, client: u8, chunks: &[(u64, u32)]) -> Vec<u8> {
+    fn put_stamp(out: &mut Vec<u8>, lamport: u64, client: u8) {
+        out.extend_from_slice(&lamport.to_le_bytes());
+        out.extend_from_slice(&cid(client).as_bytes());
+        out.push(0); // offset absent
+    }
+
+    let mut out = id.as_bytes().to_vec();
+    out.extend_from_slice(&0u32.to_le_bytes()); // no live items
+    out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    for (i, (lamport, len)) in chunks.iter().enumerate() {
+        put_stamp(&mut out, *lamport, client);
+        out.extend_from_slice(&len.to_le_bytes());
+        if i == 0 {
+            out.push(0); // no parent: the run heads the sequence
+        } else {
+            out.push(1);
+            put_stamp(&mut out, lamport - 1, client);
+        }
+        out.push(1); // Side::Right
+    }
+    out
+}
+
+#[test]
+fn a_run_longer_than_one_record_welds_back_on_decode() {
+    // The encoder chains records past the per-record cap; decode must weld them
+    // into the single run they describe, or a snapshot-restored replica would
+    // hold a different record shape — and encode a different snapshot — from a
+    // peer that saw the deletes as ops. The total id count is deliberately
+    // unbounded: a run costs one record, so a long-lived document reaches counts
+    // no per-id budget could carry, and it must still load its own snapshot.
+    const CAP: u64 = 1 << 20;
+    let chunks: Vec<(u64, u32)> = (0..5).map(|i| (1 + i * CAP, CAP as u32)).collect();
+    let bytes = chained_run_snapshot(eid(4, 4), 1, &chunks);
+
+    let back = List::decode_state(&bytes).unwrap();
+    assert!(back.is_empty());
+    assert_eq!(
+        back.stored_records(),
+        1,
+        "the chained records describe one run"
+    );
+    assert!(deleted(&back, stmp(1 + 3 * CAP, 1)));
+    assert_eq!(
+        back.encode_state(),
+        bytes,
+        "re-encode splits at the same points"
+    );
+}
+
+#[test]
+fn an_insert_hanging_right_off_a_run_interior_renders_in_place() {
+    // The other half of the split rule: a record anchored to the *right* of an id
+    // inside a run shares that id's bucket with the run's own continuation, so
+    // the walk must cut there too. Only partial delivery reaches it — the peer
+    // must anchor against an id before the ids after it exist.
+    let mut early = alphabet(2); // ab, and nothing after it yet
+    early.insert(2, ch(b'X'), stmp(2, 2)); // hangs right off b
+    assert_eq!(text(&early), "abX");
+
+    let mut whole = alphabet(4); // abcd
+    whole.delete(1); // b
+    whole.delete(1); // c — one run, with X's anchor at its head
+    assert_eq!(text(&whole), "ad");
+
+    let deleted_only = whole.deep_clone();
+    whole.merge(&early);
+    early.merge(&deleted_only);
+
+    // X's stamp sorts below c's, so it renders between them — inside the run.
+    assert_eq!(text(&whole), "aXd");
+    assert_eq!(text(&early), "aXd");
+    assert_eq!(whole.stored_records(), 4, "a, d and X plus the one run");
+    assert_eq!(whole.encode_state(), early.encode_state());
+
+    // And an insert after X lands after it, not before the run's tail.
+    whole.insert(2, ch(b'Y'), stmp(30, 3));
+    assert_eq!(text(&whole), "aXYd");
+}
+
 #[test]
 fn a_snapshot_of_a_wholly_deleted_text_round_trips() {
     let mut t = Text::new(eid(3, 3));
