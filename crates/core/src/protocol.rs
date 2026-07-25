@@ -34,8 +34,7 @@ pub const MAGIC: u32 = u32::from_le_bytes(*b"CRDT");
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The deterministic little-endian codec the wire and the durable log share —
-/// the only codec that exists, and the one a peer that advertises nothing is
-/// assumed to speak.
+/// the base codec silence carries, and the only one that exists.
 pub const CODEC_V1: u32 = 1;
 
 /// Every codec version this build can encode and decode, ascending. A client
@@ -44,21 +43,40 @@ pub const CODEC_V1: u32 = 1;
 /// here and still settles with a peer that only holds the older one.
 pub const SUPPORTED_CODECS: &[u32] = &[CODEC_V1];
 
-/// Pick the codec a connection speaks from the set a client advertised.
+/// Silence on the wire — an omitted advertisement, an absent selection — carries
+/// [`CODEC_V1`], so a build that could not speak it could not read a peer that
+/// says nothing.
+const _: () = assert!(
+    supports(SUPPORTED_CODECS, CODEC_V1),
+    "every build must speak CODEC_V1, the codec silence carries"
+);
+
+const fn supports(supported: &[u32], codec: u32) -> bool {
+    let mut i = 0;
+    while i < supported.len() {
+        if supported[i] == codec {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Pick the codec a connection speaks: the highest version present in both what
+/// the client `advertised` and what this end `supported`, so two peers that share
+/// several settle on the newest.
 ///
-/// An empty advertisement names no codec — the peer speaks [`CODEC_V1`], which
-/// every build holds. Otherwise the highest version both ends support wins, so
-/// two peers that share several settle on the newest. `None` means the sets are
-/// disjoint: nothing the client sends could be decoded, so the connection is
-/// refused rather than guessed at.
-pub fn select_codec(advertised: &[u32]) -> Option<u32> {
+/// An empty advertisement names no codec, which is itself the answer
+/// [`CODEC_V1`]. `None` means the two sets share nothing: no frame the client
+/// sends could be decoded, so the connection is refused rather than guessed at.
+pub fn select_codec(advertised: &[u32], supported: &[u32]) -> Option<u32> {
     if advertised.is_empty() {
-        return Some(CODEC_V1);
+        return supports(supported, CODEC_V1).then_some(CODEC_V1);
     }
     advertised
         .iter()
         .copied()
-        .filter(|codec| SUPPORTED_CODECS.contains(codec))
+        .filter(|codec| supported.contains(codec))
         .max()
 }
 
@@ -174,10 +192,10 @@ pub enum Message {
     /// whatever the server serves). The server resolves `{app_id, schema_version}`
     /// against its registry — an unknown version for a registered app is refused.
     /// `codecs` advertises the binary codecs this client can speak; an empty set
-    /// names none and settles on [`CODEC_V1`], so a peer that predates
-    /// negotiation keeps connecting unchanged. The server answers a non-empty
-    /// advertisement with the [`CodecSelected`](Message::CodecSelected) it chose,
-    /// and refuses a set it shares nothing with.
+    /// names none, which is itself the answer [`CODEC_V1`]. The server refuses a
+    /// set it shares nothing with, and otherwise names its pick in a
+    /// [`CodecSelected`](Message::CodecSelected) — but only when that pick leaves
+    /// [`CODEC_V1`], since silence already carries it.
     Hello {
         client: ClientId,
         app_id: Vec<u8>,
@@ -185,9 +203,9 @@ pub enum Message {
         codecs: Vec<u32>,
     },
     /// The server's answer to a codec advertisement: the one codec, out of what
-    /// the client offered, both ends speak from here on. Sent only to a client
-    /// that advertised — a peer that named no codec is already on [`CODEC_V1`]
-    /// and gets no extra frame.
+    /// the client offered, both ends speak from here on. Sent only when the pick
+    /// leaves [`CODEC_V1`] — a connection settling on the base codec is answered
+    /// nothing, because silence says the same thing.
     CodecSelected { codec: u32 },
     /// Presents an opaque credential for the server to verify. The core does not
     /// parse it; a deployment-configured verifier interprets the bytes.
@@ -554,8 +572,8 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, app_id);
             put_u32(&mut out, *schema_version);
             // The advertisement is a trailing optional field: a client that names
-            // no codec omits it, so its Hello is byte-for-byte the frame a peer
-            // that predates negotiation writes and reads.
+            // no codec omits it, so an unadvertised Hello carries no advertisement
+            // bytes at all.
             if !codecs.is_empty() {
                 put_u32(
                     &mut out,
@@ -931,7 +949,7 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let app_id = cur.bytes()?;
             let schema_version = cur.u32()?;
             // The advertisement is optional trailing: a frame that ends here names
-            // no codec, which is the peer that predates negotiation.
+            // no codec, and settles on the base codec silence carries.
             let codecs = if cur.at_end() {
                 Vec::new()
             } else {

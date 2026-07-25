@@ -7,8 +7,8 @@
 //! only holds the older one.
 //!
 //! Silence carries `CODEC_V1` in both directions — an omitted advertisement and an
-//! absent selection both settle there — so a peer that predates negotiation writes
-//! and reads exactly the frames it always did. Selection is total: a disjoint
+//! absent selection both settle there — so a peer that names no codec exchanges
+//! frames a peer that never heard of negotiation would. Selection is total: a disjoint
 //! advertisement yields no selection (the server refuses the connection) and a
 //! malformed one decodes to a `ProtocolError`, never a panic and never a silent
 //! wrong-codec decode.
@@ -34,34 +34,68 @@ fn hello(codecs: Vec<u32>) -> Message {
 // --- selection ---
 
 #[test]
-fn an_unadvertised_peer_settles_on_the_codec_that_predates_negotiation() {
+fn an_unadvertised_peer_settles_on_the_base_codec() {
     // No advertisement names no codec — the peer speaks the one every build
-    // holds, so it keeps connecting exactly as before negotiation existed.
-    assert_eq!(select_codec(&[]), Some(CODEC_V1));
+    // holds, which is what makes the omitted field a complete answer.
+    assert_eq!(select_codec(&[], SUPPORTED_CODECS), Some(CODEC_V1));
 }
 
 #[test]
 fn the_highest_shared_version_wins() {
-    assert_eq!(select_codec(SUPPORTED_CODECS), Some(CODEC_V1));
-    // Versions this build does not hold are ignored; the best shared one is taken.
-    assert_eq!(select_codec(&[CODEC_V1, 800, 900]), Some(CODEC_V1));
-    // Order of the advertisement does not decide the outcome.
-    assert_eq!(select_codec(&[900, CODEC_V1]), Some(CODEC_V1));
+    // The rule takes the supported set as an argument, so it is pinned over sets
+    // richer than the single codec that exists — a later release adding one gets
+    // the behaviour it needs already specified.
+    let supported = &[1, 2, 5, 7];
+    assert_eq!(select_codec(&[2, 5], supported), Some(5));
+    assert_eq!(
+        select_codec(&[7, 1], supported),
+        Some(7),
+        "order does not decide"
+    );
+    // Versions this end does not hold are ignored; the best shared one is taken,
+    // not the highest advertised.
+    assert_eq!(select_codec(&[2, 900], supported), Some(2));
+    assert_eq!(select_codec(&[1, 2, 5, 7, 900], supported), Some(7));
+}
+
+#[test]
+fn the_selection_is_over_this_builds_own_supported_set() {
+    assert_eq!(
+        select_codec(SUPPORTED_CODECS, SUPPORTED_CODECS),
+        Some(CODEC_V1)
+    );
+    assert_eq!(
+        select_codec(&[CODEC_V1, 900], SUPPORTED_CODECS),
+        Some(CODEC_V1)
+    );
 }
 
 #[test]
 fn a_disjoint_advertisement_selects_nothing() {
-    // A client that names only codecs this build cannot speak shares no ground:
+    // A client that names only codecs this end cannot speak shares no ground:
     // there is nothing to decode its frames with, so no selection exists.
-    assert_eq!(select_codec(&[800]), None);
-    assert_eq!(select_codec(&[800, 900, u32::MAX]), None);
+    assert_eq!(select_codec(&[800], SUPPORTED_CODECS), None);
+    assert_eq!(select_codec(&[800, 900, u32::MAX], SUPPORTED_CODECS), None);
     // Zero is not a codec version — the numbering starts at CODEC_V1.
-    assert_eq!(select_codec(&[0]), None);
+    assert_eq!(select_codec(&[0], SUPPORTED_CODECS), None);
+    assert_eq!(select_codec(&[3, 4], &[1, 2, 5]), None);
+}
+
+#[test]
+fn silence_is_answered_only_by_an_end_that_speaks_the_base_codec() {
+    // The omitted advertisement is a complete answer only because every build
+    // holds CODEC_V1 — an end that did not could not read a peer that says
+    // nothing, so it selects nothing rather than assuming.
+    assert_eq!(select_codec(&[], &[1, 2]), Some(CODEC_V1));
+    assert_eq!(select_codec(&[], &[2, 5]), None);
 }
 
 #[test]
 fn a_duplicated_advertisement_still_selects_once() {
-    assert_eq!(select_codec(&[CODEC_V1, CODEC_V1]), Some(CODEC_V1));
+    assert_eq!(
+        select_codec(&[CODEC_V1, CODEC_V1], SUPPORTED_CODECS),
+        Some(CODEC_V1)
+    );
 }
 
 // --- wire ---
@@ -88,10 +122,10 @@ fn the_codec_selection_round_trips() {
 }
 
 #[test]
-fn an_unadvertised_hello_is_byte_identical_to_the_pre_negotiation_frame() {
+fn an_unadvertised_hello_carries_no_advertisement_bytes() {
     // The advertisement is trailing and omitted when empty, so the frame a peer
-    // that names no codec writes is exactly the one both ends exchanged before
-    // negotiation: tag, client, app id, schema version, and nothing more.
+    // that names no codec writes ends at the schema version: tag, client, app id,
+    // schema version, and nothing more.
     let mut expected = vec![0u8];
     expected.extend_from_slice(&cid(9).as_bytes());
     expected.extend_from_slice(&10u32.to_le_bytes());
@@ -204,19 +238,17 @@ fn the_client_adopts_the_selection_the_server_answers_with() {
 }
 
 #[test]
-fn a_second_selection_is_a_violation() {
-    // Neither end could agree on which frame a mid-stream switch takes effect
-    // from, so the codec settles once — the mirror of the server refusing a
-    // second Hello.
+fn a_selection_re_naming_the_settled_codec_is_the_same_answer_again() {
+    // A session outlives its connections, so each reconnect re-runs the
+    // handshake and the selection arrives again. Re-naming what is already
+    // settled changes nothing and is not a violation.
     let mut session = ClientSession::new(cid(1));
-    assert_eq!(
-        session.receive(Message::CodecSelected { codec: CODEC_V1 }),
-        Ok(())
-    );
-    assert_eq!(
-        session.receive(Message::CodecSelected { codec: CODEC_V1 }),
-        Err(ClientError::UnexpectedMessage("codec already selected"))
-    );
+    for _ in 0..3 {
+        assert_eq!(
+            session.receive(Message::CodecSelected { codec: CODEC_V1 }),
+            Ok(())
+        );
+    }
     assert_eq!(session.codec(), CODEC_V1);
 }
 

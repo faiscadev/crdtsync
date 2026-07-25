@@ -83,8 +83,8 @@ fn versions_this_build_does_not_speak_are_ignored_in_the_selection() {
 
 #[test]
 fn a_client_that_advertises_nothing_defaults_to_the_current_codec() {
-    // The peer that predates negotiation: no advertisement, no selection frame,
-    // and the session on the codec every build holds.
+    // A peer that names no codec: no advertisement, no selection frame, and the
+    // session on the base codec every build holds.
     let (session, resp) = resolve(&empty(), hello(b"", Vec::new()));
     assert!(!resp.close);
     assert_eq!(session.client(), Some(cid(1)));

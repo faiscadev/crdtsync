@@ -16,7 +16,7 @@ use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::zone;
 use crdtsync_core::{
     select_codec, BranchInfo, Channel, ClientId, DiffKind, Document, ElementId, ErrorCode, Message,
-    Op, OpKind, CODEC_V1,
+    Op, OpKind, CODEC_V1, SUPPORTED_CODECS,
 };
 
 use crdtsync_core::schema::Schema;
@@ -291,7 +291,7 @@ pub fn step(
             // Settle the codec before anything else: a client that shares none
             // with this build cannot be answered in bytes it can read, so it is
             // refused here rather than served a frame it would misdecode.
-            let Some(codec) = select_codec(&codecs) else {
+            let Some(codec) = select_codec(&codecs, SUPPORTED_CODECS) else {
                 return Response {
                     replies: vec![Message::Error {
                         code: ErrorCode::UnsupportedVersion,

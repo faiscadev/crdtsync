@@ -683,15 +683,17 @@ impl ClientSession {
             // The server answers the Hello advertisement with the codec it picked.
             // A selection outside what this build speaks strands the session: every
             // later frame would be misread, so it is refused for good rather than
-            // for this frame. A second selection is a violation the same way a
-            // second Hello is — neither end would agree on which frame the switch
-            // takes effect from.
+            // for this frame. A selection that re-names the settled codec is the
+            // same answer arriving again — a session outlives its connections, so
+            // each reconnect re-runs the handshake — but one naming a *different*
+            // codec is a switch neither end could agree on the boundary of, and is
+            // refused.
             Message::CodecSelected { codec } => {
                 if !SUPPORTED_CODECS.contains(&codec) {
                     self.fatal = Some(ClientError::UnsupportedCodec(codec));
                     return Err(ClientError::UnsupportedCodec(codec));
                 }
-                if self.codec.is_some() {
+                if self.codec.is_some_and(|settled| settled != codec) {
                     return Err(ClientError::UnexpectedMessage("codec already selected"));
                 }
                 self.codec = Some(codec);
