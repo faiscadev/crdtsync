@@ -2866,20 +2866,252 @@ pub unsafe extern "C" fn crdtsync_client_get_bytes(
     path_len: usize,
     out: *mut CrdtBuf,
 ) -> i32 {
-    client_read(
-        client,
-        channel,
-        path,
-        path_len,
-        out,
-        |d, p, o| match path::get_bytes(d, p) {
-            Some(b) => {
-                *o = CrdtBuf::from_vec(b);
-                1
-            }
-            None => 0,
-        },
-    )
+    client_read_buf(client, channel, path, path_len, out, path::get_bytes)
+}
+
+// --- client sequence, scalar, and map surface ---
+//
+// The list/text/scalar/map surface on a subscribed room's replica. Reads mirror
+// the doc-level entry points; edits route through the outbox so they are resent
+// and acknowledged like every other routed edit.
+
+/// Install-or-set a Register from an encoded [`Scalar`] at a path in `channel`'s
+/// room, so a leaf keeps its type across a round trip. Returns the Ops frame to
+/// send; empty on a bad handle, a rejected `path` or `scalar` pointer, an unheld
+/// channel, or a malformed payload. A path that names nothing still frames — the
+/// frame carries no ops.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` and `scalar`/`scalar_len` each
+/// follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_set_scalar(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    scalar: *const u8,
+    scalar_len: usize,
+) -> CrdtBuf {
+    let Some(value) = decode_scalar(scalar, scalar_len) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, path, path_len, move |d, p| {
+        path::register(d, p, value)
+    })
+}
+
+/// Read the Register at a path in `channel`'s room as an encoded [`Scalar`] into
+/// a fresh buffer at `out` the caller frees — the inverse of
+/// [`crdtsync_client_set_scalar`]. Returns 1 when the slot holds a register, 0
+/// when absent, another element, or the channel isn't held, -1 on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` follow [`as_slice`]; `out` points
+/// to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_get_scalar(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    client_read_buf(client, channel, path, path_len, out, |d, p| {
+        path::get_register(d, p).map(|s| s.encode_state())
+    })
+}
+
+/// Read the live slot keys of the Map at a path in `channel`'s room into a fresh
+/// buffer at `out` the caller frees, framed as a `u32` count then each key
+/// `u32`-length-prefixed. An empty path names the room's root map. Returns 1 when
+/// the path is a live Map — or an `XmlElement`, whose attrs map it names — even
+/// with no keys, 0 when it is neither or the channel isn't held, -1 on a bad
+/// handle.
+///
+/// # Safety
+/// As [`crdtsync_client_get_scalar`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_map_keys(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    client_read_buf(client, channel, path, path_len, out, |d, p| {
+        path::map_keys(d, p).map(|keys| encode_key_list(&keys))
+    })
+}
+
+/// Insert a bytes item at live `index` into the List at a path in `channel`'s
+/// room; an `index` past the live end appends. Returns the Ops frame to send;
+/// empty on a bad handle, a rejected `path` or `value` pointer, or an unheld
+/// channel. A path that names nothing still frames — the frame carries no ops.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` and `value`/`value_len` each
+/// follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_list_insert(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    value: *const u8,
+    value_len: usize,
+) -> CrdtBuf {
+    let Some(val) = as_slice(value, value_len) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::list_insert(d, p, index, val)
+    })
+}
+
+/// Tombstone the live item at `index` in the List at a path in `channel`'s room.
+/// Returns the Ops frame to send; the frame carries no ops when `index` names no
+/// live item — a no-op delete never installs or re-stamps the List.
+///
+/// # Safety
+/// As [`crdtsync_client_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_list_delete(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+) -> CrdtBuf {
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::list_delete(d, p, index)
+    })
+}
+
+/// Read the live length of the List at a path in `channel`'s room into `out`.
+/// Returns 1 when the path is a live List, 0 when it is not or the channel isn't
+/// held, -1 on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` follow [`as_slice`]; `out` points
+/// to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_list_len(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut usize,
+) -> i32 {
+    client_read_usize(client, channel, path, path_len, out, path::list_len)
+}
+
+/// Read the bytes item at live `index` in the List at a path in `channel`'s room
+/// into a fresh buffer at `out` the caller frees. Returns 1 when present and a
+/// bytes item, 0 otherwise, -1 on a bad handle.
+///
+/// # Safety
+/// As [`crdtsync_client_get_scalar`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_list_get(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    client_read_buf(client, channel, path, path_len, out, |d, p| {
+        path::list_get(d, p, index)
+    })
+}
+
+/// Insert UTF-8 `text` at codepoint `index` into the Text at a path in `channel`'s
+/// room; an `index` past the live end appends. Returns the Ops frame to send;
+/// empty on a bad handle, a rejected `path` or `text` pointer, an unheld channel,
+/// or non-UTF-8 input. A path that names nothing still frames — the frame carries
+/// no ops.
+///
+/// # Safety
+/// `client` is a live handle; `path`/`path_len` and `text`/`text_len` each follow
+/// [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_text_insert(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    text: *const u8,
+    text_len: usize,
+) -> CrdtBuf {
+    let Some(raw) = as_slice(text, text_len) else {
+        return CrdtBuf::empty();
+    };
+    let Ok(s) = std::str::from_utf8(raw) else {
+        return CrdtBuf::empty();
+    };
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::text_insert(d, p, index, s)
+    })
+}
+
+/// Tombstone `count` codepoints from codepoint `index` in the Text at a path in
+/// `channel`'s room. Returns the Ops frame to send; the frame carries no ops when
+/// the range names no live codepoint — a no-op delete never installs or re-stamps
+/// the Text.
+///
+/// # Safety
+/// As [`crdtsync_client_register_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_text_delete(
+    client: *mut CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    count: usize,
+) -> CrdtBuf {
+    client_edit(client, channel, path, path_len, |d, p| {
+        path::text_delete(d, p, index, count)
+    })
+}
+
+/// Read the codepoint length of the Text at a path in `channel`'s room into `out`.
+/// Returns 1 when the path is a live Text, 0 when it is not or the channel isn't
+/// held, -1 on a bad handle.
+///
+/// # Safety
+/// As [`crdtsync_client_list_len`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_text_len(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut usize,
+) -> i32 {
+    client_read_usize(client, channel, path, path_len, out, path::text_len)
+}
+
+/// Read the Text at a path in `channel`'s room as UTF-8 bytes into a fresh buffer
+/// at `out` the caller frees. Returns 1 when the path is a live Text, 0 when it is
+/// not or the channel isn't held, -1 on a bad handle.
+///
+/// # Safety
+/// As [`crdtsync_client_get_scalar`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_text_get(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    client_read_buf(client, channel, path, path_len, out, |d, p| {
+        path::text_get(d, p).map(String::into_bytes)
+    })
 }
 
 /// Begin recording an atomic transaction on `channel`'s room: subsequent edits
@@ -2980,6 +3212,53 @@ where
         }
     }))
     .unwrap_or(-1)
+}
+
+/// Read a byte payload on `channel`'s room through `run` into a fresh buffer at
+/// `out` the caller frees.
+unsafe fn client_read_buf<F>(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+    run: F,
+) -> i32
+where
+    F: FnOnce(&Document, &[u8]) -> Option<Vec<u8>>,
+{
+    client_read(client, channel, path, path_len, out, |d, p, o| {
+        match run(d, p) {
+            Some(b) => {
+                *o = CrdtBuf::from_vec(b);
+                1
+            }
+            None => 0,
+        }
+    })
+}
+
+/// Read a `usize`-valued slot on `channel`'s room through `run` into `out`.
+unsafe fn client_read_usize<F>(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut usize,
+    run: F,
+) -> i32
+where
+    F: FnOnce(&Document, &[u8]) -> Option<usize>,
+{
+    client_read(client, channel, path, path_len, out, |d, p, o| {
+        match run(d, p) {
+            Some(n) => {
+                *o = n;
+                1
+            }
+            None => 0,
+        }
+    })
 }
 
 // --- client auth ---

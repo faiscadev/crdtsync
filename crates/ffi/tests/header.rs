@@ -126,6 +126,21 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_commit_atomic",
         "crdtsync_client_get_int",
         "crdtsync_client_get_bytes",
+        // Client per-channel scalar / map / list / text surface. These cross-
+        // reference each other in their doc comments, which cbindgen copies into
+        // the header, so each entry carries the trailing `(` of its prototype —
+        // a bare name would be satisfied by a `[`name`]` mention in a comment.
+        "crdtsync_client_set_scalar(",
+        "crdtsync_client_get_scalar(",
+        "crdtsync_client_map_keys(",
+        "crdtsync_client_list_insert(",
+        "crdtsync_client_list_delete(",
+        "crdtsync_client_list_len(",
+        "crdtsync_client_list_get(",
+        "crdtsync_client_text_insert(",
+        "crdtsync_client_text_delete(",
+        "crdtsync_client_text_len(",
+        "crdtsync_client_text_get(",
         // client auth + lifecycle + awareness
         "crdtsync_client_auth",
         "crdtsync_client_actor",

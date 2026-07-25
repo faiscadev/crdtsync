@@ -966,8 +966,11 @@ fn an_atomic_transaction_travels_over_the_wire_client() {
 }
 
 /// Fold a "body" text into `channel`'s replica by applying the ops a scratch doc
-/// author produced — the client surface has no text insert, so a mark's sequence
-/// is seeded from a peer frame.
+/// author produced. A mark's anchors name sequence element ids, so both peers must
+/// hold the *same* ids: element ids are deterministic in the authoring client id
+/// and counter, so a scratch author with one fixed client id and the same text
+/// mints identical ids on every side. Authoring in each replica directly would
+/// stamp each with its own client id and the anchors would not resolve on the peer.
 unsafe fn seed_body_text(c: *mut CrdtClient, channel: u32, p: &[u8], s: &str) {
     let scratch = crdtsync_doc_new(client_id(9).as_ptr());
     let ops_buf = crdtsync_doc_text_insert(scratch, p.as_ptr(), p.len(), 0, s.as_ptr(), s.len());
@@ -1480,5 +1483,471 @@ fn acl_grant_and_revoke_route_through_the_client_outbox() {
         crdtsync_buf_free(rev);
         crdtsync_client_free(a);
         crdtsync_client_free(b);
+    }
+}
+
+// --- per-channel sequence, scalar, and map surface ---
+//
+// The list/text/scalar/map reads and edits on a subscribed room, matching the
+// doc-level surface but routed through the session: an edit frames its Ops
+// message, enters the outbox, and converges on a peer that folds the frame in.
+
+unsafe fn list_len(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, usize) {
+    let mut out: usize = usize::MAX;
+    let rc = crdtsync_client_list_len(c, channel, p.as_ptr(), p.len(), &mut out);
+    (rc, out)
+}
+
+unsafe fn list_get(c: *const CrdtClient, channel: u32, p: &[u8], index: usize) -> (i32, Vec<u8>) {
+    let mut out = out_buf();
+    let rc = crdtsync_client_list_get(c, channel, p.as_ptr(), p.len(), index, &mut out);
+    let bytes = if out.len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(out.ptr, out.len).to_vec()
+    };
+    crdtsync_buf_free(out);
+    (rc, bytes)
+}
+
+unsafe fn text_len(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, usize) {
+    let mut out: usize = usize::MAX;
+    let rc = crdtsync_client_text_len(c, channel, p.as_ptr(), p.len(), &mut out);
+    (rc, out)
+}
+
+unsafe fn text_get(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, String) {
+    let mut out = out_buf();
+    let rc = crdtsync_client_text_get(c, channel, p.as_ptr(), p.len(), &mut out);
+    let s = if out.len == 0 {
+        String::new()
+    } else {
+        String::from_utf8(std::slice::from_raw_parts(out.ptr, out.len).to_vec()).unwrap()
+    };
+    crdtsync_buf_free(out);
+    (rc, s)
+}
+
+unsafe fn get_scalar(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, Option<Scalar>) {
+    let mut out = out_buf();
+    let rc = crdtsync_client_get_scalar(c, channel, p.as_ptr(), p.len(), &mut out);
+    let value = (out.len > 0)
+        .then(|| Scalar::decode_state(std::slice::from_raw_parts(out.ptr, out.len)).unwrap());
+    crdtsync_buf_free(out);
+    (rc, value)
+}
+
+/// Decode the `u32`-count, `u32`-length-prefixed key list `map_keys` frames.
+unsafe fn map_keys(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, Vec<Vec<u8>>) {
+    let mut out = out_buf();
+    let rc = crdtsync_client_map_keys(c, channel, p.as_ptr(), p.len(), &mut out);
+    let mut keys = Vec::new();
+    if out.len > 0 {
+        let raw = std::slice::from_raw_parts(out.ptr, out.len);
+        let count = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+        let mut i = 4;
+        for _ in 0..count {
+            let len = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            keys.push(raw[i..i + len].to_vec());
+            i += len;
+        }
+    }
+    crdtsync_buf_free(out);
+    keys.sort();
+    (rc, keys)
+}
+
+#[test]
+fn list_edits_route_through_the_client_outbox_and_travel() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        let (cb, sb) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sa);
+        crdtsync_buf_free(sb);
+
+        let p = path(&[b"todos"]);
+        assert_eq!(list_len(a, ca, &p), (0, usize::MAX), "no list yet");
+
+        let first = crdtsync_client_list_insert(a, ca, p.as_ptr(), p.len(), 0, b"one".as_ptr(), 3);
+        assert!(first.len > 0, "an insert frames its ops");
+        let queued = outbox_len(a, ca);
+        assert!(queued > 0, "the insert entered the outbox");
+        let second = crdtsync_client_list_insert(a, ca, p.as_ptr(), p.len(), 1, b"two".as_ptr(), 3);
+        assert!(outbox_len(a, ca) > queued, "so did the second");
+        let queued = outbox_len(a, ca);
+
+        assert_eq!(list_len(a, ca, &p), (1, 2));
+        assert_eq!(list_get(a, ca, &p, 0), (1, b"one".to_vec()));
+        assert_eq!(list_get(a, ca, &p, 1), (1, b"two".to_vec()));
+
+        // The frames carry the channel and converge on the peer.
+        let msg = decode_message(std::slice::from_raw_parts(first.ptr, first.len)).unwrap();
+        let Message::Ops { channel, .. } = msg else {
+            panic!("expected an Ops frame");
+        };
+        assert_eq!(channel, Channel(ca));
+        assert_eq!(receive(b, &first), 1);
+        assert_eq!(receive(b, &second), 1);
+        assert_eq!(list_len(b, cb, &p), (1, 2));
+        assert_eq!(list_get(b, cb, &p, 1), (1, b"two".to_vec()));
+        crdtsync_buf_free(first);
+        crdtsync_buf_free(second);
+
+        // A delete tombstones the item and travels the same way.
+        let del = crdtsync_client_list_delete(a, ca, p.as_ptr(), p.len(), 0);
+        assert!(del.len > 0);
+        assert!(outbox_len(a, ca) > queued, "the delete entered the outbox");
+        assert_eq!(list_len(a, ca, &p), (1, 1));
+        assert_eq!(list_get(a, ca, &p, 0), (1, b"two".to_vec()));
+        assert_eq!(receive(b, &del), 1);
+        assert_eq!(list_len(b, cb, &p), (1, 1));
+        crdtsync_buf_free(del);
+
+        // Reading past the live end is absent, not an error.
+        assert_eq!(list_get(a, ca, &p, 9), (0, Vec::new()));
+
+        // An index past the live end appends rather than being rejected.
+        let queued = outbox_len(a, ca);
+        let app =
+            crdtsync_client_list_insert(a, ca, p.as_ptr(), p.len(), usize::MAX, b"end".as_ptr(), 3);
+        assert!(outbox_len(a, ca) > queued);
+        assert_eq!(list_len(a, ca, &p), (1, 2));
+        assert_eq!(list_get(a, ca, &p, 1), (1, b"end".to_vec()));
+        crdtsync_buf_free(app);
+
+        // A delete naming no live item is inert: the frame carries no ops and the
+        // outbox does not grow, so it never installs or re-stamps the List.
+        let queued = outbox_len(a, ca);
+        let noop = crdtsync_client_list_delete(a, ca, p.as_ptr(), p.len(), usize::MAX);
+        assert_eq!(outbox_len(a, ca), queued, "a no-op delete enqueues nothing");
+        crdtsync_buf_free(noop);
+        let absent = path(&[b"nowhere"]);
+        let noop = crdtsync_client_list_delete(a, ca, absent.as_ptr(), absent.len(), 0);
+        assert_eq!(outbox_len(a, ca), queued, "nor does one on an absent path");
+        assert_eq!(
+            list_len(a, ca, &absent),
+            (0, usize::MAX),
+            "no List installed"
+        );
+        crdtsync_buf_free(noop);
+
+        // The reads discriminate on element type: a List is not a Text.
+        assert_eq!(text_len(a, ca, &p), (0, usize::MAX));
+        assert_eq!(text_get(a, ca, &p), (0, String::new()));
+
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}
+
+#[test]
+fn text_edits_route_through_the_client_outbox_and_travel() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        let (cb, sb) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sa);
+        crdtsync_buf_free(sb);
+
+        let p = path(&[b"body"]);
+        assert_eq!(text_len(a, ca, &p), (0, usize::MAX), "no text yet");
+
+        let hello = "héllo".as_bytes();
+        let ins =
+            crdtsync_client_text_insert(a, ca, p.as_ptr(), p.len(), 0, hello.as_ptr(), hello.len());
+        assert!(ins.len > 0, "an insert frames its ops");
+        let queued = outbox_len(a, ca);
+        assert!(queued > 0, "the insert entered the outbox");
+        // Length is counted in codepoints, not bytes.
+        assert_eq!(text_len(a, ca, &p), (1, 5));
+        assert_eq!(text_get(a, ca, &p), (1, "héllo".to_string()));
+        assert_eq!(receive(b, &ins), 1);
+        assert_eq!(text_get(b, cb, &p), (1, "héllo".to_string()));
+        crdtsync_buf_free(ins);
+
+        // Deleting two codepoints from index 1 works on codepoints too.
+        let del = crdtsync_client_text_delete(a, ca, p.as_ptr(), p.len(), 1, 2);
+        assert!(del.len > 0);
+        assert!(outbox_len(a, ca) > queued, "the delete entered the outbox");
+        let queued = outbox_len(a, ca);
+        assert_eq!(text_get(a, ca, &p), (1, "hlo".to_string()));
+        assert_eq!(receive(b, &del), 1);
+        assert_eq!(text_get(b, cb, &p), (1, "hlo".to_string()));
+        assert_eq!(text_len(b, cb, &p), (1, 3));
+        crdtsync_buf_free(del);
+
+        // Non-UTF-8 input is rejected without enqueueing anything.
+        let bad = crdtsync_client_text_insert(a, ca, p.as_ptr(), p.len(), 0, [0xffu8].as_ptr(), 1);
+        assert_eq!(bad.len, 0, "invalid UTF-8 frames nothing");
+        assert_eq!(outbox_len(a, ca), queued, "and enqueues nothing");
+
+        // An index past the live end appends rather than being rejected.
+        let queued = outbox_len(a, ca);
+        let app =
+            crdtsync_client_text_insert(a, ca, p.as_ptr(), p.len(), usize::MAX, b"!".as_ptr(), 1);
+        assert!(outbox_len(a, ca) > queued);
+        assert_eq!(text_get(a, ca, &p), (1, "hlo!".to_string()));
+        crdtsync_buf_free(app);
+
+        // A delete naming no live codepoint is inert — including a zero count, and
+        // including on a path holding no Text at all.
+        let queued = outbox_len(a, ca);
+        for noop in [
+            crdtsync_client_text_delete(a, ca, p.as_ptr(), p.len(), usize::MAX, 1),
+            crdtsync_client_text_delete(a, ca, p.as_ptr(), p.len(), 0, 0),
+        ] {
+            crdtsync_buf_free(noop);
+        }
+        assert_eq!(outbox_len(a, ca), queued, "a no-op delete enqueues nothing");
+        let absent = path(&[b"nowhere"]);
+        let noop = crdtsync_client_text_delete(a, ca, absent.as_ptr(), absent.len(), 0, 1);
+        assert_eq!(outbox_len(a, ca), queued, "nor does one on an absent path");
+        assert_eq!(
+            text_len(a, ca, &absent),
+            (0, usize::MAX),
+            "no Text installed"
+        );
+        crdtsync_buf_free(noop);
+
+        // The reads discriminate on element type: a Text is not a List.
+        assert_eq!(list_len(a, ca, &p), (0, usize::MAX));
+        assert_eq!(list_get(a, ca, &p, 0), (0, Vec::new()));
+        crdtsync_buf_free(bad);
+
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}
+
+#[test]
+fn scalars_keep_their_type_across_a_client_round_trip() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        let (cb, sb) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sa);
+        crdtsync_buf_free(sb);
+
+        let p = path(&[b"flag"]);
+        let encoded = Scalar::Bool(true).encode_state();
+        let frame =
+            crdtsync_client_set_scalar(a, ca, p.as_ptr(), p.len(), encoded.as_ptr(), encoded.len());
+        assert!(frame.len > 0, "a scalar set frames its ops");
+        let queued = outbox_len(a, ca);
+        assert!(queued > 0, "the set entered the outbox");
+        assert_eq!(get_scalar(a, ca, &p), (1, Some(Scalar::Bool(true))));
+
+        // The type survives the wire, not just the local write.
+        assert_eq!(receive(b, &frame), 1);
+        assert_eq!(get_scalar(b, cb, &p), (1, Some(Scalar::Bool(true))));
+        crdtsync_buf_free(frame);
+
+        // A malformed payload frames nothing and enqueues nothing.
+        let bad =
+            crdtsync_client_set_scalar(a, ca, p.as_ptr(), p.len(), [0xffu8, 0xff].as_ptr(), 2);
+        assert_eq!(bad.len, 0);
+        assert_eq!(
+            outbox_len(a, ca),
+            queued,
+            "a malformed payload enqueues nothing"
+        );
+        crdtsync_buf_free(bad);
+
+        // A slot holding no register reads absent.
+        let missing = path(&[b"nope"]);
+        assert_eq!(get_scalar(a, ca, &missing), (0, None));
+
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}
+
+#[test]
+fn map_keys_enumerates_a_rooms_live_slots() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        crdtsync_buf_free(sa);
+
+        crdtsync_buf_free(register_int(a, ca, &path(&[b"m", b"x"]), 1));
+        crdtsync_buf_free(register_int(a, ca, &path(&[b"m", b"y"]), 2));
+
+        let mp = path(&[b"m"]);
+        let (rc, keys) = map_keys(a, ca, &mp);
+        assert_eq!(rc, 1, "a live map reports its keys");
+        assert_eq!(keys, vec![b"x".to_vec(), b"y".to_vec()]);
+
+        // The root map is named by the empty path.
+        let (rc, keys) = map_keys(a, ca, &[]);
+        assert_eq!(rc, 1);
+        assert_eq!(keys, vec![b"m".to_vec()]);
+
+        // A leaf is not a map — 0, distinct from an empty map's 1.
+        let leaf = path(&[b"m", b"x"]);
+        assert_eq!(map_keys(a, ca, &leaf), (0, Vec::new()));
+
+        // Emptying the map keeps it live: the status stays 1 with no keys, which
+        // is what separates "a map with nothing in it" from "not a map".
+        for key in [b"x", b"y"] {
+            let slot = path(&[b"m", key]);
+            crdtsync_buf_free(crdtsync_client_delete(a, ca, slot.as_ptr(), slot.len()));
+        }
+        assert_eq!(map_keys(a, ca, &mp), (1, Vec::new()));
+
+        // An XmlElement names its attrs map, so it reports 1 as well.
+        let el = path(&[b"el"]);
+        crdtsync_buf_free(crdtsync_client_xml_element(
+            a,
+            ca,
+            el.as_ptr(),
+            el.len(),
+            b"p".as_ptr(),
+            1,
+        ));
+        assert_eq!(map_keys(a, ca, &el), (1, Vec::new()));
+
+        crdtsync_client_free(a);
+    }
+}
+
+#[test]
+fn the_per_channel_surface_addresses_one_room_at_a_time() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (c1, s1) = subscribe(a, b"room-1");
+        let (c2, s2) = subscribe(a, b"room-2");
+        crdtsync_buf_free(s1);
+        crdtsync_buf_free(s2);
+        assert_ne!(c1, c2);
+
+        let p = path(&[b"notes"]);
+        crdtsync_buf_free(crdtsync_client_text_insert(
+            a,
+            c1,
+            p.as_ptr(),
+            p.len(),
+            0,
+            b"one-room".as_ptr(),
+            8,
+        ));
+        assert_eq!(text_get(a, c1, &p), (1, "one-room".to_string()));
+        assert_eq!(text_len(a, c2, &p), (0, usize::MAX), "the sibling is empty");
+        assert_eq!(outbox_len(a, c2), 0);
+
+        // An unheld channel holds no replica: reads are absent, edits inert.
+        let unheld = 99;
+        assert_eq!(text_len(a, unheld, &p), (0, usize::MAX));
+        assert_eq!(list_len(a, unheld, &p), (0, usize::MAX));
+        assert_eq!(get_scalar(a, unheld, &p), (0, None));
+        assert_eq!(map_keys(a, unheld, &[]), (0, Vec::new()));
+        let inert =
+            crdtsync_client_list_insert(a, unheld, p.as_ptr(), p.len(), 0, b"x".as_ptr(), 1);
+        assert_eq!(inert.len, 0, "an unheld channel frames nothing");
+        crdtsync_buf_free(inert);
+
+        crdtsync_client_free(a);
+    }
+}
+
+#[test]
+fn the_per_channel_surface_rejects_null_handles() {
+    unsafe {
+        let p = path(&[b"k"]);
+        let scalar = Scalar::Bool(true).encode_state();
+        let mut buf = out_buf();
+        let mut n: usize = 0;
+
+        for frame in [
+            crdtsync_client_list_insert(
+                ptr::null_mut(),
+                0,
+                p.as_ptr(),
+                p.len(),
+                0,
+                b"x".as_ptr(),
+                1,
+            ),
+            crdtsync_client_list_delete(ptr::null_mut(), 0, p.as_ptr(), p.len(), 0),
+            crdtsync_client_text_insert(
+                ptr::null_mut(),
+                0,
+                p.as_ptr(),
+                p.len(),
+                0,
+                b"a".as_ptr(),
+                1,
+            ),
+            crdtsync_client_text_delete(ptr::null_mut(), 0, p.as_ptr(), p.len(), 0, 1),
+            crdtsync_client_set_scalar(
+                ptr::null_mut(),
+                0,
+                p.as_ptr(),
+                p.len(),
+                scalar.as_ptr(),
+                scalar.len(),
+            ),
+        ] {
+            assert_eq!(frame.len, 0, "a null handle frames nothing");
+            crdtsync_buf_free(frame);
+        }
+
+        assert_eq!(
+            crdtsync_client_list_len(ptr::null(), 0, p.as_ptr(), p.len(), &mut n),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_text_len(ptr::null(), 0, p.as_ptr(), p.len(), &mut n),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_list_get(ptr::null(), 0, p.as_ptr(), p.len(), 0, &mut buf),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_text_get(ptr::null(), 0, p.as_ptr(), p.len(), &mut buf),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_get_scalar(ptr::null(), 0, p.as_ptr(), p.len(), &mut buf),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_map_keys(ptr::null(), 0, p.as_ptr(), p.len(), &mut buf),
+            -1
+        );
+
+        // A null output pointer is rejected the same way, with a live handle.
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        assert_eq!(
+            crdtsync_client_list_len(a, 0, p.as_ptr(), p.len(), ptr::null_mut()),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_text_get(a, 0, p.as_ptr(), p.len(), ptr::null_mut()),
+            -1
+        );
+
+        // A null payload or path pointer with a nonzero length is rejected rather
+        // than dereferenced, and leaves the outbox untouched.
+        let (ca, sa) = subscribe(a, b"room-1");
+        crdtsync_buf_free(sa);
+        for frame in [
+            crdtsync_client_list_insert(a, ca, p.as_ptr(), p.len(), 0, ptr::null(), 3),
+            crdtsync_client_text_insert(a, ca, p.as_ptr(), p.len(), 0, ptr::null(), 3),
+            crdtsync_client_set_scalar(a, ca, p.as_ptr(), p.len(), ptr::null(), 3),
+            crdtsync_client_list_insert(a, ca, ptr::null(), 4, 0, b"x".as_ptr(), 1),
+            crdtsync_client_text_insert(a, ca, ptr::null(), 4, 0, b"x".as_ptr(), 1),
+        ] {
+            assert_eq!(frame.len, 0, "a rejected pointer frames nothing");
+            crdtsync_buf_free(frame);
+        }
+        assert_eq!(outbox_len(a, ca), 0, "and enqueues nothing");
+
+        crdtsync_client_free(a);
     }
 }
