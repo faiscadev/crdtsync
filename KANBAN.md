@@ -362,6 +362,17 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
+### SDK follow-ons (planned 2026-07-25, human — cs-next dispatches in this order; undo fork RESOLVED in DECISIONS/ARCHITECTURE)
+
+**Epic A — Networked socket-owning Provider for Python + Go (do FIRST; non-gated).** Makes Python/Go first-class *networked* collab clients (they have only the offline provider today). Mechanical — the wasm `WasmClient` already has the surface; port it to the C ABI + wrap.
+  - **A1 — C-ABI per-channel expansion (crates/ffi) — READY (lowest-dep, no blockers).** Add the ~11 missing per-channel `Client` methods the C ABI lacks but `WasmClient` has: `list_insert/list_delete/list_len/list_get`, `text_insert/text_delete/text_len/text_get`, `set_scalar/get_scalar`, `map_keys` (per-channel, over the client edit surface + outbox). Regenerate the cbindgen header; extend the FFI symbol-assert + round-trip tests. No core CRDT change. → *Networking / SDK*.
+  - **A2 — Python networked Provider (sdks/python) — dep: A1.** A `ClientBackend` (over the expanded C ABI single wire-client replica) + a networked `connect(url, room)` / `Provider` matching the JS provider model (handshake → auth? → subscribe, catch-up, reconnect via resume/resend, offline outbox, connection state, awareness, server signals). Ergonomic handle-graph edits frame + send; inbound applies + fires reactivity. Real-server integration test.
+  - **A3 — Go networked Provider (sdks/go) — dep: A1; independent of A2 (may run parallel).** Same as A2 for Go (`ClientBackend` + `Connect(url, room)`), mirroring the JS provider + Python A2.
+
+**Epic B — Undo/redo (do AFTER Epic A; DESIGN RESOLVED = core record-seam + origin-scope, DECISIONS/ARCHITECTURE 2026-07-25).** Inversion in the shared core, thin per-SDK handle.
+  - **B1 — core undo record-seam (crates/core + crates/wasm/ffi) — dep: A1 (its per-channel surface is the record-seam's hook).** Extend `UndoManager` inversion to **all op kinds** (register/scalar/counter/map/list/text/xml/mark/blob-ref, root+nested) and to the per-document, per-**channel** (networked) path; record every *applied* edit into an origin/scope-tagged stack; inverse = ordinary forward ops (converge on peers, no server undo state, no wire change). Miri-gated. Atomic-tx undo rides the existing `atomic_group`. → *Undo / Redo*.
+  - **B2 — SDK undo handle (JS/Python/Go) — dep: B1.** Thin `undo()/redo()/canUndo/canRedo`, origin-scoped, over the core stack — no per-language inversion logic. Cross-SDK; the handle-graph `mutate` flow feeds the record-seam. → *SDK-Ergonomic-Surface / Undo*.
+
 - _(The Schema-layer epic below — Schema Units 1–8 — is **complete** (all merged, latest 8f #190); it lingers here as board drift, pending a Next-section cleanup.)_
 
 - **Schema layer — the opt-in feature tier that unblocks awareness-TTL, `@auth`, invariant repair, and migration** (§Schema, §Schema Migration; design settled 2026-07-03, DECISIONS). The distribution/trust/versioning model is now pinned (schema is code, registered per `app_id`, relay-vs-enforcing tiers, client-declared version ranges + per-edge compat class + per-recipient in-flight translation, `onRepaired`/`onOpsRejected`/`onUpdateRequired` hooks). Sliced dependency-order; the first units consume only **built** primitives (map/list/text/register/counter + awareness), so they land now — marks/attrs/structural clauses parse but stay enforcement-inert until XmlElement/marks exist:
