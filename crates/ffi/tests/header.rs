@@ -105,8 +105,8 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_take_redirects",
         "crdtsync_client_last_seen_seq",
         "crdtsync_client_register_int",
-        "crdtsync_client_inc",
-        "crdtsync_client_dec",
+        "crdtsync_client_inc(",
+        "crdtsync_client_dec(",
         "crdtsync_client_set_bytes",
         "crdtsync_client_set_blob",
         "crdtsync_client_set_blob_ref",
@@ -124,7 +124,10 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_mark_delete",
         "crdtsync_client_begin_atomic",
         "crdtsync_client_commit_atomic",
-        "crdtsync_client_get_int",
+        // `get_counter`'s doc comment names `get_int`, `inc`, and `dec`, so
+        // those three carry the trailing `(` of their prototype too.
+        "crdtsync_client_get_int(",
+        "crdtsync_client_get_counter(",
         "crdtsync_client_get_bytes",
         // Client per-channel scalar / map / list / text surface. These cross-
         // reference each other in their doc comments, which cbindgen copies into
@@ -141,6 +144,15 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_text_delete(",
         "crdtsync_client_text_len(",
         "crdtsync_client_text_get(",
+        // Client per-channel state snapshot, blobs, marks, anchors, and xml
+        // shape — same trailing-`(` rule.
+        "crdtsync_client_channel_state(",
+        "crdtsync_client_get_blob(",
+        "crdtsync_client_marks_at(",
+        "crdtsync_client_relative_position(",
+        "crdtsync_client_resolve_position(",
+        "crdtsync_client_xml_tag(",
+        "crdtsync_client_xml_children_len(",
         // client auth + lifecycle + awareness
         "crdtsync_client_auth",
         "crdtsync_client_actor",
