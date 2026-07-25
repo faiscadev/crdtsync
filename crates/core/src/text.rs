@@ -87,6 +87,11 @@ impl Text {
         self.inner.is_empty()
     }
 
+    /// How many records back the text — see [`List::stored_records`].
+    pub fn stored_records(&self) -> usize {
+        self.inner.stored_records()
+    }
+
     /// The live text.
     pub fn as_string(&self) -> String {
         self.inner.values().iter().map(codepoint).collect()

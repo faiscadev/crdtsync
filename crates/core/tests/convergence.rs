@@ -157,7 +157,7 @@ fn top_xml(d: &Document, k: &[u8]) -> Option<(TopXml, usize)> {
 /// real removals; on the peers the same op waits for its target to arrive.
 fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
     let k = key(rng);
-    match rng.below(25) {
+    match rng.below(28) {
         0 => d.transact(|tx| tx.register(k, Scalar::Int(rng_val(rng)))),
         1 => d.transact(|tx| tx.inc(k, 1 + rng.below(4) as u32)),
         2 => d.transact(|tx| tx.dec(k, 1 + rng.below(4) as u32)),
@@ -339,6 +339,38 @@ fn random_edit(d: &mut Document, rng: &mut Rng) -> Vec<Op> {
                     tx.xml_fragment(k).children().delete(idx);
                 }),
             }
+        }
+        24 => {
+            // A multi-codepoint text run: consecutive char_ids chained
+            // parent-to-child, the shape a delete collapses to one range.
+            let idx = rng.below(text_len(d, k) + 1);
+            d.transact(|tx| tx.text(k).insert(idx, "quick"))
+        }
+        25 => {
+            // Delete a contiguous span of text — the delete-heavy family that
+            // extends and welds ranges.
+            let len = text_len(d, k);
+            if len == 0 {
+                return Vec::new();
+            }
+            let idx = rng.below(len);
+            let count = 1 + rng.below(len - idx);
+            d.transact(|tx| tx.text(k).delete(idx, count))
+        }
+        26 => {
+            // Delete a contiguous span of list items.
+            let len = list_len(d, k);
+            if len == 0 {
+                return Vec::new();
+            }
+            let idx = rng.below(len);
+            let count = 1 + rng.below(len - idx);
+            d.transact(|tx| {
+                let mut list = tx.list(k);
+                for _ in 0..count {
+                    list.delete(idx);
+                }
+            })
         }
         _ => d.transact(|tx| tx.map(k).set(subkey(rng), Scalar::Bool(true))),
     }
