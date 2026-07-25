@@ -11,6 +11,7 @@ The native library is loaded at import time from ``target/{release,debug}`` (or
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import enum
 import json
@@ -2848,16 +2849,21 @@ class Doc:
         self._init(Document(client_id if client_id is not None else os.urandom(16)))
 
     @classmethod
-    def _networked(cls, backend, wire: Callable[[bytes], None]) -> "Doc":
+    def _networked(cls, backend, wire: Callable[[bytes], None], lock) -> "Doc":
         """A doc over a provider-supplied networked backend: every edit's frame
-        goes to ``wire`` for the socket instead of staying purely local."""
+        goes to ``wire`` for the socket instead of staying purely local, and
+        ``lock`` serializes it against the provider's reader thread."""
         obj = cls.__new__(cls)
-        obj._init(backend, wire)
+        obj._init(backend, wire, lock)
         return obj
 
-    def _init(self, backend, wire: Optional[Callable[[bytes], None]] = None) -> None:
+    def _init(self, backend, wire: Optional[Callable[[bytes], None]] = None, lock=None) -> None:
         self._backend = backend
         self._wire = wire
+        # A local doc is only ever touched by its caller; a networked one shares
+        # its replica with the provider's reader thread, so an edit and the state
+        # bracket around it have to be one indivisible step.
+        self._lock = contextlib.nullcontext() if lock is None else lock
         self._update_listeners: List[Callable[[UpdateEvent], None]] = []
         self._repair_listeners: List[Callable[[RepairEvent], None]] = []
         self._observers: List[Tuple[bytes, Callable[[ChangeEvent], None]]] = []
@@ -2886,18 +2892,19 @@ class Doc:
         if self._transacting:
             fn()
             return
-        before = self._backend.encode_state() if self._observing() else None
-        self._transacting = True
-        self._backend.begin_atomic()
-        try:
-            fn()
-        finally:
-            self._transacting = False
-            ops = self._backend.commit_atomic()
-            if ops:
-                self._send(ops)
-                self._dispatch("local", ops, before)
-                self._emit_repairs()
+        with self._lock:
+            before = self._backend.encode_state() if self._observing() else None
+            self._transacting = True
+            self._backend.begin_atomic()
+            try:
+                fn()
+            finally:
+                self._transacting = False
+                ops = self._backend.commit_atomic()
+                if ops:
+                    self._send(ops)
+                    self._dispatch("local", ops, before)
+                    self._emit_repairs()
 
     def on_update(self, callback: Callable[[UpdateEvent], None]) -> Callable[[], None]:
         """Subscribe to every applied change to the document; returns a function
@@ -2990,28 +2997,30 @@ class Doc:
             self._wire(ops)
 
     def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
-        # Inside a transaction the edit just accumulates; the commit dispatches.
-        if self._transacting:
-            run(self._backend)
-            return b""
-        before = self._backend.encode_state() if self._observing() else None
-        ops = run(self._backend)
-        if not ops:
+        with self._lock:
+            # Inside a transaction the edit just accumulates; the commit dispatches.
+            if self._transacting:
+                run(self._backend)
+                return b""
+            before = self._backend.encode_state() if self._observing() else None
+            ops = run(self._backend)
+            if not ops:
+                return ops
+            self._send(ops)
+            self._dispatch("local", ops, before)
+            self._emit_repairs()
             return ops
-        self._send(ops)
-        self._dispatch("local", ops, before)
-        self._emit_repairs()
-        return ops
 
     def _apply_remote(self, receive: Callable[[], None]) -> None:
         """Bracket a provider-driven inbound frame with the reactivity a local
         edit gets: the replica the frame folds into is the backend's own, so the
         change set is the before/after diff around it."""
-        before = self._backend.encode_state() if self._observing() else None
-        receive()
-        if before is not None:
-            self._dispatch("remote", b"", before)
-        self._emit_repairs()
+        with self._lock:
+            before = self._backend.encode_state() if self._observing() else None
+            receive()
+            if before is not None:
+                self._dispatch("remote", b"", before)
+            self._emit_repairs()
 
     def _dispatch(self, origin: str, ops: bytes, before: Optional[bytes]) -> None:
         raws = [] if before is None else self._compute_changes(before)
@@ -3362,7 +3371,9 @@ class Provider:
         self._transport = transport if transport is not None else _websocket.connect
 
         self.doc = Doc._networked(
-            _ClientBackend(self._client, self._channel, self._lock), self._send_if_open
+            _ClientBackend(self._client, self._channel, self._lock),
+            self._send_if_open,
+            self._lock,
         )
 
         # "auth" awaits the AuthOk that opens a socket, "catchup" the subscribe
@@ -3457,14 +3468,13 @@ class Provider:
             ws.close()
         self._set_state("disconnected")
         self._reject(ConnectionError("crdtsync: closed before it synced"))
-        # The reader thread holds the native session; only release it once that
-        # thread is provably done with it. Calling close() from a callback runs
-        # on that very thread, so it can only unwind — the session is freed when
-        # the provider is collected.
+        # The doc stays readable and the native session alive: the reader thread
+        # and any application thread may still be inside it, and freeing it under
+        # them is a use-after-free. It is released when the provider — and with
+        # it the thread that keeps it reachable — is collected. Calling close()
+        # from a callback runs on the reader thread itself, which can only unwind.
         if threading.current_thread() is not self._thread:
             self._thread.join(timeout=5.0)
-            if not self._thread.is_alive():
-                self._client.close()
 
     def __enter__(self) -> "Provider":
         return self
@@ -3485,6 +3495,8 @@ class Provider:
             if ws is not None:
                 self._ws = ws
                 try:
+                    if self._closed:  # closed while the dial was in flight
+                        break
                     self._open(ws)
                     while not self._closed:
                         data = ws.recv()
@@ -3525,10 +3537,9 @@ class Provider:
             if err is not None:
                 self._handle_server_error(err)
                 return
-            self._send_if_open(
+            self._write(
                 self._resume_frame() if self._connected_once else self._subscribe_frame
             )
-            self._resend_outbox()
             if self._connected_once:
                 # The replica persists across the drop; deltas stream as ops.
                 self._mark_connected()
@@ -3542,10 +3553,12 @@ class Provider:
         err = folded[0] if folded else None
         if err is not None:
             self._handle_server_error(err)
+            if self._closed:  # the error was fatal — this socket is finished
+                return
         self._drain_signals()
 
-        # The subscribe reply lands the room's initial state; a frame the session
-        # refused (an unknown channel) never advances the catch-up.
+        # The server answers the Subscribe with the room's catch-up, so the first
+        # frame past the handshake completes the initial sync.
         if self._phase == "catchup":
             self._mark_connected()
 
@@ -3579,23 +3592,35 @@ class Provider:
         with self._lock:
             return self._client.resume(self._channel) or self._subscribe_frame
 
-    def _resend_outbox(self) -> None:
+    def _mark_connected(self) -> None:
+        # Opening the socket to app traffic and draining the outbox is one step:
+        # an edit authored while the handshake was in flight was not sent (the
+        # channel was not ready), so it must be in the batch this replays, and an
+        # edit authored after the flip sends itself. Both take the same lock, so
+        # neither can slip between the two.
         with self._lock:
-            frame = (
+            self._phase = "ready"
+            outstanding = (
                 self._client.resend(self._channel)
                 if self._client.outbox_len(self._channel) > 0
                 else b""
             )
-        self._send_if_open(frame)
-
-    def _mark_connected(self) -> None:
-        self._phase = "ready"
+        self._write(outstanding)
         self._connected_once = True
         self._attempt = 0
         self._set_state("connected")
         self._resolve()
 
     def _send_if_open(self, frame: bytes) -> None:
+        """Write an app frame, but only once the channel is subscribed and
+        caught up. Before that the socket carries the handshake alone — an edit
+        interleaved into it is a protocol violation the server closes on — and
+        the edit's ops wait in the outbox for :meth:`_mark_connected` to replay."""
+        if self._phase != "ready":
+            return
+        self._write(frame)
+
+    def _write(self, frame: bytes) -> None:
         ws = self._ws
         if not frame or ws is None:
             return

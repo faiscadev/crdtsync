@@ -22,7 +22,7 @@ import socket
 import ssl
 import struct
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 #: The fixed GUID RFC 6455 concatenates with the client key to derive the accept.
@@ -74,14 +74,14 @@ def connect(
             context = ssl.create_default_context()
             sock = context.wrap_socket(sock, server_hostname=parts.hostname)
         key = base64.b64encode(os.urandom(16))
-        _handshake(sock, parts.netloc, resource, key, headers or {})
+        pending = _handshake(sock, parts.netloc, resource, key, headers or {})
     except Exception:
         sock.close()
         raise
     # The handshake is bounded; the session that follows blocks until a frame
     # arrives or the socket is shut down.
     sock.settimeout(None)
-    return WebSocket(sock)
+    return WebSocket(sock, pending)
 
 
 def _handshake(
@@ -90,7 +90,10 @@ def _handshake(
     resource: str,
     key: bytes,
     headers: Dict[str, str],
-) -> None:
+) -> bytes:
+    """Run the client upgrade, returning any bytes read past the response head —
+    a peer may pipeline its first frames into the same write as the 101, and
+    dropping them would silently lose messages."""
     lines = [
         f"GET {resource} HTTP/1.1",
         f"Host: {netloc}",
@@ -102,8 +105,7 @@ def _handshake(
     lines += [f"{name}: {value}" for name, value in headers.items()]
     sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
 
-    raw = _read_until_headers_end(sock)
-    head, _, _ = raw.partition(b"\r\n\r\n")
+    head, pending = _read_response_head(sock)
     status, _, rest = head.partition(b"\r\n")
     fields = status.split(None, 2)
     if len(fields) < 2 or fields[1] != b"101":
@@ -114,11 +116,12 @@ def _handshake(
     expected = base64.b64encode(hashlib.sha1(key + _ACCEPT_GUID).digest())
     if accept != expected:
         raise WebSocketError("crdtsync: websocket upgrade returned a bad accept key")
+    return pending
 
 
-def _read_until_headers_end(sock: socket.socket) -> bytes:
-    """Read the upgrade response head. The server sends no body before the
-    first frame, so the bytes stop at the blank line that ends the headers."""
+def _read_response_head(sock: socket.socket) -> Tuple[bytes, bytes]:
+    """Read the upgrade response head, returning it and whatever followed the
+    blank line in the same read."""
     buf = b""
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(4096)
@@ -127,7 +130,8 @@ def _read_until_headers_end(sock: socket.socket) -> bytes:
         buf += chunk
         if len(buf) > 64 * 1024:
             raise WebSocketError("crdtsync: oversized upgrade response")
-    return buf
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    return head, rest
 
 
 def _header(block: bytes, name: bytes) -> Optional[bytes]:
@@ -141,11 +145,11 @@ def _header(block: bytes, name: bytes) -> Optional[bytes]:
 class WebSocket:
     """One open connection. Binary messages in, binary messages out."""
 
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock: socket.socket, pending: bytes = b""):
         self._sock: Optional[socket.socket] = sock
         self._send_lock = threading.Lock()
         self._closed = False
-        self._pending: bytes = b""
+        self._pending = pending
 
     def send(self, data: bytes) -> None:
         """Send one binary message."""
@@ -188,9 +192,10 @@ class WebSocket:
     def close(self) -> None:
         """Send a close frame (best effort) and shut the socket down, so a
         blocked :meth:`recv` returns. Idempotent."""
-        if self._closed:
+        if self._sock is None:
             return
-        self._write_frame(_OP_CLOSE, b"", ignore_errors=True)
+        if not self._closed:
+            self._write_frame(_OP_CLOSE, b"", ignore_errors=True)
         self._shutdown()
 
     @property
@@ -224,7 +229,7 @@ class WebSocket:
             header += struct.pack("!Q", length)
         mask = os.urandom(4)
         header += mask
-        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        masked = _mask(payload, mask)
         with self._send_lock:
             sock = self._sock
             if sock is None:
@@ -243,9 +248,13 @@ class WebSocket:
         if head is None:
             return None
         fin = bool(head[0] & 0x80)
+        if head[0] & 0x70:
+            raise WebSocketError("crdtsync: websocket frame set a reserved bit")
         opcode = head[0] & 0x0F
         masked = bool(head[1] & 0x80)
         length = head[1] & 0x7F
+        if opcode & 0x8 and (length > 125 or not fin):
+            raise WebSocketError("crdtsync: oversized or fragmented control frame")
         if length == 126:
             extended = self._read_exact(2)
             if extended is None:
@@ -268,7 +277,7 @@ class WebSocket:
         if payload is None:
             return None
         if mask:
-            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            payload = _mask(payload, mask)
         return fin, opcode, payload
 
     def _read_exact(self, count: int) -> Optional[bytes]:
@@ -279,10 +288,21 @@ class WebSocket:
             try:
                 chunk = sock.recv(65536)
             except OSError:
+                self._shutdown()
                 return None
             if not chunk:
-                self._closed = True
+                self._shutdown()
                 return None
             self._pending += chunk
         out, self._pending = self._pending[:count], self._pending[count:]
         return out
+
+
+def _mask(payload: bytes, mask: bytes) -> bytes:
+    """XOR ``payload`` with the repeating 4-byte ``mask``, whole-word at a time
+    so a large frame does not pay a Python-level loop per byte."""
+    if not payload:
+        return b""
+    repeated = (mask * (len(payload) // 4 + 1))[: len(payload)]
+    xored = int.from_bytes(payload, "big") ^ int.from_bytes(repeated, "big")
+    return xored.to_bytes(len(payload), "big")

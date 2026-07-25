@@ -188,6 +188,24 @@ class TestHandshake:
         provider.wait_connected(timeout=2.0)
         assert provider.state == "connected"
 
+    def test_an_edit_during_the_handshake_waits_for_the_channel(self, transport, provider):
+        socket = transport.socket(0)
+        socket.wait_sent(3)
+        socket.deliver(auth_ok())
+        socket.wait_sent(4)  # the Subscribe; the channel is not caught up yet
+
+        provider.doc.get_text("body").insert(0, "eager")
+        # Writing an edit into the handshake is a protocol violation the server
+        # closes on, so it stays in the outbox until the channel is ready.
+        time.sleep(0.05)
+        assert len(socket.sent) == 4
+        assert provider.outbox_len > 0
+
+        socket.deliver(ops(0))
+        replay = socket.wait_sent(5)[4]
+        assert tag(replay) == _TAG_OPS
+        provider.wait_connected(timeout=2.0)
+
     def test_a_handshake_error_is_fatal(self, transport):
         p = Provider("ws://fake", "room", transport=transport, connect_timeout=2.0)
         try:
@@ -316,6 +334,22 @@ class TestConnectionState:
             transport.socket(0).close()
             wait_for(lambda: states[-1:] == ["disconnected"])
             assert states == ["connected", "disconnected"]
+        finally:
+            p.close()
+
+    def test_a_fatal_error_never_reports_connected(self, transport):
+        states = []
+        p = Provider("ws://fake", "room", transport=transport, reconnect=False)
+        try:
+            p.on_state(states.append)
+            socket = transport.socket(0)
+            socket.wait_sent(3)
+            socket.deliver(auth_ok())
+            socket.wait_sent(4)
+            socket.deliver(error(ErrorCode.UNSUPPORTED_VERSION))
+            with pytest.raises(ServerError):
+                p.wait_connected(timeout=2.0)
+            assert "connected" not in states
         finally:
             p.close()
 

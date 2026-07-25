@@ -8,10 +8,11 @@ import os
 import platform
 import socket
 import subprocess
+import threading
 import time
 
 import pytest
-from crdtsync import connect
+from crdtsync import Provider, connect
 
 
 def _server_binary():
@@ -60,18 +61,26 @@ def server_url():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    try:
-        deadline = time.monotonic() + 15.0
-        while True:
-            line = process.stderr.readline()
+    # Drain the server's log on a thread: a blocking readline could not be given
+    # up on, and an undrained pipe would wedge the server once it filled.
+    started = threading.Event()
+
+    def drain():
+        for line in process.stderr:
             if b"serving on" in line:
-                break
-            if process.poll() is not None or time.monotonic() > deadline:
-                raise AssertionError("the crdtsync server did not start")
+                started.set()
+        started.set()  # the stream ended — unblock whoever is waiting
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    try:
+        if not started.wait(20.0) or process.poll() is not None:
+            raise AssertionError("the crdtsync server did not start")
         yield f"ws://127.0.0.1:{port}"
     finally:
         process.kill()
         process.wait()
+        reader.join(timeout=2.0)
         process.stderr.close()
 
 
@@ -139,10 +148,35 @@ class TestNetworkedProvider:
         a.set_awareness("cursor", "10")
         wait_for(lambda: b.awareness(a.actor, "cursor") == b"10")
 
-    def test_a_closed_provider_stops_syncing(self, join):
+    def test_a_closed_provider_stops_syncing_but_keeps_its_replica(self, join):
         a = join("room-closed")
         b = join("room-closed")
+        a.doc.get_text("body").insert(0, "before")
+        wait_for(lambda: str(b.doc.get_text("body")) == "before")
+
         b.close()
-        a.doc.get_text("body").insert(0, "after-close")
+        a.doc.get_text("body").insert(6, "-after")
+        wait_for(lambda: a.outbox_len == 0)
         time.sleep(0.2)
-        assert str(b.doc.get_text("body")) == ""
+        # The closed provider's replica is still readable — closing releases the
+        # connection, not the document — and it stopped at what it had synced.
+        assert str(b.doc.get_text("body")) == "before"
+
+    def test_edits_authored_during_the_handshake_still_reach_the_room(self, server_url, join):
+        room = "room-handshake"
+        peer = join(room)
+        provider = connect(server_url, room)
+        try:
+            # The connect above already synced; author against a second provider
+            # while its own handshake is still in flight.
+            racer = Provider(server_url, room)
+            try:
+                for i in range(20):
+                    racer.doc.get_list("items").append(i)
+                racer.wait_connected(timeout=10.0)
+                wait_for(lambda: len(peer.doc.get_list("items")) == 20)
+                assert racer.state == "connected"
+            finally:
+                racer.close()
+        finally:
+            provider.close()
