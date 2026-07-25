@@ -17,9 +17,12 @@ import json
 import os
 import platform
 import struct
+import threading
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, List, NamedTuple, Optional, Tuple, Union
+
+from . import _websocket
 
 __all__ = [
     "BlobRef",
@@ -37,6 +40,7 @@ __all__ = [
     "Effect",
     "ErrorCode",
     "Key",
+    "LocalProvider",
     "Provider",
     "Redirect",
     "Rejected",
@@ -47,6 +51,7 @@ __all__ = [
     "Undo",
     "UpdateEvent",
     "actor_key",
+    "connect",
     "diff",
     "diff_decode",
     "encode_path",
@@ -366,6 +371,18 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         buf,
     )
     sig(lib.crdtsync_client_delete, [doc, ch, cbytes, size], buf)
+    # per-channel sequence, scalar, and map reads/edits (client)
+    sig(lib.crdtsync_client_set_scalar, [doc, ch, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_get_scalar, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_map_keys, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_list_insert, [doc, ch, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_list_delete, [doc, ch, cbytes, size, size], buf)
+    sig(lib.crdtsync_client_list_len, [doc, ch, cbytes, size, c.POINTER(size)], c.c_int32)
+    sig(lib.crdtsync_client_list_get, [doc, ch, cbytes, size, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_text_insert, [doc, ch, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_text_delete, [doc, ch, cbytes, size, size, size], buf)
+    sig(lib.crdtsync_client_text_len, [doc, ch, cbytes, size, c.POINTER(size)], c.c_int32)
+    sig(lib.crdtsync_client_text_get, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
     # xml navigation (client)
     sig(lib.crdtsync_client_xml_element, [doc, ch, cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_client_xml_fragment, [doc, ch, cbytes, size], buf)
@@ -1584,6 +1601,114 @@ class Client:
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_client_delete(self._handle, channel, p, len(p)))
 
+    def set_scalar(self, channel: int, path: Path, scalar: bytes) -> bytes:
+        """Install-or-set a Register holding any encoded ``Scalar`` at a path in
+        ``channel``'s room, so a leaf keeps its type across the wire. Returns the
+        Ops frame to send."""
+        _u32("channel", channel)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_set_scalar(
+                self._handle, channel, p, len(p), scalar, len(scalar)
+            )
+        )
+
+    def get_scalar(self, channel: int, path: Path) -> Optional[bytes]:
+        """The encoded ``Scalar`` bytes of the Register at a path in ``channel``'s
+        room, or ``None`` when the slot holds no register. The inverse of
+        :meth:`set_scalar`."""
+        return self._read_buf(_LIB.crdtsync_client_get_scalar, channel, path)
+
+    def map_keys(self, channel: int, path: Path) -> Optional[List[bytes]]:
+        """The live slot keys of the Map at a path in ``channel``'s room, or
+        ``None`` when the path is not a live Map (an empty path names the room's
+        root map). An empty map reads back as an empty list, distinct from
+        ``None``."""
+        raw = self._read_buf(_LIB.crdtsync_client_map_keys, channel, path)
+        return None if raw is None else _decode_key_list(raw)
+
+    # --- per-channel list ---
+
+    def list_insert(self, channel: int, path: Path, index: int, value: bytes) -> bytes:
+        """Insert a bytes item at live ``index`` into the List at a path in
+        ``channel``'s room; an ``index`` past the live end appends. Returns the Ops
+        frame to send."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_list_insert(
+                self._handle, channel, p, len(p), index, value, len(value)
+            )
+        )
+
+    def list_delete(self, channel: int, path: Path, index: int) -> bytes:
+        """Tombstone the live item at ``index`` in the List at a path in
+        ``channel``'s room. Returns the Ops frame to send."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_list_delete(self._handle, channel, p, len(p), index)
+        )
+
+    def list_len(self, channel: int, path: Path) -> Optional[int]:
+        """The live length of the List at a path in ``channel``'s room, or ``None``
+        when the path is not a live List."""
+        return self._read_usize(_LIB.crdtsync_client_list_len, channel, path)
+
+    def list_get(self, channel: int, path: Path, index: int) -> Optional[bytes]:
+        """The bytes item at live ``index`` in the List at a path in ``channel``'s
+        room, or ``None`` when it names no live bytes item."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(path)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_list_get(
+            self._handle, channel, p, len(p), index, ctypes.byref(out)
+        )
+        return _take_buf(out) if rc == 1 else None
+
+    # --- per-channel text ---
+
+    def text_insert(self, channel: int, path: Path, index: int, text: str) -> bytes:
+        """Insert ``text`` at codepoint ``index`` into the Text at a path in
+        ``channel``'s room; an ``index`` past the live end appends. Returns the Ops
+        frame to send."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(path)
+        s = text.encode("utf-8")
+        return _take_buf(
+            _LIB.crdtsync_client_text_insert(
+                self._handle, channel, p, len(p), index, s, len(s)
+            )
+        )
+
+    def text_delete(self, channel: int, path: Path, index: int, count: int) -> bytes:
+        """Tombstone ``count`` codepoints from codepoint ``index`` in the Text at a
+        path in ``channel``'s room. Returns the Ops frame to send."""
+        _u32("channel", channel)
+        _usize("index", index)
+        _usize("count", count)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_text_delete(
+                self._handle, channel, p, len(p), index, count
+            )
+        )
+
+    def text_len(self, channel: int, path: Path) -> Optional[int]:
+        """The codepoint length of the Text at a path in ``channel``'s room, or
+        ``None`` when the path is not a live Text."""
+        return self._read_usize(_LIB.crdtsync_client_text_len, channel, path)
+
+    def text_get(self, channel: int, path: Path) -> Optional[str]:
+        """The Text at a path in ``channel``'s room, or ``None`` when the path is
+        not a live Text."""
+        raw = self._read_buf(_LIB.crdtsync_client_text_get, channel, path)
+        return None if raw is None else raw.decode("utf-8")
+
     # --- per-channel blobs ---
 
     def set_blob(self, channel: int, path: Path, mime: str, bytes_: bytes) -> bytes:
@@ -1710,13 +1835,36 @@ class Client:
         in ``channel``'s room, routed through the outbox. Returns
         ``(mark_id, frame)``: the mark's 16-byte id and the Ops frame to send.
         ``mark_id`` is ``None`` and ``frame`` empty when the author was inert."""
+        return self._mark_encoded(
+            channel,
+            seq_path,
+            start_index,
+            start_side,
+            end_index,
+            end_side,
+            name,
+            _encode_scalar(value),
+        )
+
+    def _mark_encoded(
+        self,
+        channel: int,
+        seq_path: Path,
+        start_index: int,
+        start_side: Side,
+        end_index: int,
+        end_side: Side,
+        name: bytes,
+        scalar: bytes,
+    ) -> Tuple[Optional[bytes], bytes]:
+        """Author a mark whose payload is already encoded ``Scalar`` bytes — the
+        seam the ergonomic handle layer marshals a native value through."""
         _u32("channel", channel)
         _usize("start_index", start_index)
         _usize("end_index", end_index)
         _u32("start_side", int(start_side))
         _u32("end_side", int(end_side))
         p = encode_path(seq_path)
-        v = _encode_scalar(value)
         out = _CrdtBuf()
         frame = _take_buf(
             _LIB.crdtsync_client_mark(
@@ -1730,8 +1878,8 @@ class Client:
                 int(end_side),
                 name,
                 len(name),
-                v,
-                len(v),
+                scalar,
+                len(scalar),
                 ctypes.byref(out),
             )
         )
@@ -1741,11 +1889,14 @@ class Client:
     def mark_set_value(self, channel: int, mark_id: bytes, value) -> bytes:
         """Change the payload of the mark handle ``mark_id`` to ``value`` in
         ``channel``'s room; Ops frame (empty if inert)."""
+        return self._mark_set_value_encoded(channel, mark_id, _encode_scalar(value))
+
+    def _mark_set_value_encoded(self, channel: int, mark_id: bytes, scalar: bytes) -> bytes:
+        """Change a mark's payload from already-encoded ``Scalar`` bytes."""
         _u32("channel", channel)
-        v = _encode_scalar(value)
         return _take_buf(
             _LIB.crdtsync_client_mark_set_value(
-                self._handle, channel, mark_id, len(mark_id), v, len(v)
+                self._handle, channel, mark_id, len(mark_id), scalar, len(scalar)
             )
         )
 
@@ -1825,11 +1976,7 @@ class Client:
         return out.value if rc == 1 else None
 
     def get_bytes(self, channel: int, path: Path) -> Optional[bytes]:
-        _u32("channel", channel)
-        p = encode_path(path)
-        out = _CrdtBuf()
-        rc = _LIB.crdtsync_client_get_bytes(self._handle, channel, p, len(p), ctypes.byref(out))
-        return _take_buf(out) if rc == 1 else None
+        return self._read_buf(_LIB.crdtsync_client_get_bytes, channel, path)
 
     # --- awareness ---
 
@@ -2051,6 +2198,22 @@ class Client:
         if rc != 1:
             return None
         return created.value == 1
+
+    # --- helpers ---
+
+    def _read_usize(self, fn, channel: int, path: Path) -> Optional[int]:
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = ctypes.c_size_t()
+        rc = fn(self._handle, channel, p, len(p), ctypes.byref(out))
+        return out.value if rc == 1 else None
+
+    def _read_buf(self, fn, channel: int, path: Path) -> Optional[bytes]:
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = _CrdtBuf()
+        rc = fn(self._handle, channel, p, len(p), ctypes.byref(out))
+        return _take_buf(out) if rc == 1 else None
 
 
 # --- ergonomic handle-graph layer ---------------------------------------------
@@ -2673,16 +2836,28 @@ _HANDLE_CTORS = {"map": CrdtMap, "list": CrdtList, "text": CrdtText, "xml": Crdt
 
 
 class Doc:
-    """A local CRDT replica with a single root map, edited through live typed
-    handles. A ``Doc`` is a pure local replica: two docs that exchange each other's
-    update ops (forwarded via :meth:`on_update`) converge. The low-level path API
+    """A CRDT replica with a single root map, edited through live typed handles.
+
+    Unbound, a ``Doc`` is a pure local replica: two docs that exchange each
+    other's update ops (forwarded via :meth:`on_update`) converge. Bound to a
+    networked :class:`Provider` it is backed by that connection's room replica
+    instead, and every edit frames itself for the wire. The low-level path API
     stays available on the wrapped :class:`Document` for power users."""
 
     def __init__(self, client_id: Optional[bytes] = None):
-        self._backend = Document(client_id if client_id is not None else os.urandom(16))
-        self._init_listeners()
+        self._init(Document(client_id if client_id is not None else os.urandom(16)))
 
-    def _init_listeners(self) -> None:
+    @classmethod
+    def _networked(cls, backend, wire: Callable[[bytes], None]) -> "Doc":
+        """A doc over a provider-supplied networked backend: every edit's frame
+        goes to ``wire`` for the socket instead of staying purely local."""
+        obj = cls.__new__(cls)
+        obj._init(backend, wire)
+        return obj
+
+    def _init(self, backend, wire: Optional[Callable[[bytes], None]] = None) -> None:
+        self._backend = backend
+        self._wire = wire
         self._update_listeners: List[Callable[[UpdateEvent], None]] = []
         self._repair_listeners: List[Callable[[RepairEvent], None]] = []
         self._observers: List[Tuple[bytes, Callable[[ChangeEvent], None]]] = []
@@ -2720,6 +2895,7 @@ class Doc:
             self._transacting = False
             ops = self._backend.commit_atomic()
             if ops:
+                self._send(ops)
                 self._dispatch("local", ops, before)
                 self._emit_repairs()
 
@@ -2757,7 +2933,8 @@ class Doc:
         return self._backend.set_schema(schema)
 
     def apply_update(self, ops: bytes) -> int:
-        """Fold a peer's update ops into this replica; returns the count applied."""
+        """Fold a peer's update ops into this replica; returns the count applied.
+        Local docs only — a networked doc syncs through its provider."""
         before = self._backend.encode_state() if self._observing() else None
         applied = self._backend.apply(ops)
         if applied > 0:
@@ -2773,8 +2950,7 @@ class Doc:
     def decode_state(cls, state: bytes) -> "Doc":
         """Open a ``Doc`` from a snapshot produced by :meth:`encode_state`."""
         obj = cls.__new__(cls)
-        obj._backend = Document.decode_state(state)
-        obj._init_listeners()
+        obj._init(Document.decode_state(state))
         return obj
 
     def close(self) -> None:
@@ -2809,6 +2985,10 @@ class Doc:
     def _observing(self) -> bool:
         return bool(self._update_listeners) or bool(self._observers)
 
+    def _send(self, ops: bytes) -> None:
+        if self._wire is not None:
+            self._wire(ops)
+
     def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
         # Inside a transaction the edit just accumulates; the commit dispatches.
         if self._transacting:
@@ -2818,9 +2998,20 @@ class Doc:
         ops = run(self._backend)
         if not ops:
             return ops
+        self._send(ops)
         self._dispatch("local", ops, before)
         self._emit_repairs()
         return ops
+
+    def _apply_remote(self, receive: Callable[[], None]) -> None:
+        """Bracket a provider-driven inbound frame with the reactivity a local
+        edit gets: the replica the frame folds into is the backend's own, so the
+        change set is the before/after diff around it."""
+        before = self._backend.encode_state() if self._observing() else None
+        receive()
+        if before is not None:
+            self._dispatch("remote", b"", before)
+        self._emit_repairs()
 
     def _dispatch(self, origin: str, ops: bytes, before: Optional[bytes]) -> None:
         raws = [] if before is None else self._compute_changes(before)
@@ -2864,24 +3055,20 @@ class Doc:
 
 
 
-class Provider:
-    """An ergonomic, offline-first sync binding over a :class:`Doc`'s apply/emit
-    seam — the Python realization of the §SDK-Ergonomic-Surface provider model.
+class LocalProvider:
+    """An embedded, offline-first sync binding over a :class:`Doc`'s apply/emit
+    seam, for an app that owns its own transport.
 
-    The Python SDK is embedded/offline-first: unlike the JS provider it owns no
-    socket loop, so the app supplies the transport. Bind a ``Doc`` with a ``send``
-    callback (invoked with each local edit's ops to transmit), and feed a peer's
-    ops to :meth:`receive`. The provider owns the connection state and an offline
-    outbox, so edits made while disconnected queue and flush on reconnect; inbound
-    ops apply and fire the doc's reactivity as ``remote``. A remote apply never
-    re-emits as a local edit, so a pair of linked providers can't loop.
+    Bind a local ``Doc`` with a ``send`` callback (invoked with each local edit's
+    ops to transmit), and feed a peer's ops to :meth:`receive`. The provider owns
+    the connection state and an offline outbox, so edits made while disconnected
+    queue and flush on reconnect; inbound ops apply and fire the doc's reactivity
+    as ``remote``. A remote apply never re-emits as a local edit, so a pair of
+    linked providers can't loop.
 
-    The fully-networked provider that owns a socket and backs the ``Doc`` with a
-    single wire-client replica (the JS ``connect(url, room)`` model, with awareness
-    and the operator-tier request/reply surface) is a documented follow-on: the
-    Python ``Client`` wire surface does not yet expose the per-channel
-    list/text/scalar/map-key handle ops a single-replica networked handle graph
-    needs. Until then this seam plus the low-level :class:`Client` cover sync.
+    :class:`Provider` is the networked counterpart — it owns the socket, speaks
+    the crdtsync wire protocol to a server, and backs its doc with that
+    connection's room replica.
     """
 
     def __init__(self, doc: "Doc", send: "Callable[[bytes], None]", *, connected: bool = False):
@@ -2944,7 +3131,7 @@ class Provider:
         """Unbind from the doc; local edits stop being forwarded/queued."""
         self._unsub()
 
-    def __enter__(self) -> "Provider":
+    def __enter__(self) -> "LocalProvider":
         return self
 
     def __exit__(self, *exc) -> None:
@@ -2956,3 +3143,502 @@ class Provider:
         self._state = state
         for listener in list(self._state_listeners):
             listener(state)
+
+
+# --- networked sync provider ---------------------------------------------------
+#
+# A `Provider` binds a `Doc` to a crdtsync server over a WebSocket. It owns the
+# wire session (a `Client`) and one room channel; the `Doc` is backed by that
+# channel, so local edits are framed + outboxed and sent, and inbound frames fold
+# into the same replica and fire the doc's reactivity — one replica per room,
+# never two divergent copies. On a dropped socket the outbox holds unacked edits;
+# on reconnect the provider resumes the channel from its caught-up position and
+# resends the outbox, so edits made offline converge once the link returns.
+
+#: The protocol version this SDK speaks, sent in the connection header.
+_PROTOCOL_VERSION = 1
+
+#: The magic the connection header leads with, identifying a crdtsync stream.
+_WIRE_MAGIC = b"CRDT"
+
+#: The credential sent when the caller names none — what a dev server accepts.
+_ANONYMOUS = b"anonymous"
+
+
+def _protocol_header() -> bytes:
+    """The 8-byte header a client writes once, before its Hello, to open a
+    connection at this SDK's protocol version."""
+    return _WIRE_MAGIC + struct.pack("<I", _PROTOCOL_VERSION)
+
+
+class _ClientBackend:
+    """The storage seam a networked :class:`Doc` edits and reads through: one
+    channel of a :class:`Client`. An edit frames itself for the wire and enters
+    the channel's outbox; a read queries that channel's replica.
+
+    Every call takes the provider's lock, because the reader thread folds inbound
+    frames into the same native session an application thread edits."""
+
+    def __init__(self, client: "Client", channel: int, lock: "threading.RLock"):
+        self._client = client
+        self._channel = channel
+        self._lock = lock
+
+    def get_scalar(self, path: Path) -> Optional[bytes]:
+        with self._lock:
+            return self._client.get_scalar(self._channel, path)
+
+    def map_keys(self, path: Path) -> Optional[List[bytes]]:
+        with self._lock:
+            return self._client.map_keys(self._channel, path)
+
+    def set_scalar(self, path: Path, scalar: bytes) -> bytes:
+        with self._lock:
+            return self._client.set_scalar(self._channel, path, scalar)
+
+    def delete(self, path: Path) -> bytes:
+        with self._lock:
+            return self._client.delete(self._channel, path)
+
+    def list_insert(self, path: Path, index: int, value: bytes) -> bytes:
+        with self._lock:
+            return self._client.list_insert(self._channel, path, index, value)
+
+    def list_delete(self, path: Path, index: int) -> bytes:
+        with self._lock:
+            return self._client.list_delete(self._channel, path, index)
+
+    def list_len(self, path: Path) -> Optional[int]:
+        with self._lock:
+            return self._client.list_len(self._channel, path)
+
+    def list_get(self, path: Path, index: int) -> Optional[bytes]:
+        with self._lock:
+            return self._client.list_get(self._channel, path, index)
+
+    def text_insert(self, path: Path, index: int, text: str) -> bytes:
+        with self._lock:
+            return self._client.text_insert(self._channel, path, index, text)
+
+    def text_delete(self, path: Path, index: int, count: int) -> bytes:
+        with self._lock:
+            return self._client.text_delete(self._channel, path, index, count)
+
+    def text_len(self, path: Path) -> Optional[int]:
+        with self._lock:
+            return self._client.text_len(self._channel, path)
+
+    def text_get(self, path: Path) -> Optional[str]:
+        with self._lock:
+            return self._client.text_get(self._channel, path)
+
+    def set_blob(self, path: Path, mime: str, bytes_: bytes) -> Optional[bytes]:
+        with self._lock:
+            return self._client.set_blob(self._channel, path, mime, bytes_) or None
+
+    def set_blob_ref(self, path: Path, blob_id: bytes, mime: str, size: int) -> bytes:
+        with self._lock:
+            return self._client.set_blob_ref(self._channel, path, blob_id, mime, size)
+
+    def xml_element(self, path: Path, tag: bytes) -> bytes:
+        with self._lock:
+            return self._client.xml_element(self._channel, path, tag)
+
+    def xml_fragment(self, path: Path) -> bytes:
+        with self._lock:
+            return self._client.xml_fragment(self._channel, path)
+
+    def xml_insert_element(self, elem_path: Path, index: int, tag: bytes) -> bytes:
+        with self._lock:
+            return self._client.xml_insert_element(self._channel, elem_path, index, tag)
+
+    def xml_insert_text(self, elem_path: Path, index: int, text: str) -> bytes:
+        with self._lock:
+            return self._client.xml_insert_text(self._channel, elem_path, index, text)
+
+    def xml_child_delete(self, elem_path: Path, index: int) -> bytes:
+        with self._lock:
+            return self._client.xml_child_delete(self._channel, elem_path, index)
+
+    def xml_move(
+        self, parent: Path, child_index: int, new_parent: Path, dest_index: int
+    ) -> bytes:
+        with self._lock:
+            return self._client.xml_move(
+                self._channel, parent, child_index, new_parent, dest_index
+            )
+
+    def _mark_encoded(
+        self,
+        seq_path: Path,
+        start_index: int,
+        start_side: Side,
+        end_index: int,
+        end_side: Side,
+        name: bytes,
+        scalar: bytes,
+    ) -> Tuple[Optional[bytes], bytes]:
+        with self._lock:
+            return self._client._mark_encoded(
+                self._channel,
+                seq_path,
+                start_index,
+                start_side,
+                end_index,
+                end_side,
+                name,
+                scalar,
+            )
+
+    def _mark_set_value_encoded(self, mark_id: bytes, scalar: bytes) -> bytes:
+        with self._lock:
+            return self._client._mark_set_value_encoded(self._channel, mark_id, scalar)
+
+    def mark_delete(self, mark_id: bytes) -> bytes:
+        with self._lock:
+            return self._client.mark_delete(self._channel, mark_id)
+
+    def begin_atomic(self) -> None:
+        with self._lock:
+            self._client.begin_atomic(self._channel)
+
+    def commit_atomic(self) -> bytes:
+        with self._lock:
+            return self._client.commit_atomic(self._channel)
+
+    def apply(self, ops: bytes) -> int:
+        raise RuntimeError(
+            "crdtsync: a networked document syncs through its provider, not apply_update"
+        )
+
+    def close(self) -> None:
+        """The provider owns the session's lifetime, so a doc going away leaves
+        the connection alone."""
+
+
+class Provider:
+    """A networked sync binding: it owns a WebSocket to a crdtsync server and
+    keeps :attr:`doc` in sync with one room.
+
+    Constructing one starts connecting in the background; :meth:`wait_connected`
+    (or the :func:`connect` helper) blocks until the room's initial state has
+    synced. The provider drives the handshake (protocol header → ``Hello`` →
+    ``Auth`` → ``Subscribe``), catch-up, and — on a dropped socket — reconnection
+    with backoff, resuming the channel from its caught-up position and resending
+    the unacknowledged outbox, so edits made while offline converge once the link
+    returns.
+
+    Callbacks (doc reactivity, :meth:`on_state`, and the server-signal hooks) run
+    on the provider's reader thread, not the caller's.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        room: Key,
+        *,
+        client_id: Optional[bytes] = None,
+        credential: Optional[Union[str, bytes]] = None,
+        reconnect: bool = True,
+        max_reconnect_delay: float = 10.0,
+        connect_timeout: float = 15.0,
+        on_error: "Optional[Callable[[ErrorCode], None]]" = None,
+        on_ops_rejected: "Optional[Callable[[List[Rejected]], None]]" = None,
+        on_redirect: "Optional[Callable[[List[Redirect]], None]]" = None,
+        transport: "Optional[Callable[[str], object]]" = None,
+    ):
+        self._url = url
+        self._lock = threading.RLock()
+        self._client = Client(client_id if client_id is not None else os.urandom(16))
+        self._room = _key_bytes(room)
+        self._channel, self._subscribe_frame = self._client.subscribe(self._room)
+        self._credential = _ANONYMOUS if credential is None else _key_bytes(credential)
+        self._reconnect = reconnect
+        self._max_reconnect_delay = max_reconnect_delay
+        self._connect_timeout = connect_timeout
+        self._on_error = on_error
+        self._on_ops_rejected = on_ops_rejected
+        self._on_redirect = on_redirect
+        self._transport = transport if transport is not None else _websocket.connect
+
+        self.doc = Doc._networked(
+            _ClientBackend(self._client, self._channel, self._lock), self._send_if_open
+        )
+
+        # "auth" awaits the AuthOk that opens a socket, "catchup" the subscribe
+        # reply that lands the room's initial state, "ready" is synced.
+        self._phase = "auth"
+        self._state = "connecting"
+        self._state_listeners: List[Callable[[str], None]] = []
+        self._ws: "Optional[object]" = None
+        self._closed = False
+        self._connected_once = False
+        self._attempt = 0
+        self._failure: Optional[BaseException] = None
+        self._settled = threading.Event()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="crdtsync-provider", daemon=True
+        )
+        self._thread.start()
+
+    # --- app surface ---
+
+    @property
+    def state(self) -> str:
+        """The connection state: ``"connecting"``, ``"connected"``, or
+        ``"disconnected"``."""
+        return self._state
+
+    @property
+    def outbox_len(self) -> int:
+        """How many authored ops await the server's acknowledgement — the edits a
+        reconnect resends."""
+        with self._lock:
+            return self._client.outbox_len(self._channel)
+
+    @property
+    def actor(self) -> Optional[bytes]:
+        """The server-derived actor for this connection, or ``None`` before the
+        first ``AuthOk``."""
+        with self._lock:
+            return self._client.actor()
+
+    def wait_connected(self, timeout: Optional[float] = None) -> None:
+        """Block until the room's initial state has synced. Raises if the first
+        connection fails — a server error, a refused socket with reconnect off, a
+        :meth:`close` before it synced — or ``TimeoutError`` if it does not sync
+        within ``timeout`` (defaulting to the provider's ``connect_timeout``)."""
+        limit = self._connect_timeout if timeout is None else timeout
+        if not self._settled.wait(limit):
+            raise TimeoutError("crdtsync: timed out waiting for the initial sync")
+        if self._failure is not None:
+            raise self._failure
+
+    def on_state(self, callback: Callable[[str], None]) -> Callable[[], None]:
+        """Observe connection-state changes; returns a function that unsubscribes."""
+        self._state_listeners.append(callback)
+
+        def off() -> None:
+            try:
+                self._state_listeners.remove(callback)
+            except ValueError:
+                pass
+
+        return off
+
+    def set_awareness(self, key: Key, value: Union[str, bytes]) -> None:
+        """Publish an ephemeral awareness entry (presence) for this client."""
+        with self._lock:
+            frame = self._client.set_awareness(
+                self._channel, _key_bytes(key), _key_bytes(value)
+            )
+        self._send_if_open(frame)
+
+    def awareness(self, actor: bytes, key: Key) -> Optional[bytes]:
+        """A peer's awareness entry by publishing ``actor`` and ``key``, or
+        ``None`` when that peer has published none."""
+        with self._lock:
+            return self._client.awareness(self._channel, actor, _key_bytes(key))
+
+    def awareness_len(self) -> int:
+        """How many awareness entries the room currently holds."""
+        with self._lock:
+            return self._client.awareness_len(self._channel)
+
+    def close(self) -> None:
+        """Close the connection and stop reconnecting. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        self._wake.set()
+        ws = self._ws
+        if ws is not None:
+            ws.close()
+        self._set_state("disconnected")
+        self._reject(ConnectionError("crdtsync: closed before it synced"))
+        # The reader thread holds the native session; only release it once that
+        # thread is provably done with it. Calling close() from a callback runs
+        # on that very thread, so it can only unwind — the session is freed when
+        # the provider is collected.
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=5.0)
+            if not self._thread.is_alive():
+                self._client.close()
+
+    def __enter__(self) -> "Provider":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    # --- connection loop (reader thread) ---
+
+    def _run(self) -> None:
+        while not self._closed:
+            self._set_state("connecting")
+            self._phase = "auth"
+            try:
+                ws = self._transport(self._url)
+            except Exception:  # noqa: BLE001 — any dial failure is a retry
+                ws = None
+            if ws is not None:
+                self._ws = ws
+                try:
+                    self._open(ws)
+                    while not self._closed:
+                        data = ws.recv()
+                        if data is None:
+                            break
+                        self._on_message(data)
+                except (OSError, _websocket.WebSocketError):
+                    pass  # a dropped socket: fall through to the reconnect
+                finally:
+                    self._ws = None
+                    ws.close()
+            self._set_state("disconnected")
+            if self._closed or not self._reconnect:
+                break
+            self._attempt += 1
+            if self._wake.wait(
+                min(self._max_reconnect_delay, 0.25 * 2 ** (self._attempt - 1))
+            ):
+                break
+        self._reject(ConnectionError("crdtsync: the connection closed before it synced"))
+
+    def _open(self, ws) -> None:
+        with self._lock:
+            hello = self._client.hello()
+            auth = self._client.auth(self._credential)
+        ws.send(_protocol_header())
+        ws.send(hello)
+        ws.send(auth)
+
+    def _on_message(self, data: bytes) -> None:
+        if self._phase == "auth":
+            # The first frame on any socket is the AuthOk (or a server Error).
+            # Once it folds cleanly this socket has authenticated — send Subscribe
+            # (or Resume on a reconnect) and replay the outbox. `actor()` can't
+            # gate this: it stays set across reconnects, so it would pass before
+            # the new socket re-authenticates.
+            err = self._receive(data)
+            if err is not None:
+                self._handle_server_error(err)
+                return
+            self._send_if_open(
+                self._resume_frame() if self._connected_once else self._subscribe_frame
+            )
+            self._resend_outbox()
+            if self._connected_once:
+                # The replica persists across the drop; deltas stream as ops.
+                self._mark_connected()
+            else:
+                self._phase = "catchup"
+            return
+
+        # Bracket the fold so the doc's diff-based reactivity fires for inbound ops.
+        folded: List[Optional[ErrorCode]] = []
+        self.doc._apply_remote(lambda: folded.append(self._receive(data)))
+        err = folded[0] if folded else None
+        if err is not None:
+            self._handle_server_error(err)
+        self._drain_signals()
+
+        # The subscribe reply lands the room's initial state; a frame the session
+        # refused (an unknown channel) never advances the catch-up.
+        if self._phase == "catchup":
+            self._mark_connected()
+
+    def _receive(self, data: bytes) -> "Optional[ErrorCode]":
+        """Fold one inbound frame; return the server ``ErrorCode`` when it was an
+        Error frame rather than an applicable message."""
+        try:
+            with self._lock:
+                self._client.receive(data)
+            return None
+        except ServerError as err:
+            return err.code
+
+    def _handle_server_error(self, code: "ErrorCode") -> None:
+        if not self._connected_once:
+            # A handshake-time error (bad auth, unsupported version) is fatal.
+            self._fatal(ServerError(code))
+        elif self._on_error is not None:
+            self._on_error(code)
+
+    def _drain_signals(self) -> None:
+        with self._lock:
+            rejected = self._client.take_rejected()
+            redirects = self._client.take_redirects()
+        if rejected and self._on_ops_rejected is not None:
+            self._on_ops_rejected(rejected)
+        if redirects and self._on_redirect is not None:
+            self._on_redirect(redirects)
+
+    def _resume_frame(self) -> bytes:
+        with self._lock:
+            return self._client.resume(self._channel) or self._subscribe_frame
+
+    def _resend_outbox(self) -> None:
+        with self._lock:
+            frame = (
+                self._client.resend(self._channel)
+                if self._client.outbox_len(self._channel) > 0
+                else b""
+            )
+        self._send_if_open(frame)
+
+    def _mark_connected(self) -> None:
+        self._phase = "ready"
+        self._connected_once = True
+        self._attempt = 0
+        self._set_state("connected")
+        self._resolve()
+
+    def _send_if_open(self, frame: bytes) -> None:
+        ws = self._ws
+        if not frame or ws is None:
+            return
+        try:
+            ws.send(frame)
+        except (OSError, _websocket.WebSocketError):
+            # The reader sees the same drop and reconnects; the outbox still
+            # holds the edit, so the resend covers it.
+            pass
+
+    def _fatal(self, err: BaseException) -> None:
+        self._closed = True
+        self._wake.set()
+        ws = self._ws
+        if ws is not None:
+            ws.close()
+        self._reject(err)
+
+    def _resolve(self) -> None:
+        self._settled.set()
+
+    def _reject(self, err: BaseException) -> None:
+        if self._settled.is_set():
+            return
+        self._failure = err
+        self._settled.set()
+
+    def _set_state(self, state: str) -> None:
+        if state == self._state:
+            return
+        self._state = state
+        for listener in list(self._state_listeners):
+            listener(state)
+
+
+def connect(url: str, room: Key, **options) -> Provider:
+    """Open a :class:`Provider` on ``room`` at ``url`` and return it once the
+    room's initial state has synced. Takes the same options as
+    :class:`Provider`; a failed connection closes the provider and raises."""
+    provider = Provider(url, room, **options)
+    try:
+        provider.wait_connected()
+    except BaseException:
+        provider.close()
+        raise
+    return provider

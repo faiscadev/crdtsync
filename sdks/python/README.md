@@ -46,14 +46,35 @@ atomic transactions (`doc.transact`), blobs, and XML with tree-move.
 
 ### Sync
 
-`Provider(doc, send)` is an offline-first binding over the doc's apply/emit seam:
-the app supplies the transport, the provider owns the connection state and an
-offline outbox that flushes on reconnect.
+`connect(url, room)` opens a networked `Provider`: it owns a WebSocket to a
+crdtsync server (no third-party dependency — the client is in the standard
+library), drives the handshake, catch-up, and reconnection, and backs `.doc`
+with that room's replica. Edits frame themselves for the wire; inbound frames
+fold in and fire the doc's reactivity.
 
 ```python
-from crdtsync import Provider
-p = Provider(doc, send=my_socket.send, connected=True)  # forwards local ops
-p.receive(incoming_ops)                                  # folds a peer's ops
+from crdtsync import connect
+
+p = connect("ws://localhost:9000", "my-room")   # blocks until the room syncs
+p.doc.get_text("body").insert(0, "hello")       # framed, outboxed, sent
+p.set_awareness("cursor", "10")                 # ephemeral presence
+p.on_state(print)                               # connecting / connected / disconnected
+p.close()
+```
+
+Edits made while the socket is down wait in the outbox (`p.outbox_len`) and are
+resent when the provider reconnects and resumes the channel. Server signals reach
+the app through `on_error` (an `ErrorCode`, `UPDATE_REQUIRED` being the
+update-required push), `on_ops_rejected`, and `on_redirect`.
+
+`LocalProvider(doc, send)` is the embedded counterpart for an app that owns its
+own transport: the same connection state and offline outbox over a local doc's
+apply/emit seam.
+
+```python
+from crdtsync import LocalProvider
+p = LocalProvider(doc, send=my_socket.send, connected=True)  # forwards local ops
+p.receive(incoming_ops)                                       # folds a peer's ops
 ```
 
 ## Low-level path API
