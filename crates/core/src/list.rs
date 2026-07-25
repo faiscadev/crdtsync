@@ -20,11 +20,17 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The most ids one encoded run record may cover. The encoder splits a longer
-/// run into chained records, so a record above this is malformed. It bounds the
-/// record shape, not memory: a run costs one `DeadRun` however many ids it
-/// covers, so decode allocates per record — and the record count is bounded by
-/// the input length — leaving no ratio for a decompression bomb to exploit. A
-/// sequence's total deleted count is therefore deliberately unbounded: a
+/// run into chained records, so a record above this is malformed — and this cap
+/// is what makes that split safe to invert. **Do not relax it.** It carries two
+/// duties. It keeps decode canonical: a decoded run welds its records back, and
+/// re-encoding re-splits on the same boundaries only because every record it
+/// came from was capped here. And it bounds re-encode work: the split loop runs
+/// `len / MAX_TOMBSTONE_RUN` times, so capping each record keeps that at most
+/// the number of records the run was built from — linear in the input, with no
+/// ratio for a crafted stream to exploit.
+///
+/// A sequence's *total* deleted count is deliberately unbounded. A run costs one
+/// `DeadRun` however many ids it covers, so nothing amplifies with it, and a
 /// long-lived document must be able to load its own snapshot back.
 const MAX_TOMBSTONE_RUN: u32 = 1 << 20;
 

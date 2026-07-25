@@ -14,7 +14,7 @@ use crdtsync_core::elementid::{ElementId, ElementKind};
 use crdtsync_core::{path, Element, List, Op, Scalar, Text, UndoManager};
 
 mod common;
-use common::{cid, default_id, eid, stmp};
+use common::{cid, dead_run_snapshot, default_id, eid, stmp};
 
 /// Sequence lengths the representation assertions need to be convincing. Miri
 /// interprets every tree walk, so it runs the same shapes at a smaller size —
@@ -371,34 +371,6 @@ fn the_sequence_encoding_is_unchanged_by_the_in_memory_collapse() {
     assert_eq!(hex(&t.encode_state()), "00000000000000020000000000000002060000000100000000000000010000000000000000000000000000000000026800000000000000000102000000000000000100000000000000000000000000000000000265000000000000000101000000000000000100000000000000000000000000000000010800000000000000010000000000000000000000000000000000026f0000000000000001070000000000000001000000000000000000000000000000000109000000000000000100000000000000000000000000000000000272000000000000000108000000000000000100000000000000000000000000000000010a00000000000000010000000000000000000000000000000000026c000000000000000109000000000000000100000000000000000000000000000000010b00000000000000010000000000000000000000000000000000026400000000000000010a00000000000000010000000000000000000000000000000001010000000300000000000000010000000000000000000000000000000005000000010200000000000000010000000000000000000000000000000001");
 }
 
-/// Assemble a list snapshot holding no live items and the given chained run
-/// records — the shape the encoder emits once a run passes the per-record cap.
-/// Written out by hand so a run of any length can be exercised without paying
-/// for the inserts: an id count is what the representation is meant to make free.
-fn chained_run_snapshot(id: ElementId, client: u8, chunks: &[(u64, u32)]) -> Vec<u8> {
-    fn put_stamp(out: &mut Vec<u8>, lamport: u64, client: u8) {
-        out.extend_from_slice(&lamport.to_le_bytes());
-        out.extend_from_slice(&cid(client).as_bytes());
-        out.push(0); // offset absent
-    }
-
-    let mut out = id.as_bytes().to_vec();
-    out.extend_from_slice(&0u32.to_le_bytes()); // no live items
-    out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
-    for (i, (lamport, len)) in chunks.iter().enumerate() {
-        put_stamp(&mut out, *lamport, client);
-        out.extend_from_slice(&len.to_le_bytes());
-        if i == 0 {
-            out.push(0); // no parent: the run heads the sequence
-        } else {
-            out.push(1);
-            put_stamp(&mut out, lamport - 1, client);
-        }
-        out.push(1); // Side::Right
-    }
-    out
-}
-
 #[test]
 fn a_run_longer_than_one_record_welds_back_on_decode() {
     // The encoder chains records past the per-record cap; decode must weld them
@@ -408,8 +380,13 @@ fn a_run_longer_than_one_record_welds_back_on_decode() {
     // unbounded: a run costs one record, so a long-lived document reaches counts
     // no per-id budget could carry, and it must still load its own snapshot.
     const CAP: u64 = 1 << 20;
-    let chunks: Vec<(u64, u32)> = (0..5).map(|i| (1 + i * CAP, CAP as u32)).collect();
-    let bytes = chained_run_snapshot(eid(4, 4), 1, &chunks);
+    let chunks: Vec<(crdtsync_core::Stamp, u32, Option<crdtsync_core::Stamp>)> = (0..5)
+        .map(|i| {
+            let parent = (i > 0).then(|| stmp(i * CAP, 1));
+            (stmp(1 + i * CAP, 1), CAP as u32, parent)
+        })
+        .collect();
+    let bytes = dead_run_snapshot(eid(4, 4), &chunks);
 
     let back = List::decode_state(&bytes).unwrap();
     assert!(back.is_empty());
