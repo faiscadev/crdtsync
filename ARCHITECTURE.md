@@ -549,6 +549,16 @@ Each user's undo stack contains intentions (op groups) the user authored. Undo r
 
 Global undo (revert anyone's op regardless of author) is **not** supported — produces broken UX in collaborative settings. Apps that want "revert someone else's change" build it as a deliberate edit feature, not undo.
 
+## Undo for the ergonomic handle-graph SDKs (design resolved, human, 2026-07-25)
+
+The ergonomic handle-graph SDKs (§SDK-Ergonomic-Surface) edit through a `mutate` flow that doesn't route through the legacy `UndoManager` (which only records edits made through *its own* methods, covers a subset of ops, and is local-only). The resolved design: **inversion lives in the shared core**, exactly like every other op-semantic (merge, tree-move, marks) — never reimplemented per SDK language (three divergent inverters would violate the thin-SDK principle and risk non-convergence). Concretely:
+
+- **Core record-seam.** The core records every *applied* edit into a per-document, per-channel undo stack, extending the existing `UndoManager` inversion to **all op kinds** (register/scalar/counter/map/list/text/xml/mark/blob-ref, root or nested) and to the networked (`Client`-channel) path, so undo works over a live connection, not just an offline doc. Inversion produces ordinary forward inverse ops (no server-side undo state, no wire change) that converge on peers like any edit.
+- **Origin / scope selection.** Which edit to invert is chosen by an **origin/scope tag** (Yjs-style): the SDK asks the core stack to "undo the last intention from origin X" — so a user undoes *their* edits, not a collaborator's, and an app can scope an undo manager to a subtree. The selection layer is the good idea from the observer approach; the inversion mechanism stays in core.
+- **Thin SDK handle.** Each SDK (JS/Python/Go) exposes a small undo handle (`undo()`/`redo()`/`canUndo`/`canRedo`, origin-scoped) over the core stack — no per-language inversion logic. Atomic transactions undo as one intention (existing `atomic_group` semantics).
+
+Rejected: an SDK-layer origin-filtered *inverter* (Yjs-style, but Yjs is single-language) — it would put op-inversion in each SDK, fragmenting convergence across three languages, contradicting the core-owns-semantics principle.
+
 Inverse ops emit into the normal op stream. Ops that overwrite or delete state require prior-state capture at op creation time.
 
 Auto-grouping on debounced gaps (>500ms idle = boundary by default). Manual begin / end intention for explicit grouping (paste, paragraph break).
