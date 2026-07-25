@@ -20,7 +20,7 @@ use cookie::Cookie;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::{
     decode_header, decode_message, encode_header, encode_message, ClientId, Document, ErrorCode,
-    Message,
+    Message, SUPPORTED_CODECS,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -908,6 +908,7 @@ async fn connect_peer(url: &str, server: ClientId) -> Option<(PeerWrite, PeerRea
         client: server,
         app_id: Vec::new(),
         schema_version: 0,
+        codecs: SUPPORTED_CODECS.to_vec(),
     };
     write
         .send(WsMessage::Binary(encode_message(&hello)))

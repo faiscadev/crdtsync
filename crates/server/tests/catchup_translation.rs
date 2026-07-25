@@ -100,6 +100,7 @@ fn hello(r: &mut Registry, client: u8, app: &[u8], version: u32) -> ConnId {
             client: cid(client),
             app_id: app.to_vec(),
             schema_version: version,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

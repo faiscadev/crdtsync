@@ -15,7 +15,8 @@ use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::zone;
 use crdtsync_core::{
-    BranchInfo, Channel, ClientId, DiffKind, Document, ElementId, ErrorCode, Message, Op, OpKind,
+    select_codec, BranchInfo, Channel, ClientId, DiffKind, Document, ElementId, ErrorCode, Message,
+    Op, OpKind, CODEC_V1,
 };
 
 use crdtsync_core::schema::Schema;
@@ -87,6 +88,9 @@ pub struct Session {
     /// The registered schema version this connection is enforced at, resolved at
     /// Hello; `None` for a relay connection (no app, or an unregistered app).
     schema_version: Option<u32>,
+    /// The codec this connection speaks, selected at Hello from what the client
+    /// advertised. [`CODEC_V1`] for a client that advertised none.
+    codec: u32,
 }
 
 impl Session {
@@ -97,6 +101,7 @@ impl Session {
             channels: HashMap::new(),
             app_id: Vec::new(),
             schema_version: None,
+            codec: CODEC_V1,
         }
     }
 
@@ -111,6 +116,7 @@ impl Session {
             channels: HashMap::new(),
             app_id: Vec::new(),
             schema_version: None,
+            codec: CODEC_V1,
         }
     }
 
@@ -130,6 +136,13 @@ impl Session {
     /// an app that never registered a schema).
     pub fn schema_version(&self) -> Option<u32> {
         self.schema_version
+    }
+
+    /// The codec this connection speaks, selected at Hello out of what the client
+    /// advertised. [`CODEC_V1`] before the handshake, and for a client that
+    /// advertised nothing.
+    pub fn codec(&self) -> u32 {
+        self.codec
     }
 
     /// The server-derived actor for this connection, once it is authenticated —
@@ -269,10 +282,28 @@ pub fn step(
             client,
             app_id,
             schema_version,
+            codecs,
         } => {
             if session.client.is_some() {
                 return violation("already said hello");
             }
+            // Settle the codec before anything else: a client that shares none
+            // with this build cannot be answered in bytes it can read, so it is
+            // refused here rather than served a frame it would misdecode. An
+            // empty advertisement settles on the one codec that predates
+            // negotiation and is answered no selection frame.
+            let Some(codec) = select_codec(&codecs) else {
+                return Response {
+                    replies: vec![Message::Error {
+                        code: ErrorCode::UnsupportedVersion,
+                        message: "no mutually supported codec".to_string(),
+                        details: Vec::new(),
+                    }],
+                    close: true,
+                    ..Response::default()
+                };
+            };
+            let selection = (!codecs.is_empty()).then_some(Message::CodecSelected { codec });
             // Resolve the app declaration against the registry: a registered app
             // for which the client asked a version the server does not hold is
             // refused and the connection closes; a relay or a known version
@@ -316,8 +347,9 @@ pub fn step(
             };
             session.app_id = app_id;
             session.client = Some(client);
+            session.codec = codec;
             Response {
-                replies: advert.into_iter().collect(),
+                replies: selection.into_iter().chain(advert).collect(),
                 ..Response::default()
             }
         }
@@ -721,6 +753,8 @@ pub fn step(
         Message::Error { .. } => violation("client sent an error"),
         Message::AuthOk { .. } => violation("client sent an authok"),
         Message::SchemaAdvert { .. } => violation("client sent a schema advert"),
+        // The codec selection is the server's own answer to an advertisement.
+        Message::CodecSelected { .. } => violation("client sent a codec selection"),
         // The client reports its applied sequence; recording it into the
         // per-client GC watermark is the next unit. Until then the report is
         // accepted and ignored rather than treated as a violation — a

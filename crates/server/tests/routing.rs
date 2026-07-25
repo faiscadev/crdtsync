@@ -94,6 +94,7 @@ fn handshake(h: &mut Hub, s: &mut Session, client: u8) {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     st(
@@ -349,6 +350,7 @@ fn registry_redirects_a_non_led_subscribe() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -384,6 +386,7 @@ fn registry_without_membership_serves_locally() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

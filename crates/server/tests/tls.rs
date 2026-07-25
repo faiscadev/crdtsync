@@ -169,6 +169,7 @@ async fn a_wire_frame_round_trips_over_the_encrypted_stream() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -476,6 +477,7 @@ async fn cert_authok_actor(ws: &mut Tls) -> Vec<u8> {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -553,6 +555,7 @@ async fn an_acl_decision_is_keyed_on_the_cert_actor() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -633,6 +636,7 @@ async fn a_server_with_no_client_ca_still_accepts_a_certless_client() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -690,6 +694,7 @@ async fn a_request_mode_certless_client_connects_and_authenticates_in_band() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;

@@ -127,6 +127,7 @@ fn auth(r: &mut Registry, client: u8, cred: &str, app: &[u8]) -> ConnId {
             client: cid(client),
             app_id: app.to_vec(),
             schema_version: 1,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

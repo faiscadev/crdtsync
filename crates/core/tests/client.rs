@@ -101,6 +101,7 @@ fn declaring_an_app_carries_it_and_the_version_into_hello() {
             client,
             app_id,
             schema_version,
+            ..
         } => {
             assert_eq!(client, cid(1));
             assert_eq!(app_id, b"app-x");
@@ -793,7 +794,8 @@ fn a_client_only_message_from_the_server_is_a_violation() {
         session.receive(Message::Hello {
             client: cid(2),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }),
         Err(ClientError::UnexpectedMessage(_))
     ));

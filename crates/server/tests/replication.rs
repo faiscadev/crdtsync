@@ -74,6 +74,7 @@ fn client(r: &mut Registry) -> ConnId {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     r.deliver(
@@ -463,6 +464,7 @@ async fn a_follower_applies_a_replicate_over_the_socket_and_acks() {
             client: cid(0xEE),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -549,6 +551,7 @@ async fn a_leader_dials_a_follower_and_sends_a_replicate() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;

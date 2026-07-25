@@ -96,6 +96,7 @@ fn hello_round_trips() {
         client: cid(9),
         app_id: Vec::new(),
         schema_version: 0,
+        codecs: Vec::new(),
     });
     // An enforcing connection naming its app and the version it speaks — the
     // fields survive the wire so the server can resolve them.
@@ -103,6 +104,7 @@ fn hello_round_trips() {
         client: cid(9),
         app_id: b"acme-notes".to_vec(),
         schema_version: 7,
+        codecs: Vec::new(),
     });
 }
 
@@ -461,6 +463,7 @@ fn a_truncated_message_is_an_error() {
         client: cid(9),
         app_id: Vec::new(),
         schema_version: 0,
+        codecs: Vec::new(),
     });
     assert_eq!(
         decode_message(&bytes[..bytes.len() - 1]),
@@ -470,10 +473,8 @@ fn a_truncated_message_is_an_error() {
 
 #[test]
 fn trailing_bytes_after_a_fixed_message_are_an_error() {
-    let mut bytes = encode_message(&Message::Hello {
-        client: cid(9),
-        app_id: Vec::new(),
-        schema_version: 0,
+    let mut bytes = encode_message(&Message::Unsubscribe {
+        channel: Channel(3),
     });
     bytes.push(0);
     assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));

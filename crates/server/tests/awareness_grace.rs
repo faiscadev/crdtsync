@@ -43,6 +43,7 @@ fn hello_auth(r: &mut Registry, client: u8) -> ConnId {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -64,6 +65,7 @@ fn hello_auth_as(r: &mut Registry, client: u8, credential: &[u8]) -> ConnId {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -336,7 +338,8 @@ fn a_second_connection_asserting_a_live_client_cannot_steal_its_presence() {
         Message::Hello {
             client: cid(1),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     r.disconnect(intruder);
@@ -431,7 +434,8 @@ fn an_unauthenticated_socket_does_not_keep_a_departed_clients_presence() {
         Message::Hello {
             client: cid(1),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     r.disconnect(victim);
@@ -472,7 +476,8 @@ fn an_unauthenticated_hello_does_not_cancel_a_pending_sweep() {
         Message::Hello {
             client: cid(1),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
 

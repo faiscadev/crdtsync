@@ -238,6 +238,7 @@ fn the_registry_emits_connect_then_subscribe() {
             client: cid(1),
             app_id: b"app".to_vec(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -275,6 +276,7 @@ fn a_rejected_duplicate_subscribe_does_not_re_emit() {
             client: cid(1),
             app_id: b"app".to_vec(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

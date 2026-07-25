@@ -100,6 +100,7 @@ fn hello_auth_app(r: &mut Registry, client: u8, credential: &str, app: &[u8]) ->
             client: cid(client),
             app_id: app.to_vec(),
             schema_version: 1,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -325,6 +326,7 @@ fn a_relay_client_of_an_unregistered_app_falls_to_the_deployment_deny() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

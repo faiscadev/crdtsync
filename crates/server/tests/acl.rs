@@ -282,7 +282,8 @@ fn an_acl_gates_subscribe_when_set_on_the_registry() {
         Message::Hello {
             client: cid(1),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

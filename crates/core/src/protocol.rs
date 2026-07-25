@@ -1,10 +1,16 @@
 //! Wire protocol — the framed messages two replicas exchange over a connection.
 //!
 //! A connection opens with an 8-byte header: a 4-byte [`MAGIC`] identifying the
-//! protocol and a 4-byte version for codec negotiation. Every frame after that
-//! is one [`Message`]: a tag byte and a payload. Op batches reuse the op codec,
-//! so the wire and the durable log share one encoding. Decoding is total —
-//! malformed bytes yield a [`ProtocolError`], never a panic.
+//! protocol and a 4-byte [`PROTOCOL_VERSION`]. Every frame after that is one
+//! [`Message`]: a tag byte and a payload. Op batches reuse the op codec, so the
+//! wire and the durable log share one encoding. Decoding is total — malformed
+//! bytes yield a [`ProtocolError`], never a panic.
+//!
+//! The opening [`Message::Hello`] then negotiates the codec: the client
+//! advertises the versions it speaks, the server answers with the one it picked
+//! ([`Message::CodecSelected`]) and refuses an advertisement it shares nothing
+//! with. Exactly one codec exists today ([`CODEC_V1`]); the seam is what lets a
+//! later release add one without breaking a peer that only holds the older.
 
 use crate::clientid::ClientId;
 use crate::codec::{
@@ -18,6 +24,35 @@ pub const MAGIC: u32 = u32::from_le_bytes(*b"CRDT");
 
 /// The protocol version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The deterministic little-endian codec the wire and the durable log share —
+/// the only codec that exists, and the one a peer that advertises nothing is
+/// assumed to speak.
+pub const CODEC_V1: u32 = 1;
+
+/// Every codec version this build can encode and decode, ascending. A client
+/// advertises its own set in [`Message::Hello`] and the server answers with the
+/// one it picked ([`Message::CodecSelected`]), so a later release adds a codec
+/// here and still settles with a peer that only holds the older one.
+pub const SUPPORTED_CODECS: &[u32] = &[CODEC_V1];
+
+/// Pick the codec a connection speaks from the set a client advertised.
+///
+/// An empty advertisement names no codec — the peer speaks [`CODEC_V1`], which
+/// every build holds. Otherwise the highest version both ends support wins, so
+/// two peers that share several settle on the newest. `None` means the sets are
+/// disjoint: nothing the client sends could be decoded, so the connection is
+/// refused rather than guessed at.
+pub fn select_codec(advertised: &[u32]) -> Option<u32> {
+    if advertised.is_empty() {
+        return Some(CODEC_V1);
+    }
+    advertised
+        .iter()
+        .copied()
+        .filter(|codec| SUPPORTED_CODECS.contains(codec))
+        .max()
+}
 
 /// Why a byte string could not be decoded into a header or message.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -130,11 +165,22 @@ pub enum Message {
     /// version the client speaks; `0` declares none (a dynamic client that adopts
     /// whatever the server serves). The server resolves `{app_id, schema_version}`
     /// against its registry — an unknown version for a registered app is refused.
+    /// `codecs` advertises the binary codecs this client can speak; an empty set
+    /// names none and settles on [`CODEC_V1`], so a peer that predates
+    /// negotiation keeps connecting unchanged. The server answers a non-empty
+    /// advertisement with the [`CodecSelected`](Message::CodecSelected) it chose,
+    /// and refuses a set it shares nothing with.
     Hello {
         client: ClientId,
         app_id: Vec<u8>,
         schema_version: u32,
+        codecs: Vec<u32>,
     },
+    /// The server's answer to a codec advertisement: the one codec, out of what
+    /// the client offered, both ends speak from here on. Sent only to a client
+    /// that advertised — a peer that named no codec is already on [`CODEC_V1`]
+    /// and gets no extra frame.
+    CodecSelected { codec: u32 },
     /// Presents an opaque credential for the server to verify. The core does not
     /// parse it; a deployment-configured verifier interprets the bytes.
     Auth { credential: Vec<u8> },
@@ -493,11 +539,28 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             client,
             app_id,
             schema_version,
+            codecs,
         } => {
             put_u8(&mut out, 0);
             out.extend_from_slice(&client.as_bytes());
             put_bytes(&mut out, app_id);
             put_u32(&mut out, *schema_version);
+            // The advertisement is a trailing optional field: a client that names
+            // no codec omits it, so its Hello is byte-for-byte the frame a peer
+            // that predates negotiation writes and reads.
+            if !codecs.is_empty() {
+                put_u32(
+                    &mut out,
+                    u32::try_from(codecs.len()).expect("codec count exceeds u32"),
+                );
+                for codec in codecs {
+                    put_u32(&mut out, *codec);
+                }
+            }
+        }
+        Message::CodecSelected { codec } => {
+            put_u8(&mut out, 51);
+            put_u32(&mut out, *codec);
         }
         Message::Subscribe {
             channel,
@@ -855,11 +918,33 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
 pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
     let mut cur = Cursor::new(bytes);
     let msg = match cur.u8()? {
-        0 => Message::Hello {
-            client: cur.client()?,
-            app_id: cur.bytes()?,
-            schema_version: cur.u32()?,
-        },
+        0 => {
+            let client = cur.client()?;
+            let app_id = cur.bytes()?;
+            let schema_version = cur.u32()?;
+            // The advertisement is optional trailing: a frame that ends here names
+            // no codec, which is the peer that predates negotiation.
+            let codecs = if cur.at_end() {
+                Vec::new()
+            } else {
+                let count = cur.u32()?;
+                // Grow as versions are read rather than trusting `count` to size
+                // the allocation — a bogus count then fails on the missing bytes,
+                // not on a giant up-front reservation.
+                let mut codecs = Vec::new();
+                for _ in 0..count {
+                    codecs.push(cur.u32()?);
+                }
+                codecs
+            };
+            Message::Hello {
+                client,
+                app_id,
+                schema_version,
+                codecs,
+            }
+        }
+        51 => Message::CodecSelected { codec: cur.u32()? },
         1 => {
             let channel = Channel(cur.u32()?);
             let room = cur.bytes()?;

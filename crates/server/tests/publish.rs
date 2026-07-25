@@ -63,6 +63,7 @@ fn auth(r: &mut Registry, id: ConnId, client: u8) {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -323,6 +324,7 @@ fn seed_enforcing(r: &mut Registry) -> ConnId {
             client: cid(1),
             app_id: APP.to_vec(),
             schema_version: 1,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

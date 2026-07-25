@@ -265,6 +265,7 @@ fn join(r: &mut Registry, client: u8, credential: &str) -> ConnId {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

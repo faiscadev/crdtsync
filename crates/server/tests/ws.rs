@@ -161,6 +161,7 @@ async fn join(url: &str, client: u8) -> Ws {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -295,6 +296,7 @@ async fn a_real_verifier_makes_actor_policy_enforceable() {
             client: cid(2),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -328,6 +330,7 @@ async fn auth_expecting(url: &str, client: u8, credential: &[u8], actor: &[u8]) 
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -578,6 +581,7 @@ async fn a_credential_at_the_upgrade_skips_the_auth_phase() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -747,6 +751,7 @@ async fn a_registered_apps_unknown_version_is_refused_at_the_handshake() {
             client: cid(1),
             app_id: b"app-x".to_vec(),
             schema_version: 9,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -768,6 +773,7 @@ async fn a_registered_apps_unknown_version_is_refused_at_the_handshake() {
             client: cid(2),
             app_id: b"app-x".to_vec(),
             schema_version: 1,
+            codecs: Vec::new(),
         },
     )
     .await;
@@ -850,6 +856,7 @@ async fn a_registration_over_the_admin_plane_reaches_the_data_plane_handshake() 
             client: cid(1),
             app_id: b"app-x".to_vec(),
             schema_version: 9,
+            codecs: Vec::new(),
         },
     )
     .await;

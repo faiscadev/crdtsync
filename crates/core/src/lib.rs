@@ -62,8 +62,8 @@ pub use map::Map;
 pub use marks::{MarkState, ResolvedMark};
 pub use op::{Op, OpId, OpKind, Tx, TxId};
 pub use protocol::{
-    decode_header, decode_message, encode_header, encode_message, BranchInfo, Channel, DiffKind,
-    ErrorCode, MemberState, Message, ProtocolError,
+    decode_header, decode_message, encode_header, encode_message, select_codec, BranchInfo,
+    Channel, DiffKind, ErrorCode, MemberState, Message, ProtocolError, CODEC_V1, SUPPORTED_CODECS,
 };
 pub use ranged::{RangeAnchor, RangedElement, RangedInit, RangedPayload};
 pub use register::Register;

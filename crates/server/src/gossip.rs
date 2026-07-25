@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use crdtsync_core::protocol::PROTOCOL_VERSION;
 use crdtsync_core::{
-    decode_message, encode_header, encode_message, ClientId, MemberState, Message,
+    decode_message, encode_header, encode_message, ClientId, MemberState, Message, SUPPORTED_CODECS,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::connect_async;
@@ -268,6 +268,7 @@ async fn relay_roundtrip<T>(
             client: server,
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: SUPPORTED_CODECS.to_vec(),
         };
         write
             .send(WsMessage::Binary(encode_message(&hello)))

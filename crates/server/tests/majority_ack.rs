@@ -71,6 +71,7 @@ fn client(r: &mut Registry) -> ConnId {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     r.deliver(
@@ -458,6 +459,7 @@ async fn open_client(addr: &str) -> Ws {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     )
     .await;

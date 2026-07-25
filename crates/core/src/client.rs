@@ -13,7 +13,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diff::{decode_changes, Change};
 use crate::doc::MapCursor;
-use crate::{BranchInfo, Channel, ClientId, DiffKind, Document, ElementId, ErrorCode, Message, Op};
+use crate::{
+    BranchInfo, Channel, ClientId, DiffKind, Document, ElementId, ErrorCode, Message, Op, CODEC_V1,
+    SUPPORTED_CODECS,
+};
 
 /// Why an inbound message could not be folded into a replica.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -26,6 +29,10 @@ pub enum ClientError {
     BadDiff,
     /// A routed frame named a channel this session does not hold.
     UnknownChannel(Channel),
+    /// The server selected a codec this build cannot speak. Every later frame
+    /// would decode wrong, so the session refuses the selection rather than read
+    /// bytes it cannot interpret.
+    UnsupportedCodec(u32),
     /// The server reported a failure.
     Server { code: ErrorCode, message: String },
 }
@@ -82,6 +89,10 @@ pub struct ClientSession {
     /// declared `schema_version`: a dynamic client declares 0 and learns the
     /// concrete version the server picked here. `None` until an advert arrives.
     active_schema: Option<(u32, Vec<u8>)>,
+    /// The codec this connection speaks. Opens at [`CODEC_V1`] — what a server
+    /// that answers no advertisement is on — and moves to whatever a
+    /// `CodecSelected` names.
+    codec: u32,
     rooms: HashMap<Channel, Room>,
     next_channel: u32,
     /// Op batches the server refused, awaiting the app's drain. Held at the
@@ -126,6 +137,7 @@ impl ClientSession {
             app_id: Vec::new(),
             schema_version: 0,
             active_schema: None,
+            codec: CODEC_V1,
             rooms: HashMap::new(),
             next_channel: 0,
             rejected: Vec::new(),
@@ -169,12 +181,20 @@ impl ClientSession {
         self.active_schema.as_ref().map(|(_, s)| s.as_slice())
     }
 
-    /// The opening frame, naming this replica and the app it speaks for.
+    /// The codec this connection speaks — [`CODEC_V1`] until a `CodecSelected`
+    /// names another.
+    pub fn codec(&self) -> u32 {
+        self.codec
+    }
+
+    /// The opening frame, naming this replica, the app it speaks for, and the
+    /// codecs it can speak.
     pub fn hello(&self) -> Message {
         Message::Hello {
             client: self.client,
             app_id: self.app_id.clone(),
             schema_version: self.schema_version,
+            codecs: SUPPORTED_CODECS.to_vec(),
         }
     }
 
@@ -647,6 +667,16 @@ impl ClientSession {
             }
             Message::AuthOk { actor } => {
                 self.actor = Some(actor);
+                Ok(())
+            }
+            // The server answers the Hello advertisement with the codec it picked.
+            // A selection outside what this build speaks is refused — decoding on
+            // a codec we do not hold would misread every later frame.
+            Message::CodecSelected { codec } => {
+                if !SUPPORTED_CODECS.contains(&codec) {
+                    return Err(ClientError::UnsupportedCodec(codec));
+                }
+                self.codec = codec;
                 Ok(())
             }
             // The server advertises the schema it serves this connection; record

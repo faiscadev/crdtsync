@@ -34,6 +34,7 @@ fn hello(app_id: &[u8], schema_version: u32) -> Message {
         client: cid(1),
         app_id: app_id.to_vec(),
         schema_version,
+        codecs: Vec::new(),
     }
 }
 
