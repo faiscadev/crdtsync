@@ -257,6 +257,42 @@ class TestConnectFailures:
             p.wait_connected()
         assert p.state == "disconnected"
 
+    def test_the_backoff_stays_finite_after_a_long_outage(self, transport):
+        # An unreachable server left overnight builds a large attempt count; an
+        # unclamped exponent becomes an integer too large to turn into a float,
+        # and the failure kills the reader thread rather than delaying it.
+        p = Provider("ws://fake", "room", transport=transport, max_reconnect_delay=10.0)
+        try:
+            p._attempt = 100_000
+            assert p._backoff() == 10.0
+        finally:
+            p.close()
+
+    def test_a_refused_reconnect_handshake_dials_again(self, transport):
+        seen = []
+        p = Provider(
+            "ws://fake",
+            "room",
+            transport=transport,
+            max_reconnect_delay=0.01,
+            on_error=seen.append,
+        )
+        try:
+            first = handshake(transport)
+            p.wait_connected(timeout=2.0)
+            first.close()
+
+            # The reconnect's credential is refused. A socket that will not
+            # authenticate never carries a Subscribe, so sitting on it would
+            # wedge the provider — it has to be dropped and retried.
+            second = transport.socket(1)
+            second.wait_sent(3)
+            second.deliver(error(ErrorCode.AUTH_FAILED))
+            transport.socket(2)
+            assert seen == [ErrorCode.AUTH_FAILED]
+        finally:
+            p.close()
+
     def test_a_refused_dial_keeps_retrying_when_reconnect_is_on(self):
         dials = []
 

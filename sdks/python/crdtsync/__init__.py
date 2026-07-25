@@ -2628,40 +2628,49 @@ class CrdtList:
 
     def insert(self, index: int, value) -> "CrdtList":
         """Insert a scalar item at a live ``index`` (clamped into range)."""
-        n = len(self)
-        if index < 0:
-            index = max(0, n + index)
-        index = min(index, n)
         item = _encode_value(value)
-        self._doc._mutate(lambda b: b.list_insert(self._self, index, item))
+        # The live length is resolved inside the edit, not before it: a remote
+        # fold between reading the length and authoring would place the item
+        # against a list that has since shifted.
+        self._doc._mutate(lambda b: b.list_insert(self._self, self._clamped(b, index), item))
         return self
 
     def append(self, value) -> "CrdtList":
         """Append a scalar item."""
-        return self.insert(len(self), value)
+        item = _encode_value(value)
+        self._doc._mutate(lambda b: b.list_insert(self._self, self._length(b), item))
+        return self
 
     def delete(self, index: int) -> "CrdtList":
         """Tombstone the live item at ``index``."""
-        idx = self._checked(index)
-        self._doc._mutate(lambda b: b.list_delete(self._self, idx))
+        self._doc._mutate(lambda b: b.list_delete(self._self, self._checked(b, index)))
         return self
 
     def __getitem__(self, index: int):
-        idx = self._checked(index)
-        item = self._doc._backend.list_get(self._self, idx)
+        backend = self._doc._backend
+        item = backend.list_get(self._self, self._checked(backend, index))
         if item is None:
             raise IndexError("list index out of range")
         return _decode_value(item)
 
     def __len__(self) -> int:
-        return self._doc._backend.list_len(self._self) or 0
+        return self._length(self._doc._backend)
 
     def __iter__(self):
         for i in range(len(self)):
             yield self[i]
 
-    def _checked(self, index: int) -> int:
-        n = len(self)
+    def _length(self, backend) -> int:
+        return backend.list_len(self._self) or 0
+
+    def _clamped(self, backend, index: int) -> int:
+        n = self._length(backend)
+        if index < 0:
+            index = max(0, n + index)
+        return min(index, n)
+
+    def _checked(self, backend, index: int) -> int:
+        n = self._length(backend)
         if index < 0:
             index += n
         if index < 0 or index >= n:
@@ -2917,8 +2926,11 @@ class Doc:
                         fn()
                         return
                     before = self._backend.encode_state() if self._observing() else None
-                    self._transacting = True
+                    # Only once the group is open: a begin that failed leaves
+                    # nothing to commit, and a flag set anyway would make every
+                    # later edit accumulate into a group that does not exist.
                     self._backend.begin_atomic()
+                    self._transacting = True
                     try:
                         fn()
                     finally:
@@ -3031,36 +3043,42 @@ class Doc:
 
     def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
         with self._gate:
-            with self._lock:
-                # Inside a transaction the edit just accumulates; the commit
-                # sends and publishes.
-                if self._transacting:
-                    run(self._backend)
-                    return b""
-                before = self._backend.encode_state() if self._observing() else None
-                ops = run(self._backend)
-                changes = self._collect(before) if ops else []
-                repairs = self._take_repairs() if ops else []
-            if ops:
-                self._send(ops)
-                self._publish("local", ops, changes)
-                self._publish_repairs(repairs)
+            ops, changes, repairs = b"", [], []
+            try:
+                with self._lock:
+                    # Inside a transaction the edit just accumulates; the commit
+                    # sends and publishes.
+                    if self._transacting:
+                        run(self._backend)
+                        return b""
+                    before = self._backend.encode_state() if self._observing() else None
+                    ops = run(self._backend)
+                    if ops:
+                        changes = self._collect(before)
+                        repairs = self._take_repairs()
+            finally:
+                # The ops are stamped into this replica and its outbox the moment
+                # `run` returns, so they have to reach the room even if reading
+                # the change set afterwards failed.
+                if ops:
+                    self._send(ops)
+                    self._publish("local", ops, changes)
+                    self._publish_repairs(repairs)
             return ops
 
-    def _apply_remote(self, receive: Callable[[], None]) -> None:
-        """Bracket a provider-driven inbound frame with the reactivity a local
-        edit gets: the replica the frame folds into is the backend's own, so the
-        change set is the before/after diff around it.
-
-        Listeners run after the replica lock is released. They are free to edit,
-        and an edit takes the author's gate — a listener holding the replica
-        while reaching for the gate would invert the two locks against every
-        application thread."""
+    def _fold_remote(self, receive: Callable[[], None]):
+        """Fold a provider-driven inbound frame into the replica, returning the
+        reactivity it produced for the caller to publish once the frame's other
+        work is done. Publishing here would run application listeners while the
+        replica lock is held, and a listener that edits reaches for the author's
+        gate — inverting the two locks against every application thread."""
         with self._lock:
             before = self._backend.encode_state() if self._observing() else None
             receive()
             changes = self._collect(before) if before is not None else []
-            repairs = self._take_repairs()
+            return changes, self._take_repairs()
+
+    def _publish_remote(self, changes: List[Tuple[bytes, dict]], repairs: List[list]) -> None:
         self._publish("remote", b"", changes)
         self._publish_repairs(repairs)
 
@@ -3447,6 +3465,7 @@ class Provider:
         # reply that lands the room's initial state, "ready" is synced.
         self._phase = "auth"
         self._state = "connecting"
+        self._state_lock = threading.Lock()
         self._state_listeners: List[Callable[[str], None]] = []
         self._ws: "Optional[object]" = None
         self._closed = False
@@ -3586,9 +3605,7 @@ class Provider:
             return
         self._closed = True
         self._wake.set()
-        ws = self._ws
-        if ws is not None:
-            ws.close()
+        self._drop_socket()
         self._set_state("disconnected")
         self._reject(ConnectionError("crdtsync: closed before it synced"))
         # The doc stays readable and the native session alive: the reader thread
@@ -3608,38 +3625,49 @@ class Provider:
     # --- connection loop (reader thread) ---
 
     def _run(self) -> None:
-        while not self._closed:
-            self._set_state("connecting")
-            self._bind_socket(None)
-            try:
-                ws = self._transport(self._url)
-            except Exception:  # noqa: BLE001 — any dial failure is a retry
-                ws = None
-            if ws is not None:
+        try:
+            while not self._closed:
+                self._set_state("connecting")
+                self._bind_socket(None)
                 try:
-                    self._bind_socket(ws)
-                    if self._closed:  # closed while the dial was in flight
-                        break
-                    self._open(ws)
-                    while not self._closed:
-                        data = ws.recv()
-                        if data is None:
+                    ws = self._transport(self._url)
+                except Exception:  # noqa: BLE001 — any dial failure is a retry
+                    ws = None
+                if ws is not None:
+                    try:
+                        self._bind_socket(ws)
+                        if self._closed:  # closed while the dial was in flight
                             break
-                        self._deliver(data)
-                except (OSError, _websocket.WebSocketError):
-                    pass  # a dropped socket: fall through to the reconnect
-                finally:
-                    self._bind_socket(None)
-                    ws.close()
+                        self._open(ws)
+                        while not self._closed:
+                            data = ws.recv()
+                            if data is None:
+                                break
+                            self._deliver(data)
+                    except (OSError, _websocket.WebSocketError):
+                        pass  # a dropped socket: fall through to the reconnect
+                    finally:
+                        self._bind_socket(None)
+                        ws.close()
+                if self._closed or not self._reconnect:
+                    break
+                self._set_state("disconnected")
+                if self._wake.wait(self._backoff()):
+                    break
+        finally:
+            # However the loop ended — a break, a close, an unexpected failure —
+            # the connection is gone and nobody is waiting on a sync any more.
             self._set_state("disconnected")
-            if self._closed or not self._reconnect:
-                break
-            self._attempt += 1
-            if self._wake.wait(
-                min(self._max_reconnect_delay, 0.25 * 2 ** (self._attempt - 1))
-            ):
-                break
-        self._reject(ConnectionError("crdtsync: the connection closed before it synced"))
+            self._reject(
+                ConnectionError("crdtsync: the connection closed before it synced")
+            )
+
+    def _backoff(self) -> float:
+        """The delay before the next dial: exponential, clamped. The exponent is
+        clamped too — an unreachable server left overnight would otherwise build
+        an integer too large to turn into a float."""
+        self._attempt = min(self._attempt + 1, 32)
+        return min(self._max_reconnect_delay, 0.25 * 2.0 ** (self._attempt - 1))
 
     def _bind_socket(self, ws) -> None:
         """Point the send path at ``ws`` (or at nothing) and reset the phase, as
@@ -3648,6 +3676,10 @@ class Provider:
         with self._send_lock:
             self._ws = ws
             self._phase = "auth"
+
+    def _set_phase(self, phase: str) -> None:
+        with self._send_lock:
+            self._phase = phase
 
     def _open(self, ws) -> None:
         with self._lock:
@@ -3662,13 +3694,18 @@ class Provider:
         return _websocket.connect(url, timeout=self._connect_timeout)
 
     def _deliver(self, data: bytes) -> None:
-        """Handle one inbound frame. A failure anywhere in it is reported and the
-        connection carries on — the alternative is a dead reader behind a state
-        that still reads ``connected``."""
+        """Handle one inbound frame. A frame this session cannot fold leaves the
+        replica behind the room, and carrying on would sync nothing while still
+        reporting a healthy connection — so the socket is dropped and the
+        reconnect's resume re-requests the stream from the last position it
+        actually applied."""
         try:
             self._on_message(data)
-        except Exception:
-            _LOGGER.exception("crdtsync: handling an inbound frame failed")
+        except Exception as err:
+            _LOGGER.exception("crdtsync: folding an inbound frame failed")
+            raise _websocket.WebSocketError(
+                f"crdtsync: the session could not fold a frame: {err}"
+            ) from err
 
     def _notify(self, callback, argument) -> None:
         """Hand a signal to an application hook. A hook that raises is its own
@@ -3690,7 +3727,14 @@ class Provider:
             # the new socket re-authenticates.
             err = self._receive(data)
             if err is not None:
+                # A socket that will not authenticate never carries a Subscribe,
+                # so it can only sit idle. The first connection fails outright;
+                # a later one is dropped so the reconnect can try again.
                 self._handle_server_error(err)
+                if not self._closed:
+                    raise _websocket.WebSocketError(
+                        f"crdtsync: the server refused the handshake (code {int(err)})"
+                    )
                 return
             self._write(
                 self._resume_frame() if self._connected_once else self._subscribe_frame
@@ -3699,18 +3743,16 @@ class Provider:
                 # The replica persists across the drop; deltas stream as ops.
                 self._mark_connected()
             else:
-                self._phase = "catchup"
+                self._set_phase("catchup")
             return
 
         # Bracket the fold so the doc's diff-based reactivity fires for inbound
-        # ops. Reactivity is the app's code: a listener that raises must not cost
-        # this frame its signal drain or the connection its initial sync, or the
-        # provider would sit at "catchup" forever, dropping every later edit.
+        # ops. A fold that fails propagates and drops the socket; publishing the
+        # reactivity is deferred to the end, because that is the app's code and a
+        # listener that raises must not cost this frame its signal drain or the
+        # connection its initial sync.
         folded: List[Optional[ErrorCode]] = []
-        try:
-            self.doc._apply_remote(lambda: folded.append(self._receive(data)))
-        except Exception:
-            _LOGGER.exception("crdtsync: folding an inbound frame failed")
+        changes, repairs = self.doc._fold_remote(lambda: folded.append(self._receive(data)))
         err = folded[0] if folded else None
         if err is not None:
             self._handle_server_error(err)
@@ -3722,6 +3764,10 @@ class Provider:
         # frame past the handshake completes the initial sync.
         if self._phase == "catchup":
             self._mark_connected()
+        try:
+            self.doc._publish_remote(changes, repairs)
+        except Exception:
+            _LOGGER.exception("crdtsync: a document listener raised")
 
     def _receive(self, data: bytes) -> "Optional[ErrorCode]":
         """Fold one inbound frame; return the server ``ErrorCode`` when it was an
@@ -3805,10 +3851,16 @@ class Provider:
     def _fatal(self, err: BaseException) -> None:
         self._closed = True
         self._wake.set()
-        ws = self._ws
+        self._drop_socket()
+        self._set_state("disconnected")
+        self._reject(err)
+
+    def _drop_socket(self) -> None:
+        """Shut the live socket down so a blocked reader returns."""
+        with self._send_lock:
+            ws = self._ws
         if ws is not None:
             ws.close()
-        self._reject(err)
 
     def _resolve(self) -> None:
         with self._settle_lock:
@@ -3825,10 +3877,15 @@ class Provider:
             self._settled.set()
 
     def _set_state(self, state: str) -> None:
-        if state == self._state:
-            return
-        self._state = state
-        for listener in list(self._state_listeners):
+        # The reader thread and an application thread both publish transitions,
+        # so the compare-and-set is guarded: two racing transitions must not both
+        # be announced, nor land in an order that contradicts the final state.
+        with self._state_lock:
+            if state == self._state:
+                return
+            self._state = state
+            listeners = list(self._state_listeners)
+        for listener in listeners:
             try:
                 listener(state)
             except Exception:
