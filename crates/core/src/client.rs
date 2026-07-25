@@ -91,8 +91,9 @@ pub struct ClientSession {
     active_schema: Option<(u32, Vec<u8>)>,
     /// The codec a `CodecSelected` named, or `None` while the server has answered
     /// no selection — which is itself an answer, [`CODEC_V1`]. Holding the
-    /// selection separately is what makes a second one a violation rather than a
-    /// mid-stream switch neither end agrees on the boundary of.
+    /// selection separately is what tells a selection that *changes* it, a
+    /// mid-stream switch neither end agrees on the boundary of, from one that
+    /// re-names it, which each reconnect's handshake produces.
     codec: Option<u32>,
     /// The failure that made this session unusable, once one has. A codec the
     /// server selected and this build cannot speak is unrecoverable — every later
@@ -189,7 +190,9 @@ impl ClientSession {
     }
 
     /// The codec this connection speaks — [`CODEC_V1`] until a `CodecSelected`
-    /// names another, since a server that answers no selection is on it too.
+    /// names another, since a server that answers no selection is on it too. A
+    /// session stranded on a codec it cannot speak answers nothing meaningful
+    /// here; it refuses every frame instead.
     pub fn codec(&self) -> u32 {
         self.codec.unwrap_or(CODEC_V1)
     }
