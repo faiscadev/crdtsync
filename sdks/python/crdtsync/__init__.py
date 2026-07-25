@@ -15,13 +15,14 @@ import contextlib
 import ctypes
 import enum
 import json
+import logging
 import os
 import platform
 import struct
 import threading
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable, List, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
 from . import _websocket
 
@@ -58,6 +59,8 @@ __all__ = [
     "encode_path",
     "upload_blob",
 ]
+
+_LOGGER = logging.getLogger("crdtsync")
 
 Path = List[bytes]
 
@@ -2889,10 +2892,15 @@ class Doc:
         """Run ``fn``'s edits as one atomic group — they apply together on every
         replica, ride the wire as a single batch, and fire one update. Nested calls
         flatten into the outermost transaction."""
-        if self._transacting:
-            fn()
-            return
+        outbound = b""
+        # The atomic group is state of the shared replica, not of the caller, so
+        # the whole transaction is one indivisible step: another thread's edit
+        # must queue behind it rather than be swept into the group, and its own
+        # transaction must not degrade into loose edits.
         with self._lock:
+            if self._transacting:
+                fn()
+                return
             before = self._backend.encode_state() if self._observing() else None
             self._transacting = True
             self._backend.begin_atomic()
@@ -2900,11 +2908,11 @@ class Doc:
                 fn()
             finally:
                 self._transacting = False
-                ops = self._backend.commit_atomic()
-                if ops:
-                    self._send(ops)
-                    self._dispatch("local", ops, before)
+                outbound = self._backend.commit_atomic()
+                if outbound:
+                    self._dispatch("local", outbound, before)
                     self._emit_repairs()
+        self._send(outbound)
 
     def on_update(self, callback: Callable[[UpdateEvent], None]) -> Callable[[], None]:
         """Subscribe to every applied change to the document; returns a function
@@ -2993,7 +3001,10 @@ class Doc:
         return bool(self._update_listeners) or bool(self._observers)
 
     def _send(self, ops: bytes) -> None:
-        if self._wire is not None:
+        # Always outside the replica lock: the wire write can block on a full
+        # send window, and holding the lock across it would stop the provider
+        # reading — including the peer's reads that would drain that window.
+        if ops and self._wire is not None:
             self._wire(ops)
 
     def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
@@ -3004,12 +3015,11 @@ class Doc:
                 return b""
             before = self._backend.encode_state() if self._observing() else None
             ops = run(self._backend)
-            if not ops:
-                return ops
-            self._send(ops)
-            self._dispatch("local", ops, before)
-            self._emit_repairs()
-            return ops
+            if ops:
+                self._dispatch("local", ops, before)
+                self._emit_repairs()
+        self._send(ops)
+        return ops
 
     def _apply_remote(self, receive: Callable[[], None]) -> None:
         """Bracket a provider-driven inbound frame with the reactivity a local
@@ -3337,8 +3347,12 @@ class Provider:
     the unacknowledged outbox, so edits made while offline converge once the link
     returns.
 
-    Callbacks (doc reactivity, :meth:`on_state`, and the server-signal hooks) run
-    on the provider's reader thread, not the caller's.
+    Callbacks — doc reactivity, :meth:`on_state`, and the server-signal hooks —
+    run on the provider's reader thread while it holds the replica, so a callback
+    should return promptly and must not block waiting on another thread that
+    touches the doc. One that raises is reported and the connection carries on.
+    Closing is the caller's job: the provider keeps a thread and a socket until
+    :meth:`close`.
     """
 
     def __init__(
@@ -3357,7 +3371,15 @@ class Provider:
         transport: "Optional[Callable[[str], object]]" = None,
     ):
         self._url = url
+        # Two locks. The replica lock guards the native session; the send lock
+        # orders what reaches the socket and pins the phase while a frame is
+        # written, so an edit can never land inside a handshake. A holder of both
+        # takes the send lock first — only the reader thread ever does, when it
+        # opens the channel to app traffic. An application thread authors under
+        # the replica lock and writes after releasing it, so a socket write never
+        # blocks the reader that would drain the peer's window.
         self._lock = threading.RLock()
+        self._send_lock = threading.RLock()
         self._client = Client(client_id if client_id is not None else os.urandom(16))
         self._room = _key_bytes(room)
         self._channel, self._subscribe_frame = self._client.subscribe(self._room)
@@ -3385,7 +3407,9 @@ class Provider:
         self._closed = False
         self._connected_once = False
         self._attempt = 0
+        self._published: "Dict[bytes, bytes]" = {}
         self._failure: Optional[BaseException] = None
+        self._settle_lock = threading.Lock()
         self._settled = threading.Event()
         self._wake = threading.Event()
         self._thread = threading.Thread(
@@ -3439,11 +3463,15 @@ class Provider:
         return off
 
     def set_awareness(self, key: Key, value: Union[str, bytes]) -> None:
-        """Publish an ephemeral awareness entry (presence) for this client."""
+        """Publish an ephemeral awareness entry (presence) for this client.
+
+        Presence is not durable — the server drops it with the socket — so the
+        provider remembers what this client published and republishes it once a
+        reconnect has caught the channel up."""
+        key_bytes, value_bytes = _key_bytes(key), _key_bytes(value)
         with self._lock:
-            frame = self._client.set_awareness(
-                self._channel, _key_bytes(key), _key_bytes(value)
-            )
+            self._published[key_bytes] = value_bytes
+            frame = self._client.set_awareness(self._channel, key_bytes, value_bytes)
         self._send_if_open(frame)
 
     def awareness(self, actor: bytes, key: Key) -> Optional[bytes]:
@@ -3487,14 +3515,14 @@ class Provider:
     def _run(self) -> None:
         while not self._closed:
             self._set_state("connecting")
-            self._phase = "auth"
+            self._bind_socket(None)
             try:
                 ws = self._transport(self._url)
             except Exception:  # noqa: BLE001 — any dial failure is a retry
                 ws = None
             if ws is not None:
-                self._ws = ws
                 try:
+                    self._bind_socket(ws)
                     if self._closed:  # closed while the dial was in flight
                         break
                     self._open(ws)
@@ -3502,11 +3530,11 @@ class Provider:
                         data = ws.recv()
                         if data is None:
                             break
-                        self._on_message(data)
+                        self._deliver(data)
                 except (OSError, _websocket.WebSocketError):
                     pass  # a dropped socket: fall through to the reconnect
                 finally:
-                    self._ws = None
+                    self._bind_socket(None)
                     ws.close()
             self._set_state("disconnected")
             if self._closed or not self._reconnect:
@@ -3518,13 +3546,33 @@ class Provider:
                 break
         self._reject(ConnectionError("crdtsync: the connection closed before it synced"))
 
+    def _bind_socket(self, ws) -> None:
+        """Point the send path at ``ws`` (or at nothing) and reset the phase, as
+        one step — a writer must never see a fresh socket at the old phase and
+        write an app frame into its handshake."""
+        with self._send_lock:
+            self._ws = ws
+            self._phase = "auth"
+
     def _open(self, ws) -> None:
         with self._lock:
             hello = self._client.hello()
             auth = self._client.auth(self._credential)
-        ws.send(_protocol_header())
-        ws.send(hello)
-        ws.send(auth)
+        with self._send_lock:
+            ws.send(_protocol_header())
+            ws.send(hello)
+            ws.send(auth)
+
+    def _deliver(self, data: bytes) -> None:
+        """Handle one inbound frame. An application callback that raises is
+        reported and the connection carries on — a listener's bug must not
+        silently strand the provider with a dead reader and a live state."""
+        try:
+            self._on_message(data)
+        except (OSError, _websocket.WebSocketError):
+            raise
+        except Exception:
+            _LOGGER.exception("crdtsync: a provider callback raised")
 
     def _on_message(self, data: bytes) -> None:
         if self._phase == "auth":
@@ -3593,19 +3641,27 @@ class Provider:
             return self._client.resume(self._channel) or self._subscribe_frame
 
     def _mark_connected(self) -> None:
-        # Opening the socket to app traffic and draining the outbox is one step:
-        # an edit authored while the handshake was in flight was not sent (the
-        # channel was not ready), so it must be in the batch this replays, and an
-        # edit authored after the flip sends itself. Both take the same lock, so
-        # neither can slip between the two.
-        with self._lock:
+        # Opening the socket to app traffic, replaying what the channel still
+        # owes, and republishing presence are one step under the send lock: an
+        # edit authored while the handshake was in flight was not written (the
+        # channel was not ready), so it has to be in the batch this replays,
+        # while an edit authored after the flip writes itself — and no app frame
+        # can slip between the flip and the replay.
+        with self._send_lock:
+            with self._lock:
+                outstanding = (
+                    self._client.resend(self._channel)
+                    if self._client.outbox_len(self._channel) > 0
+                    else b""
+                )
+                presence = [
+                    self._client.set_awareness(self._channel, key, value)
+                    for key, value in self._published.items()
+                ]
             self._phase = "ready"
-            outstanding = (
-                self._client.resend(self._channel)
-                if self._client.outbox_len(self._channel) > 0
-                else b""
-            )
-        self._write(outstanding)
+            self._write(outstanding)
+            for frame in presence:
+                self._write(frame)
         self._connected_once = True
         self._attempt = 0
         self._set_state("connected")
@@ -3616,20 +3672,22 @@ class Provider:
         caught up. Before that the socket carries the handshake alone — an edit
         interleaved into it is a protocol violation the server closes on — and
         the edit's ops wait in the outbox for :meth:`_mark_connected` to replay."""
-        if self._phase != "ready":
-            return
-        self._write(frame)
+        with self._send_lock:
+            if self._phase != "ready":
+                return
+            self._write(frame)
 
     def _write(self, frame: bytes) -> None:
-        ws = self._ws
-        if not frame or ws is None:
-            return
-        try:
-            ws.send(frame)
-        except (OSError, _websocket.WebSocketError):
-            # The reader sees the same drop and reconnects; the outbox still
-            # holds the edit, so the resend covers it.
-            pass
+        with self._send_lock:
+            ws = self._ws
+            if not frame or ws is None:
+                return
+            try:
+                ws.send(frame)
+            except (OSError, _websocket.WebSocketError):
+                # The reader sees the same drop and reconnects; the outbox still
+                # holds the edit, so the resend covers it.
+                pass
 
     def _fatal(self, err: BaseException) -> None:
         self._closed = True
@@ -3640,20 +3698,28 @@ class Provider:
         self._reject(err)
 
     def _resolve(self) -> None:
-        self._settled.set()
+        with self._settle_lock:
+            self._settled.set()
 
     def _reject(self, err: BaseException) -> None:
-        if self._settled.is_set():
-            return
-        self._failure = err
-        self._settled.set()
+        # Only the first outcome counts, and it is recorded before it is
+        # published, so a waiter never observes a failure on a settled-connected
+        # provider or vice versa.
+        with self._settle_lock:
+            if self._settled.is_set():
+                return
+            self._failure = err
+            self._settled.set()
 
     def _set_state(self, state: str) -> None:
         if state == self._state:
             return
         self._state = state
         for listener in list(self._state_listeners):
-            listener(state)
+            try:
+                listener(state)
+            except Exception:
+                _LOGGER.exception("crdtsync: an on_state listener raised")
 
 
 def connect(url: str, room: Key, **options) -> Provider:

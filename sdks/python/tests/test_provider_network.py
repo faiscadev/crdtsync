@@ -135,12 +135,20 @@ class TestNetworkedProvider:
 
         # Drop a's socket underneath it and edit while it is offline; the
         # reconnect resumes the channel and resends the outbox.
+        wait_for(lambda: a._ws is not None)
         a._ws.close()
         wait_for(lambda: a.state != "connected")
         a.doc.get_text("body").insert(6, "-after")
         wait_for(lambda: a.state == "connected")
         wait_for(lambda: str(b.doc.get_text("body")) == "before-after")
         assert str(a.doc.get_text("body")) == "before-after"
+
+    def test_a_transaction_rides_the_wire_as_one_batch(self, join):
+        a = join("room-transact")
+        b = join("room-transact")
+        a.doc.transact(lambda: a.doc.get_list("items").append("x").append("y").append("z"))
+        wait_for(lambda: len(b.doc.get_list("items")) == 3)
+        assert list(b.doc.get_list("items")) == ["x", "y", "z"]
 
     def test_awareness_fans_out_to_the_room(self, join):
         a = join("room-awareness")

@@ -227,9 +227,13 @@ class TestFraming:
 
 
 class TestClose:
-    def test_close_releases_the_socket_after_a_peer_disconnect(self, serve):
+    def test_a_peer_disconnect_releases_the_descriptor(self, serve):
+        # A reconnect loop that leaked the socket per drop would exhaust the
+        # process's descriptors, so the peer's EOF has to release it outright.
         ws = _websocket.connect(serve(lambda conn: conn.close()).url)
+        raw = ws._sock
         assert ws.recv() is None
+        assert raw.fileno() == -1
         ws.close()
         assert ws._sock is None
 
