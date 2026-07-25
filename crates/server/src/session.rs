@@ -89,8 +89,9 @@ pub struct Session {
     /// Hello; `None` for a relay connection (no app, or an unregistered app).
     schema_version: Option<u32>,
     /// The codec this connection speaks, selected at Hello from what the client
-    /// advertised. [`CODEC_V1`] for a client that advertised none.
-    codec: u32,
+    /// advertised; `None` before the handshake settles, and for a handshake
+    /// refused because the client shares no codec with this build.
+    codec: Option<u32>,
 }
 
 impl Session {
@@ -101,7 +102,7 @@ impl Session {
             channels: HashMap::new(),
             app_id: Vec::new(),
             schema_version: None,
-            codec: CODEC_V1,
+            codec: None,
         }
     }
 
@@ -116,7 +117,7 @@ impl Session {
             channels: HashMap::new(),
             app_id: Vec::new(),
             schema_version: None,
-            codec: CODEC_V1,
+            codec: None,
         }
     }
 
@@ -139,9 +140,9 @@ impl Session {
     }
 
     /// The codec this connection speaks, selected at Hello out of what the client
-    /// advertised. [`CODEC_V1`] before the handshake, and for a client that
-    /// advertised nothing.
-    pub fn codec(&self) -> u32 {
+    /// advertised; `None` until the handshake settles. A client that advertised
+    /// nothing settles on [`CODEC_V1`], the codec silence carries.
+    pub fn codec(&self) -> Option<u32> {
         self.codec
     }
 
@@ -289,9 +290,7 @@ pub fn step(
             }
             // Settle the codec before anything else: a client that shares none
             // with this build cannot be answered in bytes it can read, so it is
-            // refused here rather than served a frame it would misdecode. An
-            // empty advertisement settles on the one codec that predates
-            // negotiation and is answered no selection frame.
+            // refused here rather than served a frame it would misdecode.
             let Some(codec) = select_codec(&codecs) else {
                 return Response {
                     replies: vec![Message::Error {
@@ -303,7 +302,10 @@ pub fn step(
                     ..Response::default()
                 };
             };
-            let selection = (!codecs.is_empty()).then_some(Message::CodecSelected { codec });
+            // Only a selection that moves off the default is worth a frame — both
+            // ends read silence as CODEC_V1 — so the negotiation adds nothing to a
+            // connection's reply stream until a second codec exists to select.
+            let selection = (codec != CODEC_V1).then_some(Message::CodecSelected { codec });
             // Resolve the app declaration against the registry: a registered app
             // for which the client asked a version the server does not hold is
             // refused and the connection closes; a relay or a known version
@@ -347,7 +349,7 @@ pub fn step(
             };
             session.app_id = app_id;
             session.client = Some(client);
-            session.codec = codec;
+            session.codec = Some(codec);
             Response {
                 replies: selection.into_iter().chain(advert).collect(),
                 ..Response::default()

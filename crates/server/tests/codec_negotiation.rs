@@ -1,12 +1,12 @@
 //! Codec negotiation at the server's Hello gate.
 //!
-//! The client advertises the codecs it speaks; the server selects one, records it
-//! on the session, and echoes the selection back before any schema advertisement.
-//! A client that advertises nothing settles on the codec that predates
-//! negotiation and is answered no selection frame at all — the connection is
-//! byte-for-byte what it was before the seam existed. A client that shares no
-//! codec with this build is closed with a clean `UnsupportedVersion` error rather
-//! than served frames it would misdecode.
+//! The client advertises the codecs it speaks and the server selects one, records
+//! it on the session, and answers with a `CodecSelected` — but only when the
+//! selection moves off the default, since both ends read silence as `CODEC_V1`.
+//! With one codec to select, every handshake settles on it, so the reply stream is
+//! exactly what it was before the seam existed. A client that shares no codec with
+//! this build is closed with a clean `UnsupportedVersion` error rather than served
+//! frames it would misdecode.
 
 use std::sync::Mutex;
 
@@ -60,16 +60,13 @@ fn registered() -> Mutex<SchemaRegistry> {
 }
 
 #[test]
-fn an_advertising_client_is_answered_the_selected_codec() {
+fn an_advertising_client_settles_on_the_selected_codec() {
     let (session, resp) = resolve(&empty(), hello(b"", SUPPORTED_CODECS.to_vec()));
     assert!(!resp.close);
-    assert_eq!(session.codec(), CODEC_V1);
+    assert_eq!(session.codec(), Some(CODEC_V1));
     assert!(
-        matches!(
-            resp.replies.as_slice(),
-            [Message::CodecSelected { codec }] if *codec == CODEC_V1,
-        ),
-        "an advertisement is answered with the selection, got {:?}",
+        resp.replies.is_empty(),
+        "the selection is the default, which silence already carries, got {:?}",
         resp.replies
     );
 }
@@ -80,11 +77,8 @@ fn versions_this_build_does_not_speak_are_ignored_in_the_selection() {
     // the shared one — that is the whole point of the reservation.
     let (session, resp) = resolve(&empty(), hello(b"", vec![CODEC_V1, 900]));
     assert!(!resp.close);
-    assert_eq!(session.codec(), CODEC_V1);
-    assert!(matches!(
-        resp.replies.as_slice(),
-        [Message::CodecSelected { codec: 1 }]
-    ));
+    assert_eq!(session.codec(), Some(CODEC_V1));
+    assert!(resp.replies.is_empty());
 }
 
 #[test]
@@ -94,12 +88,17 @@ fn a_client_that_advertises_nothing_defaults_to_the_current_codec() {
     let (session, resp) = resolve(&empty(), hello(b"", Vec::new()));
     assert!(!resp.close);
     assert_eq!(session.client(), Some(cid(1)));
-    assert_eq!(session.codec(), CODEC_V1);
+    assert_eq!(session.codec(), Some(CODEC_V1));
     assert!(
         resp.replies.is_empty(),
         "an unadvertised handshake is answered exactly as before, got {:?}",
         resp.replies
     );
+}
+
+#[test]
+fn a_fresh_session_has_settled_on_no_codec_yet() {
+    assert_eq!(Session::new().codec(), None);
 }
 
 #[test]
@@ -122,6 +121,11 @@ fn a_client_sharing_no_codec_is_closed_with_unsupported_version() {
         None,
         "a refused handshake binds no client to the session"
     );
+    assert_eq!(
+        session.codec(),
+        None,
+        "a refused handshake settles on no codec"
+    );
 }
 
 #[test]
@@ -138,42 +142,30 @@ fn the_codec_is_settled_before_the_schema_is_resolved() {
         }]
     ));
     assert_eq!(session.schema_version(), None);
+    assert_eq!(session.codec(), None);
 }
 
 #[test]
-fn the_selection_precedes_the_schema_advert() {
-    let (session, resp) = resolve(&registered(), hello(APP, SUPPORTED_CODECS.to_vec()));
-    assert!(!resp.close);
-    assert_eq!(session.codec(), CODEC_V1);
-    assert_eq!(session.schema_version(), Some(1));
-    assert!(
-        matches!(
-            resp.replies.as_slice(),
-            [
-                Message::CodecSelected { codec: 1 },
-                Message::SchemaAdvert {
+fn an_enforcing_handshake_is_answered_the_schema_advert_alone() {
+    // The reply stream an enforcing client sees is unchanged by negotiation: the
+    // schema advert and nothing ahead of it, advertised or not.
+    for codecs in [Vec::new(), SUPPORTED_CODECS.to_vec()] {
+        let (session, resp) = resolve(&registered(), hello(APP, codecs));
+        assert!(!resp.close);
+        assert_eq!(session.codec(), Some(CODEC_V1));
+        assert_eq!(session.schema_version(), Some(1));
+        assert!(
+            matches!(
+                resp.replies.as_slice(),
+                [Message::SchemaAdvert {
                     schema_version: 1,
                     ..
-                }
-            ]
-        ),
-        "the codec settles before the schema is advertised, got {:?}",
-        resp.replies
-    );
-}
-
-#[test]
-fn an_enforcing_client_that_advertises_nothing_still_gets_its_schema_advert() {
-    let (session, resp) = resolve(&registered(), hello(APP, Vec::new()));
-    assert!(!resp.close);
-    assert_eq!(session.codec(), CODEC_V1);
-    assert!(matches!(
-        resp.replies.as_slice(),
-        [Message::SchemaAdvert {
-            schema_version: 1,
-            ..
-        }]
-    ));
+                }]
+            ),
+            "got {:?}",
+            resp.replies
+        );
+    }
 }
 
 #[test]

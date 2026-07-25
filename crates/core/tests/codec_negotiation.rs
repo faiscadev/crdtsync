@@ -1,13 +1,14 @@
 //! Codec negotiation over the Hello handshake.
 //!
 //! The client advertises the binary codecs it speaks in its `Hello`; the server
-//! picks one and echoes it back in a `CodecSelected`. Exactly one codec exists
-//! today, so the point of the exchange is the reservation: a later release adds a
-//! version and still settles with a peer that only holds the older one.
+//! picks one and answers with a `CodecSelected` when the pick moves off the
+//! default. Exactly one codec exists today, so the point of the exchange is the
+//! reservation: a later release adds a version and still settles with a peer that
+//! only holds the older one.
 //!
-//! The advertisement is a trailing optional field, so a peer that names no codec
-//! writes exactly the frame that predates negotiation and is understood as
-//! speaking `CODEC_V1`. Selection is total in both directions — a disjoint
+//! Silence carries `CODEC_V1` in both directions — an omitted advertisement and an
+//! absent selection both settle there — so a peer that predates negotiation writes
+//! and reads exactly the frames it always did. Selection is total: a disjoint
 //! advertisement yields no selection (the server refuses the connection) and a
 //! malformed one decodes to a `ProtocolError`, never a panic and never a silent
 //! wrong-codec decode.
@@ -114,15 +115,32 @@ fn an_advertisement_is_counted_and_appended() {
 // --- total decode ---
 
 #[test]
-fn a_truncated_advertisement_is_an_error() {
+fn a_partially_present_advertisement_is_an_error() {
+    // Two versions plus the count is 12 trailing bytes; every truncation that
+    // leaves some of them fails rather than reading past the frame.
     let bytes = encode_message(&hello(vec![CODEC_V1, 900]));
-    for cut in 1..=8 {
+    for cut in 1..=11 {
         assert_eq!(
             decode_message(&bytes[..bytes.len() - cut]),
             Err(ProtocolError::UnexpectedEof),
             "a Hello cut {cut} bytes short of its advertisement decodes to an error"
         );
     }
+    // Losing the advertisement whole is not a truncation — it is the frame a peer
+    // that names no codec writes, so it reads as an absent advertisement.
+    assert_eq!(
+        decode_message(&bytes[..bytes.len() - 12]),
+        Ok(hello(Vec::new()))
+    );
+}
+
+#[test]
+fn an_advertisement_naming_no_codec_is_an_error() {
+    // The empty set is the omitted field. Spelling it as a present count of zero
+    // is a second encoding of one message, so it is refused.
+    let mut bytes = encode_message(&hello(Vec::new()));
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
 }
 
 #[test]
@@ -186,13 +204,38 @@ fn the_client_adopts_the_selection_the_server_answers_with() {
 }
 
 #[test]
+fn a_second_selection_is_a_violation() {
+    // Neither end could agree on which frame a mid-stream switch takes effect
+    // from, so the codec settles once — the mirror of the server refusing a
+    // second Hello.
+    let mut session = ClientSession::new(cid(1));
+    assert_eq!(
+        session.receive(Message::CodecSelected { codec: CODEC_V1 }),
+        Ok(())
+    );
+    assert_eq!(
+        session.receive(Message::CodecSelected { codec: CODEC_V1 }),
+        Err(ClientError::UnexpectedMessage("codec already selected"))
+    );
+    assert_eq!(session.codec(), CODEC_V1);
+}
+
+#[test]
 fn the_client_refuses_a_selection_it_cannot_speak() {
     // A server naming a codec this build does not hold would have every later
-    // frame misread; the session refuses the selection and stays on its own.
+    // frame misread, so the refusal is permanent: the session reports the same
+    // failure for every frame after it rather than reading on.
     let mut session = ClientSession::new(cid(1));
     assert_eq!(
         session.receive(Message::CodecSelected { codec: 900 }),
         Err(ClientError::UnsupportedCodec(900))
     );
-    assert_eq!(session.codec(), CODEC_V1);
+    assert_eq!(
+        session.receive(Message::AuthOk {
+            actor: b"alice".to_vec()
+        }),
+        Err(ClientError::UnsupportedCodec(900)),
+        "a stranded session refuses every later frame, not just the selection"
+    );
+    assert_eq!(session.actor(), None, "and folds none of them");
 }

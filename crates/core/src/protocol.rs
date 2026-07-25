@@ -11,6 +11,14 @@
 //! ([`Message::CodecSelected`]) and refuses an advertisement it shares nothing
 //! with. Exactly one codec exists today ([`CODEC_V1`]); the seam is what lets a
 //! later release add one without breaking a peer that only holds the older.
+//!
+//! Silence carries [`CODEC_V1`] in both directions: a `Hello` that names no
+//! codec, and a handshake the server answers with no selection, both settle
+//! there. So the negotiation is invisible on the wire until a second codec
+//! exists to select. The header and the handshake frames themselves — `Hello`,
+//! `CodecSelected`, and the [`Message::Error`] refusing a disjoint peer — are
+//! always [`CODEC_V1`], which every build holds; a selection governs the frames
+//! that follow it in each direction, never the frame that announces it.
 
 use crate::clientid::ClientId;
 use crate::codec::{
@@ -928,6 +936,12 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 Vec::new()
             } else {
                 let count = cur.u32()?;
+                // An advertisement on the wire names at least one codec: the empty
+                // set is the omitted field, so a count of zero is the same message
+                // spelled a second way and is refused to keep the encoding one-to-one.
+                if count == 0 {
+                    return Err(ProtocolError::TrailingBytes);
+                }
                 // Grow as versions are read rather than trusting `count` to size
                 // the allocation — a bogus count then fails on the missing bytes,
                 // not on a giant up-front reservation.

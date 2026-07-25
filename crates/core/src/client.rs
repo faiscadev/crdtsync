@@ -89,10 +89,16 @@ pub struct ClientSession {
     /// declared `schema_version`: a dynamic client declares 0 and learns the
     /// concrete version the server picked here. `None` until an advert arrives.
     active_schema: Option<(u32, Vec<u8>)>,
-    /// The codec this connection speaks. Opens at [`CODEC_V1`] — what a server
-    /// that answers no advertisement is on — and moves to whatever a
-    /// `CodecSelected` names.
-    codec: u32,
+    /// The codec a `CodecSelected` named, or `None` while the server has answered
+    /// no selection — which is itself an answer, [`CODEC_V1`]. Holding the
+    /// selection separately is what makes a second one a violation rather than a
+    /// mid-stream switch neither end agrees on the boundary of.
+    codec: Option<u32>,
+    /// The failure that made this session unusable, once one has. A codec the
+    /// server selected and this build cannot speak is unrecoverable — every later
+    /// frame would be misread — so it is remembered and refuses every subsequent
+    /// receive rather than letting the caller pump on.
+    fatal: Option<ClientError>,
     rooms: HashMap<Channel, Room>,
     next_channel: u32,
     /// Op batches the server refused, awaiting the app's drain. Held at the
@@ -137,7 +143,8 @@ impl ClientSession {
             app_id: Vec::new(),
             schema_version: 0,
             active_schema: None,
-            codec: CODEC_V1,
+            codec: None,
+            fatal: None,
             rooms: HashMap::new(),
             next_channel: 0,
             rejected: Vec::new(),
@@ -182,9 +189,9 @@ impl ClientSession {
     }
 
     /// The codec this connection speaks — [`CODEC_V1`] until a `CodecSelected`
-    /// names another.
+    /// names another, since a server that answers no selection is on it too.
     pub fn codec(&self) -> u32 {
-        self.codec
+        self.codec.unwrap_or(CODEC_V1)
     }
 
     /// The opening frame, naming this replica, the app it speaks for, and the
@@ -627,8 +634,12 @@ impl ClientSession {
     /// place; a snapshot replaces that room's replica with the server's state up
     /// to its tagged sequence. Frames the server never sends, a frame for a
     /// channel this session does not hold, and a snapshot that fails to decode
-    /// are refused without touching any replica.
+    /// are refused without touching any replica. A session stranded on a codec it
+    /// cannot speak refuses every frame from then on.
     pub fn receive(&mut self, msg: Message) -> Result<(), ClientError> {
+        if let Some(fatal) = &self.fatal {
+            return Err(fatal.clone());
+        }
         match msg {
             Message::Ops { channel, ops } => {
                 let room = self
@@ -670,13 +681,20 @@ impl ClientSession {
                 Ok(())
             }
             // The server answers the Hello advertisement with the codec it picked.
-            // A selection outside what this build speaks is refused — decoding on
-            // a codec we do not hold would misread every later frame.
+            // A selection outside what this build speaks strands the session: every
+            // later frame would be misread, so it is refused for good rather than
+            // for this frame. A second selection is a violation the same way a
+            // second Hello is — neither end would agree on which frame the switch
+            // takes effect from.
             Message::CodecSelected { codec } => {
                 if !SUPPORTED_CODECS.contains(&codec) {
+                    self.fatal = Some(ClientError::UnsupportedCodec(codec));
                     return Err(ClientError::UnsupportedCodec(codec));
                 }
-                self.codec = codec;
+                if self.codec.is_some() {
+                    return Err(ClientError::UnexpectedMessage("codec already selected"));
+                }
+                self.codec = Some(codec);
                 Ok(())
             }
             // The server advertises the schema it serves this connection; record
