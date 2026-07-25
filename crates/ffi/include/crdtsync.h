@@ -1168,6 +1168,160 @@ int32_t crdtsync_client_get_bytes(const CrdtClient *client,
                                   uintptr_t path_len,
                                   CrdtBuf *out);
 
+// Install-or-set a Register from an encoded [`Scalar`] at a path in `channel`'s
+// room, so a leaf keeps its type across a round trip. Returns the Ops frame to
+// send; empty on a bad handle, a rejected `path` or `scalar` pointer, an unheld
+// channel, or a malformed payload. A path that names nothing still frames — the
+// frame carries no ops.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` and `scalar`/`scalar_len` each
+// follow [`as_slice`].
+CrdtBuf crdtsync_client_set_scalar(CrdtClient *client,
+                                   uint32_t channel,
+                                   const uint8_t *path,
+                                   uintptr_t path_len,
+                                   const uint8_t *scalar,
+                                   uintptr_t scalar_len);
+
+// Read the Register at a path in `channel`'s room as an encoded [`Scalar`] into
+// a fresh buffer at `out` the caller frees — the inverse of
+// [`crdtsync_client_set_scalar`]. Returns 1 when the slot holds a register, 0
+// when absent, another element, or the channel isn't held, -1 on a bad handle.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` follow [`as_slice`]; `out` points
+// to a writable `CrdtBuf`.
+int32_t crdtsync_client_get_scalar(const CrdtClient *client,
+                                   uint32_t channel,
+                                   const uint8_t *path,
+                                   uintptr_t path_len,
+                                   CrdtBuf *out);
+
+// Read the live slot keys of the Map at a path in `channel`'s room into a fresh
+// buffer at `out` the caller frees, framed as a `u32` count then each key
+// `u32`-length-prefixed. An empty path names the room's root map. Returns 1 when
+// the path is a live Map — or an `XmlElement`, whose attrs map it names — even
+// with no keys, 0 when it is neither or the channel isn't held, -1 on a bad
+// handle.
+//
+// # Safety
+// As [`crdtsync_client_get_scalar`].
+int32_t crdtsync_client_map_keys(const CrdtClient *client,
+                                 uint32_t channel,
+                                 const uint8_t *path,
+                                 uintptr_t path_len,
+                                 CrdtBuf *out);
+
+// Insert a bytes item at live `index` into the List at a path in `channel`'s
+// room; an `index` past the live end appends. Returns the Ops frame to send;
+// empty on a bad handle, a rejected `path` or `value` pointer, or an unheld
+// channel. A path that names nothing still frames — the frame carries no ops.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` and `value`/`value_len` each
+// follow [`as_slice`].
+CrdtBuf crdtsync_client_list_insert(CrdtClient *client,
+                                    uint32_t channel,
+                                    const uint8_t *path,
+                                    uintptr_t path_len,
+                                    uintptr_t index,
+                                    const uint8_t *value,
+                                    uintptr_t value_len);
+
+// Tombstone the live item at `index` in the List at a path in `channel`'s room.
+// Returns the Ops frame to send; the frame carries no ops when `index` names no
+// live item — a no-op delete never installs or re-stamps the List.
+//
+// # Safety
+// As [`crdtsync_client_register_int`].
+CrdtBuf crdtsync_client_list_delete(CrdtClient *client,
+                                    uint32_t channel,
+                                    const uint8_t *path,
+                                    uintptr_t path_len,
+                                    uintptr_t index);
+
+// Read the live length of the List at a path in `channel`'s room into `out`.
+// Returns 1 when the path is a live List, 0 when it is not or the channel isn't
+// held, -1 on a bad handle.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` follow [`as_slice`]; `out` points
+// to a writable `usize`.
+int32_t crdtsync_client_list_len(const CrdtClient *client,
+                                 uint32_t channel,
+                                 const uint8_t *path,
+                                 uintptr_t path_len,
+                                 uintptr_t *out);
+
+// Read the bytes item at live `index` in the List at a path in `channel`'s room
+// into a fresh buffer at `out` the caller frees. Returns 1 when present and a
+// bytes item, 0 otherwise, -1 on a bad handle.
+//
+// # Safety
+// As [`crdtsync_client_get_scalar`].
+int32_t crdtsync_client_list_get(const CrdtClient *client,
+                                 uint32_t channel,
+                                 const uint8_t *path,
+                                 uintptr_t path_len,
+                                 uintptr_t index,
+                                 CrdtBuf *out);
+
+// Insert UTF-8 `text` at codepoint `index` into the Text at a path in `channel`'s
+// room; an `index` past the live end appends. Returns the Ops frame to send;
+// empty on a bad handle, a rejected `path` or `text` pointer, an unheld channel,
+// or non-UTF-8 input. A path that names nothing still frames — the frame carries
+// no ops.
+//
+// # Safety
+// `client` is a live handle; `path`/`path_len` and `text`/`text_len` each follow
+// [`as_slice`].
+CrdtBuf crdtsync_client_text_insert(CrdtClient *client,
+                                    uint32_t channel,
+                                    const uint8_t *path,
+                                    uintptr_t path_len,
+                                    uintptr_t index,
+                                    const uint8_t *text,
+                                    uintptr_t text_len);
+
+// Tombstone `count` codepoints from codepoint `index` in the Text at a path in
+// `channel`'s room. Returns the Ops frame to send; the frame carries no ops when
+// the range names no live codepoint — a no-op delete never installs or re-stamps
+// the Text.
+//
+// # Safety
+// As [`crdtsync_client_register_int`].
+CrdtBuf crdtsync_client_text_delete(CrdtClient *client,
+                                    uint32_t channel,
+                                    const uint8_t *path,
+                                    uintptr_t path_len,
+                                    uintptr_t index,
+                                    uintptr_t count);
+
+// Read the codepoint length of the Text at a path in `channel`'s room into `out`.
+// Returns 1 when the path is a live Text, 0 when it is not or the channel isn't
+// held, -1 on a bad handle.
+//
+// # Safety
+// As [`crdtsync_client_list_len`].
+int32_t crdtsync_client_text_len(const CrdtClient *client,
+                                 uint32_t channel,
+                                 const uint8_t *path,
+                                 uintptr_t path_len,
+                                 uintptr_t *out);
+
+// Read the Text at a path in `channel`'s room as UTF-8 bytes into a fresh buffer
+// at `out` the caller frees. Returns 1 when the path is a live Text, 0 when it is
+// not or the channel isn't held, -1 on a bad handle.
+//
+// # Safety
+// As [`crdtsync_client_get_scalar`].
+int32_t crdtsync_client_text_get(const CrdtClient *client,
+                                 uint32_t channel,
+                                 const uint8_t *path,
+                                 uintptr_t path_len,
+                                 CrdtBuf *out);
+
 // Begin recording an atomic transaction on `channel`'s room: subsequent edits
 // on the channel accumulate into one group until
 // [`crdtsync_client_commit_atomic`], each returning an empty frame.
