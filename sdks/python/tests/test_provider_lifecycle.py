@@ -142,6 +142,25 @@ class RefusingTransport:
         raise OSError("crdtsync test: connection refused")
 
 
+class BlockingSocket(FakeSocket):
+    """A socket whose writes park, as a real one does once the peer stops
+    reading and the send window fills."""
+
+    def __init__(self):
+        super().__init__()
+        self.block = threading.Event()
+        self.blocked = threading.Event()
+
+    def send(self, data: bytes) -> None:
+        if self.block.is_set() and not self.closed:
+            self.blocked.set()
+            # A real socket only gives this up when it is shut down.
+            while not self.closed:
+                time.sleep(0.002)
+            raise OSError("crdtsync test: socket shut down under a write")
+        super().send(data)
+
+
 def wait_for(predicate, timeout: float = 2.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -257,16 +276,34 @@ class TestConnectFailures:
             p.wait_connected()
         assert p.state == "disconnected"
 
-    def test_the_backoff_stays_finite_after_a_long_outage(self, transport):
+    def test_the_backoff_escalates_and_stays_finite(self, transport):
+        p = Provider(
+            "ws://fake",
+            "room",
+            transport=transport,
+            max_reconnect_delay=10.0,
+            reconnect=False,
+        )
+        p.close()  # the reader is done, so the backoff is this test's to drive
+        delays = [p._backoff() for _ in range(12)]
+        # Jittered into the lower half of each step, so a restarted server is not
+        # met by every client at once — but always escalating and always bounded.
+        assert all(0 < d <= 10.0 for d in delays)
+        assert delays[0] <= 0.25
+        assert delays[-1] >= 5.0
+
         # An unreachable server left overnight builds a large attempt count; an
         # unclamped exponent becomes an integer too large to turn into a float,
-        # and the failure kills the reader thread rather than delaying it.
-        p = Provider("ws://fake", "room", transport=transport, max_reconnect_delay=10.0)
-        try:
-            p._attempt = 100_000
-            assert p._backoff() == 10.0
-        finally:
-            p.close()
+        # and that failure kills the reader thread rather than delaying it.
+        p._attempt = 100_000
+        assert 5.0 <= p._backoff() <= 10.0
+
+    def test_a_zero_reconnect_ceiling_does_not_spin(self, transport):
+        p = Provider(
+            "ws://fake", "room", transport=transport, max_reconnect_delay=0, reconnect=False
+        )
+        p.close()
+        assert p._backoff() > 0
 
     def test_a_refused_reconnect_handshake_dials_again(self, transport):
         seen = []
@@ -361,6 +398,47 @@ class TestEditsAndReconnect:
         second.deliver(peer_edit(provider._channel))
         wait_for(lambda: str(provider.doc.get_text("note")) == "ok")
         assert str(provider.doc.get_text("body")) == "hi"
+
+    def test_an_inert_edit_reaches_neither_the_wire_nor_the_listeners(
+        self, transport, provider
+    ):
+        socket = handshake(transport)
+        provider.wait_connected(timeout=2.0)
+        # The client seat frames every edit, even one that matched nothing; a
+        # frame carrying no ops is not an edit, exactly as on a local doc.
+        provider.doc.get_text("body").delete(0, 0)
+        time.sleep(0.05)
+        assert len(socket.sent) == 4
+
+    def test_close_breaks_a_write_that_is_parked(self, transport):
+        blocking = BlockingSocket()
+        p = Provider("ws://fake", "room", transport=lambda _url: blocking, reconnect=False)
+        try:
+            blocking.wait_sent(3)
+            blocking.deliver(auth_ok())
+            blocking.wait_sent(4)
+            blocking.deliver(ops(0))
+            p.wait_connected(timeout=2.0)
+
+            # An author parked in a socket write holds the send lock. Closing has
+            # to be able to shut that socket down — waiting for the lock the
+            # stuck writer owns would deadlock the very call meant to free it.
+            blocking.block.set()
+            author = threading.Thread(
+                target=lambda: p.doc.get_text("body").insert(0, "stuck"), daemon=True
+            )
+            author.start()
+            assert blocking.blocked.wait(2.0)
+
+            closed = threading.Thread(target=p.close, daemon=True)
+            closed.start()
+            closed.join(timeout=5.0)
+            assert not closed.is_alive()
+            author.join(timeout=2.0)
+            assert not author.is_alive()
+        finally:
+            blocking.close()
+            p.close()
 
     def test_an_acknowledgement_drains_the_outbox(self, transport, provider):
         socket = handshake(transport)

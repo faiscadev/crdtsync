@@ -173,7 +173,9 @@ class TestNetworkedProvider:
         # Drop a's socket underneath it and edit while it is offline; the
         # reconnect resumes the channel and resends the outbox.
         wait_for(lambda: a._ws is not None)
-        a._ws.close()
+        socket = a._ws
+        assert socket is not None
+        socket.close()
         wait_for(lambda: a.state != "connected")
         a.doc.get_text("body").insert(6, "-after")
         wait_for(lambda: a.state == "connected")

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import platform
+import random
 import struct
 import threading
 import urllib.request
@@ -2506,21 +2507,25 @@ class CrdtMap:
     def get(self, key: Key):
         """Read ``key``: a native scalar for a leaf, a :class:`BlobRef` for a blob, a
         nested handle for a container slot, or ``None`` when the slot is empty."""
+        # The slot is probed several ways; one read of the replica keeps the
+        # probes talking about the same state, so a remote fold between them
+        # cannot make a live slot read as empty.
+        return self._doc._read(lambda b: self._read_slot(b, key))
+
+    def _read_slot(self, backend, key: Key):
         slot = self._slot(key)
-        backend = self._doc._backend
         blob = backend.get_blob(slot)
         if blob is not None:
             return blob
         scalar = backend.get_scalar(slot)
         if scalar is not None:
             return _decode_value(scalar)
-        kind = self._container_kind(slot)
+        kind = self._container_kind(backend, slot)
         if kind is None:
             return None
         return _HANDLE_CTORS[kind](self._doc, self._child(key))
 
-    def _container_kind(self, slot: Path) -> Optional[str]:
-        backend = self._doc._backend
+    def _container_kind(self, backend, slot: Path) -> Optional[str]:
         if backend.map_keys(slot) is not None:
             return "map"
         if backend.list_len(slot) is not None:
@@ -2538,28 +2543,34 @@ class CrdtMap:
         return self
 
     def __contains__(self, key: Key) -> bool:
+        return self._doc._read(lambda b: self._holds(b, key))
+
+    def _holds(self, backend, key: Key) -> bool:
         slot = self._slot(key)
-        backend = self._doc._backend
         return (
             backend.get_scalar(slot) is not None
             or backend.get_blob(slot) is not None
-            or self._container_kind(slot) is not None
+            or self._container_kind(backend, slot) is not None
         )
 
-    def _raw_keys(self) -> List[bytes]:
-        return self._doc._backend.map_keys(list(self._path)) or []
+    def _raw_keys(self, backend) -> List[bytes]:
+        return backend.map_keys(list(self._path)) or []
 
     def keys(self) -> List[str]:
         """The live slot keys, rendered best-effort as utf-8 strings."""
-        return [_key_string(k) for k in self._raw_keys()]
+        return [_key_string(k) for k in self._doc._read(self._raw_keys)]
 
     def items(self) -> List[Tuple[str, object]]:
         """The live ``(key, value)`` pairs. Values are read by the raw key bytes, so
         a non-utf-8 (binary) key's value is never lost."""
-        return [(_key_string(k), self.get(k)) for k in self._raw_keys()]
+        return self._doc._read(
+            lambda b: [
+                (_key_string(k), self._read_slot(b, k)) for k in self._raw_keys(b)
+            ]
+        )
 
     def __len__(self) -> int:
-        return len(self._raw_keys())
+        return len(self._doc._read(self._raw_keys))
 
     def __iter__(self):
         return iter(self.keys())
@@ -2647,18 +2658,26 @@ class CrdtList:
         return self
 
     def __getitem__(self, index: int):
-        backend = self._doc._backend
-        item = backend.list_get(self._self, self._checked(backend, index))
+        # One read of the replica: resolving the index and fetching the item in
+        # separate reads lets a remote fold shift the list between them.
+        item = self._doc._read(lambda b: b.list_get(self._self, self._checked(b, index)))
         if item is None:
             raise IndexError("list index out of range")
         return _decode_value(item)
 
     def __len__(self) -> int:
-        return self._length(self._doc._backend)
+        return self._doc._read(self._length)
 
     def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
+        return iter(self._doc._read(self._items))
+
+    def _items(self, backend) -> List[object]:
+        items = []
+        for i in range(self._length(backend)):
+            raw = backend.list_get(self._self, i)
+            if raw is not None:
+                items.append(_decode_value(raw))
+        return items
 
     def _length(self, backend) -> int:
         return backend.list_len(self._self) or 0
@@ -3034,6 +3053,12 @@ class Doc:
     def _observing(self) -> bool:
         return bool(self._update_listeners) or bool(self._observers)
 
+    def _read(self, run: Callable[[Document], object]):
+        """Read the replica through ``run`` under one acquisition, so a multi-step
+        read sees one state rather than a sequence a remote fold can shift."""
+        with self._lock:
+            return run(self._backend)
+
     def _send(self, ops: bytes) -> None:
         # Never under the replica lock: the wire write can block on a full send
         # window, and holding the replica across it would stop the provider
@@ -3245,6 +3270,12 @@ _WIRE_MAGIC = b"CRDT"
 #: The credential sent when the caller names none — what a dev server accepts.
 _ANONYMOUS = b"anonymous"
 
+#: The floor on a reconnect delay, so a zero ceiling cannot spin the dial loop.
+_MIN_RECONNECT_DELAY = 0.01
+
+#: The size of an Ops frame carrying no ops — its tag byte plus the channel.
+_EMPTY_OPS_FRAME = 5
+
 
 def _protocol_header() -> bytes:
     """The 8-byte header a client writes once, before its Hello, to open a
@@ -3265,6 +3296,13 @@ class _ClientBackend:
         self._channel = channel
         self._lock = lock
 
+    @staticmethod
+    def _framed(frame: bytes) -> bytes:
+        """An edit that matched nothing still frames — the frame simply carries
+        no ops. Report that as no edit, exactly as a local document does, so an
+        inert call neither reaches the wire nor fires an update."""
+        return frame if len(frame) > _EMPTY_OPS_FRAME else b""
+
     def get_scalar(self, path: Path) -> Optional[bytes]:
         with self._lock:
             return self._client.get_scalar(self._channel, path)
@@ -3275,19 +3313,19 @@ class _ClientBackend:
 
     def set_scalar(self, path: Path, scalar: bytes) -> bytes:
         with self._lock:
-            return self._client.set_scalar(self._channel, path, scalar)
+            return self._framed(self._client.set_scalar(self._channel, path, scalar))
 
     def delete(self, path: Path) -> bytes:
         with self._lock:
-            return self._client.delete(self._channel, path)
+            return self._framed(self._client.delete(self._channel, path))
 
     def list_insert(self, path: Path, index: int, value: bytes) -> bytes:
         with self._lock:
-            return self._client.list_insert(self._channel, path, index, value)
+            return self._framed(self._client.list_insert(self._channel, path, index, value))
 
     def list_delete(self, path: Path, index: int) -> bytes:
         with self._lock:
-            return self._client.list_delete(self._channel, path, index)
+            return self._framed(self._client.list_delete(self._channel, path, index))
 
     def list_len(self, path: Path) -> Optional[int]:
         with self._lock:
@@ -3299,11 +3337,11 @@ class _ClientBackend:
 
     def text_insert(self, path: Path, index: int, text: str) -> bytes:
         with self._lock:
-            return self._client.text_insert(self._channel, path, index, text)
+            return self._framed(self._client.text_insert(self._channel, path, index, text))
 
     def text_delete(self, path: Path, index: int, count: int) -> bytes:
         with self._lock:
-            return self._client.text_delete(self._channel, path, index, count)
+            return self._framed(self._client.text_delete(self._channel, path, index, count))
 
     def text_len(self, path: Path) -> Optional[int]:
         with self._lock:
@@ -3315,38 +3353,40 @@ class _ClientBackend:
 
     def set_blob(self, path: Path, mime: str, bytes_: bytes) -> Optional[bytes]:
         with self._lock:
-            return self._client.set_blob(self._channel, path, mime, bytes_) or None
+            return self._framed(self._client.set_blob(self._channel, path, mime, bytes_)) or None
 
     def set_blob_ref(self, path: Path, blob_id: bytes, mime: str, size: int) -> bytes:
         with self._lock:
-            return self._client.set_blob_ref(self._channel, path, blob_id, mime, size)
+            return self._framed(self._client.set_blob_ref(self._channel, path, blob_id, mime, size))
 
     def xml_element(self, path: Path, tag: bytes) -> bytes:
         with self._lock:
-            return self._client.xml_element(self._channel, path, tag)
+            return self._framed(self._client.xml_element(self._channel, path, tag))
 
     def xml_fragment(self, path: Path) -> bytes:
         with self._lock:
-            return self._client.xml_fragment(self._channel, path)
+            return self._framed(self._client.xml_fragment(self._channel, path))
 
     def xml_insert_element(self, elem_path: Path, index: int, tag: bytes) -> bytes:
         with self._lock:
-            return self._client.xml_insert_element(self._channel, elem_path, index, tag)
+            return self._framed(self._client.xml_insert_element(self._channel, elem_path, index, tag))
 
     def xml_insert_text(self, elem_path: Path, index: int, text: str) -> bytes:
         with self._lock:
-            return self._client.xml_insert_text(self._channel, elem_path, index, text)
+            return self._framed(self._client.xml_insert_text(self._channel, elem_path, index, text))
 
     def xml_child_delete(self, elem_path: Path, index: int) -> bytes:
         with self._lock:
-            return self._client.xml_child_delete(self._channel, elem_path, index)
+            return self._framed(self._client.xml_child_delete(self._channel, elem_path, index))
 
     def xml_move(
         self, parent: Path, child_index: int, new_parent: Path, dest_index: int
     ) -> bytes:
         with self._lock:
-            return self._client.xml_move(
-                self._channel, parent, child_index, new_parent, dest_index
+            return self._framed(
+                self._client.xml_move(
+                    self._channel, parent, child_index, new_parent, dest_index
+                )
             )
 
     def _mark_encoded(
@@ -3360,7 +3400,7 @@ class _ClientBackend:
         scalar: bytes,
     ) -> Tuple[Optional[bytes], bytes]:
         with self._lock:
-            return self._client._mark_encoded(
+            mark_id, frame = self._client._mark_encoded(
                 self._channel,
                 seq_path,
                 start_index,
@@ -3370,14 +3410,17 @@ class _ClientBackend:
                 name,
                 scalar,
             )
+        return mark_id, self._framed(frame)
 
     def _mark_set_value_encoded(self, mark_id: bytes, scalar: bytes) -> bytes:
         with self._lock:
-            return self._client._mark_set_value_encoded(self._channel, mark_id, scalar)
+            return self._framed(
+                self._client._mark_set_value_encoded(self._channel, mark_id, scalar)
+            )
 
     def mark_delete(self, mark_id: bytes) -> bytes:
         with self._lock:
-            return self._client.mark_delete(self._channel, mark_id)
+            return self._framed(self._client.mark_delete(self._channel, mark_id))
 
     def begin_atomic(self) -> None:
         with self._lock:
@@ -3385,7 +3428,7 @@ class _ClientBackend:
 
     def commit_atomic(self) -> bytes:
         with self._lock:
-            return self._client.commit_atomic(self._channel)
+            return self._framed(self._client.commit_atomic(self._channel))
 
     def apply(self, ops: bytes) -> int:
         raise RuntimeError(
@@ -3646,9 +3689,15 @@ class Provider:
                             self._deliver(data)
                     except (OSError, _websocket.WebSocketError):
                         pass  # a dropped socket: fall through to the reconnect
+                    except Exception:
+                        # Anything else — the native session, the transport, a
+                        # bad allocation — is still just this connection failing.
+                        # Letting it end the thread would leave a provider that
+                        # never dials again and never says so.
+                        _LOGGER.exception("crdtsync: the connection failed")
                     finally:
-                        self._bind_socket(None)
                         ws.close()
+                        self._bind_socket(None)
                 if self._closed or not self._reconnect:
                     break
                 self._set_state("disconnected")
@@ -3663,11 +3712,14 @@ class Provider:
             )
 
     def _backoff(self) -> float:
-        """The delay before the next dial: exponential, clamped. The exponent is
+        """The delay before the next dial: exponential, clamped, and jittered so
+        a restarted server is not met by every client at once. The exponent is
         clamped too — an unreachable server left overnight would otherwise build
-        an integer too large to turn into a float."""
+        an integer too large to turn into a float — and the delay has a floor, so
+        a zero ceiling cannot turn the loop into a spin."""
         self._attempt = min(self._attempt + 1, 32)
-        return min(self._max_reconnect_delay, 0.25 * 2.0 ** (self._attempt - 1))
+        delay = min(self._max_reconnect_delay, 0.25 * 2.0 ** (self._attempt - 1))
+        return max(_MIN_RECONNECT_DELAY, delay) * random.uniform(0.5, 1.0)
 
     def _bind_socket(self, ws) -> None:
         """Point the send path at ``ws`` (or at nothing) and reset the phase, as
@@ -3701,6 +3753,8 @@ class Provider:
         actually applied."""
         try:
             self._on_message(data)
+        except _websocket.WebSocketError:
+            raise  # the session asked for this socket to go; not a surprise
         except Exception as err:
             _LOGGER.exception("crdtsync: folding an inbound frame failed")
             raise _websocket.WebSocketError(
@@ -3758,6 +3812,11 @@ class Provider:
             self._handle_server_error(err)
             if self._closed:  # the error was fatal — this socket is finished
                 return
+        # A frame folded past the handshake is the proof this connection works,
+        # so the backoff starts over here rather than at the AuthOk: a server
+        # that authenticates and then drops would otherwise be redialled at the
+        # minimum delay forever, by every client at once.
+        self._attempt = 0
         self._drain_signals()
 
         # The server answers the Subscribe with the room's catch-up, so the first
@@ -3822,7 +3881,6 @@ class Provider:
             for frame in presence:
                 self._write(frame)
         self._connected_once = True
-        self._attempt = 0
         self._set_state("connected")
         self._resolve()
 
@@ -3856,9 +3914,12 @@ class Provider:
         self._reject(err)
 
     def _drop_socket(self) -> None:
-        """Shut the live socket down so a blocked reader returns."""
-        with self._send_lock:
-            ws = self._ws
+        """Shut the live socket down so a blocked reader returns.
+
+        Deliberately lock-free: an author parked in a socket write holds the
+        send lock, and shutting that socket down is exactly what frees it — so
+        this must never be the thing waiting on it."""
+        ws = self._ws
         if ws is not None:
             ws.close()
 

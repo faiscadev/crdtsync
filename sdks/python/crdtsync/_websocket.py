@@ -231,11 +231,11 @@ class WebSocket:
                 return None
             fin, opcode, payload = frame
             if opcode == _OP_CLOSE:
-                self._write_frame(_OP_CLOSE, b"", ignore_errors=True)
+                self._reply(_OP_CLOSE, b"")
                 self._shutdown()
                 return None
             if opcode == _OP_PING:
-                self._write_frame(_OP_PONG, payload, ignore_errors=True)
+                self._reply(_OP_PONG, payload)
                 continue
             if opcode == _OP_PONG:
                 continue
@@ -263,8 +263,25 @@ class WebSocket:
         if self._sock is None:
             return
         if not self._closed:
-            self._write_frame(_OP_CLOSE, b"", ignore_errors=True)
+            self._reply(_OP_CLOSE, b"")
         self._shutdown()
+
+    def _reply(self, opcode: int, payload: bytes) -> None:
+        """Answer a control frame without ever waiting for the send lock.
+
+        Reads and writes run on different threads: a writer parked in `sendall`
+        because the peer's window is full holds that lock, and a reader that
+        queued behind it to send a pong would stop draining the very socket
+        whose reads let the peer drain — a full-duplex deadlock. A skipped pong
+        costs nothing; the peer pings again."""
+        if not self._send_lock.acquire(blocking=False):
+            return
+        try:
+            failure = self._write_locked(opcode, payload, ignore_errors=True)
+        finally:
+            self._send_lock.release()
+        if failure is not None:
+            self._shutdown()
 
     @property
     def closed(self) -> bool:
@@ -290,6 +307,22 @@ class WebSocket:
                 pass
 
     def _write_frame(self, opcode: int, payload: bytes, *, ignore_errors: bool = False) -> None:
+        with self._send_lock:
+            failure = self._write_locked(opcode, payload, ignore_errors=ignore_errors)
+        if failure is None:
+            return
+        # A write that failed part-way leaves a truncated frame on the wire and
+        # the peer's parser out of step, so the connection is finished — tearing
+        # it down here is what turns it into a reconnect instead of a garbled
+        # stream. Shutting down outside the send lock keeps it deadlock-free.
+        self._shutdown()
+        if not ignore_errors:
+            raise WebSocketError(f"crdtsync: websocket send failed: {failure}") from failure
+
+    def _write_locked(self, opcode: int, payload: bytes, *, ignore_errors: bool):
+        """Frame and write ``payload``; the caller holds the send lock. Returns
+        the error a partial write hit, for the caller to tear down outside the
+        lock, or ``None``."""
         header = bytearray([0x80 | opcode])
         length = len(payload)
         if length < 126:
@@ -303,26 +336,16 @@ class WebSocket:
         mask = os.urandom(4)
         header += mask
         masked = _mask(payload, mask)
-        failure = None
-        with self._send_lock:
-            sock = self._sock
-            if sock is None:
-                if ignore_errors:
-                    return
-                raise WebSocketError("crdtsync: send on a closed websocket")
-            try:
-                sock.sendall(bytes(header) + masked)
-            except OSError as err:
-                failure = err
-        if failure is None:
-            return
-        # A write that failed part-way leaves a truncated frame on the wire and
-        # the peer's parser out of step, so the connection is finished — tearing
-        # it down here is what turns it into a reconnect instead of a garbled
-        # stream. Shutting down outside the send lock keeps it deadlock-free.
-        self._shutdown()
-        if not ignore_errors:
-            raise WebSocketError(f"crdtsync: websocket send failed: {failure}") from failure
+        sock = self._sock
+        if sock is None:
+            if ignore_errors:
+                return None
+            raise WebSocketError("crdtsync: send on a closed websocket")
+        try:
+            sock.sendall(bytes(header) + masked)
+        except OSError as err:
+            return err
+        return None
 
     def _read_frame(self):
         head = self._read_exact(2)
