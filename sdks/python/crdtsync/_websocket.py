@@ -37,8 +37,9 @@ _OP_PONG = 0xA
 
 #: The largest message accepted, whether as one frame or reassembled from a run
 #: of fragments, so a hostile or corrupt length header cannot make the client
-#: allocate unbounded memory. Comfortably above a room's catch-up snapshot.
-MAX_MESSAGE_BYTES = 256 * 1024 * 1024
+#: allocate unbounded memory. Above the largest frame a crdtsync server will
+#: write, and far below what a length header alone could ask for.
+MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 
 #: How long the connect + upgrade handshake may take before it fails.
 DEFAULT_HANDSHAKE_TIMEOUT = 15.0
@@ -143,7 +144,12 @@ def _handshake(
         f"Sec-WebSocket-Key: {key.decode('ascii')}",
         "Sec-WebSocket-Version: 13",
     ]
-    lines += [f"{name}: {value}" for name, value in headers.items()]
+    for name, value in headers.items():
+        # A newline in a caller-supplied header would splice extra headers — or a
+        # whole second request — into the stream.
+        if any(c in f"{name}{value}" for c in "\r\n"):
+            raise WebSocketError(f"crdtsync: illegal newline in the {name!r} header")
+        lines.append(f"{name}: {value}")
     sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
 
     head, pending = _read_response_head(sock)
@@ -153,6 +159,10 @@ def _handshake(
         raise WebSocketError(
             f"crdtsync: websocket upgrade refused ({status.decode('latin-1')})"
         )
+    upgrade = _header(rest, b"upgrade") or b""
+    connection = _header(rest, b"connection") or b""
+    if upgrade.lower() != b"websocket" or b"upgrade" not in connection.lower():
+        raise WebSocketError("crdtsync: the response did not upgrade to a websocket")
     accept = _header(rest, b"sec-websocket-accept")
     expected = base64.b64encode(hashlib.sha1(key + _ACCEPT_GUID).digest())
     if accept != expected:
@@ -202,7 +212,16 @@ class WebSocket:
 
     def recv(self) -> Optional[bytes]:
         """Block for the next binary message, or return ``None`` once the peer
-        has closed the connection (or it was closed locally)."""
+        has closed the connection (or it was closed locally). A peer that breaks
+        the framing raises, having first shut the connection down: the read
+        cursor is mid-stream, so nothing after it can be trusted."""
+        try:
+            return self._recv()
+        except WebSocketError:
+            self._shutdown()
+            raise
+
+    def _recv(self) -> Optional[bytes]:
         fragments: List[bytes] = []
         total = 0
         started = False
@@ -313,7 +332,10 @@ class WebSocket:
         if head[0] & 0x70:
             raise WebSocketError("crdtsync: websocket frame set a reserved bit")
         opcode = head[0] & 0x0F
-        masked = bool(head[1] & 0x80)
+        if head[1] & 0x80:
+            # RFC 6455 §5.1: a server never masks. A masked frame means the peer
+            # is not speaking the server half of the protocol.
+            raise WebSocketError("crdtsync: the websocket peer masked a frame")
         length = head[1] & 0x7F
         if opcode & 0x8 and (length > 125 or not fin):
             raise WebSocketError("crdtsync: oversized or fragmented control frame")
@@ -329,17 +351,9 @@ class WebSocket:
             length = struct.unpack("!Q", extended)[0]
         if length > MAX_MESSAGE_BYTES:
             raise WebSocketError(f"crdtsync: websocket frame of {length} bytes is too large")
-        mask = b""
-        if masked:
-            got = self._read_exact(4)
-            if got is None:
-                return None
-            mask = got
         payload = self._read_exact(length) if length else b""
         if payload is None:
             return None
-        if mask:
-            payload = _mask(payload, mask)
         return fin, opcode, payload
 
     def _read_exact(self, count: int) -> Optional[bytes]:

@@ -152,6 +152,20 @@ class TestHandshake:
         with pytest.raises(WebSocketError, match="scheme"):
             _websocket.connect("http://127.0.0.1:1")
 
+    def test_refuses_a_101_that_is_not_an_upgrade(self, serve):
+        server = serve(
+            lambda conn: None,
+            status_line=b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c",
+        )
+        with pytest.raises(WebSocketError, match="did not upgrade"):
+            _websocket.connect(server.url)
+
+    def test_refuses_a_header_carrying_a_newline(self, serve):
+        # A newline would splice a header — or a whole second request — in.
+        server = serve(lambda conn: None)
+        with pytest.raises(WebSocketError, match="newline"):
+            _websocket.connect(server.url, headers={"X-Trace": "a\r\nX-Admin: 1"})
+
     def test_keeps_frames_pipelined_with_the_upgrade_response(self, serve):
         # A peer may write the 101 and its first frames in one go; the bytes read
         # past the response head belong to the session, not the handshake, and
@@ -224,6 +238,31 @@ class TestFraming:
         ws = _websocket.connect(serve(lambda conn: conn.sendall(server_frame(0x1, b"hi"))).url)
         with pytest.raises(WebSocketError, match="non-binary"):
             ws.recv()
+
+    def test_refuses_a_masked_frame(self, serve):
+        # RFC 6455 §5.1: a server never masks. One that does is not speaking the
+        # server half of the protocol.
+        def handler(conn):
+            conn.sendall(b"\x82\x81\x00\x00\x00\x00" + b"x")
+
+        ws = _websocket.connect(serve(handler).url)
+        with pytest.raises(WebSocketError, match="masked"):
+            ws.recv()
+
+    def test_refuses_a_message_over_the_ceiling(self, serve):
+        # A length header alone must not be able to make the client allocate.
+        oversized = struct.pack("!Q", _websocket.MAX_MESSAGE_BYTES + 1)
+        ws = _websocket.connect(serve(lambda conn: conn.sendall(b"\x82\x7f" + oversized)).url)
+        with pytest.raises(WebSocketError, match="too large"):
+            ws.recv()
+
+    def test_a_framing_violation_releases_the_socket(self, serve):
+        ws = _websocket.connect(serve(lambda conn: conn.sendall(server_frame(0x1, b"hi"))).url)
+        with pytest.raises(WebSocketError):
+            ws.recv()
+        # The cursor is mid-stream, so nothing after it can be trusted.
+        assert ws.closed
+        assert ws._sock is None
 
 
 class TestClose:

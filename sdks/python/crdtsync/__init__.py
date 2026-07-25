@@ -2852,20 +2852,33 @@ class Doc:
         self._init(Document(client_id if client_id is not None else os.urandom(16)))
 
     @classmethod
-    def _networked(cls, backend, wire: Callable[[bytes], None], lock) -> "Doc":
+    def _networked(cls, backend, wire: Callable[[bytes], None], gate, lock) -> "Doc":
         """A doc over a provider-supplied networked backend: every edit's frame
-        goes to ``wire`` for the socket instead of staying purely local, and
-        ``lock`` serializes it against the provider's reader thread."""
+        goes to ``wire`` for the socket instead of staying purely local, ``gate``
+        keeps concurrent authors in order, and ``lock`` serializes the replica
+        against the provider's reader thread."""
         obj = cls.__new__(cls)
-        obj._init(backend, wire, lock)
+        obj._init(backend, wire, gate, lock)
         return obj
 
-    def _init(self, backend, wire: Optional[Callable[[bytes], None]] = None, lock=None) -> None:
+    def _init(
+        self,
+        backend,
+        wire: Optional[Callable[[bytes], None]] = None,
+        gate=None,
+        lock=None,
+    ) -> None:
         self._backend = backend
         self._wire = wire
-        # A local doc is only ever touched by its caller; a networked one shares
+        # A local doc is only ever touched by its caller. A networked one shares
         # its replica with the provider's reader thread, so an edit and the state
-        # bracket around it have to be one indivisible step.
+        # bracket around it are one indivisible step under `lock` — and an author
+        # holds `gate` from before it stamps its ops until after it has written
+        # them, so two threads reach the socket in the order the replica gave
+        # them their sequences. An acknowledgement is a watermark: a later op
+        # acked ahead of an earlier one would drop the earlier from the outbox
+        # before it was ever sent.
+        self._gate = contextlib.nullcontext() if gate is None else gate
         self._lock = contextlib.nullcontext() if lock is None else lock
         self._update_listeners: List[Callable[[UpdateEvent], None]] = []
         self._repair_listeners: List[Callable[[RepairEvent], None]] = []
@@ -2892,27 +2905,36 @@ class Doc:
         """Run ``fn``'s edits as one atomic group — they apply together on every
         replica, ride the wire as a single batch, and fire one update. Nested calls
         flatten into the outermost transaction."""
-        outbound = b""
         # The atomic group is state of the shared replica, not of the caller, so
         # the whole transaction is one indivisible step: another thread's edit
         # must queue behind it rather than be swept into the group, and its own
         # transaction must not degrade into loose edits.
-        with self._lock:
-            if self._transacting:
-                fn()
-                return
-            before = self._backend.encode_state() if self._observing() else None
-            self._transacting = True
-            self._backend.begin_atomic()
+        with self._gate:
+            outbound, changes, repairs = b"", [], []
             try:
-                fn()
+                with self._lock:
+                    if self._transacting:
+                        fn()
+                        return
+                    before = self._backend.encode_state() if self._observing() else None
+                    self._transacting = True
+                    self._backend.begin_atomic()
+                    try:
+                        fn()
+                    finally:
+                        self._transacting = False
+                        outbound = self._backend.commit_atomic()
+                        if outbound:
+                            changes = self._collect(before)
+                            repairs = self._take_repairs()
             finally:
-                self._transacting = False
-                outbound = self._backend.commit_atomic()
+                # Whatever the body did before it raised is committed to this
+                # replica, so it has to reach the room too — dropping it would
+                # leave this replica ahead of every peer.
                 if outbound:
-                    self._dispatch("local", outbound, before)
-                    self._emit_repairs()
-        self._send(outbound)
+                    self._send(outbound)
+                    self._publish("local", outbound, changes)
+                    self._publish_repairs(repairs)
 
     def on_update(self, callback: Callable[[UpdateEvent], None]) -> Callable[[], None]:
         """Subscribe to every applied change to the document; returns a function
@@ -3001,39 +3023,56 @@ class Doc:
         return bool(self._update_listeners) or bool(self._observers)
 
     def _send(self, ops: bytes) -> None:
-        # Always outside the replica lock: the wire write can block on a full
-        # send window, and holding the lock across it would stop the provider
-        # reading — including the peer's reads that would drain that window.
+        # Never under the replica lock: the wire write can block on a full send
+        # window, and holding the replica across it would stop the provider
+        # reading — including the reads that would drain that window.
         if ops and self._wire is not None:
             self._wire(ops)
 
     def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
-        with self._lock:
-            # Inside a transaction the edit just accumulates; the commit dispatches.
-            if self._transacting:
-                run(self._backend)
-                return b""
-            before = self._backend.encode_state() if self._observing() else None
-            ops = run(self._backend)
+        with self._gate:
+            with self._lock:
+                # Inside a transaction the edit just accumulates; the commit
+                # sends and publishes.
+                if self._transacting:
+                    run(self._backend)
+                    return b""
+                before = self._backend.encode_state() if self._observing() else None
+                ops = run(self._backend)
+                changes = self._collect(before) if ops else []
+                repairs = self._take_repairs() if ops else []
             if ops:
-                self._dispatch("local", ops, before)
-                self._emit_repairs()
-        self._send(ops)
-        return ops
+                self._send(ops)
+                self._publish("local", ops, changes)
+                self._publish_repairs(repairs)
+            return ops
 
     def _apply_remote(self, receive: Callable[[], None]) -> None:
         """Bracket a provider-driven inbound frame with the reactivity a local
         edit gets: the replica the frame folds into is the backend's own, so the
-        change set is the before/after diff around it."""
+        change set is the before/after diff around it.
+
+        Listeners run after the replica lock is released. They are free to edit,
+        and an edit takes the author's gate — a listener holding the replica
+        while reaching for the gate would invert the two locks against every
+        application thread."""
         with self._lock:
             before = self._backend.encode_state() if self._observing() else None
             receive()
-            if before is not None:
-                self._dispatch("remote", b"", before)
-            self._emit_repairs()
+            changes = self._collect(before) if before is not None else []
+            repairs = self._take_repairs()
+        self._publish("remote", b"", changes)
+        self._publish_repairs(repairs)
 
     def _dispatch(self, origin: str, ops: bytes, before: Optional[bytes]) -> None:
-        raws = [] if before is None else self._compute_changes(before)
+        self._publish(origin, ops, self._collect(before))
+
+    def _collect(self, before: Optional[bytes]) -> List[Tuple[bytes, dict]]:
+        """The change list an edit produced, read off the replica — the caller
+        holds the replica lock."""
+        return [] if before is None else self._compute_changes(before)
+
+    def _publish(self, origin: str, ops: bytes, raws: List[Tuple[bytes, dict]]) -> None:
         changes = [change for _pb, change in raws]
         # A remote frame that changed nothing (an ack) fires no update; a local edit
         # always reports its ops. Snapshot the listener sets so one subscribed during
@@ -3059,16 +3098,21 @@ class Doc:
         return [_remarshal_change(d) for d in _decode_changes(raw)]
 
     def _emit_repairs(self) -> None:
+        self._publish_repairs(self._take_repairs())
+
+    def _take_repairs(self) -> List[list]:
         # Drain the schema-repair signal only when observed — the drain reseeds the
         # baseline, so draining unobserved would lose the signal; an unobserved doc
-        # pays nothing (and take_repairs is empty until a schema is bound).
+        # pays nothing (and take_repairs is empty until a schema is bound). The
+        # caller holds the replica lock.
         if not self._repair_listeners:
-            return
-        raw = self._backend.take_repairs()
+            return []
+        return self._backend.take_repairs()
+
+    def _publish_repairs(self, raw: List[list]) -> None:
         if not raw:
             return
-        paths = [[_repair_step(step) for step in path] for path in raw]
-        event = RepairEvent(paths=paths)
+        event = RepairEvent(paths=[[_repair_step(step) for step in path] for path in raw])
         for listener in list(self._repair_listeners):
             listener(event)
 
@@ -3371,13 +3415,13 @@ class Provider:
         transport: "Optional[Callable[[str], object]]" = None,
     ):
         self._url = url
-        # Two locks. The replica lock guards the native session; the send lock
-        # orders what reaches the socket and pins the phase while a frame is
-        # written, so an edit can never land inside a handshake. A holder of both
-        # takes the send lock first — only the reader thread ever does, when it
-        # opens the channel to app traffic. An application thread authors under
-        # the replica lock and writes after releasing it, so a socket write never
-        # blocks the reader that would drain the peer's window.
+        # Two locks, and the send lock is always the outer one. It orders what
+        # reaches the socket — an author holds it from before its ops are stamped
+        # until after they are written, so concurrent authors reach the wire in
+        # sequence order — and pins the phase while a frame is written, so an
+        # edit can never land inside a handshake. The replica lock guards the
+        # native session and is released before any socket write, so a write can
+        # never stop the reader folding what arrives.
         self._lock = threading.RLock()
         self._send_lock = threading.RLock()
         self._client = Client(client_id if client_id is not None else os.urandom(16))
@@ -3390,11 +3434,12 @@ class Provider:
         self._on_error = on_error
         self._on_ops_rejected = on_ops_rejected
         self._on_redirect = on_redirect
-        self._transport = transport if transport is not None else _websocket.connect
+        self._transport = transport if transport is not None else self._dial
 
         self.doc = Doc._networked(
             _ClientBackend(self._client, self._channel, self._lock),
             self._send_if_open,
+            self._send_lock,
             self._lock,
         )
 
@@ -3469,10 +3514,60 @@ class Provider:
         provider remembers what this client published and republishes it once a
         reconnect has caught the channel up."""
         key_bytes, value_bytes = _key_bytes(key), _key_bytes(value)
-        with self._lock:
-            self._published[key_bytes] = value_bytes
-            frame = self._client.set_awareness(self._channel, key_bytes, value_bytes)
-        self._send_if_open(frame)
+        with self._send_lock:
+            with self._lock:
+                self._published[key_bytes] = value_bytes
+                frame = self._client.set_awareness(self._channel, key_bytes, value_bytes)
+            self._send_if_open(frame)
+
+    def acl_grant(
+        self,
+        subject_kind: SubjectKind,
+        subject: bytes,
+        path: Path = (),
+        *,
+        capability: Optional[Capability] = None,
+        role: Optional[bytes] = None,
+        effect: Effect = Effect.ALLOW,
+        grantor: Optional[bytes] = None,
+    ) -> bytes:
+        """Author a doc-ACL grant over the room, routed through the op path so it
+        is acknowledged and resent like an edit. Returns the tuple id
+        :meth:`acl_revoke` names it by.
+
+        ``grantor`` defaults to this connection's authenticated actor, keyed the
+        way a matched ``Actor`` subject is — so the grant is credited to the
+        identity rather than to an ephemeral per-device id."""
+        with self._send_lock:
+            with self._lock:
+                credited = grantor
+                if credited is None:
+                    actor = self._client.actor()
+                    credited = None if actor is None else actor_key(actor)
+                if credited is None:
+                    raise ValueError(
+                        "crdtsync: no authenticated actor to credit the grant; pass grantor"
+                    )
+                tuple_id, frame = self._client.acl_grant(
+                    self._channel,
+                    subject_kind,
+                    subject,
+                    credited,
+                    path,
+                    capability=capability,
+                    role=role,
+                    effect=effect,
+                )
+            self._send_if_open(frame)
+        return tuple_id
+
+    def acl_revoke(self, tuple_id: bytes) -> None:
+        """Revoke the doc-ACL tuple :meth:`acl_grant` returned, through the same
+        op path."""
+        with self._send_lock:
+            with self._lock:
+                frame = self._client.acl_revoke(self._channel, tuple_id)
+            self._send_if_open(frame)
 
     def awareness(self, actor: bytes, key: Key) -> Optional[bytes]:
         """A peer's awareness entry by publishing ``actor`` and ``key``, or
@@ -3563,14 +3658,26 @@ class Provider:
             ws.send(hello)
             ws.send(auth)
 
+    def _dial(self, url: str):
+        return _websocket.connect(url, timeout=self._connect_timeout)
+
     def _deliver(self, data: bytes) -> None:
-        """Handle one inbound frame. An application callback that raises is
-        reported and the connection carries on — a listener's bug must not
-        silently strand the provider with a dead reader and a live state."""
+        """Handle one inbound frame. A failure anywhere in it is reported and the
+        connection carries on — the alternative is a dead reader behind a state
+        that still reads ``connected``."""
         try:
             self._on_message(data)
-        except (OSError, _websocket.WebSocketError):
-            raise
+        except Exception:
+            _LOGGER.exception("crdtsync: handling an inbound frame failed")
+
+    def _notify(self, callback, argument) -> None:
+        """Hand a signal to an application hook. A hook that raises is its own
+        bug: it is reported, and the frame's remaining work — draining the other
+        signals, completing the initial sync — still happens."""
+        if callback is None:
+            return
+        try:
+            callback(argument)
         except Exception:
             _LOGGER.exception("crdtsync: a provider callback raised")
 
@@ -3595,9 +3702,15 @@ class Provider:
                 self._phase = "catchup"
             return
 
-        # Bracket the fold so the doc's diff-based reactivity fires for inbound ops.
+        # Bracket the fold so the doc's diff-based reactivity fires for inbound
+        # ops. Reactivity is the app's code: a listener that raises must not cost
+        # this frame its signal drain or the connection its initial sync, or the
+        # provider would sit at "catchup" forever, dropping every later edit.
         folded: List[Optional[ErrorCode]] = []
-        self.doc._apply_remote(lambda: folded.append(self._receive(data)))
+        try:
+            self.doc._apply_remote(lambda: folded.append(self._receive(data)))
+        except Exception:
+            _LOGGER.exception("crdtsync: folding an inbound frame failed")
         err = folded[0] if folded else None
         if err is not None:
             self._handle_server_error(err)
@@ -3624,17 +3737,17 @@ class Provider:
         if not self._connected_once:
             # A handshake-time error (bad auth, unsupported version) is fatal.
             self._fatal(ServerError(code))
-        elif self._on_error is not None:
-            self._on_error(code)
+        else:
+            self._notify(self._on_error, code)
 
     def _drain_signals(self) -> None:
         with self._lock:
             rejected = self._client.take_rejected()
             redirects = self._client.take_redirects()
-        if rejected and self._on_ops_rejected is not None:
-            self._on_ops_rejected(rejected)
-        if redirects and self._on_redirect is not None:
-            self._on_redirect(redirects)
+        if rejected:
+            self._notify(self._on_ops_rejected, rejected)
+        if redirects:
+            self._notify(self._on_redirect, redirects)
 
     def _resume_frame(self) -> bytes:
         with self._lock:

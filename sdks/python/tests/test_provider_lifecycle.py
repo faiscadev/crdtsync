@@ -468,6 +468,28 @@ class TestCallbackFailures:
         finally:
             p.close()
 
+    def test_a_hook_that_raises_on_the_first_frame_still_completes_the_sync(
+        self, transport
+    ):
+        def explode(_rejected):
+            raise RuntimeError("callback bug")
+
+        p = Provider("ws://fake", "room", transport=transport, on_ops_rejected=explode)
+        try:
+            socket = transport.socket(0)
+            socket.wait_sent(3)
+            socket.deliver(auth_ok())
+            socket.wait_sent(4)
+            # The catch-up frame carries a rejection the hook fumbles. If that
+            # aborted the frame the provider would sit at "catchup" forever,
+            # dropping every later edit into an outbox nothing replays.
+            socket.deliver(ops_rejected(p._channel, [1], ErrorCode.FORBIDDEN))
+            p.wait_connected(timeout=2.0)
+            p.doc.get_text("body").insert(0, "after")
+            assert tag(socket.wait_sent(5)[4]) == _TAG_OPS
+        finally:
+            p.close()
+
     def test_a_raising_state_listener_does_not_break_close(self, transport):
         def explode(_state):
             raise RuntimeError("listener bug")

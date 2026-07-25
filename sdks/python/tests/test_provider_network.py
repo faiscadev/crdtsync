@@ -123,9 +123,46 @@ class TestNetworkedProvider:
 
     def test_the_server_acknowledges_and_drains_the_outbox(self, join):
         a = join("room-outbox")
-        a.doc.get_text("body").insert(0, "hi")
-        assert a.outbox_len > 0
+        # An acknowledgement may already have landed by the time the edit
+        # returns, so the drain is the observable: the ops leave the outbox
+        # rather than accumulating unacknowledged.
+        for i in range(20):
+            a.doc.get_list("items").append(i)
         wait_for(lambda: a.outbox_len == 0)
+        assert a.state == "connected"
+
+    def test_concurrent_authors_all_reach_the_room(self, join):
+        a = join("room-threads")
+        b = join("room-threads")
+        # Two threads editing one doc stamp their ops under the replica lock but
+        # write them after; a later op acknowledged ahead of an earlier one would
+        # drop the earlier from the outbox before it was ever sent.
+        threads = [
+            threading.Thread(target=lambda tag=tag: [
+                a.doc.get_list(tag).append(i) for i in range(25)
+            ])
+            for tag in ("left", "right")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        wait_for(lambda: a.outbox_len == 0)
+        wait_for(lambda: len(b.doc.get_list("left")) == 25)
+        wait_for(lambda: len(b.doc.get_list("right")) == 25)
+
+    def test_a_transaction_body_that_raises_still_ships_what_it_committed(self, join):
+        a = join("room-tx-raise")
+        b = join("room-tx-raise")
+
+        def body():
+            a.doc.get_list("items").append("kept")
+            raise RuntimeError("halfway")
+
+        with pytest.raises(RuntimeError):
+            a.doc.transact(body)
+        # The edit is committed to this replica, so the room has to see it too.
+        wait_for(lambda: len(b.doc.get_list("items")) == 1)
 
     def test_an_edit_survives_a_dropped_socket(self, join):
         a = join("room-reconnect")
