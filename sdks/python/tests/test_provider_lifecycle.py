@@ -86,12 +86,13 @@ def tag(frame: bytes) -> int:
     return frame[0]
 
 
-def peer_edit(channel: int) -> bytes:
+def peer_edit(channel: int, key: bytes = b"note", replica: int = 9) -> bytes:
     """An Ops frame authored by another replica, retargeted at ``channel`` — what
-    the server fans out when a peer edits the room."""
-    peer = Client(bytes([9] + [0] * 15))
+    the server fans out when a peer edits the room. Each peer gets its own
+    replica id, so two of them author distinct ops."""
+    peer = Client(bytes([replica] + [0] * 15))
     peer_channel, _ = peer.subscribe(b"room")
-    frame = peer.text_insert(peer_channel, [b"note"], 0, "ok")
+    frame = peer.text_insert(peer_channel, [key], 0, "ok")
     return frame[:1] + struct.pack("<I", channel) + frame[5:]
 
 
@@ -685,6 +686,41 @@ class TestCallbackFailures:
             assert tag(socket.wait_sent(5)[4]) == _TAG_OPS
         finally:
             p.close()
+
+    def test_a_listener_may_edit_while_an_inbound_frame_folds(self, transport, provider):
+        socket = handshake(transport)
+        provider.wait_connected(timeout=2.0)
+
+        # A listener runs on the reader thread, and an edit from it takes the
+        # author's gate — which the fold must already have let go of, or the two
+        # locks invert against every application thread.
+        def echo(_event):
+            if not str(provider.doc.get_text("echo")):
+                provider.doc.get_text("echo").insert(0, "seen")
+
+        provider.doc.on_update(echo)
+        socket.deliver(peer_edit(provider._channel))
+        wait_for(lambda: str(provider.doc.get_text("echo")) == "seen")
+        assert tag(socket.wait_sent(5)[4]) == _TAG_OPS
+
+    def test_a_raising_doc_listener_leaves_the_connection_alone(self, transport, provider):
+        socket = handshake(transport)
+        provider.wait_connected(timeout=2.0)
+        off = provider.doc.on_update(
+            lambda _e: (_ for _ in ()).throw(RuntimeError("listener bug"))
+        )
+        socket.deliver(peer_edit(provider._channel))
+        wait_for(lambda: str(provider.doc.get_text("note")) == "ok")
+
+        # The connection is still folding and still writing after the raise, not
+        # merely still labelled connected. A local edit's listener raises at its
+        # caller, so the observer stands down before that half.
+        socket.deliver(peer_edit(provider._channel, key=b"second", replica=10))
+        wait_for(lambda: str(provider.doc.get_text("second")) == "ok")
+        off()
+        provider.doc.get_text("body").insert(0, "after")
+        assert tag(socket.wait_sent(5)[4]) == _TAG_OPS
+        assert provider.state == "connected"
 
     def test_a_raising_state_listener_does_not_break_close(self, transport):
         def explode(_state):

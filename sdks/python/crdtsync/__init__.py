@@ -388,6 +388,27 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_client_text_delete, [doc, ch, cbytes, size, size, size], buf)
     sig(lib.crdtsync_client_text_len, [doc, ch, cbytes, size, c.POINTER(size)], c.c_int32)
     sig(lib.crdtsync_client_text_get, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    # per-channel state, blob, mark, and anchor reads (client)
+    sig(lib.crdtsync_client_channel_state, [doc, ch, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_get_counter, [doc, ch, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
+    sig(lib.crdtsync_client_get_blob, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_marks_at, [doc, ch, cbytes, size, size, c.POINTER(buf)], c.c_int32)
+    sig(
+        lib.crdtsync_client_relative_position,
+        [doc, ch, cbytes, size, size, c.c_uint32, c.POINTER(buf)],
+        c.c_int32,
+    )
+    sig(
+        lib.crdtsync_client_resolve_position,
+        [doc, ch, cbytes, size, cbytes, size, c.POINTER(size)],
+        c.c_int32,
+    )
+    sig(lib.crdtsync_client_xml_tag, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(
+        lib.crdtsync_client_xml_children_len,
+        [doc, ch, cbytes, size, c.POINTER(size)],
+        c.c_int32,
+    )
     # xml navigation (client)
     sig(lib.crdtsync_client_xml_element, [doc, ch, cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_client_xml_fragment, [doc, ch, cbytes, size], buf)
@@ -1746,6 +1767,23 @@ class Client:
             )
         )
 
+    def get_blob(self, channel: int, path: Path) -> Optional[BlobRef]:
+        """Read the :class:`BlobRef` at a path in ``channel``'s room, or ``None``
+        when the slot holds no blob ref."""
+        raw = self._read_buf(_LIB.crdtsync_client_get_blob, channel, path)
+        return None if raw is None else _decode_blob_ref(raw)
+
+    # --- per-channel state ---
+
+    def channel_state(self, channel: int) -> Optional[bytes]:
+        """Serialize ``channel``'s room replica to a canonical snapshot, or
+        ``None`` when the channel isn't held. The before/after seam the ergonomic
+        layer diffs to derive change events."""
+        _u32("channel", channel)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_channel_state(self._handle, channel, ctypes.byref(out))
+        return _take_buf(out) if rc == 1 else None
+
     # --- per-channel xml ---
 
     def xml_element(self, channel: int, path: Path, tag: bytes) -> bytes:
@@ -1822,6 +1860,16 @@ class Client:
                 self._handle, channel, pp, len(pp), child_index, np, len(np), dest_index
             )
         )
+
+    def xml_tag(self, channel: int, path: Path) -> Optional[bytes]:
+        """The tag of the ``XmlElement`` at a path in ``channel``'s room, or
+        ``None`` for a fragment or a path that is not a live xml node."""
+        return self._read_buf(_LIB.crdtsync_client_xml_tag, channel, path)
+
+    def xml_children_len(self, channel: int, elem_path: Path) -> Optional[int]:
+        """The live child count of the element or fragment at ``elem_path`` in
+        ``channel``'s room, or ``None`` when the path is not a live xml node."""
+        return self._read_usize(_LIB.crdtsync_client_xml_children_len, channel, elem_path)
 
     # --- per-channel marks ---
 
@@ -1913,6 +1961,50 @@ class Client:
             _LIB.crdtsync_client_mark_delete(self._handle, channel, mark_id, len(mark_id))
         )
 
+    def marks_at(self, channel: int, seq_path: Path, index: int) -> list:
+        """The marks active on character ``index`` of the sequence at ``seq_path``
+        in ``channel``'s room, each a dict with ``name``, ``flavor``
+        (``boolean``/``value``/``object``), and the flavor's field. Empty for a
+        non-sequence path or an uncovered index."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(seq_path)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_marks_at(
+            self._handle, channel, p, len(p), index, ctypes.byref(out)
+        )
+        return _decode_marks(_take_buf(out)) if rc == 1 else []
+
+    # --- per-channel relative positions (anchors) ---
+
+    def relative_position(
+        self, channel: int, path: Path, index: int, side: Side = Side.LEFT
+    ) -> Optional[bytes]:
+        """Capture a stable position in the List or Text at a path in
+        ``channel``'s room — encoded bytes to resolve later with
+        :meth:`resolve_position`. ``None`` for a bad or non-sequence path, an
+        unknown ``side``, or an unheld channel."""
+        _u32("channel", channel)
+        _usize("index", index)
+        _u32("side", int(side))
+        p = encode_path(path)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_relative_position(
+            self._handle, channel, p, len(p), index, int(side), ctypes.byref(out)
+        )
+        return _take_buf(out) if rc == 1 else None
+
+    def resolve_position(self, channel: int, path: Path, pos: bytes) -> Optional[int]:
+        """Resolve a captured position back to a live index in the List or Text at
+        a path in ``channel``'s room, or ``None`` when it no longer resolves."""
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = ctypes.c_size_t()
+        rc = _LIB.crdtsync_client_resolve_position(
+            self._handle, channel, p, len(p), pos, len(pos), ctypes.byref(out)
+        )
+        return out.value if rc == 1 else None
+
     # --- per-channel acl authoring ---
 
     def acl_grant(
@@ -1974,11 +2066,13 @@ class Client:
     # --- per-channel reads ---
 
     def get_int(self, channel: int, path: Path) -> Optional[int]:
-        _u32("channel", channel)
-        p = encode_path(path)
-        out = ctypes.c_int64()
-        rc = _LIB.crdtsync_client_get_int(self._handle, channel, p, len(p), ctypes.byref(out))
-        return out.value if rc == 1 else None
+        return self._read_i64(_LIB.crdtsync_client_get_int, channel, path)
+
+    def get_counter(self, channel: int, path: Path) -> Optional[int]:
+        """The value of the Counter at a path in ``channel``'s room — the
+        read-back for :meth:`inc`/:meth:`dec` — or ``None`` when the slot holds
+        no counter."""
+        return self._read_i64(_LIB.crdtsync_client_get_counter, channel, path)
 
     def get_bytes(self, channel: int, path: Path) -> Optional[bytes]:
         return self._read_buf(_LIB.crdtsync_client_get_bytes, channel, path)
@@ -2205,6 +2299,13 @@ class Client:
         return created.value == 1
 
     # --- helpers ---
+
+    def _read_i64(self, fn, channel: int, path: Path) -> Optional[int]:
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = ctypes.c_int64()
+        rc = fn(self._handle, channel, p, len(p), ctypes.byref(out))
+        return out.value if rc == 1 else None
 
     def _read_usize(self, fn, channel: int, path: Path) -> Optional[int]:
         _u32("channel", channel)
@@ -3308,6 +3409,10 @@ class _ClientBackend:
         neither reaches the wire nor fires an update."""
         return frame if _carries_ops(frame) else b""
 
+    def encode_state(self) -> bytes:
+        with self._lock:
+            return self._client.channel_state(self._channel) or b""
+
     def get_scalar(self, path: Path) -> Optional[bytes]:
         with self._lock:
             return self._client.get_scalar(self._channel, path)
@@ -3364,6 +3469,10 @@ class _ClientBackend:
         with self._lock:
             return self._framed(self._client.set_blob_ref(self._channel, path, blob_id, mime, size))
 
+    def get_blob(self, path: Path) -> Optional[BlobRef]:
+        with self._lock:
+            return self._client.get_blob(self._channel, path)
+
     def xml_element(self, path: Path, tag: bytes) -> bytes:
         with self._lock:
             return self._framed(self._client.xml_element(self._channel, path, tag))
@@ -3383,6 +3492,14 @@ class _ClientBackend:
     def xml_child_delete(self, elem_path: Path, index: int) -> bytes:
         with self._lock:
             return self._framed(self._client.xml_child_delete(self._channel, elem_path, index))
+
+    def xml_tag(self, path: Path) -> Optional[bytes]:
+        with self._lock:
+            return self._client.xml_tag(self._channel, path)
+
+    def xml_children_len(self, elem_path: Path) -> Optional[int]:
+        with self._lock:
+            return self._client.xml_children_len(self._channel, elem_path)
 
     def xml_move(
         self, parent: Path, child_index: int, new_parent: Path, dest_index: int
@@ -3426,6 +3543,27 @@ class _ClientBackend:
     def mark_delete(self, mark_id: bytes) -> bytes:
         with self._lock:
             return self._framed(self._client.mark_delete(self._channel, mark_id))
+
+    def marks_at(self, seq_path: Path, index: int) -> list:
+        with self._lock:
+            return self._client.marks_at(self._channel, seq_path, index)
+
+    def relative_position(self, path: Path, index: int, side: Side) -> Optional[bytes]:
+        with self._lock:
+            return self._client.relative_position(self._channel, path, index, side)
+
+    def resolve_position(self, path: Path, pos: bytes) -> Optional[int]:
+        with self._lock:
+            return self._client.resolve_position(self._channel, path, pos)
+
+    def set_schema(self, schema: bytes) -> bool:
+        """A room replica binds no schema: the client seat has no schema surface,
+        so there is nothing for the repair signal to measure against."""
+        return False
+
+    def take_repairs(self) -> List[list]:
+        """Empty for the same reason :meth:`set_schema` binds nothing."""
+        return []
 
     def begin_atomic(self) -> None:
         with self._lock:

@@ -67,6 +67,13 @@ resent when the provider reconnects and resumes the channel. Server signals reac
 the app through `on_error` (an `ErrorCode`, `UPDATE_REQUIRED` being the
 update-required push), `on_ops_rejected`, and `on_redirect`.
 
+`p.doc` is the whole handle graph over that room's replica — reads, nested
+containers, cursors, marks, blobs, transactions, and reactivity (`on_update` /
+`handle.observe`) all work as they do locally, with a peer's edit arriving as
+`origin == "remote"`. Callbacks run on the provider's reader thread, so keep them
+quick. A networked doc binds no schema (`set_schema` returns `False`), so the
+`on_repair` signal stays silent on one.
+
 `LocalProvider(doc, send)` is the embedded counterpart for an app that owns its
 own transport: the same connection state and offline outbox over a local doc's
 apply/emit seam.

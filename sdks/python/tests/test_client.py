@@ -1,7 +1,16 @@
 """The Python SDK drives the wire client over the C ABI: a local edit produces a
 frame a peer folds in and converges on, and the handshake surface marshals."""
 
-from crdtsync import Client, DiffKind, Document, ErrorCode, Redirect, Rejected, ServerError
+from crdtsync import (
+    Client,
+    DiffKind,
+    Document,
+    ErrorCode,
+    Redirect,
+    Rejected,
+    ServerError,
+    Side,
+)
 
 
 def cid(first: int) -> bytes:
@@ -340,3 +349,54 @@ def test_atomic_transaction_over_the_client():
         b.receive(frame)
         assert b.get_int(cb, [b"x"]) == 1
         assert b.get_int(cb, [b"y"]) == 2
+
+
+def test_per_channel_reads_answer_over_the_room_replica():
+    """The reads the ergonomic layer needs of a channel: a counter's value, an
+    xml node's tag and child count, the marks on a character, and the whole
+    replica as a snapshot."""
+    with Client(cid(1)) as a, Client(cid(2)) as b:
+        ca, _ = a.subscribe(b"room-reads")
+        cb, _ = b.subscribe(b"room-reads")
+
+        assert b.receive(a.inc(ca, [b"hits"], 5)) == 1
+        assert b.receive(a.inc(ca, [b"hits"], 2)) == 1
+        assert a.get_counter(ca, [b"hits"]) == 7
+        assert b.get_counter(cb, [b"hits"]) == 7
+        assert b.get_counter(cb, [b"absent"]) is None
+
+        assert b.receive(a.xml_element(ca, [b"doc"], b"article")) == 1
+        assert b.receive(a.xml_insert_element(ca, [b"doc"], 0, b"p")) == 1
+        assert b.xml_tag(cb, [b"doc"]) == b"article"
+        assert b.xml_children_len(cb, [b"doc"]) == 1
+        assert b.xml_tag(cb, [b"hits"]) is None
+        assert b.xml_children_len(cb, [b"hits"]) is None
+
+        assert b.receive(a.text_insert(ca, [b"body"], 0, "hello")) == 1
+        _mark_id, frame = a.mark(ca, [b"body"], 0, Side.LEFT, 2, Side.LEFT, b"bold", True)
+        assert b.receive(frame) == 1
+        assert [m["name"] for m in b.marks_at(cb, [b"body"], 0)] == [b"bold"]
+        assert b.marks_at(cb, [b"body"], 4) == []
+
+        # The snapshot is a real replica: it reopens as a document holding the
+        # same state, which is what the ergonomic layer diffs before and after.
+        state = b.channel_state(cb)
+        assert state
+        with Document.decode_state(state) as reopened:
+            assert reopened.get_counter([b"hits"]) == 7
+            assert reopened.text_get([b"body"]) == "hello"
+        assert b.channel_state(cb + 7) is None  # an unheld channel
+
+
+def test_per_channel_anchors_track_a_position_across_an_insert():
+    with Client(cid(1)) as a, Client(cid(2)) as b:
+        ca, _ = a.subscribe(b"room-anchor")
+        cb, _ = b.subscribe(b"room-anchor")
+        assert b.receive(a.text_insert(ca, [b"body"], 0, "hello")) == 1
+
+        anchor = b.relative_position(cb, [b"body"], 5)
+        assert anchor is not None
+        assert b.receive(a.text_insert(ca, [b"body"], 0, ">> ")) == 1
+        # The anchor names the character, so it follows the text that shifted.
+        assert b.resolve_position(cb, [b"body"], anchor) == 8
+        assert b.relative_position(cb, [b"hits"], 0) is None

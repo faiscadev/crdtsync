@@ -134,6 +134,76 @@ class TestNetworkedProvider:
         assert list(b.doc.get_list("items")) == ["x", "y"]
         assert b.doc.get_map("root").keys() == ["title"]
 
+    def test_the_handle_graph_reads_back_through_the_room_replica(self, join):
+        a = join("room-graph")
+        b = join("room-graph")
+        a.doc.get_map("root").set("title", "Hello")
+        a.doc.get_map("root").get_map("nested").set("flag", True)
+        a.doc.get_map("root").set_blob("logo", "image/png", b"\x89PNG")
+
+        wait_for(lambda: b.doc.get_map("root").get("title") == "Hello")
+        wait_for(lambda: b.doc.get_map("root").get("nested") is not None)
+        assert b.doc.get_map("root").get("nested").get("flag") is True
+        assert "title" in b.doc.get_map("root")
+        assert "absent" not in b.doc.get_map("root")
+        wait_for(lambda: b.doc.get_map("root").get_blob("logo") is not None)
+        assert b.doc.get_map("root").get_blob("logo").mime == "image/png"
+        assert b.doc.encode_state()
+
+    def test_xml_and_marks_read_back_over_the_wire(self, join):
+        a = join("room-rich")
+        b = join("room-rich")
+        a.doc.get_xml("tree").element("article")
+        a.doc.get_xml("tree").insert_element(0, "p")
+        a.doc.get_text("body").insert(0, "hello")
+        a.doc.get_text("body").mark(0, 2, "bold", True)
+
+        wait_for(lambda: b.doc.get_xml("tree").tag == "article")
+        wait_for(lambda: len(b.doc.get_xml("tree")) == 1)
+        wait_for(lambda: [m["name"] for m in b.doc.get_text("body").marks_at(0)] == ["bold"])
+        assert b.doc.get_text("body").marks_at(4) == []
+        assert b.doc.get_xml("tree").tag == "article"
+        assert b.doc.get_xml("absent").tag is None
+
+    def test_a_peer_edit_fires_remote_reactivity(self, join):
+        a = join("room-reactivity")
+        b = join("room-reactivity")
+        updates, observed = [], []
+        b.doc.on_update(updates.append)
+        b.doc.get_map("root").observe(observed.append)
+
+        a.doc.get_map("root").set("k", "first")
+        a.doc.get_map("root").set("k", "second")
+
+        wait_for(lambda: b.doc.get_map("root").get("k") == "second")
+        wait_for(lambda: any(e.origin == "remote" for e in updates))
+        assert all(e.origin == "remote" for e in updates)
+        # The change list names what actually moved, not just that something did.
+        assert any(c["kind"] in ("add", "update") for e in updates for c in e.changes)
+        wait_for(lambda: len(observed) > 0)
+        assert all(e.origin == "remote" for e in observed)
+
+    def test_a_local_edit_reports_itself_before_the_room_answers(self, join):
+        a = join("room-local-reactivity")
+        updates = []
+        a.doc.on_update(updates.append)
+        a.doc.get_text("body").insert(0, "hi")
+        assert [e.origin for e in updates] == ["local"]
+        assert updates[0].ops  # the frame it put on the wire
+
+    def test_cursors_survive_a_concurrent_remote_insert(self, join):
+        a = join("room-cursors")
+        b = join("room-cursors")
+        a.doc.get_text("body").insert(0, "hello")
+        wait_for(lambda: str(b.doc.get_text("body")) == "hello")
+
+        anchor = b.doc.get_text("body").relative_position(5)
+        assert anchor is not None
+        a.doc.get_text("body").insert(0, ">> ")
+        wait_for(lambda: str(b.doc.get_text("body")) == ">> hello")
+        # The anchor tracks the character it was taken against, not the index.
+        assert b.doc.get_text("body").resolve(anchor) == 8
+
     def test_a_late_joiner_catches_up_to_existing_state(self, join):
         a = join("room-catchup")
         a.doc.get_text("body").insert(0, "early")
