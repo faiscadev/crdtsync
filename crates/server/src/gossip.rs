@@ -263,11 +263,15 @@ async fn relay_roundtrip<T>(
             .await
             .ok()?;
         // An empty-`app_id` Hello resolves to a relay, so the peer accepts the
-        // node-to-node frame that follows.
+        // node-to-node frame that follows. It advertises no codec: this link
+        // pushes a frame and reads for one reply shape, with nowhere to fold a
+        // selection, so it must not invite one — it speaks the codec silence
+        // carries. Negotiating peer links waits on a second codec existing.
         let hello = Message::Hello {
             client: server,
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         };
         write
             .send(WsMessage::Binary(encode_message(&hello)))

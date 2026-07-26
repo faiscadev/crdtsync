@@ -13,7 +13,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diff::{decode_changes, Change};
 use crate::doc::MapCursor;
-use crate::{BranchInfo, Channel, ClientId, DiffKind, Document, ElementId, ErrorCode, Message, Op};
+use crate::{
+    BranchInfo, Channel, ClientId, DiffKind, Document, ElementId, ErrorCode, Message, Op, CODEC_V1,
+    SUPPORTED_CODECS,
+};
 
 /// Why an inbound message could not be folded into a replica.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -26,6 +29,10 @@ pub enum ClientError {
     BadDiff,
     /// A routed frame named a channel this session does not hold.
     UnknownChannel(Channel),
+    /// The server selected a codec this build cannot speak. Every later frame
+    /// would decode wrong, so the session refuses the selection rather than read
+    /// bytes it cannot interpret.
+    UnsupportedCodec(u32),
     /// The server reported a failure.
     Server { code: ErrorCode, message: String },
 }
@@ -82,6 +89,17 @@ pub struct ClientSession {
     /// declared `schema_version`: a dynamic client declares 0 and learns the
     /// concrete version the server picked here. `None` until an advert arrives.
     active_schema: Option<(u32, Vec<u8>)>,
+    /// The codec a `CodecSelected` named, or `None` while the server has answered
+    /// no selection — which is itself an answer, [`CODEC_V1`]. Holding the
+    /// selection separately is what tells a selection that *changes* it, a
+    /// mid-stream switch neither end agrees on the boundary of, from one that
+    /// re-names it, which each reconnect's handshake produces.
+    codec: Option<u32>,
+    /// The failure that made this session unusable, once one has. A codec the
+    /// server selected and this build cannot speak is unrecoverable — every later
+    /// frame would be misread — so it is remembered and refuses every subsequent
+    /// receive rather than letting the caller pump on.
+    fatal: Option<ClientError>,
     rooms: HashMap<Channel, Room>,
     next_channel: u32,
     /// Op batches the server refused, awaiting the app's drain. Held at the
@@ -126,6 +144,8 @@ impl ClientSession {
             app_id: Vec::new(),
             schema_version: 0,
             active_schema: None,
+            codec: None,
+            fatal: None,
             rooms: HashMap::new(),
             next_channel: 0,
             rejected: Vec::new(),
@@ -169,12 +189,22 @@ impl ClientSession {
         self.active_schema.as_ref().map(|(_, s)| s.as_slice())
     }
 
-    /// The opening frame, naming this replica and the app it speaks for.
+    /// The codec this connection speaks — [`CODEC_V1`] until a `CodecSelected`
+    /// names another, since a server that answers no selection is on it too. A
+    /// session stranded on a codec it cannot speak answers nothing meaningful
+    /// here; it refuses every frame instead.
+    pub fn codec(&self) -> u32 {
+        self.codec.unwrap_or(CODEC_V1)
+    }
+
+    /// The opening frame, naming this replica, the app it speaks for, and the
+    /// codecs it can speak.
     pub fn hello(&self) -> Message {
         Message::Hello {
             client: self.client,
             app_id: self.app_id.clone(),
             schema_version: self.schema_version,
+            codecs: SUPPORTED_CODECS.to_vec(),
         }
     }
 
@@ -607,8 +637,12 @@ impl ClientSession {
     /// place; a snapshot replaces that room's replica with the server's state up
     /// to its tagged sequence. Frames the server never sends, a frame for a
     /// channel this session does not hold, and a snapshot that fails to decode
-    /// are refused without touching any replica.
+    /// are refused without touching any replica. A session stranded on a codec it
+    /// cannot speak refuses every frame from then on.
     pub fn receive(&mut self, msg: Message) -> Result<(), ClientError> {
+        if let Some(fatal) = &self.fatal {
+            return Err(fatal.clone());
+        }
         match msg {
             Message::Ops { channel, ops } => {
                 let room = self
@@ -647,6 +681,25 @@ impl ClientSession {
             }
             Message::AuthOk { actor } => {
                 self.actor = Some(actor);
+                Ok(())
+            }
+            // The server answers the Hello advertisement with the codec it picked.
+            // A selection outside what this build speaks strands the session: every
+            // later frame would be misread, so it is refused for good rather than
+            // for this frame. A selection that re-names the settled codec is the
+            // same answer arriving again — a session outlives its connections, so
+            // each reconnect re-runs the handshake — but one naming a *different*
+            // codec is a switch neither end could agree on the boundary of, and is
+            // refused.
+            Message::CodecSelected { codec } => {
+                if !SUPPORTED_CODECS.contains(&codec) {
+                    self.fatal = Some(ClientError::UnsupportedCodec(codec));
+                    return Err(ClientError::UnsupportedCodec(codec));
+                }
+                if self.codec.is_some_and(|settled| settled != codec) {
+                    return Err(ClientError::UnexpectedMessage("codec already selected"));
+                }
+                self.codec = Some(codec);
                 Ok(())
             }
             // The server advertises the schema it serves this connection; record

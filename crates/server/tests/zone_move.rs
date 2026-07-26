@@ -298,6 +298,7 @@ fn handshake(h: &mut Hub, s: &mut Session, schema: &Schema) {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     st(

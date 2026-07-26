@@ -140,7 +140,8 @@ fn wrapping_the_registry_authorizer_logs_enforcement() {
         Message::Hello {
             client: cid(1),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -208,7 +209,8 @@ fn an_awareness_publish_logs_the_decision_not_the_entry() {
         Message::Hello {
             client: cid(1),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

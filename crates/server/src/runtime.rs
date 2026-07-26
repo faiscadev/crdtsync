@@ -904,10 +904,14 @@ async fn connect_peer(url: &str, server: ClientId) -> Option<(PeerWrite, PeerRea
         .send(WsMessage::Binary(encode_header(PROTOCOL_VERSION).to_vec()))
         .await
         .ok()?;
+    // The peer link advertises no codec: it pumps replication frames and folds
+    // only `ReplicaAck`, with nowhere to fold a selection, so it must not invite
+    // one — it speaks the codec silence carries.
     let hello = Message::Hello {
         client: server,
         app_id: Vec::new(),
         schema_version: 0,
+        codecs: Vec::new(),
     };
     write
         .send(WsMessage::Binary(encode_message(&hello)))

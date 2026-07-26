@@ -59,6 +59,7 @@ fn hello_auth(r: &mut Registry, client: u8, app_id: &[u8], version: u32) -> Conn
             client: cid(client),
             app_id: app_id.to_vec(),
             schema_version: version,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(

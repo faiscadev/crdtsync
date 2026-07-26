@@ -56,6 +56,7 @@ fn auth(r: &mut Registry, id: ConnId, client: u8) {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -209,7 +210,8 @@ fn delivering_to_an_unknown_connection_signals_close() {
         Message::Hello {
             client: cid(1),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
 }
@@ -227,7 +229,8 @@ fn a_fast_path_connection_subscribes_without_the_auth_phase() {
         Message::Hello {
             client: cid(1),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(id, sub(ROOM)));
@@ -243,7 +246,8 @@ fn a_fast_path_actor_still_fans_out_awareness() {
         Message::Hello {
             client: cid(1),
             app_id: Vec::new(),
-            schema_version: 0
+            schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(a, sub(ROOM)));

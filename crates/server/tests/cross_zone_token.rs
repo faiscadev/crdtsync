@@ -105,6 +105,7 @@ fn handshake(h: &mut Hub, s: &mut Session, authorizer: &dyn Authorizer) {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     drive(

@@ -44,6 +44,7 @@ fn hello_auth(r: &mut Registry, client: u8) -> ConnId {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -297,6 +298,7 @@ fn awareness_before_auth_is_a_violation() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     r.take_outbox(c);

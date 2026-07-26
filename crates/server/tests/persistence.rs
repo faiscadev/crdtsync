@@ -221,6 +221,7 @@ fn ingest_via(r: &mut Registry, client: u8, room: &[u8], ops: Vec<crdtsync_core:
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         }
     ));
     assert!(r.deliver(
@@ -309,6 +310,7 @@ fn catch_up_uses_stable_sequences_across_a_restart() {
                 client: cid(1),
                 app_id: Vec::new(),
                 schema_version: 0,
+                codecs: Vec::new(),
             },
         );
         r.deliver(

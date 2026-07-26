@@ -118,6 +118,7 @@ fn client(r: &mut Registry) -> crdtsync_server::ConnId {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     r.deliver(

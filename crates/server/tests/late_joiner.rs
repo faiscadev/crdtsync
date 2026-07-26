@@ -67,6 +67,7 @@ fn client_as(r: &mut Registry, client: u8) -> ConnId {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     r.deliver(

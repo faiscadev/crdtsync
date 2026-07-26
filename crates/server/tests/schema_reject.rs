@@ -143,6 +143,7 @@ fn handshake(h: &mut Hub, s: &mut Session, schema: Option<&Schema>, client: Clie
             client,
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     st(

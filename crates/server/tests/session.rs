@@ -71,6 +71,7 @@ fn handshake(hub: &mut Hub, s: &mut Session, client: u8) {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     assert!(
@@ -110,6 +111,7 @@ fn hello_establishes_the_client() {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     assert_eq!(s.client(), Some(cid(1)));
@@ -137,6 +139,7 @@ fn a_second_hello_is_a_violation() {
             client: cid(2),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     assert!(r.close);

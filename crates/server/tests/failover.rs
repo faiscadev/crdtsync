@@ -120,6 +120,7 @@ fn handshake(h: &mut Hub, s: &mut Session, client: u8) {
             client: cid(client),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     st(
@@ -141,6 +142,7 @@ fn client(r: &mut Registry) -> crdtsync_server::ConnId {
             client: cid(1),
             app_id: Vec::new(),
             schema_version: 0,
+            codecs: Vec::new(),
         },
     );
     r.deliver(
