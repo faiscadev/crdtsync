@@ -83,6 +83,9 @@ jobs:
       # cgo links the static library; build it, then run go test.
       - name: Build the native library
         run: cargo build -p crdtsync-ffi --release
+      # The networked provider's integration test spins up the real server binary.
+      - name: Build the server binary
+        run: cargo build -p crdtsync-server
       - name: Test
         run: go test ./...
         working-directory: sdks/go

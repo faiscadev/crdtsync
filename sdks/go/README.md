@@ -31,3 +31,38 @@ return the value and an `ok` bool.
 
 cgo links `target/release/libcrdtsync_ffi.a` via `${SRCDIR}`-relative flags, so
 build the release library before `go test`. Close a document to free it.
+
+## Collaborating over a server
+
+`Connect` opens a socket to a crdtsync server, joins a room, and returns once the
+room's state has synced. The `Doc` it carries is the ergonomic handle graph —
+edits frame and send, inbound frames fold into the same replica, and a dropped
+socket resumes and resends what the server never acknowledged.
+
+```go
+p, err := crdtsync.Connect(ctx, "ws://localhost:6060", "my-room", crdtsync.ProviderOptions{})
+if err != nil {
+	return err
+}
+defer p.Close()
+
+p.Doc().GetMap("root").Set("title", "Hello")
+p.Doc().GetText("body").Insert(0, "hi")
+p.SetAwareness("cursor", []byte("10"))
+```
+
+The WebSocket transport is built in, so the SDK stays dependency-free; supply
+`ProviderOptions.Dial` to plug in another. `ProviderOptions` also carries the
+credential, the app/schema declaration, the reconnect policy, and the server's
+signals (`OnError`, `OnOpsRejected`, `OnRedirect`).
+
+The transport-agnostic `Provider` remains for syncing over something crdtsync
+knows nothing about — a peer mesh, a message bus, a test harness.
+
+A networked `Doc` is the full handle graph: values, blobs, XML, cursors, marks,
+change events, and `Observe` all answer off the room's replica. The one
+exception is `SetSchema` — binding a schema is replica-local runtime state with
+no per-channel seat, so a networked `Doc` reports no repairs.
+
+The integration tests spin up the real server; build it first with
+`cargo build -p crdtsync-server` (they skip when it is absent).

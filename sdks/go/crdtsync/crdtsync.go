@@ -970,6 +970,196 @@ func (c *Client) GetBytes(channel uint32, path [][]byte) ([]byte, bool) {
 	return takeBuf(out), true
 }
 
+// SetScalar sets an encoded Scalar at path in channel's room, whatever its
+// tagged type, routed through the outbox. The ergonomic handle layer marshals a
+// native value to a Scalar and sets it here, so a leaf keeps its type across a
+// round trip rather than collapsing to bytes. Returns the Ops frame to send.
+func (c *Client) SetScalar(channel uint32, path [][]byte, scalar []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	sp, sl := bytesArg(scalar)
+	return takeBuf(C.crdtsync_client_set_scalar(c.h, C.uint32_t(channel), pp, pl, sp, sl))
+}
+
+// GetScalar reads the Register at path in channel's room as an encoded Scalar,
+// whatever its type — the inverse of SetScalar. The bool is false when the
+// channel isn't held, the slot is absent, or it holds another element.
+func (c *Client) GetScalar(channel uint32, path [][]byte) ([]byte, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_client_get_scalar(c.h, C.uint32_t(channel), pp, pl, &out) != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// MapKeys reads the live slot keys of the Map at path in channel's room. An
+// empty path names the root map. The bool is false when the channel isn't held
+// or the path is not a live Map (a map with no keys returns an empty slice and
+// true).
+func (c *Client) MapKeys(channel uint32, path [][]byte) ([][]byte, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_client_map_keys(c.h, C.uint32_t(channel), pp, pl, &out) != 1 {
+		return nil, false
+	}
+	return decodeKeyList(takeBuf(out)), true
+}
+
+// ListInsert inserts a bytes item at live index in the List at path in channel's
+// room, routed through the outbox. Returns the Ops frame to send.
+func (c *Client) ListInsert(channel uint32, path [][]byte, index uint, value []byte) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	vp, vl := bytesArg(value)
+	return takeBuf(C.crdtsync_client_list_insert(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index), vp, vl))
+}
+
+// ListDelete tombstones the live item at index in the List at path in channel's
+// room. Returns the Ops frame to send.
+func (c *Client) ListDelete(channel uint32, path [][]byte, index uint) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_client_list_delete(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index)))
+}
+
+// ListLen reads the live length of the List at path in channel's room.
+func (c *Client) ListLen(channel uint32, path [][]byte) (uint, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.uintptr_t
+	rc := C.crdtsync_client_list_len(c.h, C.uint32_t(channel), pp, pl, &out)
+	return uint(out), rc == 1
+}
+
+// ListGet reads the bytes item at live index in the List at path in channel's
+// room.
+func (c *Client) ListGet(channel uint32, path [][]byte, index uint) ([]byte, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_client_list_get(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index), &out) != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// TextInsert inserts text at a codepoint index in the Text at path in channel's
+// room, routed through the outbox. Returns the Ops frame to send.
+func (c *Client) TextInsert(channel uint32, path [][]byte, index uint, text string) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	tp, tl := bytesArg([]byte(text))
+	return takeBuf(C.crdtsync_client_text_insert(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index), tp, tl))
+}
+
+// TextDelete tombstones count codepoints from index in the Text at path in
+// channel's room. Returns the Ops frame to send.
+func (c *Client) TextDelete(channel uint32, path [][]byte, index, count uint) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	return takeBuf(C.crdtsync_client_text_delete(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index), C.uintptr_t(count)))
+}
+
+// TextLen reads the codepoint length of the Text at path in channel's room.
+func (c *Client) TextLen(channel uint32, path [][]byte) (uint, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.uintptr_t
+	rc := C.crdtsync_client_text_len(c.h, C.uint32_t(channel), pp, pl, &out)
+	return uint(out), rc == 1
+}
+
+// TextGet reads the Text at path in channel's room as a string.
+func (c *Client) TextGet(channel uint32, path [][]byte) (string, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_client_text_get(c.h, C.uint32_t(channel), pp, pl, &out) != 1 {
+		return "", false
+	}
+	return string(takeBuf(out)), true
+}
+
+// ChannelState serializes channel's room replica to a canonical snapshot — the
+// before/after pair the ergonomic Doc diffs to derive its change events. The
+// bool is false when the channel isn't held.
+func (c *Client) ChannelState(channel uint32) ([]byte, bool) {
+	var out C.CrdtBuf
+	if C.crdtsync_client_channel_state(c.h, C.uint32_t(channel), &out) != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// GetCounter reads a Counter's value at path in channel's room. Counters have no
+// other read-back: GetInt resolves a Register only.
+func (c *Client) GetCounter(channel uint32, path [][]byte) (int64, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.int64_t
+	rc := C.crdtsync_client_get_counter(c.h, C.uint32_t(channel), pp, pl, &out)
+	return int64(out), rc == 1
+}
+
+// GetBlob reads the BlobRef at path in channel's room. The bool is false when
+// the slot is absent or holds no blob ref.
+func (c *Client) GetBlob(channel uint32, path [][]byte) (BlobRef, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_client_get_blob(c.h, C.uint32_t(channel), pp, pl, &out) != 1 {
+		return BlobRef{}, false
+	}
+	return decodeBlobRef(takeBuf(out)), true
+}
+
+// MarksAt reads the marks active on character index of the sequence at seqPath
+// in channel's room.
+func (c *Client) MarksAt(channel uint32, seqPath [][]byte, index uint) []Mark {
+	pp, pl := bytesArg(EncodePath(seqPath))
+	var out C.CrdtBuf
+	if C.crdtsync_client_marks_at(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index), &out) != 1 {
+		return nil
+	}
+	return decodeMarks(takeBuf(out))
+}
+
+// RelativePosition captures a stable position in the List or Text at path in
+// channel's room — the encoded bytes to resolve later with ResolvePosition. Nil
+// for a bad path, a non-sequence slot, an unknown side, or an unheld channel.
+func (c *Client) RelativePosition(channel uint32, path [][]byte, index uint, side Side) []byte {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_client_relative_position(c.h, C.uint32_t(channel), pp, pl, C.uintptr_t(index), C.uint32_t(side), &out) != 1 {
+		return nil
+	}
+	b := takeBuf(out)
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
+// ResolvePosition resolves a captured position back to a live index in the List
+// or Text at path in channel's room.
+func (c *Client) ResolvePosition(channel uint32, path [][]byte, pos []byte) (uint, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	qp, ql := bytesArg(pos)
+	var out C.uintptr_t
+	rc := C.crdtsync_client_resolve_position(c.h, C.uint32_t(channel), pp, pl, qp, ql, &out)
+	return uint(out), rc == 1
+}
+
+// XmlTag reads the tag of the live XmlElement at path in channel's room. The
+// bool is false when the path is absent or a tagless fragment.
+func (c *Client) XmlTag(channel uint32, path [][]byte) ([]byte, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.CrdtBuf
+	if C.crdtsync_client_xml_tag(c.h, C.uint32_t(channel), pp, pl, &out) != 1 {
+		return nil, false
+	}
+	return takeBuf(out), true
+}
+
+// XmlChildrenLen reads the count of live children of the node at path in
+// channel's room.
+func (c *Client) XmlChildrenLen(channel uint32, path [][]byte) (uint, bool) {
+	pp, pl := bytesArg(EncodePath(path))
+	var out C.uintptr_t
+	rc := C.crdtsync_client_xml_children_len(c.h, C.uint32_t(channel), pp, pl, &out)
+	return uint(out), rc == 1
+}
+
 // SetAwareness publishes an ephemeral awareness entry key in channel's room.
 func (c *Client) SetAwareness(channel uint32, key, value []byte) []byte {
 	kp, kl := bytesArg(key)

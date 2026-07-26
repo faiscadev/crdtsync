@@ -23,6 +23,7 @@ package crdtsync
 import (
 	"crypto/rand"
 	"fmt"
+	"sync"
 )
 
 const (
@@ -195,16 +196,34 @@ func (l *listenerList[T]) snapshot() []T {
 	return out
 }
 
-// Doc is a local CRDT replica with a single root map, edited through live typed
-// handles. Two docs that exchange each other's update ops (forwarded via
-// OnUpdate) converge. The low-level path API stays available on the wrapped
-// Document for power users (Doc.Backend()).
+// Doc is a CRDT replica with a single root map, edited through live typed
+// handles. A local Doc is backed by its own Document; two that exchange each
+// other's update ops (forwarded via OnUpdate) converge. A networked Doc is
+// backed by one channel of a wire Client — its edits frame for the wire and its
+// provider syncs them. The low-level path API stays available underneath the
+// handle graph (Doc.Backend()).
+//
+// A Doc is safe for concurrent use: every operation runs under its lock, and a
+// networked Doc shares that lock with the provider driving its socket, so an
+// inbound frame and a local edit never touch the replica at once. Listener
+// callbacks always run with the lock released, so a listener may edit the doc or
+// drive its provider. Transact is the one exception — the atomic group is
+// doc-wide, so an edit another goroutine makes while it is open joins the group.
 type Doc struct {
-	backend         *Document
+	mu sync.Mutex
+
+	backend Backend
+	// wire transmits an edit's bytes as they are authored. Nil for a local doc,
+	// whose updates travel through OnUpdate instead.
+	wire            func([]byte)
 	updateListeners listenerList[func(UpdateEvent)]
 	observers       listenerList[observer]
 	repairListeners listenerList[func(RepairEvent)]
 	transacting     bool
+	// txSawRemote records that a peer's frame landed while a transaction was open.
+	// The transaction's pre-edit snapshot then predates work that was not its own,
+	// so the diff it would produce is not this transaction's change set.
+	txSawRemote bool
 }
 
 // NewDoc opens a Doc for a fresh random 16-byte client id.
@@ -234,15 +253,33 @@ func DecodeDoc(state []byte) (*Doc, error) {
 	return &Doc{backend: backend}, nil
 }
 
-// Backend returns the wrapped low-level Document — the byte-path power-user
-// surface underneath the handle graph.
-func (d *Doc) Backend() *Document { return d.backend }
+// newNetworkedDoc builds a Doc over a provider-supplied networked backend. wire
+// carries each authored edit's frame to the socket.
+func newNetworkedDoc(backend Backend, wire func([]byte)) *Doc {
+	return &Doc{backend: backend, wire: wire}
+}
 
-// Close frees the document. Safe to call more than once.
-func (d *Doc) Close() { d.backend.Close() }
+// Backend returns the replica underneath the handle graph — the byte-path
+// power-user surface. Drive it only from the goroutine that holds the doc; it
+// carries no lock of its own.
+func (d *Doc) Backend() Backend { return d.backend }
 
-// EncodeState serializes the whole replica to a canonical snapshot.
-func (d *Doc) EncodeState() []byte { return d.backend.EncodeState() }
+// Close frees the document. Safe to call more than once. A networked doc's
+// backend is owned by its provider, so closing the doc leaves the wire session
+// alone — close the provider instead.
+func (d *Doc) Close() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.backend.Close()
+}
+
+// EncodeState serializes the whole replica to a canonical snapshot. Empty only
+// when the backing replica is gone — a networked doc whose provider has closed.
+func (d *Doc) EncodeState() []byte {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.backend.EncodeState()
+}
 
 // GetMap returns a live root Map handle at key.
 func (d *Doc) GetMap(key string) *CrdtMap {
@@ -266,122 +303,234 @@ func (d *Doc) GetXml(key string) *CrdtXml {
 
 // Transact runs fn's edits as one atomic group — they apply together on every
 // replica, ride the wire as a single batch, and fire one update. Nested calls
-// flatten into the outermost transaction.
+// flatten into the outermost transaction. The group is doc-wide, so an edit
+// another goroutine makes while it is open joins it.
 func (d *Doc) Transact(fn func()) {
+	d.mu.Lock()
 	if d.transacting {
+		d.mu.Unlock()
 		fn()
 		return
 	}
 	var before []byte
-	if d.observing() {
+	if d.observingLocked() {
 		before = d.backend.EncodeState()
 	}
 	d.transacting = true
+	d.txSawRemote = false
 	d.backend.BeginAtomic()
-	defer func() {
-		d.transacting = false
-		ops := d.backend.CommitAtomic()
-		if len(ops) > 0 {
-			d.dispatch("local", ops, before)
-			d.emitRepairs()
-		}
-	}()
+	d.mu.Unlock()
+
+	// Commit even if fn panics, so a failed transaction never strands the group
+	// open and silently swallows every later edit.
+	defer d.commitTransaction(before)
 	fn()
+}
+
+func (d *Doc) commitTransaction(before []byte) {
+	d.mu.Lock()
+	d.transacting = false
+	if d.txSawRemote {
+		// A peer's frame folded in mid-transaction, so the snapshot taken when the
+		// group opened no longer isolates this transaction's own work. Report the
+		// ops with no change set rather than crediting the peer's edit to it — the
+		// frame already fired its own remote event with the right changes.
+		before = nil
+		d.txSawRemote = false
+	}
+	ops := d.backend.CommitAtomic()
+	if len(ops) == 0 {
+		d.mu.Unlock()
+		return
+	}
+	plan := d.planDispatchLocked("local", ops, before)
+	d.mu.Unlock()
+	plan.run()
 }
 
 // OnUpdate subscribes to applied changes to the document; returns a function
 // that unsubscribes.
 func (d *Doc) OnUpdate(cb func(UpdateEvent)) func() {
-	return d.updateListeners.add(cb)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.guarded(d.updateListeners.add(cb))
 }
 
 // OnRepair subscribes to the schema-repair signal (fires only once a schema is
 // bound via SetSchema): the located paths whose repaired reading changed against
 // the schema after an edit. Returns a function that unsubscribes.
 func (d *Doc) OnRepair(cb func(RepairEvent)) func() {
-	return d.repairListeners.add(cb)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.guarded(d.repairListeners.add(cb))
+}
+
+// guarded wraps an unsubscribe so removal runs under the doc's lock, like the
+// registration it undoes.
+func (d *Doc) guarded(off func()) func() {
+	return func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		off()
+	}
 }
 
 // SetSchema binds a schema (its JSON, as bytes) to this replica, returning
 // whether it bound. A bound schema gives named marks their declared flavor and
 // turns on the OnRepair signal.
-func (d *Doc) SetSchema(schema []byte) bool { return d.backend.SetSchema(schema) }
+func (d *Doc) SetSchema(schema []byte) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.backend.SetSchema(schema)
+}
 
 // ApplyUpdate folds a peer's update ops into this replica; returns the count
-// applied.
+// applied. Local docs only — a networked doc syncs through its provider and
+// refuses with -1.
 func (d *Doc) ApplyUpdate(ops []byte) int {
+	d.mu.Lock()
 	var before []byte
-	if d.observing() {
+	if d.observingLocked() {
 		before = d.backend.EncodeState()
 	}
 	applied := d.backend.Apply(ops)
-	if applied > 0 {
-		d.dispatch("remote", ops, before)
-		d.emitRepairs()
+	if applied <= 0 {
+		d.mu.Unlock()
+		return applied
 	}
+	plan := d.planDispatchLocked("remote", ops, before)
+	d.mu.Unlock()
+	plan.run()
 	return applied
 }
 
-// mutate runs one edit and dispatches its ops as a local update. Inside a
-// transaction the edit just accumulates; Transact's commit dispatches once.
-func (d *Doc) mutate(run func(*Document) []byte) []byte {
+// applyRemote brackets a provider-driven inbound receive with reactivity. The
+// caller holds the doc's lock; the returned func delivers the events and must
+// run once it is released.
+func (d *Doc) applyRemote(receive func()) func() {
+	if d.transacting {
+		d.txSawRemote = true
+	}
+	var before []byte
+	if d.observingLocked() {
+		before = d.backend.EncodeState()
+	}
+	receive()
+	if before == nil {
+		// Nothing observing (or no snapshot to diff against): the frame still
+		// folded, there is just no change set to report.
+		return func() {}
+	}
+	plan := d.planDispatchLocked("remote", nil, before)
+	return plan.run
+}
+
+// mutate runs one edit, transmits its bytes, and dispatches them as a local
+// update. Inside a transaction the edit just accumulates; Transact's commit
+// transmits and dispatches once.
+func (d *Doc) mutate(run func(Backend) []byte) []byte {
+	d.mu.Lock()
 	if d.transacting {
 		run(d.backend)
+		d.mu.Unlock()
 		return nil
 	}
 	var before []byte
-	if d.observing() {
+	if d.observingLocked() {
 		before = d.backend.EncodeState()
 	}
 	ops := run(d.backend)
 	if len(ops) == 0 {
+		d.mu.Unlock()
 		return ops
 	}
-	d.dispatch("local", ops, before)
-	d.emitRepairs()
+	plan := d.planDispatchLocked("local", ops, before)
+	d.mu.Unlock()
+	plan.run()
 	return ops
 }
 
-// observing reports whether any update listener or subtree observer is
+// observingLocked reports whether any update listener or subtree observer is
 // subscribed — a snapshot+diff runs only then, so an unobserved doc pays nothing.
-func (d *Doc) observing() bool {
+func (d *Doc) observingLocked() bool {
 	return d.updateListeners.len() > 0 || d.observers.len() > 0
 }
 
-func (d *Doc) dispatch(origin string, ops []byte, before []byte) {
-	var raws []changeWithPath
-	if before != nil {
-		raws = d.computeChanges(before)
+// dispatchPlan is the delivery half of an applied edit: the frame to transmit
+// and the listener snapshots with the events they receive, all captured under
+// the doc's lock so delivery itself runs with it released — a listener is free
+// to edit the doc or drive its provider.
+type dispatchPlan struct {
+	wire       func([]byte)
+	ops        []byte
+	updates    []func(UpdateEvent)
+	update     UpdateEvent
+	fireUpdate bool
+	observers  []observer
+	raws       []changeWithPath
+	origin     string
+	repairs    []func(RepairEvent)
+	repair     RepairEvent
+}
+
+func (p dispatchPlan) run() {
+	if p.wire != nil {
+		p.wire(p.ops)
 	}
-	changes := make([]EventChange, len(raws))
-	for i, r := range raws {
-		changes[i] = r.change
-	}
-	// A remote frame that changed nothing (an ack) fires no update; a local edit
-	// always reports its ops.
-	if origin == "local" || len(changes) > 0 {
-		event := UpdateEvent{Origin: origin, Ops: ops, Changes: changes}
-		for _, l := range d.updateListeners.snapshot() {
-			l(event)
+	if p.fireUpdate {
+		for _, l := range p.updates {
+			l(p.update)
 		}
 	}
-	for _, obs := range d.observers.snapshot() {
+	for _, obs := range p.observers {
 		var matched []EventChange
-		for _, r := range raws {
+		for _, r := range p.raws {
 			if pathStartsWith(r.pathBytes, obs.prefix) {
 				matched = append(matched, r.change)
 			}
 		}
 		if len(matched) > 0 {
-			obs.cb(ChangeEvent{Origin: origin, Changes: matched})
+			obs.cb(ChangeEvent{Origin: p.origin, Changes: matched})
+		}
+	}
+	if len(p.repair.Paths) > 0 {
+		for _, l := range p.repairs {
+			l(p.repair)
 		}
 	}
 }
 
-// computeChanges diffs the replica against a pre-edit snapshot and re-marshals
-// each raw change into an ergonomic EventChange plus its framed path (for
-// observer prefix matching).
-func (d *Doc) computeChanges(before []byte) []changeWithPath {
+// planDispatchLocked computes an applied edit's change set and captures who
+// receives it. A local edit's ops are transmitted; an inbound frame carries nil
+// ops and is already on the wire.
+func (d *Doc) planDispatchLocked(origin string, ops []byte, before []byte) dispatchPlan {
+	plan := dispatchPlan{ops: ops, origin: origin}
+	if origin == "local" {
+		plan.wire = d.wire
+	}
+	if before != nil {
+		plan.raws = d.computeChangesLocked(before)
+	}
+	changes := make([]EventChange, len(plan.raws))
+	for i, r := range plan.raws {
+		changes[i] = r.change
+	}
+	// A remote frame that changed nothing (an ack, an awareness update) fires no
+	// update; a local edit always reports its ops.
+	if origin == "local" || len(changes) > 0 {
+		plan.fireUpdate = true
+		plan.update = UpdateEvent{Origin: origin, Ops: ops, Changes: changes}
+		plan.updates = d.updateListeners.snapshot()
+	}
+	plan.observers = d.observers.snapshot()
+	plan.repairs, plan.repair = d.drainRepairsLocked()
+	return plan
+}
+
+// computeChangesLocked diffs the replica against a pre-edit snapshot and
+// re-marshals each raw change into an ergonomic EventChange plus its framed path
+// (for observer prefix matching).
+func (d *Doc) computeChangesLocked(before []byte) []changeWithPath {
 	after := d.backend.EncodeState()
 	if len(before) == 0 || len(after) == 0 {
 		return nil
@@ -402,16 +551,17 @@ func (d *Doc) computeChanges(before []byte) []changeWithPath {
 	return out
 }
 
-func (d *Doc) emitRepairs() {
-	// Drain only when observed — the drain reseeds the baseline, so draining
-	// unobserved would lose the signal (and take_repairs is empty until a schema
-	// is bound).
+// drainRepairsLocked takes the schema-repair signal and who receives it. It
+// drains only when observed — the drain reseeds the baseline, so draining
+// unobserved would lose the signal (and TakeRepairs is empty until a schema is
+// bound).
+func (d *Doc) drainRepairsLocked() ([]func(RepairEvent), RepairEvent) {
 	if d.repairListeners.len() == 0 {
-		return
+		return nil, RepairEvent{}
 	}
 	raw := d.backend.TakeRepairs()
 	if len(raw) == 0 {
-		return
+		return nil, RepairEvent{}
 	}
 	paths := make([][]RepairStep, len(raw))
 	for i, p := range raw {
@@ -425,17 +575,16 @@ func (d *Doc) emitRepairs() {
 		}
 		paths[i] = steps
 	}
-	event := RepairEvent{Paths: paths}
-	for _, l := range d.repairListeners.snapshot() {
-		l(event)
-	}
+	return d.repairListeners.snapshot(), RepairEvent{Paths: paths}
 }
 
 func (d *Doc) addObserver(prefix []byte, cb func(ChangeEvent)) func() {
-	return d.observers.add(observer{prefix: prefix, cb: cb})
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.guarded(d.observers.add(observer{prefix: prefix, cb: cb}))
 }
 
-func (d *Doc) containerKind(slot [][]byte) string {
+func (d *Doc) containerKindLocked(slot [][]byte) string {
 	if _, ok := d.backend.MapKeys(slot); ok {
 		return "map"
 	}
@@ -488,13 +637,19 @@ func (m *CrdtMap) Set(key string, value any) error {
 		return err
 	}
 	slot := m.slot(key)
-	m.doc.mutate(func(b *Document) []byte { return b.SetScalar(slot, scalar) })
+	m.doc.mutate(func(b Backend) []byte { return b.SetScalar(slot, scalar) })
 	return nil
 }
 
 // Get reads key: a native scalar for a leaf, a BlobRef for a blob, a nested
 // handle for a container slot, or (nil, false) when the slot is empty.
 func (m *CrdtMap) Get(key string) (any, bool) {
+	m.doc.mu.Lock()
+	defer m.doc.mu.Unlock()
+	return m.getLocked(key)
+}
+
+func (m *CrdtMap) getLocked(key string) (any, bool) {
 	slot := m.slot(key)
 	if blob, ok := m.doc.backend.GetBlob(slot); ok {
 		return blob, true
@@ -502,7 +657,7 @@ func (m *CrdtMap) Get(key string) (any, bool) {
 	if scalar, ok := m.doc.backend.GetScalar(slot); ok {
 		return unmarshalValue(scalar), true
 	}
-	kind := m.doc.containerKind(slot)
+	kind := m.doc.containerKindLocked(slot)
 	if kind == "" {
 		return nil, false
 	}
@@ -515,11 +670,13 @@ func (m *CrdtMap) Get(key string) (any, bool) {
 // Delete tombstones the slot at key.
 func (m *CrdtMap) Delete(key string) {
 	slot := m.slot(key)
-	m.doc.mutate(func(b *Document) []byte { return b.Delete(slot) })
+	m.doc.mutate(func(b Backend) []byte { return b.Delete(slot) })
 }
 
 // Has reports whether key holds a leaf, a blob, or a container.
 func (m *CrdtMap) Has(key string) bool {
+	m.doc.mu.Lock()
+	defer m.doc.mu.Unlock()
 	slot := m.slot(key)
 	if _, ok := m.doc.backend.GetScalar(slot); ok {
 		return true
@@ -527,17 +684,19 @@ func (m *CrdtMap) Has(key string) bool {
 	if _, ok := m.doc.backend.GetBlob(slot); ok {
 		return true
 	}
-	return m.doc.containerKind(slot) != ""
+	return m.doc.containerKindLocked(slot) != ""
 }
 
-func (m *CrdtMap) rawKeys() [][]byte {
+func (m *CrdtMap) rawKeysLocked() [][]byte {
 	keys, _ := m.doc.backend.MapKeys(m.path)
 	return keys
 }
 
 // Keys returns the live slot keys, rendered best-effort as utf-8 strings.
 func (m *CrdtMap) Keys() []string {
-	raw := m.rawKeys()
+	m.doc.mu.Lock()
+	defer m.doc.mu.Unlock()
+	raw := m.rawKeysLocked()
 	out := make([]string, len(raw))
 	for i, k := range raw {
 		out[i] = keyString(k)
@@ -548,17 +707,23 @@ func (m *CrdtMap) Keys() []string {
 // Entries returns the live (key, value) pairs. Values are read by the raw key
 // bytes, so a non-utf-8 (binary) key's value is never lost.
 func (m *CrdtMap) Entries() []Entry {
-	raw := m.rawKeys()
+	m.doc.mu.Lock()
+	defer m.doc.mu.Unlock()
+	raw := m.rawKeysLocked()
 	out := make([]Entry, 0, len(raw))
 	for _, k := range raw {
-		v, _ := m.Get(keyString(k))
+		v, _ := m.getLocked(keyString(k))
 		out = append(out, Entry{Key: keyString(k), Value: v})
 	}
 	return out
 }
 
 // Len returns the number of live slots.
-func (m *CrdtMap) Len() int { return len(m.rawKeys()) }
+func (m *CrdtMap) Len() int {
+	m.doc.mu.Lock()
+	defer m.doc.mu.Unlock()
+	return len(m.rawKeysLocked())
+}
 
 // GetMap returns a nested Map handle at key.
 func (m *CrdtMap) GetMap(key string) *CrdtMap {
@@ -586,7 +751,7 @@ func (m *CrdtMap) GetXml(key string) *CrdtXml {
 func (m *CrdtMap) SetBlob(key, mime string, data []byte) bool {
 	slot := m.slot(key)
 	ok := false
-	m.doc.mutate(func(b *Document) []byte {
+	m.doc.mutate(func(b Backend) []byte {
 		ops, inlined := b.SetBlob(slot, mime, data)
 		if !inlined {
 			return nil
@@ -601,11 +766,13 @@ func (m *CrdtMap) SetBlob(key, mime string, data []byte) bool {
 // and size — the content is fetched by id, not carried in the op.
 func (m *CrdtMap) SetBlobRef(key string, id [16]byte, mime string, size uint64) {
 	slot := m.slot(key)
-	m.doc.mutate(func(b *Document) []byte { return b.SetBlobRef(slot, id, mime, size) })
+	m.doc.mutate(func(b Backend) []byte { return b.SetBlobRef(slot, id, mime, size) })
 }
 
 // GetBlob reads the BlobRef at key, or false when the slot holds no blob.
 func (m *CrdtMap) GetBlob(key string) (BlobRef, bool) {
+	m.doc.mu.Lock()
+	defer m.doc.mu.Unlock()
 	return m.doc.backend.GetBlob(m.slot(key))
 }
 
@@ -621,45 +788,69 @@ type CrdtList struct {
 	path [][]byte
 }
 
-// Insert inserts a scalar item at a live index (clamped into range). Returns an
-// error for an unsupported value type.
+// Insert inserts a scalar item at a live index (clamped into range). A negative
+// index counts from the end. Returns an error for an unsupported value type.
 func (l *CrdtList) Insert(index int, value any) error {
 	item, err := marshalValue(value)
 	if err != nil {
 		return err
 	}
-	n := l.Len()
-	if index < 0 {
-		index = n + index
-		if index < 0 {
-			index = 0
+	// Resolve the index against the same live length the insert lands in — an
+	// index read in an earlier critical section could be stale by the time the
+	// item is placed.
+	l.doc.mutate(func(b Backend) []byte {
+		at := index
+		n := l.lenLocked()
+		if at < 0 {
+			at += n
+			if at < 0 {
+				at = 0
+			}
 		}
-	}
-	if index > n {
-		index = n
-	}
-	idx := index
-	l.doc.mutate(func(b *Document) []byte { return b.ListInsert(l.path, uint(idx), item) })
+		if at > n {
+			at = n
+		}
+		return b.ListInsert(l.path, uint(at), item)
+	})
 	return nil
 }
 
 // Append appends a scalar item.
-func (l *CrdtList) Append(value any) error { return l.Insert(l.Len(), value) }
-
-// Delete tombstones the live item at index. Returns an error when index is out
-// of range.
-func (l *CrdtList) Delete(index int) error {
-	idx, err := l.checked(index)
+func (l *CrdtList) Append(value any) error {
+	item, err := marshalValue(value)
 	if err != nil {
 		return err
 	}
-	l.doc.mutate(func(b *Document) []byte { return b.ListDelete(l.path, idx) })
+	l.doc.mutate(func(b Backend) []byte {
+		return b.ListInsert(l.path, uint(l.lenLocked()), item)
+	})
 	return nil
+}
+
+// Delete tombstones the live item at index. A negative index counts from the
+// end. Returns an error when index is out of range.
+func (l *CrdtList) Delete(index int) error {
+	var err error
+	l.doc.mutate(func(b Backend) []byte {
+		var idx uint
+		idx, err = l.checkedLocked(index)
+		if err != nil {
+			return nil
+		}
+		return b.ListDelete(l.path, idx)
+	})
+	return err
 }
 
 // Get reads the item at index. The bool is false when index is out of range.
 func (l *CrdtList) Get(index int) (any, bool) {
-	idx, err := l.checked(index)
+	l.doc.mu.Lock()
+	defer l.doc.mu.Unlock()
+	return l.getLocked(index)
+}
+
+func (l *CrdtList) getLocked(index int) (any, bool) {
+	idx, err := l.checkedLocked(index)
 	if err != nil {
 		return nil, false
 	}
@@ -672,16 +863,24 @@ func (l *CrdtList) Get(index int) (any, bool) {
 
 // Len returns the live length of the list.
 func (l *CrdtList) Len() int {
+	l.doc.mu.Lock()
+	defer l.doc.mu.Unlock()
+	return l.lenLocked()
+}
+
+func (l *CrdtList) lenLocked() int {
 	n, _ := l.doc.backend.ListLen(l.path)
 	return int(n)
 }
 
 // Values returns the live items in order.
 func (l *CrdtList) Values() []any {
-	n := l.Len()
+	l.doc.mu.Lock()
+	defer l.doc.mu.Unlock()
+	n := l.lenLocked()
 	out := make([]any, 0, n)
 	for i := 0; i < n; i++ {
-		v, _ := l.Get(i)
+		v, _ := l.getLocked(i)
 		out = append(out, v)
 	}
 	return out
@@ -693,8 +892,8 @@ func (l *CrdtList) Observe(cb func(ChangeEvent)) func() {
 	return l.doc.addObserver(EncodePath(l.path), cb)
 }
 
-func (l *CrdtList) checked(index int) (uint, error) {
-	n := l.Len()
+func (l *CrdtList) checkedLocked(index int) (uint, error) {
+	n := l.lenLocked()
 	if index < 0 {
 		index += n
 	}
@@ -712,22 +911,26 @@ type CrdtText struct {
 
 // Insert inserts text at a codepoint index.
 func (t *CrdtText) Insert(index int, text string) {
-	t.doc.mutate(func(b *Document) []byte { return b.TextInsert(t.path, uint(index), text) })
+	t.doc.mutate(func(b Backend) []byte { return b.TextInsert(t.path, uint(index), text) })
 }
 
 // Delete tombstones count codepoints from index.
 func (t *CrdtText) Delete(index, count int) {
-	t.doc.mutate(func(b *Document) []byte { return b.TextDelete(t.path, uint(index), uint(count)) })
+	t.doc.mutate(func(b Backend) []byte { return b.TextDelete(t.path, uint(index), uint(count)) })
 }
 
 // String returns the text content.
 func (t *CrdtText) String() string {
+	t.doc.mu.Lock()
+	defer t.doc.mu.Unlock()
 	s, _ := t.doc.backend.TextGet(t.path)
 	return s
 }
 
 // Len returns the codepoint length of the text.
 func (t *CrdtText) Len() int {
+	t.doc.mu.Lock()
+	defer t.doc.mu.Unlock()
 	n, _ := t.doc.backend.TextLen(t.path)
 	return int(n)
 }
