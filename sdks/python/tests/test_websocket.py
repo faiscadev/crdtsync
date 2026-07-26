@@ -202,15 +202,21 @@ class TestFraming:
         ws.close()
 
     def test_answers_a_ping_interleaved_inside_a_fragment(self, serve):
+        ponged = threading.Event()
+
         def handler(conn):
             conn.sendall(server_frame(0x2, b"a", fin=False))
             conn.sendall(server_frame(0x9, b"beat"))
             conn.sendall(server_frame(0x0, b"b", fin=True))
-            assert read_client_message(conn) == b"beat"  # the pong
+            if read_client_message(conn) == b"beat":
+                ponged.set()
 
         server = serve(handler)
         ws = _websocket.connect(server.url)
         assert ws.recv() == b"ab"
+        # Waited for, not read off the server thread after the fact: an assertion
+        # that races the handler reports a missing pong as a pass.
+        assert ponged.wait(2.0)
         ws.close()
         assert server.error is None
 
@@ -257,6 +263,19 @@ class TestFraming:
         with pytest.raises(WebSocketError, match="too large"):
             ws.recv()
 
+    def test_refuses_a_message_fragmented_past_the_ceiling(self, serve, monkeypatch):
+        # The ceiling is on the reassembled message, not each frame — otherwise a
+        # run of legal-sized fragments walks straight past it.
+        monkeypatch.setattr(_websocket, "MAX_MESSAGE_BYTES", 100)
+
+        def handler(conn):
+            conn.sendall(server_frame(0x2, b"a" * 60, fin=False))
+            conn.sendall(server_frame(0x0, b"b" * 60, fin=True))
+
+        ws = _websocket.connect(serve(handler).url)
+        with pytest.raises(WebSocketError, match="size ceiling"):
+            ws.recv()
+
     def test_a_framing_violation_releases_the_socket(self, serve):
         ws = _websocket.connect(serve(lambda conn: conn.sendall(server_frame(0x1, b"hi"))).url)
         with pytest.raises(WebSocketError):
@@ -298,6 +317,24 @@ class TestClose:
             assert ws.recv() == b"payload"
         finally:
             ws._send_lock.release()
+            ws.close()
+
+    def test_a_stalled_write_gives_up_and_tears_the_connection_down(self, serve):
+        # A peer that stops reading parks the writer forever otherwise, and a
+        # writer holds the send order while it writes — so an unbounded write is
+        # an unbounded stall for everything behind it.
+        stop = threading.Event()
+        ws = _websocket.connect(serve(lambda conn: stop.wait(10)).url, send_timeout=1)
+        try:
+            with pytest.raises(WebSocketError, match="send failed"):
+                for _ in range(400):
+                    ws.send(b"x" * 1_000_000)
+            # A write that stopped part-way left a truncated frame on the wire,
+            # so the connection is finished rather than merely slow.
+            assert ws.closed
+            assert ws._sock is None
+        finally:
+            stop.set()
             ws.close()
 
     def test_sending_on_a_closed_socket_raises(self, serve):

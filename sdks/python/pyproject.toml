@@ -14,3 +14,7 @@ packages = ["crdtsync"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The provider suite drives real sockets and background threads, so a regression
+# that leaves two sides waiting on each other must fail the run rather than hang
+# it. Needs pytest-timeout; without it the setting is ignored.
+timeout = 120

@@ -52,36 +52,58 @@ def wait_for(predicate, timeout: float = 5.0) -> None:
         time.sleep(0.01)
 
 
-@pytest.fixture(scope="module")
-def server_url():
-    port = _free_port()
+def _spawn_server(port: int):
+    """Start the server on ``port``; return it once it is listening, or ``None``
+    with its log when it refused to (a port claimed between probe and bind)."""
     process = subprocess.Popen(
         [SERVER_BINARY],
         env={**os.environ, "CRDTSYNC_ADDR": f"127.0.0.1:{port}"},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    # Drain the server's log on a thread: a blocking readline could not be given
-    # up on, and an undrained pipe would wedge the server once it filled.
+    # Drain the log on a thread: a blocking readline could not be given up on,
+    # and an undrained pipe would wedge the server once it filled.
     started = threading.Event()
+    log = []
 
     def drain():
         for line in process.stderr:
+            log.append(line.decode("utf-8", "replace").rstrip())
             if b"serving on" in line:
                 started.set()
         started.set()  # the stream ended — unblock whoever is waiting
 
     reader = threading.Thread(target=drain, daemon=True)
     reader.start()
-    try:
-        if not started.wait(20.0) or process.poll() is not None:
-            raise AssertionError("the crdtsync server did not start")
-        yield f"ws://127.0.0.1:{port}"
-    finally:
-        process.kill()
-        process.wait()
-        reader.join(timeout=2.0)
-        process.stderr.close()
+    if started.wait(20.0) and process.poll() is None:
+        return process, reader, log
+    process.kill()
+    process.wait()
+    reader.join(timeout=2.0)
+    process.stderr.close()
+    return None, None, log
+
+
+@pytest.fixture(scope="module")
+def server_url():
+    # A probed-then-released port can be claimed before the server binds it, and
+    # a module-scoped fixture failing takes every test in the file with it — so
+    # retry on a fresh port and report the server's own log if it never starts.
+    logs = []
+    for _ in range(3):
+        port = _free_port()
+        process, reader, log = _spawn_server(port)
+        if process is not None:
+            try:
+                yield f"ws://127.0.0.1:{port}"
+            finally:
+                process.kill()
+                process.wait()
+                reader.join(timeout=2.0)
+                process.stderr.close()
+            return
+        logs.extend(log)
+    raise AssertionError("the crdtsync server did not start: " + "; ".join(logs))
 
 
 @pytest.fixture
@@ -102,7 +124,6 @@ class TestNetworkedProvider:
     def test_map_list_and_text_edits_reach_the_other_client(self, join):
         a = join("room-edits")
         b = join("room-edits")
-        assert a.state == "connected"
 
         a.doc.get_map("root").set("title", "Hello")
         a.doc.get_list("items").append("x").append("y")
@@ -174,7 +195,6 @@ class TestNetworkedProvider:
         # reconnect resumes the channel and resends the outbox.
         wait_for(lambda: a._ws is not None)
         socket = a._ws
-        assert socket is not None
         socket.close()
         wait_for(lambda: a.state != "connected")
         a.doc.get_text("body").insert(6, "-after")

@@ -11,9 +11,18 @@ import queue
 import struct
 import threading
 import time
+from typing import Optional
 
 import pytest
-from crdtsync import Client, ErrorCode, Provider, ServerError, connect
+from crdtsync import (
+    Capability,
+    Client,
+    ErrorCode,
+    Provider,
+    ServerError,
+    SubjectKind,
+    connect,
+)
 from crdtsync import _MIN_RECONNECT_DELAY
 
 # --- server frames (tag byte, then the message's fields, all little-endian) ---
@@ -170,14 +179,16 @@ def wait_for(predicate, timeout: float = 2.0) -> None:
         time.sleep(0.005)
 
 
-def handshake(transport: FakeTransport, index: int = 0) -> FakeSocket:
+def handshake(
+    transport: FakeTransport, index: int = 0, catch_up: Optional[bytes] = None
+) -> FakeSocket:
     """Drive one socket from dial to synced: authenticate it, then answer its
-    Subscribe with an empty catch-up."""
+    Subscribe with a catch-up (an empty one, for an empty room, unless given)."""
     socket = transport.socket(index)
     socket.wait_sent(3)
     socket.deliver(auth_ok())
     socket.wait_sent(4)
-    socket.deliver(ops(0))
+    socket.deliver(ops(0) if catch_up is None else catch_up)
     return socket
 
 
@@ -287,11 +298,13 @@ class TestConnectFailures:
         )
         p.close()  # the reader is done, so the backoff is this test's to drive
         delays = [p._backoff() for _ in range(12)]
-        # Jittered into the lower half of each step, so a restarted server is not
-        # met by every client at once — but always escalating and always bounded.
         assert all(0 < d <= 10.0 for d in delays)
         assert delays[0] <= 0.25
         assert delays[-1] >= 5.0
+
+        # Jittered, so a restarted server is not met by every client at once.
+        p._attempt = 32
+        assert len({p._backoff() for _ in range(20)}) > 1
 
         # An unreachable server left overnight builds a large attempt count; an
         # unclamped exponent becomes an integer too large to turn into a float,
@@ -381,11 +394,15 @@ class TestEditsAndReconnect:
         wait_for(lambda: provider.state != "connected")
         provider.doc.get_text("body").insert(0, "offline")
         assert provider.outbox_len > 0
+        assert len(socket.sent) == 4  # outboxed, not written to the dead socket
 
     def test_a_reconnect_resumes_the_channel_and_resends_the_outbox(
         self, transport, provider
     ):
-        first = handshake(transport)
+        # The catch-up carries a peer's ops, so the channel resumes from a real
+        # position — with an empty one the resume is byte-identical to the
+        # original Subscribe and the test could not tell them apart.
+        first = handshake(transport, catch_up=peer_edit(0))
         provider.wait_connected(timeout=2.0)
         provider.doc.get_text("body").insert(0, "hi")
         edit = first.wait_sent(5)[4]
@@ -396,6 +413,7 @@ class TestEditsAndReconnect:
         second.deliver(auth_ok())
         resume, resend = second.wait_sent(5)[3:5]
         assert tag(resume) == _TAG_SUBSCRIBE
+        assert resume != provider._subscribe_frame  # resumed, not restarted
         assert tag(resend) == _TAG_OPS
         assert resend == edit
         wait_for(lambda: provider.state == "connected")
@@ -546,6 +564,52 @@ class TestServerSignals:
             wait_for(lambda: len(seen) == 1)
             assert seen[0].room == b"room"
             assert seen[0].leader_addr == b"10.0.0.2:9000"
+        finally:
+            p.close()
+
+
+class TestAcl:
+    def test_a_grant_rides_the_op_path_and_names_its_tuple(self, transport, provider):
+        socket = handshake(transport)
+        provider.wait_connected(timeout=2.0)
+        tuple_id = provider.acl_grant(
+            SubjectKind.ACTOR, bytes(16), ["root"], capability=Capability.READ
+        )
+        assert len(tuple_id) == 16
+        assert tag(socket.wait_sent(5)[4]) == _TAG_OPS
+        # The revoke names the same tuple, over the same path.
+        provider.acl_revoke(tuple_id)
+        assert tag(socket.wait_sent(6)[5]) == _TAG_OPS
+
+    def test_a_malformed_grant_raises_rather_than_granting_nothing(
+        self, transport, provider
+    ):
+        socket = handshake(transport)
+        provider.wait_connected(timeout=2.0)
+        # An access-control call that returns as though it succeeded is the worst
+        # way to fail: the caller believes access was given.
+        with pytest.raises(ValueError):
+            provider.acl_grant(SubjectKind.ACTOR, b"too-short", capability=Capability.READ)
+        with pytest.raises(ValueError):
+            provider.acl_grant(SubjectKind.ACTOR, bytes(16))  # neither capability nor role
+        time.sleep(0.05)
+        assert len(socket.sent) == 4
+
+    def test_a_revoke_naming_no_tuple_writes_nothing(self, transport, provider):
+        socket = handshake(transport)
+        provider.wait_connected(timeout=2.0)
+        provider.acl_revoke(bytes(16))
+        time.sleep(0.05)
+        assert len(socket.sent) == 4
+
+    def test_a_grant_needs_an_actor_to_credit(self, transport):
+        p = Provider("ws://fake", "room", transport=transport)
+        try:
+            socket = transport.socket(0)
+            socket.wait_sent(3)
+            # No AuthOk yet, so the connection has no authenticated actor.
+            with pytest.raises(ValueError, match="grantor"):
+                p.acl_grant(SubjectKind.ACTOR, bytes(16), capability=Capability.READ)
         finally:
             p.close()
 

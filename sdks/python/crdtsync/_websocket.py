@@ -21,6 +21,7 @@ import os
 import socket
 import ssl
 import struct
+import sys
 import threading
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -137,11 +138,16 @@ def _enable_keepalive(sock: socket.socket, idle: int) -> None:
 
 def _bound_sends(sock: socket.socket, seconds: int) -> None:
     """Cap how long a write may stall, at the socket rather than in Python: the
-    read side stays plainly blocking, so a local close still wakes it."""
+    read side stays plainly blocking, so a local close still wakes it.
+
+    The option's shape is the platform's: a `timeval` on POSIX, milliseconds in a
+    `DWORD` on Windows."""
+    if sys.platform == "win32":
+        value = struct.pack("I", int(seconds * 1000))
+    else:
+        value = struct.pack("ll", seconds, 0)
     try:
-        sock.setsockopt(
-            socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", seconds, 0)
-        )
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, value)
     except OSError:
         pass  # a platform that will not bound sends leaves them blocking
 
