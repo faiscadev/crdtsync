@@ -23,7 +23,7 @@ use crate::codec::{
 use crate::counter::Counter;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
-use crate::list::{Anchor, List};
+use crate::list::{Anchor, List, Side};
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::marks::{MarkState, ResolvedMark};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
@@ -34,6 +34,7 @@ use crate::schema::{MarkFlavor, Schema};
 use crate::stamp::Stamp;
 use crate::text::Text;
 use crate::treemove::TreeMoves;
+use crate::undo::{History, Intention, Landing, Snap, Step as Inverse, MAX_SNAPSHOT_DEPTH};
 use crate::validate::Step;
 use crate::xml::{XmlElement, XmlFragment};
 use crate::zone;
@@ -213,6 +214,11 @@ pub struct Document {
     /// repair is told apart from a newly-needed or newly-changed one. Kept
     /// meaningful only while a schema is bound.
     repair_baseline: Vec<RepairId>,
+    /// The recorded undo history — the inverse of every op this replica emitted
+    /// while an origin was set, stacked by intention. Inert (and empty) until
+    /// [`set_undo_origin`](Self::set_undo_origin) turns recording on, so a
+    /// replica that never authors undoable edits — a server's — carries none.
+    history: History,
 }
 
 impl Drop for Document {
@@ -270,6 +276,7 @@ impl Document {
             pending: Vec::new(),
             schema: None,
             repair_baseline: Vec::new(),
+            history: History::default(),
         }
     }
 
@@ -1909,6 +1916,9 @@ impl Document {
             pending: Vec::new(),
             schema: None,
             repair_baseline: Vec::new(),
+            // A snapshot carries state, not authorship: a replica restored from
+            // one has emitted nothing, so it has nothing of its own to undo.
+            history: History::default(),
         };
         // Rebuild the tree-move state: the created-under parent of each placed
         // node (for the cycle check + fallback parent), then replay the move log,
@@ -2029,6 +2039,12 @@ impl Document {
         // waiting on; replay them now, not only on the next remote apply.
         self.drain_buffer();
         let ops = std::mem::take(&mut self.pending);
+        // A transact is one intention unless it is part of a larger group — an
+        // explicit `begin_intention` or an open atomic transaction, each of which
+        // closes the intention itself.
+        if self.atomic.is_none() && !self.history.grouped() {
+            self.history.close(false);
+        }
         // While recording an atomic transaction, edits accumulate into the group
         // rather than returning per call; the group ships on `commit_atomic`.
         match self.atomic.as_mut() {
@@ -2054,6 +2070,8 @@ impl Document {
     /// nothing) if no edits were recorded or no transaction was open.
     pub fn commit_atomic(&mut self) -> Vec<Op> {
         let ops = self.atomic.take().unwrap_or_default();
+        // The group is one intention, undone and redone as one transaction.
+        self.history.close(true);
         self.tag_atomic(ops)
     }
 
@@ -2544,6 +2562,13 @@ impl Document {
         self.seq += 1;
         self.seen.insert(id);
         let author = self.client;
+        // The record-seam: the inverse is read off the state this op is about to
+        // overwrite, so it must be taken before the op lands.
+        if self.history.recording() {
+            if let Some(step) = self.inverse(target, &kind, stamp) {
+                self.history.push(step);
+            }
+        }
         self.apply_kind(target, &kind, stamp, author);
         self.pending.push(Op {
             id,
@@ -3178,6 +3203,587 @@ impl Document {
                 self.parents.insert(children_id, id);
                 Element::XmlFragment(handle)
             }
+        }
+    }
+
+    // --- undo record-seam ---
+    //
+    // Every op this replica emits passes through `emit_stamped`, which asks
+    // `inverse` what would put the state back. That is the whole seam: an edit is
+    // recorded because it was *emitted*, not because it was made through some
+    // particular helper, so a handle-graph SDK, the path façade and a raw cursor
+    // all record identically, on an offline replica and on a channel's replica
+    // alike. Replaying an intention emits ordinary forward ops, which record
+    // their own inverses — so the mirror is always derived from live state.
+
+    /// Record emitted edits under `origin` from now on. Recording is off until
+    /// this is called; the origin is the tag [`undo`](Self::undo) selects by, so
+    /// two managers over one document (a user's and a subtree-scoped one) keep
+    /// separate histories.
+    pub fn set_undo_origin(&mut self, origin: &[u8]) {
+        self.history.track(origin);
+    }
+
+    /// Stop recording emitted edits. What was already recorded stays undoable.
+    pub fn clear_undo_origin(&mut self) {
+        self.history.untrack();
+    }
+
+    /// The origin edits are recording under, or `None` when recording is off.
+    pub fn undo_origin(&self) -> Option<&[u8]> {
+        self.history.origin()
+    }
+
+    /// Open an explicit intention: every edit until the matching
+    /// [`end_intention`](Self::end_intention) records as one undo step, however
+    /// many transacts it spans. Nests.
+    pub fn begin_intention(&mut self) {
+        self.history.open_group();
+    }
+
+    /// Close the intention opened by [`begin_intention`](Self::begin_intention).
+    /// The outermost close records the step.
+    pub fn end_intention(&mut self) {
+        if self.history.close_group() && self.atomic.is_none() {
+            self.history.close(false);
+        }
+    }
+
+    /// Whether `origin` has a recorded intention to undo.
+    pub fn can_undo(&self, origin: &[u8]) -> bool {
+        self.history.can_undo(origin)
+    }
+
+    /// Whether `origin` has an undone intention to redo.
+    pub fn can_redo(&self, origin: &[u8]) -> bool {
+        self.history.can_redo(origin)
+    }
+
+    /// Revert `origin`'s most recent intention — skipping any another origin
+    /// interleaved — and return the ordinary forward ops that did it, for the
+    /// caller to broadcast. The intention becomes redoable. `None` when `origin`
+    /// has nothing to undo, or while an atomic transaction is open: the undo's
+    /// own ops would be swallowed into that group.
+    pub fn undo(&mut self, origin: &[u8]) -> Option<Vec<Op>> {
+        if self.atomic.is_some() {
+            return None;
+        }
+        let intention = self.history.take(origin, Landing::Undo)?;
+        Some(self.replay(intention, Landing::Redo))
+    }
+
+    /// Replay `origin`'s most recently undone intention, returning the ops to
+    /// broadcast. It becomes undoable again. `None` under the same conditions as
+    /// [`undo`](Self::undo).
+    pub fn redo(&mut self, origin: &[u8]) -> Option<Vec<Op>> {
+        if self.atomic.is_some() {
+            return None;
+        }
+        let intention = self.history.take(origin, Landing::Redo)?;
+        Some(self.replay(intention, Landing::Undo))
+    }
+
+    /// Emit an intention's inverses — last edit undone first — and return their
+    /// ops. The emitted ops record their own inverses, which close as the mirror
+    /// intention on `landing`. An atomic intention replays inside one atomic
+    /// transaction, so its ops reach a peer all-or-nothing and the mirror is
+    /// itself atomic.
+    fn replay(&mut self, intention: Intention, landing: Landing) -> Vec<Op> {
+        let Intention {
+            origin,
+            steps,
+            atomic,
+        } = intention;
+        let saved = self.history.begin_replay(&origin, landing);
+        if atomic {
+            self.begin_atomic();
+        }
+        self.pending.clear();
+        for step in steps.into_iter().rev() {
+            self.emit_inverse(step);
+        }
+        // A revived container can be what buffered remote ops were waiting on.
+        self.drain_buffer();
+        let ops = std::mem::take(&mut self.pending);
+        let ops = if atomic {
+            self.atomic.get_or_insert_with(Vec::new).extend(ops);
+            self.commit_atomic()
+        } else {
+            self.history.close(false);
+            ops
+        };
+        self.history.end_replay(saved);
+        ops
+    }
+
+    /// Emit one inverse action.
+    fn emit_inverse(&mut self, step: Inverse) {
+        match step {
+            Inverse::Op { target, kind } => self.emit(target, kind),
+            Inverse::Revive { list, anchor, node } => self.revive_node(list, anchor, node),
+            Inverse::Ranged {
+                start,
+                end,
+                name,
+                payload,
+            } => self.revive_ranged(start, end, name, payload),
+        }
+    }
+
+    /// What would put the state back after `kind` lands on `target` with
+    /// `stamp` — read against the state as it stands *now*, before the op
+    /// applies. `None` for an op with nothing to restore.
+    fn inverse(&self, target: ElementId, kind: &OpKind, stamp: Stamp) -> Option<Inverse> {
+        let at = |target, kind| Some(Inverse::Op { target, kind });
+        match kind {
+            // Every slot mutation — a value, a leaf, or a container install —
+            // inverts to whatever the slot held before it.
+            OpKind::RegisterSet { key, .. }
+            | OpKind::MapSet { key, .. }
+            | OpKind::MapDelete { key }
+            | OpKind::MapCreate { key }
+            | OpKind::ListCreate { key }
+            | OpKind::TextCreate { key }
+            | OpKind::XmlElementCreate { key, .. }
+            | OpKind::XmlFragmentCreate { key } => self.slot_inverse(target, key),
+            OpKind::CounterInc { key, amount } => at(
+                target,
+                OpKind::CounterDec {
+                    key: key.clone(),
+                    amount: *amount,
+                },
+            ),
+            OpKind::CounterDec { key, amount } => at(
+                target,
+                OpKind::CounterInc {
+                    key: key.clone(),
+                    amount: *amount,
+                },
+            ),
+            // A sequence insert is undone by tombstoning exactly the node it
+            // mints, whose id is the op's own stamp.
+            OpKind::ListInsert { .. } | OpKind::XmlInsertChild { .. } => {
+                at(target, OpKind::ListDelete { id: stamp })
+            }
+            OpKind::ListDelete { id } => self.list_delete_inverse(target, *id),
+            // A run takes one char_id per codepoint from the op's stamp, so the
+            // ids to tombstone are known without reading the text back. An empty
+            // run mints nothing and has nothing to undo.
+            OpKind::TextInsert { s, .. } => {
+                let count = s.chars().count() as u64;
+                if count == 0 {
+                    return None;
+                }
+                let ids = (0..count).map(|i| stamp.run_member(i)).collect();
+                at(target, OpKind::TextDelete { ids })
+            }
+            OpKind::TextDelete { ids } => self.text_delete_inverse(target, ids),
+            OpKind::XmlMove { node, .. } => self.move_inverse(*node),
+            // A reveal is synthesized by the server at redaction time, never
+            // authored here, so it never reaches the seam — and it installs only
+            // a shell, so there is nothing to restore.
+            OpKind::XmlReveal { .. } => None,
+            OpKind::RangedCreate { .. } => at(
+                target,
+                OpKind::RangedDelete {
+                    id: ranged_id(stamp),
+                },
+            ),
+            OpKind::RangedSetPayload { id, .. } => {
+                let prior = match &self.ranged.get(id)?.payload {
+                    Payload::Scalar { value, .. } => value.clone(),
+                    // A composite payload is edited through its container, so
+                    // this op is inert against one and needs no inverse.
+                    Payload::Composite { .. } => return None,
+                };
+                at(
+                    target,
+                    OpKind::RangedSetPayload {
+                        id: *id,
+                        payload: prior,
+                    },
+                )
+            }
+            OpKind::RangedDelete { id } => self.ranged_inverse(*id),
+            OpKind::AclGrant { .. } => at(target, OpKind::AclRevoke { id: acl_id(stamp) }),
+            OpKind::AclRevoke { id } => {
+                let e = self.acl.get(id)?;
+                at(
+                    target,
+                    OpKind::AclGrant {
+                        subject: e.subject.clone(),
+                        grant: e.grant.clone(),
+                        effect: e.effect,
+                        scope: e.scope.clone(),
+                        grantor: e.grantor,
+                    },
+                )
+            }
+        }
+    }
+
+    /// Re-install whatever `key` holds in `map_id` right now. A container is
+    /// restored by re-creating it at the same key: its handle is retained by id,
+    /// so the same logical element comes back with its content intact. An empty
+    /// or tombstoned slot inverts to a delete.
+    fn slot_inverse(&self, map_id: ElementId, key: &[u8]) -> Option<Inverse> {
+        let map = self.maps.get(&map_id)?;
+        let key = key.to_vec();
+        let kind = match map.borrow().get(&key) {
+            None => OpKind::MapDelete { key },
+            Some(Element::Scalar(value)) => OpKind::MapSet { key, value },
+            Some(Element::Register(r)) => OpKind::RegisterSet {
+                key,
+                value: r.borrow().read().clone(),
+            },
+            // The tally lives in the registry keyed by the slot's derived id, so
+            // re-winning the slot with a zero delta restores the counter whole.
+            Some(Element::Counter(_)) => OpKind::CounterInc { key, amount: 0 },
+            Some(Element::Map(_)) => OpKind::MapCreate { key },
+            Some(Element::List(_)) => OpKind::ListCreate { key },
+            Some(Element::Text(_)) => OpKind::TextCreate { key },
+            Some(Element::XmlElement(x)) => OpKind::XmlElementCreate {
+                tag: x.borrow().tag().to_vec(),
+                key,
+            },
+            Some(Element::XmlFragment(_)) => OpKind::XmlFragmentCreate { key },
+        };
+        Some(Inverse::Op {
+            target: map_id,
+            kind,
+        })
+    }
+
+    /// Revive the node about to be tombstoned, right where it sits: the revival
+    /// anchors as the *left* child of the node it replaces, which renders
+    /// immediately before it — the position the tombstone still holds, however
+    /// the sequence has shifted since. A scalar comes back as a plain insert; a
+    /// composite sequence node — an XML child — is rebuilt from a snapshot, since
+    /// a tombstone drops the value it held.
+    fn list_delete_inverse(&self, list_id: ElementId, id: Stamp) -> Option<Inverse> {
+        let list = self.lists.get(&list_id)?;
+        let value = {
+            let l = list.borrow();
+            l.live_index(id).and_then(|i| l.get(i))?
+        };
+        let anchor = Anchor {
+            parent: Some(id),
+            side: Side::Left,
+        };
+        match value {
+            Element::Scalar(value) => Some(Inverse::Op {
+                target: list_id,
+                kind: OpKind::ListInsert { value, anchor },
+            }),
+            other => Some(Inverse::Revive {
+                list: list_id,
+                anchor,
+                node: self.snapshot(&other, 0)?,
+            }),
+        }
+    }
+
+    /// Revive the codepoints about to be tombstoned, anchored as the left child
+    /// of the first of them — the left edge of the run, which is where the
+    /// revived text belongs however the sequence has shifted since.
+    fn text_delete_inverse(&self, text_id: ElementId, ids: &[Stamp]) -> Option<Inverse> {
+        let text = self.texts.get(&text_id)?;
+        let t = text.borrow();
+        let chars: Vec<char> = t.as_string().chars().collect();
+        let mut live: Vec<(usize, Stamp)> = ids
+            .iter()
+            .filter_map(|id| t.live_index(*id).map(|i| (i, *id)))
+            .collect();
+        live.sort_unstable_by_key(|(i, _)| *i);
+        let (_, first) = *live.first()?;
+        let s: String = live.iter().filter_map(|(i, _)| chars.get(*i)).collect();
+        Some(Inverse::Op {
+            target: text_id,
+            kind: OpKind::TextInsert {
+                s,
+                anchor: Anchor {
+                    parent: Some(first),
+                    side: Side::Left,
+                },
+            },
+        })
+    }
+
+    /// Move `node` back where it renders now — its live placement's list, at its
+    /// live index there, discounting its own slot exactly as a forward reorder
+    /// does.
+    fn move_inverse(&self, node: ElementId) -> Option<Inverse> {
+        let from = *self.parents.get(&node)?;
+        let list = self.lists.get(&from)?;
+        let slot = self
+            .placements
+            .get(&node)?
+            .iter()
+            .filter(|p| p.list == from)
+            .map(|p| p.stamp)
+            .max()?;
+        let l = list.borrow();
+        let index = l.live_index(slot)?;
+        Some(Inverse::Op {
+            target: from,
+            kind: OpKind::XmlMove {
+                node,
+                anchor: l.place_excluding(index, Some(slot)),
+            },
+        })
+    }
+
+    /// Re-create the RangedElement about to be tombstoned over the same span,
+    /// carrying its payload. A tombstone is terminal, so the revival is a fresh
+    /// annotation with a new id.
+    fn ranged_inverse(&self, id: ElementId) -> Option<Inverse> {
+        let e = self.ranged.get(&id)?;
+        if e.tombstone {
+            return None;
+        }
+        let payload = match &e.payload {
+            Payload::Scalar { value, .. } => Snap::Scalar(value.clone()),
+            Payload::Composite { kind } => {
+                let pid = payload_id(id, *kind);
+                match kind {
+                    ElementKind::Map => {
+                        self.snapshot(&Element::Map(self.maps.get(&pid)?.clone()), 0)
+                    }
+                    ElementKind::List => {
+                        self.snapshot(&Element::List(self.lists.get(&pid)?.clone()), 0)
+                    }
+                    ElementKind::Text => {
+                        self.snapshot(&Element::Text(self.texts.get(&pid)?.clone()), 0)
+                    }
+                    _ => None,
+                }?
+            }
+        };
+        Some(Inverse::Ranged {
+            start: e.start,
+            end: e.end,
+            name: e.name.clone(),
+            payload,
+        })
+    }
+
+    /// Capture `element` deeply enough to rebuild it out of forward ops. `None`
+    /// past [`MAX_SNAPSHOT_DEPTH`], so the walk cannot run off the stack.
+    fn snapshot(&self, element: &Element, depth: u32) -> Option<Snap> {
+        if depth >= MAX_SNAPSHOT_DEPTH {
+            return None;
+        }
+        let next = depth + 1;
+        Some(match element {
+            Element::Scalar(v) => Snap::Scalar(v.clone()),
+            Element::Register(r) => Snap::Register(r.borrow().read().clone()),
+            Element::Counter(c) => Snap::Counter(c.borrow().read()),
+            Element::Map(m) => Snap::Map(self.snapshot_slots(m, next)),
+            Element::List(l) => Snap::List(
+                l.borrow()
+                    .values()
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Element::Scalar(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            Element::Text(t) => Snap::Text(t.borrow().as_string()),
+            Element::XmlElement(x) => {
+                let (tag, attrs, children) = {
+                    let x = x.borrow();
+                    (x.tag().to_vec(), x.attrs(), x.children())
+                };
+                Snap::XmlElement {
+                    tag,
+                    attrs: self.snapshot_slots(&attrs, next),
+                    children: self.snapshot_children(&children, next),
+                }
+            }
+            Element::XmlFragment(f) => Snap::XmlFragment {
+                children: self.snapshot_children(&f.borrow().children(), next),
+            },
+        })
+    }
+
+    /// Capture a map's live slots, skipping any too deep to rebuild.
+    fn snapshot_slots(&self, map: &Rc<RefCell<Map>>, depth: u32) -> Vec<(Vec<u8>, Snap)> {
+        map.borrow()
+            .entries()
+            .into_iter()
+            .filter_map(|(key, value)| Some((key, self.snapshot(&value, depth)?)))
+            .collect()
+    }
+
+    /// Capture a children sequence's live nodes, skipping any too deep.
+    fn snapshot_children(&self, list: &Rc<RefCell<List>>, depth: u32) -> Vec<Snap> {
+        list.borrow()
+            .values()
+            .into_iter()
+            .filter_map(|v| self.snapshot(&v, depth))
+            .collect()
+    }
+
+    /// Rebuild a captured sequence node in `list` at `anchor`. Only the two
+    /// movable node kinds ever occupy a children sequence.
+    fn revive_node(&mut self, list: ElementId, anchor: Anchor, node: Snap) {
+        match node {
+            Snap::Text(s) => {
+                let stamp = self.emit_stamped(list, OpKind::XmlInsertChild { tag: None, anchor });
+                let child = xml_child_id(list, stamp, ElementKind::Text);
+                self.fill_text(child, s);
+            }
+            Snap::XmlElement {
+                tag,
+                attrs,
+                children,
+            } => {
+                let stamp = self.emit_stamped(
+                    list,
+                    OpKind::XmlInsertChild {
+                        tag: Some(tag),
+                        anchor,
+                    },
+                );
+                let child = xml_child_id(list, stamp, ElementKind::XmlElement);
+                self.fill_slots(XmlElement::attrs_id(child), attrs);
+                self.fill_children(XmlElement::children_id(child), children);
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-create a captured RangedElement and rebuild its payload.
+    fn revive_ranged(
+        &mut self,
+        start: RangeAnchor,
+        end: RangeAnchor,
+        name: Option<Vec<u8>>,
+        payload: Snap,
+    ) {
+        let init = match &payload {
+            Snap::Scalar(v) => RangedInit::Scalar(v.clone()),
+            Snap::Map(_) => RangedInit::Composite(ElementKind::Map),
+            Snap::List(_) => RangedInit::Composite(ElementKind::List),
+            Snap::Text(_) => RangedInit::Composite(ElementKind::Text),
+            _ => return,
+        };
+        let root = self.root_id();
+        let stamp = self.emit_stamped(
+            root,
+            OpKind::RangedCreate {
+                start,
+                end,
+                payload: init,
+                name,
+            },
+        );
+        let ranged = ranged_id(stamp);
+        match payload {
+            Snap::Map(slots) => self.fill_slots(payload_id(ranged, ElementKind::Map), slots),
+            Snap::List(values) => self.fill_list(payload_id(ranged, ElementKind::List), values),
+            Snap::Text(s) => self.fill_text(payload_id(ranged, ElementKind::Text), s),
+            _ => {}
+        }
+    }
+
+    /// Re-create captured slots in the map `map_id`, descending into each
+    /// container as it is installed.
+    fn fill_slots(&mut self, map_id: ElementId, slots: Vec<(Vec<u8>, Snap)>) {
+        for (key, snap) in slots {
+            match snap {
+                Snap::Scalar(value) => self.emit(map_id, OpKind::MapSet { key, value }),
+                Snap::Register(value) => self.emit(map_id, OpKind::RegisterSet { key, value }),
+                Snap::Counter(total) => self.fill_counter(map_id, key, total),
+                Snap::Map(slots) => {
+                    let child = ElementId::derive(map_id, &key, ElementKind::Map);
+                    self.emit(map_id, OpKind::MapCreate { key });
+                    self.fill_slots(child, slots);
+                }
+                Snap::List(values) => {
+                    let child = ElementId::derive(map_id, &key, ElementKind::List);
+                    self.emit(map_id, OpKind::ListCreate { key });
+                    self.fill_list(child, values);
+                }
+                Snap::Text(s) => {
+                    let child = ElementId::derive(map_id, &key, ElementKind::Text);
+                    self.emit(map_id, OpKind::TextCreate { key });
+                    self.fill_text(child, s);
+                }
+                Snap::XmlElement {
+                    tag,
+                    attrs,
+                    children,
+                } => {
+                    let child = XmlElement::node_id(map_id, &key, &tag);
+                    self.emit(map_id, OpKind::XmlElementCreate { key, tag });
+                    self.fill_slots(XmlElement::attrs_id(child), attrs);
+                    self.fill_children(XmlElement::children_id(child), children);
+                }
+                Snap::XmlFragment { children } => {
+                    let child = XmlFragment::node_id(map_id, &key);
+                    self.emit(map_id, OpKind::XmlFragmentCreate { key });
+                    self.fill_children(XmlFragment::children_id(child), children);
+                }
+            }
+        }
+    }
+
+    /// Drive a counter at `key` to `total` from zero. The op carries a `u32`
+    /// delta, so a total beyond that range takes several.
+    fn fill_counter(&mut self, map_id: ElementId, key: Vec<u8>, total: i64) {
+        let mut left = total.unsigned_abs();
+        // A zero total still re-installs the counter in its slot.
+        loop {
+            let amount = u32::try_from(left.min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+            left -= u64::from(amount);
+            let kind = if total < 0 {
+                OpKind::CounterDec {
+                    key: key.clone(),
+                    amount,
+                }
+            } else {
+                OpKind::CounterInc {
+                    key: key.clone(),
+                    amount,
+                }
+            };
+            self.emit(map_id, kind);
+            if left == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Re-insert captured values into the list `list_id`, in order.
+    fn fill_list(&mut self, list_id: ElementId, values: Vec<Scalar>) {
+        for (index, value) in values.into_iter().enumerate() {
+            let Some(anchor) = self.lists.get(&list_id).map(|l| l.borrow().place(index)) else {
+                return;
+            };
+            self.emit(list_id, OpKind::ListInsert { value, anchor });
+        }
+    }
+
+    /// Re-insert a captured string into the text `text_id`.
+    fn fill_text(&mut self, text_id: ElementId, s: String) {
+        if s.is_empty() {
+            return;
+        }
+        let Some(anchor) = self.texts.get(&text_id).map(|t| t.borrow().place(0)) else {
+            return;
+        };
+        self.emit(text_id, OpKind::TextInsert { s, anchor });
+    }
+
+    /// Rebuild captured children into the sequence `list_id`, in order.
+    fn fill_children(&mut self, list_id: ElementId, children: Vec<Snap>) {
+        for (index, child) in children.into_iter().enumerate() {
+            let Some(anchor) = self.lists.get(&list_id).map(|l| l.borrow().place(index)) else {
+                return;
+            };
+            self.revive_node(list_id, anchor, child);
         }
     }
 }

@@ -383,6 +383,55 @@ impl ClientSession {
         Some(Message::Ops { channel, ops })
     }
 
+    /// Record `channel`'s edits under `origin` so they become undoable. Every
+    /// edit the replica emits — through [`edit`](Self::edit), the path façade, or
+    /// any cursor — is recorded from here on; a remote op folded in by
+    /// [`receive`](Self::receive) never is, so a collaborator's change can never
+    /// land on this seat's stack. Each channel keeps its own history, since each
+    /// holds its own replica. `None` if the channel isn't held.
+    pub fn set_undo_origin(&mut self, channel: Channel, origin: &[u8]) -> Option<()> {
+        self.rooms.get_mut(&channel)?.doc.set_undo_origin(origin);
+        Some(())
+    }
+
+    /// Stop recording `channel`'s edits. What was recorded stays undoable.
+    /// `None` if the channel isn't held.
+    pub fn clear_undo_origin(&mut self, channel: Channel) -> Option<()> {
+        self.rooms.get_mut(&channel)?.doc.clear_undo_origin();
+        Some(())
+    }
+
+    /// Whether `origin` has an intention to undo on `channel`.
+    pub fn can_undo(&self, channel: Channel, origin: &[u8]) -> bool {
+        self.rooms
+            .get(&channel)
+            .is_some_and(|r| r.doc.can_undo(origin))
+    }
+
+    /// Whether `origin` has an undone intention to redo on `channel`.
+    pub fn can_redo(&self, channel: Channel, origin: &[u8]) -> bool {
+        self.rooms
+            .get(&channel)
+            .is_some_and(|r| r.doc.can_redo(origin))
+    }
+
+    /// Revert `origin`'s most recent intention on `channel` and frame the ops to
+    /// send. The inverse is an ordinary edit — it goes through the same outbox,
+    /// so it is acknowledged and resent like any other, and a peer folds it in
+    /// with no notion that an undo happened. `None` if the channel isn't held or
+    /// `origin` has nothing to undo.
+    pub fn undo(&mut self, channel: Channel, origin: &[u8]) -> Option<Message> {
+        let ops = self.rooms.get_mut(&channel)?.doc.undo(origin)?;
+        self.enqueue_ops(channel, ops)
+    }
+
+    /// Replay `origin`'s most recently undone intention on `channel` and frame
+    /// the ops to send. `None` under the same conditions as [`undo`](Self::undo).
+    pub fn redo(&mut self, channel: Channel, origin: &[u8]) -> Option<Message> {
+        let ops = self.rooms.get_mut(&channel)?.doc.redo(origin)?;
+        self.enqueue_ops(channel, ops)
+    }
+
     /// Publish an ephemeral awareness entry on `channel`'s room, returning the
     /// frame to send. `None` if the channel isn't held. The entry is transient —
     /// it is not stored locally or reflected back.
