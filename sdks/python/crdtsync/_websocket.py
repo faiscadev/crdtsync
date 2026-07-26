@@ -56,6 +56,13 @@ DEFAULT_KEEPALIVE_IDLE = 30
 KEEPALIVE_INTERVAL = 10
 KEEPALIVE_PROBES = 3
 
+#: How long a write may make no progress at all before the connection is treated
+#: as broken. A peer that stops reading parks the writer indefinitely otherwise,
+#: and a writer holds the send order while it writes — so an unbounded write is
+#: an unbounded stall for everything behind it. The clock only runs while nothing
+#: moves, so a large frame on a slow link is unaffected.
+DEFAULT_SEND_TIMEOUT = 20
+
 #: How far the read cursor may run ahead before the consumed prefix is dropped.
 _COMPACT_AFTER = 1 << 20
 
@@ -69,6 +76,7 @@ def connect(
     *,
     timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
     keepalive_idle: int = DEFAULT_KEEPALIVE_IDLE,
+    send_timeout: int = DEFAULT_SEND_TIMEOUT,
     headers: Optional[Dict[str, str]] = None,
 ) -> "WebSocket":
     """Open a WebSocket to ``url`` (``ws://`` or ``wss://``) and return it once
@@ -93,6 +101,7 @@ def connect(
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         _enable_keepalive(sock, keepalive_idle)
+        _bound_sends(sock, send_timeout)
         if scheme == "wss":
             context = ssl.create_default_context()
             sock = context.wrap_socket(sock, server_hostname=parts.hostname)
@@ -124,6 +133,17 @@ def _enable_keepalive(sock: socket.socket, idle: int) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, option, value)
         except OSError:
             pass  # the platform names the option but will not set it
+
+
+def _bound_sends(sock: socket.socket, seconds: int) -> None:
+    """Cap how long a write may stall, at the socket rather than in Python: the
+    read side stays plainly blocking, so a local close still wakes it."""
+    try:
+        sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", seconds, 0)
+        )
+    except OSError:
+        pass  # a platform that will not bound sends leaves them blocking
 
 
 def _handshake(

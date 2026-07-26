@@ -14,6 +14,7 @@ import time
 
 import pytest
 from crdtsync import Client, ErrorCode, Provider, ServerError, connect
+from crdtsync import _MIN_RECONNECT_DELAY
 
 # --- server frames (tag byte, then the message's fields, all little-endian) ---
 
@@ -303,7 +304,27 @@ class TestConnectFailures:
             "ws://fake", "room", transport=transport, max_reconnect_delay=0, reconnect=False
         )
         p.close()
-        assert p._backoff() > 0
+        assert p._backoff() >= _MIN_RECONNECT_DELAY * 0.5
+
+    def test_a_server_error_does_not_restart_the_backoff(self, transport):
+        # An error is not proof the connection works — the update-required push
+        # is precisely a server saying so before it drops. Restarting the backoff
+        # on one pins every client at the floor delay, hammering the server.
+        p = Provider("ws://fake", "room", transport=transport, on_error=lambda _c: None)
+        try:
+            socket = handshake(transport)
+            p.wait_connected(timeout=2.0)
+            p._attempt = 6
+            socket.deliver(error(ErrorCode.UPDATE_REQUIRED))
+            wait_for(lambda: p.state == "connected")
+            time.sleep(0.05)
+            assert p._attempt == 6
+
+            # A frame the session applies is proof, and does restart it.
+            socket.deliver(peer_edit(p._channel))
+            wait_for(lambda: p._attempt == 0)
+        finally:
+            p.close()
 
     def test_a_refused_reconnect_handshake_dials_again(self, transport):
         seen = []

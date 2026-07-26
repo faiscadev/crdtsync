@@ -11,6 +11,7 @@ import hashlib
 import socket
 import struct
 import threading
+import time
 
 import pytest
 from crdtsync import _websocket
@@ -281,6 +282,23 @@ class TestClose:
         ws.close()
         ws.close()
         assert ws.closed
+
+    def test_a_control_reply_never_waits_for_a_parked_writer(self, serve):
+        # Reads and writes run on different threads. A reader that queued behind
+        # a writer parked in `sendall` would stop draining the very socket whose
+        # reads let the peer drain — a full-duplex deadlock with nothing to end
+        # it. The pong is skipped instead; the peer simply pings again.
+        def handler(conn):
+            conn.sendall(server_frame(0x9, b"beat") + server_frame(0x2, b"payload"))
+            time.sleep(0.5)
+
+        ws = _websocket.connect(serve(handler).url)
+        try:
+            ws._send_lock.acquire()  # stand in for a writer parked mid-send
+            assert ws.recv() == b"payload"
+        finally:
+            ws._send_lock.release()
+            ws.close()
 
     def test_sending_on_a_closed_socket_raises(self, serve):
         ws = _websocket.connect(serve(lambda conn: None).url)

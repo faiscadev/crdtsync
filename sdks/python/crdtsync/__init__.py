@@ -23,7 +23,7 @@ import struct
 import threading
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 from . import _websocket
 
@@ -2675,8 +2675,9 @@ class CrdtList:
         items = []
         for i in range(self._length(backend)):
             raw = backend.list_get(self._self, i)
-            if raw is not None:
-                items.append(_decode_value(raw))
+            if raw is None:
+                break  # the list ended short of its length; report the prefix
+            items.append(_decode_value(raw))
         return items
 
     def _length(self, backend) -> int:
@@ -3586,7 +3587,7 @@ class Provider:
         self,
         subject_kind: SubjectKind,
         subject: bytes,
-        path: Path = (),
+        path: "Sequence[Key]" = (),
         *,
         capability: Optional[Capability] = None,
         role: Optional[bytes] = None,
@@ -3595,11 +3596,14 @@ class Provider:
     ) -> bytes:
         """Author a doc-ACL grant over the room, routed through the op path so it
         is acknowledged and resent like an edit. Returns the tuple id
-        :meth:`acl_revoke` names it by.
+        :meth:`acl_revoke` names it by; raises ``ValueError`` when the grant is
+        malformed — an access-control call that quietly granted nothing would
+        leave the caller believing access was given.
 
         ``grantor`` defaults to this connection's authenticated actor, keyed the
         way a matched ``Actor`` subject is — so the grant is credited to the
         identity rather than to an ephemeral per-device id."""
+        keys = [_key_bytes(k) for k in path]
         with self._send_lock:
             with self._lock:
                 credited = grantor
@@ -3615,21 +3619,23 @@ class Provider:
                     subject_kind,
                     subject,
                     credited,
-                    path,
+                    keys,
                     capability=capability,
                     role=role,
                     effect=effect,
                 )
-            self._send_if_open(frame)
+            if tuple_id is None:
+                raise ValueError("crdtsync: the acl grant was refused as malformed")
+            self._send_if_open(_ClientBackend._framed(frame))
         return tuple_id
 
     def acl_revoke(self, tuple_id: bytes) -> None:
         """Revoke the doc-ACL tuple :meth:`acl_grant` returned, through the same
-        op path."""
+        op path. A tuple id this replica does not hold revokes nothing."""
         with self._send_lock:
             with self._lock:
                 frame = self._client.acl_revoke(self._channel, tuple_id)
-            self._send_if_open(frame)
+            self._send_if_open(_ClientBackend._framed(frame))
 
     def awareness(self, actor: bytes, key: Key) -> Optional[bytes]:
         """A peer's awareness entry by publishing ``actor`` and ``key``, or
@@ -3696,7 +3702,12 @@ class Provider:
                         # never dials again and never says so.
                         _LOGGER.exception("crdtsync: the connection failed")
                     finally:
-                        ws.close()
+                        # Shutting the socket down frees any writer parked on it,
+                        # so the rebind behind it cannot wait on a stuck author.
+                        try:
+                            ws.close()
+                        except Exception:
+                            _LOGGER.exception("crdtsync: closing the socket failed")
                         self._bind_socket(None)
                 if self._closed or not self._reconnect:
                     break
@@ -3779,7 +3790,7 @@ class Provider:
             # (or Resume on a reconnect) and replay the outbox. `actor()` can't
             # gate this: it stays set across reconnects, so it would pass before
             # the new socket re-authenticates.
-            err = self._receive(data)
+            _applied, err = self._receive(data)
             if err is not None:
                 # A socket that will not authenticate never carries a Subscribe,
                 # so it can only sit idle. The first connection fails outright;
@@ -3805,38 +3816,40 @@ class Provider:
         # reactivity is deferred to the end, because that is the app's code and a
         # listener that raises must not cost this frame its signal drain or the
         # connection its initial sync.
-        folded: List[Optional[ErrorCode]] = []
+        folded: List[Tuple[bool, Optional[ErrorCode]]] = []
         changes, repairs = self.doc._fold_remote(lambda: folded.append(self._receive(data)))
-        err = folded[0] if folded else None
+        applied, err = folded[0] if folded else (False, None)
         if err is not None:
             self._handle_server_error(err)
             if self._closed:  # the error was fatal — this socket is finished
                 return
-        # A frame folded past the handshake is the proof this connection works,
-        # so the backoff starts over here rather than at the AuthOk: a server
-        # that authenticates and then drops would otherwise be redialled at the
-        # minimum delay forever, by every client at once.
-        self._attempt = 0
+        if applied:
+            # A frame this session actually applied is the proof the connection
+            # works, so the backoff starts over here rather than at the AuthOk
+            # or on any frame at all. A server that authenticates and then errors
+            # — the update-required push is exactly that — would otherwise be
+            # redialled at the floor delay forever, by every client at once.
+            self._attempt = 0
+            # The Subscribe is answered with the room's catch-up, so the first
+            # frame the session applies past the handshake completes the sync.
+            if self._phase == "catchup":
+                self._mark_connected()
         self._drain_signals()
-
-        # The server answers the Subscribe with the room's catch-up, so the first
-        # frame past the handshake completes the initial sync.
-        if self._phase == "catchup":
-            self._mark_connected()
         try:
             self.doc._publish_remote(changes, repairs)
         except Exception:
             _LOGGER.exception("crdtsync: a document listener raised")
 
-    def _receive(self, data: bytes) -> "Optional[ErrorCode]":
-        """Fold one inbound frame; return the server ``ErrorCode`` when it was an
-        Error frame rather than an applicable message."""
+    def _receive(self, data: bytes) -> "Tuple[bool, Optional[ErrorCode]]":
+        """Fold one inbound frame, reporting whether the session applied it and
+        the server ``ErrorCode`` when it was an Error frame rather than an
+        applicable message. A frame the session refuses — one naming a channel it
+        does not hold — is neither."""
         try:
             with self._lock:
-                self._client.receive(data)
-            return None
+                return self._client.receive(data) == 1, None
         except ServerError as err:
-            return err.code
+            return False, err.code
 
     def _handle_server_error(self, code: "ErrorCode") -> None:
         if not self._connected_once:
