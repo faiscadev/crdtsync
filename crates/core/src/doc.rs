@@ -187,7 +187,6 @@ pub struct Document {
     seq: u64,
     /// The next atomic-transaction id to mint; namespaced by this replica's
     /// client, so `(client, tx)` is globally unique.
-    next_tx: u64,
     /// When recording an atomic transaction (between `begin_atomic` and
     /// `commit_atomic`), the ops emitted so far accumulate here instead of being
     /// returned per edit, so several edits commit as one group.
@@ -266,7 +265,6 @@ impl Document {
             lamport: 0,
             zone_clocks: HashMap::new(),
             seq: 0,
-            next_tx: 0,
             atomic: None,
             seen: HashSet::new(),
             buffer: Vec::new(),
@@ -1908,11 +1906,6 @@ impl Document {
             lamport,
             zone_clocks,
             seq,
-            // Tx ids scope only the buffering of remote partial transactions,
-            // keyed by their author's client; a restored replica mints its own
-            // under its own client with fresh op ids, so restarting at 0 cannot
-            // collide with anything still buffered.
-            next_tx: 0,
             atomic: None,
             seen,
             buffer,
@@ -2093,15 +2086,24 @@ impl Document {
 
     /// Tag a group's ops as one atomic transaction. An empty group is left
     /// untagged.
+    ///
+    /// The id is the group's lowest member seq. A receiver buckets buffered
+    /// members by `(author client, tx id)`, so the id has to be unique for the
+    /// life of the client, not merely for the life of one replica object: a
+    /// counter restarted by a snapshot restore — which keeps the client id and
+    /// the op-seq counter — collides with a stale partial group the peers still
+    /// hold, merging two unrelated groups into one bucket whose size gate then
+    /// commits a mixed set and strands the remainder for good. Op seqs are
+    /// already unique per client and already carried across a restore, so
+    /// deriving the id from one removes the collision and the state to persist.
     fn tag_atomic(&mut self, ops: Vec<Op>) -> Vec<Op> {
         let Ok(count) = u32::try_from(ops.len()) else {
             return ops;
         };
-        if count == 0 {
+        let Some(seq) = ops.iter().map(|op| op.id.seq).min() else {
             return ops;
-        }
-        let id = TxId(self.next_tx);
-        self.next_tx += 1;
+        };
+        let id = TxId(seq);
         ops.into_iter()
             .map(|mut op| {
                 op.tx = Some(Tx { id, count });
@@ -2112,7 +2114,10 @@ impl Document {
 
     /// Like [`transact`](Self::transact), but tag the emitted ops as one atomic
     /// transaction. A receiver holds the members until the whole group arrives,
-    /// then applies them together, so no peer observes a partial transaction. The
+    /// then applies them together, so no peer observes a partial transaction. A
+    /// member whose own dependencies are still unmet when the group arrives keeps
+    /// waiting on its own — grouping never changes what a set of ops merges to,
+    /// and such a member has no effect the current state could show anyway. The
     /// author applies its own edits immediately, as with any local edit. An empty
     /// transaction tags nothing.
     pub fn atomic_transact<F>(&mut self, f: F) -> Vec<Op>
@@ -2133,8 +2138,9 @@ impl Document {
             return false;
         }
         // An atomic-transaction member is always held first; its group commits
-        // together once every member is present and the group's external
-        // dependencies resolve. A lone (single-member) tx completes immediately.
+        // together once every member is present. A lone (single-member) tx
+        // completes immediately. A member whose own dependencies are unmet at
+        // that point keeps waiting on its own, so `apply` reports `false` for it.
         if op.tx.is_some() {
             self.buffered.insert(op.id);
             self.buffer.push(op.clone());

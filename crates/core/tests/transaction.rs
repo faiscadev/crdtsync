@@ -436,3 +436,50 @@ fn a_member_waiting_on_an_outside_op_does_not_hold_back_its_group() {
     assert_eq!(list_len(&a, b"k"), 0);
     assert_eq!(list_len(&b, b"k"), 0, "the held delete never landed");
 }
+
+/// A snapshot restore keeps the client id and the op-seq counter, so a group id
+/// minted after one must not collide with a group minted before it — peers may
+/// still be holding a partial group from the earlier incarnation, and two groups
+/// sharing `(client, tx id)` land in one receiver bucket.
+#[test]
+fn a_group_minted_after_a_restore_cannot_collide_with_one_minted_before() {
+    let mut a = doc(1);
+    let old = a.atomic_transact(|tx| {
+        tx.register(b"m1", Scalar::Int(1));
+        tx.register(b"m2", Scalar::Int(2));
+    });
+    let mut a =
+        Document::decode_state_as(a.client(), a.next_seq(), &a.encode_state()).expect("restore");
+    let new = a.atomic_transact(|tx| {
+        tx.register(b"n1", Scalar::Int(3));
+        tx.register(b"n2", Scalar::Int(4));
+        tx.register(b"n3", Scalar::Int(5));
+        tx.register(b"n4", Scalar::Int(6));
+    });
+    assert_ne!(
+        old[0].tx.as_ref().expect("tagged").id,
+        new[0].tx.as_ref().expect("tagged").id,
+        "a restore re-minted a group id the peers already hold"
+    );
+
+    // Only the first member of the stale group has reached this peer. Merging it
+    // into the new group's bucket would commit a mixed set — making `m1` visible
+    // without `m2` — and strand whatever the size gate left over.
+    let mut b = doc(2);
+    b.apply(&old[0]);
+    for op in &new {
+        b.apply(op);
+    }
+    assert_eq!(reg(&b, b"m1"), None, "a partial transaction stayed hidden");
+    for key in [b"n1", b"n2", b"n3", b"n4"] {
+        assert!(
+            reg(&b, key).is_some(),
+            "the new group committed whole alongside the stale partial"
+        );
+    }
+
+    // The stale group completes and lands like any other.
+    b.apply(&old[1]);
+    assert_eq!(reg(&b, b"m1"), Some(Scalar::Int(1)));
+    assert_eq!(reg(&b, b"m2"), Some(Scalar::Int(2)));
+}
