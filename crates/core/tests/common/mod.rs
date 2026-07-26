@@ -30,6 +30,45 @@ pub fn stmp(lamport: u64, client_first: u8) -> Stamp {
     }
 }
 
+fn put_stamp(out: &mut Vec<u8>, s: Stamp) {
+    out.extend_from_slice(&s.lamport.to_le_bytes());
+    out.extend_from_slice(&s.client.as_bytes());
+    match s.offset {
+        0 => out.push(0),
+        offset => {
+            out.push(1);
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+}
+
+/// Append a sequence tombstone-run record — start stamp, id count, and an anchor
+/// hanging right off `parent` (or the sequence start). Lets a test hand a
+/// decoder a run of any length, and streams an encoder would never emit.
+pub fn put_run_record(out: &mut Vec<u8>, start: Stamp, len: u32, parent: Option<Stamp>) {
+    put_stamp(out, start);
+    out.extend_from_slice(&len.to_le_bytes());
+    match parent {
+        None => out.push(0),
+        Some(p) => {
+            out.push(1);
+            put_stamp(out, p);
+        }
+    }
+    out.push(1); // Side::Right
+}
+
+/// A list state snapshot holding no live items and the given run records.
+pub fn dead_run_snapshot(id: ElementId, runs: &[(Stamp, u32, Option<Stamp>)]) -> Vec<u8> {
+    let mut out = id.as_bytes().to_vec();
+    out.extend_from_slice(&0u32.to_le_bytes()); // no live items
+    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    for (start, len, parent) in runs {
+        put_run_record(&mut out, *start, *len, *parent);
+    }
+    out
+}
+
 #[track_caller]
 pub fn assert_scalar(e: &Element, expected: Scalar) {
     match e {

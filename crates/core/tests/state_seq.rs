@@ -9,7 +9,7 @@
 use crdtsync_core::{DecodeError, Element, List, Scalar, Text};
 
 mod common;
-use common::{eid, stmp};
+use common::{dead_run_snapshot, eid, put_run_record, stmp};
 
 fn int(n: i64) -> Element {
     Element::Scalar(Scalar::Int(n))
@@ -207,36 +207,49 @@ fn an_empty_run_is_rejected() {
 }
 
 #[test]
-fn many_capped_runs_exceed_the_global_decode_budget() {
-    // The per-record cap bounds one run but not their sum: a small stream of
-    // many records, each at the per-record cap, could still claim an enormous
-    // node count. Assemble such a stream directly and confirm decode rejects it
-    // on the declared total — quickly, without materialising the nodes.
-    let empty = List::new(eid(1, 1)).encode_state();
-    let header = empty.len(); // id + live_count(0) + run_count(0)
+fn run_records_covering_ids_the_sequence_holds_are_rejected() {
+    // A record may not cover an id the sequence already carries: the two would
+    // describe one id twice, and one placement would be silently dropped. No
+    // encoder emits that, so every way records can overlap is rejected —
+    // assemble each stream directly.
+    let id = eid(1, 1);
 
-    let mut l = List::new(eid(1, 1));
-    l.insert(0, int(7), stmp(1, 1));
-    l.delete(0);
-    let one_run = l.encode_state();
-    // One record = everything past the header (stamp, length, anchor), with its
-    // length field set to the per-record cap (1 << 20).
-    let mut record = one_run[header..].to_vec();
-    let stamp_len = 24;
-    let len_off = stamp_len; // length sits right after the start stamp
-    record[len_off..len_off + 4].copy_from_slice(&(1u32 << 20).to_le_bytes());
+    // Disjoint records in descending order are fine — what follows is rejected
+    // for overlapping, not for arriving out of order.
+    let disjoint = dead_run_snapshot(id, &[(stmp(5, 1), 3, None), (stmp(1, 1), 3, None)]);
+    assert_eq!(List::decode_state(&disjoint).unwrap().len(), 0);
 
-    // Many records at the per-record cap (1<<20 each) sum far past the global
-    // budget, so decode must reject on the declared total.
-    let runs = 17u32;
-    let mut bytes = one_run[..header].to_vec();
-    bytes[header - 4..].copy_from_slice(&runs.to_le_bytes()); // run_count
-    for _ in 0..runs {
-        bytes.extend_from_slice(&record);
-    }
+    let same = dead_run_snapshot(id, &[(stmp(1, 1), 2, None), (stmp(1, 1), 2, None)]);
     assert!(
-        List::decode_state(&bytes).is_err(),
-        "the summed run lengths exceed the decode budget and must be rejected"
+        List::decode_state(&same).is_err(),
+        "an identical record repeats every id"
+    );
+
+    let inside = dead_run_snapshot(
+        id,
+        &[(stmp(1, 1), 4, None), (stmp(3, 1), 1, Some(stmp(2, 1)))],
+    );
+    assert!(
+        List::decode_state(&inside).is_err(),
+        "a record starting inside an installed run"
+    );
+
+    let straddle = dead_run_snapshot(id, &[(stmp(3, 1), 3, None), (stmp(1, 1), 4, None)]);
+    assert!(
+        List::decode_state(&straddle).is_err(),
+        "a record running into an installed run from the left"
+    );
+
+    // And a record covering an id the live section already placed.
+    let mut l = List::new(id);
+    l.insert(0, int(7), stmp(1, 1));
+    let mut over_live = l.encode_state();
+    let count_at = over_live.len() - 4; // the trailing run_count, currently 0
+    over_live[count_at..].copy_from_slice(&1u32.to_le_bytes());
+    put_run_record(&mut over_live, stmp(1, 1), 1, None);
+    assert!(
+        List::decode_state(&over_live).is_err(),
+        "a record covering a live item"
     );
 }
 
