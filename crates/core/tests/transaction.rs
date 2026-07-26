@@ -482,4 +482,19 @@ fn a_group_minted_after_a_restore_cannot_collide_with_one_minted_before() {
     b.apply(&old[1]);
     assert_eq!(reg(&b, b"m1"), Some(Scalar::Int(1)));
     assert_eq!(reg(&b, b"m2"), Some(Scalar::Int(2)));
+
+    // The plain restore keeps its own client and seq counter, so it carries the
+    // same obligation.
+    let mut plain = Document::decode_state(&a.encode_state()).expect("restore");
+    let later = plain.atomic_transact(|tx| {
+        tx.register(b"p1", Scalar::Int(7));
+        tx.register(b"p2", Scalar::Int(8));
+    });
+    for group in [&old, &new] {
+        assert_ne!(
+            group[0].tx.as_ref().expect("tagged").id,
+            later[0].tx.as_ref().expect("tagged").id,
+            "a plain restore re-minted a live group id"
+        );
+    }
 }

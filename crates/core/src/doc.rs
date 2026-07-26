@@ -185,8 +185,6 @@ pub struct Document {
     /// with no zones.
     zone_clocks: HashMap<u32, u64>,
     seq: u64,
-    /// The next atomic-transaction id to mint; namespaced by this replica's
-    /// client, so `(client, tx)` is globally unique.
     /// When recording an atomic transaction (between `begin_atomic` and
     /// `commit_atomic`), the ops emitted so far accumulate here instead of being
     /// returned per edit, so several edits commit as one group.
@@ -2056,8 +2054,14 @@ impl Document {
     }
 
     /// Begin recording an atomic transaction: until [`commit_atomic`], every edit
-    /// accumulates into one group and returns no ops of its own. Idempotent while
-    /// already recording (the open group continues). Pair with `commit_atomic`.
+    /// accumulates into one group and returns no ops of its own. Pair with
+    /// `commit_atomic`.
+    ///
+    /// Groups do not nest: a second `begin_atomic` joins the open group rather
+    /// than opening one inside it, so the *first* `commit_atomic` closes and
+    /// returns everything recorded so far and the outer one returns nothing. A
+    /// caller handed a `&mut Document` mid-group (an undo `atomic_group` body,
+    /// say) must therefore not commit a group it did not open.
     pub fn begin_atomic(&mut self) {
         if self.atomic.is_none() {
             self.atomic = Some(Vec::new());
@@ -2088,14 +2092,15 @@ impl Document {
     /// untagged.
     ///
     /// The id is the group's lowest member seq. A receiver buckets buffered
-    /// members by `(author client, tx id)`, so the id has to be unique for the
-    /// life of the client, not merely for the life of one replica object: a
-    /// counter restarted by a snapshot restore — which keeps the client id and
-    /// the op-seq counter — collides with a stale partial group the peers still
-    /// hold, merging two unrelated groups into one bucket whose size gate then
-    /// commits a mixed set and strands the remainder for good. Op seqs are
-    /// already unique per client and already carried across a restore, so
-    /// deriving the id from one removes the collision and the state to persist.
+    /// members by `(author client, tx id)`, so the id has to outlive one replica
+    /// object: a counter restarted by a snapshot restore — which keeps the client
+    /// id and the op-seq counter — collides with a stale partial group the peers
+    /// still hold, merging two unrelated groups into one bucket whose size gate
+    /// then commits a mixed set and strands the remainder for good. A seq is
+    /// minted once per op by a counter that only ever rises, restore included, so
+    /// deriving the id from one ties group identity to the same counter that
+    /// already distinguishes the group's members — no extra state to persist, and
+    /// a group id is unique exactly as far as the op ids beside it are.
     fn tag_atomic(&mut self, ops: Vec<Op>) -> Vec<Op> {
         let Ok(count) = u32::try_from(ops.len()) else {
             return ops;
@@ -2411,13 +2416,21 @@ impl Document {
                 groups.entry((op.id.client, tx.id)).or_default().push(i);
             }
         }
-        let complete = groups.into_values().find(|idxs| {
-            let count = self.buffer[idxs[0]]
-                .tx
-                .as_ref()
-                .map_or(0, |tx| tx.count as usize);
-            idxs.len() == count
-        })?;
+        // Lowest buffer position wins when more than one group is complete, so
+        // the commit order is the buffer's, not the hash map's. A live `apply`
+        // completes at most one group at a time, but a decoded snapshot can hand
+        // `drain_buffer` several at once, and a map-order pick would apply them
+        // in an order that varies between processes.
+        let complete = groups
+            .into_values()
+            .filter(|idxs| {
+                let count = self.buffer[idxs[0]]
+                    .tx
+                    .as_ref()
+                    .map_or(0, |tx| tx.count as usize);
+                idxs.len() == count
+            })
+            .min_by_key(|idxs| idxs[0])?;
         // Remove in descending index order so earlier indices stay valid.
         let mut idxs = complete;
         idxs.sort_unstable_by(|a, b| b.cmp(a));
