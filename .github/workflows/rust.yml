@@ -19,16 +19,32 @@ jobs:
     runs-on: ubuntu-latest
     # Miri is the memory gate: UB + leaks, deterministic and cross-platform.
     # One shard per crate so they run in parallel — wall-clock is the slowest
-    # single job, not the sum. The server crate is the long pole, so it fans
-    # further into three nextest partitions that split its tests by hash and
-    # run in parallel, keeping the slowest job well under core's. Within each
-    # shard: a warm build cache skips the cold Miri codegen + sysroot rebuild,
-    # and nextest fans the tests across cores instead of one serial process.
+    # single job, not the sum. The two long poles fan further into nextest
+    # partitions that split their tests by hash and run in parallel: core into
+    # eight, server into three, keeping the slowest job under the CI budget.
+    # Within each shard: a warm build cache skips the cold Miri codegen +
+    # sysroot rebuild, and nextest fans the tests across cores instead of one
+    # serial process.
     strategy:
       fail-fast: false
       matrix:
         include:
           - crate: crdtsync-core
+            partition: 1/8
+          - crate: crdtsync-core
+            partition: 2/8
+          - crate: crdtsync-core
+            partition: 3/8
+          - crate: crdtsync-core
+            partition: 4/8
+          - crate: crdtsync-core
+            partition: 5/8
+          - crate: crdtsync-core
+            partition: 6/8
+          - crate: crdtsync-core
+            partition: 7/8
+          - crate: crdtsync-core
+            partition: 8/8
           - crate: crdtsync-ffi
           - crate: crdtsync-server
             partition: 1/3
