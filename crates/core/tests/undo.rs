@@ -2064,7 +2064,10 @@ fn a_reorder_redoes_to_the_same_order() {
 #[test]
 fn undo_and_redo_round_trip_to_the_states_they_started_from() {
     const KEYS: &[&[u8]] = &[b"a", b"b", b"c"];
-    for seed in 0..300u64 {
+    // Miri interprets every op, so keep its sweep short; a native run covers a
+    // far wider band of seeds.
+    let seeds = if cfg!(miri) { 4 } else { 300 };
+    for seed in 0..seeds {
         let mut rng = Rng(seed ^ 0x9E37_79B9_7F4A_7C15);
         let mut d = doc(1);
         let empty = deep_observe(&d);
@@ -2309,7 +2312,10 @@ fn render_children(list: &std::rc::Rc<std::cell::RefCell<crdtsync_core::List>>) 
 #[test]
 fn undo_and_redo_converge_under_concurrent_editing() {
     const KEYS: &[&[u8]] = &[b"a", b"b", b"c"];
-    for seed in 0..300u64 {
+    // Two replicas plus shuffled delivery makes each seed heavier than the
+    // round trip's, so Miri takes fewer still.
+    let seeds = if cfg!(miri) { 3 } else { 300 };
+    for seed in 0..seeds {
         let mut rng = Rng(seed ^ 0x9E37_79B9_7F4A_7C15);
         let mut docs = [doc(1), doc(2)];
         // Ops each replica has emitted but the other has not yet seen, so a
