@@ -498,3 +498,71 @@ fn a_group_minted_after_a_restore_cannot_collide_with_one_minted_before() {
         );
     }
 }
+
+/// Replace a snapshot's trailing framed op buffer with `ops`. `encode_state`
+/// ends with a `u32` length and that many framed bytes, so a snapshot taken with
+/// an empty buffer has a known-size tail to swap out.
+fn with_buffer(empty_snapshot: &[u8], ops: &[Op]) -> Vec<u8> {
+    let tail = 4 + crdtsync_core::encode_ops(&[]).len();
+    let mut out = empty_snapshot[..empty_snapshot.len() - tail].to_vec();
+    let framed = crdtsync_core::encode_ops(ops);
+    out.extend_from_slice(&(framed.len() as u32).to_le_bytes());
+    out.extend_from_slice(&framed);
+    out
+}
+
+/// A decode drains the buffer it just read, and a snapshot that arrives from a
+/// peer can hold more than one complete transaction at once. Which one commits
+/// first decides whether the other's members still resolve, so the choice has to
+/// come from the buffer, not from hash order — two replicas reading identical
+/// bytes must reach identical state.
+#[test]
+fn a_snapshot_holding_two_complete_transactions_decodes_the_same_way_every_time() {
+    // One group installs a nested map and writes a slot in it; the other takes
+    // that same key with a register that outranks the map's create.
+    let mut author = doc(1);
+    let nested_write = author.atomic_transact(|tx| {
+        tx.map(b"k").register(b"x", Scalar::Int(9));
+    });
+    let mut rival = doc(2);
+    let takeover = rival.atomic_transact(|tx| {
+        tx.register(b"k", Scalar::Int(1));
+        tx.register(b"z", Scalar::Int(2));
+    });
+    assert_eq!(nested_write.len(), 2, "create plus write");
+    assert_eq!(takeover.len(), 2, "two registers");
+
+    // Later, the map is re-created above the register and takes the key back —
+    // which is what makes the nested write's fate observable.
+    for op in &takeover {
+        author.apply(op);
+    }
+    let revival = author.transact(|tx| {
+        tx.map(b"k").register(b"y", Scalar::Int(4));
+    });
+
+    let mut buffered: Vec<Op> = nested_write.clone();
+    buffered.extend(takeover.iter().cloned());
+    let snapshot = with_buffer(&doc(3).encode_state(), &buffered);
+
+    let read_back = |bytes: &[u8]| -> (usize, Option<Scalar>) {
+        let mut d = Document::decode_state(bytes).expect("decode");
+        let seen = d.seen().count();
+        for op in &revival {
+            d.apply(op);
+        }
+        (seen, nested(&d, b"k", b"x"))
+    };
+
+    let first = read_back(&snapshot);
+    for _ in 0..200 {
+        assert_eq!(
+            read_back(&snapshot),
+            first,
+            "the same snapshot bytes decoded to different state"
+        );
+    }
+    // The buffer's order is the tie-break, so the group sitting first commits
+    // first and its write survives the takeover.
+    assert_eq!(first, (4, Some(Scalar::Int(9))));
+}

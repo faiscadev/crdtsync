@@ -620,7 +620,7 @@ fn atomic_groups_do_not_change_what_ops_merge_to() {
             // of the multi-member commit path this test exists for.
             assert!(
                 pool.len() > 10,
-                "seed {seed}: the generator produced nothing"
+                "seed {seed}: the generator produced too little to exercise a group"
             );
             let tagged = pool.iter().filter(|op| op.tx.is_some()).count();
             if atomic {

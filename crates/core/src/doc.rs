@@ -2092,16 +2092,16 @@ impl Document {
     /// untagged.
     ///
     /// The id is the group's lowest member seq. A receiver buckets buffered
-    /// members by `(author client, tx id)`, so the id has to outlive one replica
-    /// object: a counter restarted by a snapshot restore — which keeps the client
-    /// id and the op-seq counter — collides with a stale partial group the peers
-    /// still hold, merging two unrelated groups into one bucket whose size gate
-    /// then commits a mixed set and strands the remainder for good. A seq is
-    /// minted once per op by a counter that only ever rises, restore included, so
-    /// deriving the id from one ties group identity to the same counter that
-    /// already distinguishes the group's members — no extra state to persist, and
-    /// a group id is unique exactly as far as the op ids beside it are.
-    fn tag_atomic(&mut self, ops: Vec<Op>) -> Vec<Op> {
+    /// members by `(author client, tx id)`, so a group id has to be as durable as
+    /// the op ids it sits beside: peers hold partial groups across a disconnect,
+    /// and a restore keeps the client id, so an id minted from a counter of its
+    /// own would collide with a group still in flight — merging two unrelated
+    /// groups into one bucket, whose size gate then commits a mixed set and
+    /// strands the remainder for good. A seq is minted once per op and carried,
+    /// not reset, by the restore paths that preserve identity, so deriving the
+    /// group id from one makes it exactly as unique as the op ids beside it, with
+    /// no separate state to persist.
+    fn tag_atomic(&self, ops: Vec<Op>) -> Vec<Op> {
         let Ok(count) = u32::try_from(ops.len()) else {
             return ops;
         };
@@ -2122,7 +2122,8 @@ impl Document {
     /// then applies them together, so no peer observes a partial transaction. A
     /// member whose own dependencies are still unmet when the group arrives keeps
     /// waiting on its own — grouping never changes what a set of ops merges to,
-    /// and such a member has no effect the current state could show anyway. The
+    /// and such a member almost never has an effect the current state could show
+    /// (see ARCHITECTURE §Transactions for the two that can). The
     /// author applies its own edits immediately, as with any local edit. An empty
     /// transaction tags nothing.
     pub fn atomic_transact<F>(&mut self, f: F) -> Vec<Op>
@@ -2316,9 +2317,11 @@ impl Document {
                     // silently lose its effect while a replica that saw the group
                     // against an installed container kept it. A member that is not
                     // ready is held instead, untagged, and drains with the ordinary
-                    // buffer once its container is installed. An unresolvable target
-                    // is exactly what makes the member unobservable, so holding it
-                    // leaves the group's all-or-nothing view intact.
+                    // buffer once its container is installed. What blocks a member
+                    // is almost always what makes it unobservable — an unresolvable
+                    // target renders nothing — so holding it leaves the group's
+                    // all-or-nothing view intact; ARCHITECTURE §Transactions names
+                    // the two cases where it does not.
                     if self.ready(&op) {
                         self.buffered.remove(&op.id);
                         self.apply_now(&op);
@@ -2404,11 +2407,10 @@ impl Document {
     /// whole group has arrived — or `None` if none is complete. Completeness is
     /// the only group-level gate: a member's own dependencies are the readiness
     /// gate's business at the moment it applies, so a member waiting on something
-    /// outside the group holds only itself, never its group-mates. Gating the
-    /// whole group on every member resolving instead made commit a window a group
-    /// could miss — a transiently displaced container blocked members that were
-    /// perfectly applicable, and whether the window was hit depended on arrival
-    /// order, so the same ops folded to different states.
+    /// outside the group holds only itself, never its group-mates. Readiness is
+    /// not monotone — a container is installed, displaced, and re-installed as
+    /// ops arrive — so a group-wide resolution gate would make commit a window
+    /// arrival order decides, and the same ops would fold to different states.
     fn take_complete_tx(&mut self) -> Option<Vec<Op>> {
         let mut groups: HashMap<(ClientId, TxId), Vec<usize>> = HashMap::new();
         for (i, op) in self.buffer.iter().enumerate() {
@@ -2417,10 +2419,12 @@ impl Document {
             }
         }
         // Lowest buffer position wins when more than one group is complete, so
-        // the commit order is the buffer's, not the hash map's. A live `apply`
-        // completes at most one group at a time, but a decoded snapshot can hand
-        // `drain_buffer` several at once, and a map-order pick would apply them
-        // in an order that varies between processes.
+        // the commit order is the buffer's, not the hash map's. Draining to a
+        // fixpoint after every fold keeps a replica's own buffer down to at most
+        // one complete group, so this decides nothing on the live path — it is
+        // the decode of a *peer-supplied* snapshot that can present several at
+        // once, and two replicas reading identical bytes have to reach identical
+        // state whatever those bytes hold.
         let complete = groups
             .into_values()
             .filter(|idxs| {
