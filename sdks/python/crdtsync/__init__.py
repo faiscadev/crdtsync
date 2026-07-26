@@ -11,15 +11,21 @@ The native library is loaded at import time from ``target/{release,debug}`` (or
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import enum
 import json
+import logging
 import os
 import platform
+import random
 import struct
+import threading
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable, List, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+
+from . import _websocket
 
 __all__ = [
     "BlobRef",
@@ -37,6 +43,7 @@ __all__ = [
     "Effect",
     "ErrorCode",
     "Key",
+    "LocalProvider",
     "Provider",
     "Redirect",
     "Rejected",
@@ -47,11 +54,14 @@ __all__ = [
     "Undo",
     "UpdateEvent",
     "actor_key",
+    "connect",
     "diff",
     "diff_decode",
     "encode_path",
     "upload_blob",
 ]
+
+_LOGGER = logging.getLogger("crdtsync")
 
 Path = List[bytes]
 
@@ -366,6 +376,39 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         buf,
     )
     sig(lib.crdtsync_client_delete, [doc, ch, cbytes, size], buf)
+    # per-channel sequence, scalar, and map reads/edits (client)
+    sig(lib.crdtsync_client_set_scalar, [doc, ch, cbytes, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_get_scalar, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_map_keys, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_list_insert, [doc, ch, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_list_delete, [doc, ch, cbytes, size, size], buf)
+    sig(lib.crdtsync_client_list_len, [doc, ch, cbytes, size, c.POINTER(size)], c.c_int32)
+    sig(lib.crdtsync_client_list_get, [doc, ch, cbytes, size, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_text_insert, [doc, ch, cbytes, size, size, cbytes, size], buf)
+    sig(lib.crdtsync_client_text_delete, [doc, ch, cbytes, size, size, size], buf)
+    sig(lib.crdtsync_client_text_len, [doc, ch, cbytes, size, c.POINTER(size)], c.c_int32)
+    sig(lib.crdtsync_client_text_get, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    # per-channel state, blob, mark, and anchor reads (client)
+    sig(lib.crdtsync_client_channel_state, [doc, ch, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_get_counter, [doc, ch, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
+    sig(lib.crdtsync_client_get_blob, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_marks_at, [doc, ch, cbytes, size, size, c.POINTER(buf)], c.c_int32)
+    sig(
+        lib.crdtsync_client_relative_position,
+        [doc, ch, cbytes, size, size, c.c_uint32, c.POINTER(buf)],
+        c.c_int32,
+    )
+    sig(
+        lib.crdtsync_client_resolve_position,
+        [doc, ch, cbytes, size, cbytes, size, c.POINTER(size)],
+        c.c_int32,
+    )
+    sig(lib.crdtsync_client_xml_tag, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(
+        lib.crdtsync_client_xml_children_len,
+        [doc, ch, cbytes, size, c.POINTER(size)],
+        c.c_int32,
+    )
     # xml navigation (client)
     sig(lib.crdtsync_client_xml_element, [doc, ch, cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_client_xml_fragment, [doc, ch, cbytes, size], buf)
@@ -1584,6 +1627,114 @@ class Client:
         p = encode_path(path)
         return _take_buf(_LIB.crdtsync_client_delete(self._handle, channel, p, len(p)))
 
+    def set_scalar(self, channel: int, path: Path, scalar: bytes) -> bytes:
+        """Install-or-set a Register holding any encoded ``Scalar`` at a path in
+        ``channel``'s room, so a leaf keeps its type across the wire. Returns the
+        Ops frame to send."""
+        _u32("channel", channel)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_set_scalar(
+                self._handle, channel, p, len(p), scalar, len(scalar)
+            )
+        )
+
+    def get_scalar(self, channel: int, path: Path) -> Optional[bytes]:
+        """The encoded ``Scalar`` bytes of the Register at a path in ``channel``'s
+        room, or ``None`` when the slot holds no register. The inverse of
+        :meth:`set_scalar`."""
+        return self._read_buf(_LIB.crdtsync_client_get_scalar, channel, path)
+
+    def map_keys(self, channel: int, path: Path) -> Optional[List[bytes]]:
+        """The live slot keys of the Map at a path in ``channel``'s room, or
+        ``None`` when the path is not a live Map (an empty path names the room's
+        root map). An empty map reads back as an empty list, distinct from
+        ``None``."""
+        raw = self._read_buf(_LIB.crdtsync_client_map_keys, channel, path)
+        return None if raw is None else _decode_key_list(raw)
+
+    # --- per-channel list ---
+
+    def list_insert(self, channel: int, path: Path, index: int, value: bytes) -> bytes:
+        """Insert a bytes item at live ``index`` into the List at a path in
+        ``channel``'s room; an ``index`` past the live end appends. Returns the Ops
+        frame to send."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_list_insert(
+                self._handle, channel, p, len(p), index, value, len(value)
+            )
+        )
+
+    def list_delete(self, channel: int, path: Path, index: int) -> bytes:
+        """Tombstone the live item at ``index`` in the List at a path in
+        ``channel``'s room. Returns the Ops frame to send."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_list_delete(self._handle, channel, p, len(p), index)
+        )
+
+    def list_len(self, channel: int, path: Path) -> Optional[int]:
+        """The live length of the List at a path in ``channel``'s room, or ``None``
+        when the path is not a live List."""
+        return self._read_usize(_LIB.crdtsync_client_list_len, channel, path)
+
+    def list_get(self, channel: int, path: Path, index: int) -> Optional[bytes]:
+        """The bytes item at live ``index`` in the List at a path in ``channel``'s
+        room, or ``None`` when it names no live bytes item."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(path)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_list_get(
+            self._handle, channel, p, len(p), index, ctypes.byref(out)
+        )
+        return _take_buf(out) if rc == 1 else None
+
+    # --- per-channel text ---
+
+    def text_insert(self, channel: int, path: Path, index: int, text: str) -> bytes:
+        """Insert ``text`` at codepoint ``index`` into the Text at a path in
+        ``channel``'s room; an ``index`` past the live end appends. Returns the Ops
+        frame to send."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(path)
+        s = text.encode("utf-8")
+        return _take_buf(
+            _LIB.crdtsync_client_text_insert(
+                self._handle, channel, p, len(p), index, s, len(s)
+            )
+        )
+
+    def text_delete(self, channel: int, path: Path, index: int, count: int) -> bytes:
+        """Tombstone ``count`` codepoints from codepoint ``index`` in the Text at a
+        path in ``channel``'s room. Returns the Ops frame to send."""
+        _u32("channel", channel)
+        _usize("index", index)
+        _usize("count", count)
+        p = encode_path(path)
+        return _take_buf(
+            _LIB.crdtsync_client_text_delete(
+                self._handle, channel, p, len(p), index, count
+            )
+        )
+
+    def text_len(self, channel: int, path: Path) -> Optional[int]:
+        """The codepoint length of the Text at a path in ``channel``'s room, or
+        ``None`` when the path is not a live Text."""
+        return self._read_usize(_LIB.crdtsync_client_text_len, channel, path)
+
+    def text_get(self, channel: int, path: Path) -> Optional[str]:
+        """The Text at a path in ``channel``'s room, or ``None`` when the path is
+        not a live Text."""
+        raw = self._read_buf(_LIB.crdtsync_client_text_get, channel, path)
+        return None if raw is None else raw.decode("utf-8")
+
     # --- per-channel blobs ---
 
     def set_blob(self, channel: int, path: Path, mime: str, bytes_: bytes) -> bytes:
@@ -1615,6 +1766,23 @@ class Client:
                 self._handle, channel, p, len(p), blob_id, m, len(m), size
             )
         )
+
+    def get_blob(self, channel: int, path: Path) -> Optional[BlobRef]:
+        """Read the :class:`BlobRef` at a path in ``channel``'s room, or ``None``
+        when the slot holds no blob ref."""
+        raw = self._read_buf(_LIB.crdtsync_client_get_blob, channel, path)
+        return None if raw is None else _decode_blob_ref(raw)
+
+    # --- per-channel state ---
+
+    def channel_state(self, channel: int) -> Optional[bytes]:
+        """Serialize ``channel``'s room replica to a canonical snapshot, or
+        ``None`` when the channel isn't held. The before/after seam the ergonomic
+        layer diffs to derive change events."""
+        _u32("channel", channel)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_channel_state(self._handle, channel, ctypes.byref(out))
+        return _take_buf(out) if rc == 1 else None
 
     # --- per-channel xml ---
 
@@ -1693,6 +1861,16 @@ class Client:
             )
         )
 
+    def xml_tag(self, channel: int, path: Path) -> Optional[bytes]:
+        """The tag of the ``XmlElement`` at a path in ``channel``'s room, or
+        ``None`` for a fragment or a path that is not a live xml node."""
+        return self._read_buf(_LIB.crdtsync_client_xml_tag, channel, path)
+
+    def xml_children_len(self, channel: int, elem_path: Path) -> Optional[int]:
+        """The live child count of the element or fragment at ``elem_path`` in
+        ``channel``'s room, or ``None`` when the path is not a live xml node."""
+        return self._read_usize(_LIB.crdtsync_client_xml_children_len, channel, elem_path)
+
     # --- per-channel marks ---
 
     def mark(
@@ -1710,13 +1888,36 @@ class Client:
         in ``channel``'s room, routed through the outbox. Returns
         ``(mark_id, frame)``: the mark's 16-byte id and the Ops frame to send.
         ``mark_id`` is ``None`` and ``frame`` empty when the author was inert."""
+        return self._mark_encoded(
+            channel,
+            seq_path,
+            start_index,
+            start_side,
+            end_index,
+            end_side,
+            name,
+            _encode_scalar(value),
+        )
+
+    def _mark_encoded(
+        self,
+        channel: int,
+        seq_path: Path,
+        start_index: int,
+        start_side: Side,
+        end_index: int,
+        end_side: Side,
+        name: bytes,
+        scalar: bytes,
+    ) -> Tuple[Optional[bytes], bytes]:
+        """Author a mark whose payload is already encoded ``Scalar`` bytes — the
+        seam the ergonomic handle layer marshals a native value through."""
         _u32("channel", channel)
         _usize("start_index", start_index)
         _usize("end_index", end_index)
         _u32("start_side", int(start_side))
         _u32("end_side", int(end_side))
         p = encode_path(seq_path)
-        v = _encode_scalar(value)
         out = _CrdtBuf()
         frame = _take_buf(
             _LIB.crdtsync_client_mark(
@@ -1730,8 +1931,8 @@ class Client:
                 int(end_side),
                 name,
                 len(name),
-                v,
-                len(v),
+                scalar,
+                len(scalar),
                 ctypes.byref(out),
             )
         )
@@ -1741,11 +1942,14 @@ class Client:
     def mark_set_value(self, channel: int, mark_id: bytes, value) -> bytes:
         """Change the payload of the mark handle ``mark_id`` to ``value`` in
         ``channel``'s room; Ops frame (empty if inert)."""
+        return self._mark_set_value_encoded(channel, mark_id, _encode_scalar(value))
+
+    def _mark_set_value_encoded(self, channel: int, mark_id: bytes, scalar: bytes) -> bytes:
+        """Change a mark's payload from already-encoded ``Scalar`` bytes."""
         _u32("channel", channel)
-        v = _encode_scalar(value)
         return _take_buf(
             _LIB.crdtsync_client_mark_set_value(
-                self._handle, channel, mark_id, len(mark_id), v, len(v)
+                self._handle, channel, mark_id, len(mark_id), scalar, len(scalar)
             )
         )
 
@@ -1756,6 +1960,50 @@ class Client:
         return _take_buf(
             _LIB.crdtsync_client_mark_delete(self._handle, channel, mark_id, len(mark_id))
         )
+
+    def marks_at(self, channel: int, seq_path: Path, index: int) -> list:
+        """The marks active on character ``index`` of the sequence at ``seq_path``
+        in ``channel``'s room, each a dict with ``name``, ``flavor``
+        (``boolean``/``value``/``object``), and the flavor's field. Empty for a
+        non-sequence path or an uncovered index."""
+        _u32("channel", channel)
+        _usize("index", index)
+        p = encode_path(seq_path)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_marks_at(
+            self._handle, channel, p, len(p), index, ctypes.byref(out)
+        )
+        return _decode_marks(_take_buf(out)) if rc == 1 else []
+
+    # --- per-channel relative positions (anchors) ---
+
+    def relative_position(
+        self, channel: int, path: Path, index: int, side: Side = Side.LEFT
+    ) -> Optional[bytes]:
+        """Capture a stable position in the List or Text at a path in
+        ``channel``'s room — encoded bytes to resolve later with
+        :meth:`resolve_position`. ``None`` for a bad or non-sequence path, an
+        unknown ``side``, or an unheld channel."""
+        _u32("channel", channel)
+        _usize("index", index)
+        _u32("side", int(side))
+        p = encode_path(path)
+        out = _CrdtBuf()
+        rc = _LIB.crdtsync_client_relative_position(
+            self._handle, channel, p, len(p), index, int(side), ctypes.byref(out)
+        )
+        return _take_buf(out) if rc == 1 else None
+
+    def resolve_position(self, channel: int, path: Path, pos: bytes) -> Optional[int]:
+        """Resolve a captured position back to a live index in the List or Text at
+        a path in ``channel``'s room, or ``None`` when it no longer resolves."""
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = ctypes.c_size_t()
+        rc = _LIB.crdtsync_client_resolve_position(
+            self._handle, channel, p, len(p), pos, len(pos), ctypes.byref(out)
+        )
+        return out.value if rc == 1 else None
 
     # --- per-channel acl authoring ---
 
@@ -1818,18 +2066,16 @@ class Client:
     # --- per-channel reads ---
 
     def get_int(self, channel: int, path: Path) -> Optional[int]:
-        _u32("channel", channel)
-        p = encode_path(path)
-        out = ctypes.c_int64()
-        rc = _LIB.crdtsync_client_get_int(self._handle, channel, p, len(p), ctypes.byref(out))
-        return out.value if rc == 1 else None
+        return self._read_i64(_LIB.crdtsync_client_get_int, channel, path)
+
+    def get_counter(self, channel: int, path: Path) -> Optional[int]:
+        """The value of the Counter at a path in ``channel``'s room — the
+        read-back for :meth:`inc`/:meth:`dec` — or ``None`` when the slot holds
+        no counter."""
+        return self._read_i64(_LIB.crdtsync_client_get_counter, channel, path)
 
     def get_bytes(self, channel: int, path: Path) -> Optional[bytes]:
-        _u32("channel", channel)
-        p = encode_path(path)
-        out = _CrdtBuf()
-        rc = _LIB.crdtsync_client_get_bytes(self._handle, channel, p, len(p), ctypes.byref(out))
-        return _take_buf(out) if rc == 1 else None
+        return self._read_buf(_LIB.crdtsync_client_get_bytes, channel, path)
 
     # --- awareness ---
 
@@ -2051,6 +2297,29 @@ class Client:
         if rc != 1:
             return None
         return created.value == 1
+
+    # --- helpers ---
+
+    def _read_i64(self, fn, channel: int, path: Path) -> Optional[int]:
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = ctypes.c_int64()
+        rc = fn(self._handle, channel, p, len(p), ctypes.byref(out))
+        return out.value if rc == 1 else None
+
+    def _read_usize(self, fn, channel: int, path: Path) -> Optional[int]:
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = ctypes.c_size_t()
+        rc = fn(self._handle, channel, p, len(p), ctypes.byref(out))
+        return out.value if rc == 1 else None
+
+    def _read_buf(self, fn, channel: int, path: Path) -> Optional[bytes]:
+        _u32("channel", channel)
+        p = encode_path(path)
+        out = _CrdtBuf()
+        rc = fn(self._handle, channel, p, len(p), ctypes.byref(out))
+        return _take_buf(out) if rc == 1 else None
 
 
 # --- ergonomic handle-graph layer ---------------------------------------------
@@ -2339,21 +2608,25 @@ class CrdtMap:
     def get(self, key: Key):
         """Read ``key``: a native scalar for a leaf, a :class:`BlobRef` for a blob, a
         nested handle for a container slot, or ``None`` when the slot is empty."""
+        # The slot is probed several ways; one read of the replica keeps the
+        # probes talking about the same state, so a remote fold between them
+        # cannot make a live slot read as empty.
+        return self._doc._read(lambda b: self._read_slot(b, key))
+
+    def _read_slot(self, backend, key: Key):
         slot = self._slot(key)
-        backend = self._doc._backend
         blob = backend.get_blob(slot)
         if blob is not None:
             return blob
         scalar = backend.get_scalar(slot)
         if scalar is not None:
             return _decode_value(scalar)
-        kind = self._container_kind(slot)
+        kind = self._container_kind(backend, slot)
         if kind is None:
             return None
         return _HANDLE_CTORS[kind](self._doc, self._child(key))
 
-    def _container_kind(self, slot: Path) -> Optional[str]:
-        backend = self._doc._backend
+    def _container_kind(self, backend, slot: Path) -> Optional[str]:
         if backend.map_keys(slot) is not None:
             return "map"
         if backend.list_len(slot) is not None:
@@ -2371,28 +2644,34 @@ class CrdtMap:
         return self
 
     def __contains__(self, key: Key) -> bool:
+        return self._doc._read(lambda b: self._holds(b, key))
+
+    def _holds(self, backend, key: Key) -> bool:
         slot = self._slot(key)
-        backend = self._doc._backend
         return (
             backend.get_scalar(slot) is not None
             or backend.get_blob(slot) is not None
-            or self._container_kind(slot) is not None
+            or self._container_kind(backend, slot) is not None
         )
 
-    def _raw_keys(self) -> List[bytes]:
-        return self._doc._backend.map_keys(list(self._path)) or []
+    def _raw_keys(self, backend) -> List[bytes]:
+        return backend.map_keys(list(self._path)) or []
 
     def keys(self) -> List[str]:
         """The live slot keys, rendered best-effort as utf-8 strings."""
-        return [_key_string(k) for k in self._raw_keys()]
+        return [_key_string(k) for k in self._doc._read(self._raw_keys)]
 
     def items(self) -> List[Tuple[str, object]]:
         """The live ``(key, value)`` pairs. Values are read by the raw key bytes, so
         a non-utf-8 (binary) key's value is never lost."""
-        return [(_key_string(k), self.get(k)) for k in self._raw_keys()]
+        return self._doc._read(
+            lambda b: [
+                (_key_string(k), self._read_slot(b, k)) for k in self._raw_keys(b)
+            ]
+        )
 
     def __len__(self) -> int:
-        return len(self._raw_keys())
+        return len(self._doc._read(self._raw_keys))
 
     def __iter__(self):
         return iter(self.keys())
@@ -2461,40 +2740,55 @@ class CrdtList:
 
     def insert(self, index: int, value) -> "CrdtList":
         """Insert a scalar item at a live ``index`` (clamped into range)."""
-        n = len(self)
-        if index < 0:
-            index = max(0, n + index)
-        index = min(index, n)
         item = _encode_value(value)
-        self._doc._mutate(lambda b: b.list_insert(self._self, index, item))
+        # The live length is resolved inside the edit, not before it: a remote
+        # fold between reading the length and authoring would place the item
+        # against a list that has since shifted.
+        self._doc._mutate(lambda b: b.list_insert(self._self, self._clamped(b, index), item))
         return self
 
     def append(self, value) -> "CrdtList":
         """Append a scalar item."""
-        return self.insert(len(self), value)
+        item = _encode_value(value)
+        self._doc._mutate(lambda b: b.list_insert(self._self, self._length(b), item))
+        return self
 
     def delete(self, index: int) -> "CrdtList":
         """Tombstone the live item at ``index``."""
-        idx = self._checked(index)
-        self._doc._mutate(lambda b: b.list_delete(self._self, idx))
+        self._doc._mutate(lambda b: b.list_delete(self._self, self._checked(b, index)))
         return self
 
     def __getitem__(self, index: int):
-        idx = self._checked(index)
-        item = self._doc._backend.list_get(self._self, idx)
+        # One read of the replica: resolving the index and fetching the item in
+        # separate reads lets a remote fold shift the list between them.
+        item = self._doc._read(lambda b: b.list_get(self._self, self._checked(b, index)))
         if item is None:
             raise IndexError("list index out of range")
         return _decode_value(item)
 
     def __len__(self) -> int:
-        return self._doc._backend.list_len(self._self) or 0
+        return self._doc._read(self._length)
 
     def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
+        return iter(self._doc._read(self._items))
 
-    def _checked(self, index: int) -> int:
-        n = len(self)
+    def _items(self, backend) -> List[object]:
+        return [
+            _decode_value(backend.list_get(self._self, i))
+            for i in range(self._length(backend))
+        ]
+
+    def _length(self, backend) -> int:
+        return backend.list_len(self._self) or 0
+
+    def _clamped(self, backend, index: int) -> int:
+        n = self._length(backend)
+        if index < 0:
+            index = max(0, n + index)
+        return min(index, n)
+
+    def _checked(self, backend, index: int) -> int:
+        n = self._length(backend)
         if index < 0:
             index += n
         if index < 0 or index >= n:
@@ -2673,16 +2967,46 @@ _HANDLE_CTORS = {"map": CrdtMap, "list": CrdtList, "text": CrdtText, "xml": Crdt
 
 
 class Doc:
-    """A local CRDT replica with a single root map, edited through live typed
-    handles. A ``Doc`` is a pure local replica: two docs that exchange each other's
-    update ops (forwarded via :meth:`on_update`) converge. The low-level path API
+    """A CRDT replica with a single root map, edited through live typed handles.
+
+    Unbound, a ``Doc`` is a pure local replica: two docs that exchange each
+    other's update ops (forwarded via :meth:`on_update`) converge. Bound to a
+    networked :class:`Provider` it is backed by that connection's room replica
+    instead, and every edit frames itself for the wire. The low-level path API
     stays available on the wrapped :class:`Document` for power users."""
 
     def __init__(self, client_id: Optional[bytes] = None):
-        self._backend = Document(client_id if client_id is not None else os.urandom(16))
-        self._init_listeners()
+        self._init(Document(client_id if client_id is not None else os.urandom(16)))
 
-    def _init_listeners(self) -> None:
+    @classmethod
+    def _networked(cls, backend, wire: Callable[[bytes], None], gate, lock) -> "Doc":
+        """A doc over a provider-supplied networked backend: every edit's frame
+        goes to ``wire`` for the socket instead of staying purely local, ``gate``
+        keeps concurrent authors in order, and ``lock`` serializes the replica
+        against the provider's reader thread."""
+        obj = cls.__new__(cls)
+        obj._init(backend, wire, gate, lock)
+        return obj
+
+    def _init(
+        self,
+        backend,
+        wire: Optional[Callable[[bytes], None]] = None,
+        gate=None,
+        lock=None,
+    ) -> None:
+        self._backend = backend
+        self._wire = wire
+        # A local doc is only ever touched by its caller. A networked one shares
+        # its replica with the provider's reader thread, so an edit and the state
+        # bracket around it are one indivisible step under `lock` — and an author
+        # holds `gate` from before it stamps its ops until after it has written
+        # them, so two threads reach the socket in the order the replica gave
+        # them their sequences. An acknowledgement is a watermark: a later op
+        # acked ahead of an earlier one would drop the earlier from the outbox
+        # before it was ever sent.
+        self._gate = contextlib.nullcontext() if gate is None else gate
+        self._lock = contextlib.nullcontext() if lock is None else lock
         self._update_listeners: List[Callable[[UpdateEvent], None]] = []
         self._repair_listeners: List[Callable[[RepairEvent], None]] = []
         self._observers: List[Tuple[bytes, Callable[[ChangeEvent], None]]] = []
@@ -2708,20 +3032,39 @@ class Doc:
         """Run ``fn``'s edits as one atomic group — they apply together on every
         replica, ride the wire as a single batch, and fire one update. Nested calls
         flatten into the outermost transaction."""
-        if self._transacting:
-            fn()
-            return
-        before = self._backend.encode_state() if self._observing() else None
-        self._transacting = True
-        self._backend.begin_atomic()
-        try:
-            fn()
-        finally:
-            self._transacting = False
-            ops = self._backend.commit_atomic()
-            if ops:
-                self._dispatch("local", ops, before)
-                self._emit_repairs()
+        # The atomic group is state of the shared replica, not of the caller, so
+        # the whole transaction is one indivisible step: another thread's edit
+        # must queue behind it rather than be swept into the group, and its own
+        # transaction must not degrade into loose edits.
+        with self._gate:
+            outbound, changes, repairs = b"", [], []
+            try:
+                with self._lock:
+                    if self._transacting:
+                        fn()
+                        return
+                    before = self._backend.encode_state() if self._observing() else None
+                    # Only once the group is open: a begin that failed leaves
+                    # nothing to commit, and a flag set anyway would make every
+                    # later edit accumulate into a group that does not exist.
+                    self._backend.begin_atomic()
+                    self._transacting = True
+                    try:
+                        fn()
+                    finally:
+                        self._transacting = False
+                        outbound = self._backend.commit_atomic()
+                        if outbound:
+                            changes = self._collect(before)
+                            repairs = self._take_repairs()
+            finally:
+                # Whatever the body did before it raised is committed to this
+                # replica, so it has to reach the room too — dropping it would
+                # leave this replica ahead of every peer.
+                if outbound:
+                    self._send(outbound)
+                    self._publish("local", outbound, changes)
+                    self._publish_repairs(repairs)
 
     def on_update(self, callback: Callable[[UpdateEvent], None]) -> Callable[[], None]:
         """Subscribe to every applied change to the document; returns a function
@@ -2757,7 +3100,8 @@ class Doc:
         return self._backend.set_schema(schema)
 
     def apply_update(self, ops: bytes) -> int:
-        """Fold a peer's update ops into this replica; returns the count applied."""
+        """Fold a peer's update ops into this replica; returns the count applied.
+        Local docs only — a networked doc syncs through its provider."""
         before = self._backend.encode_state() if self._observing() else None
         applied = self._backend.apply(ops)
         if applied > 0:
@@ -2773,8 +3117,7 @@ class Doc:
     def decode_state(cls, state: bytes) -> "Doc":
         """Open a ``Doc`` from a snapshot produced by :meth:`encode_state`."""
         obj = cls.__new__(cls)
-        obj._backend = Document.decode_state(state)
-        obj._init_listeners()
+        obj._init(Document.decode_state(state))
         return obj
 
     def close(self) -> None:
@@ -2809,21 +3152,70 @@ class Doc:
     def _observing(self) -> bool:
         return bool(self._update_listeners) or bool(self._observers)
 
+    def _read(self, run: Callable[[Document], object]):
+        """Read the replica through ``run`` under one acquisition, so a multi-step
+        read sees one state rather than a sequence a remote fold can shift."""
+        with self._lock:
+            return run(self._backend)
+
+    def _send(self, ops: bytes) -> None:
+        # Never under the replica lock: the wire write can block on a full send
+        # window, and holding the replica across it would stop the provider
+        # reading — including the reads that would drain that window.
+        if ops and self._wire is not None:
+            self._wire(ops)
+
     def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
-        # Inside a transaction the edit just accumulates; the commit dispatches.
-        if self._transacting:
-            run(self._backend)
-            return b""
-        before = self._backend.encode_state() if self._observing() else None
-        ops = run(self._backend)
-        if not ops:
+        with self._gate:
+            ops, changes, repairs = b"", [], []
+            try:
+                with self._lock:
+                    # Inside a transaction the edit just accumulates; the commit
+                    # sends and publishes.
+                    if self._transacting:
+                        run(self._backend)
+                        return b""
+                    before = self._backend.encode_state() if self._observing() else None
+                    ops = run(self._backend)
+                    if ops:
+                        changes = self._collect(before)
+                        repairs = self._take_repairs()
+            finally:
+                # The ops are stamped into this replica and its outbox the moment
+                # `run` returns, so they have to reach the room even if reading
+                # the change set afterwards failed.
+                if ops:
+                    self._send(ops)
+                    self._publish("local", ops, changes)
+                    self._publish_repairs(repairs)
             return ops
-        self._dispatch("local", ops, before)
-        self._emit_repairs()
-        return ops
+
+    def _fold_remote(self, receive: Callable[[], object]):
+        """Fold a provider-driven inbound frame into the replica, returning what
+        ``receive`` reported plus the reactivity the fold produced, for the caller
+        to publish once the frame's other work is done. Publishing here would run
+        application listeners while the replica lock is held, and a listener that
+        edits reaches for the author's gate — inverting the two locks against
+        every application thread."""
+        with self._lock:
+            before = self._backend.encode_state() if self._observing() else None
+            outcome = receive()
+            changes = self._collect(before) if before is not None else []
+            return outcome, changes, self._take_repairs()
+
+    def _publish_remote(self, changes: List[Tuple[bytes, dict]], repairs: List[list]) -> None:
+        self._publish("remote", b"", changes)
+        self._publish_repairs(repairs)
 
     def _dispatch(self, origin: str, ops: bytes, before: Optional[bytes]) -> None:
-        raws = [] if before is None else self._compute_changes(before)
+        self._publish(origin, ops, self._collect(before))
+
+    def _collect(self, before: Optional[bytes]) -> List[Tuple[bytes, dict]]:
+        """The change list an edit produced, read off the replica — the caller
+        holds the replica lock."""
+        return [] if before is None else self._compute_changes(before)
+
+    def _publish(self, origin: str, ops: bytes, raws: List[Tuple[bytes, dict]]) -> None:
         changes = [change for _pb, change in raws]
         # A remote frame that changed nothing (an ack) fires no update; a local edit
         # always reports its ops. Snapshot the listener sets so one subscribed during
@@ -2849,39 +3241,40 @@ class Doc:
         return [_remarshal_change(d) for d in _decode_changes(raw)]
 
     def _emit_repairs(self) -> None:
+        self._publish_repairs(self._take_repairs())
+
+    def _take_repairs(self) -> List[list]:
         # Drain the schema-repair signal only when observed — the drain reseeds the
         # baseline, so draining unobserved would lose the signal; an unobserved doc
-        # pays nothing (and take_repairs is empty until a schema is bound).
+        # pays nothing (and take_repairs is empty until a schema is bound). The
+        # caller holds the replica lock.
         if not self._repair_listeners:
-            return
-        raw = self._backend.take_repairs()
+            return []
+        return self._backend.take_repairs()
+
+    def _publish_repairs(self, raw: List[list]) -> None:
         if not raw:
             return
-        paths = [[_repair_step(step) for step in path] for path in raw]
-        event = RepairEvent(paths=paths)
+        event = RepairEvent(paths=[[_repair_step(step) for step in path] for path in raw])
         for listener in list(self._repair_listeners):
             listener(event)
 
 
 
-class Provider:
-    """An ergonomic, offline-first sync binding over a :class:`Doc`'s apply/emit
-    seam — the Python realization of the §SDK-Ergonomic-Surface provider model.
+class LocalProvider:
+    """An embedded, offline-first sync binding over a :class:`Doc`'s apply/emit
+    seam, for an app that owns its own transport.
 
-    The Python SDK is embedded/offline-first: unlike the JS provider it owns no
-    socket loop, so the app supplies the transport. Bind a ``Doc`` with a ``send``
-    callback (invoked with each local edit's ops to transmit), and feed a peer's
-    ops to :meth:`receive`. The provider owns the connection state and an offline
-    outbox, so edits made while disconnected queue and flush on reconnect; inbound
-    ops apply and fire the doc's reactivity as ``remote``. A remote apply never
-    re-emits as a local edit, so a pair of linked providers can't loop.
+    Bind a local ``Doc`` with a ``send`` callback (invoked with each local edit's
+    ops to transmit), and feed a peer's ops to :meth:`receive`. The provider owns
+    the connection state and an offline outbox, so edits made while disconnected
+    queue and flush on reconnect; inbound ops apply and fire the doc's reactivity
+    as ``remote``. A remote apply never re-emits as a local edit, so a pair of
+    linked providers can't loop.
 
-    The fully-networked provider that owns a socket and backs the ``Doc`` with a
-    single wire-client replica (the JS ``connect(url, room)`` model, with awareness
-    and the operator-tier request/reply surface) is a documented follow-on: the
-    Python ``Client`` wire surface does not yet expose the per-channel
-    list/text/scalar/map-key handle ops a single-replica networked handle graph
-    needs. Until then this seam plus the low-level :class:`Client` cover sync.
+    :class:`Provider` is the networked counterpart — it owns the socket, speaks
+    the crdtsync wire protocol to a server, and backs its doc with that
+    connection's room replica.
     """
 
     def __init__(self, doc: "Doc", send: "Callable[[bytes], None]", *, connected: bool = False):
@@ -2944,7 +3337,7 @@ class Provider:
         """Unbind from the doc; local edits stop being forwarded/queued."""
         self._unsub()
 
-    def __enter__(self) -> "Provider":
+    def __enter__(self) -> "LocalProvider":
         return self
 
     def __exit__(self, *exc) -> None:
@@ -2956,3 +3349,777 @@ class Provider:
         self._state = state
         for listener in list(self._state_listeners):
             listener(state)
+
+
+# --- networked sync provider ---------------------------------------------------
+#
+# A `Provider` binds a `Doc` to a crdtsync server over a WebSocket. It owns the
+# wire session (a `Client`) and one room channel; the `Doc` is backed by that
+# channel, so local edits are framed + outboxed and sent, and inbound frames fold
+# into the same replica and fire the doc's reactivity — one replica per room,
+# never two divergent copies. On a dropped socket the outbox holds unacked edits;
+# on reconnect the provider resumes the channel from its caught-up position and
+# resends the outbox, so edits made offline converge once the link returns.
+
+#: The protocol version this SDK speaks, sent in the connection header.
+_PROTOCOL_VERSION = 1
+
+#: The magic the connection header leads with, identifying a crdtsync stream.
+_WIRE_MAGIC = b"CRDT"
+
+#: The credential sent when the caller names none — what a dev server accepts.
+_ANONYMOUS = b"anonymous"
+
+#: The floor on a reconnect delay, so a zero ceiling cannot spin the dial loop.
+_MIN_RECONNECT_DELAY = 0.01
+
+#: The size of an Ops frame carrying no ops — its tag byte plus the channel.
+_EMPTY_OPS_FRAME = 5
+
+
+def _carries_ops(frame: bytes) -> bool:
+    """Whether a framed edit actually carries any. The client seat frames every
+    call, including one that matched nothing, where the document seat returns
+    nothing at all — so this is what keeps the two seats behaving alike."""
+    return len(frame) > _EMPTY_OPS_FRAME
+
+
+def _protocol_header() -> bytes:
+    """The 8-byte header a client writes once, before its Hello, to open a
+    connection at this SDK's protocol version."""
+    return _WIRE_MAGIC + struct.pack("<I", _PROTOCOL_VERSION)
+
+
+class _ClientBackend:
+    """The storage seam a networked :class:`Doc` edits and reads through: one
+    channel of a :class:`Client`. An edit frames itself for the wire and enters
+    the channel's outbox; a read queries that channel's replica.
+
+    Every call takes the provider's lock, because the reader thread folds inbound
+    frames into the same native session an application thread edits."""
+
+    def __init__(self, client: "Client", channel: int, lock: "threading.RLock"):
+        self._client = client
+        self._channel = channel
+        self._lock = lock
+
+    @staticmethod
+    def _framed(frame: bytes) -> bytes:
+        """Report an edit that matched nothing as no edit, so an inert call
+        neither reaches the wire nor fires an update."""
+        return frame if _carries_ops(frame) else b""
+
+    def encode_state(self) -> bytes:
+        with self._lock:
+            return self._client.channel_state(self._channel) or b""
+
+    def get_scalar(self, path: Path) -> Optional[bytes]:
+        with self._lock:
+            return self._client.get_scalar(self._channel, path)
+
+    def map_keys(self, path: Path) -> Optional[List[bytes]]:
+        with self._lock:
+            return self._client.map_keys(self._channel, path)
+
+    def set_scalar(self, path: Path, scalar: bytes) -> bytes:
+        with self._lock:
+            return self._framed(self._client.set_scalar(self._channel, path, scalar))
+
+    def delete(self, path: Path) -> bytes:
+        with self._lock:
+            return self._framed(self._client.delete(self._channel, path))
+
+    def list_insert(self, path: Path, index: int, value: bytes) -> bytes:
+        with self._lock:
+            return self._framed(self._client.list_insert(self._channel, path, index, value))
+
+    def list_delete(self, path: Path, index: int) -> bytes:
+        with self._lock:
+            return self._framed(self._client.list_delete(self._channel, path, index))
+
+    def list_len(self, path: Path) -> Optional[int]:
+        with self._lock:
+            return self._client.list_len(self._channel, path)
+
+    def list_get(self, path: Path, index: int) -> Optional[bytes]:
+        with self._lock:
+            return self._client.list_get(self._channel, path, index)
+
+    def text_insert(self, path: Path, index: int, text: str) -> bytes:
+        with self._lock:
+            return self._framed(self._client.text_insert(self._channel, path, index, text))
+
+    def text_delete(self, path: Path, index: int, count: int) -> bytes:
+        with self._lock:
+            return self._framed(self._client.text_delete(self._channel, path, index, count))
+
+    def text_len(self, path: Path) -> Optional[int]:
+        with self._lock:
+            return self._client.text_len(self._channel, path)
+
+    def text_get(self, path: Path) -> Optional[str]:
+        with self._lock:
+            return self._client.text_get(self._channel, path)
+
+    def set_blob(self, path: Path, mime: str, bytes_: bytes) -> Optional[bytes]:
+        with self._lock:
+            return self._framed(self._client.set_blob(self._channel, path, mime, bytes_)) or None
+
+    def set_blob_ref(self, path: Path, blob_id: bytes, mime: str, size: int) -> bytes:
+        with self._lock:
+            return self._framed(self._client.set_blob_ref(self._channel, path, blob_id, mime, size))
+
+    def get_blob(self, path: Path) -> Optional[BlobRef]:
+        with self._lock:
+            return self._client.get_blob(self._channel, path)
+
+    def xml_element(self, path: Path, tag: bytes) -> bytes:
+        with self._lock:
+            return self._framed(self._client.xml_element(self._channel, path, tag))
+
+    def xml_fragment(self, path: Path) -> bytes:
+        with self._lock:
+            return self._framed(self._client.xml_fragment(self._channel, path))
+
+    def xml_insert_element(self, elem_path: Path, index: int, tag: bytes) -> bytes:
+        with self._lock:
+            return self._framed(self._client.xml_insert_element(self._channel, elem_path, index, tag))
+
+    def xml_insert_text(self, elem_path: Path, index: int, text: str) -> bytes:
+        with self._lock:
+            return self._framed(self._client.xml_insert_text(self._channel, elem_path, index, text))
+
+    def xml_child_delete(self, elem_path: Path, index: int) -> bytes:
+        with self._lock:
+            return self._framed(self._client.xml_child_delete(self._channel, elem_path, index))
+
+    def xml_tag(self, path: Path) -> Optional[bytes]:
+        with self._lock:
+            return self._client.xml_tag(self._channel, path)
+
+    def xml_children_len(self, elem_path: Path) -> Optional[int]:
+        with self._lock:
+            return self._client.xml_children_len(self._channel, elem_path)
+
+    def xml_move(
+        self, parent: Path, child_index: int, new_parent: Path, dest_index: int
+    ) -> bytes:
+        with self._lock:
+            return self._framed(
+                self._client.xml_move(
+                    self._channel, parent, child_index, new_parent, dest_index
+                )
+            )
+
+    def _mark_encoded(
+        self,
+        seq_path: Path,
+        start_index: int,
+        start_side: Side,
+        end_index: int,
+        end_side: Side,
+        name: bytes,
+        scalar: bytes,
+    ) -> Tuple[Optional[bytes], bytes]:
+        with self._lock:
+            mark_id, frame = self._client._mark_encoded(
+                self._channel,
+                seq_path,
+                start_index,
+                start_side,
+                end_index,
+                end_side,
+                name,
+                scalar,
+            )
+        return mark_id, self._framed(frame)
+
+    def _mark_set_value_encoded(self, mark_id: bytes, scalar: bytes) -> bytes:
+        with self._lock:
+            return self._framed(
+                self._client._mark_set_value_encoded(self._channel, mark_id, scalar)
+            )
+
+    def mark_delete(self, mark_id: bytes) -> bytes:
+        with self._lock:
+            return self._framed(self._client.mark_delete(self._channel, mark_id))
+
+    def marks_at(self, seq_path: Path, index: int) -> list:
+        with self._lock:
+            return self._client.marks_at(self._channel, seq_path, index)
+
+    def relative_position(self, path: Path, index: int, side: Side) -> Optional[bytes]:
+        with self._lock:
+            return self._client.relative_position(self._channel, path, index, side)
+
+    def resolve_position(self, path: Path, pos: bytes) -> Optional[int]:
+        with self._lock:
+            return self._client.resolve_position(self._channel, path, pos)
+
+    def set_schema(self, schema: bytes) -> bool:
+        """A room replica binds no schema: the client seat has no schema surface,
+        so there is nothing for the repair signal to measure against."""
+        return False
+
+    def take_repairs(self) -> List[list]:
+        """Empty for the same reason :meth:`set_schema` binds nothing."""
+        return []
+
+    def begin_atomic(self) -> None:
+        with self._lock:
+            self._client.begin_atomic(self._channel)
+
+    def commit_atomic(self) -> bytes:
+        with self._lock:
+            return self._framed(self._client.commit_atomic(self._channel))
+
+    def apply(self, ops: bytes) -> int:
+        raise RuntimeError(
+            "crdtsync: a networked document syncs through its provider, not apply_update"
+        )
+
+    def close(self) -> None:
+        """The provider owns the session's lifetime, so a doc going away leaves
+        the connection alone."""
+
+
+class Provider:
+    """A networked sync binding: it owns a WebSocket to a crdtsync server and
+    keeps :attr:`doc` in sync with one room.
+
+    Constructing one starts connecting in the background; :meth:`wait_connected`
+    (or the :func:`connect` helper) blocks until the room's initial state has
+    synced. The provider drives the handshake (protocol header → ``Hello`` →
+    ``Auth`` → ``Subscribe``), catch-up, and — on a dropped socket — reconnection
+    with backoff, resuming the channel from its caught-up position and resending
+    the unacknowledged outbox, so edits made while offline converge once the link
+    returns.
+
+    Callbacks — doc reactivity, :meth:`on_state`, and the server-signal hooks —
+    run on the provider's reader thread, holding none of its locks, so one is
+    free to read or edit the doc. It is the thread draining the socket, though,
+    so a callback that does not return promptly stalls everything the room sends.
+    One that raises is reported and the connection carries on. Closing is the
+    caller's job: the provider keeps a thread and a socket until :meth:`close`.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        room: Key,
+        *,
+        client_id: Optional[bytes] = None,
+        credential: Optional[Union[str, bytes]] = None,
+        reconnect: bool = True,
+        max_reconnect_delay: float = 10.0,
+        connect_timeout: float = 15.0,
+        on_error: "Optional[Callable[[ErrorCode], None]]" = None,
+        on_ops_rejected: "Optional[Callable[[List[Rejected]], None]]" = None,
+        on_redirect: "Optional[Callable[[List[Redirect]], None]]" = None,
+        transport: "Optional[Callable[[str], object]]" = None,
+    ):
+        self._url = url
+        # Two locks, and the send lock is always the outer one. It orders what
+        # reaches the socket — an author holds it from before its ops are stamped
+        # until after they are written, so concurrent authors reach the wire in
+        # sequence order — and pins the phase while a frame is written, so an
+        # edit can never land inside a handshake. The replica lock guards the
+        # native session and is released before any socket write, so a write can
+        # never stop the reader folding what arrives.
+        self._lock = threading.RLock()
+        self._send_lock = threading.RLock()
+        self._client = Client(client_id if client_id is not None else os.urandom(16))
+        self._room = _key_bytes(room)
+        self._channel, self._subscribe_frame = self._client.subscribe(self._room)
+        self._credential = _ANONYMOUS if credential is None else _key_bytes(credential)
+        self._reconnect = reconnect
+        self._max_reconnect_delay = max_reconnect_delay
+        self._connect_timeout = connect_timeout
+        self._on_error = on_error
+        self._on_ops_rejected = on_ops_rejected
+        self._on_redirect = on_redirect
+        self._transport = transport if transport is not None else self._dial
+
+        self.doc = Doc._networked(
+            _ClientBackend(self._client, self._channel, self._lock),
+            self._send_if_open,
+            self._send_lock,
+            self._lock,
+        )
+
+        # "auth" awaits the AuthOk that opens a socket, "catchup" the subscribe
+        # reply that lands the room's initial state, "ready" is synced.
+        self._phase = "auth"
+        self._state = "connecting"
+        self._state_lock = threading.Lock()
+        self._state_listeners: List[Callable[[str], None]] = []
+        self._ws: "Optional[object]" = None
+        self._closed = False
+        self._connected_once = False
+        self._attempt = 0
+        self._published: "Dict[bytes, bytes]" = {}
+        self._failure: Optional[BaseException] = None
+        self._settle_lock = threading.Lock()
+        self._settled = threading.Event()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="crdtsync-provider", daemon=True
+        )
+        self._thread.start()
+
+    # --- app surface ---
+
+    @property
+    def state(self) -> str:
+        """The connection state: ``"connecting"``, ``"connected"``, or
+        ``"disconnected"``."""
+        return self._state
+
+    @property
+    def outbox_len(self) -> int:
+        """How many authored ops await the server's acknowledgement — the edits a
+        reconnect resends."""
+        with self._lock:
+            return self._client.outbox_len(self._channel)
+
+    @property
+    def actor(self) -> Optional[bytes]:
+        """The server-derived actor for this connection, or ``None`` before the
+        first ``AuthOk``."""
+        with self._lock:
+            return self._client.actor()
+
+    def wait_connected(self, timeout: Optional[float] = None) -> None:
+        """Block until the room's initial state has synced. Raises if the first
+        connection fails — a server error, a refused socket with reconnect off, a
+        :meth:`close` before it synced — or ``TimeoutError`` if it does not sync
+        within ``timeout`` (defaulting to the provider's ``connect_timeout``)."""
+        limit = self._connect_timeout if timeout is None else timeout
+        if not self._settled.wait(limit):
+            raise TimeoutError("crdtsync: timed out waiting for the initial sync")
+        if self._failure is not None:
+            raise self._failure
+
+    def on_state(self, callback: Callable[[str], None]) -> Callable[[], None]:
+        """Observe connection-state changes; returns a function that unsubscribes."""
+        self._state_listeners.append(callback)
+
+        def off() -> None:
+            try:
+                self._state_listeners.remove(callback)
+            except ValueError:
+                pass
+
+        return off
+
+    def set_awareness(self, key: Key, value: Union[str, bytes]) -> None:
+        """Publish an ephemeral awareness entry (presence) for this client.
+
+        Presence is not durable — the server drops it with the socket — so the
+        provider remembers what this client published and republishes it once a
+        reconnect has caught the channel up."""
+        key_bytes, value_bytes = _key_bytes(key), _key_bytes(value)
+        with self._send_lock:
+            with self._lock:
+                self._published[key_bytes] = value_bytes
+                frame = self._client.set_awareness(self._channel, key_bytes, value_bytes)
+            self._send_if_open(frame)
+
+    def acl_grant(
+        self,
+        subject_kind: SubjectKind,
+        subject: bytes,
+        path: "Sequence[Key]" = (),
+        *,
+        capability: Optional[Capability] = None,
+        role: Optional[bytes] = None,
+        effect: Effect = Effect.ALLOW,
+        grantor: Optional[bytes] = None,
+    ) -> bytes:
+        """Author a doc-ACL grant over the room, routed through the op path so it
+        is acknowledged and resent like an edit. Returns the tuple id
+        :meth:`acl_revoke` names it by; raises ``ValueError`` when the grant is
+        malformed — an access-control call that quietly granted nothing would
+        leave the caller believing access was given.
+
+        ``grantor`` defaults to this connection's authenticated actor, keyed the
+        way a matched ``Actor`` subject is — so the grant is credited to the
+        identity rather than to an ephemeral per-device id."""
+        keys = [_key_bytes(k) for k in path]
+        with self._send_lock:
+            with self._lock:
+                credited = grantor
+                if credited is None:
+                    actor = self._client.actor()
+                    credited = None if actor is None else actor_key(actor)
+                if credited is None:
+                    raise ValueError(
+                        "crdtsync: no authenticated actor to credit the grant; pass grantor"
+                    )
+                tuple_id, frame = self._client.acl_grant(
+                    self._channel,
+                    subject_kind,
+                    subject,
+                    credited,
+                    keys,
+                    capability=capability,
+                    role=role,
+                    effect=effect,
+                )
+            if tuple_id is None:
+                raise ValueError("crdtsync: the room's channel is not held")
+            self._send_edit(frame)
+        return tuple_id
+
+    def acl_revoke(self, tuple_id: bytes) -> None:
+        """Revoke the doc-ACL tuple :meth:`acl_grant` returned, through the same
+        op path. A tuple id this replica does not hold revokes nothing."""
+        with self._send_lock:
+            with self._lock:
+                frame = self._client.acl_revoke(self._channel, tuple_id)
+            self._send_edit(frame)
+
+    def awareness(self, actor: bytes, key: Key) -> Optional[bytes]:
+        """A peer's awareness entry by publishing ``actor`` and ``key``, or
+        ``None`` when that peer has published none."""
+        with self._lock:
+            return self._client.awareness(self._channel, actor, _key_bytes(key))
+
+    def awareness_len(self) -> int:
+        """How many awareness entries the room currently holds."""
+        with self._lock:
+            return self._client.awareness_len(self._channel)
+
+    def close(self) -> None:
+        """Close the connection and stop reconnecting. Idempotent. Returns once
+        the socket is shut down; a dial already in flight unwinds behind it."""
+        if self._closed:
+            return
+        self._closed = True
+        self._wake.set()
+        self._drop_socket()
+        self._set_state("disconnected")
+        self._reject(ConnectionError("crdtsync: closed before it synced"))
+        # The doc stays readable and the native session alive: the reader thread
+        # and any application thread may still be inside it, and freeing it under
+        # them is a use-after-free. It is released when the provider — and with
+        # it the thread that keeps it reachable — is collected. Calling close()
+        # from a callback runs on the reader thread itself, which can only unwind.
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=5.0)
+
+    def __enter__(self) -> "Provider":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    # --- connection loop (reader thread) ---
+
+    def _run(self) -> None:
+        try:
+            while not self._closed:
+                self._set_state("connecting")
+                self._bind_socket(None)
+                try:
+                    ws = self._transport(self._url)
+                except Exception:  # noqa: BLE001 — any dial failure is a retry
+                    ws = None
+                if ws is not None:
+                    try:
+                        self._bind_socket(ws)
+                        if self._closed:  # closed while the dial was in flight
+                            break
+                        self._open(ws)
+                        while not self._closed:
+                            data = ws.recv()
+                            if data is None:
+                                break
+                            self._deliver(data)
+                    except (OSError, _websocket.WebSocketError):
+                        pass  # a dropped socket: fall through to the reconnect
+                    except Exception:
+                        # Anything else — the native session, the transport, a
+                        # bad allocation — is still just this connection failing.
+                        # Letting it end the thread would leave a provider that
+                        # never dials again and never says so.
+                        _LOGGER.exception("crdtsync: the connection failed")
+                    finally:
+                        # Shutting the socket down frees any writer parked on it,
+                        # so the rebind behind it cannot wait on a stuck author.
+                        try:
+                            ws.close()
+                        except Exception:
+                            _LOGGER.exception("crdtsync: closing the socket failed")
+                        self._bind_socket(None)
+                if self._closed or not self._reconnect:
+                    break
+                self._set_state("disconnected")
+                if self._wake.wait(self._backoff()):
+                    break
+        finally:
+            # However the loop ended — a break, a close, an unexpected failure —
+            # the connection is gone and nobody is waiting on a sync any more.
+            self._set_state("disconnected")
+            self._reject(
+                ConnectionError("crdtsync: the connection closed before it synced")
+            )
+
+    def _backoff(self) -> float:
+        """The delay before the next dial: exponential, clamped, and jittered so
+        a restarted server is not met by every client at once. The exponent is
+        clamped too — an unreachable server left overnight would otherwise build
+        an integer too large to turn into a float — and the delay has a floor, so
+        a zero ceiling cannot turn the loop into a spin."""
+        self._attempt = min(self._attempt + 1, 32)
+        delay = min(self._max_reconnect_delay, 0.25 * 2.0 ** (self._attempt - 1))
+        return max(_MIN_RECONNECT_DELAY, delay) * random.uniform(0.5, 1.0)
+
+    def _bind_socket(self, ws) -> None:
+        """Point the send path at ``ws`` (or at nothing) and reset the phase, as
+        one step — a writer must never see a fresh socket at the old phase and
+        write an app frame into its handshake."""
+        with self._send_lock:
+            self._ws = ws
+            self._phase = "auth"
+
+    def _open(self, ws) -> None:
+        with self._lock:
+            hello = self._client.hello()
+            auth = self._client.auth(self._credential)
+        with self._send_lock:
+            ws.send(_protocol_header())
+            ws.send(hello)
+            ws.send(auth)
+
+    def _dial(self, url: str):
+        return _websocket.connect(url, timeout=self._connect_timeout)
+
+    def _deliver(self, data: bytes) -> None:
+        """Handle one inbound frame. A frame this session cannot fold leaves the
+        replica behind the room, and carrying on would sync nothing while still
+        reporting a healthy connection — so the socket is dropped and the
+        reconnect's resume re-requests the stream from the last position it
+        actually applied."""
+        try:
+            self._on_message(data)
+        except _websocket.WebSocketError:
+            raise  # the session asked for this socket to go; not a surprise
+        except Exception as err:
+            _LOGGER.exception("crdtsync: folding an inbound frame failed")
+            raise _websocket.WebSocketError(
+                f"crdtsync: the session could not fold a frame: {err}"
+            ) from err
+
+    def _notify(self, callback, argument) -> None:
+        """Hand a signal to an application hook. A hook that raises is its own
+        bug: it is reported, and the frame's remaining work — draining the other
+        signals, completing the initial sync — still happens."""
+        if callback is None:
+            return
+        try:
+            callback(argument)
+        except Exception:
+            _LOGGER.exception("crdtsync: a provider callback raised")
+
+    def _on_message(self, data: bytes) -> None:
+        if self._phase == "auth":
+            # The first frame on any socket is the AuthOk (or a server Error).
+            # Once it folds cleanly this socket has authenticated — send Subscribe
+            # (or Resume on a reconnect) and replay the outbox. `actor()` can't
+            # gate this: it stays set across reconnects, so it would pass before
+            # the new socket re-authenticates.
+            _applied, err = self._receive(data)
+            if err is not None:
+                # A socket that will not authenticate never carries a Subscribe,
+                # so it can only sit idle. The first connection fails outright;
+                # a later one is dropped so the reconnect can try again.
+                self._handle_server_error(err)
+                if not self._closed:
+                    raise _websocket.WebSocketError(
+                        f"crdtsync: the server refused the handshake (code {int(err)})"
+                    )
+                return
+            self._write(
+                self._resume_frame() if self._connected_once else self._subscribe_frame
+            )
+            if self._connected_once:
+                # The replica persists across the drop; deltas stream as ops.
+                self._mark_connected()
+            else:
+                with self._send_lock:
+                    self._phase = "catchup"
+            return
+
+        # Bracket the fold so the doc's diff-based reactivity fires for inbound
+        # ops. A fold that fails propagates and drops the socket; publishing the
+        # reactivity is deferred to the end, because that is the app's code and a
+        # listener that raises must not cost this frame its signal drain or the
+        # connection its initial sync.
+        (applied, err), changes, repairs = self.doc._fold_remote(
+            lambda: self._receive(data)
+        )
+        if err is not None:
+            self._handle_server_error(err)
+            if self._closed:  # the error was fatal — this socket is finished
+                return
+        if applied:
+            # A frame this session actually applied is the proof the connection
+            # works, so the backoff starts over here rather than at the AuthOk
+            # or on any frame at all. A server that authenticates and then errors
+            # — the update-required push is exactly that — would otherwise be
+            # redialled at the floor delay forever, by every client at once.
+            self._attempt = 0
+            # The Subscribe is answered with the room's catch-up, so the first
+            # frame the session applies past the handshake completes the sync.
+            if self._phase == "catchup":
+                self._mark_connected()
+        self._drain_signals()
+        try:
+            self.doc._publish_remote(changes, repairs)
+        except Exception:
+            _LOGGER.exception("crdtsync: a document listener raised")
+
+    def _receive(self, data: bytes) -> "Tuple[bool, Optional[ErrorCode]]":
+        """Fold one inbound frame, reporting whether the session applied it and
+        the server ``ErrorCode`` when it was an Error frame rather than an
+        applicable message. A frame the session refuses — one naming a channel it
+        does not hold — is neither."""
+        try:
+            with self._lock:
+                return self._client.receive(data) == 1, None
+        except ServerError as err:
+            return False, err.code
+
+    def _handle_server_error(self, code: "ErrorCode") -> None:
+        if not self._connected_once:
+            # A handshake-time error (bad auth, unsupported version) is fatal.
+            self._fatal(ServerError(code))
+        else:
+            self._notify(self._on_error, code)
+
+    def _drain_signals(self) -> None:
+        with self._lock:
+            rejected = self._client.take_rejected()
+            redirects = self._client.take_redirects()
+        if rejected:
+            self._notify(self._on_ops_rejected, rejected)
+        if redirects:
+            self._notify(self._on_redirect, redirects)
+
+    def _resume_frame(self) -> bytes:
+        with self._lock:
+            return self._client.resume(self._channel) or self._subscribe_frame
+
+    def _mark_connected(self) -> None:
+        # Opening the socket to app traffic, replaying what the channel still
+        # owes, and republishing presence are one step under the send lock: an
+        # edit authored while the handshake was in flight was not written (the
+        # channel was not ready), so it has to be in the batch this replays,
+        # while an edit authored after the flip writes itself — and no app frame
+        # can slip between the flip and the replay.
+        with self._send_lock:
+            with self._lock:
+                outstanding = (
+                    self._client.resend(self._channel)
+                    if self._client.outbox_len(self._channel) > 0
+                    else b""
+                )
+                presence = [
+                    self._client.set_awareness(self._channel, key, value)
+                    for key, value in self._published.items()
+                ]
+            self._phase = "ready"
+            self._write(outstanding)
+            for frame in presence:
+                self._write(frame)
+        self._connected_once = True
+        self._set_state("connected")
+        self._resolve()
+
+    def _send_if_open(self, frame: bytes) -> None:
+        """Write an app frame, but only once the channel is subscribed and
+        caught up. Before that the socket carries the handshake alone — an edit
+        interleaved into it is a protocol violation the server closes on — and
+        the edit's ops wait in the outbox for :meth:`_mark_connected` to replay."""
+        with self._send_lock:
+            if self._phase != "ready":
+                return
+            self._write(frame)
+
+    def _send_edit(self, frame: bytes) -> None:
+        """Write an authored frame unless it carries no ops — an edit that
+        matched nothing is not an edit."""
+        if _carries_ops(frame):
+            self._send_if_open(frame)
+
+    def _write(self, frame: bytes) -> None:
+        with self._send_lock:
+            ws = self._ws
+            if not frame or ws is None:
+                return
+            try:
+                ws.send(frame)
+            except (OSError, _websocket.WebSocketError):
+                # The reader sees the same drop and reconnects; the outbox still
+                # holds the edit, so the resend covers it.
+                pass
+
+    def _fatal(self, err: BaseException) -> None:
+        self._closed = True
+        self._wake.set()
+        self._drop_socket()
+        self._set_state("disconnected")
+        self._reject(err)
+
+    def _drop_socket(self) -> None:
+        """Shut the live socket down so a blocked reader returns.
+
+        Deliberately lock-free: an author parked in a socket write holds the
+        send lock, and shutting that socket down is exactly what frees it — so
+        this must never be the thing waiting on it."""
+        ws = self._ws
+        if ws is not None:
+            ws.close()
+
+    def _resolve(self) -> None:
+        with self._settle_lock:
+            self._settled.set()
+
+    def _reject(self, err: BaseException) -> None:
+        # Only the first outcome counts, and it is recorded before it is
+        # published, so a waiter never observes a failure on a settled-connected
+        # provider or vice versa.
+        with self._settle_lock:
+            if self._settled.is_set():
+                return
+            self._failure = err
+            self._settled.set()
+
+    def _set_state(self, state: str) -> None:
+        # The reader thread and an application thread both publish transitions,
+        # so the compare-and-set is guarded: two racing transitions must not both
+        # be announced, nor land in an order that contradicts the final state.
+        with self._state_lock:
+            if state == self._state:
+                return
+            self._state = state
+            listeners = list(self._state_listeners)
+        for listener in listeners:
+            try:
+                listener(state)
+            except Exception:
+                _LOGGER.exception("crdtsync: an on_state listener raised")
+
+
+def connect(url: str, room: Key, **options) -> Provider:
+    """Open a :class:`Provider` on ``room`` at ``url`` and return it once the
+    room's initial state has synced. Takes the same options as
+    :class:`Provider`; a failed connection closes the provider and raises."""
+    provider = Provider(url, room, **options)
+    try:
+        provider.wait_connected()
+    except BaseException:
+        provider.close()
+        raise
+    return provider

@@ -62,11 +62,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # The SDK loads the cdylib at runtime; build it, then run pytest.
-      - name: Build the native library
-        run: cargo build -p crdtsync-ffi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: python-sdk
+      # The SDK loads the cdylib at runtime, and the provider integration test
+      # spins up the real server binary; build both, then run pytest.
+      - name: Build the native library and the server binary
+        run: cargo build -p crdtsync-ffi -p crdtsync-server
       - name: Install pytest
-        run: python -m pip install --upgrade pytest
+        run: python -m pip install --upgrade pytest pytest-timeout
       - name: Test
         run: python -m pytest -q
         working-directory: sdks/python

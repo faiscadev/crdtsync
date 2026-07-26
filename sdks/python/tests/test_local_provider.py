@@ -1,10 +1,10 @@
-"""The ergonomic sync provider: an offline-first binding over a Doc's apply/emit
+"""The embedded sync provider: an offline-first binding over a Doc's apply/emit
 seam. The app supplies the transport (a `send` callback for outbound ops, feeds
 inbound ops to `receive`); the provider owns the connection state and an offline
 outbox so edits made while disconnected flush on reconnect. Two docs bound to a
 pair of providers converge."""
 
-from crdtsync import Doc, Provider
+from crdtsync import Doc, LocalProvider
 
 
 def cid(first: int) -> bytes:
@@ -15,13 +15,13 @@ def _linked_pair():
     """Two docs each bound to a provider that forwards to the other's `receive`."""
     a, b = Doc(cid(1)), Doc(cid(2))
     link: dict = {}
-    pa = Provider(a, lambda ops: link["b"].receive(ops), connected=True)
-    pb = Provider(b, lambda ops: link["a"].receive(ops), connected=True)
+    pa = LocalProvider(a, lambda ops: link["b"].receive(ops), connected=True)
+    pb = LocalProvider(b, lambda ops: link["a"].receive(ops), connected=True)
     link["a"], link["b"] = pa, pb
     return a, b, pa, pb
 
 
-class TestProvider:
+class TestLocalProvider:
     def test_two_docs_sync_through_providers(self):
         a, b, pa, pb = _linked_pair()
         a.get_map("root").set("k", 1)
@@ -39,8 +39,8 @@ class TestProvider:
     def test_offline_edits_flush_on_connect(self):
         a, b = Doc(cid(1)), Doc(cid(2))
         link: dict = {}
-        pa = Provider(a, lambda ops: link["b"].receive(ops))  # disconnected
-        pb = Provider(b, lambda ops: link["a"].receive(ops), connected=True)
+        pa = LocalProvider(a, lambda ops: link["b"].receive(ops))  # disconnected
+        pb = LocalProvider(b, lambda ops: link["a"].receive(ops), connected=True)
         link["a"], link["b"] = pa, pb
 
         assert pa.state == "disconnected"
@@ -53,7 +53,7 @@ class TestProvider:
         assert pa.outbox_len == 0
 
     def test_connection_state_transitions_and_notifies(self):
-        p = Provider(Doc(cid(1)), lambda ops: None)
+        p = LocalProvider(Doc(cid(1)), lambda ops: None)
         states = []
         p.on_state(states.append)
         assert p.state == "disconnected"
@@ -78,6 +78,6 @@ class TestProvider:
 
     def test_connected_edit_sends_immediately(self):
         sent = []
-        p = Provider(Doc(cid(1)), sent.append, connected=True)
+        p = LocalProvider(Doc(cid(1)), sent.append, connected=True)
         p.doc.get_map("root").set("k", 1)
         assert len(sent) == 1
