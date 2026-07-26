@@ -7,7 +7,7 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
-## 2026-07-26 · core undo record-seam (Epic B / B1, #PR) · the stack lives in the document, the seam is the emit path, and the origin tag is both the author filter and the scope selector
+## 2026-07-26 · core undo record-seam (Epic B / B1, #348) · the stack lives in the document, the seam is the emit path, and the origin tag is both the author filter and the scope selector
 **Changed:** realizes ARCHITECTURE §"Undo for the ergonomic handle-graph SDKs" and rewrites the older paragraphs of §Undo / Redo that the resolved design had already superseded. Four points the build forced.
 
 1. **The stack lives in the `Document`, not in the SDK.** ARCHITECTURE previously read "Stack lives in SDK on client, persists in local storage", while the resolved design (2026-07-25) called for a "per-document, per-**channel** undo stack". Those cannot both hold, and the channel requirement decides it: a `ClientSession` holds one replica per channel, so putting the stack in the document *is* the per-channel stack — no new plumbing, and the same undo call works on an offline replica and a live seat. An SDK-side stack would have needed a per-channel side table in every language and would have had to re-derive inverses from outside the document's private state. `UndoManager` survives as a thin origin handle over the document's history.
