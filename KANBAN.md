@@ -375,6 +375,20 @@ scalar / counter / register / element / map (#22–#27), list Fugue (#24), text 
 
 ## ⏭ Next
 
+### Correctness — atomic transactions violate convergence (found 2026-07-26 while building B1; NOT caused by it)
+
+**C1 — atomic-transaction convergence bug (crates/core) — READY, no dependencies. HIGH: this is a CRDT-law violation on `main`.** Two replicas that have applied **every** op still read different state, whenever the edits were made inside `begin_atomic`/`commit_atomic` groups. Predates the undo seam — reproduced on `main` at `2e9dfce` with plain `Document`s, **no undo origin set and no `undo`/`redo` call** — and B1 only makes it matter more, since an atomic intention now undoes *and* redoes as one atomic transaction. It is also why B1's convergence oracle stops short of atomic groups.
+
+  **Reproduction, rebuildable from this entry alone** (one file under `crates/core/tests/`, no fixtures):
+  1. Two `Document`s with distinct client ids. A seeded LCG for determinism.
+  2. 40 rounds. Each round: pick a replica, `begin_atomic()`, make **2–3** path-façade edits over a 3-key vocabulary (`path::register` / `path::inc` / `path::text_insert(0,"xy")` / `path::list_insert(0,b"i")`), then append `commit_atomic()`'s ops to one shared log.
+  3. Deliver **the whole log to both replicas twice**, shuffling the order independently each time (so every op reaches both, out of order, with re-delivery).
+  4. Compare the observable state of the two replicas.
+
+  **Observed** (identical on `main` and on the B1 branch): **131 / 200 seeds diverge**, first at seed 0. At seed 0 the log holds 146 ops, all `tx`-tagged, and `Document::seen()` reports **146 on both** — so it is *not* the buffered-never-ready artifact it resembles; both applied everything and still disagree (list `a` renders 11 items vs 13, list `b` 3 vs 7). **Control:** the same generator with the grouping removed — same edits, same shuffled delivery, each edit's ops logged directly instead of through `begin_atomic`/`commit_atomic` — diverges **0 / 200**. Atomicity is the trigger, not the edit mix or the delivery order.
+
+  **Where to start (hypothesis, not a diagnosis):** `Document::apply` holds every `tx`-tagged op in the buffer and commits the group via `ready_group`/`drain_buffer`, while the author applies its own members immediately at `emit_stamped`. Suspect the order a group's members fold in on a receiver versus on the author — a sequence insert's Fugue anchor resolves against the state at apply time, so a group applied as a unit after other ops have landed can place its nodes differently than the author did. → *Atomic transactions*.
+
 ### SDK follow-ons (planned 2026-07-25, human — cs-next dispatches in this order; undo fork RESOLVED in DECISIONS/ARCHITECTURE)
 
 **Epic A — Networked socket-owning Provider for Python + Go (do FIRST; non-gated).** Makes Python/Go first-class *networked* collab clients (they have only the offline provider today). Mechanical — the wasm `WasmClient` already has the surface; port it to the C ABI + wrap.
