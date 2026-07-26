@@ -98,20 +98,24 @@ pub(crate) enum Step {
         was: Vec<Stamp>,
     },
     /// Re-create a deleted sequence node in the children list `list` at
-    /// `anchor`, rebuilding its subtree, replacing the deleted node `was`.
+    /// `anchor`, rebuilding its subtree, replacing the deleted node `was` — its
+    /// sequence id, and the stable element id `was_node` that ops elsewhere on
+    /// the stack (a move) address it by.
     ReviveNode {
         list: ElementId,
         anchor: Anchor,
         node: Snap,
         was: Stamp,
+        was_node: ElementId,
     },
     /// Re-create a deleted RangedElement over the same span, rebuilding its
-    /// payload.
+    /// payload, replacing the annotation `was`.
     Ranged {
         start: RangeAnchor,
         end: RangeAnchor,
         name: Option<Vec<u8>>,
         payload: Snap,
+        was: ElementId,
     },
 }
 
@@ -151,13 +155,25 @@ pub(crate) struct History {
     replaying: bool,
     undo: Vec<Intention>,
     redo: Vec<Intention>,
-    /// Sequence ids a revival re-minted, old id → the id it came back with. A
-    /// tombstone is terminal, so undoing a delete re-inserts the value under a
-    /// *fresh* id — while the intentions still stacked beneath name the ids their
-    /// own edit minted. Following the substitution is what makes a second undo
-    /// ("type, delete, undo, undo") reach the revived characters instead of
-    /// leaving them behind.
-    revived: HashMap<Stamp, Stamp>,
+    /// Sequence ids a revival re-minted, keyed by the sequence they live in: the
+    /// old id → the id it came back with. A tombstone is terminal, so undoing a
+    /// delete re-inserts the value under a *fresh* id — while the intentions
+    /// still stacked beneath name the ids their own edit minted. Following the
+    /// substitution is what makes a second undo ("type, delete, undo, undo")
+    /// reach the revived characters instead of leaving them behind.
+    ///
+    /// Keyed by the sequence, not by the id alone: an op is stamped from its own
+    /// zone's clock, so a `Stamp` is unique per zone, not per document — two
+    /// zones mint the same one, and a bare-id map would re-point one zone's
+    /// delete at the other's revival.
+    revived: HashMap<(ElementId, Stamp), Stamp>,
+    /// Stable element ids a revival re-minted, old → new. The sequence-id map
+    /// above re-points a *delete*; this one re-points everything that names an
+    /// element directly — a tree move of a revived node, a payload change or a
+    /// delete of a revived annotation, a revoke of a re-issued ACL tuple.
+    /// Element ids are derived from a parent and a key or from a root-partition
+    /// stamp, so they need no sequence qualifier.
+    revived_elements: HashMap<ElementId, ElementId>,
 }
 
 impl Default for History {
@@ -171,6 +187,7 @@ impl Default for History {
             undo: Vec::new(),
             redo: Vec::new(),
             revived: HashMap::new(),
+            revived_elements: HashMap::new(),
         }
     }
 }
@@ -204,13 +221,14 @@ impl History {
         self.origin = None;
     }
 
-    /// The id `id` came back as, following a chain of revivals. Bounded by the
-    /// chain length, and a cycle (unreachable — a revival always mints a fresh,
-    /// strictly later id) exits at the bound rather than spinning.
-    pub(crate) fn current(&self, id: Stamp) -> Stamp {
+    /// The id `id` in sequence `seq` came back as, following a chain of
+    /// revivals. Each hop consumes a distinct entry, so the map size bounds the
+    /// walk and a cycle (unreachable — a revival always mints a fresh, strictly
+    /// later id) exits at the bound rather than spinning.
+    pub(crate) fn current(&self, seq: ElementId, id: Stamp) -> Stamp {
         let mut id = id;
         for _ in 0..self.revived.len() {
-            match self.revived.get(&id) {
+            match self.revived.get(&(seq, id)) {
                 Some(&next) if next != id => id = next,
                 _ => break,
             }
@@ -218,10 +236,40 @@ impl History {
         id
     }
 
-    /// Record that `was` came back as `now`.
-    pub(crate) fn substitute(&mut self, was: Stamp, now: Stamp) {
+    /// Record that `was` came back as `now` in sequence `seq`.
+    pub(crate) fn substitute(&mut self, seq: ElementId, was: Stamp, now: Stamp) {
         if was != now {
-            self.revived.insert(was, now);
+            self.revived.insert((seq, was), now);
+        }
+    }
+
+    /// Drop everything recorded, keeping the recording origin. For a boundary
+    /// past which the recorded inverses no longer describe the document — a
+    /// migration rewrites the slot shapes they name.
+    pub(crate) fn forget(&mut self) {
+        self.open.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.revived.clear();
+        self.revived_elements.clear();
+    }
+
+    /// The element `id` came back as, following a chain of revivals.
+    pub(crate) fn current_element(&self, id: ElementId) -> ElementId {
+        let mut id = id;
+        for _ in 0..self.revived_elements.len() {
+            match self.revived_elements.get(&id) {
+                Some(&next) if next != id => id = next,
+                _ => break,
+            }
+        }
+        id
+    }
+
+    /// Record that element `was` came back as `now`.
+    pub(crate) fn substitute_element(&mut self, was: ElementId, now: ElementId) {
+        if was != now {
+            self.revived_elements.insert(was, now);
         }
     }
 
@@ -251,7 +299,10 @@ impl History {
     /// drops the redo future of its own origin — an intervening edit makes that
     /// origin's redone future ambiguous — while leaving other origins' alone.
     pub(crate) fn close(&mut self, atomic: bool) {
-        if self.open.is_empty() {
+        // A replay always closes a mirror, even an empty one: an intention whose
+        // inverses all turned out to be inert still came off its stack, and
+        // dropping the mirror would leave N undos answered by N-1 redos.
+        if self.open.is_empty() && !self.replaying {
             return;
         }
         let intention = Intention {
@@ -267,6 +318,11 @@ impl History {
                 self.undo.push(intention);
             }
             Landing::Redo => self.redo.push(intention),
+        }
+        // With both stacks empty no intention names an id a revival replaced.
+        if self.undo.is_empty() && self.redo.is_empty() {
+            self.revived.clear();
+            self.revived_elements.clear();
         }
     }
 

@@ -300,7 +300,10 @@ fn a_wasm_undo_converges_on_a_peer() {
     b.apply(&a.inc(&p, 5));
     assert_eq!(b.get_counter(&p), Some(5));
     b.apply(&u.undo(&mut a));
-    assert_eq!(b.get_counter(&p), Some(0));
+    // The delta re-won the slot on the way in, so its inverse both cancels the
+    // tally and gives the slot back — an unset counter reads as absent.
+    assert_eq!(a.get_counter(&p), None);
+    assert_eq!(b.get_counter(&p), None, "and the peer agrees");
 }
 
 use crdtsync_wasm::WasmClient;

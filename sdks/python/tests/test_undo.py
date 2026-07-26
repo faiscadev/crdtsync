@@ -36,6 +36,9 @@ def test_undo_of_a_counter():
         assert d.get_counter([b"votes"]) == 3
         u.undo(d)
         assert d.get_counter([b"votes"]) == 5
+        # The first delta installed the counter, so undoing it empties the slot.
+        u.undo(d)
+        assert d.get_counter([b"votes"]) is None
 
 
 def test_undo_of_a_list_insert():

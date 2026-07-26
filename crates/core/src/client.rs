@@ -724,8 +724,16 @@ impl ClientSession {
                 // high-water mark for the ops we author next, so a re-mint can't
                 // collide with an op already made durable. A decode failure
                 // leaves the room untouched.
-                let doc = Document::decode_state_as(self.client, room.doc.next_seq(), &state)
+                let mut doc = Document::decode_state_as(self.client, room.doc.next_seq(), &state)
                     .map_err(|_| ClientError::BadSnapshot)?;
+                // Carry the undo origin across, so edits authored after a
+                // late-join or a reconnect catch-up stay recorded. The recorded
+                // *stack* does not survive: its inverses restore state the
+                // adopted snapshot has replaced, so replaying them would write
+                // back values the server never had.
+                if let Some(origin) = room.doc.undo_origin() {
+                    doc.set_undo_origin(origin);
+                }
                 room.doc = doc;
                 room.last_seen_seq = seq;
                 Ok(())

@@ -15,9 +15,10 @@
 //! intention undoes and redoes as one atomic transaction in turn.
 
 use crdtsync_core::acl::{AclEffect, AclGrant, AclSubject, Capability};
-use crdtsync_core::doc::Document;
+use crdtsync_core::doc::{Document, SlotFate};
 use crdtsync_core::elementid::ElementId;
 use crdtsync_core::ranged::RangeAnchor;
+use crdtsync_core::schema::Schema;
 use crdtsync_core::RelativePosition;
 use crdtsync_core::{
     path, Channel, ClientId, ClientSession, Element, Message, Op, Scalar, Side, UndoManager,
@@ -1415,6 +1416,91 @@ fn an_undo_converges_when_a_peer_displaced_the_slot_meanwhile() {
         "an inverse emitted onto an unreachable target is applied inertly here \
          but buffered and replayed by a peer"
     );
+    // The reversal put the revival ahead of the slot restore that makes it
+    // reachable; without the hoist the revival is skipped and "h" never returns.
+    assert_eq!(
+        text(&b, &body),
+        "hi",
+        "and the undo actually restores the text"
+    );
+}
+
+#[test]
+fn an_intention_that_drops_and_re_creates_a_slot_undoes_both_writes() {
+    let mut d = doc(1);
+    let items = p(&[b"items"]);
+    path::list_insert(&mut d, &items, 0, b"a");
+
+    // One gesture: clear the slot, then put an item back. The second call
+    // re-creates the list, so the slot is written twice inside one intention.
+    d.begin_intention();
+    path::delete(&mut d, &items);
+    path::list_insert(&mut d, &items, 0, b"z");
+    d.end_intention();
+    // The list is retained by id, so re-creating the slot brings "a" back with
+    // it and "z" lands in front.
+    assert_eq!(list_vals(&d, &items), vec![b"z".to_vec(), b"a".to_vec()]);
+
+    undo(&mut d);
+    assert_eq!(
+        list_vals(&d, &items),
+        vec![b"a".to_vec()],
+        "a container another step puts back is not really removed, and two \
+         writes to one slot keep their order"
+    );
+}
+
+#[test]
+fn redo_restores_a_child_deleted_after_it_was_moved() {
+    let mut d = doc(1);
+    let root = p(&[b"root"]);
+    let sink = p(&[b"sink"]);
+    path::xml_element(&mut d, &root, b"doc");
+    path::xml_element(&mut d, &sink, b"sink");
+    path::xml_insert_element(&mut d, &root, 0, b"p");
+    path::xml_move_child(&mut d, &root, 0, &sink, 0);
+    assert_eq!(child_shapes(&d, b"sink"), vec!["<p>"]);
+
+    undo(&mut d);
+    assert_eq!(child_shapes(&d, b"root"), vec!["<p>"], "the move is undone");
+    undo(&mut d);
+    assert!(child_shapes(&d, b"root").is_empty(), "then the insert");
+
+    // The delete landed on a placement the move had suppressed; its inverse has
+    // to reach the node by id or the redo has nothing to bring back.
+    redo(&mut d);
+    assert_eq!(
+        child_shapes(&d, b"root"),
+        vec!["<p>"],
+        "redo brings the child back"
+    );
+    assert!(d.can_redo(ORIGIN), "and the move is still redoable");
+    redo(&mut d);
+    assert_eq!(child_shapes(&d, b"sink"), vec!["<p>"]);
+}
+
+#[test]
+fn every_undo_leaves_exactly_one_redo() {
+    let mut d = doc(1);
+    let root = p(&[b"root"]);
+    let sink = p(&[b"sink"]);
+    path::xml_element(&mut d, &root, b"doc");
+    path::xml_element(&mut d, &sink, b"sink");
+    path::xml_insert_element(&mut d, &root, 0, b"p");
+    path::xml_move_child(&mut d, &root, 0, &sink, 0);
+
+    let mut undone = 0;
+    while d.undo(ORIGIN).is_some() {
+        undone += 1;
+    }
+    let mut redone = 0;
+    while d.redo(ORIGIN).is_some() {
+        redone += 1;
+    }
+    assert_eq!(
+        undone, redone,
+        "an intention whose inverses were all inert still owes a redo"
+    );
 }
 
 #[test]
@@ -1595,6 +1681,83 @@ fn committing_without_an_open_transaction_does_not_close_an_intention() {
     assert!(!d.can_undo(ORIGIN));
 }
 
+#[test]
+fn a_revival_in_one_zone_does_not_re_point_another_zones_delete() {
+    // An op is stamped from its own zone's clock, so two zones mint the same
+    // `Stamp`. A revival records the id its item came back under; keyed by the
+    // id alone it would re-point the *other* zone's delete at it.
+    let mut d = doc(1);
+    d.set_schema(
+        Schema::parse(
+            r#"{ "schema": "s", "version": 1, "root": "R",
+                 "types": { "R": { "kind": "map" } },
+                 "zones": { "west": "/west", "east": "/east" } }"#,
+        )
+        .expect("schema parses"),
+    );
+    let west = p(&[b"west", b"items"]);
+    let east = p(&[b"east", b"items"]);
+
+    path::list_insert(&mut d, &east, 0, b"E0");
+    path::register(&mut d, &p(&[b"west", b"x"]), Scalar::Int(1));
+    path::register(&mut d, &p(&[b"west", b"y"]), Scalar::Int(2));
+    path::list_insert(&mut d, &west, 0, b"W");
+    path::list_insert(&mut d, &east, 1, b"E1");
+    path::list_delete(&mut d, &west, 0);
+    assert!(list_vals(&d, &west).is_empty());
+
+    // Revives W under a fresh id, recording a substitution in the west zone.
+    undo(&mut d);
+    assert_eq!(list_vals(&d, &west), vec![b"W".to_vec()]);
+
+    // Now undo the east insert. Its inverse names an east id that happens to
+    // equal the west id the revival replaced.
+    undo(&mut d);
+    assert_eq!(
+        list_vals(&d, &east),
+        vec![b"E0".to_vec()],
+        "the east delete must reach E1, not the west revival"
+    );
+    assert_eq!(
+        list_vals(&d, &west),
+        vec![b"W".to_vec()],
+        "west is untouched"
+    );
+}
+
+#[test]
+fn an_inverse_onto_a_container_a_peer_displaced_is_dropped_not_emitted() {
+    let mut a = doc(1);
+    let mut b = Document::new(cid(2));
+    let root = p(&[b"root"]);
+    let setup = path::xml_element(&mut a, &root, b"doc");
+    apply_all(&mut b, &setup);
+    let fill = path::xml_insert_text(&mut a, &root, 0, "x");
+    apply_all(&mut b, &fill);
+
+    // A child delete emits only a ListDelete on the children sequence — no
+    // container-create rides along, so nothing in the intention can make the
+    // sequence reachable again.
+    let del = path::xml_child_delete(&mut a, &root, 0);
+    apply_all(&mut b, &del);
+    // The peer displaces the whole element out of its slot.
+    let displace = path::register(&mut b, &root, Scalar::Int(1));
+    apply_all(&mut a, &displace);
+
+    let ops = a.undo(ORIGIN).expect("the intention comes off the stack");
+    assert!(
+        ops.is_empty(),
+        "an op the author would apply to nothing is not emitted: a peer would \
+         buffer it and replay it once the container returned"
+    );
+    apply_all(&mut b, &ops);
+    assert_eq!(observe(&a), observe(&b));
+    assert!(
+        a.can_redo(ORIGIN),
+        "an intention whose inverses were all inert still owes a redo"
+    );
+}
+
 // --- a randomized undo/redo convergence property ---
 
 /// A small deterministic PRNG, so a failure names a reproducing seed.
@@ -1614,6 +1777,181 @@ impl Rng {
     }
 }
 
+#[test]
+fn a_reorder_redoes_to_the_same_order() {
+    for (count, from, to) in [(2usize, 1usize, 0usize), (3, 2, 0), (3, 0, 2)] {
+        let mut d = doc(1);
+        let root = p(&[b"root"]);
+        path::xml_element(&mut d, &root, b"doc");
+        for i in 0..count {
+            path::xml_insert_text(&mut d, &root, i, &i.to_string());
+        }
+        let before = child_shapes(&d, b"root");
+        path::xml_move_child(&mut d, &root, from, &root, to);
+        let moved = child_shapes(&d, b"root");
+        assert_ne!(before, moved, "the reorder moved something");
+
+        undo(&mut d);
+        assert_eq!(child_shapes(&d, b"root"), before, "undo restores the order");
+        redo(&mut d);
+        assert_eq!(child_shapes(&d, b"root"), moved, "redo restores it again");
+    }
+}
+
+/// Undoing every intention must land back on the state the edits started from,
+/// and redoing them all must land back on the state they ended at. Convergence
+/// alone cannot see this — two replicas lose the same content identically — so
+/// this oracle is what catches a replay that drops or reorders a step.
+#[test]
+fn undo_and_redo_round_trip_to_the_states_they_started_from() {
+    const KEYS: &[&[u8]] = &[b"a", b"b", b"c"];
+    for seed in 0..300u64 {
+        let mut rng = Rng(seed ^ 0x9E37_79B9_7F4A_7C15);
+        let mut d = doc(1);
+        let empty = deep_observe(&d);
+
+        let mut intentions = 0;
+        for _ in 0..40 {
+            let key = KEYS[rng.below(KEYS.len())];
+            let grouped = rng.below(4) == 0;
+            if grouped {
+                d.begin_intention();
+            }
+            let ops = random_edit(&mut d, key, &mut rng, false);
+            if grouped {
+                d.end_intention();
+            }
+            if !ops.is_empty() {
+                intentions += 1;
+            }
+        }
+        let filled = deep_observe(&d);
+
+        let mut undone = 0;
+        while d.undo(ORIGIN).is_some() {
+            undone += 1;
+        }
+        assert_eq!(
+            deep_observe(&d),
+            empty,
+            "seed {seed}: undoing everything must reach the starting state"
+        );
+
+        let mut redone = 0;
+        while d.redo(ORIGIN).is_some() {
+            redone += 1;
+        }
+        assert_eq!(
+            deep_observe(&d),
+            filled,
+            "seed {seed}: redoing everything must reach the state undo left"
+        );
+        assert_eq!(
+            undone, redone,
+            "seed {seed}: every undo owes exactly one redo"
+        );
+        assert!(
+            undone >= intentions.min(1),
+            "seed {seed}: nothing was recorded"
+        );
+    }
+}
+
+/// One random edit over `key`, across the op families the seam inverts.
+///
+/// `moves` admits `xml_move_child`. The convergence oracle takes it; the
+/// round-trip oracle does not, because a move's inverse re-derives its anchor
+/// from live state at each replay, so after unrelated structural edits to the
+/// same sequence its redo can land the node at a different index than the
+/// original move did. The node is never lost or duplicated and replicas still
+/// agree — it is a positional imprecision, not a correctness break — and the
+/// exact round trip of a reorder on its own is pinned by
+/// `a_reorder_redoes_to_the_same_order`.
+fn random_edit(d: &mut Document, key: &[u8], rng: &mut Rng, moves: bool) -> Vec<Op> {
+    let path = p(&[key]);
+    match rng.below(if moves { 11 } else { 10 }) {
+        0 => path::register(d, &path, Scalar::Int(rng.below(4) as i64)),
+        1 => path::inc(d, &path, rng.below(3) as u32 + 1),
+        2 => path::dec(d, &path, rng.below(3) as u32 + 1),
+        3 => path::delete(d, &path),
+        4 => path::text_insert(d, &path, 0, "xy"),
+        5 => {
+            let len = path::text_len(d, &path).unwrap_or(0);
+            path::text_delete(d, &path, 0, len.min(2))
+        }
+        6 => path::list_insert(d, &path, 0, b"i"),
+        7 => {
+            let len = path::list_len(d, &path).unwrap_or(0);
+            if len == 0 {
+                Vec::new()
+            } else {
+                path::list_delete(d, &path, rng.below(len))
+            }
+        }
+        8 => path::xml_element(d, &path, b"p"),
+        9 => {
+            let n = path::xml_children_len(d, &path).unwrap_or(0);
+            if rng.below(2) == 0 || n == 0 {
+                path::xml_insert_text(d, &path, n, "z")
+            } else {
+                path::xml_child_delete(d, &path, rng.below(n))
+            }
+        }
+        _ => {
+            let n = path::xml_children_len(d, &path).unwrap_or(0);
+            if n < 2 {
+                path::xml_insert_element(d, &path, n, b"q")
+            } else {
+                path::xml_move_child(d, &path, n - 1, &path, 0)
+            }
+        }
+    }
+}
+
+/// `observe`, but rendering each XML subtree to its full depth — a nested
+/// element that came back as an empty shell has to be distinguishable from the
+/// one that was deleted.
+fn deep_observe(d: &Document) -> Vec<String> {
+    let mut out = observe(d);
+    for key in path::map_keys(d, &p(&[])).unwrap_or_default() {
+        out.push(format!("{key:?}=tree:{}", render_tree(d, &key)));
+    }
+    out.sort();
+    out
+}
+
+fn render_tree(d: &Document, key: &[u8]) -> String {
+    match d.get(key) {
+        Some(Element::XmlElement(x)) => {
+            let (tag, kids) = {
+                let x = x.borrow();
+                (String::from_utf8_lossy(x.tag()).into_owned(), x.children())
+            };
+            format!("<{tag}>{}", render_children(&kids))
+        }
+        Some(Element::XmlFragment(f)) => format!("<>{}", render_children(&f.borrow().children())),
+        _ => String::new(),
+    }
+}
+
+fn render_children(list: &std::rc::Rc<std::cell::RefCell<crdtsync_core::List>>) -> String {
+    let vals = list.borrow().values();
+    vals.iter()
+        .map(|child| match child {
+            Element::XmlElement(x) => {
+                let (tag, kids) = {
+                    let x = x.borrow();
+                    (String::from_utf8_lossy(x.tag()).into_owned(), x.children())
+                };
+                format!("<{tag}>{}", render_children(&kids))
+            }
+            Element::Text(t) => format!("{:?}", t.borrow().as_string()),
+            other => format!("?{:?}", other.kind()),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Two replicas edit a shared key vocabulary and undo/redo their own
 /// intentions, exchanging every op they emit — an inverse included, since an
 /// inverse is an ordinary forward op. Whatever the mix, the two must agree.
@@ -1630,37 +1968,15 @@ fn undo_and_redo_converge_under_concurrent_editing() {
         for _ in 0..80 {
             let who = rng.below(2);
             let key = KEYS[rng.below(KEYS.len())];
-            let path = p(&[key]);
-            let ops = match rng.below(12) {
-                0 => path::register(&mut docs[who], &path, Scalar::Int(rng.below(4) as i64)),
-                1 => path::inc(&mut docs[who], &path, rng.below(3) as u32 + 1),
-                2 => path::dec(&mut docs[who], &path, rng.below(3) as u32 + 1),
-                3 => path::delete(&mut docs[who], &path),
-                4 => path::text_insert(&mut docs[who], &path, 0, "xy"),
-                5 => {
-                    let len = path::text_len(&docs[who], &path).unwrap_or(0);
-                    path::text_delete(&mut docs[who], &path, 0, len.min(2))
+            let ops = match rng.below(13) {
+                11 => docs[who].undo(ORIGIN).unwrap_or_default(),
+                12 => docs[who].redo(ORIGIN).unwrap_or_default(),
+                _ => {
+                    // Re-roll inside the shared generator, which covers the same
+                    // families plus tree moves.
+                    let mut inner = Rng(rng.next());
+                    random_edit(&mut docs[who], key, &mut inner, true)
                 }
-                6 => path::list_insert(&mut docs[who], &path, 0, b"i"),
-                7 => {
-                    let len = path::list_len(&docs[who], &path).unwrap_or(0);
-                    if len == 0 {
-                        Vec::new()
-                    } else {
-                        path::list_delete(&mut docs[who], &path, rng.below(len))
-                    }
-                }
-                8 => path::xml_element(&mut docs[who], &path, b"p"),
-                9 => {
-                    let n = path::xml_children_len(&docs[who], &path).unwrap_or(0);
-                    if rng.below(2) == 0 || n == 0 {
-                        path::xml_insert_text(&mut docs[who], &path, n, "z")
-                    } else {
-                        path::xml_child_delete(&mut docs[who], &path, rng.below(n))
-                    }
-                }
-                10 => docs[who].undo(ORIGIN).unwrap_or_default(),
-                _ => docs[who].redo(ORIGIN).unwrap_or_default(),
             };
             inflight[who].extend(ops);
             // Deliver a random prefix of the other side's backlog.
@@ -1683,6 +1999,62 @@ fn undo_and_redo_converge_under_concurrent_editing() {
             "seed {seed}: replicas diverged"
         );
     }
+}
+
+#[test]
+fn a_migration_drops_the_stack_but_keeps_recording() {
+    let mut d = doc(1);
+    path::register(&mut d, &p(&[b"old"]), Scalar::Int(1));
+    assert!(d.can_undo(ORIGIN));
+
+    // A rename rewrites the slot shape the recorded inverse names.
+    assert!(d.migrate_leaf_slots(|key| if key == b"old" {
+        SlotFate::Rename(b"new".to_vec())
+    } else {
+        SlotFate::Keep
+    }));
+    assert_eq!(path::get_register(&d, &p(&[b"new"])), Some(Scalar::Int(1)));
+    assert!(
+        !d.can_undo(ORIGIN),
+        "the stack drops at the migration boundary"
+    );
+
+    path::register(&mut d, &p(&[b"new"]), Scalar::Int(2));
+    assert!(d.can_undo(ORIGIN), "and recording continues past it");
+    undo(&mut d);
+    assert_eq!(path::get_register(&d, &p(&[b"new"])), Some(Scalar::Int(1)));
+}
+
+#[test]
+fn a_channel_keeps_recording_across_a_snapshot_catch_up() {
+    let mut author = Document::new(cid(9));
+    path::register(&mut author, &p(&[b"seed"]), Scalar::Int(1));
+
+    let mut s = ClientSession::new(cid(1));
+    let (ch, _) = s.subscribe(ROOM);
+    s.set_undo_origin(ch, ORIGIN);
+    s.edit(ch, |c| c.register(b"k", Scalar::Int(1)));
+    assert!(s.can_undo(ch, ORIGIN));
+
+    s.receive(Message::Snapshot {
+        channel: ch,
+        seq: 1,
+        state: author.encode_state(),
+    })
+    .unwrap();
+    assert_eq!(
+        channel_doc(&s, ch).undo_origin(),
+        Some(ORIGIN),
+        "adopting the server's state must not silently stop recording"
+    );
+
+    s.edit(ch, |c| c.register(b"after", Scalar::Int(2)));
+    assert!(s.can_undo(ch, ORIGIN));
+    s.undo(ch, ORIGIN).expect("the post-snapshot edit undoes");
+    assert_eq!(
+        path::get_register(channel_doc(&s, ch), &p(&[b"after"])),
+        None
+    );
 }
 
 // --- the UndoManager handle ---

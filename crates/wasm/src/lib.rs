@@ -845,19 +845,35 @@ impl ReplyTag {
             ReplyTag::VersionState { channel, name } => {
                 set(&obj, "kind", &JsValue::from_str("versionState"));
                 set(&obj, "channel", &JsValue::from_f64(*channel as f64));
-                set(&obj, "name", &js_sys::Uint8Array::from(name.as_slice()).into());
+                set(
+                    &obj,
+                    "name",
+                    &js_sys::Uint8Array::from(name.as_slice()).into(),
+                );
             }
             ReplyTag::Branches { room } => {
                 set(&obj, "kind", &JsValue::from_str("branches"));
-                set(&obj, "room", &js_sys::Uint8Array::from(room.as_slice()).into());
+                set(
+                    &obj,
+                    "room",
+                    &js_sys::Uint8Array::from(room.as_slice()).into(),
+                );
             }
             ReplyTag::Diff { room } => {
                 set(&obj, "kind", &JsValue::from_str("diff"));
-                set(&obj, "room", &js_sys::Uint8Array::from(room.as_slice()).into());
+                set(
+                    &obj,
+                    "room",
+                    &js_sys::Uint8Array::from(room.as_slice()).into(),
+                );
             }
             ReplyTag::Clone { dst } => {
                 set(&obj, "kind", &JsValue::from_str("clone"));
-                set(&obj, "dst", &js_sys::Uint8Array::from(dst.as_slice()).into());
+                set(
+                    &obj,
+                    "dst",
+                    &js_sys::Uint8Array::from(dst.as_slice()).into(),
+                );
             }
         }
         obj.into()
@@ -1193,7 +1209,13 @@ impl WasmClient {
     /// Insert a scalar item at a live index in the List at a path in `channel`'s
     /// room. Returns the Ops frame to send.
     #[wasm_bindgen(js_name = listInsert)]
-    pub fn list_insert(&mut self, channel: u32, path: &[u8], index: usize, value: &[u8]) -> Vec<u8> {
+    pub fn list_insert(
+        &mut self,
+        channel: u32,
+        path: &[u8],
+        index: usize,
+        value: &[u8],
+    ) -> Vec<u8> {
         self.ops_frame(channel, |d| path::list_insert(d, path, index, value))
     }
 
@@ -1839,7 +1861,11 @@ fn mark_result(id: Option<Vec<u8>>, ops: Vec<u8>) -> JsValue {
         None => JsValue::UNDEFINED,
     };
     set(&obj, "id", &id_val);
-    set(&obj, "ops", &js_sys::Uint8Array::from(ops.as_slice()).into());
+    set(
+        &obj,
+        "ops",
+        &js_sys::Uint8Array::from(ops.as_slice()).into(),
+    );
     obj.into()
 }
 

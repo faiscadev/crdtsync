@@ -909,8 +909,13 @@ func TestUndoConvergesOnAPeer(t *testing.T) {
 		t.Fatalf("peer want 5, got %d", v)
 	}
 	b.Apply(u.Undo(a))
-	if v, _ := b.GetCounter(path("votes")); v != 0 {
-		t.Fatalf("peer after undo want 0, got %d", v)
+	// The delta re-won the slot on the way in, so its inverse both cancels the
+	// tally and gives the slot back — an unset counter reads as absent.
+	if _, ok := a.GetCounter(path("votes")); ok {
+		t.Fatal("the author's slot should be empty after undo")
+	}
+	if _, ok := b.GetCounter(path("votes")); ok {
+		t.Fatal("and the peer's too")
 	}
 }
 

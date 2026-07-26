@@ -563,7 +563,7 @@ Inverse ops emit into the normal op stream. Ops that overwrite or delete state r
 
 An intention is one transact, one explicit begin/end intention group, or one atomic transaction — which undoes and redoes as one atomic transaction in turn. Manual begin / end intention covers explicit grouping (paste, paragraph break); auto-grouping on debounced gaps (>500ms idle = boundary by default) is an SDK concern, since core injects its clock rather than reading one.
 
-The stack lives in the **document** — so a channel's replica carries its own, and undo works identically offline and over a live connection — with the SDK holding only the origin tag. Offline editing produces undoable ops without network. Stack drops at migration boundaries.
+The stack lives in the **document** — so a channel's replica carries its own, and undo works identically offline and over a live connection — with the SDK holding only the origin tag. Offline editing produces undoable ops without network. The stack drops at a migration boundary and when a channel adopts a server snapshot — in both cases the recorded inverses describe slot shapes the document no longer has — while recording itself continues past either.
 
 ---
 
