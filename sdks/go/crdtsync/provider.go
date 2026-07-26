@@ -3,20 +3,18 @@ package crdtsync
 // Provider is the ergonomic, offline-first sync binding over a Doc's apply/emit
 // seam — the Go realization of the §SDK-Ergonomic-Surface provider model.
 //
-// Like the Python SDK, the Go SDK is embedded/offline-first: it owns no socket
-// loop, so the app supplies the transport. Bind a Doc with a send callback
-// (invoked with each local edit's ops to transmit) and feed a peer's ops to
-// Receive. The provider owns the connection state and an offline outbox, so
-// edits made while disconnected queue and flush in order on reconnect; inbound
-// ops apply and fire the doc's reactivity as "remote". A remote apply never
-// re-emits as a local edit, so a pair of linked providers can't loop.
+// This is the transport-agnostic seam: it owns no socket loop, so the app
+// supplies the transport. Bind a Doc with a send callback (invoked with each
+// local edit's ops to transmit) and feed a peer's ops to Receive. The provider
+// owns the connection state and an offline outbox, so edits made while
+// disconnected queue and flush in order on reconnect; inbound ops apply and fire
+// the doc's reactivity as "remote". A remote apply never re-emits as a local
+// edit, so a pair of linked providers can't loop.
 //
-// The fully-networked provider that owns a socket and backs the Doc with a
-// single wire-client replica (the JS connect(url, room) model, with awareness
-// and the operator-tier request/reply surface) is a documented follow-on shared
-// with Python: the Go Client wire surface does not yet expose the per-channel
-// list/text/scalar/map-key handle ops a single-replica networked handle graph
-// needs. Until then this seam plus the low-level Client cover sync.
+// Reach for it to sync over a transport crdtsync knows nothing about — a peer
+// mesh, a message bus, a test harness. To talk to a crdtsync server, use the
+// socket-owning NetProvider (Connect) instead, which handles the handshake,
+// catch-up, reconnect, awareness, and the server's signals.
 type Provider struct {
 	doc            *Doc
 	send           func([]byte)

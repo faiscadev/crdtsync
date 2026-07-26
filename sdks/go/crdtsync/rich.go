@@ -19,12 +19,16 @@ func sideFromString(side string) Side {
 // left-gravity, "after" right-gravity), resolved later with Resolve. Nil for a
 // bad or non-sequence path.
 func (l *CrdtList) RelativePosition(index int, side string) []byte {
+	l.doc.mu.Lock()
+	defer l.doc.mu.Unlock()
 	return l.doc.backend.RelativePosition(l.path, uint(index), sideFromString(side))
 }
 
 // Resolve resolves a captured cursor back to a live index. The bool is false
 // when it can't resolve.
 func (l *CrdtList) Resolve(pos []byte) (int, bool) {
+	l.doc.mu.Lock()
+	defer l.doc.mu.Unlock()
 	n, ok := l.doc.backend.ResolvePosition(l.path, pos)
 	return int(n), ok
 }
@@ -35,11 +39,15 @@ func (l *CrdtList) Resolve(pos []byte) (int, bool) {
 // left-gravity, "after" right-gravity). The cursor tracks its spot as text is
 // inserted and deleted around it. Nil for a bad path.
 func (t *CrdtText) RelativePosition(index int, side string) []byte {
+	t.doc.mu.Lock()
+	defer t.doc.mu.Unlock()
 	return t.doc.backend.RelativePosition(t.path, uint(index), sideFromString(side))
 }
 
 // Resolve resolves a captured cursor back to a live codepoint index.
 func (t *CrdtText) Resolve(pos []byte) (int, bool) {
+	t.doc.mu.Lock()
+	defer t.doc.mu.Unlock()
 	n, ok := t.doc.backend.ResolvePosition(t.path, pos)
 	return int(n), ok
 }
@@ -80,7 +88,7 @@ func (t *CrdtText) MarkWithGravity(start, end int, startSide, endSide, name stri
 		return nil, err
 	}
 	var markID []byte
-	t.doc.mutate(func(b *Document) []byte {
+	t.doc.mutate(func(b Backend) []byte {
 		id, ops := b.Mark(t.path, uint(start), sideFromString(startSide), uint(end), sideFromString(endSide), []byte(name), sc)
 		markID = id
 		return ops
@@ -95,19 +103,21 @@ func (t *CrdtText) SetMarkValue(markID []byte, value any) error {
 	if err != nil {
 		return err
 	}
-	t.doc.mutate(func(b *Document) []byte { return b.MarkSetValue(markID, sc) })
+	t.doc.mutate(func(b Backend) []byte { return b.MarkSetValue(markID, sc) })
 	return nil
 }
 
 // DeleteMark tombstones the mark markID.
 func (t *CrdtText) DeleteMark(markID []byte) {
-	t.doc.mutate(func(b *Document) []byte { return b.MarkDelete(markID) })
+	t.doc.mutate(func(b Backend) []byte { return b.MarkDelete(markID) })
 }
 
 // MarksAt reads the marks covering the character at index, each an ergonomic
 // MarkInfo.
 func (t *CrdtText) MarksAt(index int) []MarkInfo {
+	t.doc.mu.Lock()
 	raw := t.doc.backend.MarksAt(t.path, uint(index))
+	t.doc.mu.Unlock()
 	out := make([]MarkInfo, 0, len(raw))
 	for _, m := range raw {
 		out = append(out, markInfo(m))
@@ -130,20 +140,22 @@ type CrdtXml struct {
 // Element installs a tagged XML element at this slot; returns the handle for
 // chaining.
 func (x *CrdtXml) Element(tag string) *CrdtXml {
-	x.doc.mutate(func(b *Document) []byte { return b.XmlElement(x.path, []byte(tag)) })
+	x.doc.mutate(func(b Backend) []byte { return b.XmlElement(x.path, []byte(tag)) })
 	return x
 }
 
 // Fragment installs a tagless XML fragment at this slot; returns the handle.
 func (x *CrdtXml) Fragment() *CrdtXml {
-	x.doc.mutate(func(b *Document) []byte { return b.XmlFragment(x.path) })
+	x.doc.mutate(func(b Backend) []byte { return b.XmlFragment(x.path) })
 	return x
 }
 
 // Tag reads this element's tag. The bool is false for a fragment or an absent
 // node.
 func (x *CrdtXml) Tag() (string, bool) {
+	x.doc.mu.Lock()
 	t, ok := x.doc.backend.XmlTag(x.path)
+	x.doc.mu.Unlock()
 	if !ok {
 		return "", false
 	}
@@ -152,6 +164,8 @@ func (x *CrdtXml) Tag() (string, bool) {
 
 // Len returns the count of live children.
 func (x *CrdtXml) Len() int {
+	x.doc.mu.Lock()
+	defer x.doc.mu.Unlock()
 	n, _ := x.doc.backend.XmlChildrenLen(x.path)
 	return int(n)
 }
@@ -159,20 +173,20 @@ func (x *CrdtXml) Len() int {
 // InsertElement inserts a child element with tag at a live child index; returns
 // the handle.
 func (x *CrdtXml) InsertElement(index int, tag string) *CrdtXml {
-	x.doc.mutate(func(b *Document) []byte { return b.XmlInsertElement(x.path, uint(index), []byte(tag)) })
+	x.doc.mutate(func(b Backend) []byte { return b.XmlInsertElement(x.path, uint(index), []byte(tag)) })
 	return x
 }
 
 // InsertText inserts a text-run child holding text at a live child index;
 // returns the handle.
 func (x *CrdtXml) InsertText(index int, text string) *CrdtXml {
-	x.doc.mutate(func(b *Document) []byte { return b.XmlInsertText(x.path, uint(index), text) })
+	x.doc.mutate(func(b Backend) []byte { return b.XmlInsertText(x.path, uint(index), text) })
 	return x
 }
 
 // DeleteChild tombstones the child at a live index; returns the handle.
 func (x *CrdtXml) DeleteChild(index int) *CrdtXml {
-	x.doc.mutate(func(b *Document) []byte { return b.XmlChildDelete(x.path, uint(index)) })
+	x.doc.mutate(func(b Backend) []byte { return b.XmlChildDelete(x.path, uint(index)) })
 	return x
 }
 
@@ -180,7 +194,7 @@ func (x *CrdtXml) DeleteChild(index int) *CrdtXml {
 // children — an identity-preserving tree move; returns the handle.
 func (x *CrdtXml) Move(childIndex int, newParent *CrdtXml, destIndex int) *CrdtXml {
 	dest := newParent.path
-	x.doc.mutate(func(b *Document) []byte {
+	x.doc.mutate(func(b Backend) []byte {
 		return b.XmlMove(x.path, uint(childIndex), dest, uint(destIndex))
 	})
 	return x
