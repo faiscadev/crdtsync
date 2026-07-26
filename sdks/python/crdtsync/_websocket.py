@@ -1,16 +1,15 @@
 """A minimal RFC 6455 WebSocket client, over the standard library only.
 
-The SDK ships no third-party dependency, so the networked provider carries the
-slice of the protocol a crdtsync connection uses: a client-side upgrade
-handshake, binary data frames (masked outbound, as a client must), and the
-control frames a peer may interleave — ping answered with a pong, close
-answered and then reported as end-of-stream. Text frames never appear on the
-wire protocol and are refused.
+It carries the slice of the protocol a crdtsync connection uses: a client-side
+upgrade handshake, binary data frames (masked outbound, as a client must), and
+the control frames a peer may interleave — a ping answered with a pong, a close
+answered and then reported as end-of-stream. A text frame never appears on the
+wire protocol and is refused, as is anything else outside that slice.
 
 The transport is a plain blocking socket: :meth:`WebSocket.recv` blocks until a
 message arrives, and :meth:`WebSocket.close` shuts the socket down so a blocked
-reader returns. Sends are serialized, so the reader thread's pong and an
-application thread's data frame cannot interleave on the wire.
+reader returns. Reads and writes run on different threads; writes are serialized
+against each other and bounded, so neither can hold the other off indefinitely.
 """
 
 from __future__ import annotations
@@ -76,7 +75,6 @@ def connect(
     url: str,
     *,
     timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
-    keepalive_idle: int = DEFAULT_KEEPALIVE_IDLE,
     send_timeout: int = DEFAULT_SEND_TIMEOUT,
     headers: Optional[Dict[str, str]] = None,
 ) -> "WebSocket":
@@ -95,13 +93,14 @@ def connect(
 
     # The Host header names the origin only: any userinfo in the URL is a
     # credential, and echoing it into a header would both break the request and
-    # leak it.
-    host = parts.hostname if parts.port is None else f"{parts.hostname}:{parts.port}"
+    # leak it. Taken from the netloc rather than rebuilt from the hostname, which
+    # has had an IPv6 literal's brackets stripped.
+    host = parts.netloc.rpartition("@")[2]
 
     sock = socket.create_connection((parts.hostname, port), timeout=timeout)
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        _enable_keepalive(sock, keepalive_idle)
+        _enable_keepalive(sock, DEFAULT_KEEPALIVE_IDLE)
         _bound_sends(sock, send_timeout)
         if scheme == "wss":
             context = ssl.create_default_context()

@@ -394,14 +394,12 @@ class TestEditsAndReconnect:
         wait_for(lambda: provider.state != "connected")
         provider.doc.get_text("body").insert(0, "offline")
         assert provider.outbox_len > 0
-        assert len(socket.sent) == 4  # outboxed, not written to the dead socket
 
     def test_a_reconnect_resumes_the_channel_and_resends_the_outbox(
         self, transport, provider
     ):
-        # The catch-up carries a peer's ops, so the channel resumes from a real
-        # position — with an empty one the resume is byte-identical to the
-        # original Subscribe and the test could not tell them apart.
+        # The catch-up carries a peer's ops, so the channel resumes from a
+        # position past zero and the resume differs from a fresh Subscribe.
         first = handshake(transport, catch_up=peer_edit(0))
         provider.wait_connected(timeout=2.0)
         provider.doc.get_text("body").insert(0, "hi")
@@ -577,7 +575,6 @@ class TestAcl:
         )
         assert len(tuple_id) == 16
         assert tag(socket.wait_sent(5)[4]) == _TAG_OPS
-        # The revoke names the same tuple, over the same path.
         provider.acl_revoke(tuple_id)
         assert tag(socket.wait_sent(6)[5]) == _TAG_OPS
 

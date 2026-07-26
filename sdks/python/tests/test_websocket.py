@@ -1,10 +1,9 @@
 """The bundled RFC 6455 client, against a raw loopback server.
 
-The provider's transport is hand-rolled so the SDK carries no dependency, which
-makes the framing its own spec: the upgrade handshake, the three payload-length
-encodings, fragmentation, interleaved control frames, masking in both
-directions, and the malformed frames that must be refused rather than
-misinterpreted."""
+The framing is the SDK's own, so it is spec'd here directly: the upgrade
+handshake, the three payload-length encodings, fragmentation, interleaved
+control frames, masking in both directions, the size ceilings, and the
+malformed frames that must be refused rather than misinterpreted."""
 
 import base64
 import hashlib
@@ -214,8 +213,6 @@ class TestFraming:
         server = serve(handler)
         ws = _websocket.connect(server.url)
         assert ws.recv() == b"ab"
-        # Waited for, not read off the server thread after the fact: an assertion
-        # that races the handler reports a missing pong as a pass.
         assert ponged.wait(2.0)
         ws.close()
         assert server.error is None
@@ -324,11 +321,15 @@ class TestClose:
         # writer holds the send order while it writes — so an unbounded write is
         # an unbounded stall for everything behind it.
         stop = threading.Event()
-        ws = _websocket.connect(serve(lambda conn: stop.wait(10)).url, send_timeout=1)
+        ws = _websocket.connect(serve(lambda conn: stop.wait(60)).url, send_timeout=1)
         try:
+            started = time.monotonic()
             with pytest.raises(WebSocketError, match="send failed"):
                 for _ in range(400):
                     ws.send(b"x" * 1_000_000)
+            # The peer never closes, so only the send bound can end this — a test
+            # that let the peer hang up would pass with no bound at all.
+            assert time.monotonic() - started < 10
             # A write that stopped part-way left a truncated frame on the wire,
             # so the connection is finished rather than merely slow.
             assert ws.closed

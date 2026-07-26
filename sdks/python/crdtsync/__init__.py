@@ -2672,13 +2672,10 @@ class CrdtList:
         return iter(self._doc._read(self._items))
 
     def _items(self, backend) -> List[object]:
-        items = []
-        for i in range(self._length(backend)):
-            raw = backend.list_get(self._self, i)
-            if raw is None:
-                break  # the list ended short of its length; report the prefix
-            items.append(_decode_value(raw))
-        return items
+        return [
+            _decode_value(backend.list_get(self._self, i))
+            for i in range(self._length(backend))
+        ]
 
     def _length(self, backend) -> int:
         return backend.list_len(self._self) or 0
@@ -3092,17 +3089,18 @@ class Doc:
                     self._publish_repairs(repairs)
             return ops
 
-    def _fold_remote(self, receive: Callable[[], None]):
-        """Fold a provider-driven inbound frame into the replica, returning the
-        reactivity it produced for the caller to publish once the frame's other
-        work is done. Publishing here would run application listeners while the
-        replica lock is held, and a listener that edits reaches for the author's
-        gate — inverting the two locks against every application thread."""
+    def _fold_remote(self, receive: Callable[[], object]):
+        """Fold a provider-driven inbound frame into the replica, returning what
+        ``receive`` reported plus the reactivity the fold produced, for the caller
+        to publish once the frame's other work is done. Publishing here would run
+        application listeners while the replica lock is held, and a listener that
+        edits reaches for the author's gate — inverting the two locks against
+        every application thread."""
         with self._lock:
             before = self._backend.encode_state() if self._observing() else None
-            receive()
+            outcome = receive()
             changes = self._collect(before) if before is not None else []
-            return changes, self._take_repairs()
+            return outcome, changes, self._take_repairs()
 
     def _publish_remote(self, changes: List[Tuple[bytes, dict]], repairs: List[list]) -> None:
         self._publish("remote", b"", changes)
@@ -3278,6 +3276,13 @@ _MIN_RECONNECT_DELAY = 0.01
 _EMPTY_OPS_FRAME = 5
 
 
+def _carries_ops(frame: bytes) -> bool:
+    """Whether a framed edit actually carries any. The client seat frames every
+    call, including one that matched nothing, where the document seat returns
+    nothing at all — so this is what keeps the two seats behaving alike."""
+    return len(frame) > _EMPTY_OPS_FRAME
+
+
 def _protocol_header() -> bytes:
     """The 8-byte header a client writes once, before its Hello, to open a
     connection at this SDK's protocol version."""
@@ -3299,10 +3304,9 @@ class _ClientBackend:
 
     @staticmethod
     def _framed(frame: bytes) -> bytes:
-        """An edit that matched nothing still frames — the frame simply carries
-        no ops. Report that as no edit, exactly as a local document does, so an
-        inert call neither reaches the wire nor fires an update."""
-        return frame if len(frame) > _EMPTY_OPS_FRAME else b""
+        """Report an edit that matched nothing as no edit, so an inert call
+        neither reaches the wire nor fires an update."""
+        return frame if _carries_ops(frame) else b""
 
     def get_scalar(self, path: Path) -> Optional[bytes]:
         with self._lock:
@@ -3454,11 +3458,11 @@ class Provider:
     returns.
 
     Callbacks — doc reactivity, :meth:`on_state`, and the server-signal hooks —
-    run on the provider's reader thread while it holds the replica, so a callback
-    should return promptly and must not block waiting on another thread that
-    touches the doc. One that raises is reported and the connection carries on.
-    Closing is the caller's job: the provider keeps a thread and a socket until
-    :meth:`close`.
+    run on the provider's reader thread, holding none of its locks, so one is
+    free to read or edit the doc. It is the thread draining the socket, though,
+    so a callback that does not return promptly stalls everything the room sends.
+    One that raises is reported and the connection carries on. Closing is the
+    caller's job: the provider keeps a thread and a socket until :meth:`close`.
     """
 
     def __init__(
@@ -3625,8 +3629,8 @@ class Provider:
                     effect=effect,
                 )
             if tuple_id is None:
-                raise ValueError("crdtsync: the acl grant was refused as malformed")
-            self._send_if_open(_ClientBackend._framed(frame))
+                raise ValueError("crdtsync: the room's channel is not held")
+            self._send_edit(frame)
         return tuple_id
 
     def acl_revoke(self, tuple_id: bytes) -> None:
@@ -3635,7 +3639,7 @@ class Provider:
         with self._send_lock:
             with self._lock:
                 frame = self._client.acl_revoke(self._channel, tuple_id)
-            self._send_if_open(_ClientBackend._framed(frame))
+            self._send_edit(frame)
 
     def awareness(self, actor: bytes, key: Key) -> Optional[bytes]:
         """A peer's awareness entry by publishing ``actor`` and ``key``, or
@@ -3649,7 +3653,8 @@ class Provider:
             return self._client.awareness_len(self._channel)
 
     def close(self) -> None:
-        """Close the connection and stop reconnecting. Idempotent."""
+        """Close the connection and stop reconnecting. Idempotent. Returns once
+        the socket is shut down; a dial already in flight unwinds behind it."""
         if self._closed:
             return
         self._closed = True
@@ -3740,10 +3745,6 @@ class Provider:
             self._ws = ws
             self._phase = "auth"
 
-    def _set_phase(self, phase: str) -> None:
-        with self._send_lock:
-            self._phase = phase
-
     def _open(self, ws) -> None:
         with self._lock:
             hello = self._client.hello()
@@ -3808,7 +3809,8 @@ class Provider:
                 # The replica persists across the drop; deltas stream as ops.
                 self._mark_connected()
             else:
-                self._set_phase("catchup")
+                with self._send_lock:
+                    self._phase = "catchup"
             return
 
         # Bracket the fold so the doc's diff-based reactivity fires for inbound
@@ -3816,9 +3818,9 @@ class Provider:
         # reactivity is deferred to the end, because that is the app's code and a
         # listener that raises must not cost this frame its signal drain or the
         # connection its initial sync.
-        folded: List[Tuple[bool, Optional[ErrorCode]]] = []
-        changes, repairs = self.doc._fold_remote(lambda: folded.append(self._receive(data)))
-        applied, err = folded[0] if folded else (False, None)
+        (applied, err), changes, repairs = self.doc._fold_remote(
+            lambda: self._receive(data)
+        )
         if err is not None:
             self._handle_server_error(err)
             if self._closed:  # the error was fatal — this socket is finished
@@ -3906,6 +3908,12 @@ class Provider:
             if self._phase != "ready":
                 return
             self._write(frame)
+
+    def _send_edit(self, frame: bytes) -> None:
+        """Write an authored frame unless it carries no ops — an edit that
+        matched nothing is not an edit."""
+        if _carries_ops(frame):
+            self._send_if_open(frame)
 
     def _write(self, frame: bytes) -> None:
         with self._send_lock:
