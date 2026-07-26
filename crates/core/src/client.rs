@@ -422,14 +422,16 @@ impl ClientSession {
     /// `origin` has nothing to undo.
     pub fn undo(&mut self, channel: Channel, origin: &[u8]) -> Option<Message> {
         let ops = self.rooms.get_mut(&channel)?.doc.undo(origin)?;
-        self.enqueue_ops(channel, ops)
+        // An intention whose inverses were all subsumed emits nothing; framing it
+        // would put an empty batch on the wire and in the outbox.
+        (!ops.is_empty()).then(|| self.enqueue_ops(channel, ops))?
     }
 
     /// Replay `origin`'s most recently undone intention on `channel` and frame
     /// the ops to send. `None` under the same conditions as [`undo`](Self::undo).
     pub fn redo(&mut self, channel: Channel, origin: &[u8]) -> Option<Message> {
         let ops = self.rooms.get_mut(&channel)?.doc.redo(origin)?;
-        self.enqueue_ops(channel, ops)
+        (!ops.is_empty()).then(|| self.enqueue_ops(channel, ops))?
     }
 
     /// Publish an ephemeral awareness entry on `channel`'s room, returning the

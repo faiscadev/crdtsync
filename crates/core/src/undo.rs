@@ -36,6 +36,8 @@ use crate::list::Anchor;
 use crate::op::{Op, OpKind};
 use crate::ranged::RangeAnchor;
 use crate::scalar::Scalar;
+use crate::stamp::Stamp;
+use std::collections::HashMap;
 
 /// How deep a subtree snapshot descends. A delete of a composite sequence node
 /// captures its subtree so an undo can rebuild it; past this depth the capture
@@ -69,18 +71,39 @@ pub(crate) enum Snap {
     },
 }
 
-/// One inverse action: what to emit to undo a single recorded op. Most are a
-/// lone forward op; the two revivals need the document to mint an id first and
-/// then rebuild under it, so they carry a snapshot instead of a fixed op.
+/// One inverse action: what to emit to undo a single recorded op.
+///
+/// Most are a lone forward op. The revivals are not: the op log has no
+/// un-tombstone, so bringing a deleted item back mints a *fresh* id, and the
+/// document has to know both what to rebuild and which id the new one replaces
+/// — an intention still on the stack names the ids its own edit minted, so a
+/// later replay has to follow the substitution.
 pub(crate) enum Step {
     /// Emit `kind` against `target`.
     Op { target: ElementId, kind: OpKind },
+    /// Re-insert `value` in the sequence `list` at `anchor`, replacing the
+    /// deleted node `was`.
+    ReviveItem {
+        list: ElementId,
+        anchor: Anchor,
+        value: Scalar,
+        was: Stamp,
+    },
+    /// Re-insert `s` in the text `text` at `anchor`, replacing the deleted
+    /// codepoints `was` (in sequence order).
+    ReviveRun {
+        text: ElementId,
+        anchor: Anchor,
+        s: String,
+        was: Vec<Stamp>,
+    },
     /// Re-create a deleted sequence node in the children list `list` at
-    /// `anchor`, rebuilding its subtree.
-    Revive {
+    /// `anchor`, rebuilding its subtree, replacing the deleted node `was`.
+    ReviveNode {
         list: ElementId,
         anchor: Anchor,
         node: Snap,
+        was: Stamp,
     },
     /// Re-create a deleted RangedElement over the same span, rebuilding its
     /// payload.
@@ -128,6 +151,13 @@ pub(crate) struct History {
     replaying: bool,
     undo: Vec<Intention>,
     redo: Vec<Intention>,
+    /// Sequence ids a revival re-minted, old id → the id it came back with. A
+    /// tombstone is terminal, so undoing a delete re-inserts the value under a
+    /// *fresh* id — while the intentions still stacked beneath name the ids their
+    /// own edit minted. Following the substitution is what makes a second undo
+    /// ("type, delete, undo, undo") reach the revived characters instead of
+    /// leaving them behind.
+    revived: HashMap<Stamp, Stamp>,
 }
 
 impl Default for History {
@@ -140,6 +170,7 @@ impl Default for History {
             replaying: false,
             undo: Vec::new(),
             redo: Vec::new(),
+            revived: HashMap::new(),
         }
     }
 }
@@ -155,20 +186,43 @@ impl History {
         self.origin.as_deref()
     }
 
-    /// Record under `origin` from now on, discarding any half-open intention
-    /// from a previous one.
+    /// Record under `origin` from now on. An intention in progress belongs to the
+    /// origin that opened it, so switching closes it rather than dropping it —
+    /// an edit that was recorded must stay undoable by whoever recorded it.
     pub(crate) fn track(&mut self, origin: &[u8]) {
         if self.origin.as_deref() != Some(origin) {
-            self.open.clear();
+            self.close(false);
         }
         self.origin = Some(origin.to_vec());
     }
 
-    /// Stop recording, discarding the intention in progress. The closed stacks
-    /// are kept — an app that pauses recording can still undo what it recorded.
+    /// Stop recording. The intention in progress closes under the origin that
+    /// opened it, and the closed stacks are kept — an app that pauses recording
+    /// can still undo everything it recorded.
     pub(crate) fn untrack(&mut self) {
+        self.close(false);
         self.origin = None;
-        self.open.clear();
+    }
+
+    /// The id `id` came back as, following a chain of revivals. Bounded by the
+    /// chain length, and a cycle (unreachable — a revival always mints a fresh,
+    /// strictly later id) exits at the bound rather than spinning.
+    pub(crate) fn current(&self, id: Stamp) -> Stamp {
+        let mut id = id;
+        for _ in 0..self.revived.len() {
+            match self.revived.get(&id) {
+                Some(&next) if next != id => id = next,
+                _ => break,
+            }
+        }
+        id
+    }
+
+    /// Record that `was` came back as `now`.
+    pub(crate) fn substitute(&mut self, was: Stamp, now: Stamp) {
+        if was != now {
+            self.revived.insert(was, now);
+        }
     }
 
     /// Add an inverse to the intention in progress.
