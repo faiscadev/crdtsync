@@ -293,3 +293,146 @@ fn a_tx_textinsert_at_the_lamport_ceiling_keeps_every_codepoint() {
         "codepoints must not collapse to one char_id"
     );
 }
+
+/// The live length of the List in a top-level slot.
+fn list_len(d: &Document, key: &[u8]) -> usize {
+    match d.get(key) {
+        Some(Element::List(l)) => l.borrow().len(),
+        _ => panic!("slot holds no list"),
+    }
+}
+
+/// The text in a top-level slot.
+fn text(d: &Document, key: &[u8]) -> String {
+    match d.get(key) {
+        Some(Element::Text(t)) => t.borrow().as_string(),
+        _ => panic!("slot holds no text"),
+    }
+}
+
+/// A slot inside the nested map at `key`.
+fn nested(d: &Document, key: &[u8], slot: &[u8]) -> Option<Scalar> {
+    match d.get(key) {
+        Some(Element::Map(m)) => match m.borrow().get(slot) {
+            Some(Element::Register(r)) => Some(r.borrow().read().clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The op set that displaces a group's own container: `a` opens a sequence at a
+/// slot `b`'s concurrent register then wins, and `a` later re-creates the
+/// sequence at a higher stamp, taking the slot back. Returns `(b`'s register,
+/// the losing group, the winning group)`.
+fn displaced_group<F>(edit: F) -> (Document, Document, Vec<Op>, Vec<Op>, Vec<Op>)
+where
+    F: Fn(&mut Document, u8) -> Vec<Op>,
+{
+    let mut a = doc(1);
+    let mut b = doc(2);
+    // Same lamport, higher client: b's register beats a's first create.
+    let reg = b.atomic_transact(|tx| {
+        tx.register(b"k", Scalar::Int(7));
+    });
+    let losing = edit(&mut a, 1);
+    for op in &reg {
+        a.apply(op);
+    }
+    // Now stamped above the register, so this create takes the slot back.
+    let winning = edit(&mut a, 2);
+    (a, b, reg, losing, winning)
+}
+
+#[test]
+fn a_group_member_survives_its_own_create_losing_the_slot() {
+    let (a, mut b, _reg, losing, winning) = displaced_group(|d, n| {
+        d.atomic_transact(|tx| {
+            tx.list(b"k").insert(0, Scalar::Int(n as i64));
+        })
+    });
+    for op in losing.iter().chain(winning.iter()) {
+        b.apply(op);
+    }
+    // Both replicas folded in every op — the loss is not a buffered-forever
+    // artifact, it is an insert that applied into a displaced sequence and
+    // vanished.
+    assert_eq!(
+        a.seen().count(),
+        b.seen().count(),
+        "both replicas applied the same ops"
+    );
+    assert_eq!(list_len(&a, b"k"), 2, "the author holds both inserts");
+    assert_eq!(list_len(&b, b"k"), list_len(&a, b"k"), "list diverged");
+}
+
+#[test]
+fn a_group_text_member_survives_its_own_create_losing_the_slot() {
+    let (a, mut b, _reg, losing, winning) = displaced_group(|d, n| {
+        let s = if n == 1 { "x" } else { "y" };
+        d.atomic_transact(|tx| {
+            tx.text(b"k").insert(0, s);
+        })
+    });
+    for op in losing.iter().chain(winning.iter()) {
+        b.apply(op);
+    }
+    assert_eq!(a.seen().count(), b.seen().count());
+    assert_eq!(text(&a, b"k"), "yx", "the author holds both runs");
+    assert_eq!(text(&b, b"k"), text(&a, b"k"), "text diverged");
+}
+
+#[test]
+fn a_group_map_member_survives_its_own_create_losing_the_slot() {
+    let (a, mut b, _reg, losing, winning) = displaced_group(|d, n| {
+        let slot = if n == 1 { b"x".to_vec() } else { b"y".to_vec() };
+        d.atomic_transact(move |tx| {
+            tx.map(b"k").register(&slot, Scalar::Int(n as i64));
+        })
+    });
+    for op in losing.iter().chain(winning.iter()) {
+        b.apply(op);
+    }
+    assert_eq!(a.seen().count(), b.seen().count());
+    assert_eq!(nested(&a, b"k", b"x"), Some(Scalar::Int(1)));
+    assert_eq!(
+        nested(&b, b"k", b"x"),
+        nested(&a, b"k", b"x"),
+        "nested slot diverged"
+    );
+}
+
+#[test]
+fn a_member_waiting_on_an_outside_op_does_not_hold_back_its_group() {
+    let mut a = doc(1);
+    let mut b = doc(2);
+    let insert = a.transact(|tx| {
+        tx.list(b"k").insert(0, Scalar::Int(1));
+    });
+    let node = match a.get(b"k") {
+        Some(Element::List(l)) => l.borrow().node_ids(0, 1)[0],
+        _ => panic!("no list"),
+    };
+    // One group both writes a register and deletes a node whose insert is still
+    // in flight. The delete has nothing to remove yet, so it waits — on its own.
+    let group = a.atomic_transact(|tx| {
+        tx.register(b"r", Scalar::Int(9));
+        tx.list(b"k").delete_id(node);
+    });
+    for op in &group {
+        b.apply(op);
+    }
+    assert_eq!(
+        reg(&b, b"r"),
+        Some(Scalar::Int(9)),
+        "an applicable member commits with its group"
+    );
+
+    // The insert arrives; the held delete drains behind it, so the node is gone
+    // exactly as on the author.
+    for op in &insert {
+        b.apply(op);
+    }
+    assert_eq!(list_len(&a, b"k"), 0);
+    assert_eq!(list_len(&b, b"k"), 0, "the held delete never landed");
+}

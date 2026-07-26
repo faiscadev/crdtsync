@@ -2297,9 +2297,24 @@ impl Document {
             // lands after it.
             if let Some(mut members) = self.take_complete_tx() {
                 members.sort_by_key(|op| op.id.seq);
-                for op in &members {
-                    self.buffered.remove(&op.id);
-                    self.apply_now(op);
+                for mut op in members {
+                    // Every applied op still passes the ordinary readiness gate:
+                    // routing drops a mutation whose container is displaced, so a
+                    // member waved through by the group gate — its target created
+                    // by an earlier member whose create then lost the slot — would
+                    // silently lose its effect while a replica that saw the group
+                    // against an installed container kept it. A member that is not
+                    // ready is held instead, untagged, and drains with the ordinary
+                    // buffer once its container is installed. An unresolvable target
+                    // is exactly what makes the member unobservable, so holding it
+                    // leaves the group's all-or-nothing view intact.
+                    if self.ready(&op) {
+                        self.buffered.remove(&op.id);
+                        self.apply_now(&op);
+                    } else {
+                        op.tx = None;
+                        self.buffer.push(op);
+                    }
                 }
                 progressed = true;
             }
@@ -2374,9 +2389,15 @@ impl Document {
         }
     }
 
-    /// Remove and return the members of one atomic transaction whose whole group
-    /// is buffered and whose external dependencies resolve — or `None` if no
-    /// buffered transaction is ready to commit.
+    /// Remove and return the members of one buffered atomic transaction whose
+    /// whole group has arrived — or `None` if none is complete. Completeness is
+    /// the only group-level gate: a member's own dependencies are the readiness
+    /// gate's business at the moment it applies, so a member waiting on something
+    /// outside the group holds only itself, never its group-mates. Gating the
+    /// whole group on every member resolving instead made commit a window a group
+    /// could miss — a transiently displaced container blocked members that were
+    /// perfectly applicable, and whether the window was hit depended on arrival
+    /// order, so the same ops folded to different states.
     fn take_complete_tx(&mut self) -> Option<Vec<Op>> {
         let mut groups: HashMap<(ClientId, TxId), Vec<usize>> = HashMap::new();
         for (i, op) in self.buffer.iter().enumerate() {
@@ -2384,161 +2405,17 @@ impl Document {
                 groups.entry((op.id.client, tx.id)).or_default().push(i);
             }
         }
-        let ready = groups.into_values().find(|idxs| {
-            let members: Vec<&Op> = idxs.iter().map(|&i| &self.buffer[i]).collect();
-            let count = members[0].tx.as_ref().map_or(0, |tx| tx.count) as usize;
-            members.len() == count && self.tx_group_ready(&members)
+        let complete = groups.into_values().find(|idxs| {
+            let count = self.buffer[idxs[0]]
+                .tx
+                .as_ref()
+                .map_or(0, |tx| tx.count as usize);
+            idxs.len() == count
         })?;
         // Remove in descending index order so earlier indices stay valid.
-        let mut idxs = ready;
+        let mut idxs = complete;
         idxs.sort_unstable_by(|a, b| b.cmp(a));
         Some(idxs.into_iter().map(|i| self.buffer.remove(i)).collect())
-    }
-
-    /// Whether a whole transaction can commit: every member either targets a
-    /// container reachable now or one an earlier member creates, and every delete
-    /// removes a node present now or inserted by an earlier member. Intra-group
-    /// dependencies are satisfied by seq-order application, so they are counted
-    /// as met here.
-    fn tx_group_ready(&self, members: &[&Op]) -> bool {
-        let mut ordered: Vec<&Op> = members.to_vec();
-        ordered.sort_by_key(|op| op.id.seq);
-        let mut created: HashSet<ElementId> = HashSet::new();
-        let mut inserted: HashSet<Stamp> = HashSet::new();
-        // Movable node ids a member inserts, so a later member's move of one is
-        // judged ready — a move whose node has not yet been materialised must
-        // wait, or apply_move drops it silently.
-        let mut movable: HashSet<ElementId> = HashSet::new();
-        // RangedElement ids a member creates, so a later member's payload change or
-        // delete of one is judged ready — else the group would commit and the
-        // change would apply against a missing entry and be lost.
-        let mut created_ranged: HashSet<ElementId> = HashSet::new();
-        // ACL tuple ids a member grants, so a later member's revoke of one is
-        // judged ready — else the group commits and the revoke applies against a
-        // missing entry and is lost.
-        let mut created_acl: HashSet<ElementId> = HashSet::new();
-        for op in &ordered {
-            // An XmlInsertChild / XmlMove / ListDelete commits into a
-            // materialised-but-displaced sequence (see `ready`), so a displaced
-            // parent does not stall the group and the move / delete still lands in
-            // the log — else the group would fold to different trees by arrival
-            // order.
-            let target_ok = match &op.kind {
-                OpKind::XmlInsertChild { .. }
-                | OpKind::XmlMove { .. }
-                | OpKind::ListDelete { .. } => {
-                    self.lists.contains_key(&op.target) || created.contains(&op.target)
-                }
-                _ => self.resolvable(op.target) || created.contains(&op.target),
-            };
-            if !target_ok {
-                return false;
-            }
-            match &op.kind {
-                OpKind::MapCreate { key } => {
-                    created.insert(ElementId::derive(op.target, key, ElementKind::Map));
-                }
-                OpKind::ListCreate { key } => {
-                    created.insert(ElementId::derive(op.target, key, ElementKind::List));
-                }
-                OpKind::TextCreate { key } => {
-                    created.insert(ElementId::derive(op.target, key, ElementKind::Text));
-                }
-                // An XML create installs a node whose attrs Map and children List
-                // are the containers a later member of the same transaction
-                // targets, so mark those reachable — not the node id itself,
-                // which no op addresses directly.
-                OpKind::XmlElementCreate { key, tag } => {
-                    let node = XmlElement::node_id(op.target, key, tag);
-                    created.insert(XmlElement::attrs_id(node));
-                    created.insert(XmlElement::children_id(node));
-                }
-                OpKind::XmlFragmentCreate { key } => {
-                    let node = XmlFragment::node_id(op.target, key);
-                    created.insert(XmlFragment::children_id(node));
-                }
-                OpKind::XmlInsertChild { tag, .. } => {
-                    // The node stamp so a later delete finds it, plus the child's
-                    // targetable ids so a later member editing it is satisfied.
-                    inserted.insert(op.stamp);
-                    let kind = if tag.is_some() {
-                        ElementKind::XmlElement
-                    } else {
-                        ElementKind::Text
-                    };
-                    let child = xml_child_id(op.target, op.stamp, kind);
-                    movable.insert(child);
-                    if tag.is_some() {
-                        created.insert(XmlElement::attrs_id(child));
-                        created.insert(XmlElement::children_id(child));
-                    } else {
-                        created.insert(child);
-                    }
-                }
-                OpKind::ListInsert { .. } => {
-                    inserted.insert(op.stamp);
-                }
-                OpKind::TextInsert { s, .. } => {
-                    for k in 0..s.chars().count() as u64 {
-                        inserted.insert(op.stamp.run_member(k));
-                    }
-                }
-                OpKind::ListDelete { id } => {
-                    let present = inserted.contains(id)
-                        || self
-                            .lists
-                            .get(&op.target)
-                            .is_some_and(|l| l.borrow().contains(*id));
-                    if !present {
-                        return false;
-                    }
-                }
-                OpKind::TextDelete { ids } => {
-                    let present = ids.iter().all(|id| {
-                        inserted.contains(id)
-                            || self
-                                .texts
-                                .get(&op.target)
-                                .is_some_and(|t| t.borrow().contains(*id))
-                    });
-                    if !present {
-                        return false;
-                    }
-                }
-                OpKind::XmlMove { node, .. } => {
-                    // The moved node must already exist or be inserted by an
-                    // earlier member — else the group would commit and apply_move
-                    // would drop the move against a not-yet-materialised node.
-                    if !self.placements.contains_key(node) && !movable.contains(node) {
-                        return false;
-                    }
-                }
-                OpKind::RangedCreate { payload, .. } => {
-                    let rid = ranged_id(op.stamp);
-                    created_ranged.insert(rid);
-                    // A composite create installs the payload container a later
-                    // member may target — mark it reachable within the group.
-                    if let RangedInit::Composite(kind) = payload {
-                        created.insert(payload_id(rid, *kind));
-                    }
-                }
-                OpKind::RangedSetPayload { id, .. } | OpKind::RangedDelete { id } => {
-                    if !self.ranged.contains_key(id) && !created_ranged.contains(id) {
-                        return false;
-                    }
-                }
-                OpKind::AclGrant { .. } => {
-                    created_acl.insert(acl_id(op.stamp));
-                }
-                OpKind::AclRevoke { id } => {
-                    if !self.acl.contains_key(id) && !created_acl.contains(id) {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
-        }
-        true
     }
 
     /// Mint identity + causal position for a local edit, apply it, and record

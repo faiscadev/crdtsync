@@ -519,6 +519,8 @@ Most ops should be independent and stream as they arrive. Typing should appear c
 
 For cases where intermediate state is genuinely unsafe: privilege grant + use of new permission, delete + remove all refs, multi-element invariant schema cannot repair. Receivers buffer member ops until commit marker arrives; on commit, all apply atomically to local view. Costs latency, buffering complexity, partial-tx timeout handling.
 
+**Arrival of the whole group is the only commit condition, and convergence outranks the view boundary.** A member still passes the ordinary readiness gate at the moment it applies; one that cannot land yet waits by itself and drains behind the op it needs, rather than holding back the group or applying into a container that has lost its slot and losing its effect. Gating the *group* on every member resolving makes commit a window that arrival order decides, so replicas fold the same ops to different states — a CRDT-law violation traded for a view nicety. A member that is not ready is one the current state cannot express (its container is displaced, or the node it deletes is absent), so holding it back withholds nothing an observer could see.
+
 ## Why Atomic Is NOT Default
 
 Atomic-by-default wrecks streaming UX. Typing "hello" pops in all-at-once when the typist pauses. Paragraph moves hidden until "all done." Cursor moves buffered, never feels live. CRDTs exist specifically to avoid coordination. Atomic-by-default reintroduces it for every op. Atomic is the deliberate override for the 5% that need it.
