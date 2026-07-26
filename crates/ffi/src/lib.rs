@@ -25,7 +25,7 @@ use crdtsync_core::{
     decode_message, encode_message, encode_op, encode_ops, path, AclEffect, AclGrant, AclSubject,
     BlobRef, Capability, Channel, ClientError, ClientId, ClientSession, DiffKind, Document,
     ElementId, ErrorCode, Host, MarkState, Message, Redirect, Rejected, RelativePosition,
-    ResolvedMark, Scalar, UndoManager,
+    ResolvedMark, Scalar,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
@@ -1630,275 +1630,179 @@ where
 
 // --- undo / redo ---
 //
-// A per-user undo manager over one document. Edits recorded through it capture
-// their inverse; `undo`/`redo` emit ordinary ops that converge on peers like any
-// edit. The manager is a handle distinct from the document it drives, so every
-// call names both. Edits return the ops to broadcast, encoded like a doc edit.
+// The core records the inverse of every op a replica emits while an undo origin
+// is set, so an edit made through *any* surface — a doc call, a client-channel
+// call, or a binding's own handle graph — is undoable; there is no separate
+// undo-edit API to route through. A caller names the origin its edits record
+// under, then undoes and redoes by that tag, so one document can carry several
+// independent histories and a collaborator's ops (applied, never emitted) are
+// never on any of them. The stacks live in the document, so a channel's seat has
+// its own by construction.
 
-/// Opaque undo-manager handle.
-pub struct CrdtUndo {
-    undo: UndoManager,
-}
-
-/// Open an undo manager. It drives whichever document is passed to each call.
+/// Record `doc`'s emitted edits under `origin`, turning recording on. 1 on
+/// success, -1 on a bad handle or origin.
 ///
 /// # Safety
-/// The returned handle is freed with [`crdtsync_undo_free`].
+/// `doc` is a live handle; `origin`/`origin_len` follow [`as_slice`].
 #[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_new() -> *mut CrdtUndo {
-    catch_unwind(AssertUnwindSafe(|| {
-        Box::into_raw(Box::new(CrdtUndo {
-            undo: UndoManager::new(),
-        }))
-    }))
-    .unwrap_or(std::ptr::null_mut())
-}
-
-/// # Safety
-/// `undo` must be a handle from `crdtsync_undo_new`, not yet freed.
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_free(undo: *mut CrdtUndo) {
-    if undo.is_null() {
-        return;
-    }
-    let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(undo))));
-}
-
-/// Record a path-addressed edit through the manager, applying it to `doc` and
-/// returning the ops to broadcast.
-unsafe fn undo_edit<F>(
-    undo: *mut CrdtUndo,
+pub unsafe extern "C" fn crdtsync_doc_set_undo_origin(
     doc: *mut CrdtDoc,
-    path: *const u8,
-    path_len: usize,
-    run: F,
-) -> CrdtBuf
+    origin: *const u8,
+    origin_len: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return -1;
+        }
+        let Some(o) = as_slice(origin, origin_len) else {
+            return -1;
+        };
+        (*doc).doc.set_undo_origin(o);
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Stop recording `doc`'s edits; what was recorded stays undoable. 1 on success,
+/// -1 on a bad handle.
+///
+/// # Safety
+/// `doc` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_clear_undo_origin(doc: *mut CrdtDoc) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return -1;
+        }
+        (*doc).doc.clear_undo_origin();
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Open an explicit intention on `doc`: every edit until the matching
+/// [`crdtsync_doc_end_intention`] undoes as one step. Nests.
+///
+/// # Safety
+/// `doc` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_begin_intention(doc: *mut CrdtDoc) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return -1;
+        }
+        (*doc).doc.begin_intention();
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Close the intention opened by [`crdtsync_doc_begin_intention`].
+///
+/// # Safety
+/// `doc` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_end_intention(doc: *mut CrdtDoc) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return -1;
+        }
+        (*doc).doc.end_intention();
+        1
+    }))
+    .unwrap_or(-1)
+}
+
+/// Whether `origin` has an intention to undo on `doc` (1), none (0), or a bad
+/// handle (-1).
+///
+/// # Safety
+/// `doc` is a live handle; `origin`/`origin_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_can_undo(
+    doc: *const CrdtDoc,
+    origin: *const u8,
+    origin_len: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return -1;
+        }
+        match as_slice(origin, origin_len) {
+            Some(o) => i32::from((*doc).doc.can_undo(o)),
+            None => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Whether `origin` has an undone intention to redo on `doc` (1), none (0), or a
+/// bad handle (-1).
+///
+/// # Safety
+/// As [`crdtsync_doc_can_undo`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_can_redo(
+    doc: *const CrdtDoc,
+    origin: *const u8,
+    origin_len: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if doc.is_null() {
+            return -1;
+        }
+        match as_slice(origin, origin_len) {
+            Some(o) => i32::from((*doc).doc.can_redo(o)),
+            None => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Revert `origin`'s most recent intention on `doc`, returning the encoded ops to
+/// broadcast — empty when there is nothing to undo.
+///
+/// # Safety
+/// `doc` is a live handle; `origin`/`origin_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_undo(
+    doc: *mut CrdtDoc,
+    origin: *const u8,
+    origin_len: usize,
+) -> CrdtBuf {
+    doc_history(doc, origin, origin_len, |d, o| d.undo(o))
+}
+
+/// Replay `origin`'s most recently undone intention on `doc`, returning the
+/// encoded ops — empty when there is nothing to redo.
+///
+/// # Safety
+/// As [`crdtsync_doc_undo`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_doc_redo(
+    doc: *mut CrdtDoc,
+    origin: *const u8,
+    origin_len: usize,
+) -> CrdtBuf {
+    doc_history(doc, origin, origin_len, |d, o| d.redo(o))
+}
+
+/// Run an origin-selected history move on `doc` and encode its ops.
+unsafe fn doc_history<F>(doc: *mut CrdtDoc, origin: *const u8, origin_len: usize, run: F) -> CrdtBuf
 where
-    F: FnOnce(&mut UndoManager, &mut Document, &[u8]) -> Vec<Op>,
+    F: FnOnce(&mut Document, &[u8]) -> Option<Vec<Op>>,
 {
     catch_unwind(AssertUnwindSafe(|| {
-        if undo.is_null() || doc.is_null() {
+        if doc.is_null() {
             return CrdtBuf::empty();
         }
-        let Some(p) = as_slice(path, path_len) else {
+        let Some(o) = as_slice(origin, origin_len) else {
             return CrdtBuf::empty();
         };
-        let ops = run(&mut (*undo).undo, &mut (*doc).doc, p);
+        let ops = run(&mut (*doc).doc, o).unwrap_or_default();
         CrdtBuf::from_vec(encode_ops(&ops))
     }))
     .unwrap_or_else(|_| CrdtBuf::empty())
-}
-
-/// Set an integer Register at a path as one undo step. Returns the ops.
-///
-/// # Safety
-/// `undo`/`doc` are live handles; `path`/`path_len` follow [`as_slice`].
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_register_int(
-    undo: *mut CrdtUndo,
-    doc: *mut CrdtDoc,
-    path: *const u8,
-    path_len: usize,
-    value: i64,
-) -> CrdtBuf {
-    undo_edit(undo, doc, path, path_len, |u, d, p| {
-        u.register(d, p, Scalar::Int(value))
-    })
-}
-
-/// Increment a Counter at a path as one undo step. Returns the ops.
-///
-/// # Safety
-/// As [`crdtsync_undo_register_int`].
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_inc(
-    undo: *mut CrdtUndo,
-    doc: *mut CrdtDoc,
-    path: *const u8,
-    path_len: usize,
-    amount: u32,
-) -> CrdtBuf {
-    undo_edit(undo, doc, path, path_len, |u, d, p| u.inc(d, p, amount))
-}
-
-/// Decrement a Counter at a path as one undo step. Returns the ops.
-///
-/// # Safety
-/// As [`crdtsync_undo_register_int`].
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_dec(
-    undo: *mut CrdtUndo,
-    doc: *mut CrdtDoc,
-    path: *const u8,
-    path_len: usize,
-    amount: u32,
-) -> CrdtBuf {
-    undo_edit(undo, doc, path, path_len, |u, d, p| u.dec(d, p, amount))
-}
-
-/// Tombstone the Register slot at a path as one undo step. Returns the ops.
-///
-/// # Safety
-/// As [`crdtsync_undo_register_int`].
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_delete(
-    undo: *mut CrdtUndo,
-    doc: *mut CrdtDoc,
-    path: *const u8,
-    path_len: usize,
-) -> CrdtBuf {
-    undo_edit(undo, doc, path, path_len, |u, d, p| u.delete(d, p))
-}
-
-/// Insert a bytes item at a live index in the List at a path as one undo step.
-///
-/// # Safety
-/// `undo`/`doc` are live handles; `path`/`path_len` and `value`/`value_len` each
-/// follow [`as_slice`].
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_list_insert(
-    undo: *mut CrdtUndo,
-    doc: *mut CrdtDoc,
-    path: *const u8,
-    path_len: usize,
-    index: usize,
-    value: *const u8,
-    value_len: usize,
-) -> CrdtBuf {
-    let Some(val) = as_slice(value, value_len) else {
-        return CrdtBuf::empty();
-    };
-    undo_edit(undo, doc, path, path_len, |u, d, p| {
-        u.list_insert(d, p, index, val)
-    })
-}
-
-/// Tombstone the live item at an index in the List at a path as one undo step.
-///
-/// # Safety
-/// As [`crdtsync_undo_register_int`].
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_list_delete(
-    undo: *mut CrdtUndo,
-    doc: *mut CrdtDoc,
-    path: *const u8,
-    path_len: usize,
-    index: usize,
-) -> CrdtBuf {
-    undo_edit(undo, doc, path, path_len, |u, d, p| {
-        u.list_delete(d, p, index)
-    })
-}
-
-/// Insert UTF-8 text at a codepoint index in the Text at a path as one undo step.
-///
-/// # Safety
-/// `undo`/`doc` are live handles; `path`/`path_len` and `s`/`s_len` each follow
-/// [`as_slice`]. `s` must be valid UTF-8; invalid bytes yield an empty result.
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_text_insert(
-    undo: *mut CrdtUndo,
-    doc: *mut CrdtDoc,
-    path: *const u8,
-    path_len: usize,
-    index: usize,
-    s: *const u8,
-    s_len: usize,
-) -> CrdtBuf {
-    let Some(bytes) = as_slice(s, s_len) else {
-        return CrdtBuf::empty();
-    };
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return CrdtBuf::empty();
-    };
-    undo_edit(undo, doc, path, path_len, |u, d, p| {
-        u.text_insert(d, p, index, text)
-    })
-}
-
-/// Tombstone `count` codepoints from an index in the Text at a path as one undo
-/// step. Returns the ops.
-///
-/// # Safety
-/// As [`crdtsync_undo_register_int`].
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_text_delete(
-    undo: *mut CrdtUndo,
-    doc: *mut CrdtDoc,
-    path: *const u8,
-    path_len: usize,
-    index: usize,
-    count: usize,
-) -> CrdtBuf {
-    undo_edit(undo, doc, path, path_len, |u, d, p| {
-        u.text_delete(d, p, index, count)
-    })
-}
-
-/// Revert the most recent intention, applying it to `doc` and returning the ops
-/// to broadcast — empty when there is nothing to undo.
-///
-/// # Safety
-/// `undo`/`doc` are live handles.
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_undo(undo: *mut CrdtUndo, doc: *mut CrdtDoc) -> CrdtBuf {
-    catch_unwind(AssertUnwindSafe(|| {
-        if undo.is_null() || doc.is_null() {
-            return CrdtBuf::empty();
-        }
-        let ops = (*undo).undo.undo(&mut (*doc).doc).unwrap_or_default();
-        CrdtBuf::from_vec(encode_ops(&ops))
-    }))
-    .unwrap_or_else(|_| CrdtBuf::empty())
-}
-
-/// Replay the most recently undone intention. Returns the ops — empty when there
-/// is nothing to redo.
-///
-/// # Safety
-/// `undo`/`doc` are live handles.
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_redo(undo: *mut CrdtUndo, doc: *mut CrdtDoc) -> CrdtBuf {
-    catch_unwind(AssertUnwindSafe(|| {
-        if undo.is_null() || doc.is_null() {
-            return CrdtBuf::empty();
-        }
-        let ops = (*undo).undo.redo(&mut (*doc).doc).unwrap_or_default();
-        CrdtBuf::from_vec(encode_ops(&ops))
-    }))
-    .unwrap_or_else(|_| CrdtBuf::empty())
-}
-
-/// Whether there is a recorded intention to undo (1), none (0), or a bad handle
-/// (-1).
-///
-/// # Safety
-/// `undo` is a live handle.
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_can_undo(undo: *const CrdtUndo) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if undo.is_null() {
-            return -1;
-        }
-        i32::from((*undo).undo.can_undo())
-    }))
-    .unwrap_or(-1)
-}
-
-/// Whether there is an undone intention to redo (1), none (0), or a bad handle
-/// (-1).
-///
-/// # Safety
-/// `undo` is a live handle.
-#[no_mangle]
-pub unsafe extern "C" fn crdtsync_undo_can_redo(undo: *const CrdtUndo) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if undo.is_null() {
-            return -1;
-        }
-        i32::from((*undo).undo.can_redo())
-    }))
-    .unwrap_or(-1)
 }
 
 // --- wire client session ---
@@ -3467,6 +3371,175 @@ where
             None => 0,
         }
     })
+}
+
+// --- client undo / redo ---
+//
+// The per-channel seat over the core record-seam. Each channel holds its own
+// replica, so each keeps its own history; an inverse is an ordinary edit, framed
+// as the same Ops message an edit produces and routed through the same outbox,
+// so it is acknowledged and resent like any other authored op.
+
+/// Record `channel`'s emitted edits under `origin`. 1 on success, 0 when the
+/// channel isn't held, -1 on a bad handle or origin.
+///
+/// # Safety
+/// `client` is a live handle; `origin`/`origin_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_set_undo_origin(
+    client: *mut CrdtClient,
+    channel: u32,
+    origin: *const u8,
+    origin_len: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return -1;
+        }
+        let Some(o) = as_slice(origin, origin_len) else {
+            return -1;
+        };
+        i32::from(
+            (*client)
+                .session
+                .set_undo_origin(Channel(channel), o)
+                .is_some(),
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+/// Stop recording `channel`'s edits; what was recorded stays undoable. 1 on
+/// success, 0 when the channel isn't held, -1 on a bad handle.
+///
+/// # Safety
+/// `client` is a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_clear_undo_origin(
+    client: *mut CrdtClient,
+    channel: u32,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return -1;
+        }
+        i32::from(
+            (*client)
+                .session
+                .clear_undo_origin(Channel(channel))
+                .is_some(),
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+/// Whether `origin` has an intention to undo on `channel` (1), none (0), or a bad
+/// handle (-1).
+///
+/// # Safety
+/// `client` is a live handle; `origin`/`origin_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_can_undo(
+    client: *const CrdtClient,
+    channel: u32,
+    origin: *const u8,
+    origin_len: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return -1;
+        }
+        match as_slice(origin, origin_len) {
+            Some(o) => i32::from((*client).session.can_undo(Channel(channel), o)),
+            None => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Whether `origin` has an undone intention to redo on `channel` (1), none (0),
+/// or a bad handle (-1).
+///
+/// # Safety
+/// As [`crdtsync_client_can_undo`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_can_redo(
+    client: *const CrdtClient,
+    channel: u32,
+    origin: *const u8,
+    origin_len: usize,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return -1;
+        }
+        match as_slice(origin, origin_len) {
+            Some(o) => i32::from((*client).session.can_redo(Channel(channel), o)),
+            None => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Revert `origin`'s most recent intention on `channel`, returning the Ops frame
+/// to send — empty when there is nothing to undo or the channel isn't held.
+///
+/// # Safety
+/// `client` is a live handle; `origin`/`origin_len` follow [`as_slice`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_undo(
+    client: *mut CrdtClient,
+    channel: u32,
+    origin: *const u8,
+    origin_len: usize,
+) -> CrdtBuf {
+    client_history(client, channel, origin, origin_len, |s, ch, o| {
+        s.undo(ch, o)
+    })
+}
+
+/// Replay `origin`'s most recently undone intention on `channel`, returning the
+/// Ops frame to send — empty when there is nothing to redo.
+///
+/// # Safety
+/// As [`crdtsync_client_undo`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_redo(
+    client: *mut CrdtClient,
+    channel: u32,
+    origin: *const u8,
+    origin_len: usize,
+) -> CrdtBuf {
+    client_history(client, channel, origin, origin_len, |s, ch, o| {
+        s.redo(ch, o)
+    })
+}
+
+/// Run an origin-selected history move on `channel` and encode the frame it
+/// returns.
+unsafe fn client_history<F>(
+    client: *mut CrdtClient,
+    channel: u32,
+    origin: *const u8,
+    origin_len: usize,
+    run: F,
+) -> CrdtBuf
+where
+    F: FnOnce(&mut ClientSession, Channel, &[u8]) -> Option<Message>,
+{
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() {
+            return CrdtBuf::empty();
+        }
+        let Some(o) = as_slice(origin, origin_len) else {
+            return CrdtBuf::empty();
+        };
+        match run(&mut (*client).session, Channel(channel), o) {
+            Some(msg) => CrdtBuf::from_vec(encode_message(&msg)),
+            None => CrdtBuf::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| CrdtBuf::empty())
 }
 
 // --- client auth ---

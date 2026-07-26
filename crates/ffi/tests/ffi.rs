@@ -1217,31 +1217,83 @@ fn a_null_data_pointer_is_rejected_not_dereferenced() {
 }
 
 // --- undo / redo ---
+//
+// Recording is opt-in and origin-tagged: naming an origin makes every subsequent
+// edit through any surface undoable, and undo selects by that tag.
+
+const UNDO_ORIGIN: &[u8] = b"local";
 
 #[test]
 fn undo_and_redo_a_register_across_the_boundary() {
     unsafe {
         let c = client(1);
         let doc = crdtsync_doc_new(c.as_ptr());
-        let undo = crdtsync_undo_new();
         let p = path(&[b"title"]);
+        let o = UNDO_ORIGIN;
+        assert_eq!(crdtsync_doc_set_undo_origin(doc, o.as_ptr(), o.len()), 1);
 
-        let o1 = crdtsync_undo_register_int(undo, doc, p.as_ptr(), p.len(), 1);
-        let o2 = crdtsync_undo_register_int(undo, doc, p.as_ptr(), p.len(), 2);
+        let o1 = crdtsync_doc_register_int(doc, p.as_ptr(), p.len(), 1);
+        let o2 = crdtsync_doc_register_int(doc, p.as_ptr(), p.len(), 2);
         assert_eq!(get_int(doc, &p), (1, 2));
-        assert_eq!(crdtsync_undo_can_undo(undo), 1);
+        assert_eq!(crdtsync_doc_can_undo(doc, o.as_ptr(), o.len()), 1);
 
-        let u1 = crdtsync_undo_undo(undo, doc);
+        let u1 = crdtsync_doc_undo(doc, o.as_ptr(), o.len());
+        assert!(u1.len > 0, "the undo emits ordinary ops");
         assert_eq!(get_int(doc, &p), (1, 1), "undo steps back one value");
-        let r1 = crdtsync_undo_redo(undo, doc);
+        let r1 = crdtsync_doc_redo(doc, o.as_ptr(), o.len());
         assert_eq!(get_int(doc, &p), (1, 2), "redo restores it");
-        assert_eq!(crdtsync_undo_can_redo(undo), 0);
+        assert_eq!(crdtsync_doc_can_redo(doc, o.as_ptr(), o.len()), 0);
 
         crdtsync_buf_free(o1);
         crdtsync_buf_free(o2);
         crdtsync_buf_free(u1);
         crdtsync_buf_free(r1);
-        crdtsync_undo_free(undo);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn an_untagged_document_records_nothing() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let p = path(&[b"title"]);
+        let o = UNDO_ORIGIN;
+
+        let edit = crdtsync_doc_register_int(doc, p.as_ptr(), p.len(), 1);
+        assert_eq!(crdtsync_doc_can_undo(doc, o.as_ptr(), o.len()), 0);
+        let un = crdtsync_doc_undo(doc, o.as_ptr(), o.len());
+        assert_eq!(un.len, 0);
+        assert_eq!(get_int(doc, &p), (1, 1));
+
+        crdtsync_buf_free(edit);
+        crdtsync_buf_free(un);
+        crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn an_explicit_intention_undoes_as_one_step() {
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let (a, b) = (path(&[b"a"]), path(&[b"b"]));
+        let o = UNDO_ORIGIN;
+        crdtsync_doc_set_undo_origin(doc, o.as_ptr(), o.len());
+
+        crdtsync_doc_begin_intention(doc);
+        let e1 = crdtsync_doc_register_int(doc, a.as_ptr(), a.len(), 1);
+        let e2 = crdtsync_doc_register_int(doc, b.as_ptr(), b.len(), 2);
+        crdtsync_doc_end_intention(doc);
+
+        let un = crdtsync_doc_undo(doc, o.as_ptr(), o.len());
+        assert_eq!(get_int(doc, &a), (0, 0), "both slots are reverted");
+        assert_eq!(get_int(doc, &b), (0, 0));
+        assert_eq!(crdtsync_doc_can_undo(doc, o.as_ptr(), o.len()), 0);
+
+        crdtsync_buf_free(e1);
+        crdtsync_buf_free(e2);
+        crdtsync_buf_free(un);
         crdtsync_doc_free(doc);
     }
 }
@@ -1252,22 +1304,22 @@ fn an_undo_converges_on_a_peer() {
         let (ca, cb) = (client(1), client(2));
         let a = crdtsync_doc_new(ca.as_ptr());
         let b = crdtsync_doc_new(cb.as_ptr());
-        let undo = crdtsync_undo_new();
         let p = path(&[b"votes"]);
+        let o = UNDO_ORIGIN;
+        crdtsync_doc_set_undo_origin(a, o.as_ptr(), o.len());
 
-        let up = crdtsync_undo_inc(undo, a, p.as_ptr(), p.len(), 5);
+        let up = crdtsync_doc_inc(a, p.as_ptr(), p.len(), 5);
         exchange(b, &up);
         assert_eq!(get_counter(b, &p).1, 5);
 
         // The undo's ops travel like any edit and the peer converges.
-        let un = crdtsync_undo_undo(undo, a);
+        let un = crdtsync_doc_undo(a, o.as_ptr(), o.len());
         exchange(b, &un);
         assert_eq!(get_counter(a, &p).1, 0);
         assert_eq!(get_counter(b, &p).1, 0, "the peer sees the undo");
 
         crdtsync_buf_free(up);
         crdtsync_buf_free(un);
-        crdtsync_undo_free(undo);
         crdtsync_doc_free(a);
         crdtsync_doc_free(b);
     }
@@ -1278,36 +1330,107 @@ fn undo_removes_a_list_insert() {
     unsafe {
         let c = client(1);
         let doc = crdtsync_doc_new(c.as_ptr());
-        let undo = crdtsync_undo_new();
         let p = path(&[b"items"]);
         let v = b"a";
+        let o = UNDO_ORIGIN;
+        crdtsync_doc_set_undo_origin(doc, o.as_ptr(), o.len());
 
-        let ins = crdtsync_undo_list_insert(undo, doc, p.as_ptr(), p.len(), 0, v.as_ptr(), v.len());
+        let ins = crdtsync_doc_list_insert(doc, p.as_ptr(), p.len(), 0, v.as_ptr(), v.len());
         let mut len: usize = 0;
         assert_eq!(crdtsync_doc_list_len(doc, p.as_ptr(), p.len(), &mut len), 1);
         assert_eq!(len, 1);
 
-        let un = crdtsync_undo_undo(undo, doc);
-        assert_eq!(crdtsync_doc_list_len(doc, p.as_ptr(), p.len(), &mut len), 1);
-        assert_eq!(len, 0, "the inserted item is removed");
+        let un = crdtsync_doc_undo(doc, o.as_ptr(), o.len());
+        assert_eq!(crdtsync_doc_list_len(doc, p.as_ptr(), p.len(), &mut len), 0);
 
         crdtsync_buf_free(ins);
         crdtsync_buf_free(un);
-        crdtsync_undo_free(undo);
         crdtsync_doc_free(doc);
     }
 }
 
 #[test]
-fn a_null_undo_handle_is_inert() {
+fn a_null_handle_or_origin_is_inert() {
     unsafe {
-        assert_eq!(crdtsync_undo_can_undo(ptr::null()), -1);
-        assert_eq!(crdtsync_undo_can_redo(ptr::null()), -1);
+        let o = UNDO_ORIGIN;
+        assert_eq!(crdtsync_doc_can_undo(ptr::null(), o.as_ptr(), o.len()), -1);
+        assert_eq!(crdtsync_doc_can_redo(ptr::null(), o.as_ptr(), o.len()), -1);
+        assert_eq!(
+            crdtsync_doc_set_undo_origin(ptr::null_mut(), o.as_ptr(), o.len()),
+            -1
+        );
+        let buf = crdtsync_doc_undo(ptr::null_mut(), o.as_ptr(), o.len());
+        assert_eq!(buf.len, 0);
+        crdtsync_buf_free(buf);
+
         let doc = crdtsync_doc_new(client(1).as_ptr());
-        let buf = crdtsync_undo_undo(ptr::null_mut(), doc);
+        // A null origin with a nonzero length is rejected, never dereferenced.
+        assert_eq!(crdtsync_doc_set_undo_origin(doc, ptr::null(), 4), -1);
+        assert_eq!(crdtsync_doc_can_undo(doc, ptr::null(), 4), -1);
+        let buf = crdtsync_doc_undo(doc, ptr::null(), 4);
+        assert_eq!(buf.len, 0);
         crdtsync_buf_free(buf);
         crdtsync_doc_free(doc);
-        crdtsync_undo_free(ptr::null_mut());
+    }
+}
+
+// --- the per-channel undo seat ---
+
+#[test]
+fn a_channels_edits_undo_over_the_wire_surface() {
+    unsafe {
+        let cl = crdtsync_client_new(client(1).as_ptr());
+        let mut ch: u32 = 0;
+        let sub = crdtsync_client_subscribe(cl, b"room".as_ptr(), 4, &mut ch);
+        crdtsync_buf_free(sub);
+        let p = path(&[b"title"]);
+        let o = UNDO_ORIGIN;
+        assert_eq!(
+            crdtsync_client_set_undo_origin(cl, ch, o.as_ptr(), o.len()),
+            1
+        );
+
+        let e1 = crdtsync_client_register_int(cl, ch, p.as_ptr(), p.len(), 1);
+        let e2 = crdtsync_client_register_int(cl, ch, p.as_ptr(), p.len(), 2);
+        assert_eq!(crdtsync_client_can_undo(cl, ch, o.as_ptr(), o.len()), 1);
+
+        let un = crdtsync_client_undo(cl, ch, o.as_ptr(), o.len());
+        assert!(un.len > 0, "the inverse ships as an ordinary Ops frame");
+        let mut got: i64 = 0;
+        assert_eq!(
+            crdtsync_client_get_int(cl, ch, p.as_ptr(), p.len(), &mut got),
+            1
+        );
+        assert_eq!(got, 1);
+        assert_eq!(crdtsync_client_can_redo(cl, ch, o.as_ptr(), o.len()), 1);
+
+        let re = crdtsync_client_redo(cl, ch, o.as_ptr(), o.len());
+        assert!(re.len > 0);
+        crdtsync_client_get_int(cl, ch, p.as_ptr(), p.len(), &mut got);
+        assert_eq!(got, 2);
+
+        crdtsync_buf_free(e1);
+        crdtsync_buf_free(e2);
+        crdtsync_buf_free(un);
+        crdtsync_buf_free(re);
+        crdtsync_client_free(cl);
+    }
+}
+
+#[test]
+fn an_unheld_channel_has_no_undo_seat() {
+    unsafe {
+        let cl = crdtsync_client_new(client(1).as_ptr());
+        let o = UNDO_ORIGIN;
+        assert_eq!(
+            crdtsync_client_set_undo_origin(cl, 7, o.as_ptr(), o.len()),
+            0
+        );
+        assert_eq!(crdtsync_client_can_undo(cl, 7, o.as_ptr(), o.len()), 0);
+        let buf = crdtsync_client_undo(cl, 7, o.as_ptr(), o.len());
+        assert_eq!(buf.len, 0);
+        crdtsync_buf_free(buf);
+        crdtsync_client_free(cl);
     }
 }
 

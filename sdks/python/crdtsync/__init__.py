@@ -316,21 +316,14 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_take_repairs, [doc, c.POINTER(buf)], c.c_int32)
 
     # undo / redo
-    undo = c.c_void_p
-    sig(lib.crdtsync_undo_new, [], undo)
-    sig(lib.crdtsync_undo_free, [undo], None)
-    sig(lib.crdtsync_undo_register_int, [undo, doc, cbytes, size, c.c_int64], buf)
-    sig(lib.crdtsync_undo_inc, [undo, doc, cbytes, size, c.c_uint32], buf)
-    sig(lib.crdtsync_undo_dec, [undo, doc, cbytes, size, c.c_uint32], buf)
-    sig(lib.crdtsync_undo_delete, [undo, doc, cbytes, size], buf)
-    sig(lib.crdtsync_undo_list_insert, [undo, doc, cbytes, size, size, cbytes, size], buf)
-    sig(lib.crdtsync_undo_list_delete, [undo, doc, cbytes, size, size], buf)
-    sig(lib.crdtsync_undo_text_insert, [undo, doc, cbytes, size, size, cbytes, size], buf)
-    sig(lib.crdtsync_undo_text_delete, [undo, doc, cbytes, size, size, size], buf)
-    sig(lib.crdtsync_undo_undo, [undo, doc], buf)
-    sig(lib.crdtsync_undo_redo, [undo, doc], buf)
-    sig(lib.crdtsync_undo_can_undo, [undo], c.c_int32)
-    sig(lib.crdtsync_undo_can_redo, [undo], c.c_int32)
+    sig(lib.crdtsync_doc_set_undo_origin, [doc, cbytes, size], c.c_int32)
+    sig(lib.crdtsync_doc_clear_undo_origin, [doc], c.c_int32)
+    sig(lib.crdtsync_doc_begin_intention, [doc], c.c_int32)
+    sig(lib.crdtsync_doc_end_intention, [doc], c.c_int32)
+    sig(lib.crdtsync_doc_can_undo, [doc, cbytes, size], c.c_int32)
+    sig(lib.crdtsync_doc_can_redo, [doc, cbytes, size], c.c_int32)
+    sig(lib.crdtsync_doc_undo, [doc, cbytes, size], buf)
+    sig(lib.crdtsync_doc_redo, [doc, cbytes, size], buf)
 
     # wire client session
     ch = c.c_uint32
@@ -1321,104 +1314,58 @@ class Document:
         return _take_buf(out) if rc == 1 else None
 
 
-class Undo:
-    """A per-user undo/redo manager over a :class:`Document`.
+DEFAULT_UNDO_ORIGIN = b"local"
 
-    Each edit made through the manager records its inverse; :meth:`undo` and
-    :meth:`redo` emit ordinary ops that converge on peers like any edit. The
-    manager is separate from the document it drives, so every call names the
-    document.
+
+class Undo:
+    """An origin-scoped undo/redo handle over a :class:`Document`.
+
+    It holds no history of its own: the document records the inverse of every op
+    it emits while an undo origin is set, whatever surface authored it, so an
+    edit made through any of :class:`Document`'s methods is undoable. The handle
+    only names the origin to record under and select by, so several independent
+    histories can share one document and a peer's applied ops are on none of
+    them.
     """
 
-    def __init__(self):
-        self._handle = _LIB.crdtsync_undo_new()
-        if not self._handle:
-            raise RuntimeError("failed to open undo manager")
-
-    def close(self) -> None:
-        if getattr(self, "_handle", None):
-            _LIB.crdtsync_undo_free(self._handle)
-            self._handle = None
+    def __init__(self, origin: bytes = DEFAULT_UNDO_ORIGIN):
+        self.origin = bytes(origin)
 
     def __enter__(self) -> "Undo":
         return self
 
     def __exit__(self, *exc) -> None:
-        self.close()
+        return None
 
-    def __del__(self):
-        self.close()
+    def track(self, doc: "Document") -> None:
+        """Start recording ``doc``'s emitted edits under this origin."""
+        _LIB.crdtsync_doc_set_undo_origin(doc._handle, self.origin, len(self.origin))
 
-    def register_int(self, doc: "Document", path: Path, value: int) -> bytes:
-        _i64("value", value)
-        p = encode_path(path)
-        return _take_buf(
-            _LIB.crdtsync_undo_register_int(self._handle, doc._handle, p, len(p), value)
-        )
+    def untrack(self, doc: "Document") -> None:
+        """Stop recording ``doc``'s edits; what was recorded stays undoable."""
+        _LIB.crdtsync_doc_clear_undo_origin(doc._handle)
 
-    def inc(self, doc: "Document", path: Path, amount: int) -> bytes:
-        _u32("amount", amount)
-        p = encode_path(path)
-        return _take_buf(_LIB.crdtsync_undo_inc(self._handle, doc._handle, p, len(p), amount))
+    def begin_intention(self, doc: "Document") -> None:
+        """Open an explicit intention: edits until :meth:`end_intention` undo as one."""
+        _LIB.crdtsync_doc_begin_intention(doc._handle)
 
-    def dec(self, doc: "Document", path: Path, amount: int) -> bytes:
-        _u32("amount", amount)
-        p = encode_path(path)
-        return _take_buf(_LIB.crdtsync_undo_dec(self._handle, doc._handle, p, len(p), amount))
-
-    def delete(self, doc: "Document", path: Path) -> bytes:
-        p = encode_path(path)
-        return _take_buf(_LIB.crdtsync_undo_delete(self._handle, doc._handle, p, len(p)))
-
-    def list_insert(self, doc: "Document", path: Path, index: int, value: bytes) -> bytes:
-        _usize("index", index)
-        p = encode_path(path)
-        return _take_buf(
-            _LIB.crdtsync_undo_list_insert(
-                self._handle, doc._handle, p, len(p), index, value, len(value)
-            )
-        )
-
-    def list_delete(self, doc: "Document", path: Path, index: int) -> bytes:
-        _usize("index", index)
-        p = encode_path(path)
-        return _take_buf(
-            _LIB.crdtsync_undo_list_delete(self._handle, doc._handle, p, len(p), index)
-        )
-
-    def text_insert(self, doc: "Document", path: Path, index: int, text: str) -> bytes:
-        _usize("index", index)
-        p = encode_path(path)
-        s = text.encode("utf-8")
-        return _take_buf(
-            _LIB.crdtsync_undo_text_insert(
-                self._handle, doc._handle, p, len(p), index, s, len(s)
-            )
-        )
-
-    def text_delete(self, doc: "Document", path: Path, index: int, count: int) -> bytes:
-        _usize("index", index)
-        _usize("count", count)
-        p = encode_path(path)
-        return _take_buf(
-            _LIB.crdtsync_undo_text_delete(
-                self._handle, doc._handle, p, len(p), index, count
-            )
-        )
+    def end_intention(self, doc: "Document") -> None:
+        """Close the intention opened by :meth:`begin_intention`."""
+        _LIB.crdtsync_doc_end_intention(doc._handle)
 
     def undo(self, doc: "Document") -> bytes:
-        """Revert the most recent intention; returns the ops (empty if none)."""
-        return _take_buf(_LIB.crdtsync_undo_undo(self._handle, doc._handle))
+        """Revert this origin's most recent intention; returns the ops (empty if none)."""
+        return _take_buf(_LIB.crdtsync_doc_undo(doc._handle, self.origin, len(self.origin)))
 
     def redo(self, doc: "Document") -> bytes:
-        """Replay the most recently undone intention; returns the ops (empty if none)."""
-        return _take_buf(_LIB.crdtsync_undo_redo(self._handle, doc._handle))
+        """Replay this origin's most recently undone intention; ops empty if none."""
+        return _take_buf(_LIB.crdtsync_doc_redo(doc._handle, self.origin, len(self.origin)))
 
-    def can_undo(self) -> bool:
-        return _LIB.crdtsync_undo_can_undo(self._handle) == 1
+    def can_undo(self, doc: "Document") -> bool:
+        return _LIB.crdtsync_doc_can_undo(doc._handle, self.origin, len(self.origin)) == 1
 
-    def can_redo(self) -> bool:
-        return _LIB.crdtsync_undo_can_redo(self._handle) == 1
+    def can_redo(self, doc: "Document") -> bool:
+        return _LIB.crdtsync_doc_can_redo(doc._handle, self.origin, len(self.origin)) == 1
 
 
 class Client:

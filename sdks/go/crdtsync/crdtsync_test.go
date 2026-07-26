@@ -773,13 +773,14 @@ func TestUndoAndRedoARegister(t *testing.T) {
 	defer d.Close()
 	u := newUndo(t)
 	defer u.Close()
+	u.Track(d)
 
-	u.RegisterInt(d, path("title"), 1)
-	u.RegisterInt(d, path("title"), 2)
+	d.RegisterInt(path("title"), 1)
+	d.RegisterInt(path("title"), 2)
 	if v, _ := d.GetInt(path("title")); v != 2 {
 		t.Fatalf("want 2, got %d", v)
 	}
-	if !u.CanUndo() {
+	if !u.CanUndo(d) {
 		t.Fatal("expected can-undo")
 	}
 
@@ -791,8 +792,26 @@ func TestUndoAndRedoARegister(t *testing.T) {
 	if v, _ := d.GetInt(path("title")); v != 2 {
 		t.Fatalf("after redo want 2, got %d", v)
 	}
-	if u.CanRedo() {
+	if u.CanRedo(d) {
 		t.Fatal("redo stack should be empty")
+	}
+}
+
+func TestAnUntrackedDocumentRecordsNothing(t *testing.T) {
+	d := newDoc(t, 1)
+	defer d.Close()
+	u := newUndo(t)
+	defer u.Close()
+
+	d.RegisterInt(path("title"), 1)
+	if u.CanUndo(d) {
+		t.Fatal("an untracked edit must not be recorded")
+	}
+	if ops := u.Undo(d); len(ops) != 0 {
+		t.Fatalf("want no ops, got %d bytes", len(ops))
+	}
+	if v, _ := d.GetInt(path("title")); v != 1 {
+		t.Fatalf("the edit must stand, got %d", v)
 	}
 }
 
@@ -801,14 +820,16 @@ func TestUndoOfAListInsert(t *testing.T) {
 	defer d.Close()
 	u := newUndo(t)
 	defer u.Close()
+	u.Track(d)
 
-	u.ListInsert(d, path("items"), 0, []byte("a"))
+	d.ListInsert(path("items"), 0, []byte("a"))
 	if n, _ := d.ListLen(path("items")); n != 1 {
 		t.Fatalf("want len 1, got %d", n)
 	}
+	// The insert's transact created the list too, so its undo takes the slot.
 	u.Undo(d)
-	if n, _ := d.ListLen(path("items")); n != 0 {
-		t.Fatalf("after undo want len 0, got %d", n)
+	if _, ok := d.ListLen(path("items")); ok {
+		t.Fatal("after undo the slot should be empty")
 	}
 }
 
@@ -817,14 +838,60 @@ func TestUndoOfATextEdit(t *testing.T) {
 	defer d.Close()
 	u := newUndo(t)
 	defer u.Close()
+	u.Track(d)
 
-	u.TextInsert(d, path("body"), 0, "hi")
-	if s, _ := d.TextGet(path("body")); s != "hi" {
-		t.Fatalf("want hi, got %q", s)
+	d.TextInsert(path("body"), 0, "hi")
+	d.TextInsert(path("body"), 2, "!")
+	if s, _ := d.TextGet(path("body")); s != "hi!" {
+		t.Fatalf("want hi!, got %q", s)
 	}
 	u.Undo(d)
-	if s, _ := d.TextGet(path("body")); s != "" {
-		t.Fatalf("after undo want empty, got %q", s)
+	if s, _ := d.TextGet(path("body")); s != "hi" {
+		t.Fatalf("after undo want hi, got %q", s)
+	}
+}
+
+func TestAnExplicitIntentionUndoesAsOneStep(t *testing.T) {
+	d := newDoc(t, 1)
+	defer d.Close()
+	u := newUndo(t)
+	defer u.Close()
+	u.Track(d)
+
+	u.BeginIntention(d)
+	d.RegisterInt(path("a"), 1)
+	d.RegisterInt(path("b"), 2)
+	u.EndIntention(d)
+
+	u.Undo(d)
+	if _, ok := d.GetInt(path("a")); ok {
+		t.Fatal("a should be reverted")
+	}
+	if _, ok := d.GetInt(path("b")); ok {
+		t.Fatal("b should be reverted")
+	}
+	if u.CanUndo(d) {
+		t.Fatal("the group was a single step")
+	}
+}
+
+func TestTwoOriginsKeepSeparateHistories(t *testing.T) {
+	d := newDoc(t, 1)
+	defer d.Close()
+	mine := NewUndoOrigin("mine")
+	theirs := NewUndoOrigin("theirs")
+
+	mine.Track(d)
+	d.RegisterInt(path("mine"), 1)
+	theirs.Track(d)
+	d.RegisterInt(path("theirs"), 2)
+
+	mine.Undo(d)
+	if _, ok := d.GetInt(path("mine")); ok {
+		t.Fatal("my edit should be reverted")
+	}
+	if v, _ := d.GetInt(path("theirs")); v != 2 {
+		t.Fatalf("the other origin's edit must stand, got %d", v)
 	}
 }
 
@@ -835,14 +902,20 @@ func TestUndoConvergesOnAPeer(t *testing.T) {
 	defer b.Close()
 	u := newUndo(t)
 	defer u.Close()
+	u.Track(a)
 
-	b.Apply(u.Inc(a, path("votes"), 5))
+	b.Apply(a.Inc(path("votes"), 5))
 	if v, _ := b.GetCounter(path("votes")); v != 5 {
 		t.Fatalf("peer want 5, got %d", v)
 	}
 	b.Apply(u.Undo(a))
-	if v, _ := b.GetCounter(path("votes")); v != 0 {
-		t.Fatalf("peer after undo want 0, got %d", v)
+	// The delta re-won the slot on the way in, so its inverse both cancels the
+	// tally and gives the slot back — an unset counter reads as absent.
+	if _, ok := a.GetCounter(path("votes")); ok {
+		t.Fatal("the author's slot should be empty after undo")
+	}
+	if _, ok := b.GetCounter(path("votes")); ok {
+		t.Fatal("and the peer's too")
 	}
 }
 

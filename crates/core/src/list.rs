@@ -535,6 +535,12 @@ impl List {
             .collect()
     }
 
+    /// The value node `id` holds, whether it renders here or is suppressed by a
+    /// tree move. A deleted id holds nothing — a tombstone keeps only a position.
+    pub(crate) fn node_value(&self, id: Stamp) -> Option<Element> {
+        self.nodes.get(&seq_key(&id)).map(|n| n.value.clone())
+    }
+
     /// The live position of node `id`, if it is present and rendered — neither
     /// deleted nor moved under another parent.
     pub fn live_index(&self, id: Stamp) -> Option<usize> {

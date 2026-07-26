@@ -23,7 +23,7 @@ use crate::codec::{
 use crate::counter::Counter;
 use crate::element::Element;
 use crate::elementid::{ElementId, ElementKind};
-use crate::list::{Anchor, List};
+use crate::list::{Anchor, List, Side};
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::marks::{MarkState, ResolvedMark};
 use crate::op::{Op, OpId, OpKind, Tx, TxId};
@@ -34,6 +34,7 @@ use crate::schema::{MarkFlavor, Schema};
 use crate::stamp::Stamp;
 use crate::text::Text;
 use crate::treemove::TreeMoves;
+use crate::undo::{History, Intention, Landing, Snap, Step as Inverse, MAX_SNAPSHOT_DEPTH};
 use crate::validate::Step;
 use crate::xml::{XmlElement, XmlFragment};
 use crate::zone;
@@ -213,6 +214,11 @@ pub struct Document {
     /// repair is told apart from a newly-needed or newly-changed one. Kept
     /// meaningful only while a schema is bound.
     repair_baseline: Vec<RepairId>,
+    /// The recorded undo history — the inverse of every op this replica emitted
+    /// while an origin was set, stacked by intention. Inert (and empty) until
+    /// [`set_undo_origin`](Self::set_undo_origin) turns recording on, so a
+    /// replica that never authors undoable edits — a server's — carries none.
+    history: History,
 }
 
 impl Drop for Document {
@@ -270,6 +276,7 @@ impl Document {
             pending: Vec::new(),
             schema: None,
             repair_baseline: Vec::new(),
+            history: History::default(),
         }
     }
 
@@ -833,6 +840,12 @@ impl Document {
                         .put_slot_lww(new_key, delete_stamp, None, true);
                 }
             }
+        }
+        if changed {
+            // The recorded inverses restore slot shapes this migration has just
+            // rewritten, so replaying one would write back a pre-migration key.
+            // The stack drops at the boundary; recording continues.
+            self.history.forget();
         }
         changed
     }
@@ -1909,6 +1922,9 @@ impl Document {
             pending: Vec::new(),
             schema: None,
             repair_baseline: Vec::new(),
+            // A snapshot carries state, not authorship: a replica restored from
+            // one has emitted nothing, so it has nothing of its own to undo.
+            history: History::default(),
         };
         // Rebuild the tree-move state: the created-under parent of each placed
         // node (for the cycle check + fallback parent), then replay the move log,
@@ -2029,6 +2045,12 @@ impl Document {
         // waiting on; replay them now, not only on the next remote apply.
         self.drain_buffer();
         let ops = std::mem::take(&mut self.pending);
+        // A transact is one intention unless it is part of a larger group — an
+        // explicit `begin_intention` or an open atomic transaction, each of which
+        // closes the intention itself.
+        if self.atomic.is_none() && !self.history.grouped() {
+            self.history.close(false);
+        }
         // While recording an atomic transaction, edits accumulate into the group
         // rather than returning per call; the group ships on `commit_atomic`.
         match self.atomic.as_mut() {
@@ -2053,7 +2075,14 @@ impl Document {
     /// tagged as one group for all-or-nothing delivery. Returns empty (and tags
     /// nothing) if no edits were recorded or no transaction was open.
     pub fn commit_atomic(&mut self) -> Vec<Op> {
-        let ops = self.atomic.take().unwrap_or_default();
+        // With no transaction open there is nothing to close — and nothing to
+        // record either: closing here would cut an explicit intention in half and
+        // mislabel the first half atomic.
+        let Some(ops) = self.atomic.take() else {
+            return Vec::new();
+        };
+        // The group is one intention, undone and redone as one transaction.
+        self.history.close(true);
         self.tag_atomic(ops)
     }
 
@@ -2544,6 +2573,13 @@ impl Document {
         self.seq += 1;
         self.seen.insert(id);
         let author = self.client;
+        // The record-seam: the inverse is read off the state this op is about to
+        // overwrite, so it must be taken before the op lands.
+        if self.history.recording() {
+            for step in self.inverse(target, &kind, stamp) {
+                self.history.push(step);
+            }
+        }
         self.apply_kind(target, &kind, stamp, author);
         self.pending.push(Op {
             id,
@@ -3178,6 +3214,982 @@ impl Document {
                 self.parents.insert(children_id, id);
                 Element::XmlFragment(handle)
             }
+        }
+    }
+
+    // --- undo record-seam ---
+    //
+    // Every op this replica emits passes through `emit_stamped`, which asks
+    // `inverse` what would put the state back. That is the whole seam: an edit is
+    // recorded because it was *emitted*, not because it was made through some
+    // particular helper, so a handle-graph SDK, the path façade and a raw cursor
+    // all record identically, on an offline replica and on a channel's replica
+    // alike. Replaying an intention emits ordinary forward ops, which record
+    // their own inverses — so the mirror is always derived from live state.
+
+    /// Record emitted edits under `origin` from now on. Recording is off until
+    /// this is called; the origin is the tag [`undo`](Self::undo) selects by, so
+    /// two managers over one document (a user's and a subtree-scoped one) keep
+    /// separate histories.
+    pub fn set_undo_origin(&mut self, origin: &[u8]) {
+        self.history.track(origin);
+    }
+
+    /// Stop recording emitted edits. What was already recorded stays undoable.
+    pub fn clear_undo_origin(&mut self) {
+        self.history.untrack();
+    }
+
+    /// The origin edits are recording under, or `None` when recording is off.
+    pub fn undo_origin(&self) -> Option<&[u8]> {
+        self.history.origin()
+    }
+
+    /// Open an explicit intention: every edit until the matching
+    /// [`end_intention`](Self::end_intention) records as one undo step, however
+    /// many transacts it spans. Nests.
+    pub fn begin_intention(&mut self) {
+        self.history.open_group();
+    }
+
+    /// Close the intention opened by [`begin_intention`](Self::begin_intention).
+    /// The outermost close records the step.
+    pub fn end_intention(&mut self) {
+        if self.history.close_group() && self.atomic.is_none() {
+            self.history.close(false);
+        }
+    }
+
+    /// Whether `origin` has a recorded intention to undo.
+    pub fn can_undo(&self, origin: &[u8]) -> bool {
+        self.history.can_undo(origin)
+    }
+
+    /// Whether `origin` has an undone intention to redo.
+    pub fn can_redo(&self, origin: &[u8]) -> bool {
+        self.history.can_redo(origin)
+    }
+
+    /// Revert `origin`'s most recent intention — skipping any another origin
+    /// interleaved — and return the ordinary forward ops that did it, for the
+    /// caller to broadcast. The intention becomes redoable. `None` when `origin`
+    /// has nothing to undo, or while an intention is open — an atomic
+    /// transaction or an explicit [`begin_intention`](Self::begin_intention)
+    /// group: the undo's own edits would be recorded into that open intention,
+    /// silently taking the group's edits onto the wrong stack.
+    pub fn undo(&mut self, origin: &[u8]) -> Option<Vec<Op>> {
+        if self.recording_intention() {
+            return None;
+        }
+        let intention = self.history.take(origin, Landing::Undo)?;
+        Some(self.replay(intention, Landing::Redo))
+    }
+
+    /// Replay `origin`'s most recently undone intention, returning the ops to
+    /// broadcast. It becomes undoable again. `None` under the same conditions as
+    /// [`undo`](Self::undo).
+    pub fn redo(&mut self, origin: &[u8]) -> Option<Vec<Op>> {
+        if self.recording_intention() {
+            return None;
+        }
+        let intention = self.history.take(origin, Landing::Redo)?;
+        Some(self.replay(intention, Landing::Undo))
+    }
+
+    /// Whether an intention is open, so a replay would record into it.
+    fn recording_intention(&self) -> bool {
+        self.atomic.is_some() || self.history.grouped()
+    }
+
+    /// Emit an intention's inverses — last edit undone first — and return their
+    /// ops. The emitted ops record their own inverses, which close as the mirror
+    /// intention on `landing`. An atomic intention replays inside one atomic
+    /// transaction, so its ops reach a peer all-or-nothing and the mirror is
+    /// itself atomic.
+    fn replay(&mut self, intention: Intention, landing: Landing) -> Vec<Op> {
+        let Intention {
+            origin,
+            steps,
+            atomic,
+        } = intention;
+        let saved = self.history.begin_replay(&origin, landing);
+        if atomic {
+            self.begin_atomic();
+        }
+        self.pending.clear();
+        let plan = self.plan(steps);
+        // The container-restoring ops this intention holds, by the element each
+        // makes live. A step whose target is displaced when its turn comes is
+        // preceded by a *copy* of the op that puts the container back, rather
+        // than by hoisting that op out of its place: re-creating a container is
+        // idempotent, while moving a slot write past another inverts which of
+        // them the slot ends up holding.
+        let installers: HashMap<ElementId, (ElementId, OpKind)> = plan
+            .iter()
+            .filter_map(|step| match step {
+                Inverse::Op { target, kind } => {
+                    self.installs(step).map(|id| (id, (*target, kind.clone())))
+                }
+                _ => None,
+            })
+            .collect();
+        for step in plan {
+            // The element the step will actually address — a revival may have
+            // replaced the one it names — so the reachability decision and the
+            // emission are about the same thing.
+            let target = self.history.current_element(self.step_target(&step));
+            if !self.resolvable(target) {
+                self.reinstate(target, &installers);
+            }
+            // What is still unreachable is dropped rather than emitted: a peer
+            // would buffer and later replay what this replica applies to nothing.
+            if self.resolvable(target) {
+                self.emit_inverse(step);
+            }
+        }
+        // A revived container can be what buffered remote ops were waiting on.
+        self.drain_buffer();
+        let ops = std::mem::take(&mut self.pending);
+        let ops = if atomic {
+            self.atomic.get_or_insert_with(Vec::new).extend(ops);
+            self.commit_atomic()
+        } else {
+            self.history.close(false);
+            ops
+        };
+        self.history.end_replay(saved);
+        self.history.prune();
+        ops
+    }
+
+    /// Emit one inverse action, following any revival that has since replaced the
+    /// sequence ids it names, and recording the substitutions its own revival
+    /// makes for the intentions still stacked beneath.
+    fn emit_inverse(&mut self, step: Inverse) {
+        match step {
+            Inverse::Op { target, kind } => {
+                // The target itself can be a container of something a revival
+                // replaced — a revived annotation's payload, a revived node's
+                // attrs or children — so it follows the element map too.
+                let target = self.history.current_element(target);
+                let kind = self.follow_revivals(target, kind);
+                self.emit(target, kind)
+            }
+            Inverse::Regrant {
+                target,
+                subject,
+                grant,
+                effect,
+                scope,
+                grantor,
+                was,
+            } => {
+                let stamp = self.emit_stamped(
+                    target,
+                    OpKind::AclGrant {
+                        subject,
+                        grant,
+                        effect,
+                        scope,
+                        grantor,
+                    },
+                );
+                self.history.substitute_element(was, acl_id(stamp));
+            }
+            Inverse::ReviveItem {
+                list,
+                anchor,
+                value,
+                was,
+            } => {
+                let now = self.emit_stamped(list, OpKind::ListInsert { value, anchor });
+                self.history.substitute(list, was, now);
+            }
+            Inverse::ReviveRun {
+                text,
+                anchor,
+                s,
+                was,
+            } => {
+                let now = self.emit_stamped(text, OpKind::TextInsert { s, anchor });
+                for (i, old) in was.into_iter().enumerate() {
+                    self.history.substitute(text, old, now.run_member(i as u64));
+                }
+            }
+            Inverse::ReviveNode {
+                list,
+                anchor,
+                node,
+                was,
+                was_node,
+            } => {
+                if let Some(now) = self.revive_node(list, anchor, node) {
+                    self.history.substitute(list, was, now);
+                    if let Some(element) = self.node_at(list, now) {
+                        self.history.substitute_element(was_node, element);
+                        // A stacked step may target the node's attrs or children
+                        // rather than the node, and those ids derive from it.
+                        self.history.substitute_element(
+                            XmlElement::attrs_id(was_node),
+                            XmlElement::attrs_id(element),
+                        );
+                        self.history.substitute_element(
+                            XmlElement::children_id(was_node),
+                            XmlElement::children_id(element),
+                        );
+                    }
+                }
+            }
+            Inverse::Ranged {
+                start,
+                end,
+                name,
+                payload,
+                was,
+            } => {
+                if let Some(now) = self.revive_ranged(start, end, name, payload) {
+                    self.history.substitute_element(was, now);
+                    // A composite payload is a container in its own right, and a
+                    // stacked step edits it by that derived id.
+                    for kind in [ElementKind::Map, ElementKind::List, ElementKind::Text] {
+                        self.history
+                            .substitute_element(payload_id(was, kind), payload_id(now, kind));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The element id of the node `stamp` just minted in the children list
+    /// `list` — an XML element or a text run.
+    fn node_at(&self, list: ElementId, stamp: Stamp) -> Option<ElementId> {
+        [ElementKind::XmlElement, ElementKind::Text]
+            .into_iter()
+            .map(|kind| xml_child_id(list, stamp, kind))
+            .find(|id| self.node_element(*id).is_some())
+    }
+
+    /// Re-point a sequence delete at the ids its items came back as. A tombstone
+    /// is terminal, so an earlier undo revived them under fresh ids; an intention
+    /// recorded before that revival still names the originals.
+    fn follow_revivals(&self, seq: ElementId, kind: OpKind) -> OpKind {
+        // An anchor names a node of the sequence it places into, so a revived
+        // anchor has to be followed too or the step lands beside the tombstone
+        // instead of beside the item that replaced it.
+        let anchored = |anchor: Anchor| Anchor {
+            parent: anchor.parent.map(|id| self.history.current(seq, id)),
+            side: anchor.side,
+        };
+        match kind {
+            OpKind::ListDelete { id } => OpKind::ListDelete {
+                id: self.history.current(seq, id),
+            },
+            OpKind::ListInsert { value, anchor } => OpKind::ListInsert {
+                value,
+                anchor: anchored(anchor),
+            },
+            OpKind::TextInsert { s, anchor } => OpKind::TextInsert {
+                s,
+                anchor: anchored(anchor),
+            },
+            OpKind::XmlInsertChild { tag, anchor } => OpKind::XmlInsertChild {
+                tag,
+                anchor: anchored(anchor),
+            },
+            OpKind::TextDelete { ids } => OpKind::TextDelete {
+                ids: ids
+                    .into_iter()
+                    .map(|id| self.history.current(seq, id))
+                    .collect(),
+            },
+            // These name an element outright, so they follow the element map
+            // rather than the sequence one: a revived node, annotation, or ACL
+            // tuple carries a new id its own revival recorded.
+            OpKind::XmlMove { node, anchor } => OpKind::XmlMove {
+                node: self.history.current_element(node),
+                anchor: anchored(anchor),
+            },
+            OpKind::RangedSetPayload { id, payload } => OpKind::RangedSetPayload {
+                id: self.history.current_element(id),
+                payload,
+            },
+            OpKind::RangedDelete { id } => OpKind::RangedDelete {
+                id: self.history.current_element(id),
+            },
+            OpKind::AclRevoke { id } => OpKind::AclRevoke {
+                id: self.history.current_element(id),
+            },
+            other => other,
+        }
+    }
+
+    /// Order an intention's inverses for replay.
+    ///
+    /// The base order is the reverse of the edits — the last thing done is the
+    /// first thing undone — and it is *kept*: two writes to one map slot are
+    /// ordered by that reversal, and moving either past the other inverts which
+    /// of them the slot ends up holding. A container a step needs is re-created
+    /// on demand instead (see [`replay`](Self::replay)).
+    ///
+    /// The one thing dropped is a step addressing inside a container another
+    /// step *terminally removes* — a slot emptied by a delete, or a sequence node
+    /// tombstoned. Those leave the tree whole and come back whole, so tearing
+    /// their interior down first is not merely redundant: it would leave the
+    /// mirror an empty shell to snapshot, and the redo would lose everything the
+    /// intention put inside. A vacated map slot is not that — the container is
+    /// retained holding what the intention put there, and anything that
+    /// re-installs the slot exposes it — so those steps still run.
+    fn plan(&self, steps: Vec<Inverse>) -> Vec<Inverse> {
+        let steps: Vec<Inverse> = steps.into_iter().rev().collect();
+        let removed: Vec<ElementId> = steps.iter().filter_map(|s| self.removes(s)).collect();
+        steps
+            .into_iter()
+            .filter(|s| !self.under_any(self.step_target(s), &removed))
+            .collect()
+    }
+
+    /// Re-create the containers `target` sits under, outermost first, from the
+    /// restoring ops this intention already holds. Inert when it holds none — the
+    /// step is then dropped rather than emitted onto nothing.
+    fn reinstate(
+        &mut self,
+        target: ElementId,
+        installers: &HashMap<ElementId, (ElementId, OpKind)>,
+    ) {
+        let mut chain: Vec<(ElementId, OpKind)> = Vec::new();
+        let mut cur = Some(target);
+        // Bounded like the other parent walks, so a corrupt link stops the walk
+        // rather than spinning.
+        for _ in 0..=self.parents.len() {
+            let Some(id) = cur else { break };
+            if let Some((at, kind)) = installers.get(&id) {
+                chain.push((*at, kind.clone()));
+            }
+            if id == self.root_id() {
+                break;
+            }
+            cur = self.parents.get(&id).copied();
+        }
+        for (at, kind) in chain.into_iter().rev() {
+            // The copies answer to the same rule as the steps: an op this replica
+            // would apply to nothing is not emitted, because a peer buffers it
+            // and fires it the moment the container returns. Once one link of the
+            // chain cannot land, nothing below it can either.
+            if !self.resolvable(at) {
+                return;
+            }
+            self.emit(at, kind);
+        }
+    }
+
+    /// The element a step addresses.
+    fn step_target(&self, step: &Inverse) -> ElementId {
+        match step {
+            Inverse::Op { target, .. } => *target,
+            Inverse::ReviveItem { list, .. } | Inverse::ReviveNode { list, .. } => *list,
+            Inverse::ReviveRun { text, .. } => *text,
+            Inverse::Regrant { target, .. } => *target,
+            // An annotation hangs off the document, which is always reachable.
+            Inverse::Ranged { .. } => self.root_id(),
+        }
+    }
+
+    /// The element a step puts in a map slot, if any. The child is re-derived
+    /// from the key, so this is a function of the op alone — not of what the slot
+    /// happens to hold, which is what the step *displaces*.
+    fn installs(&self, step: &Inverse) -> Option<ElementId> {
+        let Inverse::Op { target, kind } = step else {
+            return None;
+        };
+        let (key, kind) = match kind {
+            OpKind::MapCreate { key } => (key, ElementKind::Map),
+            OpKind::ListCreate { key } => (key, ElementKind::List),
+            OpKind::TextCreate { key } => (key, ElementKind::Text),
+            OpKind::XmlElementCreate { key, tag } => {
+                return Some(XmlElement::node_id(*target, key, tag))
+            }
+            OpKind::XmlFragmentCreate { key } => return Some(XmlFragment::node_id(*target, key)),
+            // A counter is a leaf: nothing is ever reached *through* it, so it can
+            // never be a link in the chain a step's target hangs off. Listing it
+            // would only let two deltas on one key collide over the entry.
+            _ => return None,
+        };
+        Some(ElementId::derive(*target, key, kind))
+    }
+
+    /// The container a step puts permanently out of reach, if any — the one
+    /// whose subtree the step therefore subsumes.
+    ///
+    /// Only a tombstoned **sequence node** qualifies. A delete there is terminal:
+    /// the move fold hides every placement of a deleted node, so nothing can ever
+    /// render it again, and its containers — retained by id like all of them —
+    /// become unreachable for good. Undoing the node's contents before deleting
+    /// it would therefore lose them outright, since the revival's snapshot is
+    /// taken from what is left.
+    ///
+    /// A **map slot** is not terminal, however it is vacated: emptied by a
+    /// delete or taken by another value, the container is retained holding what
+    /// the intention put in it, and the next thing to install that slot brings it
+    /// back — exposing exactly the edits a subsumption would have discarded. So
+    /// those steps always run.
+    fn removes(&self, step: &Inverse) -> Option<ElementId> {
+        let Inverse::Op {
+            target,
+            kind: OpKind::ListDelete { id },
+        } = step
+        else {
+            return None;
+        };
+        let held = self.lists.get(target)?.borrow().node_value(*id)?;
+        held.is_container().then(|| held.id())
+    }
+
+    /// Whether `id` is one of `roots` or sits under one — so a step addressing it
+    /// is subsumed by the step that removes that root.
+    fn under_any(&self, id: ElementId, roots: &[ElementId]) -> bool {
+        if roots.is_empty() {
+            return false;
+        }
+        let mut cur = id;
+        // A chain longer than the parent map has revisited a node, which only a
+        // corrupt parent link could produce; stop rather than spin.
+        for _ in 0..=self.parents.len() {
+            if roots.contains(&cur) {
+                return true;
+            }
+            if cur == self.root_id() {
+                return false;
+            }
+            match self.parents.get(&cur) {
+                Some(&parent) => cur = parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// What would put the state back after `kind` lands on `target` with
+    /// `stamp` — read against the state as it stands *now*, before the op
+    /// applies. Empty for an op with nothing to restore; a counter delta needs
+    /// two steps, since it both moves the tally and re-wins the slot.
+    fn inverse(&self, target: ElementId, kind: &OpKind, stamp: Stamp) -> Vec<Inverse> {
+        match kind {
+            // A counter delta re-wins its slot on the way past, so cancelling the
+            // tally is only half the inverse — whatever the delta displaced has to
+            // come back too. The slot step is recorded *first* so the reversed
+            // replay cancels the tally and then restores the slot; the other way
+            // round the counter would re-take the slot it had just given up.
+            OpKind::CounterInc { key, amount } | OpKind::CounterDec { key, amount } => {
+                let cancel = if matches!(kind, OpKind::CounterInc { .. }) {
+                    OpKind::CounterDec {
+                        key: key.clone(),
+                        amount: *amount,
+                    }
+                } else {
+                    OpKind::CounterInc {
+                        key: key.clone(),
+                        amount: *amount,
+                    }
+                };
+                let mut steps = Vec::new();
+                // A slot the counter already held needs no restoring — that step
+                // would be a zero-delta op re-winning a slot it never left.
+                let counter_id = ElementId::derive(target, key, ElementKind::Counter);
+                // A bare scalar has no id at all — asking for one panics — so the
+                // "already this counter" test has to exclude it before comparing.
+                let held = self
+                    .maps
+                    .get(&target)
+                    .and_then(|m| m.borrow().get(key))
+                    .is_some_and(|e| !matches!(e, Element::Scalar(_)) && e.id() == counter_id);
+                if !held {
+                    steps.extend(self.slot_inverse(target, key));
+                }
+                steps.push(Inverse::Op {
+                    target,
+                    kind: cancel,
+                });
+                steps
+            }
+            other => self
+                .single_inverse(target, other, stamp)
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// The inverse of every op whose undo is a single action.
+    fn single_inverse(&self, target: ElementId, kind: &OpKind, stamp: Stamp) -> Option<Inverse> {
+        let at = |target, kind| Some(Inverse::Op { target, kind });
+        match kind {
+            // Every slot mutation — a value, a leaf, or a container install —
+            // inverts to whatever the slot held before it.
+            OpKind::RegisterSet { key, .. }
+            | OpKind::MapSet { key, .. }
+            | OpKind::MapDelete { key }
+            | OpKind::MapCreate { key }
+            | OpKind::ListCreate { key }
+            | OpKind::TextCreate { key }
+            | OpKind::XmlElementCreate { key, .. }
+            | OpKind::XmlFragmentCreate { key } => self.slot_inverse(target, key),
+            OpKind::CounterInc { .. } | OpKind::CounterDec { .. } => {
+                unreachable!("a counter delta inverts to two steps, routed above")
+            }
+            // A sequence insert is undone by tombstoning exactly the node it
+            // mints, whose id is the op's own stamp.
+            OpKind::ListInsert { .. } | OpKind::XmlInsertChild { .. } => {
+                at(target, OpKind::ListDelete { id: stamp })
+            }
+            OpKind::ListDelete { id } => self.list_delete_inverse(target, *id),
+            // A run takes one char_id per codepoint from the op's stamp, so the
+            // ids to tombstone are known without reading the text back. An empty
+            // run mints nothing and has nothing to undo.
+            OpKind::TextInsert { s, .. } => {
+                let count = s.chars().count() as u64;
+                if count == 0 {
+                    return None;
+                }
+                let ids = (0..count).map(|i| stamp.run_member(i)).collect();
+                at(target, OpKind::TextDelete { ids })
+            }
+            OpKind::TextDelete { ids } => self.text_delete_inverse(target, ids),
+            OpKind::XmlMove { node, .. } => self.move_inverse(*node),
+            // A reveal is synthesized by the server at redaction time, never
+            // authored here, so it never reaches the seam — and it installs only
+            // a shell, so there is nothing to restore.
+            OpKind::XmlReveal { .. } => None,
+            OpKind::RangedCreate { .. } => at(
+                target,
+                OpKind::RangedDelete {
+                    id: ranged_id(stamp),
+                },
+            ),
+            OpKind::RangedSetPayload { id, .. } => {
+                let prior = match &self.ranged.get(id)?.payload {
+                    Payload::Scalar { value, .. } => value.clone(),
+                    // A composite payload is edited through its container, so
+                    // this op is inert against one and needs no inverse.
+                    Payload::Composite { .. } => return None,
+                };
+                at(
+                    target,
+                    OpKind::RangedSetPayload {
+                        id: *id,
+                        payload: prior,
+                    },
+                )
+            }
+            OpKind::RangedDelete { id } => self.ranged_inverse(*id),
+            OpKind::AclGrant { .. } => at(target, OpKind::AclRevoke { id: acl_id(stamp) }),
+            OpKind::AclRevoke { id } => {
+                let e = self.acl.get(id)?;
+                Some(Inverse::Regrant {
+                    target,
+                    subject: e.subject.clone(),
+                    grant: e.grant.clone(),
+                    effect: e.effect,
+                    scope: e.scope.clone(),
+                    grantor: e.grantor,
+                    was: *id,
+                })
+            }
+        }
+    }
+
+    /// Re-install whatever `key` holds in `map_id` right now. A container is
+    /// restored by re-creating it at the same key: its handle is retained by id,
+    /// so the same logical element comes back with its content intact. An empty
+    /// or tombstoned slot inverts to a delete.
+    fn slot_inverse(&self, map_id: ElementId, key: &[u8]) -> Option<Inverse> {
+        let map = self.maps.get(&map_id)?;
+        let key = key.to_vec();
+        let kind = match map.borrow().get(&key) {
+            None => OpKind::MapDelete { key },
+            Some(Element::Scalar(value)) => OpKind::MapSet { key, value },
+            Some(Element::Register(r)) => OpKind::RegisterSet {
+                key,
+                value: r.borrow().read().clone(),
+            },
+            // The tally lives in the registry keyed by the slot's derived id, so
+            // re-winning the slot with a zero delta restores the counter whole.
+            Some(Element::Counter(_)) => OpKind::CounterInc { key, amount: 0 },
+            Some(Element::Map(_)) => OpKind::MapCreate { key },
+            Some(Element::List(_)) => OpKind::ListCreate { key },
+            Some(Element::Text(_)) => OpKind::TextCreate { key },
+            Some(Element::XmlElement(x)) => OpKind::XmlElementCreate {
+                tag: x.borrow().tag().to_vec(),
+                key,
+            },
+            Some(Element::XmlFragment(_)) => OpKind::XmlFragmentCreate { key },
+        };
+        Some(Inverse::Op {
+            target: map_id,
+            kind,
+        })
+    }
+
+    /// Revive the node about to be tombstoned, right where it sits: the revival
+    /// anchors as the *left* child of the node it replaces, which renders
+    /// immediately before it — the position the tombstone still holds, however
+    /// the sequence has shifted since. A scalar comes back as a plain insert; a
+    /// composite sequence node — an XML child — is rebuilt from a snapshot, since
+    /// a tombstone drops the value it held.
+    fn list_delete_inverse(&self, list_id: ElementId, id: Stamp) -> Option<Inverse> {
+        let list = self.lists.get(&list_id)?;
+        // By id, not by live index: a node suppressed by a tree move renders
+        // elsewhere but is still what this placement holds, and deleting the
+        // placement hides the node everywhere (delete wins over move) — so the
+        // inverse has to be able to bring it back.
+        let value = list.borrow().node_value(id)?;
+        let anchor = Anchor {
+            parent: Some(id),
+            side: Side::Left,
+        };
+        match value {
+            Element::Scalar(value) => Some(Inverse::ReviveItem {
+                list: list_id,
+                anchor,
+                value,
+                was: id,
+            }),
+            // A movable node is revived only when the delete is what takes it out
+            // of view. Deleting one of its placements hides *every* placement
+            // (delete wins over move), so a node rendering elsewhere still needs
+            // an inverse — but a node already hidden loses nothing here, and
+            // reviving it would put a duplicate beside whatever restores the
+            // original. No edit surface can delete an already-hidden placement;
+            // a replay can, by emitting a recorded delete against a node a later
+            // step has since hidden, which is where the duplicate came from.
+            other if self.renders(other.id()) => Some(Inverse::ReviveNode {
+                list: list_id,
+                anchor,
+                node: self.snapshot(&other, 0)?,
+                was: id,
+                was_node: other.id(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether a movable node currently renders — one of its placements is live
+    /// in a reachable sequence.
+    fn renders(&self, node: ElementId) -> bool {
+        self.placements.get(&node).is_some_and(|places| {
+            places.iter().any(|p| {
+                self.resolvable(p.list)
+                    && self
+                        .lists
+                        .get(&p.list)
+                        .is_some_and(|l| l.borrow().live_index(p.stamp).is_some())
+            })
+        })
+    }
+
+    /// Revive the codepoints about to be tombstoned, anchored as the left child
+    /// of the first of them — the left edge of the run, which is where the
+    /// revived text belongs however the sequence has shifted since.
+    fn text_delete_inverse(&self, text_id: ElementId, ids: &[Stamp]) -> Option<Inverse> {
+        let text = self.texts.get(&text_id)?;
+        let t = text.borrow();
+        let chars: Vec<char> = t.as_string().chars().collect();
+        let mut live: Vec<(usize, Stamp)> = ids
+            .iter()
+            .filter_map(|id| t.live_index(*id).map(|i| (i, *id)))
+            .collect();
+        live.sort_unstable_by_key(|(i, _)| *i);
+        let (_, first) = *live.first()?;
+        let s: String = live.iter().filter_map(|(i, _)| chars.get(*i)).collect();
+        Some(Inverse::ReviveRun {
+            text: text_id,
+            anchor: Anchor {
+                parent: Some(first),
+                side: Side::Left,
+            },
+            s,
+            was: live.into_iter().map(|(_, id)| id).collect(),
+        })
+    }
+
+    /// Move `node` back where it renders now — its live placement's list, at its
+    /// live index there, discounting its own slot exactly as a forward reorder
+    /// does.
+    fn move_inverse(&self, node: ElementId) -> Option<Inverse> {
+        let from = *self.parents.get(&node)?;
+        let list = self.lists.get(&from)?;
+        let slot = self
+            .placements
+            .get(&node)?
+            .iter()
+            .filter(|p| p.list == from)
+            .map(|p| p.stamp)
+            .max()?;
+        let l = list.borrow();
+        let index = l.live_index(slot)?;
+        Some(Inverse::Op {
+            target: from,
+            kind: OpKind::XmlMove {
+                node,
+                anchor: l.place_excluding(index, Some(slot)),
+            },
+        })
+    }
+
+    /// Re-create the RangedElement about to be tombstoned over the same span,
+    /// carrying its payload. A tombstone is terminal, so the revival is a fresh
+    /// annotation with a new id.
+    fn ranged_inverse(&self, id: ElementId) -> Option<Inverse> {
+        let e = self.ranged.get(&id)?;
+        if e.tombstone {
+            return None;
+        }
+        let payload = match &e.payload {
+            Payload::Scalar { value, .. } => Snap::Scalar(value.clone()),
+            Payload::Composite { kind } => {
+                let pid = payload_id(id, *kind);
+                match kind {
+                    ElementKind::Map => {
+                        self.snapshot(&Element::Map(self.maps.get(&pid)?.clone()), 0)
+                    }
+                    ElementKind::List => {
+                        self.snapshot(&Element::List(self.lists.get(&pid)?.clone()), 0)
+                    }
+                    ElementKind::Text => {
+                        self.snapshot(&Element::Text(self.texts.get(&pid)?.clone()), 0)
+                    }
+                    _ => None,
+                }?
+            }
+        };
+        Some(Inverse::Ranged {
+            start: e.start,
+            end: e.end,
+            name: e.name.clone(),
+            payload,
+            was: id,
+        })
+    }
+
+    /// Capture `element` deeply enough to rebuild it out of forward ops. `None`
+    /// past [`MAX_SNAPSHOT_DEPTH`], so the walk cannot run off the stack.
+    fn snapshot(&self, element: &Element, depth: u32) -> Option<Snap> {
+        if depth >= MAX_SNAPSHOT_DEPTH {
+            return None;
+        }
+        let next = depth + 1;
+        Some(match element {
+            Element::Scalar(v) => Snap::Scalar(v.clone()),
+            Element::Register(r) => Snap::Register(r.borrow().read().clone()),
+            Element::Counter(c) => Snap::Counter(c.borrow().read()),
+            Element::Map(m) => Snap::Map(self.snapshot_slots(m, next)),
+            Element::List(l) => Snap::List(
+                l.borrow()
+                    .values()
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Element::Scalar(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            Element::Text(t) => Snap::Text(t.borrow().as_string()),
+            Element::XmlElement(x) => {
+                let (tag, attrs, children) = {
+                    let x = x.borrow();
+                    (x.tag().to_vec(), x.attrs(), x.children())
+                };
+                Snap::XmlElement {
+                    tag,
+                    attrs: self.snapshot_slots(&attrs, next),
+                    children: self.snapshot_children(&children, next),
+                }
+            }
+            Element::XmlFragment(f) => Snap::XmlFragment {
+                children: self.snapshot_children(&f.borrow().children(), next),
+            },
+        })
+    }
+
+    /// Capture a map's live slots, skipping any too deep to rebuild.
+    fn snapshot_slots(&self, map: &Rc<RefCell<Map>>, depth: u32) -> Vec<(Vec<u8>, Snap)> {
+        map.borrow()
+            .entries()
+            .into_iter()
+            .filter_map(|(key, value)| Some((key, self.snapshot(&value, depth)?)))
+            .collect()
+    }
+
+    /// Capture a children sequence's live nodes, skipping any too deep.
+    fn snapshot_children(&self, list: &Rc<RefCell<List>>, depth: u32) -> Vec<Snap> {
+        list.borrow()
+            .values()
+            .into_iter()
+            .filter_map(|v| self.snapshot(&v, depth))
+            .collect()
+    }
+
+    /// Rebuild a captured sequence node in `list` at `anchor`, returning the
+    /// sequence id it came back under. Only the two movable node kinds ever
+    /// occupy a children sequence.
+    fn revive_node(&mut self, list: ElementId, anchor: Anchor, node: Snap) -> Option<Stamp> {
+        match node {
+            Snap::Text(s) => {
+                let stamp = self.emit_stamped(list, OpKind::XmlInsertChild { tag: None, anchor });
+                let child = xml_child_id(list, stamp, ElementKind::Text);
+                self.fill_text(child, s);
+                Some(stamp)
+            }
+            Snap::XmlElement {
+                tag,
+                attrs,
+                children,
+            } => {
+                let stamp = self.emit_stamped(
+                    list,
+                    OpKind::XmlInsertChild {
+                        tag: Some(tag),
+                        anchor,
+                    },
+                );
+                let child = xml_child_id(list, stamp, ElementKind::XmlElement);
+                self.fill_slots(XmlElement::attrs_id(child), attrs);
+                self.fill_children(XmlElement::children_id(child), children);
+                Some(stamp)
+            }
+            _ => None,
+        }
+    }
+
+    /// Re-create a captured RangedElement and rebuild its payload.
+    fn revive_ranged(
+        &mut self,
+        start: RangeAnchor,
+        end: RangeAnchor,
+        name: Option<Vec<u8>>,
+        payload: Snap,
+    ) -> Option<ElementId> {
+        let init = match &payload {
+            Snap::Scalar(v) => RangedInit::Scalar(v.clone()),
+            Snap::Map(_) => RangedInit::Composite(ElementKind::Map),
+            Snap::List(_) => RangedInit::Composite(ElementKind::List),
+            Snap::Text(_) => RangedInit::Composite(ElementKind::Text),
+            _ => return None,
+        };
+        let root = self.root_id();
+        let stamp = self.emit_stamped(
+            root,
+            OpKind::RangedCreate {
+                start,
+                end,
+                payload: init,
+                name,
+            },
+        );
+        let ranged = ranged_id(stamp);
+        match payload {
+            Snap::Map(slots) => self.fill_slots(payload_id(ranged, ElementKind::Map), slots),
+            Snap::List(values) => self.fill_list(payload_id(ranged, ElementKind::List), values),
+            Snap::Text(s) => self.fill_text(payload_id(ranged, ElementKind::Text), s),
+            _ => {}
+        }
+        Some(ranged)
+    }
+
+    /// Re-create captured slots in the map `map_id`, descending into each
+    /// container as it is installed.
+    fn fill_slots(&mut self, map_id: ElementId, slots: Vec<(Vec<u8>, Snap)>) {
+        for (key, snap) in slots {
+            match snap {
+                Snap::Scalar(value) => self.emit(map_id, OpKind::MapSet { key, value }),
+                Snap::Register(value) => self.emit(map_id, OpKind::RegisterSet { key, value }),
+                Snap::Counter(total) => self.fill_counter(map_id, key, total),
+                Snap::Map(slots) => {
+                    let child = ElementId::derive(map_id, &key, ElementKind::Map);
+                    self.emit(map_id, OpKind::MapCreate { key });
+                    self.fill_slots(child, slots);
+                }
+                Snap::List(values) => {
+                    let child = ElementId::derive(map_id, &key, ElementKind::List);
+                    self.emit(map_id, OpKind::ListCreate { key });
+                    self.fill_list(child, values);
+                }
+                Snap::Text(s) => {
+                    let child = ElementId::derive(map_id, &key, ElementKind::Text);
+                    self.emit(map_id, OpKind::TextCreate { key });
+                    self.fill_text(child, s);
+                }
+                Snap::XmlElement {
+                    tag,
+                    attrs,
+                    children,
+                } => {
+                    let child = XmlElement::node_id(map_id, &key, &tag);
+                    self.emit(map_id, OpKind::XmlElementCreate { key, tag });
+                    self.fill_slots(XmlElement::attrs_id(child), attrs);
+                    self.fill_children(XmlElement::children_id(child), children);
+                }
+                Snap::XmlFragment { children } => {
+                    let child = XmlFragment::node_id(map_id, &key);
+                    self.emit(map_id, OpKind::XmlFragmentCreate { key });
+                    self.fill_children(XmlFragment::children_id(child), children);
+                }
+            }
+        }
+    }
+
+    /// Drive a counter at `key` to `total` from zero. The op carries a `u32`
+    /// delta, so a total beyond that range takes several.
+    fn fill_counter(&mut self, map_id: ElementId, key: Vec<u8>, total: i64) {
+        let mut left = total.unsigned_abs();
+        // A zero total still re-installs the counter in its slot.
+        loop {
+            let amount = u32::try_from(left.min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+            left -= u64::from(amount);
+            let kind = if total < 0 {
+                OpKind::CounterDec {
+                    key: key.clone(),
+                    amount,
+                }
+            } else {
+                OpKind::CounterInc {
+                    key: key.clone(),
+                    amount,
+                }
+            };
+            self.emit(map_id, kind);
+            if left == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Re-insert captured values into the list `list_id`, in order.
+    fn fill_list(&mut self, list_id: ElementId, values: Vec<Scalar>) {
+        for (index, value) in values.into_iter().enumerate() {
+            let Some(anchor) = self.lists.get(&list_id).map(|l| l.borrow().place(index)) else {
+                return;
+            };
+            self.emit(list_id, OpKind::ListInsert { value, anchor });
+        }
+    }
+
+    /// Re-insert a captured string into the text `text_id`.
+    fn fill_text(&mut self, text_id: ElementId, s: String) {
+        if s.is_empty() {
+            return;
+        }
+        let Some(anchor) = self.texts.get(&text_id).map(|t| t.borrow().place(0)) else {
+            return;
+        };
+        self.emit(text_id, OpKind::TextInsert { s, anchor });
+    }
+
+    /// Rebuild captured children into the sequence `list_id`, in order.
+    fn fill_children(&mut self, list_id: ElementId, children: Vec<Snap>) {
+        for (index, child) in children.into_iter().enumerate() {
+            let Some(anchor) = self.lists.get(&list_id).map(|l| l.borrow().place(index)) else {
+                return;
+            };
+            let _ = self.revive_node(list_id, anchor, child);
         }
     }
 }

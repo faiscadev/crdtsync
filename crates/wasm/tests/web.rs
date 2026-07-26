@@ -210,48 +210,100 @@ use crdtsync_wasm::WasmUndo;
 #[wasm_bindgen_test]
 fn undo_and_redo_a_register() {
     let mut d = doc(1);
-    let mut u = WasmUndo::new();
+    let u = WasmUndo::new(None);
+    u.track(&mut d);
     let p = path(&["title"]);
-    u.register_int(&mut d, &p, 1);
-    u.register_int(&mut d, &p, 2);
+    d.register_int(&p, 1);
+    d.register_int(&p, 2);
     assert_eq!(d.get_int(&p), Some(2));
-    assert!(u.can_undo());
+    assert!(u.can_undo(&d));
 
     u.undo(&mut d);
     assert_eq!(d.get_int(&p), Some(1));
     u.redo(&mut d);
     assert_eq!(d.get_int(&p), Some(2));
-    assert!(!u.can_redo());
+    assert!(!u.can_redo(&d));
+}
+
+#[wasm_bindgen_test]
+fn an_untracked_document_records_nothing() {
+    let mut d = doc(1);
+    let u = WasmUndo::new(None);
+    let p = path(&["title"]);
+    d.register_int(&p, 1);
+    assert!(!u.can_undo(&d));
+    assert!(u.undo(&mut d).is_empty());
+    assert_eq!(d.get_int(&p), Some(1));
 }
 
 #[wasm_bindgen_test]
 fn undo_covers_list_and_text() {
     let mut d = doc(1);
-    let mut u = WasmUndo::new();
+    let u = WasmUndo::new(None);
+    u.track(&mut d);
 
     let items = path(&["items"]);
-    u.list_insert(&mut d, &items, 0, b"a");
+    d.list_insert(&items, 0, b"a");
     assert_eq!(d.list_len(&items), Some(1));
+    // The insert's transact created the list too, so its undo takes the slot.
     u.undo(&mut d);
-    assert_eq!(d.list_len(&items), Some(0));
+    assert_eq!(d.list_len(&items), None);
 
     let body = path(&["body"]);
-    u.text_insert(&mut d, &body, 0, "hi");
-    assert_eq!(d.text_get(&body), Some("hi".to_string()));
+    d.text_insert(&body, 0, "hi");
+    d.text_insert(&body, 2, "!");
+    assert_eq!(d.text_get(&body), Some("hi!".to_string()));
     u.undo(&mut d);
-    assert_eq!(d.text_get(&body), Some(String::new()));
+    assert_eq!(d.text_get(&body), Some("hi".to_string()));
+}
+
+#[wasm_bindgen_test]
+fn an_explicit_intention_undoes_as_one_step() {
+    let mut d = doc(1);
+    let u = WasmUndo::new(None);
+    u.track(&mut d);
+
+    u.begin_intention(&mut d);
+    d.register_int(&path(&["a"]), 1);
+    d.register_int(&path(&["b"]), 2);
+    u.end_intention(&mut d);
+
+    u.undo(&mut d);
+    assert_eq!(d.get_int(&path(&["a"])), None);
+    assert_eq!(d.get_int(&path(&["b"])), None);
+    assert!(!u.can_undo(&d));
+}
+
+#[wasm_bindgen_test]
+fn two_origins_keep_separate_histories() {
+    let mut d = doc(1);
+    let mine = WasmUndo::new(Some(b"mine".to_vec()));
+    let theirs = WasmUndo::new(Some(b"theirs".to_vec()));
+
+    mine.track(&mut d);
+    d.register_int(&path(&["mine"]), 1);
+    theirs.track(&mut d);
+    d.register_int(&path(&["theirs"]), 2);
+
+    mine.undo(&mut d);
+    assert_eq!(d.get_int(&path(&["mine"])), None);
+    assert_eq!(d.get_int(&path(&["theirs"])), Some(2));
 }
 
 #[wasm_bindgen_test]
 fn a_wasm_undo_converges_on_a_peer() {
     let mut a = doc(1);
     let mut b = doc(2);
-    let mut u = WasmUndo::new();
+    let u = WasmUndo::new(None);
+    u.track(&mut a);
     let p = path(&["votes"]);
-    b.apply(&u.inc(&mut a, &p, 5));
+    b.apply(&a.inc(&p, 5));
     assert_eq!(b.get_counter(&p), Some(5));
     b.apply(&u.undo(&mut a));
-    assert_eq!(b.get_counter(&p), Some(0));
+    // The delta re-won the slot on the way in, so its inverse both cancels the
+    // tally and gives the slot back — an unset counter reads as absent.
+    assert_eq!(a.get_counter(&p), None);
+    assert_eq!(b.get_counter(&p), None, "and the peer agrees");
 }
 
 use crdtsync_wasm::WasmClient;
@@ -276,6 +328,34 @@ fn a_client_edit_travels_to_a_peer() {
     assert!(b.receive(&ops).unwrap());
     assert_eq!(b.get_int(sb.channel(), &p), Some(30));
     assert_eq!(b.last_seen_seq(sb.channel()), Some(1));
+}
+
+#[wasm_bindgen_test]
+fn a_channels_edits_undo_over_the_wire_surface() {
+    let mut a = wasm_client(1);
+    let mut b = wasm_client(2);
+    let sa = a.subscribe(b"room-undo");
+    let sb = b.subscribe(b"room-undo");
+    let origin = b"local";
+    assert!(a.set_undo_origin(sa.channel(), origin));
+
+    let p = path(&["title"]);
+    let first = a.register_int(sa.channel(), &p, 1);
+    let second = a.register_int(sa.channel(), &p, 2);
+    assert!(b.receive(&first).unwrap());
+    assert!(b.receive(&second).unwrap());
+    assert!(a.can_undo(sa.channel(), origin));
+
+    let inverse = a.undo(sa.channel(), origin);
+    assert!(!inverse.is_empty());
+    assert_eq!(a.get_int(sa.channel(), &p), Some(1));
+    // The inverse is an ordinary Ops frame the peer folds in like any edit.
+    assert!(b.receive(&inverse).unwrap());
+    assert_eq!(b.get_int(sb.channel(), &p), Some(1));
+    assert!(
+        !b.can_undo(sb.channel(), origin),
+        "a peer's ops are applied, never emitted, so they are not undoable there"
+    );
 }
 
 #[wasm_bindgen_test]

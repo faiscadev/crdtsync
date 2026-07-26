@@ -566,103 +566,82 @@ func (d *Document) CommitAtomic() []byte {
 
 // --- undo / redo ---
 
-// Undo is a per-user undo/redo manager over a Document. Each edit made through
-// it records its inverse; Undo and Redo emit ordinary ops that converge on peers
-// like any edit. The manager is separate from the document it drives, so every
-// call names the document.
+// DefaultUndoOrigin is the origin an Undo records under when none is named.
+const DefaultUndoOrigin = "local"
+
+// Undo is an origin-scoped undo/redo handle over a Document. It holds no history
+// of its own: the document records the inverse of every op it emits while an
+// undo origin is set, whatever surface authored it, so an edit made through any
+// Document method is undoable. The handle only names the origin to record under
+// and select by, so several independent histories can share one document and a
+// peer's applied ops are on none of them.
 type Undo struct {
-	h *C.CrdtUndo
+	origin []byte
 }
 
-// NewUndo opens an undo manager.
+// NewUndo opens an undo handle over the default origin.
 func NewUndo() (*Undo, error) {
-	h := C.crdtsync_undo_new()
-	if h == nil {
-		return nil, errors.New("failed to open undo manager")
-	}
-	return &Undo{h: h}, nil
+	return NewUndoOrigin(DefaultUndoOrigin), nil
 }
 
-// Close frees the manager. Safe to call more than once.
-func (u *Undo) Close() {
-	if u.h != nil {
-		C.crdtsync_undo_free(u.h)
-		u.h = nil
-	}
+// NewUndoOrigin opens an undo handle over the named origin.
+func NewUndoOrigin(origin string) *Undo {
+	return &Undo{origin: []byte(origin)}
 }
 
-// RegisterInt sets an integer Register at path as one undo step.
-func (u *Undo) RegisterInt(doc *Document, path [][]byte, value int64) []byte {
-	pp, pl := bytesArg(EncodePath(path))
-	return takeBuf(C.crdtsync_undo_register_int(u.h, doc.h, pp, pl, C.int64_t(value)))
+// Close releases the handle. It owns nothing, so this is a no-op kept for
+// symmetry with the other handles.
+func (u *Undo) Close() {}
+
+// Origin is the tag this handle records and selects by.
+func (u *Undo) Origin() string { return string(u.origin) }
+
+// Track starts recording doc's emitted edits under this origin.
+func (u *Undo) Track(doc *Document) {
+	op, ol := bytesArg(u.origin)
+	C.crdtsync_doc_set_undo_origin(doc.h, op, ol)
 }
 
-// Inc increments a Counter at path as one undo step.
-func (u *Undo) Inc(doc *Document, path [][]byte, amount uint32) []byte {
-	pp, pl := bytesArg(EncodePath(path))
-	return takeBuf(C.crdtsync_undo_inc(u.h, doc.h, pp, pl, C.uint32_t(amount)))
+// Untrack stops recording doc's edits. What was recorded stays undoable.
+func (u *Undo) Untrack(doc *Document) {
+	C.crdtsync_doc_clear_undo_origin(doc.h)
 }
 
-// Dec decrements a Counter at path as one undo step.
-func (u *Undo) Dec(doc *Document, path [][]byte, amount uint32) []byte {
-	pp, pl := bytesArg(EncodePath(path))
-	return takeBuf(C.crdtsync_undo_dec(u.h, doc.h, pp, pl, C.uint32_t(amount)))
+// BeginIntention opens an explicit intention: every edit until EndIntention
+// undoes as one step.
+func (u *Undo) BeginIntention(doc *Document) {
+	C.crdtsync_doc_begin_intention(doc.h)
 }
 
-// Delete tombstones the Register slot at path as one undo step.
-func (u *Undo) Delete(doc *Document, path [][]byte) []byte {
-	pp, pl := bytesArg(EncodePath(path))
-	return takeBuf(C.crdtsync_undo_delete(u.h, doc.h, pp, pl))
+// EndIntention closes the intention opened by BeginIntention.
+func (u *Undo) EndIntention(doc *Document) {
+	C.crdtsync_doc_end_intention(doc.h)
 }
 
-// ListInsert inserts a bytes item at live index in the List at path as one undo
-// step.
-func (u *Undo) ListInsert(doc *Document, path [][]byte, index uint, value []byte) []byte {
-	pp, pl := bytesArg(EncodePath(path))
-	vp, vl := bytesArg(value)
-	return takeBuf(C.crdtsync_undo_list_insert(u.h, doc.h, pp, pl, C.uintptr_t(index), vp, vl))
-}
-
-// ListDelete tombstones the live item at index in the List at path as one undo
-// step.
-func (u *Undo) ListDelete(doc *Document, path [][]byte, index uint) []byte {
-	pp, pl := bytesArg(EncodePath(path))
-	return takeBuf(C.crdtsync_undo_list_delete(u.h, doc.h, pp, pl, C.uintptr_t(index)))
-}
-
-// TextInsert inserts UTF-8 text at a codepoint index in the Text at path as one
-// undo step.
-func (u *Undo) TextInsert(doc *Document, path [][]byte, index uint, s string) []byte {
-	pp, pl := bytesArg(EncodePath(path))
-	sp, sl := bytesArg([]byte(s))
-	return takeBuf(C.crdtsync_undo_text_insert(u.h, doc.h, pp, pl, C.uintptr_t(index), sp, sl))
-}
-
-// TextDelete tombstones count codepoints from index in the Text at path as one
-// undo step.
-func (u *Undo) TextDelete(doc *Document, path [][]byte, index, count uint) []byte {
-	pp, pl := bytesArg(EncodePath(path))
-	return takeBuf(C.crdtsync_undo_text_delete(u.h, doc.h, pp, pl, C.uintptr_t(index), C.uintptr_t(count)))
-}
-
-// Undo reverts the most recent intention; returns the ops (empty if none).
+// Undo reverts this origin's most recent intention; returns the ops (empty if
+// none).
 func (u *Undo) Undo(doc *Document) []byte {
-	return takeBuf(C.crdtsync_undo_undo(u.h, doc.h))
+	op, ol := bytesArg(u.origin)
+	return takeBuf(C.crdtsync_doc_undo(doc.h, op, ol))
 }
 
-// Redo replays the most recently undone intention; returns the ops (empty if none).
+// Redo replays this origin's most recently undone intention; returns the ops
+// (empty if none).
 func (u *Undo) Redo(doc *Document) []byte {
-	return takeBuf(C.crdtsync_undo_redo(u.h, doc.h))
+	op, ol := bytesArg(u.origin)
+	return takeBuf(C.crdtsync_doc_redo(doc.h, op, ol))
 }
 
-// CanUndo reports whether there is a recorded intention to undo.
-func (u *Undo) CanUndo() bool {
-	return C.crdtsync_undo_can_undo(u.h) == 1
+// CanUndo reports whether this origin has a recorded intention to undo.
+func (u *Undo) CanUndo(doc *Document) bool {
+	op, ol := bytesArg(u.origin)
+	return C.crdtsync_doc_can_undo(doc.h, op, ol) == 1
 }
 
-// CanRedo reports whether there is an undone intention to redo.
-func (u *Undo) CanRedo() bool {
-	return C.crdtsync_undo_can_redo(u.h) == 1
+// CanRedo reports whether this origin has an undone intention to redo.
+func (u *Undo) CanRedo(doc *Document) bool {
+	op, ol := bytesArg(u.origin)
+	return C.crdtsync_doc_can_redo(doc.h, op, ol) == 1
 }
 
 // --- wire client session ---

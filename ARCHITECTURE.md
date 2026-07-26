@@ -543,7 +543,7 @@ Strong consensus / 2PC across replicas (defeats coordination-free property). Com
 
 # Undo / Redo
 
-Per-user undo via SDK helper. Core sees only inverse ops — no server-side undo state, no special wire format.
+Per-user undo over a core record-seam, with a thin per-SDK handle. Core sees only inverse ops — no server-side undo state, no special wire format.
 
 Each user's undo stack contains intentions (op groups) the user authored. Undo reverts only that user's ops, even when others' ops are interleaved. Per-op identity makes targeting precise.
 
@@ -553,17 +553,17 @@ Global undo (revert anyone's op regardless of author) is **not** supported — p
 
 The ergonomic handle-graph SDKs (§SDK-Ergonomic-Surface) edit through a `mutate` flow that doesn't route through the legacy `UndoManager` (which only records edits made through *its own* methods, covers a subset of ops, and is local-only). The resolved design: **inversion lives in the shared core**, exactly like every other op-semantic (merge, tree-move, marks) — never reimplemented per SDK language (three divergent inverters would violate the thin-SDK principle and risk non-convergence). Concretely:
 
-- **Core record-seam.** The core records every *applied* edit into a per-document, per-channel undo stack, extending the existing `UndoManager` inversion to **all op kinds** (register/scalar/counter/map/list/text/xml/mark/blob-ref, root or nested) and to the networked (`Client`-channel) path, so undo works over a live connection, not just an offline doc. Inversion produces ordinary forward inverse ops (no server-side undo state, no wire change) that converge on peers like any edit.
-- **Origin / scope selection.** Which edit to invert is chosen by an **origin/scope tag** (Yjs-style): the SDK asks the core stack to "undo the last intention from origin X" — so a user undoes *their* edits, not a collaborator's, and an app can scope an undo manager to a subtree. The selection layer is the good idea from the observer approach; the inversion mechanism stays in core.
+- **Core record-seam.** The core records every edit it *emits* into a per-document, per-channel undo stack — a remote op is folded in by `apply` and deliberately never recorded, which is what makes a collaborator's edit structurally incapable of landing on a local stack — extending the existing `UndoManager` inversion to **all op kinds** (register/scalar/counter/map/list/text/xml/mark/blob-ref, root or nested) and to the networked (`Client`-channel) path, so undo works over a live connection, not just an offline doc. Inversion produces ordinary forward inverse ops (no server-side undo state, no wire change) that converge on peers like any edit.
+- **Origin / scope selection.** Recording is opt-in and tagged: a document records only while an **origin** is set on it, and undo asks the core stack to "undo the newest intention from origin X", skipping any another origin interleaved. The tag is opaque to core, so it is equally the *scope* selector — an undo manager scoped to a subtree edits that subtree under its own origin and undoes only that. A remote op is folded in by `apply` and never emitted, so a collaborator's edit is structurally incapable of landing on a local stack; global undo needs no separate guard. The selection layer is the good idea from the observer approach; the inversion mechanism stays in core.
 - **Thin SDK handle.** Each SDK (JS/Python/Go) exposes a small undo handle (`undo()`/`redo()`/`canUndo`/`canRedo`, origin-scoped) over the core stack — no per-language inversion logic. Atomic transactions undo as one intention (existing `atomic_group` semantics).
 
 Rejected: an SDK-layer origin-filtered *inverter* (Yjs-style, but Yjs is single-language) — it would put op-inversion in each SDK, fragmenting convergence across three languages, contradicting the core-owns-semantics principle.
 
-Inverse ops emit into the normal op stream. Ops that overwrite or delete state require prior-state capture at op creation time.
+Inverse ops emit into the normal op stream. Ops that overwrite or delete state require prior-state capture at op creation time — the seam reads the inverse off the state an op is about to overwrite, before it lands. A tombstone drops the value it held, so reviving a deleted sequence node re-creates it: a scalar as a fresh insert, a composite XML child rebuilt from a subtree snapshot taken at record time, both anchored on the tombstone so the revival lands where the node was.
 
-Auto-grouping on debounced gaps (>500ms idle = boundary by default). Manual begin / end intention for explicit grouping (paste, paragraph break).
+An intention is one transact, one explicit begin/end intention group, or one atomic transaction — which undoes and redoes as one atomic transaction in turn. Manual begin / end intention covers explicit grouping (paste, paragraph break); auto-grouping on debounced gaps (>500ms idle = boundary by default) is an SDK concern, since core injects its clock rather than reading one.
 
-Stack lives in SDK on client, persists in local storage. Offline editing produces undoable ops without network. Stack drops at migration boundaries.
+The stack lives in the **document** — so a channel's replica carries its own, and undo works identically offline and over a live connection — with the SDK holding only the origin tag. Offline editing produces undoable ops without network. The stack drops at a migration boundary and when a channel adopts a server snapshot — in both cases the recorded inverses describe slot shapes the document no longer has — while recording itself continues past either.
 
 ---
 

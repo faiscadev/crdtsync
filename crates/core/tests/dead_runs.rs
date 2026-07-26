@@ -542,10 +542,11 @@ fn delete_heavy_replicas_converge_to_identical_bytes() {
 #[test]
 fn undo_revives_a_run_that_collapsed() {
     let mut d = Document::new(cid(1));
-    let mut u = UndoManager::new();
+    let u = UndoManager::new();
+    u.track(&mut d);
     let t = path::encode_path(&[b"t"]);
-    u.text_insert(&mut d, &t, 0, "hello world");
-    u.text_delete(&mut d, &t, 2, 5);
+    path::text_insert(&mut d, &t, 0, "hello world");
+    path::text_delete(&mut d, &t, 2, 5);
 
     assert_eq!(text_of(&d, b"t"), "heorld");
     assert_eq!(text_records(&d, b"t"), 7, "6 live codepoints plus one run");

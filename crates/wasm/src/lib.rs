@@ -13,11 +13,12 @@ use crdtsync_core::elementid::ElementId;
 use crdtsync_core::list::Side;
 use crdtsync_core::marks::{MarkState, ResolvedMark};
 use crdtsync_core::op::Op;
+use crdtsync_core::undo::DEFAULT_ORIGIN;
 use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_op, encode_ops, path, AclEffect, AclGrant,
     AclSubject, BlobRef, BranchInfo, Capability, Channel, ClientError, ClientId, ClientSession,
     DiffKind, Document, ErrorCode as CoreErrorCode, Host, Message, Redirect, Rejected,
-    RelativePosition, Scalar, UndoManager,
+    RelativePosition, Scalar,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -694,119 +695,78 @@ impl WasmDocument {
     }
 }
 
-/// A per-user undo/redo manager over a [`WasmDocument`]. Each edit made through
-/// it records its inverse; `undo`/`redo` emit ordinary ops that converge on peers
-/// like any edit. The manager is separate from the document it drives, so every
-/// call names the document.
+/// A per-user undo/redo handle over a [`WasmDocument`]. It holds no history of
+/// its own: the document records the inverse of every op it emits while an undo
+/// origin is set, whatever surface authored it, so an SDK editing through its own
+/// handle graph is undoable without routing through this type. The handle only
+/// names the origin to record under and select by, so several independent
+/// histories (a user's, a subtree-scoped manager's) can share one document and a
+/// collaborator's applied ops are on none of them.
 #[wasm_bindgen]
 pub struct WasmUndo {
-    inner: UndoManager,
+    origin: Vec<u8>,
 }
 
 #[wasm_bindgen]
 impl WasmUndo {
-    /// Open an undo manager.
+    /// An undo handle over `origin` — or the default origin when none is named.
     #[wasm_bindgen(constructor)]
-    pub fn new() -> WasmUndo {
+    pub fn new(origin: Option<Vec<u8>>) -> WasmUndo {
         WasmUndo {
-            inner: UndoManager::new(),
+            origin: origin.unwrap_or_else(|| DEFAULT_ORIGIN.to_vec()),
         }
     }
 
-    /// Set an integer Register at a path as one undo step. Returns the ops.
-    #[wasm_bindgen(js_name = registerInt)]
-    pub fn register_int(&mut self, doc: &mut WasmDocument, path: &[u8], value: i64) -> Vec<u8> {
-        encode_ops(
-            &self
-                .inner
-                .register(&mut doc.inner, path, Scalar::Int(value)),
-        )
+    /// The origin this handle records and selects by.
+    pub fn origin(&self) -> Vec<u8> {
+        self.origin.clone()
     }
 
-    /// Increment a Counter at a path as one undo step.
-    pub fn inc(&mut self, doc: &mut WasmDocument, path: &[u8], amount: u32) -> Vec<u8> {
-        encode_ops(&self.inner.inc(&mut doc.inner, path, amount))
+    /// Start recording `doc`'s emitted edits under this origin.
+    pub fn track(&self, doc: &mut WasmDocument) {
+        doc.inner.set_undo_origin(&self.origin);
     }
 
-    /// Decrement a Counter at a path as one undo step.
-    pub fn dec(&mut self, doc: &mut WasmDocument, path: &[u8], amount: u32) -> Vec<u8> {
-        encode_ops(&self.inner.dec(&mut doc.inner, path, amount))
+    /// Stop recording `doc`'s edits. What was recorded stays undoable.
+    pub fn untrack(&self, doc: &mut WasmDocument) {
+        doc.inner.clear_undo_origin();
     }
 
-    /// Tombstone the Register slot at a path as one undo step.
-    pub fn delete(&mut self, doc: &mut WasmDocument, path: &[u8]) -> Vec<u8> {
-        encode_ops(&self.inner.delete(&mut doc.inner, path))
+    /// Open an explicit intention on `doc`: every edit until `endIntention`
+    /// undoes as one step.
+    #[wasm_bindgen(js_name = beginIntention)]
+    pub fn begin_intention(&self, doc: &mut WasmDocument) {
+        doc.inner.begin_intention();
     }
 
-    /// Insert a bytes item at a live index in the List at a path as one undo step.
-    #[wasm_bindgen(js_name = listInsert)]
-    pub fn list_insert(
-        &mut self,
-        doc: &mut WasmDocument,
-        path: &[u8],
-        index: usize,
-        value: &[u8],
-    ) -> Vec<u8> {
-        encode_ops(&self.inner.list_insert(&mut doc.inner, path, index, value))
+    /// Close the intention opened by `beginIntention`.
+    #[wasm_bindgen(js_name = endIntention)]
+    pub fn end_intention(&self, doc: &mut WasmDocument) {
+        doc.inner.end_intention();
     }
 
-    /// Tombstone the live item at an index in the List at a path as one undo step.
-    #[wasm_bindgen(js_name = listDelete)]
-    pub fn list_delete(&mut self, doc: &mut WasmDocument, path: &[u8], index: usize) -> Vec<u8> {
-        encode_ops(&self.inner.list_delete(&mut doc.inner, path, index))
+    /// Revert this origin's most recent intention; returns the ops (empty if
+    /// none).
+    pub fn undo(&self, doc: &mut WasmDocument) -> Vec<u8> {
+        encode_ops(&doc.inner.undo(&self.origin).unwrap_or_default())
     }
 
-    /// Insert text at a codepoint index in the Text at a path as one undo step.
-    #[wasm_bindgen(js_name = textInsert)]
-    pub fn text_insert(
-        &mut self,
-        doc: &mut WasmDocument,
-        path: &[u8],
-        index: usize,
-        s: &str,
-    ) -> Vec<u8> {
-        encode_ops(&self.inner.text_insert(&mut doc.inner, path, index, s))
+    /// Replay this origin's most recently undone intention; returns the ops
+    /// (empty if none).
+    pub fn redo(&self, doc: &mut WasmDocument) -> Vec<u8> {
+        encode_ops(&doc.inner.redo(&self.origin).unwrap_or_default())
     }
 
-    /// Tombstone `count` codepoints from an index in the Text at a path as one
-    /// undo step.
-    #[wasm_bindgen(js_name = textDelete)]
-    pub fn text_delete(
-        &mut self,
-        doc: &mut WasmDocument,
-        path: &[u8],
-        index: usize,
-        count: usize,
-    ) -> Vec<u8> {
-        encode_ops(&self.inner.text_delete(&mut doc.inner, path, index, count))
-    }
-
-    /// Revert the most recent intention; returns the ops (empty if none).
-    pub fn undo(&mut self, doc: &mut WasmDocument) -> Vec<u8> {
-        encode_ops(&self.inner.undo(&mut doc.inner).unwrap_or_default())
-    }
-
-    /// Replay the most recently undone intention; returns the ops (empty if none).
-    pub fn redo(&mut self, doc: &mut WasmDocument) -> Vec<u8> {
-        encode_ops(&self.inner.redo(&mut doc.inner).unwrap_or_default())
-    }
-
-    /// Whether there is a recorded intention to undo.
+    /// Whether this origin has a recorded intention to undo.
     #[wasm_bindgen(js_name = canUndo)]
-    pub fn can_undo(&self) -> bool {
-        self.inner.can_undo()
+    pub fn can_undo(&self, doc: &WasmDocument) -> bool {
+        doc.inner.can_undo(&self.origin)
     }
 
-    /// Whether there is an undone intention to redo.
+    /// Whether this origin has an undone intention to redo.
     #[wasm_bindgen(js_name = canRedo)]
-    pub fn can_redo(&self) -> bool {
-        self.inner.can_redo()
-    }
-}
-
-impl Default for WasmUndo {
-    fn default() -> Self {
-        Self::new()
+    pub fn can_redo(&self, doc: &WasmDocument) -> bool {
+        doc.inner.can_redo(&self.origin)
     }
 }
 
@@ -885,19 +845,35 @@ impl ReplyTag {
             ReplyTag::VersionState { channel, name } => {
                 set(&obj, "kind", &JsValue::from_str("versionState"));
                 set(&obj, "channel", &JsValue::from_f64(*channel as f64));
-                set(&obj, "name", &js_sys::Uint8Array::from(name.as_slice()).into());
+                set(
+                    &obj,
+                    "name",
+                    &js_sys::Uint8Array::from(name.as_slice()).into(),
+                );
             }
             ReplyTag::Branches { room } => {
                 set(&obj, "kind", &JsValue::from_str("branches"));
-                set(&obj, "room", &js_sys::Uint8Array::from(room.as_slice()).into());
+                set(
+                    &obj,
+                    "room",
+                    &js_sys::Uint8Array::from(room.as_slice()).into(),
+                );
             }
             ReplyTag::Diff { room } => {
                 set(&obj, "kind", &JsValue::from_str("diff"));
-                set(&obj, "room", &js_sys::Uint8Array::from(room.as_slice()).into());
+                set(
+                    &obj,
+                    "room",
+                    &js_sys::Uint8Array::from(room.as_slice()).into(),
+                );
             }
             ReplyTag::Clone { dst } => {
                 set(&obj, "kind", &JsValue::from_str("clone"));
-                set(&obj, "dst", &js_sys::Uint8Array::from(dst.as_slice()).into());
+                set(
+                    &obj,
+                    "dst",
+                    &js_sys::Uint8Array::from(dst.as_slice()).into(),
+                );
             }
         }
         obj.into()
@@ -1233,7 +1209,13 @@ impl WasmClient {
     /// Insert a scalar item at a live index in the List at a path in `channel`'s
     /// room. Returns the Ops frame to send.
     #[wasm_bindgen(js_name = listInsert)]
-    pub fn list_insert(&mut self, channel: u32, path: &[u8], index: usize, value: &[u8]) -> Vec<u8> {
+    pub fn list_insert(
+        &mut self,
+        channel: u32,
+        path: &[u8],
+        index: usize,
+        value: &[u8],
+    ) -> Vec<u8> {
         self.ops_frame(channel, |d| path::list_insert(d, path, index, value))
     }
 
@@ -1269,7 +1251,13 @@ impl WasmClient {
     /// Tombstone `count` codepoints from an index in the Text at a path in
     /// `channel`'s room.
     #[wasm_bindgen(js_name = textDelete)]
-    pub fn text_delete(&mut self, channel: u32, path: &[u8], index: usize, count: usize) -> Vec<u8> {
+    pub fn text_delete(
+        &mut self,
+        channel: u32,
+        path: &[u8],
+        index: usize,
+        count: usize,
+    ) -> Vec<u8> {
         self.ops_frame(channel, |d| path::text_delete(d, path, index, count))
     }
 
@@ -1335,6 +1323,54 @@ impl WasmClient {
         {
             Some(blob) => blob_ref_to_js(&blob),
             None => JsValue::NULL,
+        }
+    }
+
+    /// Record `channel`'s emitted edits under `origin`, making them undoable.
+    /// Each channel holds its own replica, so each keeps its own history; a
+    /// remote op is applied, never emitted, so a collaborator's change is never
+    /// on this seat's stack.
+    #[wasm_bindgen(js_name = setUndoOrigin)]
+    pub fn set_undo_origin(&mut self, channel: u32, origin: &[u8]) -> bool {
+        self.inner
+            .set_undo_origin(Channel(channel), origin)
+            .is_some()
+    }
+
+    /// Stop recording `channel`'s edits. What was recorded stays undoable.
+    #[wasm_bindgen(js_name = clearUndoOrigin)]
+    pub fn clear_undo_origin(&mut self, channel: u32) -> bool {
+        self.inner.clear_undo_origin(Channel(channel)).is_some()
+    }
+
+    /// Whether `origin` has an intention to undo on `channel`.
+    #[wasm_bindgen(js_name = canUndo)]
+    pub fn can_undo(&self, channel: u32, origin: &[u8]) -> bool {
+        self.inner.can_undo(Channel(channel), origin)
+    }
+
+    /// Whether `origin` has an undone intention to redo on `channel`.
+    #[wasm_bindgen(js_name = canRedo)]
+    pub fn can_redo(&self, channel: u32, origin: &[u8]) -> bool {
+        self.inner.can_redo(Channel(channel), origin)
+    }
+
+    /// Revert `origin`'s most recent intention on `channel`. Returns the Ops
+    /// frame to send — the inverse is an ordinary edit, routed through the same
+    /// outbox — or empty when there is nothing to undo.
+    pub fn undo(&mut self, channel: u32, origin: &[u8]) -> Vec<u8> {
+        match self.inner.undo(Channel(channel), origin) {
+            Some(msg) => encode_message(&msg),
+            None => Vec::new(),
+        }
+    }
+
+    /// Replay `origin`'s most recently undone intention on `channel`. Returns the
+    /// Ops frame to send, or empty when there is nothing to redo.
+    pub fn redo(&mut self, channel: u32, origin: &[u8]) -> Vec<u8> {
+        match self.inner.redo(Channel(channel), origin) {
+            Some(msg) => encode_message(&msg),
+            None => Vec::new(),
         }
     }
 
@@ -1825,7 +1861,11 @@ fn mark_result(id: Option<Vec<u8>>, ops: Vec<u8>) -> JsValue {
         None => JsValue::UNDEFINED,
     };
     set(&obj, "id", &id_val);
-    set(&obj, "ops", &js_sys::Uint8Array::from(ops.as_slice()).into());
+    set(
+        &obj,
+        "ops",
+        &js_sys::Uint8Array::from(ops.as_slice()).into(),
+    );
     obj.into()
 }
 
