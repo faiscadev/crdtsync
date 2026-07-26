@@ -3334,7 +3334,10 @@ impl Document {
             })
             .collect();
         for step in plan {
-            let target = self.step_target(&step);
+            // The element the step will actually address — a revival may have
+            // replaced the one it names — so the reachability decision and the
+            // emission are about the same thing.
+            let target = self.history.current_element(self.step_target(&step));
             if !self.resolvable(target) {
                 self.reinstate(target, &installers);
             }
@@ -3399,7 +3402,6 @@ impl Document {
                 value,
                 was,
             } => {
-                let anchor = self.follow_anchor(list, anchor);
                 let now = self.emit_stamped(list, OpKind::ListInsert { value, anchor });
                 self.history.substitute(list, was, now);
             }
@@ -3409,7 +3411,6 @@ impl Document {
                 s,
                 was,
             } => {
-                let anchor = self.follow_anchor(text, anchor);
                 let now = self.emit_stamped(text, OpKind::TextInsert { s, anchor });
                 for (i, old) in was.into_iter().enumerate() {
                     self.history.substitute(text, old, now.run_member(i as u64));
@@ -3422,7 +3423,6 @@ impl Document {
                 was,
                 was_node,
             } => {
-                let anchor = self.follow_anchor(list, anchor);
                 if let Some(now) = self.revive_node(list, anchor, node) {
                     self.history.substitute(list, was, now);
                     if let Some(element) = self.node_at(list, now) {
@@ -3467,14 +3467,6 @@ impl Document {
             .into_iter()
             .map(|kind| xml_child_id(list, stamp, kind))
             .find(|id| self.node_element(*id).is_some())
-    }
-
-    /// Re-point an anchor at the id its referent came back as.
-    fn follow_anchor(&self, seq: ElementId, anchor: Anchor) -> Anchor {
-        Anchor {
-            parent: anchor.parent.map(|id| self.history.current(seq, id)),
-            side: anchor.side,
-        }
     }
 
     /// Re-point a sequence delete at the ids its items came back as. A tombstone
@@ -3544,18 +3536,12 @@ impl Document {
     /// tombstoned. Those leave the tree whole and come back whole, so tearing
     /// their interior down first is not merely redundant: it would leave the
     /// mirror an empty shell to snapshot, and the redo would lose everything the
-    /// intention put inside. A *displacement* is not a removal — the container is
+    /// intention put inside. A vacated map slot is not that — the container is
     /// retained holding what the intention put there, and anything that
-    /// re-installs the slot exposes it — so those steps still run. Nor is a
-    /// removal a removal when another step puts the container back.
+    /// re-installs the slot exposes it — so those steps still run.
     fn plan(&self, steps: Vec<Inverse>) -> Vec<Inverse> {
         let steps: Vec<Inverse> = steps.into_iter().rev().collect();
-        let restored: Vec<ElementId> = steps.iter().filter_map(|s| self.installs(s)).collect();
-        let removed: Vec<ElementId> = steps
-            .iter()
-            .filter_map(|s| self.removes(s))
-            .filter(|id| !restored.contains(id))
-            .collect();
+        let removed: Vec<ElementId> = steps.iter().filter_map(|s| self.removes(s)).collect();
         steps
             .into_iter()
             .filter(|s| !self.under_any(self.step_target(s), &removed))
@@ -3585,6 +3571,13 @@ impl Document {
             cur = self.parents.get(&id).copied();
         }
         for (at, kind) in chain.into_iter().rev() {
+            // The copies answer to the same rule as the steps: an op this replica
+            // would apply to nothing is not emitted, because a peer buffers it
+            // and fires it the moment the container returns. Once one link of the
+            // chain cannot land, nothing below it can either.
+            if !self.resolvable(at) {
+                return;
+            }
             self.emit(at, kind);
         }
     }
@@ -3612,13 +3605,13 @@ impl Document {
             OpKind::MapCreate { key } => (key, ElementKind::Map),
             OpKind::ListCreate { key } => (key, ElementKind::List),
             OpKind::TextCreate { key } => (key, ElementKind::Text),
-            OpKind::CounterInc { key, .. } | OpKind::CounterDec { key, .. } => {
-                (key, ElementKind::Counter)
-            }
             OpKind::XmlElementCreate { key, tag } => {
                 return Some(XmlElement::node_id(*target, key, tag))
             }
             OpKind::XmlFragmentCreate { key } => return Some(XmlFragment::node_id(*target, key)),
+            // A counter is a leaf: nothing is ever reached *through* it, so it can
+            // never be a link in the chain a step's target hangs off. Listing it
+            // would only let two deltas on one key collide over the entry.
             _ => return None,
         };
         Some(ElementId::derive(*target, key, kind))
@@ -3702,11 +3695,13 @@ impl Document {
                 // A slot the counter already held needs no restoring — that step
                 // would be a zero-delta op re-winning a slot it never left.
                 let counter_id = ElementId::derive(target, key, ElementKind::Counter);
+                // A bare scalar has no id at all — asking for one panics — so the
+                // "already this counter" test has to exclude it before comparing.
                 let held = self
                     .maps
                     .get(&target)
                     .and_then(|m| m.borrow().get(key))
-                    .is_some_and(|e| e.id() == counter_id);
+                    .is_some_and(|e| !matches!(e, Element::Scalar(_)) && e.id() == counter_id);
                 if !held {
                     steps.extend(self.slot_inverse(target, key));
                 }
@@ -3862,7 +3857,9 @@ impl Document {
             // (delete wins over move), so a node rendering elsewhere still needs
             // an inverse — but a node already hidden loses nothing here, and
             // reviving it would put a duplicate beside whatever restores the
-            // original.
+            // original. No edit surface can delete an already-hidden placement;
+            // a replay can, by emitting a recorded delete against a node a later
+            // step has since hidden, which is where the duplicate came from.
             other if self.renders(other.id()) => Some(Inverse::ReviveNode {
                 list: list_id,
                 anchor,

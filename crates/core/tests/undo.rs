@@ -1865,13 +1865,21 @@ fn a_counter_and_a_container_in_one_intention_both_undo_when_displaced() {
     apply_all(&mut a, &setup);
 
     b.begin_intention();
-    path::inc(&mut b, &k, 1);
-    path::text_insert(&mut b, &k, 0, "Z");
+    let mut edits = path::inc(&mut b, &k, 1);
+    edits.extend(path::text_insert(&mut b, &k, 0, "Z"));
     b.end_intention();
     assert_eq!(text(&b, &k), "Zhi");
 
+    // The peer must see b's edits first, or its own write is behind them in
+    // lamport order and loses the slot instead of taking it.
+    apply_all(&mut a, &edits);
     let displace = path::register(&mut a, &k, Scalar::Int(9));
     apply_all(&mut b, &displace);
+    assert_eq!(
+        path::text_get(&b, &k),
+        None,
+        "the peer's write really did take the slot"
+    );
 
     undo(&mut b);
     assert_eq!(
@@ -1953,6 +1961,60 @@ fn undoing_a_revoke_then_the_grant_leaves_no_live_tuple() {
         d.acl_tuples().is_empty(),
         "undoing everything must not leave a live grant standing"
     );
+}
+
+#[test]
+fn a_counter_delta_over_a_bare_scalar_slot_records_without_panicking() {
+    let mut d = doc(1);
+    // A bare map value has no element id at all; asking one for its id panics,
+    // and a counter delta over that slot is an ordinary forward edit.
+    d.transact(|c| c.set(b"k", Scalar::Int(1)));
+    let ops = path::inc(&mut d, &p(&[b"k"]), 1);
+    assert!(!ops.is_empty());
+    assert_eq!(counter(&d, &p(&[b"k"])), 1);
+
+    undo(&mut d);
+    assert!(
+        matches!(d.get(b"k"), Some(Element::Scalar(Scalar::Int(1)))),
+        "and the scalar the counter displaced comes back"
+    );
+}
+
+#[test]
+fn a_reinstate_copy_is_not_emitted_onto_a_container_a_peer_displaced() {
+    let mut a = Document::new(cid(1));
+    let mut b = doc(2);
+    let nested = p(&[b"a", b"t"]);
+    let outer = p(&[b"a"]);
+    let setup = path::text_insert(&mut b, &nested, 0, "hi");
+    apply_all(&mut a, &setup);
+
+    b.begin_intention();
+    let mut edits = path::text_insert(&mut b, &nested, 0, "Z");
+    edits.extend(path::inc(&mut b, &nested, 1));
+    b.end_intention();
+    apply_all(&mut a, &edits);
+
+    // The peer displaces the *outer* map, so the container the undo would want
+    // to re-create is itself unreachable.
+    let displace = path::register(&mut a, &outer, Scalar::Int(9));
+    apply_all(&mut b, &displace);
+
+    let inverse = undo(&mut b);
+    apply_all(&mut a, &inverse);
+    assert_eq!(observe(&a), observe(&b));
+
+    // Re-installing the outer map must not let a copy this replica applied to
+    // nothing fire on the peer.
+    let back = path::list_insert(&mut b, &p(&[b"a", b"other"]), 0, b"x");
+    apply_all(&mut a, &back);
+    assert_eq!(
+        observe(&a),
+        observe(&b),
+        "a container-restoring copy emitted onto nothing here would be buffered \
+         by a peer and fire once the container returned"
+    );
+    assert_eq!(path::text_get(&a, &nested), path::text_get(&b, &nested));
 }
 
 // --- a randomized undo/redo convergence property ---
