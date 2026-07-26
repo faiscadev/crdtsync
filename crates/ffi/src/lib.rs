@@ -2402,7 +2402,8 @@ pub unsafe extern "C" fn crdtsync_client_delete(
 //
 // The xml edits mirror the doc surface but on a subscribed room's replica, so
 // their ops route through the outbox (like every routed edit) and are resent /
-// acknowledged rather than framed and forgotten.
+// acknowledged rather than framed and forgotten; the tag and children-count
+// reads report a node's shape in one channel's room.
 
 /// Install an `XmlElement` tagged `tag` at a path in `channel`'s room. Returns the
 /// Ops frame to send; empty on a bad handle, path, tag, or unheld channel.
@@ -2561,6 +2562,52 @@ pub unsafe extern "C" fn crdtsync_client_xml_move(
     .unwrap_or_else(|_| CrdtBuf::empty())
 }
 
+/// Read the tag of the live `XmlElement` at a path in `channel`'s room into a
+/// fresh buffer at `out` the caller frees. Returns 1 when found, 0 on a rejected
+/// or malformed path, an absent slot, a slot that is not a tagged element (a
+/// fragment is tagless), or an unheld channel, -1 on a bad handle or a null
+/// `out`.
+///
+/// # Safety
+/// `client` is a live handle or null; `path`/`path_len` follow [`as_slice`];
+/// `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_xml_tag(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    client_read_buf(client, channel, path, path_len, out, path::xml_tag)
+}
+
+/// Read the count of live children of the element/fragment at `elem_path` in
+/// `channel`'s room into `out`. Returns 1 when found, 0 on a rejected or
+/// malformed path, a path that is not a live xml node, or an unheld channel, -1
+/// on a bad handle or a null `out`.
+///
+/// # Safety
+/// `client` is a live handle or null; `elem_path`/`elem_path_len` follow
+/// [`as_slice`]; `out` points to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_xml_children_len(
+    client: *const CrdtClient,
+    channel: u32,
+    elem_path: *const u8,
+    elem_path_len: usize,
+    out: *mut usize,
+) -> i32 {
+    client_read_usize(
+        client,
+        channel,
+        elem_path,
+        elem_path_len,
+        out,
+        path::xml_children_len,
+    )
+}
+
 // --- client acl ---
 //
 // The grant/revoke authoring surface on a subscribed room's replica, routed
@@ -2657,9 +2704,9 @@ pub unsafe extern "C" fn crdtsync_client_acl_revoke(
 
 // --- client blobs ---
 //
-// The inline and ref blob producers on a subscribed room's replica, routed
-// through the outbox like every other client edit. The read (`get_blob`) is a
-// doc-surface entry point.
+// The inline and ref blob producers on a subscribed room's replica route
+// through the outbox like every other client edit; the read reports the stored
+// ref back for one channel's room.
 
 /// Set an inline blob at a path in `channel`'s room, minting the handle from
 /// system entropy, and route the ops through the outbox. Returns the Ops frame to
@@ -2727,11 +2774,32 @@ pub unsafe extern "C" fn crdtsync_client_set_blob_ref(
     })
 }
 
+/// Read the [`BlobRef`] at a path in `channel`'s room into a fresh
+/// [`encode_blob_ref`] buffer at `out` the caller frees. Returns 1 when found, 0
+/// on a rejected or malformed path, an absent slot, another type, or an unheld
+/// channel, -1 on a bad handle or a null `out`.
+///
+/// # Safety
+/// `client` is a live handle or null; `path`/`path_len` follow [`as_slice`];
+/// `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_get_blob(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    client_read_buf(client, channel, path, path_len, out, |d, p| {
+        path::get_blob(d, p).map(|b| encode_blob_ref(&b))
+    })
+}
+
 // --- client marks ---
 //
 // Marks authored on a subscribed room route through the outbox like every other
 // client edit, so they are resent and acknowledged rather than framed and
-// forgotten. The read (`marks_at`) is a doc-surface entry point.
+// forgotten; the read resolves them at a character in one channel's room.
 
 /// Author a named mark over `[start, end)` of the sequence at `seq_path` in
 /// `channel`'s room, routed through the outbox. Endpoints and `value` cross as for
@@ -2821,6 +2889,30 @@ pub unsafe extern "C" fn crdtsync_client_mark_delete(
     client_edit(client, channel, mark_id, mark_id_len, path::mark_delete)
 }
 
+/// Read the marks active on character `index` of the sequence at `seq_path` in
+/// `channel`'s room into `out` — the [`encode_resolved_marks`] buffer the caller
+/// frees, decoded with the SDK's marks reader. Returns 1 with the encoded list (a
+/// path naming no live sequence, or an uncovered index, encodes zero marks), 0 on
+/// a rejected `seq_path` pointer or an unheld channel, -1 on a bad handle or a
+/// null `out`.
+///
+/// # Safety
+/// `client` is a live handle or null; `seq_path`/`seq_path_len` follow
+/// [`as_slice`]; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_marks_at(
+    client: *const CrdtClient,
+    channel: u32,
+    seq_path: *const u8,
+    seq_path_len: usize,
+    index: usize,
+    out: *mut CrdtBuf,
+) -> i32 {
+    client_read_buf(client, channel, seq_path, seq_path_len, out, |d, p| {
+        Some(encode_resolved_marks(&path::marks_at(d, p, index)))
+    })
+}
+
 /// Read an integer Register at a path in `channel`'s room into `out`. Returns 1
 /// on success, 0 if absent or the channel isn't held, -1 on a bad handle.
 ///
@@ -2842,6 +2934,36 @@ pub unsafe extern "C" fn crdtsync_client_get_int(
         path_len,
         out,
         |d, p, o| match path::get_int(d, p) {
+            Some(n) => {
+                *o = n;
+                1
+            }
+            None => 0,
+        },
+    )
+}
+
+/// Read a Counter's value at a path in `channel`'s room into `out` — the read
+/// back for [`crdtsync_client_inc`] / [`crdtsync_client_dec`]. Returns 1/0/-1 as
+/// [`crdtsync_client_get_int`].
+///
+/// # Safety
+/// As [`crdtsync_client_get_int`].
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_get_counter(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    out: *mut i64,
+) -> i32 {
+    client_read(
+        client,
+        channel,
+        path,
+        path_len,
+        out,
+        |d, p, o| match path::get_counter(d, p) {
             Some(n) => {
                 *o = n;
                 1
@@ -3111,6 +3233,92 @@ pub unsafe extern "C" fn crdtsync_client_text_get(
 ) -> i32 {
     client_read_buf(client, channel, path, path_len, out, |d, p| {
         path::text_get(d, p).map(String::into_bytes)
+    })
+}
+
+// --- client channel state and anchors ---
+//
+// A room's canonical snapshot and the stable positions taken over its sequences.
+
+/// Snapshot `channel`'s room replica to a canonical state buffer at `out` the
+/// caller frees — the before/after an ergonomic SDK diffs to derive change
+/// events, since an inbound frame does not surface the ops it applied. Returns 1
+/// when the channel is held (an untouched room still snapshots), 0 when it is
+/// not, -1 on a bad handle or a null `out`.
+///
+/// # Safety
+/// `client` is a live handle or null; `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_channel_state(
+    client: *const CrdtClient,
+    channel: u32,
+    out: *mut CrdtBuf,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if client.is_null() || out.is_null() {
+            return -1;
+        }
+        match (*client).session.document(Channel(channel)) {
+            Some(doc) => {
+                *out = CrdtBuf::from_vec(doc.encode_state());
+                1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Capture a stable position in the List or Text at a path in `channel`'s room
+/// into a fresh buffer at `out` the caller frees — the encoded
+/// [`RelativePosition`] bytes, resolved later with
+/// [`crdtsync_client_resolve_position`]. `side` is 0 (left of `index`) or 1
+/// (right). Returns 1 when captured, 0 on a rejected or malformed path, a
+/// non-sequence slot, an unknown `side`, or an unheld channel, -1 on a bad handle
+/// or a null `out`.
+///
+/// # Safety
+/// `client` is a live handle or null; `path`/`path_len` follow [`as_slice`];
+/// `out` points to a writable `CrdtBuf`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_relative_position(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    index: usize,
+    side: u32,
+    out: *mut CrdtBuf,
+) -> i32 {
+    client_read_buf(client, channel, path, path_len, out, |d, p| {
+        let side = side_from_u32(side)?;
+        path::relative_position(d, p, index, side).map(|pos| pos.encode())
+    })
+}
+
+/// Resolve a captured position (bytes from
+/// [`crdtsync_client_relative_position`]) back to a live index in the List or
+/// Text at a path in `channel`'s room, written to `out`. Returns 1 when resolved,
+/// 0 on a rejected or malformed path, a rejected `pos` pointer, malformed
+/// position bytes, a non-sequence slot, or an unheld channel, -1 on a bad handle
+/// or a null `out`.
+///
+/// # Safety
+/// `client` is a live handle or null; `path`/`path_len` and `pos`/`pos_len`
+/// follow [`as_slice`]; `out` points to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn crdtsync_client_resolve_position(
+    client: *const CrdtClient,
+    channel: u32,
+    path: *const u8,
+    path_len: usize,
+    pos: *const u8,
+    pos_len: usize,
+    out: *mut usize,
+) -> i32 {
+    client_read_usize(client, channel, path, path_len, out, |d, p| {
+        let position = RelativePosition::decode(as_slice(pos, pos_len)?).ok()?;
+        path::resolve_position(d, p, &position)
     })
 }
 

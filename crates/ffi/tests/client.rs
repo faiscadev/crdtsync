@@ -98,6 +98,12 @@ unsafe fn get_int(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, i64) {
     (rc, out)
 }
 
+unsafe fn get_counter(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, i64) {
+    let mut out: i64 = i64::MIN;
+    let rc = crdtsync_client_get_counter(c, channel, p.as_ptr(), p.len(), &mut out);
+    (rc, out)
+}
+
 unsafe fn receive(c: *mut CrdtClient, frame: &CrdtBuf) -> i32 {
     crdtsync_client_receive(c, frame.ptr, frame.len, ptr::null_mut())
 }
@@ -1947,6 +1953,810 @@ fn the_per_channel_surface_rejects_null_handles() {
             crdtsync_buf_free(frame);
         }
         assert_eq!(outbox_len(a, ca), 0, "and enqueues nothing");
+
+        crdtsync_client_free(a);
+    }
+}
+
+// --- client channel state, blobs, marks, anchors, and xml reads ---
+//
+// The per-channel reads addressed at one subscribed room: its canonical
+// snapshot, blob refs, resolved marks, anchors, and xml shape.
+
+/// The state buffer of `channel`'s replica and the status, as an owned copy.
+unsafe fn channel_state(c: *const CrdtClient, channel: u32) -> (i32, Vec<u8>) {
+    let mut out = out_buf();
+    let rc = crdtsync_client_channel_state(c, channel, &mut out);
+    let bytes = if out.len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(out.ptr, out.len).to_vec()
+    };
+    crdtsync_buf_free(out);
+    (rc, bytes)
+}
+
+/// The changes turning one channel snapshot into another: the state pair through
+/// `crdtsync_diff`, decoded with the change reader.
+unsafe fn diff_states(old: &[u8], new: &[u8]) -> Vec<Change> {
+    let buf = crdtsync_diff(old.as_ptr(), old.len(), new.as_ptr(), new.len());
+    let changes = decode_changes(std::slice::from_raw_parts(buf.ptr, buf.len)).unwrap();
+    crdtsync_buf_free(buf);
+    changes
+}
+
+/// A blob ref decoded from the client's `get_blob` framing: id, mime, size, and
+/// the inline bytes when the payload rode along.
+struct DecodedBlob {
+    id: [u8; 16],
+    mime: String,
+    size: u64,
+    inline: Option<Vec<u8>>,
+}
+
+fn decode_blob(b: &[u8]) -> DecodedBlob {
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&b[..16]);
+    let mut i = 16;
+    let mime_len = u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+    i += 4;
+    let mime = String::from_utf8(b[i..i + mime_len].to_vec()).unwrap();
+    i += mime_len;
+    let size = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+    i += 8;
+    let present = b[i];
+    i += 1;
+    let inline = if present == 1 {
+        let n = u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+        let start = i + 4;
+        i = start + n;
+        Some(b[start..i].to_vec())
+    } else {
+        None
+    };
+    assert_eq!(i, b.len(), "the blob framing is fully consumed");
+    DecodedBlob {
+        id,
+        mime,
+        size,
+        inline,
+    }
+}
+
+unsafe fn get_blob(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, Option<DecodedBlob>) {
+    let mut out = out_buf();
+    let rc = crdtsync_client_get_blob(c, channel, p.as_ptr(), p.len(), &mut out);
+    let blob = (out.len > 0).then(|| decode_blob(std::slice::from_raw_parts(out.ptr, out.len)));
+    crdtsync_buf_free(out);
+    (rc, blob)
+}
+
+/// The name of each resolved mark in a `marks_at` buffer — the `u32` count, then
+/// per mark a `u32`-length-prefixed name, a flavor tag, and that tag's payload.
+fn parse_mark_names(buf: &[u8]) -> Vec<Vec<u8>> {
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+    let mut c = 0usize;
+    let count = u32_at(buf, c);
+    c += 4;
+    let mut names = Vec::new();
+    for _ in 0..count {
+        let nl = u32_at(buf, c);
+        c += 4;
+        names.push(buf[c..c + nl].to_vec());
+        c += nl;
+        let tag = buf[c];
+        c += 1;
+        match tag {
+            0 => c += 1,
+            1 => {
+                let vl = u32_at(buf, c);
+                c += 4 + vl;
+            }
+            2 => {
+                let n = u32_at(buf, c);
+                c += 4 + n * 16;
+            }
+            _ => panic!("unknown mark flavor tag {tag}"),
+        }
+    }
+    assert_eq!(c, buf.len(), "the marks framing is fully consumed");
+    names
+}
+
+unsafe fn marks_at(
+    c: *const CrdtClient,
+    channel: u32,
+    p: &[u8],
+    index: usize,
+) -> (i32, Vec<Vec<u8>>) {
+    let mut out = out_buf();
+    let rc = crdtsync_client_marks_at(c, channel, p.as_ptr(), p.len(), index, &mut out);
+    let names = if out.len == 0 {
+        Vec::new()
+    } else {
+        parse_mark_names(std::slice::from_raw_parts(out.ptr, out.len))
+    };
+    crdtsync_buf_free(out);
+    (rc, names)
+}
+
+unsafe fn relative_position(
+    c: *const CrdtClient,
+    channel: u32,
+    p: &[u8],
+    index: usize,
+    side: u32,
+) -> (i32, Vec<u8>) {
+    let mut out = out_buf();
+    let rc =
+        crdtsync_client_relative_position(c, channel, p.as_ptr(), p.len(), index, side, &mut out);
+    let bytes = if out.len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(out.ptr, out.len).to_vec()
+    };
+    crdtsync_buf_free(out);
+    (rc, bytes)
+}
+
+unsafe fn resolve_position(
+    c: *const CrdtClient,
+    channel: u32,
+    p: &[u8],
+    pos: &[u8],
+) -> (i32, usize) {
+    let mut out: usize = usize::MAX;
+    let rc = crdtsync_client_resolve_position(
+        c,
+        channel,
+        p.as_ptr(),
+        p.len(),
+        pos.as_ptr(),
+        pos.len(),
+        &mut out,
+    );
+    (rc, out)
+}
+
+unsafe fn xml_tag(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, Vec<u8>) {
+    let mut out = out_buf();
+    let rc = crdtsync_client_xml_tag(c, channel, p.as_ptr(), p.len(), &mut out);
+    let tag = if out.len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(out.ptr, out.len).to_vec()
+    };
+    crdtsync_buf_free(out);
+    (rc, tag)
+}
+
+unsafe fn xml_children_len(c: *const CrdtClient, channel: u32, p: &[u8]) -> (i32, usize) {
+    let mut out: usize = usize::MAX;
+    let rc = crdtsync_client_xml_children_len(c, channel, p.as_ptr(), p.len(), &mut out);
+    (rc, out)
+}
+
+#[test]
+fn a_counter_reads_back_over_the_client() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        let (cb, sb) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sa);
+        crdtsync_buf_free(sb);
+
+        let hits = path(&[b"hits"]);
+        let up = crdtsync_client_inc(a, ca, hits.as_ptr(), hits.len(), 7);
+        let down = crdtsync_client_dec(a, ca, hits.as_ptr(), hits.len(), 2);
+        assert_eq!(get_counter(a, ca, &hits), (1, 5));
+
+        // The peer's replica converges on the same value from the frames alone.
+        assert_eq!(receive(b, &up), 1);
+        assert_eq!(receive(b, &down), 1);
+        assert_eq!(get_counter(b, cb, &hits), (1, 5));
+        crdtsync_buf_free(up);
+        crdtsync_buf_free(down);
+
+        // A register is not a counter, and an absent slot is neither — both read
+        // absent with `out` untouched.
+        let n = path(&[b"n"]);
+        crdtsync_buf_free(register_int(a, ca, &n, 1));
+        assert_eq!(get_counter(a, ca, &n), (0, i64::MIN));
+        assert_eq!(get_counter(a, ca, &path(&[b"nope"])), (0, i64::MIN));
+        assert_eq!(get_counter(a, 99, &hits), (0, i64::MIN));
+        assert_eq!(
+            crdtsync_client_get_counter(ptr::null(), 0, hits.as_ptr(), hits.len(), &mut 0i64),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_get_counter(a, ca, hits.as_ptr(), hits.len(), ptr::null_mut()),
+            -1
+        );
+
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}
+
+#[test]
+fn channel_state_snapshots_the_room_an_sdk_diffs() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        crdtsync_buf_free(sa);
+
+        // A held-but-untouched channel snapshots: 1 with the empty room's state,
+        // which is what separates "nothing here yet" from "no such channel".
+        let (rc, before) = channel_state(a, ca);
+        assert_eq!(rc, 1, "a held channel snapshots its replica");
+        assert!(
+            !before.is_empty(),
+            "an empty room still snapshots to a non-empty buffer"
+        );
+
+        let p = path(&[b"age"]);
+        let seed = register_int(a, ca, &p, 41);
+        let (rc, seeded) = channel_state(a, ca);
+        assert_eq!(rc, 1);
+        assert_ne!(before, seeded, "the edit moved the snapshot");
+
+        let bump = register_int(a, ca, &p, 42);
+        let (_, after) = channel_state(a, ca);
+
+        // The pair is exactly what the ergonomic SDKs diff to derive the change
+        // events an inbound frame never surfaces on its own.
+        assert_eq!(
+            diff_states(&seeded, &after),
+            vec![Change::Value {
+                path: p.clone(),
+                old: Scalar::Int(41),
+                new: Scalar::Int(42),
+            }]
+        );
+
+        // And the buffer is a real snapshot: it reopens as a document.
+        let reopened = crdtsync_doc_decode_state(after.as_ptr(), after.len());
+        assert!(!reopened.is_null(), "the state buffer reopens");
+        let mut n: i64 = 0;
+        assert_eq!(
+            crdtsync_doc_get_int(reopened, p.as_ptr(), p.len(), &mut n),
+            1
+        );
+        assert_eq!(n, 42);
+        crdtsync_doc_free(reopened);
+
+        // A peer's inbound frame moves the snapshot the same way, so the same
+        // diff derives change the peer never saw as a local edit.
+        let b = crdtsync_client_new(client_id(2).as_ptr());
+        let (cb, sb) = subscribe(b, b"room-1");
+        crdtsync_buf_free(sb);
+        assert_eq!(receive(b, &seed), 1);
+        let (_, b_before) = channel_state(b, cb);
+        assert_eq!(receive(b, &bump), 1);
+        let (_, b_after) = channel_state(b, cb);
+        assert_eq!(
+            diff_states(&b_before, &b_after),
+            vec![Change::Value {
+                path: p,
+                old: Scalar::Int(41),
+                new: Scalar::Int(42),
+            }]
+        );
+
+        crdtsync_buf_free(seed);
+        crdtsync_buf_free(bump);
+        crdtsync_client_free(a);
+        crdtsync_client_free(b);
+    }
+}
+
+#[test]
+fn a_blob_reads_back_over_the_client() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        crdtsync_buf_free(sa);
+
+        let p = path(&[b"avatar"]);
+        let bytes = [0x89u8, b'P', b'N', b'G', 0x00, 0xFF];
+        crdtsync_buf_free(crdtsync_client_set_blob(
+            a,
+            ca,
+            p.as_ptr(),
+            p.len(),
+            b"image/png".as_ptr(),
+            9,
+            bytes.as_ptr(),
+            bytes.len(),
+        ));
+
+        let (rc, blob) = get_blob(a, ca, &p);
+        assert_eq!(rc, 1, "a live blob ref reads back");
+        let blob = blob.unwrap();
+        assert_eq!(blob.mime, "image/png");
+        assert_eq!(blob.size, bytes.len() as u64);
+        assert_eq!(blob.inline.as_deref(), Some(&bytes[..]));
+        assert_ne!(blob.id, [0u8; 16], "a minted handle is not all-zero");
+
+        // An out-of-band ref carries the caller's handle and no bytes.
+        let vid = path(&[b"clip"]);
+        let id = [7u8; 16];
+        crdtsync_buf_free(crdtsync_client_set_blob_ref(
+            a,
+            ca,
+            vid.as_ptr(),
+            vid.len(),
+            id.as_ptr(),
+            b"video/mp4".as_ptr(),
+            9,
+            10_000_000,
+        ));
+        let (rc, blob) = get_blob(a, ca, &vid);
+        assert_eq!(rc, 1);
+        let blob = blob.unwrap();
+        assert_eq!(blob.id, id);
+        assert_eq!(blob.size, 10_000_000);
+        assert_eq!(blob.inline, None, "a ref carries no inline bytes");
+
+        // A slot holding something else, and an absent one, both read absent.
+        crdtsync_buf_free(register_int(a, ca, &path(&[b"n"]), 1));
+        assert_eq!(get_blob(a, ca, &path(&[b"n"])).0, 0);
+        assert_eq!(get_blob(a, ca, &path(&[b"nope"])).0, 0);
+
+        crdtsync_client_free(a);
+    }
+}
+
+#[test]
+fn marks_read_back_and_isolate_channels() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        let (cb, sb) = subscribe(a, b"room-2");
+        crdtsync_buf_free(sa);
+        crdtsync_buf_free(sb);
+
+        let body = path(&[b"body"]);
+        seed_body_text(a, ca, &body, "hello world");
+        let value = Scalar::Bool(true).encode_state();
+        let mut mid = out_buf();
+        crdtsync_buf_free(crdtsync_client_mark(
+            a,
+            ca,
+            body.as_ptr(),
+            body.len(),
+            0,
+            0,
+            5,
+            0,
+            b"bold".as_ptr(),
+            4,
+            value.as_ptr(),
+            value.len(),
+            &mut mid,
+        ));
+        assert_eq!(mid.len, 16, "the author returns the mark handle");
+        crdtsync_buf_free(mid);
+
+        assert_eq!(marks_at(a, ca, &body, 2), (1, vec![b"bold".to_vec()]));
+        assert_eq!(
+            marks_at(a, ca, &body, 7),
+            (1, Vec::new()),
+            "an uncovered index resolves to no marks"
+        );
+
+        // The sibling room carries neither the text nor the mark, so the same
+        // path there resolves to nothing — the read addresses one channel.
+        assert_eq!(marks_at(a, cb, &body, 2), (1, Vec::new()));
+
+        // A live non-sequence slot, and an absent one, each resolve to no marks
+        // rather than an error.
+        let n = path(&[b"n"]);
+        crdtsync_buf_free(register_int(a, ca, &n, 1));
+        assert_eq!(marks_at(a, ca, &n, 0), (1, Vec::new()));
+        assert_eq!(marks_at(a, ca, &path(&[b"nope"]), 0), (1, Vec::new()));
+
+        crdtsync_client_free(a);
+    }
+}
+
+#[test]
+fn anchors_capture_and_resolve_over_the_client() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        crdtsync_buf_free(sa);
+
+        let body = path(&[b"body"]);
+        seed_body_text(a, ca, &body, "hello world");
+
+        // Two anchors at the "world" boundary, one bound to the character on
+        // each side of it. Both read 6 until something lands in the gap.
+        let (rc, left) = relative_position(a, ca, &body, 6, 0);
+        assert_eq!(rc, 1, "a live sequence captures an anchor");
+        assert!(!left.is_empty());
+        let (rc, right) = relative_position(a, ca, &body, 6, 1);
+        assert_eq!(rc, 1);
+        assert_ne!(left, right, "the sides bind to different characters");
+        assert_eq!(resolve_position(a, ca, &body, &left), (1, 6));
+        assert_eq!(resolve_position(a, ca, &body, &right), (1, 6));
+
+        // An insert at the gap separates them: the left anchor stays behind it,
+        // the right anchor rides ahead of it.
+        crdtsync_buf_free(crdtsync_client_text_insert(
+            a,
+            ca,
+            body.as_ptr(),
+            body.len(),
+            6,
+            b"big ".as_ptr(),
+            4,
+        ));
+        assert_eq!(resolve_position(a, ca, &body, &left), (1, 6));
+        assert_eq!(resolve_position(a, ca, &body, &right), (1, 10));
+
+        // An insert before the whole span carries both along.
+        crdtsync_buf_free(crdtsync_client_text_insert(
+            a,
+            ca,
+            body.as_ptr(),
+            body.len(),
+            0,
+            b">> ".as_ptr(),
+            3,
+        ));
+        assert_eq!(resolve_position(a, ca, &body, &left), (1, 9));
+        assert_eq!(resolve_position(a, ca, &body, &right), (1, 13));
+
+        // A List anchors the same way — the entry points take either sequence.
+        let items = path(&[b"items"]);
+        for v in [b"a", b"b", b"c"] {
+            crdtsync_buf_free(crdtsync_client_list_insert(
+                a,
+                ca,
+                items.as_ptr(),
+                items.len(),
+                usize::MAX,
+                v.as_ptr(),
+                1,
+            ));
+        }
+        let (rc, at_c) = relative_position(a, ca, &items, 2, 1);
+        assert_eq!(rc, 1);
+        assert_eq!(resolve_position(a, ca, &items, &at_c), (1, 2));
+        crdtsync_buf_free(crdtsync_client_list_insert(
+            a,
+            ca,
+            items.as_ptr(),
+            items.len(),
+            0,
+            b"z".as_ptr(),
+            1,
+        ));
+        assert_eq!(resolve_position(a, ca, &items, &at_c), (1, 3));
+
+        // A non-sequence slot captures nothing; an unknown side is refused. A
+        // refused capture leaves `out` untouched, so the buffer stays empty.
+        crdtsync_buf_free(register_int(a, ca, &path(&[b"n"]), 1));
+        assert_eq!(
+            relative_position(a, ca, &path(&[b"n"]), 0, 0),
+            (0, Vec::new())
+        );
+        assert_eq!(
+            relative_position(a, ca, &body, 0, 9),
+            (0, Vec::new()),
+            "an unknown side is refused"
+        );
+
+        // Malformed position bytes resolve to nothing rather than panicking, and
+        // leave the out index untouched.
+        assert_eq!(
+            resolve_position(a, ca, &body, &[0xff, 0xff]),
+            (0, usize::MAX)
+        );
+
+        crdtsync_client_free(a);
+    }
+}
+
+#[test]
+fn xml_shape_reads_back_over_the_client() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        crdtsync_buf_free(sa);
+
+        let root = path(&[b"doc"]);
+        crdtsync_buf_free(crdtsync_client_xml_element(
+            a,
+            ca,
+            root.as_ptr(),
+            root.len(),
+            b"article".as_ptr(),
+            7,
+        ));
+        assert_eq!(xml_tag(a, ca, &root), (1, b"article".to_vec()));
+        assert_eq!(xml_children_len(a, ca, &root), (1, 0));
+
+        for tag in [b"p1", b"p2"] {
+            crdtsync_buf_free(crdtsync_client_xml_insert_element(
+                a,
+                ca,
+                root.as_ptr(),
+                root.len(),
+                0,
+                tag.as_ptr(),
+                2,
+            ));
+        }
+        assert_eq!(xml_children_len(a, ca, &root), (1, 2));
+
+        // A fragment is tagless, so it reports no tag but still counts children.
+        let frag = path(&[b"frag"]);
+        crdtsync_buf_free(crdtsync_client_xml_fragment(
+            a,
+            ca,
+            frag.as_ptr(),
+            frag.len(),
+        ));
+        assert_eq!(xml_tag(a, ca, &frag), (0, Vec::new()));
+        assert_eq!(xml_children_len(a, ca, &frag), (1, 0));
+        crdtsync_buf_free(crdtsync_client_xml_insert_element(
+            a,
+            ca,
+            frag.as_ptr(),
+            frag.len(),
+            0,
+            b"li".as_ptr(),
+            2,
+        ));
+        assert_eq!(xml_children_len(a, ca, &frag), (1, 1));
+
+        // A non-xml slot is neither.
+        let n = path(&[b"n"]);
+        crdtsync_buf_free(register_int(a, ca, &n, 1));
+        assert_eq!(xml_tag(a, ca, &n), (0, Vec::new()));
+        assert_eq!(xml_children_len(a, ca, &n), (0, usize::MAX));
+
+        crdtsync_client_free(a);
+    }
+}
+
+#[test]
+fn the_channel_reads_address_one_room_and_refuse_an_unheld_channel() {
+    unsafe {
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (c1, s1) = subscribe(a, b"room-1");
+        let (c2, s2) = subscribe(a, b"room-2");
+        crdtsync_buf_free(s1);
+        crdtsync_buf_free(s2);
+        assert_ne!(c1, c2);
+
+        // Everything under test lives in room-1 only, and each slot read reports
+        // 1 there — so a 0 on the sibling or an unheld channel can only come
+        // from the channel, not from the path naming nothing anywhere. The mark
+        // read never reports 0 for a path, so it only appears below.
+        let body = path(&[b"body"]);
+        seed_body_text(a, c1, &body, "hello world");
+        let el = path(&[b"doc"]);
+        crdtsync_buf_free(crdtsync_client_xml_element(
+            a,
+            c1,
+            el.as_ptr(),
+            el.len(),
+            b"article".as_ptr(),
+            7,
+        ));
+        let pic = path(&[b"pic"]);
+        crdtsync_buf_free(crdtsync_client_set_blob_ref(
+            a,
+            c1,
+            pic.as_ptr(),
+            pic.len(),
+            [3u8; 16].as_ptr(),
+            b"image/png".as_ptr(),
+            9,
+            64,
+        ));
+        let (rc, anchor) = relative_position(a, c1, &body, 6, 0);
+        assert_eq!(rc, 1);
+        assert_eq!(xml_tag(a, c1, &el), (1, b"article".to_vec()));
+        assert_eq!(xml_children_len(a, c1, &el), (1, 0));
+        assert_eq!(get_blob(a, c1, &pic).0, 1);
+        assert_eq!(resolve_position(a, c1, &body, &anchor), (1, 6));
+
+        // The sibling room holds none of it.
+        assert_eq!(xml_tag(a, c2, &el), (0, Vec::new()));
+        assert_eq!(xml_children_len(a, c2, &el), (0, usize::MAX));
+        assert_eq!(relative_position(a, c2, &body, 0, 0), (0, Vec::new()));
+        assert_eq!(get_blob(a, c2, &pic).0, 0);
+        assert_eq!(resolve_position(a, c2, &body, &anchor), (0, usize::MAX));
+        let (rc1, state1) = channel_state(a, c1);
+        let (rc2, state2) = channel_state(a, c2);
+        assert_eq!((rc1, rc2), (1, 1), "both channels are held");
+        assert_ne!(state1, state2, "each channel snapshots its own replica");
+
+        // An unheld channel holds no replica at all: every read is 0, distinct
+        // from the -1 a bad handle reports.
+        let unheld = 99;
+        assert_eq!(channel_state(a, unheld), (0, Vec::new()));
+        assert_eq!(get_blob(a, unheld, &pic).0, 0);
+        assert_eq!(marks_at(a, unheld, &body, 0), (0, Vec::new()));
+        assert_eq!(relative_position(a, unheld, &body, 0, 0), (0, Vec::new()));
+        assert_eq!(resolve_position(a, unheld, &body, &anchor), (0, usize::MAX));
+        assert_eq!(xml_tag(a, unheld, &el), (0, Vec::new()));
+        assert_eq!(xml_children_len(a, unheld, &el), (0, usize::MAX));
+
+        // Unsubscribing drops the replica, so a channel that was held reads the
+        // same absent as one that never was.
+        crdtsync_buf_free(crdtsync_client_unsubscribe(a, c1));
+        assert_eq!(channel_state(a, c1), (0, Vec::new()));
+        assert_eq!(get_blob(a, c1, &pic).0, 0);
+        assert_eq!(marks_at(a, c1, &body, 0), (0, Vec::new()));
+        assert_eq!(relative_position(a, c1, &body, 0, 0), (0, Vec::new()));
+        assert_eq!(resolve_position(a, c1, &body, &anchor), (0, usize::MAX));
+        assert_eq!(xml_tag(a, c1, &el), (0, Vec::new()));
+        assert_eq!(xml_children_len(a, c1, &el), (0, usize::MAX));
+
+        crdtsync_client_free(a);
+    }
+}
+
+#[test]
+fn the_channel_reads_reject_null_handles_and_pointers() {
+    unsafe {
+        let p = path(&[b"k"]);
+        let mut buf = out_buf();
+        let mut n: usize = 0;
+
+        // A null handle is rejected before any payload is looked at — each call
+        // here passes a well-formed path and side so the null check is what
+        // fires, not an earlier validation guard.
+        assert_eq!(crdtsync_client_channel_state(ptr::null(), 0, &mut buf), -1);
+        assert_eq!(
+            crdtsync_client_get_blob(ptr::null(), 0, p.as_ptr(), p.len(), &mut buf),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_marks_at(ptr::null(), 0, p.as_ptr(), p.len(), 0, &mut buf),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_relative_position(ptr::null(), 0, p.as_ptr(), p.len(), 0, 0, &mut buf),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_resolve_position(
+                ptr::null(),
+                0,
+                p.as_ptr(),
+                p.len(),
+                [0u8; 4].as_ptr(),
+                4,
+                &mut n
+            ),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_xml_tag(ptr::null(), 0, p.as_ptr(), p.len(), &mut buf),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_xml_children_len(ptr::null(), 0, p.as_ptr(), p.len(), &mut n),
+            -1
+        );
+
+        // A null output pointer is rejected the same way, with a live handle and
+        // a held channel — so the guard under test is the `out` check.
+        let a = crdtsync_client_new(client_id(1).as_ptr());
+        let (ca, sa) = subscribe(a, b"room-1");
+        crdtsync_buf_free(sa);
+        assert_eq!(crdtsync_client_channel_state(a, ca, ptr::null_mut()), -1);
+        assert_eq!(
+            crdtsync_client_get_blob(a, ca, p.as_ptr(), p.len(), ptr::null_mut()),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_marks_at(a, ca, p.as_ptr(), p.len(), 0, ptr::null_mut()),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_relative_position(a, ca, p.as_ptr(), p.len(), 0, 0, ptr::null_mut()),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_resolve_position(
+                a,
+                ca,
+                p.as_ptr(),
+                p.len(),
+                [0u8; 4].as_ptr(),
+                4,
+                ptr::null_mut()
+            ),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_xml_tag(a, ca, p.as_ptr(), p.len(), ptr::null_mut()),
+            -1
+        );
+        assert_eq!(
+            crdtsync_client_xml_children_len(a, ca, p.as_ptr(), p.len(), ptr::null_mut()),
+            -1
+        );
+
+        // A null path or position pointer with a nonzero length is rejected
+        // rather than dereferenced — 0, not the -1 a bad handle reports.
+        // `marks_at` answers 1 for any well-formed path, so its 0 can only come
+        // from the pointer rejection.
+        assert_eq!(crdtsync_client_get_blob(a, ca, ptr::null(), 4, &mut buf), 0);
+        assert_eq!(
+            crdtsync_client_marks_at(a, ca, ptr::null(), 4, 0, &mut buf),
+            0
+        );
+        assert_eq!(
+            crdtsync_client_relative_position(a, ca, ptr::null(), 4, 0, 0, &mut buf),
+            0
+        );
+        assert_eq!(crdtsync_client_xml_tag(a, ca, ptr::null(), 4, &mut buf), 0);
+        assert_eq!(
+            crdtsync_client_xml_children_len(a, ca, ptr::null(), 4, &mut n),
+            0
+        );
+
+        // A null path or position pointer is refused against a path and anchor
+        // that do resolve, so each 0 is the pointer rejection, not the payload.
+        let body = path(&[b"body"]);
+        seed_body_text(a, ca, &body, "hello world");
+        let (rc, anchor) = relative_position(a, ca, &body, 6, 0);
+        assert_eq!(rc, 1);
+        assert_eq!(resolve_position(a, ca, &body, &anchor), (1, 6));
+        assert_eq!(
+            crdtsync_client_resolve_position(
+                a,
+                ca,
+                ptr::null(),
+                4,
+                anchor.as_ptr(),
+                anchor.len(),
+                &mut n
+            ),
+            0
+        );
+        assert_eq!(
+            crdtsync_client_resolve_position(
+                a,
+                ca,
+                body.as_ptr(),
+                body.len(),
+                ptr::null(),
+                4,
+                &mut n
+            ),
+            0
+        );
+
+        // A structurally malformed path — a key length prefix past the end of
+        // the buffer — names no slot, so the slot reads report absent. The mark
+        // read still answers 1 with no marks, since a path naming no sequence is
+        // an empty resolution, not a failure.
+        let torn = 0xffff_ffffu32.to_le_bytes().to_vec();
+        assert_eq!(
+            crdtsync_client_get_blob(a, ca, torn.as_ptr(), torn.len(), &mut buf),
+            0
+        );
+        assert_eq!(
+            crdtsync_client_xml_tag(a, ca, torn.as_ptr(), torn.len(), &mut buf),
+            0
+        );
+        assert_eq!(
+            crdtsync_client_xml_children_len(a, ca, torn.as_ptr(), torn.len(), &mut n),
+            0
+        );
+        assert_eq!(relative_position(a, ca, &torn, 0, 0), (0, Vec::new()));
+        assert_eq!(resolve_position(a, ca, &torn, &anchor), (0, usize::MAX));
+        assert_eq!(marks_at(a, ca, &torn, 0), (1, Vec::new()));
 
         crdtsync_client_free(a);
     }
