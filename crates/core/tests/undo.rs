@@ -17,6 +17,7 @@
 use crdtsync_core::acl::{AclEffect, AclGrant, AclSubject, Capability};
 use crdtsync_core::doc::{Document, SlotFate};
 use crdtsync_core::elementid::ElementId;
+use crdtsync_core::marks::MarkState;
 use crdtsync_core::ranged::RangeAnchor;
 use crdtsync_core::schema::Schema;
 use crdtsync_core::RelativePosition;
@@ -67,6 +68,23 @@ fn text(d: &Document, path: &[u8]) -> String {
     path::text_get(d, path).unwrap_or_default()
 }
 
+/// The marks on the first character, by name and resolved value. An
+/// object-flavored mark resolves to the *ids* of its covering ranges, and a
+/// revival always mints a fresh id — so the count stands in for them, or every
+/// comparison across a revival would fail on identity alone.
+fn marks(d: &Document, path: &[u8]) -> Vec<String> {
+    path::marks_at(d, path, 0)
+        .into_iter()
+        .map(|m| {
+            let state = match m.state {
+                MarkState::Object(ids) => format!("object({})", ids.len()),
+                other => format!("{other:?}"),
+            };
+            format!("{:?}={state}", m.name)
+        })
+        .collect()
+}
+
 fn undo(d: &mut Document) -> Vec<Op> {
     d.undo(ORIGIN).expect("an intention to undo")
 }
@@ -91,7 +109,7 @@ fn observe(d: &Document) -> Vec<String> {
             path::text_get(d, &path),
             path::xml_tag(d, &path),
             child_shapes(d, &key),
-            path::marks_at(d, &path, 0),
+            marks(d, &path),
         ));
     }
     out.sort();
@@ -1758,6 +1776,185 @@ fn an_inverse_onto_a_container_a_peer_displaced_is_dropped_not_emitted() {
     );
 }
 
+#[test]
+fn redo_restores_the_interior_of_a_container_the_intention_only_displaced() {
+    let mut d = doc(1);
+    let a = p(&[b"a"]);
+    path::xml_element(&mut d, &a, b"p");
+
+    // One gesture: add a child, then displace the element with a counter. The
+    // element is *retained* holding the child — it is not removed from the tree
+    // — so undoing the child cannot be skipped just because the counter took
+    // the slot.
+    d.begin_intention();
+    path::xml_insert_text(&mut d, &a, 0, "z");
+    path::inc(&mut d, &a, 2);
+    d.end_intention();
+
+    undo(&mut d);
+    assert_eq!(child_shapes(&d, b"a"), Vec::<String>::new());
+    redo(&mut d);
+    assert_eq!(counter(&d, &a), 2);
+
+    // Bring the element back and look inside: the redo had to put the child back
+    // into the retained element, not drop the step.
+    path::xml_element(&mut d, &a, b"p");
+    assert_eq!(
+        child_shapes(&d, b"a"),
+        vec!["\"z\""],
+        "a displaced container keeps what the intention put in it, so the redo \
+         must restore it there"
+    );
+}
+
+#[test]
+fn a_deleted_map_slot_stays_undone_when_the_container_comes_back() {
+    let mut d = doc(1);
+    let nested = p(&[b"b", b"sub"]);
+    // Creates the map at `b` and a text inside it.
+    path::text_insert(&mut d, &nested, 0, "xy");
+    assert_eq!(text(&d, &nested), "xy");
+
+    undo(&mut d);
+    assert_eq!(path::map_keys(&d, &p(&[b"b"])), None, "the slot is empty");
+
+    // A map slot is never terminally removed: the container is retained by id,
+    // so anything that installs the slot brings it back — with whatever the
+    // undone intention left inside, unless the interior was undone too.
+    path::register(&mut d, &p(&[b"b", b"other"]), Scalar::Int(1));
+    assert_eq!(
+        path::text_get(&d, &nested),
+        None,
+        "the undone text must not reappear with the retained container"
+    );
+}
+
+#[test]
+fn every_revival_of_an_intention_lands_when_a_peer_displaced_the_slot() {
+    let mut a = Document::new(cid(1));
+    let mut b = doc(2);
+    let body = p(&[b"body"]);
+    let setup = path::text_insert(&mut b, &body, 0, "hello");
+    apply_all(&mut a, &setup);
+
+    // Two deletes in one intention, so the slot is written twice by the
+    // inverses — the second write must not stop the first revival from being
+    // made reachable.
+    b.begin_intention();
+    let mut edits = path::text_delete(&mut b, &body, 0, 1);
+    edits.extend(path::text_delete(&mut b, &body, 0, 1));
+    b.end_intention();
+    assert_eq!(text(&b, &body), "llo");
+    apply_all(&mut a, &edits);
+
+    let displace = path::register(&mut a, &body, Scalar::Int(1));
+    apply_all(&mut b, &displace);
+
+    let inverse = undo(&mut b);
+    assert_eq!(text(&b, &body), "hello", "both revivals land");
+    apply_all(&mut a, &inverse);
+    assert_eq!(observe(&a), observe(&b));
+}
+
+#[test]
+fn a_counter_and_a_container_in_one_intention_both_undo_when_displaced() {
+    let mut a = Document::new(cid(1));
+    let mut b = doc(2);
+    let k = p(&[b"k"]);
+    let setup = path::text_insert(&mut b, &k, 0, "hi");
+    apply_all(&mut a, &setup);
+
+    b.begin_intention();
+    path::inc(&mut b, &k, 1);
+    path::text_insert(&mut b, &k, 0, "Z");
+    b.end_intention();
+    assert_eq!(text(&b, &k), "Zhi");
+
+    let displace = path::register(&mut a, &k, Scalar::Int(9));
+    apply_all(&mut b, &displace);
+
+    undo(&mut b);
+    assert_eq!(
+        text(&b, &k),
+        "hi",
+        "the inserted run is undone even though the slot was displaced"
+    );
+}
+
+#[test]
+fn undo_of_an_edit_inside_a_revived_annotation_reaches_the_revived_one() {
+    let mut d = doc(1);
+    let body = p(&[b"body"]);
+    path::text_insert(&mut d, &body, 0, "hello");
+    let seq = seq_id(&d, b"body");
+    let mut id = None;
+    d.transact(|c| {
+        id = Some(c.ranged().create_map(
+            RangeAnchor {
+                seq,
+                pos: anchor_at(0).pos,
+            },
+            RangeAnchor {
+                seq,
+                pos: anchor_at(5).pos,
+            },
+        ));
+    });
+    let id = id.expect("a range id");
+    d.transact(|c| {
+        if let Some(mut m) = c.ranged().payload_map(id) {
+            m.register(b"author", Scalar::Int(42));
+        }
+    });
+    d.transact(|c| c.ranged().delete(id));
+
+    // Revives the range under a fresh id, rebuilding the payload.
+    undo(&mut d);
+    let back = d
+        .ranged_elements()
+        .into_iter()
+        .find(|r| r.id != id)
+        .expect("the range came back under a fresh id");
+    assert_eq!(payload_slot(&d, back.id, b"author"), Some(Scalar::Int(42)));
+
+    // The next undo targets the payload container of the *old* range id.
+    undo(&mut d);
+    assert_eq!(
+        payload_slot(&d, back.id, b"author"),
+        None,
+        "the step has to follow the range's substitution into the revived payload"
+    );
+}
+
+#[test]
+fn undoing_a_revoke_then_the_grant_leaves_no_live_tuple() {
+    let mut d = doc(1);
+    let author = cid(1);
+    let mut id = None;
+    d.transact(|c| {
+        id = Some(c.acl().grant(
+            AclSubject::Actor(cid(7)),
+            AclGrant::Capability(Capability::Write),
+            AclEffect::Allow,
+            p(&[b"doc"]),
+            author,
+        ));
+    });
+    let id = id.expect("a tuple id");
+    d.transact(|c| c.acl().revoke(id));
+
+    // Re-issues the grant under a fresh tuple id.
+    undo(&mut d);
+    assert_eq!(d.acl_tuples().len(), 1);
+
+    // Undoing the grant must revoke the tuple that is actually live.
+    undo(&mut d);
+    assert!(
+        d.acl_tuples().is_empty(),
+        "undoing everything must not leave a live grant standing"
+    );
+}
+
 // --- a randomized undo/redo convergence property ---
 
 /// A small deterministic PRNG, so a failure names a reproducing seed.
@@ -1812,16 +2009,27 @@ fn undo_and_redo_round_trip_to_the_states_they_started_from() {
 
         let mut intentions = 0;
         for _ in 0..40 {
-            let key = KEYS[rng.below(KEYS.len())];
-            let grouped = rng.below(4) == 0;
-            if grouped {
+            // A group carries several edits — one-edit groups are behaviourally
+            // the ungrouped case, and the interesting hazards live in an
+            // intention whose later edit displaces a container an earlier one
+            // wrote into.
+            let edits = if rng.below(3) == 0 {
+                2 + rng.below(3)
+            } else {
+                1
+            };
+            if edits > 1 {
                 d.begin_intention();
             }
-            let ops = random_edit(&mut d, key, &mut rng, false);
-            if grouped {
+            let mut any = false;
+            for _ in 0..edits {
+                let key = KEYS[rng.below(KEYS.len())];
+                any |= !random_edit(&mut d, key, &mut rng, false).is_empty();
+            }
+            if edits > 1 {
                 d.end_intention();
             }
-            if !ops.is_empty() {
+            if any {
                 intentions += 1;
             }
         }
@@ -1868,8 +2076,13 @@ fn undo_and_redo_round_trip_to_the_states_they_started_from() {
 /// exact round trip of a reorder on its own is pinned by
 /// `a_reorder_redoes_to_the_same_order`.
 fn random_edit(d: &mut Document, key: &[u8], rng: &mut Rng, moves: bool) -> Vec<Op> {
-    let path = p(&[key]);
-    match rng.below(if moves { 11 } else { 10 }) {
+    // Every third edit addresses a nested slot rather than a root one.
+    let path = if rng.below(3) == 0 {
+        p(&[key, b"sub"])
+    } else {
+        p(&[key])
+    };
+    match rng.below(if moves { 14 } else { 13 }) {
         0 => path::register(d, &path, Scalar::Int(rng.below(4) as i64)),
         1 => path::inc(d, &path, rng.below(3) as u32 + 1),
         2 => path::dec(d, &path, rng.below(3) as u32 + 1),
@@ -1897,6 +2110,59 @@ fn random_edit(d: &mut Document, key: &[u8], rng: &mut Rng, moves: bool) -> Vec<
                 path::xml_child_delete(d, &path, rng.below(n))
             }
         }
+        10 => {
+            // A named mark over the text at this path, if there is any.
+            let len = path::text_len(d, &path).unwrap_or(0);
+            if len == 0 {
+                Vec::new()
+            } else {
+                path::mark(
+                    d,
+                    &path,
+                    0,
+                    Side::Left,
+                    len,
+                    Side::Right,
+                    b"bold",
+                    Scalar::Int(rng.below(3) as i64),
+                )
+                .0
+            }
+        }
+        11 => {
+            // Change or delete a live annotation.
+            let live: Vec<_> = d.ranged_elements().into_iter().map(|r| r.id).collect();
+            if live.is_empty() {
+                Vec::new()
+            } else {
+                let id = live[rng.below(live.len())];
+                if rng.below(2) == 0 {
+                    d.transact(|c| c.ranged().set_payload(id, Scalar::Int(7)))
+                } else {
+                    d.transact(|c| c.ranged().delete(id))
+                }
+            }
+        }
+        12 => {
+            // Grant or revoke an ACL tuple.
+            let live: Vec<_> = d.acl_tuples().into_iter().map(|t| t.id).collect();
+            let author = d.client();
+            if !live.is_empty() && rng.below(2) == 0 {
+                let id = live[rng.below(live.len())];
+                d.transact(|c| c.acl().revoke(id))
+            } else {
+                let scope = path.clone();
+                d.transact(|c| {
+                    c.acl().grant(
+                        AclSubject::Actor(author),
+                        AclGrant::Capability(Capability::Write),
+                        AclEffect::Allow,
+                        scope,
+                        author,
+                    );
+                })
+            }
+        }
         _ => {
             let n = path::xml_children_len(d, &path).unwrap_or(0);
             if n < 2 {
@@ -1915,7 +2181,30 @@ fn deep_observe(d: &Document) -> Vec<String> {
     let mut out = observe(d);
     for key in path::map_keys(d, &p(&[])).unwrap_or_default() {
         out.push(format!("{key:?}=tree:{}", render_tree(d, &key)));
+        let nested = p(&[&key, b"sub"]);
+        out.push(format!(
+            "{key:?}/sub=reg:{:?} ctr:{:?} list:{:?} text:{:?} xml:{:?}",
+            path::get_register(d, &nested),
+            path::get_counter(d, &nested),
+            path::list_len(d, &nested),
+            path::text_get(d, &nested),
+            path::xml_tag(d, &nested),
+        ));
     }
+    let mut ranges: Vec<String> = d
+        .ranged_elements()
+        .into_iter()
+        .map(|r| format!("range:{:?}/{:?}", r.name, r.scalar()))
+        .collect();
+    ranges.sort();
+    out.push(format!("ranges:{}", ranges.join("|")));
+    let mut acl: Vec<String> = d
+        .acl_tuples()
+        .into_iter()
+        .map(|t| format!("{:?}/{:?}/{:?}/{:?}", t.subject, t.grant, t.effect, t.scope))
+        .collect();
+    acl.sort();
+    out.push(format!("acl:{}", acl.join("|")));
     out.sort();
     out
 }

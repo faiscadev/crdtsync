@@ -30,6 +30,8 @@
 //! taken at record time, so undoing "delete this paragraph" brings its text
 //! back rather than an empty shell.
 
+use crate::acl::{AclEffect, AclGrant, AclScope, AclSubject};
+use crate::clientid::ClientId;
 use crate::doc::Document;
 use crate::elementid::ElementId;
 use crate::list::Anchor;
@@ -115,6 +117,18 @@ pub(crate) enum Step {
         end: RangeAnchor,
         name: Option<Vec<u8>>,
         payload: Snap,
+        was: ElementId,
+    },
+    /// Re-issue a revoked ACL tuple. A revoke is terminal, so the tuple comes
+    /// back under a fresh id, replacing `was` — which the intentions still
+    /// stacked beneath name it by.
+    Regrant {
+        target: ElementId,
+        subject: AclSubject,
+        grant: AclGrant,
+        effect: AclEffect,
+        scope: AclScope,
+        grantor: ClientId,
         was: ElementId,
     },
 }
@@ -319,7 +333,12 @@ impl History {
             }
             Landing::Redo => self.redo.push(intention),
         }
-        // With both stacks empty no intention names an id a revival replaced.
+    }
+
+    /// Drop the substitution maps once no stacked intention can name an id a
+    /// revival replaced. Called after a replay settles, which is the only point
+    /// at which both stacks can be empty.
+    pub(crate) fn prune(&mut self) {
         if self.undo.is_empty() && self.redo.is_empty() {
             self.revived.clear();
             self.revived_elements.clear();

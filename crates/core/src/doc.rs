@@ -3317,13 +3317,30 @@ impl Document {
             self.begin_atomic();
         }
         self.pending.clear();
-        for step in self.plan(steps) {
-            // Checked as each step comes up, not once up front: an earlier step
-            // may be exactly what re-installs the container this one addresses.
-            // What is still unreachable is dropped rather than emitted, since a
-            // peer would buffer and later replay what this replica applies to
-            // nothing.
-            if self.resolvable(self.step_target(&step)) {
+        let plan = self.plan(steps);
+        // The container-restoring ops this intention holds, by the element each
+        // makes live. A step whose target is displaced when its turn comes is
+        // preceded by a *copy* of the op that puts the container back, rather
+        // than by hoisting that op out of its place: re-creating a container is
+        // idempotent, while moving a slot write past another inverts which of
+        // them the slot ends up holding.
+        let installers: HashMap<ElementId, (ElementId, OpKind)> = plan
+            .iter()
+            .filter_map(|step| match step {
+                Inverse::Op { target, kind } => {
+                    self.installs(step).map(|id| (id, (*target, kind.clone())))
+                }
+                _ => None,
+            })
+            .collect();
+        for step in plan {
+            let target = self.step_target(&step);
+            if !self.resolvable(target) {
+                self.reinstate(target, &installers);
+            }
+            // What is still unreachable is dropped rather than emitted: a peer
+            // would buffer and later replay what this replica applies to nothing.
+            if self.resolvable(target) {
                 self.emit_inverse(step);
             }
         }
@@ -3338,6 +3355,7 @@ impl Document {
             ops
         };
         self.history.end_replay(saved);
+        self.history.prune();
         ops
     }
 
@@ -3347,8 +3365,33 @@ impl Document {
     fn emit_inverse(&mut self, step: Inverse) {
         match step {
             Inverse::Op { target, kind } => {
+                // The target itself can be a container of something a revival
+                // replaced — a revived annotation's payload, a revived node's
+                // attrs or children — so it follows the element map too.
+                let target = self.history.current_element(target);
                 let kind = self.follow_revivals(target, kind);
                 self.emit(target, kind)
+            }
+            Inverse::Regrant {
+                target,
+                subject,
+                grant,
+                effect,
+                scope,
+                grantor,
+                was,
+            } => {
+                let stamp = self.emit_stamped(
+                    target,
+                    OpKind::AclGrant {
+                        subject,
+                        grant,
+                        effect,
+                        scope,
+                        grantor,
+                    },
+                );
+                self.history.substitute_element(was, acl_id(stamp));
             }
             Inverse::ReviveItem {
                 list,
@@ -3384,6 +3427,16 @@ impl Document {
                     self.history.substitute(list, was, now);
                     if let Some(element) = self.node_at(list, now) {
                         self.history.substitute_element(was_node, element);
+                        // A stacked step may target the node's attrs or children
+                        // rather than the node, and those ids derive from it.
+                        self.history.substitute_element(
+                            XmlElement::attrs_id(was_node),
+                            XmlElement::attrs_id(element),
+                        );
+                        self.history.substitute_element(
+                            XmlElement::children_id(was_node),
+                            XmlElement::children_id(element),
+                        );
                     }
                 }
             }
@@ -3394,9 +3447,14 @@ impl Document {
                 payload,
                 was,
             } => {
-                let now = self.revive_ranged(start, end, name, payload);
-                if let Some(now) = now {
+                if let Some(now) = self.revive_ranged(start, end, name, payload) {
                     self.history.substitute_element(was, now);
+                    // A composite payload is a container in its own right, and a
+                    // stacked step edits it by that derived id.
+                    for kind in [ElementKind::Map, ElementKind::List, ElementKind::Text] {
+                        self.history
+                            .substitute_element(payload_id(was, kind), payload_id(now, kind));
+                    }
                 }
             }
         }
@@ -3476,25 +3534,20 @@ impl Document {
     /// Order an intention's inverses for replay.
     ///
     /// The base order is the reverse of the edits — the last thing done is the
-    /// first thing undone — but a plain reversal breaks two things the forward
-    /// order guaranteed, and both are convergence bugs rather than cosmetics.
+    /// first thing undone — and it is *kept*: two writes to one map slot are
+    /// ordered by that reversal, and moving either past the other inverts which
+    /// of them the slot ends up holding. A container a step needs is re-created
+    /// on demand instead (see [`replay`](Self::replay)).
     ///
-    /// A step that *removes* a container subsumes every step targeting inside it:
-    /// the container is retained by id with its content intact, so removing it
-    /// alone restores more than tearing its content down first would, and the
-    /// teardown would leave the mirror an empty shell to snapshot — a redo that
-    /// loses everything the intention put inside the container. Only a container
-    /// no *other* step puts back counts: an intention that drops a slot and
-    /// re-creates it holds both, and subsuming against the drop would discard the
-    /// edits the re-create is about to make reachable again.
-    ///
-    /// A step that *re-installs* a container must land before the steps that
-    /// mutate it. An op on an unreachable target is applied inertly here but
-    /// *buffered* by a peer and replayed once the container returns, so an
-    /// installer left behind its dependents diverges the two replicas. That hoist
-    /// is allowed only where the installer is its slot's sole writer: two writes
-    /// to one slot are ordered by the reversal, and moving one past the other
-    /// inverts which of them the slot ends up holding.
+    /// The one thing dropped is a step addressing inside a container another
+    /// step *terminally removes* — a slot emptied by a delete, or a sequence node
+    /// tombstoned. Those leave the tree whole and come back whole, so tearing
+    /// their interior down first is not merely redundant: it would leave the
+    /// mirror an empty shell to snapshot, and the redo would lose everything the
+    /// intention put inside. A *displacement* is not a removal — the container is
+    /// retained holding what the intention put there, and anything that
+    /// re-installs the slot exposes it — so those steps still run. Nor is a
+    /// removal a removal when another step puts the container back.
     fn plan(&self, steps: Vec<Inverse>) -> Vec<Inverse> {
         let steps: Vec<Inverse> = steps.into_iter().rev().collect();
         let restored: Vec<ElementId> = steps.iter().filter_map(|s| self.installs(s)).collect();
@@ -3503,100 +3556,37 @@ impl Document {
             .filter_map(|s| self.removes(s))
             .filter(|id| !restored.contains(id))
             .collect();
-        let kept: Vec<Inverse> = steps
+        steps
             .into_iter()
             .filter(|s| !self.under_any(self.step_target(s), &removed))
-            .collect();
-
-        // How many kept steps write each map slot, so an installer that shares
-        // its slot is left where the reversal put it.
-        let mut writers: HashMap<(ElementId, Vec<u8>), usize> = HashMap::new();
-        for step in &kept {
-            if let Some(slot) = self.slot_of(step) {
-                *writers.entry(slot).or_default() += 1;
-            }
-        }
-        // Depth-first over the installer edges, so an installer is emitted ahead
-        // of every step that needs it. `open` breaks the cycle a pathological
-        // pair would otherwise form.
-        let installs: HashMap<ElementId, usize> = kept
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                self.slot_of(s)
-                    .is_some_and(|slot| writers.get(&slot) == Some(&1))
-            })
-            .filter_map(|(i, s)| self.installs(s).map(|id| (id, i)))
-            .collect();
-        let mut order = Vec::with_capacity(kept.len());
-        let mut placed = vec![false; kept.len()];
-        let mut open = vec![false; kept.len()];
-        for i in 0..kept.len() {
-            self.place(i, &kept, &installs, &mut placed, &mut open, &mut order);
-        }
-
-        let mut planned: Vec<Option<Inverse>> = kept.into_iter().map(Some).collect();
-        order
-            .into_iter()
-            .filter_map(|i| planned[i].take())
             .collect()
     }
 
-    /// Emit `i` after whichever step installs the container it targets.
-    fn place(
-        &self,
-        i: usize,
-        steps: &[Inverse],
-        installs: &HashMap<ElementId, usize>,
-        placed: &mut [bool],
-        open: &mut [bool],
-        order: &mut Vec<usize>,
+    /// Re-create the containers `target` sits under, outermost first, from the
+    /// restoring ops this intention already holds. Inert when it holds none — the
+    /// step is then dropped rather than emitted onto nothing.
+    fn reinstate(
+        &mut self,
+        target: ElementId,
+        installers: &HashMap<ElementId, (ElementId, OpKind)>,
     ) {
-        if placed[i] || open[i] {
-            return;
-        }
-        open[i] = true;
-        let mut needed = Some(self.step_target(&steps[i]));
-        // Walk up: the target may sit several containers below the one a step
-        // re-installs. Bounded like `under_any`, so a corrupt parent link stops
-        // the walk instead of spinning.
+        let mut chain: Vec<(ElementId, OpKind)> = Vec::new();
+        let mut cur = Some(target);
+        // Bounded like the other parent walks, so a corrupt link stops the walk
+        // rather than spinning.
         for _ in 0..=self.parents.len() {
-            let Some(id) = needed else { break };
-            if let Some(&j) = installs.get(&id) {
-                if j != i {
-                    self.place(j, steps, installs, placed, open, order);
-                }
+            let Some(id) = cur else { break };
+            if let Some((at, kind)) = installers.get(&id) {
+                chain.push((*at, kind.clone()));
+            }
+            if id == self.root_id() {
                 break;
             }
-            needed = (id != self.root_id())
-                .then(|| self.parents.get(&id).copied())
-                .flatten();
+            cur = self.parents.get(&id).copied();
         }
-        open[i] = false;
-        placed[i] = true;
-        order.push(i);
-    }
-
-    /// The map slot a step writes, if it writes one — the unit whose LWW order
-    /// the reversal fixes and a reorder would invert.
-    fn slot_of(&self, step: &Inverse) -> Option<(ElementId, Vec<u8>)> {
-        let Inverse::Op { target, kind } = step else {
-            return None;
-        };
-        let key = match kind {
-            OpKind::RegisterSet { key, .. }
-            | OpKind::MapSet { key, .. }
-            | OpKind::MapDelete { key }
-            | OpKind::MapCreate { key }
-            | OpKind::ListCreate { key }
-            | OpKind::TextCreate { key }
-            | OpKind::XmlElementCreate { key, .. }
-            | OpKind::XmlFragmentCreate { key }
-            | OpKind::CounterInc { key, .. }
-            | OpKind::CounterDec { key, .. } => key,
-            _ => return None,
-        };
-        Some((*target, key.clone()))
+        for (at, kind) in chain.into_iter().rev() {
+            self.emit(at, kind);
+        }
     }
 
     /// The element a step addresses.
@@ -3605,6 +3595,7 @@ impl Document {
             Inverse::Op { target, .. } => *target,
             Inverse::ReviveItem { list, .. } | Inverse::ReviveNode { list, .. } => *list,
             Inverse::ReviveRun { text, .. } => *text,
+            Inverse::Regrant { target, .. } => *target,
             // An annotation hangs off the document, which is always reachable.
             Inverse::Ranged { .. } => self.root_id(),
         }
@@ -3633,35 +3624,31 @@ impl Document {
         Some(ElementId::derive(*target, key, kind))
     }
 
-    /// The container a step takes out of its slot or sequence, if any — the one
-    /// whose subtree the step therefore subsumes. The container is retained by
-    /// id with its content, so removing it restores strictly more than tearing
-    /// its content down first, and the teardown would leave a redo nothing to
-    /// bring back.
+    /// The container a step puts permanently out of reach, if any — the one
+    /// whose subtree the step therefore subsumes.
+    ///
+    /// Only a tombstoned **sequence node** qualifies. A delete there is terminal:
+    /// the move fold hides every placement of a deleted node, so nothing can ever
+    /// render it again, and its containers — retained by id like all of them —
+    /// become unreachable for good. Undoing the node's contents before deleting
+    /// it would therefore lose them outright, since the revival's snapshot is
+    /// taken from what is left.
+    ///
+    /// A **map slot** is not terminal, however it is vacated: emptied by a
+    /// delete or taken by another value, the container is retained holding what
+    /// the intention put in it, and the next thing to install that slot brings it
+    /// back — exposing exactly the edits a subsumption would have discarded. So
+    /// those steps always run.
     fn removes(&self, step: &Inverse) -> Option<ElementId> {
-        let Inverse::Op { target, kind } = step else {
+        let Inverse::Op {
+            target,
+            kind: OpKind::ListDelete { id },
+        } = step
+        else {
             return None;
         };
-        let held = match kind {
-            OpKind::MapDelete { key }
-            | OpKind::MapSet { key, .. }
-            | OpKind::RegisterSet { key, .. }
-            | OpKind::MapCreate { key }
-            | OpKind::ListCreate { key }
-            | OpKind::TextCreate { key }
-            | OpKind::XmlElementCreate { key, .. }
-            | OpKind::XmlFragmentCreate { key }
-            | OpKind::CounterInc { key, .. }
-            | OpKind::CounterDec { key, .. } => self.maps.get(target)?.borrow().get(key),
-            OpKind::ListDelete { id } => self.lists.get(target)?.borrow().node_value(*id),
-            _ => return None,
-        }?;
-        if !held.is_container() {
-            return None;
-        }
-        // A step that re-installs the very element already in the slot displaces
-        // nothing.
-        (self.installs(step) != Some(held.id())).then(|| held.id())
+        let held = self.lists.get(target)?.borrow().node_value(*id)?;
+        held.is_container().then(|| held.id())
     }
 
     /// Whether `id` is one of `roots` or sits under one — so a step addressing it
@@ -3801,16 +3788,15 @@ impl Document {
             OpKind::AclGrant { .. } => at(target, OpKind::AclRevoke { id: acl_id(stamp) }),
             OpKind::AclRevoke { id } => {
                 let e = self.acl.get(id)?;
-                at(
+                Some(Inverse::Regrant {
                     target,
-                    OpKind::AclGrant {
-                        subject: e.subject.clone(),
-                        grant: e.grant.clone(),
-                        effect: e.effect,
-                        scope: e.scope.clone(),
-                        grantor: e.grantor,
-                    },
-                )
+                    subject: e.subject.clone(),
+                    grant: e.grant.clone(),
+                    effect: e.effect,
+                    scope: e.scope.clone(),
+                    grantor: e.grantor,
+                    was: *id,
+                })
             }
         }
     }
