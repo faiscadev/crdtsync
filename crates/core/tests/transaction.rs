@@ -511,11 +511,13 @@ fn with_buffer(empty_snapshot: &[u8], ops: &[Op]) -> Vec<u8> {
     out
 }
 
-/// A decode drains the buffer it just read, and a snapshot that arrives from a
-/// peer can hold more than one complete transaction at once. Which one commits
-/// first decides whether the other's members still resolve, so the choice has to
-/// come from the buffer, not from hash order — two replicas reading identical
-/// bytes must reach identical state.
+/// A decode drains the buffer it just read. An honest replica never serializes a
+/// complete transaction — it drains to a fixpoint before anything can encode it —
+/// so a buffer holding two is a shape only bytes this replica did not produce can
+/// take, which is exactly what arrives over the wire. Which group commits first
+/// decides whether the other's members still resolve, so the choice comes from
+/// the buffer, not from hash order: two replicas reading identical bytes reach
+/// identical state whatever those bytes hold.
 #[test]
 fn a_snapshot_holding_two_complete_transactions_decodes_the_same_way_every_time() {
     // One group installs a nested map and writes a slot in it; the other takes

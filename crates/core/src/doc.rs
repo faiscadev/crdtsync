@@ -1853,8 +1853,8 @@ impl Document {
         let buf_len = cur.u32()? as usize;
         let framed = cur.take(buf_len)?;
         let buffer = decode_ops(framed)?;
-        // A buffered op that is already applied, or repeated, would be replayed
-        // by `drain_buffer` (which applies unconditionally): reject both.
+        // A buffered op that is already applied, or repeated, would be replayed by
+        // `drain_buffer`, which dedups against neither: reject both.
         let mut buffered = HashSet::with_capacity(buffer.len().min(1024));
         for op in &buffer {
             if seen.contains(&op.id) || !buffered.insert(op.id) {
