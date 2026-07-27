@@ -282,8 +282,8 @@ impl Document {
 
     /// The ids of every op this replica has applied — the dedup set, so a
     /// reconstructing server can restore its own dedup from a decoded snapshot. In a
-    /// projection that withheld something it is instead what the *recipient*
-    /// published, one of several ways such a document is not a live replica.
+    /// projection that ran it is instead what the *recipient* published, one of
+    /// several ways such a document is not a live replica.
     pub fn seen(&self) -> impl Iterator<Item = OpId> + '_ {
         self.seen.iter().copied()
     }

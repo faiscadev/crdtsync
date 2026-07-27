@@ -593,39 +593,28 @@ fn a_restarted_reader_does_not_re_mint_on_a_second_channel() {
 }
 
 #[test]
-fn a_hello_after_a_subscribe_is_refused() {
-    // A transport-authenticated connection carries an identity without having
-    // declared a client id, so it may subscribe before Hello. Declaring one
-    // afterwards would hand a replica identity to a channel whose catch-up was
-    // already served — served, therefore, with the frontier of that identity's own
-    // ids scrubbed rather than kept.
+fn a_subscribe_before_a_hello_is_refused() {
+    // A transport-authenticated connection holds an identity without having declared
+    // a client id, so it reaches Subscribe having said nothing — and its catch-up
+    // would be projected for no recipient at all, its own published ids scrubbed out
+    // of a snapshot it can persist and later author from.
     let (mut r, _alice_doc, _alice) = acl_room();
     let conn = r.connect_authenticated(Identity::new(b"bob".to_vec()));
-    assert!(r.deliver(
-        conn,
-        Message::Subscribe {
-            channel: Channel(0),
-            room: ROOM.to_vec(),
-            branch: Vec::new(),
-            zone: Vec::new(),
-            last_seen_seq: 0,
-        }
-    ));
-    r.take_outbox(conn);
     assert!(
         !r.deliver(
             conn,
-            Message::Hello {
-                client: cid(2),
-                app_id: Vec::new(),
-                schema_version: 0,
-                codecs: Vec::new(),
+            Message::Subscribe {
+                channel: Channel(0),
+                room: ROOM.to_vec(),
+                branch: Vec::new(),
+                zone: Vec::new(),
+                last_seen_seq: 0,
             }
         ),
-        "a Hello naming an id for an already-bound channel was accepted",
+        "a channel was bound before its replica identity was declared",
     );
 
-    // The ordinary order is untouched: Hello, then Subscribe.
+    // Hello first, and the same fast-path connection subscribes as before.
     let ok = r.connect_authenticated(Identity::new(b"bob".to_vec()));
     assert!(r.deliver(
         ok,
@@ -646,4 +635,8 @@ fn a_hello_after_a_subscribe_is_refused() {
             last_seen_seq: 0,
         }
     ));
+    assert!(
+        !r.take_outbox(ok).is_empty(),
+        "the fast path still serves its catch-up once the id is declared",
+    );
 }
