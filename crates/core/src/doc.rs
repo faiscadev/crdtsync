@@ -4292,11 +4292,11 @@ fn ranged_id(stamp: Stamp) -> ElementId {
 /// dedup stably (a resumed catch-up re-derives the same shell) and never collide with a
 /// real authored op the reader also receives. The client is derived from the node under
 /// a fixed reveal namespace: deterministic and unique per node (so two revealed nodes
-/// never alias). It cannot equal a real op's id: a replica's identity is either the one
-/// its embedder chose or a [`for_channel`](ClientId::for_channel) derivation of it, and
-/// neither shares this namespace, so a collision would take a SHA-1 collision across
-/// different namespace-and-name inputs. `seq` is 0 — the derived client is a namespace
-/// of one.
+/// never alias). It cannot equal a real op's id: this derivation's *name* is a node id
+/// plus a kind tag, where the only other id-shaped derivation a replica performs
+/// ([`for_channel`](ClientId::for_channel)) names a four-byte channel number, so the two
+/// SHA-1 inputs cannot coincide whatever namespace an embedder happens to choose for its
+/// own id. `seq` is 0 — the derived client is a namespace of one.
 fn reveal_op_id(node: ElementId) -> OpId {
     let ns = ElementId::from_bytes(*b"crdtsync\0reveal\0");
     let derived = ElementId::derive(ns, &node.as_bytes(), ElementKind::XmlElement);

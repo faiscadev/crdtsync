@@ -239,25 +239,36 @@ fn two_channels_incrementing_one_counter_both_count() {
 /// stamp, so the two inserts become one node and an item vanishes anyway.
 #[test]
 fn distinct_op_ids_alone_do_not_save_two_inserts_that_share_a_stamp() {
-    // Two replicas under one identity, as the defect had them, holding the same
-    // list and standing at the same lamport.
-    let mut left = Document::new(cid(1));
-    let create = left.transact(|tx| {
+    // Two replicas under one identity, as the defect had them. The list is
+    // created elsewhere and folded into both, so neither spends a seq on it and
+    // both stand at seq 0 and the same lamport — exactly the position two
+    // freshly-subscribed channels of one session are in.
+    let mut origin = Document::new(cid(0xEE));
+    let create = origin.transact(|tx| {
         tx.list(b"xs");
     });
+    let mut left = Document::new(cid(1));
     let mut right = Document::new(cid(1));
     for op in &create {
+        left.apply(op);
         right.apply(op);
     }
+    assert_eq!(left.next_seq(), 0);
+    assert_eq!(right.next_seq(), 0);
 
     let from_left = left.transact(|tx| tx.list(b"xs").insert(0, Scalar::Int(1)));
     let mut from_right = right.transact(|tx| tx.list(b"xs").insert(0, Scalar::Int(2)));
+    assert_eq!(
+        from_left[0].id, from_right[0].id,
+        "one identity at seq 0 is one op id"
+    );
     assert_eq!(
         from_left[0].stamp, from_right[0].stamp,
         "one identity at one lamport is one stamp"
     );
 
-    // Repair only the envelope, as a channel-scoped seq would.
+    // Repair only the envelope, as a channel-scoped seq would: this assignment is
+    // the whole of the hypothetical fix.
     from_right[0].id.seq = 99;
     assert_ne!(from_left[0].id, from_right[0].id);
 
@@ -474,10 +485,11 @@ fn a_resent_batch_still_carries_its_channels_identity() {
     assert_ne!(replayed_a[0].id, replayed_b[0].id);
 }
 
-/// An `Accepted` names a channel and a per-author seq frontier. Two channels both
-/// minting from seq 0 make that frontier ambiguous across the session, so the
-/// prune has to be per channel: one channel's ack leaves the other's queue
-/// untouched.
+/// A pre-existing invariant this unit leans on rather than one it introduces:
+/// the outbox and its `Accepted` prune are keyed by channel, never by author. Two
+/// channels minting from seq 0 would otherwise make an ack frontier ambiguous
+/// across the session, so pin it here beside the identity split that relies on
+/// it. (Unchanged by this unit — it passes on `main` too.)
 #[test]
 fn an_ack_on_one_channel_leaves_the_others_outbox_queued() {
     let (mut session, a, b) = two_channels();

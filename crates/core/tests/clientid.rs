@@ -70,11 +70,6 @@ fn generate_timestamp_is_big_endian_prefix() {
 // --- per-channel replica identities ---
 
 #[test]
-fn for_channel_is_deterministic() {
-    assert_eq!(cid(1).for_channel(3), cid(1).for_channel(3));
-}
-
-#[test]
 fn for_channel_distinguishes_channels() {
     let ids: Vec<ClientId> = (0..64u32).map(|c| cid(1).for_channel(c)).collect();
     for (i, a) in ids.iter().enumerate() {
@@ -115,8 +110,10 @@ fn a_derived_channel_id_is_v5() {
     }
 }
 
-// The channel number feeds the derivation as its four big-endian bytes, so every
-// byte of it is distinguishing — not just the low one a narrower hash would see.
+// Every byte of the channel number is distinguishing, not just the low one a
+// narrower hash would see. Byte *order* is not pinned here — these inputs stay
+// pairwise distinct under either endianness; `the_derivation_is_a_fixed_wire_constant`
+// is what fixes that.
 #[test]
 fn for_channel_distinguishes_every_byte_of_the_channel_number() {
     let ids: Vec<ClientId> = [1u32, 1 << 8, 1 << 16, 1 << 24, u32::MAX, u32::MAX - 1]
