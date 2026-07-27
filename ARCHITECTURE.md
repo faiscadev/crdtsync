@@ -914,6 +914,22 @@ Recommended: ACK only after majority replication. Avoids losing acknowledged edi
 
 Leader dies → followers elect new leader → clients reconnect → resume from last_seen_seq.
 
+## Peer-Plane Authentication
+
+Node-to-node traffic — `Replicate`, `ReplicateSnapshot`, `Gossip`, `FollowerHeads`, `PingReq` — shares the data-plane listener with clients, and the engine handles it ahead of the client session so a member's link needs no room subscription. That makes the peer plane a **second ingest seam**, reaching the replica directly, past the identity reservation, the doc-ACL write tier, the schema tier, the cross-zone token gate and leadership alike. It is therefore authenticated in its own right.
+
+**The credential is a deployment-wide cluster secret**, presented once per link in a `PeerAuth` frame and required before any node-to-node frame is honored on that connection. Nothing else on those frames identifies a member: every node dials under the same reserved replica id, so the link's `Hello` distinguishes nobody, and a `FollowerHeads` names whichever node it pleases. On a connection that has not presented the secret, all five frames are the **client-plane protocol violation they look like** — answered with an error and closed — so the client data plane is structurally incapable of reaching a peer handler.
+
+**Fail-closed at configuration.** A node with a membership and no secret refuses to start, as does one whose secret is below a floor short enough to brute-force, and as does a single-node deployment given a secret it has no peer plane to use. There is no mode in which a clustered node comes up with an open peer plane. A rejected attempt is answered with nothing at all and the connection dropped, so a guess costs a fresh connection and whether a secret is configured at all is not observable. Where one is, the comparison is constant-time over the content, so a rejection leaks no prefix of it (its *length* is leaked by the length check, which for a random secret is not a secret).
+
+**Peer admission and client authentication are disjoint.** Holding the secret opens the node-to-node plane and confers no client rights — admission never sets a session identity, so a peer link is subject to exactly the handshake a client is; and completing Hello + Auth confers no peer rights.
+
+**Admission is one-directional, and that is the secret's sharpest edge.** A dialing node proves itself to the node it dials; the node it dials proves nothing back. So a node writes the cluster secret to whatever answers a member's advertise address, before anything establishes that the other end is a member — and an address is not hard to become: a port freed by a restart, a DNS or ARP win, or an address any already-admitted peer can inject into every node's member set through gossip. Whoever answers **harvests the secret**, and with it write access to every room on every node; it also acks whatever it likes, so a leader can believe a write is durably replicated when it is not. Making the peer handshake mutual, over a transport that authenticates the far end, is where this closes.
+
+**What the secret does not distinguish is members from each other.** It is one deployment-wide value, so every gate downstream of admission trusts any member equally: a forged leadership `epoch` still supersedes a leader, and a `FollowerHeads` still names whichever node it likes, so an admitted peer can raise another node's replication watermark and make majority-ack credit a write that was never replicated. Both are inside the cluster's trust boundary by construction — a genuinely promoted leader must be able to supersede — and closing them wants per-member identity and a real election, not a bigger shared credential.
+
+The secret is a **bearer** credential, so the peer link should carry it over an encrypted transport; mTLS (below) composes on top and can pin peers to a CA independently, but it is not the peer credential — it is optional by configuration, and an optional gate cannot be what closes an ingest seam. Likewise a separate peer listener remains a deployment choice (bind the advertise address on a private interface) rather than an engine mandate: relocating a port authenticates nobody, and the structural half of that benefit — a client plane that cannot carry peer frames — is already had by gating on the secret.
+
 ## Cluster Discovery
 
 Static join via CLI flag, or gossip-based for liveness / room ownership / replication state / membership.

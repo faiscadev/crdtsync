@@ -53,6 +53,7 @@ fn node(self_addr: Option<&str>) -> Registry {
     r.set_clock(Arc::new(ManualClock::new(0)));
     if let Some(addr) = self_addr {
         r.set_membership(membership_for(addr));
+        r.set_cluster_secret(CLUSTER_SECRET.to_vec());
     }
     r
 }
@@ -143,6 +144,26 @@ fn catch_up_frame(leader: &mut Registry, follower: &NodeId) -> Message {
     to_follower.pop().unwrap()
 }
 
+/// The cluster secret these nodes share — what admits a node-to-node link to a
+/// peer's replication plane. A connection that has not presented it reaches none
+/// of the node-to-node handlers (C10).
+const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
+
+/// A connection admitted to `r`'s peer plane, as a member's dialed link is.
+fn peer_conn(r: &mut Registry) -> ConnId {
+    let id = r.connect();
+    assert!(
+        r.deliver(
+            id,
+            Message::PeerAuth {
+                secret: CLUSTER_SECRET.to_vec(),
+            },
+        ),
+        "the cluster secret admits a peer",
+    );
+    id
+}
+
 // --- a brand-new follower below the floor is caught up via a snapshot ---
 
 #[test]
@@ -172,7 +193,7 @@ fn a_below_floor_follower_is_caught_up_by_a_snapshot() {
 
     // Applied to a fresh follower, it converges to the leader's state and sequence.
     let mut follower = node(Some(B));
-    let peer = follower.connect();
+    let peer = peer_conn(&mut follower);
     assert!(follower.deliver(peer, frame));
     assert_eq!(
         follower.hub().seq(&room),
@@ -205,7 +226,7 @@ fn snapshot_then_steady_tail_converges() {
     leader.catch_up_follower(&b);
     let snap = catch_up_frame(&mut leader, &b);
     let mut follower = node(Some(B));
-    let peer = follower.connect();
+    let peer = peer_conn(&mut follower);
     assert!(follower.deliver(peer, snap));
     follower.take_outbox(peer);
 
@@ -268,7 +289,7 @@ fn a_watermark_below_a_later_floor_gets_the_snapshot() {
         "a watermark below the floor is served a snapshot, not an ops tail"
     );
     let mut follower = node(Some(B));
-    let peer = follower.connect();
+    let peer = peer_conn(&mut follower);
     assert!(follower.deliver(peer, frame));
     assert_eq!(
         follower.hub().export_room(&room),
@@ -328,7 +349,7 @@ fn a_resent_snapshot_is_idempotent() {
     let frame = catch_up_frame(&mut leader, &b);
 
     let mut follower = node(Some(B));
-    let peer = follower.connect();
+    let peer = peer_conn(&mut follower);
     // Deliver the same snapshot twice: the second decode replaces the state, landing
     // at the same sequence and the same converged bytes.
     assert!(follower.deliver(peer, frame.clone()));
@@ -378,7 +399,7 @@ fn a_below_floor_follower_is_not_left_stale() {
         follower.hub().export_room(&room).is_none(),
         "the follower holds nothing before catch-up"
     );
-    let peer = follower.connect();
+    let peer = peer_conn(&mut follower);
     assert!(follower.deliver(peer, frame));
     assert_eq!(
         follower.hub().export_room(&room),
@@ -393,7 +414,7 @@ fn a_below_floor_follower_is_not_left_stale() {
 fn a_stale_epoch_snapshot_is_fenced() {
     let room = room_led_by_a_with_b_follower();
     let mut follower = node(Some(B));
-    let peer = follower.connect();
+    let peer = peer_conn(&mut follower);
 
     // The follower has seen epoch 5 (a live leader's frame at that epoch).
     let mut w = doc(7);

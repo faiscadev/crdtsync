@@ -532,6 +532,19 @@ pub enum Message {
     /// node — never a client frame; a client that sends one commits a protocol
     /// violation.
     PingAck { reachable: bool },
+    /// A node's proof that it belongs to this cluster, opening the peer plane on
+    /// the connection it is sent on. The dialing node sends it once, after the
+    /// peer link's `Hello`, carrying the deployment's cluster secret; the accepting
+    /// node honors the node-to-node frames — [`Replicate`](Message::Replicate),
+    /// [`ReplicateSnapshot`](Message::ReplicateSnapshot),
+    /// [`Gossip`](Message::Gossip), [`FollowerHeads`](Message::FollowerHeads),
+    /// [`PingReq`](Message::PingReq) — only on a connection that presented it, and
+    /// treats each of them on any other connection as a protocol violation. The
+    /// link's `Hello` is codec and version negotiation, never identity: every node
+    /// dials under the same reserved replica id, so the secret is what distinguishes
+    /// a member from anyone else who can reach the port. Node-to-node — never a
+    /// client frame.
+    PeerAuth { secret: Vec<u8> },
 }
 
 /// Encode the 8-byte connection header: [`MAGIC`] then the version.
@@ -936,6 +949,10 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u8(&mut out, 48);
             put_u8(&mut out, u8::from(*reachable));
         }
+        Message::PeerAuth { secret } => {
+            put_u8(&mut out, 52);
+            put_bytes(&mut out, secret);
+        }
     }
     out
 }
@@ -1329,6 +1346,9 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
         },
         48 => Message::PingAck {
             reachable: cur.u8()? != 0,
+        },
+        52 => Message::PeerAuth {
+            secret: cur.bytes()?,
         },
         tag => {
             return Err(ProtocolError::BadTag {

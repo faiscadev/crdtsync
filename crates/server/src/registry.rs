@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crdtsync_core::schema::Trigger;
 use crdtsync_core::{ClientId, ElementId, ErrorCode, MemberState, Message, Op, OpKind, Schema};
+use subtle::ConstantTimeEq;
 
 use crate::acl::authorized;
 use crate::auth::{AllowAll, Identity, Verifier};
@@ -44,6 +45,12 @@ pub struct ConnId(u64);
 struct Conn {
     session: Session,
     outbox: Vec<Message>,
+    /// Whether this connection has presented the cluster secret, admitting it to
+    /// the peer plane. False for every connection until a
+    /// [`Message::PeerAuth`] carrying the configured secret arrives, so an
+    /// ordinary client — and any socket that has said nothing at all — reaches
+    /// none of the node-to-node handlers.
+    peer: bool,
 }
 
 /// A client write-ack withheld pending majority replication. The leader owes the
@@ -103,6 +110,12 @@ pub struct Registry {
     /// single-node mode: every room is served locally. Held for the routing and
     /// replication layers to consult; this layer does not yet route on it.
     membership: Option<Membership>,
+    /// The deployment's cluster secret — what a node presents to open the peer
+    /// plane on a connection ([`Message::PeerAuth`]). `None` (the default) admits
+    /// no peer at all, so every node-to-node frame is refused as the client-plane
+    /// protocol violation it is; a clustered deployment configures one or it does
+    /// not replicate.
+    cluster_secret: Option<Vec<u8>>,
     /// Leader-to-follower replication state: frames queued for each follower and
     /// the acknowledged per-`(room, follower)` watermark. Inert in single-node
     /// mode — a node with no membership never leads a room, so it never
@@ -177,6 +190,7 @@ impl Registry {
             auto_version,
             schedule_fires: HashMap::new(),
             membership: None,
+            cluster_secret: None,
             replication: Replication::default(),
             epochs,
             pending_acks: Vec::new(),
@@ -242,6 +256,20 @@ impl Registry {
     /// (Unit 3) and replication (Unit 4) read placement through this.
     pub fn membership(&self) -> Option<&Membership> {
         self.membership.as_ref()
+    }
+
+    /// Hold the deployment's cluster secret — the credential a peer presents to
+    /// open the peer plane on its connection. Unset (the default) leaves the peer
+    /// plane closed to every connection: a node-to-node frame is then refused as
+    /// the client-plane protocol violation it is, so a clustered node without a
+    /// secret does not replicate rather than replicating for anyone. An empty
+    /// secret configures none for the same reason — it would be matched by a
+    /// `PeerAuth` carrying no secret at all — so passing one disarms a plane
+    /// already armed. This is the mechanism; how long a secret must be, and that a
+    /// clustered node must have one at all, is [`ServeConfig`](crate::runtime::ServeConfig)'s
+    /// policy, enforced before a deployment starts.
+    pub fn set_cluster_secret(&mut self, secret: Vec<u8>) {
+        self.cluster_secret = (!secret.is_empty()).then_some(secret);
     }
 
     /// Record a peer's reachability, the failover liveness signal (Unit 6a): its
@@ -474,6 +502,39 @@ impl Registry {
         let epoch = self.epochs.claim_leadership(room);
         self.persist_epoch_if_advanced(room, before);
         epoch
+    }
+
+    /// Admit connection `id` to the peer plane if `presented` is this deployment's
+    /// cluster secret. This is the whole of a node's peer authentication: the frames
+    /// a member sends carry no identity a stranger could not also assert — every node
+    /// dials under the same reserved replica id, and a `FollowerHeads` simply names
+    /// whichever node it likes — so possession of the secret is what separates a
+    /// member from anyone else who can reach the port.
+    ///
+    /// Fail-closed and silent. A node with no configured secret has no peer plane to
+    /// open, so it refuses; so does any mismatch. Either way the connection is dropped
+    /// with no reply — which is what hides whether a secret is configured at all, since
+    /// the unconfigured case returns before comparing anything. Where a secret *is*
+    /// configured the comparison is constant-time over the content, so a rejection
+    /// leaks no prefix of it. Returns whether the connection stays open.
+    fn authenticate_peer(&mut self, id: ConnId, presented: &[u8]) -> bool {
+        let Some(expected) = &self.cluster_secret else {
+            return false;
+        };
+        if !bool::from(expected.as_slice().ct_eq(presented)) {
+            return false;
+        }
+        let Some(conn) = self.conns.get_mut(&id) else {
+            return false;
+        };
+        conn.peer = true;
+        true
+    }
+
+    /// Whether connection `id` has presented the cluster secret — the gate every
+    /// node-to-node frame passes before it reaches a peer handler.
+    fn is_peer(&self, id: ConnId) -> bool {
+        self.conns.get(&id).is_some_and(|conn| conn.peer)
     }
 
     /// The shared membership + leadership-epoch fence for a node-to-node replication
@@ -879,6 +940,7 @@ impl Registry {
             Conn {
                 session,
                 outbox: Vec::new(),
+                peer: false,
             },
         );
         self.hub.emit(EngineEvent::Connected { conn: id });
@@ -1566,40 +1628,54 @@ impl Registry {
     /// replies and fanning any broadcast out to the room's other connections.
     /// Returns whether the connection should stay open.
     pub fn deliver(&mut self, id: ConnId, msg: Message) -> bool {
+        // The cluster secret admits this connection to the peer plane. Handled
+        // ahead of everything else and never answered: a wrong or unconfigured
+        // secret drops the connection with no reply, so a guess costs a fresh
+        // connection and learns nothing from what comes back.
+        if let Message::PeerAuth { secret } = &msg {
+            return self.authenticate_peer(id, secret);
+        }
         // A Replicate or a Gossip arrives node-to-node on a peer connection, not
         // from a client on its data plane — intercept each before the client
-        // session step (which treats both as a violation) and handle it as a peer.
-        let msg = match msg {
-            Message::Replicate {
-                room,
-                branch,
-                ops,
-                base_seq,
-                epoch,
-            } => return self.apply_replicate(id, room, branch, ops, base_seq, epoch),
-            Message::ReplicateSnapshot {
-                room,
-                branch,
-                seq,
-                state,
-                epoch,
-            } => return self.apply_replicate_snapshot(id, room, branch, seq, state, epoch),
-            Message::Gossip { members } => return self.apply_gossip(id, members),
-            // A follower's durable-head report arrives node-to-node on a peer
-            // connection; catch it up from the reported heads off the client session
-            // path. Self-describing (it names the reporting node), so no connection
-            // identity is needed — handled exactly as a Gossip.
-            Message::FollowerHeads { reporter, heads } => {
-                return self.apply_follower_heads(reporter, heads)
+        // session step and handle it as a peer, but only on a connection that has
+        // presented the cluster secret. On any other connection they fall through
+        // to the session step, which answers each with the protocol violation it
+        // is: the node-to-node handlers are unreachable from the client plane.
+        let msg = if self.is_peer(id) {
+            match msg {
+                Message::Replicate {
+                    room,
+                    branch,
+                    ops,
+                    base_seq,
+                    epoch,
+                } => return self.apply_replicate(id, room, branch, ops, base_seq, epoch),
+                Message::ReplicateSnapshot {
+                    room,
+                    branch,
+                    seq,
+                    state,
+                    epoch,
+                } => return self.apply_replicate_snapshot(id, room, branch, seq, state, epoch),
+                Message::Gossip { members } => return self.apply_gossip(id, members),
+                // A follower's durable-head report arrives node-to-node on a peer
+                // connection; catch it up from the reported heads off the client session
+                // path. Self-describing (it names the reporting node), so no connection
+                // identity beyond peer admission is needed — handled exactly as a Gossip.
+                Message::FollowerHeads { reporter, heads } => {
+                    return self.apply_follower_heads(reporter, heads)
+                }
+                // A ping-req arrives node-to-node on a peer connection asking this relay
+                // for its liveness view of a third member; answer it off the client
+                // session path. A ping-ack is only ever read inline by the requester that
+                // sent the ping-req (never delivered), so one reaching here is unsolicited
+                // — drop the connection.
+                Message::PingReq { target } => return self.apply_ping_req(id, target),
+                Message::PingAck { .. } => return false,
+                other => other,
             }
-            // A ping-req arrives node-to-node on a peer connection asking this relay
-            // for its liveness view of a third member; answer it off the client
-            // session path. A ping-ack is only ever read inline by the requester that
-            // sent the ping-req (never delivered), so one reaching here is unsolicited
-            // — drop the connection.
-            Message::PingReq { target } => return self.apply_ping_req(id, target),
-            Message::PingAck { .. } => return false,
-            other => other,
+        } else {
+            msg
         };
         // An awareness set consults the clock (to stamp last-seen); a cross-zone
         // token request stamps the token's expiry and its redemption checks that

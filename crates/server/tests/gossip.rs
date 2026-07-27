@@ -23,7 +23,7 @@ use crdtsync_core::{ClientId, MemberState, Message};
 use crdtsync_server::gossip::{exchange, gossip_exchange, gossip_frame, merge_into};
 use crdtsync_server::membership::{Membership, DEAD_AFTER_FAILURES, SUSPECT_AFTER_FAILURES};
 use crdtsync_server::placement::NodeId;
-use crdtsync_server::{ManualClock, Registry};
+use crdtsync_server::{ConnId, ManualClock, Registry};
 
 const N: usize = 3;
 const A: &str = "10.0.0.1:9000";
@@ -98,6 +98,26 @@ fn tuple(
     state: MemberState,
 ) -> (NodeId, Vec<u8>, u64, MemberState) {
     (node.clone(), addr.as_bytes().to_vec(), inc, state)
+}
+
+/// The cluster secret these nodes share — what admits a node-to-node link to a
+/// peer's replication plane. A connection that has not presented it reaches none
+/// of the node-to-node handlers (C10).
+const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
+
+/// A connection admitted to `r`'s peer plane, as a member's dialed link is.
+fn peer_conn(r: &mut Registry) -> ConnId {
+    let id = r.connect();
+    assert!(
+        r.deliver(
+            id,
+            Message::PeerAuth {
+                secret: CLUSTER_SECRET.to_vec(),
+            },
+        ),
+        "the cluster secret admits a peer",
+    );
+    id
 }
 
 // --- (a) convergence: a seed-only node learns the whole cluster ---
@@ -279,6 +299,9 @@ fn a_batch_add_unions_every_new_member_at_once() {
 fn a_single_node_registry_knows_no_members_and_ignores_gossip() {
     let mut r = Registry::new(cid(0xFF));
     r.set_clock(Arc::new(ManualClock::new(0)));
+    // A secret with no membership: the peer plane opens, so the Gossip below is
+    // refused by the cluster gate rather than for want of admission.
+    r.set_cluster_secret(CLUSTER_SECRET.to_vec());
     assert!(r.membership().is_none());
     assert!(r.known_members().is_empty(), "no members to advertise");
 
@@ -293,7 +316,7 @@ fn a_single_node_registry_knows_no_members_and_ignores_gossip() {
     assert!(r.membership().is_none());
 
     // A stray Gossip frame on a single-node node drops the connection.
-    let peer = r.connect();
+    let peer = peer_conn(&mut r);
     let kept = r.deliver(
         peer,
         Message::Gossip {
@@ -705,6 +728,7 @@ async fn a_gossip_exchange_over_the_socket_merges_and_replies() {
     let addr = listener.local_addr().unwrap().to_string();
     let config = ServeConfig {
         membership: Some(m),
+        cluster_secret: Some(CLUSTER_SECRET.to_vec()),
         ..ServeConfig::default()
     };
     let server = tokio::spawn(serve_with(listener, cid(0xFF), None, config));
@@ -718,7 +742,7 @@ async fn a_gossip_exchange_over_the_socket_merges_and_replies() {
             MemberState::Alive,
         )],
     };
-    let learned = gossip_exchange(&addr, cid(0xEE), frame)
+    let learned = gossip_exchange(&addr, cid(0xEE), CLUSTER_SECRET, frame)
         .await
         .expect("the node replies with its member set");
 

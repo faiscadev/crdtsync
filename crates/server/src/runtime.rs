@@ -71,6 +71,14 @@ const PEER_REDIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(
 /// a spawned task and socket indefinitely.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The shortest cluster secret a clustered node will start with. The secret is
+/// the only thing separating a cluster member from anyone who can reach the peer
+/// port, and a rejected guess costs an attacker nothing but a reconnect, so a
+/// short one is brute-forceable rather than merely weak. Thirty-two bytes matches
+/// the zone-master key's discipline; `openssl rand -hex 32` clears it comfortably,
+/// emitting 64 characters for 32 bytes of entropy.
+pub const MIN_CLUSTER_SECRET_LEN: usize = 32;
+
 /// Runtime policy: how the ephemeral-awareness sweep runs (how long a
 /// disconnected client's presence lingers, and how often the sweep checks), and
 /// whether a connection with no credential is admitted anonymously. The defaults
@@ -97,6 +105,14 @@ pub struct ServeConfig {
     /// node holds its member view; routing on it is Unit 3, so a set membership
     /// changes nothing here yet.
     pub membership: Option<Membership>,
+    /// The deployment's cluster secret — the credential every node in the cluster
+    /// holds and presents to open the peer plane on a link it dials. Required
+    /// whenever `membership` is set, and at least
+    /// [`MIN_CLUSTER_SECRET_LEN`] bytes: it is the whole of a node's peer
+    /// authentication, so a missing or guessable one is a startup error rather
+    /// than a cluster that replicates for anyone who can reach the port. `None`
+    /// (the default) belongs with single-node mode, which has no peer plane.
+    pub cluster_secret: Option<Vec<u8>>,
     /// TLS termination for the listener. `Some` wraps every accepted socket in a
     /// rustls session, so the wire protocol runs over an encrypted stream;
     /// `None` (the default) binds plaintext, unchanged. Build it with
@@ -124,6 +140,7 @@ impl Default for ServeConfig {
             schema: Arc::default(),
             webhook: None,
             membership: None,
+            cluster_secret: None,
             tls: None,
             zone_key: None,
             audit_log: None,
@@ -321,6 +338,11 @@ async fn start_registry(
     verifier: Box<dyn Verifier + Send + Sync>,
     authorizer: Box<dyn Authorizer + Send + Sync>,
 ) -> std::io::Result<(UnboundedSender<Cmd>, Option<TlsAcceptor>)> {
+    // A clustered node's peer plane is opened by the cluster secret alone, so a
+    // membership without one would be a node that either replicates for anyone or
+    // not at all. Checked first, ahead of the log replay and the accept loop, so a
+    // misconfigured cluster fails immediately rather than after a long startup.
+    let peer_secret = cluster_secret(&config)?;
     // The read is blocking, so it runs on the blocking pool to keep the runtime
     // free for other tasks.
     let (rooms, store) = match store {
@@ -346,13 +368,14 @@ async fn start_registry(
     // channel the registry actor routes replication to, and reads the follower's
     // acks back into the actor as `Cmd::PeerAck`. Single-node (no membership) opens
     // no peer connections, so a plain deployment is unchanged.
-    let peer_conns = spawn_peers(server, config.membership.as_ref(), &cmds);
+    let cluster = config.membership.as_ref().zip(peer_secret.as_ref());
+    let peer_conns = spawn_peers(server, cluster, &cmds);
     // Run the anti-entropy gossip loop here, on this I/O-enabled runtime, behind the
     // same cluster gate as replication: it periodically gossips this node's member
     // set with a random peer and unions back what the peer knows, so a node that
     // booted knowing only a seed converges on the full cluster. Single-node (no
     // membership) spawns no gossip task.
-    spawn_gossip(server, config.membership.as_ref(), &cmds);
+    spawn_gossip(server, cluster, &cmds);
     // Wrap each accepted socket in a rustls session when TLS is configured, so the
     // wire protocol runs over an encrypted stream; without it the accept loop
     // hands the raw TcpStream straight to `handle`, unchanged. Built before the
@@ -525,6 +548,12 @@ async fn registry_actor(
     reg.set_grace_millis(config.grace.as_millis() as u64);
     if let Some(membership) = config.membership.clone() {
         reg.set_membership(membership);
+    }
+    // Startup validated that a membership carries a secret, so this arms the peer
+    // plane exactly when the node is clustered; a single-node registry keeps it
+    // closed and refuses every node-to-node frame.
+    if let Some(secret) = config.cluster_secret.clone() {
+        reg.set_cluster_secret(secret);
     }
     if let Some(webhook) = webhook {
         reg.add_event_sink(Box::new(webhook));
@@ -708,18 +737,46 @@ fn dispatch_replication(reg: &mut Registry, peer_conns: &HashMap<NodeId, Sender<
     }
 }
 
+/// The node's cluster secret, validated against its membership. A clustered node
+/// must hold one — it is the whole of its peer authentication — and it must be at
+/// least [`MIN_CLUSTER_SECRET_LEN`] bytes, so a misconfiguration is a clean startup
+/// error rather than a node that replicates for anyone who reaches the port. A
+/// single-node deployment has no peer plane and takes none; a secret configured
+/// without a membership is the same misconfiguration read the other way and is
+/// refused too, so the pair is always consistent by the time anything dials.
+fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
+    match (&config.membership, &config.cluster_secret) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(invalid(
+            "a cluster secret needs a cluster membership: single-node mode has no peer plane"
+                .to_string(),
+        )),
+        (Some(_), None) => Err(invalid(
+            "cluster membership needs a cluster secret: without one the node's peer plane is \
+             closed and it cannot replicate"
+                .to_string(),
+        )),
+        (Some(_), Some(secret)) if secret.len() < MIN_CLUSTER_SECRET_LEN => Err(invalid(format!(
+            "a cluster secret must be at least {MIN_CLUSTER_SECRET_LEN} bytes"
+        ))),
+        (Some(_), Some(secret)) => Ok(Some(Arc::from(secret.as_slice()))),
+    }
+}
+
 /// Open an outbound peer connection to every cluster member other than self,
 /// returning the frame channel for each. Each spawned task owns the socket to one
-/// follower: it dials, redials on drop, sends the replication frames the registry
-/// routes to it, and reads that follower's acks back into the registry. With no
-/// membership the map is empty — a single-node deployment dials no peers.
+/// follower: it dials, presents the cluster secret, redials on drop, sends the
+/// replication frames the registry routes to it, and reads that follower's acks
+/// back into the registry. Outside a cluster the map is empty — a single-node
+/// deployment dials no peers.
 fn spawn_peers(
     server: ClientId,
-    membership: Option<&Membership>,
+    cluster: Option<(&Membership, &Arc<[u8]>)>,
     cmds: &UnboundedSender<Cmd>,
 ) -> HashMap<NodeId, Sender<Message>> {
     let mut peer_conns = HashMap::new();
-    let Some(membership) = membership else {
+    let Some((membership, secret)) = cluster else {
         return peer_conns;
     };
     for member in membership.members() {
@@ -730,6 +787,7 @@ fn spawn_peers(
         let (tx, rx) = channel::<Message>(PEER_FRAME_CAPACITY);
         tokio::spawn(peer_connection(
             server,
+            secret.clone(),
             member.clone(),
             addr,
             rx,
@@ -745,12 +803,16 @@ fn spawn_peers(
 /// gossip. The loop drives anti-entropy against the registry over the command
 /// channel — reading the current member set out and unioning learned members
 /// back in.
-fn spawn_gossip(server: ClientId, membership: Option<&Membership>, cmds: &UnboundedSender<Cmd>) {
-    let Some(membership) = membership else {
+fn spawn_gossip(
+    server: ClientId,
+    cluster: Option<(&Membership, &Arc<[u8]>)>,
+    cmds: &UnboundedSender<Cmd>,
+) {
+    let Some((membership, secret)) = cluster else {
         return;
     };
     let self_id = membership.self_id().clone();
-    tokio::spawn(gossip_loop(server, self_id, cmds.clone()));
+    tokio::spawn(gossip_loop(server, secret.clone(), self_id, cmds.clone()));
 }
 
 /// The anti-entropy gossip round loop: each tick, snapshot this node's known
@@ -758,7 +820,12 @@ fn spawn_gossip(server: ClientId, membership: Option<&Membership>, cmds: &Unboun
 /// and feed what the peer advertised back into the registry. A dead or slow peer
 /// is abandoned for the round and retried next tick. The loop ends when the
 /// command channel closes (the registry shut down).
-async fn gossip_loop(server: ClientId, self_id: NodeId, cmds: UnboundedSender<Cmd>) {
+async fn gossip_loop(
+    server: ClientId,
+    secret: Arc<[u8]>,
+    self_id: NodeId,
+    cmds: UnboundedSender<Cmd>,
+) {
     let mut ticker = tokio::time::interval(crate::gossip::GOSSIP_INTERVAL);
     // A round can block on a slow peer up to the gossip timeout; delay the next
     // tick past that rather than firing a catch-up burst of rounds (the default
@@ -783,7 +850,7 @@ async fn gossip_loop(server: ClientId, self_id: NodeId, cmds: UnboundedSender<Cm
         let frame = crate::gossip::gossip_frame(&members);
         // A successful direct round is first-hand proof the peer is alive and
         // carries the liveness it advertised back.
-        let direct = crate::gossip::gossip_exchange(&addr, server, frame).await;
+        let direct = crate::gossip::gossip_exchange(&addr, server, &secret, frame).await;
         // On a direct failure, ask a few other members for a second opinion (SWIM
         // ping-req) before counting the failure toward suspicion: a peer any relay
         // still reaches is not falsely suspected. The direct and indirect signals
@@ -791,7 +858,7 @@ async fn gossip_loop(server: ClientId, self_id: NodeId, cmds: UnboundedSender<Cm
         let indirect = if direct.is_some() {
             Vec::new()
         } else {
-            indirect_probe(server, &members, &self_id, &peer, &peer_addr).await
+            indirect_probe(server, &secret, &members, &self_id, &peer, &peer_addr).await
         };
         let reachable = crate::gossip::probe_outcome(direct.is_some(), &indirect);
         // A direct success carries the liveness the peer advertised back; an
@@ -817,6 +884,7 @@ async fn gossip_loop(server: ClientId, self_id: NodeId, cmds: UnboundedSender<Cm
 /// itself unreachable) is no evidence either way.
 async fn indirect_probe(
     server: ClientId,
+    secret: &Arc<[u8]>,
     members: &[GossipMember],
     self_id: &NodeId,
     peer: &NodeId,
@@ -829,7 +897,10 @@ async fn indirect_probe(
         .map(|(_relay, relay_addr)| {
             let relay_addr = String::from_utf8_lossy(&relay_addr).into_owned();
             let peer_addr = peer_addr.to_vec();
-            async move { crate::gossip::ping_req_exchange(&relay_addr, server, &peer_addr).await }
+            let secret = secret.clone();
+            async move {
+                crate::gossip::ping_req_exchange(&relay_addr, server, &secret, &peer_addr).await
+            }
         })
         .collect();
     let mut results = Vec::new();
@@ -843,13 +914,82 @@ async fn indirect_probe(
     results
 }
 
+/// How long a link must survive to count as one the peer accepted. A refused link
+/// is closed as soon as the peer reads the opening frames — nothing is queued to
+/// flush, so the writer-drain grace never engages and the socket dies in about a
+/// round trip (measured well under 10ms on loopback, against this threshold). A
+/// link that carried real traffic and then dropped lived orders of magnitude
+/// longer, so the two separate by a wide margin even across a datacenter.
+const PEER_LINK_MIN_HEALTHY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many consecutive short-lived links are tolerated before the node says so.
+/// A follower restarting drops one or two in a row; a peer that refuses this node
+/// drops every one of them forever, and the symptom is otherwise a cluster that
+/// silently never converges.
+const PEER_REJECTION_STREAK_WARN: u32 = 5;
+
+/// The longest a redial waits while a peer keeps refusing. Each refusal doubles the
+/// wait from [`PEER_REDIAL_DELAY`] up to this, so a peer that will never accept
+/// costs a dial every few seconds instead of four a second — each of which, because
+/// a link coming up drives the late-joiner catch-up, would otherwise re-encode this
+/// node's whole backlog for that peer (a full snapshot below the compaction floor).
+/// A peer that starts accepting again reconverges within one of these.
+const PEER_REFUSED_REDIAL_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Consecutive peer links that died as soon as they opened — the signature of a
+/// peer refusing this node's cluster secret. The dialer cannot observe admission
+/// directly (`connect_peer` returns once its opening frames are written, never that
+/// they were accepted) and cannot infer it from traffic either, since this node
+/// queues a `FollowerHeads` for every peer the moment its link comes up and so
+/// writes to a refused link before the close arrives. What does separate the two is
+/// how long the link lived.
+#[derive(Default)]
+struct RefusalStreak {
+    /// Consecutive links shorter than [`PEER_LINK_MIN_HEALTHY`]. Reset by any link
+    /// that lived long enough to have been admitted.
+    n: u32,
+}
+
+impl RefusalStreak {
+    /// Fold in a link that lived `lifetime`, returning whether to tell the operator
+    /// now. A permanent refusal reports every [`PEER_REJECTION_STREAK_WARN`] links
+    /// rather than once, so an operator attaching late still sees it. The count
+    /// saturates rather than wrapping, which at the ceiling reports every link — a
+    /// position some 4 billion refusals away, and louder rather than quieter.
+    fn observe(&mut self, lifetime: std::time::Duration) -> bool {
+        if lifetime >= PEER_LINK_MIN_HEALTHY {
+            self.n = 0;
+            return false;
+        }
+        self.n = self.n.saturating_add(1);
+        self.n % PEER_REJECTION_STREAK_WARN == 0
+    }
+
+    /// How long to wait before redialing: the steady cadence while the peer is
+    /// merely unreachable, doubling per consecutive refusal to
+    /// [`PEER_REFUSED_REDIAL_MAX`] so a peer that will never accept is not dialed —
+    /// and catch-up-encoded for — four times a second forever.
+    fn redial_delay(&self) -> std::time::Duration {
+        PEER_REDIAL_DELAY
+            .saturating_mul(1u32 << self.n.min(8))
+            .min(PEER_REFUSED_REDIAL_MAX)
+    }
+}
+
 /// Own the socket to one follower: dial it, relay the replication frames that
 /// arrive on `frames`, and forward the follower's acks back to the registry as
 /// [`Cmd::PeerAck`]. A dial failure or a dropped socket redials after a short
 /// delay, so a follower that starts late or restarts reconverges. The task ends
 /// only when the frame channel closes (the registry shut down).
+///
+/// A link the follower *refuses* — a cluster secret that does not match its own —
+/// looks like any other dropped socket from here, so a run of them is recognised by
+/// how briefly each lived ([`RefusalStreak`]): the operator is told, and the redial
+/// backs off so a peer that will never accept is not dialed, and catch-up-encoded
+/// for, several times a second forever.
 async fn peer_connection(
     server: ClientId,
+    secret: Arc<[u8]>,
     follower: NodeId,
     addr: String,
     mut frames: Receiver<Message>,
@@ -865,14 +1005,24 @@ async fn peer_connection(
             live,
         });
     };
+    let mut refusals = RefusalStreak::default();
     loop {
-        match connect_peer(&url, server).await {
+        match connect_peer(&url, server, &secret).await {
             Some((write, read)) => {
                 mark(true);
+                let up = std::time::Instant::now();
                 // Pump until the socket or the frame channel closes, then redial.
                 if pump_peer(write, read, &follower, &mut frames, &cmds).await {
                     // The frame channel closed — the registry is gone; stop.
                     return;
+                }
+                if refusals.observe(up.elapsed()) {
+                    eprintln!(
+                        "crdtsync: peer {addr} keeps closing this node's link as soon as it \
+                         opens — usually a CRDTSYNC_CLUSTER_SECRET that does not match the \
+                         rest of the cluster, or a protocol version this node cannot speak; \
+                         this node will not replicate to it until that is fixed",
+                    );
                 }
                 // The link dropped: the follower is unreachable until it redials.
                 mark(false);
@@ -885,7 +1035,7 @@ async fn peer_connection(
                 }
             }
         }
-        tokio::time::sleep(PEER_REDIAL_DELAY).await;
+        tokio::time::sleep(refusals.redial_delay()).await;
     }
 }
 
@@ -894,10 +1044,12 @@ type PeerRead = futures_util::stream::SplitStream<WsStream>;
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Dial the follower and open the relay peer connection: the 8-byte header, then
-/// an empty-`app_id` `Hello` that resolves to a relay so the follower accepts the
-/// peer. `None` if the dial or either opening frame fails.
-async fn connect_peer(url: &str, server: ClientId) -> Option<(PeerWrite, PeerRead)> {
+/// Dial the follower and open the relay peer connection: the 8-byte header, an
+/// empty-`app_id` `Hello` that resolves to a relay, then the `PeerAuth` carrying
+/// the cluster secret — which is what admits the link to the follower's peer plane,
+/// since the `Hello` names the same reserved replica id every node dials under.
+/// `None` if the dial or any opening frame fails.
+async fn connect_peer(url: &str, server: ClientId, secret: &[u8]) -> Option<(PeerWrite, PeerRead)> {
     let (ws, _) = connect_async(url).await.ok()?;
     let (mut write, read) = ws.split();
     write
@@ -915,6 +1067,13 @@ async fn connect_peer(url: &str, server: ClientId) -> Option<(PeerWrite, PeerRea
     };
     write
         .send(WsMessage::Binary(encode_message(&hello)))
+        .await
+        .ok()?;
+    let auth = Message::PeerAuth {
+        secret: secret.to_vec(),
+    };
+    write
+        .send(WsMessage::Binary(encode_message(&auth)))
         .await
         .ok()?;
     Some((write, read))
@@ -1190,4 +1349,109 @@ where
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A link that lived long enough to have been admitted.
+    const HEALTHY: Duration = Duration::from_secs(1);
+    /// A link closed as soon as it opened — what a refusal looks like.
+    const REFUSED: Duration = Duration::from_millis(1);
+
+    /// The tests below count runs up to the threshold, so a threshold of one would
+    /// collapse their loops to nothing and stop pinning "does not warn early" and
+    /// "a healthy link clears the streak". Assert the shape they rely on.
+    #[test]
+    fn the_warn_threshold_leaves_room_to_not_warn() {
+        const { assert!(PEER_REJECTION_STREAK_WARN > 1) };
+    }
+
+    #[test]
+    fn a_healthy_link_never_warns() {
+        let mut streak = RefusalStreak::default();
+        for _ in 0..100 {
+            assert!(!streak.observe(HEALTHY));
+        }
+    }
+
+    #[test]
+    fn a_run_of_refusals_warns_at_the_threshold() {
+        let mut streak = RefusalStreak::default();
+        for _ in 1..PEER_REJECTION_STREAK_WARN {
+            assert!(!streak.observe(REFUSED), "warned before the threshold");
+        }
+        assert!(streak.observe(REFUSED), "the threshold link warns");
+    }
+
+    #[test]
+    fn a_permanent_refusal_keeps_reporting() {
+        // One line at startup is easily missed; a condition that never clears is
+        // reported once per threshold run so a late-attaching operator still sees it.
+        let mut streak = RefusalStreak::default();
+        let warnings = (0..PEER_REJECTION_STREAK_WARN * 4)
+            .filter(|_| streak.observe(REFUSED))
+            .count();
+        assert_eq!(warnings, 4);
+    }
+
+    #[test]
+    fn one_healthy_link_clears_the_streak() {
+        // A follower restarting drops a link or two; that must not accumulate toward
+        // a refusal verdict once it comes back.
+        let mut streak = RefusalStreak::default();
+        for _ in 1..PEER_REJECTION_STREAK_WARN {
+            streak.observe(REFUSED);
+        }
+        assert!(!streak.observe(HEALTHY));
+        for _ in 1..PEER_REJECTION_STREAK_WARN {
+            assert!(!streak.observe(REFUSED), "the streak did not reset");
+        }
+    }
+
+    /// The boundary itself: a link exactly at the threshold counts as admitted, so
+    /// the check is `>=` and not a strict `>`.
+    #[test]
+    fn a_link_at_the_healthy_boundary_is_not_a_refusal() {
+        let mut streak = RefusalStreak::default();
+        assert!(!streak.observe(PEER_LINK_MIN_HEALTHY));
+        assert_eq!(streak.redial_delay(), PEER_REDIAL_DELAY);
+    }
+
+    #[test]
+    fn refusals_back_the_redial_off_to_a_cap() {
+        let mut streak = RefusalStreak::default();
+        assert_eq!(
+            streak.redial_delay(),
+            PEER_REDIAL_DELAY,
+            "an unreachable peer keeps the steady cadence",
+        );
+        let mut previous = PEER_REDIAL_DELAY;
+        for _ in 0..40 {
+            streak.observe(REFUSED);
+            let delay = streak.redial_delay();
+            assert!(delay >= previous, "the backoff went backwards");
+            assert!(
+                delay <= PEER_REFUSED_REDIAL_MAX,
+                "the backoff passed its cap"
+            );
+            previous = delay;
+        }
+        assert_eq!(
+            previous, PEER_REFUSED_REDIAL_MAX,
+            "a peer that never accepts settles at the cap",
+        );
+    }
+
+    /// The counter saturates rather than overflowing on a node left running for
+    /// years against a peer that never accepts.
+    #[test]
+    fn the_streak_saturates_without_overflowing() {
+        let mut streak = RefusalStreak { n: u32::MAX - 1 };
+        streak.observe(REFUSED);
+        streak.observe(REFUSED);
+        assert_eq!(streak.redial_delay(), PEER_REFUSED_REDIAL_MAX);
+    }
 }

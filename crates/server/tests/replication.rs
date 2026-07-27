@@ -61,6 +61,7 @@ fn node(self_addr: Option<&str>) -> Registry {
     r.set_clock(Arc::new(ManualClock::new(0)));
     if let Some(addr) = self_addr {
         r.set_membership(membership_for(addr));
+        r.set_cluster_secret(CLUSTER_SECRET.to_vec());
     }
     r
 }
@@ -111,6 +112,26 @@ fn room_led_by_a_with_b_follower() -> Vec<u8> {
         }
     }
     panic!("no room led by A with B a follower");
+}
+
+/// The cluster secret these nodes share — what admits a node-to-node link to a
+/// peer's replication plane. A connection that has not presented it reaches none
+/// of the node-to-node handlers (C10).
+const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
+
+/// A connection admitted to `r`'s peer plane, as a member's dialed link is.
+fn peer_conn(r: &mut Registry) -> ConnId {
+    let id = r.connect();
+    assert!(
+        r.deliver(
+            id,
+            Message::PeerAuth {
+                secret: CLUSTER_SECRET.to_vec(),
+            },
+        ),
+        "the cluster secret admits a peer",
+    );
+    id
 }
 
 // --- the leader replicates a commit, the follower acks, the leader records it ---
@@ -207,7 +228,7 @@ fn a_follower_applies_a_replicate_and_advances_the_leader_watermark() {
 
     // B, a follower of the room, applies it into its own replica.
     let mut follower = node(Some(B));
-    let peer = follower.connect();
+    let peer = peer_conn(&mut follower);
     assert!(follower.deliver(peer, frame));
     assert_eq!(follower.hub().seq(&room), 1, "the op reached B's replica");
     let outbox = follower.take_outbox(peer);
@@ -247,7 +268,7 @@ fn a_follower_drops_a_branch_replicate() {
     // apply it to a branch it may not hold and falsely ack.
     let room = room_led_by_a_with_b_follower();
     let mut follower = node(Some(B));
-    let peer = follower.connect();
+    let peer = peer_conn(&mut follower);
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
     let kept = follower.deliver(
         peer,
@@ -287,6 +308,7 @@ fn a_non_leader_does_not_originate_replication() {
     r.deliver(c, sub(&room)); // binds while single-node
     r.take_outbox(c);
     r.set_membership(membership_for(A));
+    r.set_cluster_secret(CLUSTER_SECRET.to_vec());
 
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
     r.deliver(c, Message::Ops { channel: CH, ops });
@@ -313,7 +335,7 @@ fn a_follower_ignores_a_replicate_for_a_room_it_leads() {
         .expect("a room A leads");
 
     let mut leader = node(Some(A));
-    let peer = leader.connect();
+    let peer = peer_conn(&mut leader);
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
     let kept = leader.deliver(
         peer,
@@ -361,7 +383,10 @@ fn single_node_rejects_a_replicate() {
     // Replicate is a stray frame and the connection is dropped.
     let mut r = Registry::new(cid(0xFF));
     r.set_clock(Arc::new(ManualClock::new(0)));
-    let peer = r.connect();
+    // A secret with no membership: the peer plane opens, so the frames below are
+    // refused by the cluster gate rather than for want of admission.
+    r.set_cluster_secret(CLUSTER_SECRET.to_vec());
+    let peer = peer_conn(&mut r);
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
     let kept = r.deliver(
         peer,
@@ -447,11 +472,14 @@ async fn a_follower_applies_a_replicate_over_the_socket_and_acks() {
     let addr = listener.local_addr().unwrap();
     let config = ServeConfig {
         membership: Some(m),
+        cluster_secret: Some(CLUSTER_SECRET.to_vec()),
         ..ServeConfig::default()
     };
     let server = tokio::spawn(serve_with(listener, cid(0xFF), None, config));
 
-    // Dial the follower as a relay peer: header, then an empty-app_id Hello.
+    // Dial the follower as a relay peer: header, an empty-app_id Hello, then the
+    // cluster secret that admits the link to its peer plane — the Hello names an
+    // id anyone could assert, so it is the secret that makes this a member's link.
     let (mut ws, _) = connect_async(format!("ws://{addr}/")).await.unwrap();
     ws.send(WsMessage::Binary(
         encode_header(PROTOCOL_VERSION).to_vec().into(),
@@ -465,6 +493,13 @@ async fn a_follower_applies_a_replicate_over_the_socket_and_acks() {
             app_id: Vec::new(),
             schema_version: 0,
             codecs: Vec::new(),
+        },
+    )
+    .await;
+    send_frame(
+        &mut ws,
+        &Message::PeerAuth {
+            secret: CLUSTER_SECRET.to_vec(),
         },
     )
     .await;
@@ -512,19 +547,31 @@ async fn a_leader_dials_a_follower_and_sends_a_replicate() {
         .expect("a room the leader leads");
 
     // Stand in for the follower: accept the leader's peer dial and capture the
-    // first Replicate it sends.
+    // first Replicate it sends. The leader must present the cluster secret on the
+    // link before any node-to-node frame, or a real follower would refuse it — so
+    // assert the PeerAuth arrives first.
     let expected_room = room.clone();
     let follower = tokio::spawn(async move {
         let (stream, _) = follower_listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
+        let mut admitted = false;
         loop {
             match ws.next().await.unwrap().unwrap() {
-                WsMessage::Binary(b) => {
-                    if let Ok(Message::Replicate { room, ops, .. }) = decode_message(&b) {
+                WsMessage::Binary(b) => match decode_message(&b) {
+                    Ok(Message::PeerAuth { secret }) => {
+                        assert_eq!(
+                            secret, CLUSTER_SECRET,
+                            "the link presents the cluster secret"
+                        );
+                        admitted = true;
+                    }
+                    Ok(Message::Replicate { room, ops, .. }) => {
+                        assert!(admitted, "a Replicate arrived before the link was admitted");
                         assert_eq!(room, expected_room);
                         return ops;
                     }
-                }
+                    _ => continue,
+                },
                 WsMessage::Close(_) => panic!("peer closed before a Replicate"),
                 _ => continue,
             }
@@ -533,6 +580,7 @@ async fn a_leader_dials_a_follower_and_sends_a_replicate() {
 
     let config = ServeConfig {
         membership: Some(m),
+        cluster_secret: Some(CLUSTER_SECRET.to_vec()),
         ..ServeConfig::default()
     };
     let leader = tokio::spawn(serve_with(leader_listener, cid(0xFF), None, config));
