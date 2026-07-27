@@ -186,6 +186,9 @@ pub struct PeerDialer {
 }
 
 impl PeerDialer {
+    /// A dialer presenting `secret` on every link it opens, authenticating a TLS
+    /// member against `tls` when one is configured, and refusing plaintext members
+    /// outright when `require_tls`.
     pub fn new(secret: Arc<[u8]>, tls: Option<Arc<ClientConfig>>, require_tls: bool) -> Self {
         Self {
             secret,

@@ -125,10 +125,17 @@ impl Ca {
     /// the listener, `clientAuth` so the same identity can be presented on a dial —
     /// naming `127.0.0.1` so a loopback `wss://127.0.0.1:port` verifies.
     fn issue(&self, name: &str) -> Leaf {
+        self.issue_for(name, "127.0.0.1")
+    }
+
+    /// Issue a leaf cert as [`issue`](Self::issue) does, naming `san` instead — so
+    /// a test can present a cert this authority really signed for an address that
+    /// is not the one being dialed.
+    fn issue_for(&self, name: &str, san: &str) -> Leaf {
         let n = self
             .issued
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![san.to_string()]).unwrap();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, name);
@@ -520,6 +527,79 @@ async fn a_squatter_at_a_members_address_never_receives_the_cluster_secret() {
         !seen.windows(SECRET.len()).any(|w| w == SECRET),
         "the cluster secret was written to a squatter at a member's address",
     );
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)] // binds and dials loopback servers over real sockets
+async fn a_certificate_from_another_authority_is_not_a_member() {
+    // The squatter with a certificate of its own: a real TLS listener, a real
+    // handshake, a cert that simply chains to an authority this cluster does not
+    // trust. Nothing about presenting *a* certificate makes a far end a member, so
+    // the dial fails and the secret is not written.
+    let cluster_ca = Ca::new("trusted");
+    let other_ca = Ca::new("untrusted");
+    let leaf = other_ca.issue("impostor");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("wss://{}", listener.local_addr().unwrap());
+    let impostor = tokio::spawn(serve_with(
+        listener,
+        cid(0xFF),
+        None,
+        ServeConfig {
+            tls: Some(server_config_from_pem(&leaf.cert_path, &leaf.key_path).unwrap()),
+            ..ServeConfig::default()
+        },
+    ));
+
+    let dialer = PeerDialer::new(
+        Arc::from(SECRET),
+        Some(client_config_from_pem(&cluster_ca.ca_path).unwrap()),
+        false,
+    );
+    assert!(
+        gossip_exchange(&addr, cid(0), &dialer, gossip_frame(&[]))
+            .await
+            .is_none(),
+        "a certificate from an untrusted authority was accepted as a member",
+    );
+
+    impostor.abort();
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)] // binds and dials loopback servers over real sockets
+async fn a_cluster_certificate_for_another_address_is_not_this_member() {
+    // Chaining to the cluster's own authority is not enough either: the certificate
+    // must name the address being dialed. Otherwise any member's key — or any leaf
+    // the cluster CA ever issued — impersonates every other member, which is the
+    // whole of what the dial is meant to distinguish.
+    let ca = Ca::new("wrong-name");
+    let leaf = ca.issue_for("elsewhere", "10.9.9.9");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("wss://{}", listener.local_addr().unwrap());
+    let node = tokio::spawn(serve_with(
+        listener,
+        cid(0xFF),
+        None,
+        ServeConfig {
+            tls: Some(server_config_from_pem(&leaf.cert_path, &leaf.key_path).unwrap()),
+            ..ServeConfig::default()
+        },
+    ));
+
+    let dialer = PeerDialer::new(
+        Arc::from(SECRET),
+        Some(client_config_from_pem(&ca.ca_path).unwrap()),
+        false,
+    );
+    assert!(
+        gossip_exchange(&addr, cid(0), &dialer, gossip_frame(&[]))
+            .await
+            .is_none(),
+        "a certificate naming another address was accepted for this member",
+    );
+
+    node.abort();
 }
 
 // --- mixed plaintext / TLS membership ---
