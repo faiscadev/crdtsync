@@ -7,7 +7,7 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
-## 2026-07-27 · C12 peer-link TLS (#PR) · a member's advertise address declares its own transport, trust anchors are explicit, and a mixed cluster is allowed but never silent
+## 2026-07-27 · C12 peer-link TLS (#361) · a member's advertise address declares its own transport, trust anchors are explicit, and a mixed cluster is allowed but never silent
 
 **Changed:** ARCHITECTURE gains §Peer Transport, and §Peer-Plane Authentication's "admission is one-directional" and "the peer link should carry it over an encrypted transport" paragraphs are rewritten to what is now true.
 
