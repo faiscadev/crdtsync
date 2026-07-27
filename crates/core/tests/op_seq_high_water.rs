@@ -11,22 +11,28 @@
 //! delta and the whole-replica snapshot (whose encoded counter belongs to the
 //! *server*, which never mints, so it is 0 and lifts nothing).
 //!
-//! The counter therefore advances past what the replica has already published,
-//! read off the dedup set it already holds — never assigned from a number on the
-//! wire. That distinction is the whole design. A lift of the form
+//! So minting searches for a sequence the replica does not hold, rather than
+//! tracking a frontier. That distinction is the whole design. A lift of the form
 //! `seq = seq.max(wire_seq + 1)` repairs the restore case and hands any frame a
 //! write primitive on the counter: one op carrying this replica's own id at
 //! `u64::MAX` pins it at the ceiling, and the next ordinary local edit overflows
-//! — a panic in debug, a wrap into already-published ids in release. Walking the
-//! dedup set instead steps one id at a time over evidence already in memory, so
-//! a forged frame contributes one entry the walk will never reach, and driving
-//! the counter to the ceiling would take 2^64 folded ops.
+//! — a panic in debug, a wrap into already-published ids in release. A search
+//! over the ids already in memory takes nothing off the wire: a forged frame
+//! contributes one held id, which costs one step.
+//!
+//! Held, not merely applied — an op waiting on its transaction group sits in the
+//! buffer with its id out of the dedup set, and the room's log holds it all the
+//! same. And the space is a finite *set*, not a ladder: the search wraps at its
+//! end, so a position no minting could reach is a few wrapped steps rather than a
+//! replica re-issuing one id forever.
 //!
 //! The same property is what keeps a *server's* replica clean. Its doc merges
 //! ops under a node identity, and its `encode_state` rides every catch-up
 //! snapshot it serves; a counter it could be made to inherit from a frame would
 //! reach every client that later adopts one. Its counter moves only when the
 //! server itself mints.
+
+use std::collections::HashSet;
 
 use crdtsync_core::client::ClientSession;
 use crdtsync_core::{ClientId, Document, Element, Message, Op, OpId, Scalar};
@@ -325,20 +331,64 @@ fn a_ceiling_frame_survives_a_snapshot_round_trip_without_moving_the_counter() {
     assert_eq!(back.next_seq(), 0);
 }
 
-#[test]
-fn a_state_whose_counter_is_at_the_end_of_the_space_is_refused() {
-    // The counter names the next id to mint, so the end of the space names none:
-    // a replica restored onto it could only re-issue an id it already published.
-    // Reaching it by minting takes 2^64 ops, so a state carrying it is malformed
-    // — and refused loudly rather than decoded into a replica that mints one id
-    // forever.
-    let mut state = Document::new(cid(1)).encode_state();
-    // The counter follows the version byte, the client id, and the lamport clock.
+/// `bytes` with the encoded op-seq position replaced by `seq`. The position
+/// follows the version byte, the client id, and the lamport clock, little-endian
+/// like every other integer in the state codec.
+fn with_seq(mut bytes: Vec<u8>, seq: u64) -> Vec<u8> {
     let at = 1 + 16 + 8;
-    state[at..at + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+    bytes[at..at + 8].copy_from_slice(&seq.to_le_bytes());
+    bytes
+}
 
-    assert!(Document::decode_state(&state).is_err());
-    assert!(Document::decode_state_as(cid(2), 0, &state).is_err());
+#[test]
+fn a_counter_decoded_at_the_end_of_the_space_keeps_minting_distinct_ids() {
+    // The position is a search hint, not a frontier, so the end of the space is
+    // not the end of the ids: the search wraps into the sequences the replica has
+    // not published. A replica restored onto a position no minting could reach
+    // keeps authoring distinct ids rather than re-issuing one forever.
+    let state = with_seq(Document::new(cid(1)).encode_state(), u64::MAX);
+    let mut doc = Document::decode_state(&state).expect("decodes");
+
+    let mut minted = Vec::new();
+    for i in 0..4 {
+        let key = format!("k{i}").into_bytes();
+        minted.extend(doc.transact(|tx| tx.set(&key, Scalar::Int(i))));
+    }
+    let ids: HashSet<OpId> = minted.iter().map(|op| op.id).collect();
+    assert_eq!(ids.len(), minted.len(), "re-issued an id it had published");
+}
+
+#[test]
+fn a_counter_decoded_short_of_the_end_wraps_past_it_without_repeating() {
+    // The same, one step out: a position at `MAX - 2` buys three mints before the
+    // wrap, which is exactly where a bound that only refused `u64::MAX` would let
+    // the duplicate through.
+    let state = with_seq(Document::new(cid(1)).encode_state(), u64::MAX - 2);
+    let mut doc = Document::decode_state(&state).expect("decodes");
+
+    let mut minted = Vec::new();
+    for i in 0..6 {
+        let key = format!("k{i}").into_bytes();
+        minted.extend(doc.transact(|tx| tx.set(&key, Scalar::Int(i))));
+    }
+    let ids: HashSet<OpId> = minted.iter().map(|op| op.id).collect();
+    assert_eq!(ids.len(), minted.len(), "re-issued an id it had published");
+    assert_eq!(
+        seqs(&minted),
+        vec![u64::MAX - 2, u64::MAX - 1, u64::MAX, 0, 1, 2]
+    );
+}
+
+#[test]
+fn a_replica_handed_the_end_of_the_space_still_mints_distinct_ids() {
+    // `decode_state_as` takes the position from its caller, so the same property
+    // has to hold when the caller names one no minting could reach.
+    let state = Document::new(cid(1)).encode_state();
+    let mut doc = Document::decode_state_as(cid(1), u64::MAX, &state).expect("decodes");
+
+    let first = doc.transact(|tx| tx.set(b"a", Scalar::Int(1)));
+    let second = doc.transact(|tx| tx.set(b"b", Scalar::Int(2)));
+    assert_ne!(first[0].id, second[0].id);
 }
 
 // --- the server's replica, and the snapshot it serves ---

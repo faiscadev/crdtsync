@@ -704,9 +704,12 @@ impl Hub {
         }
     }
 
-    /// The identity this node's room replicas are held under. Reserved to the
-    /// node: the op gate refuses a client batch authored under it, so no write on
-    /// the client path enters a room's log carrying the node's identity.
+    /// The identity this node authors its own room replicas under — the one a
+    /// fresh room is created with. Reserved to the node: the op gate refuses a
+    /// client batch authored under it, so no write on the client path enters a
+    /// room's log carrying it. A room installed from a decoded snapshot keeps the
+    /// identity that encoded it, so this is what the node would author as, not a
+    /// claim about every replica it currently holds.
     pub fn replica_identity(&self) -> ClientId {
         self.server
     }

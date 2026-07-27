@@ -1554,8 +1554,18 @@ impl Document {
     /// as published as any other — the room's log holds it, and a re-mint of its
     /// id would leave the replica applying two different ops under one identity
     /// once the buffer drains.
-    fn free_seq(&self, mut seq: u64) -> u64 {
-        loop {
+    ///
+    /// The search wraps at the end of the space rather than stopping there. A
+    /// sequence space is a finite *set*, not a ladder, and what a replica holds is
+    /// bounded by its memory — so a free sequence always exists, and the position
+    /// is a search hint rather than a frontier. One step per held id is enough to
+    /// reach one: after that many misses the ids seen were all distinct and all
+    /// held, so the next candidate cannot be. That is what makes an exhausted
+    /// counter unrepresentable — a decoded position near the end of the space
+    /// costs a few wrapped steps, not a replica that re-issues one id forever.
+    fn free_seq(&self, from: u64) -> u64 {
+        let mut seq = from;
+        for _ in 0..self.seen.len() + self.buffered.len() {
             let id = OpId {
                 client: self.client,
                 seq,
@@ -1563,11 +1573,9 @@ impl Document {
             if !self.seen.contains(&id) && !self.buffered.contains(&id) {
                 return seq;
             }
-            let Some(next) = seq.checked_add(1) else {
-                return seq;
-            };
-            seq = next;
+            seq = seq.wrapping_add(1);
         }
+        seq
     }
 
     /// The current lamport high-water of a replication partition: the root clock
@@ -1615,17 +1623,6 @@ impl Document {
         let client = cur.client()?;
         let lamport = cur.u64()?;
         let seq = cur.u64()?;
-        // The counter names the next id the replica will mint, so the end of the
-        // space names none — a replica restored onto it could only re-issue an id
-        // it has already published. No replica reaches it by minting (that is 2^64
-        // authored ops), so a state carrying it is malformed, and refusing it here
-        // keeps the position on a value minting can always move off.
-        if seq == u64::MAX {
-            return Err(DecodeError::BadTag {
-                what: "document: op sequence at the end of the space",
-                tag: 0,
-            });
-        }
 
         let zone_clock_count = cur.u32()?;
         let mut zone_clocks: HashMap<u32, u64> =
@@ -2502,7 +2499,7 @@ impl Document {
             client: self.client,
             seq: self.seq,
         };
-        self.seq = self.seq.saturating_add(1);
+        self.seq = self.seq.wrapping_add(1);
         self.seen.insert(id);
         id
     }
