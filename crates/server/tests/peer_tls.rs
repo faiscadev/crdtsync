@@ -276,6 +276,9 @@ async fn retrying<T, F: std::future::Future<Output = Option<T>>>(
         if std::time::Instant::now() >= deadline {
             return None;
         }
+        // A round that fails fast (a dial refused before the node's listener is up)
+        // must not spin: the gossip loop paces its rounds, and so does this.
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
