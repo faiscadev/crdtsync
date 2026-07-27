@@ -1,4 +1,5 @@
-//! TLS termination at the server listener.
+//! TLS for both ends of a connection: termination at this node's listener, and
+//! the client-side config its outbound peer dials run under.
 //!
 //! [`server_config_from_pem`] loads a PEM certificate chain + private key into a
 //! [`rustls::ServerConfig`] the [`serve`](crate::runtime::serve) accept loop wraps
@@ -32,6 +33,13 @@
 //!   true *absence* of a cert is admitted — a bad presented cert is never treated
 //!   as anonymous.
 //!
+//! The dial side is [`client_config_from_pem`]: the trust anchors a node
+//! authenticates a TLS *member* against before its peer link writes the cluster
+//! secret, optionally with [`client_config_from_pem_with_identity`] presenting this
+//! node's own certificate so one handshake authenticates both ends. The anchors are
+//! always explicit — see [`client_config_from_pem`] for why no ambient root store
+//! stands in for them. [`crate::dial`] decides which members it applies to.
+//!
 //! [`WebPkiClientVerifier`]: rustls::server::WebPkiClientVerifier
 
 use std::path::{Path, PathBuf};
@@ -39,7 +47,7 @@ use std::sync::Arc;
 
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
-use tokio_rustls::rustls::{self, RootCertStore, ServerConfig};
+use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 /// Why building a [`ServerConfig`] from PEM files failed. Each arm names the file
@@ -60,6 +68,11 @@ pub enum TlsConfigError {
     /// nothing to anchor client certs to. Never fall through to server-auth-only
     /// (a silent drop of the client-auth requirement is a security regression).
     NoClientCa(PathBuf),
+    /// The peer trust bundle held no certificate — outbound peer dials were asked
+    /// to verify TLS members against nothing. Never fall through to trusting
+    /// whatever answers (nor to an ambient root store): a bearer credential is
+    /// written over that link.
+    NoPeerCa(PathBuf),
     /// rustls rejected building the client-cert verifier from the trust bundle.
     ClientVerifier(rustls::server::VerifierBuilderError),
     /// rustls rejected the cert/key pair (e.g. the key does not match the cert).
@@ -122,6 +135,11 @@ impl std::fmt::Display for TlsConfigError {
                 "TLS client-CA file {} holds no certificate",
                 path.display()
             ),
+            TlsConfigError::NoPeerCa(path) => write!(
+                f,
+                "peer trust bundle {} holds no certificate",
+                path.display()
+            ),
             TlsConfigError::ClientVerifier(e) => {
                 write!(f, "building TLS client-cert verifier: {e}")
             }
@@ -143,6 +161,7 @@ impl std::error::Error for TlsConfigError {
             TlsConfigError::NoCertificate(_)
             | TlsConfigError::NoPrivateKey(_)
             | TlsConfigError::NoClientCa(_)
+            | TlsConfigError::NoPeerCa(_)
             | TlsConfigError::BadClientAuthMode(_) => None,
         }
     }
@@ -223,30 +242,8 @@ fn build_server_config(
     key_path: &Path,
     client_ca: Option<(&Path, ClientAuthMode)>,
 ) -> Result<Arc<ServerConfig>, TlsConfigError> {
-    let cert_bytes = std::fs::read(cert_path).map_err(|source| TlsConfigError::Io {
-        path: cert_path.to_path_buf(),
-        source,
-    })?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_bytes.as_slice())
-        .collect::<Result<_, _>>()
-        .map_err(|source| TlsConfigError::Io {
-            path: cert_path.to_path_buf(),
-            source,
-        })?;
-    if certs.is_empty() {
-        return Err(TlsConfigError::NoCertificate(cert_path.to_path_buf()));
-    }
-
-    let key_bytes = std::fs::read(key_path).map_err(|source| TlsConfigError::Io {
-        path: key_path.to_path_buf(),
-        source,
-    })?;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_bytes.as_slice())
-        .map_err(|source| TlsConfigError::Io {
-            path: key_path.to_path_buf(),
-            source,
-        })?
-        .ok_or_else(|| TlsConfigError::NoPrivateKey(key_path.to_path_buf()))?;
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
 
     // Pin the ring provider explicitly rather than lean on a process-default that
     // other TLS users (reqwest) in the same binary may or may not have installed.
@@ -257,7 +254,7 @@ fn build_server_config(
         .map_err(TlsConfigError::Rustls)?;
     let config = match client_ca {
         Some((ca_path, mode)) => {
-            let roots = load_client_roots(ca_path)?;
+            let roots = load_roots(ca_path, TlsConfigError::NoClientCa)?;
             let verifier_builder =
                 WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider);
             // Both modes validate a *presented* cert against the trust anchors; in
@@ -281,12 +278,111 @@ fn build_server_config(
     Ok(Arc::new(config))
 }
 
-/// Load the client-cert trust anchors from the PEM bundle at `path` into a
-/// [`RootCertStore`]. An unreadable file is an [`Io`](TlsConfigError::Io) error and
-/// a bundle holding no usable certificate is a
-/// [`NoClientCa`](TlsConfigError::NoClientCa) error — mTLS never silently degrades
-/// to server-auth-only.
-fn load_client_roots(path: &Path) -> Result<RootCertStore, TlsConfigError> {
+/// Build a [`ClientConfig`] for this node's outbound peer dials, trusting the PEM
+/// trust-anchor bundle at `ca_path` and presenting no client certificate. A dial
+/// under it verifies the acceptor's certificate against those anchors before the
+/// link carries a single frame, which is what lets a node tell a member from
+/// anything else answering the member's advertise address.
+///
+/// The anchors are explicit and nothing else is trusted: no platform store, no
+/// bundled public root set. The peer link carries a bearer credential granting
+/// write access to every room the cluster replicates, so trusting an ambient store
+/// would widen the set of issuers that can impersonate a member to every CA on the
+/// host — and a cluster's certificates are an operator-controlled input, so naming
+/// them costs one line of configuration.
+pub fn client_config_from_pem(
+    ca_path: impl AsRef<Path>,
+) -> Result<Arc<ClientConfig>, TlsConfigError> {
+    build_client_config(ca_path.as_ref(), None)
+}
+
+/// Build a peer-dial [`ClientConfig`] as [`client_config_from_pem`] does, also
+/// presenting the PEM certificate chain + key at `cert_path`/`key_path` as this
+/// node's client identity. With the acceptor configured for mTLS
+/// ([`server_config_from_pem_with_client_ca`]) the one handshake then authenticates
+/// both ends of the peer link.
+///
+/// The client identity is its own configuration, never inferred from the node's
+/// listener certificate: a server certificate commonly carries `serverAuth` alone,
+/// so reusing it as a client identity would work in a lab and be rejected at the
+/// handshake in a deployment that issues its certificates properly.
+pub fn client_config_from_pem_with_identity(
+    ca_path: impl AsRef<Path>,
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+) -> Result<Arc<ClientConfig>, TlsConfigError> {
+    build_client_config(
+        ca_path.as_ref(),
+        Some((cert_path.as_ref(), key_path.as_ref())),
+    )
+}
+
+/// Build the [`ClientConfig`], presenting a client identity when `identity` is set.
+fn build_client_config(
+    ca_path: &Path,
+    identity: Option<(&Path, &Path)>,
+) -> Result<Arc<ClientConfig>, TlsConfigError> {
+    let roots = load_roots(ca_path, TlsConfigError::NoPeerCa)?;
+    // The same pinned provider the listener uses, so both directions of a peer
+    // handshake speak the same crypto.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(TlsConfigError::Rustls)?
+        .with_root_certificates(roots);
+    let config = match identity {
+        Some((cert_path, key_path)) => builder
+            .with_client_auth_cert(load_certs(cert_path)?, load_private_key(key_path)?)
+            .map_err(TlsConfigError::Rustls)?,
+        None => builder.with_no_client_auth(),
+    };
+    Ok(Arc::new(config))
+}
+
+/// Load the PEM certificate chain at `path`. An empty file is a
+/// [`NoCertificate`](TlsConfigError::NoCertificate) error rather than an empty
+/// chain rustls would reject less legibly.
+fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsConfigError> {
+    let bytes = std::fs::read(path).map_err(|source| TlsConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut bytes.as_slice())
+        .collect::<Result<_, _>>()
+        .map_err(|source| TlsConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if certs.is_empty() {
+        return Err(TlsConfigError::NoCertificate(path.to_path_buf()));
+    }
+    Ok(certs)
+}
+
+/// Load the PEM private key at `path`.
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
+    let bytes = std::fs::read(path).map_err(|source| TlsConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    rustls_pemfile::private_key(&mut bytes.as_slice())
+        .map_err(|source| TlsConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .ok_or_else(|| TlsConfigError::NoPrivateKey(path.to_path_buf()))
+}
+
+/// Load trust anchors from the PEM bundle at `path` into a [`RootCertStore`],
+/// reporting a bundle that holds no usable certificate through `empty` — the
+/// caller's error arm naming which side asked for it. A trust bundle never
+/// silently resolves to no anchors: on the listener that would drop the client-auth
+/// requirement, and on the dial it would refuse every TLS peer at every round
+/// instead of at startup.
+fn load_roots(
+    path: &Path,
+    empty: fn(PathBuf) -> TlsConfigError,
+) -> Result<RootCertStore, TlsConfigError> {
     let bytes = std::fs::read(path).map_err(|source| TlsConfigError::Io {
         path: path.to_path_buf(),
         source,
@@ -300,7 +396,7 @@ fn load_client_roots(path: &Path) -> Result<RootCertStore, TlsConfigError> {
     let mut roots = RootCertStore::empty();
     let (added, _) = roots.add_parsable_certificates(cas);
     if added == 0 {
-        return Err(TlsConfigError::NoClientCa(path.to_path_buf()));
+        return Err(empty(path.to_path_buf()));
     }
     Ok(roots)
 }
