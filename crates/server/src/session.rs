@@ -653,6 +653,11 @@ pub fn step(
                 // The subscribe gate already refused a reader with no read grant at all,
                 // so a partial reader here holds read on at least one subtree.
                 Catchup::Snapshot { seq, state } => {
+                    // The replica identity this channel's snapshot is served to — what
+                    // the recipient authors under, and so the one author whose ids the
+                    // projections keep in the frontier they otherwise scrub. A
+                    // projection has no way to know who it serves; this caller does.
+                    let recipient = session.client.map(|c| c.for_channel(channel.0));
                     let reads_all = records.is_empty()
                         || reads_whole_document(
                             authorizer,
@@ -674,9 +679,10 @@ pub fn step(
                             schema,
                             identity,
                             &room,
+                            recipient,
                         )
                     };
-                    let state = project_snapshot_zones(state, schema, &zones);
+                    let state = project_snapshot_zones(state, schema, &zones, recipient);
                     Message::Snapshot {
                         channel,
                         seq,
@@ -1557,6 +1563,7 @@ fn project_snapshot_zones(
     state: Vec<u8>,
     schema: Option<&Schema>,
     zones: &Option<HashSet<u32>>,
+    recipient: Option<ClientId>,
 ) -> Vec<u8> {
     let (Some(schema), Some(set)) = (schema, zones) else {
         return state;
@@ -1566,7 +1573,7 @@ fn project_snapshot_zones(
     }
     match Document::decode_state(&state) {
         Ok(mut doc) => {
-            doc.project_zones(schema, set);
+            doc.project_zones(schema, set, recipient);
             doc.encode_state()
         }
         // An undecodable snapshot is left as-is: it fails downstream on the same
@@ -1595,6 +1602,7 @@ fn project_snapshot_reads(
     schema: Option<&Schema>,
     identity: &Identity,
     room: &[u8],
+    recipient: Option<ClientId>,
 ) -> Vec<u8> {
     match Document::decode_state(&state) {
         Ok(mut doc) => {
@@ -1603,9 +1611,12 @@ fn project_snapshot_reads(
             // same element-context index the op fan-out resolves against, derived here
             // from the decoded doc so it cannot drift from what is projected.
             let index = crate::index::element_paths(&doc);
-            doc.project_read_paths(crate::acl::recipient_reads_predicate(
-                authorizer, records, creator, &index, schema, identity, room,
-            ));
+            doc.project_read_paths(
+                crate::acl::recipient_reads_predicate(
+                    authorizer, records, creator, &index, schema, identity, room,
+                ),
+                recipient,
+            );
             doc.encode_state()
         }
         Err(_) => state,
