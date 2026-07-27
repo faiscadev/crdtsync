@@ -961,13 +961,20 @@ async fn a_node_requiring_peer_tls_that_serves_plaintext_refuses_to_start() {
     // Incoherent rather than merely strict: a node that demands TLS of every peer
     // while terminating none is refused by every peer running the same policy, so
     // the cluster it declared finished cannot form at all.
+    //
+    // Every *peer* here already satisfies the policy — one member, advertising TLS,
+    // with anchors to authenticate it — so the only rule left to refuse this
+    // configuration is the one about self. A peer that also advertised plaintext
+    // would be refused first and this would pass without the self rule existing.
+    let ca = Ca::new("require-tls-self");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let err = startup_error(
         listener,
         ServeConfig {
             require_peer_tls: true,
-            ..clustered(&addr, "10.0.0.9:9000")
+            peer_tls: Some(client_config_from_pem(&ca.ca_path).unwrap()),
+            ..clustered(&addr, "wss://10.0.0.9:9000")
         },
     )
     .await;
