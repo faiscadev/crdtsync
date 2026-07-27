@@ -68,6 +68,15 @@ fn list_len(doc: &Document, key: &[u8]) -> usize {
     }
 }
 
+/// Nodes the sequence actually stores, live or tombstoned — what tells "the two
+/// inserts became one node" apart from "one of two nodes is hidden".
+fn list_stored(doc: &Document, key: &[u8]) -> usize {
+    match doc.get(key) {
+        Some(Element::List(l)) => l.borrow().stored_records(),
+        _ => panic!("expected a List at {key:?}"),
+    }
+}
+
 /// A session holding two channels on `ROOM` — the shape this file is about. The
 /// subscription flavour does not bear on identity (every constructor routes
 /// through one `subscribe_inner`, and the room/branch/zone selectors ride the
@@ -294,6 +303,11 @@ fn distinct_op_ids_alone_do_not_save_two_inserts_that_share_a_stamp() {
         1,
         "a shared stamp collapses the two inserts onto one node — which is why \
          the replica identity, not the seq space, is what had to change"
+    );
+    assert_eq!(
+        list_stored(&peer, b"xs"),
+        1,
+        "one node stored, not two with one hidden"
     );
 }
 
