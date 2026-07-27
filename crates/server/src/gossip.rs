@@ -49,9 +49,9 @@ use crdtsync_core::{
     decode_message, encode_header, encode_message, ClientId, MemberState, Message,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::dial::PeerDialer;
 use crate::membership::Membership;
 use crate::placement::NodeId;
 
@@ -206,7 +206,7 @@ pub fn probe_outcome(direct_reachable: bool, indirect: &[Option<bool>]) -> bool 
 pub async fn ping_req_exchange(
     relay_addr: &str,
     server: ClientId,
-    secret: &[u8],
+    dialer: &PeerDialer,
     target_addr: &[u8],
 ) -> Option<bool> {
     let frame = Message::PingReq {
@@ -215,7 +215,7 @@ pub async fn ping_req_exchange(
     relay_roundtrip(
         relay_addr,
         server,
-        secret,
+        dialer,
         frame,
         PING_REQ_TIMEOUT,
         |m| match m {
@@ -236,10 +236,10 @@ pub async fn ping_req_exchange(
 pub async fn gossip_exchange(
     addr: &str,
     server: ClientId,
-    secret: &[u8],
+    dialer: &PeerDialer,
     frame: Message,
 ) -> Option<Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>> {
-    relay_roundtrip(addr, server, secret, frame, GOSSIP_TIMEOUT, |m| match m {
+    relay_roundtrip(addr, server, dialer, frame, GOSSIP_TIMEOUT, |m| match m {
         Message::Gossip { members } => Some(members),
         _ => None,
     })
@@ -247,26 +247,27 @@ pub async fn gossip_exchange(
     .flatten()
 }
 
-/// Open an ephemeral relay connection to `addr`, push one `frame`, and pull the
-/// peer's reply, returning the first inbound message `extract` accepts. Shared by
-/// the node-to-node exchanges (gossip anti-entropy and ping-req): the 8-byte
-/// header, the empty-`app_id` Hello that resolves to a relay, the `PeerAuth` that
-/// admits the link to the peer's node-to-node plane, the send, then the read loop
-/// that skips control frames until `extract` yields. `None` on any
-/// dial/handshake/send failure, on a close before a match, or if nothing matches
-/// within `timeout`. The outer `Option` (from the timeout) and the inner (from the
-/// read) both collapse to "no reply", so callers `.flatten()`.
+/// Open an ephemeral relay connection to `addr` over the transport that member's
+/// advertise address declares, push one `frame`, and pull the peer's reply,
+/// returning the first inbound message `extract` accepts. Shared by the
+/// node-to-node exchanges (gossip anti-entropy and ping-req): the dial (which on a
+/// TLS member has already authenticated the far end), the 8-byte header, the
+/// empty-`app_id` Hello that resolves to a relay, the `PeerAuth` that admits the
+/// link to the peer's node-to-node plane, the send, then the read loop that skips
+/// control frames until `extract` yields. `None` on any dial/handshake/send
+/// failure, on a close before a match, or if nothing matches within `timeout`. The
+/// outer `Option` (from the timeout) and the inner (from the read) both collapse to
+/// "no reply", so callers `.flatten()`.
 async fn relay_roundtrip<T>(
     addr: &str,
     server: ClientId,
-    secret: &[u8],
+    dialer: &PeerDialer,
     frame: Message,
     timeout: Duration,
     extract: impl Fn(Message) -> Option<T>,
 ) -> Option<Option<T>> {
     let fut = async {
-        let url = format!("ws://{addr}/");
-        let (ws, _) = connect_async(&url).await.ok()?;
+        let ws = dialer.connect(addr).await.ok()?;
         let (mut write, mut read) = ws.split();
         write
             .send(WsMessage::Binary(encode_header(PROTOCOL_VERSION).to_vec()))
@@ -290,7 +291,7 @@ async fn relay_roundtrip<T>(
         // the Hello names the reserved replica id every node dials under, so it
         // distinguishes nothing.
         let auth = Message::PeerAuth {
-            secret: secret.to_vec(),
+            secret: dialer.secret().to_vec(),
         };
         write
             .send(WsMessage::Binary(encode_message(&auth)))

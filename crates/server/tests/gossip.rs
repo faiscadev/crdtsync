@@ -105,6 +105,12 @@ fn tuple(
 /// of the node-to-node handlers (C10).
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
+/// The dialer these socket tests dial under: this cluster's secret, no client-side
+/// TLS — every node here advertises a bare `host:port`, which is plaintext.
+fn plaintext_dialer() -> crdtsync_server::dial::PeerDialer {
+    crdtsync_server::dial::PeerDialer::new(std::sync::Arc::from(CLUSTER_SECRET), None, false)
+}
+
 /// A connection admitted to `r`'s peer plane, as a member's dialed link is.
 fn peer_conn(r: &mut Registry) -> ConnId {
     let id = r.connect();
@@ -742,7 +748,7 @@ async fn a_gossip_exchange_over_the_socket_merges_and_replies() {
             MemberState::Alive,
         )],
     };
-    let learned = gossip_exchange(&addr, cid(0xEE), CLUSTER_SECRET, frame)
+    let learned = gossip_exchange(&addr, cid(0xEE), &plaintext_dialer(), frame)
         .await
         .expect("the node replies with its member set");
 

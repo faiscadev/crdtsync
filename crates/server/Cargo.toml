@@ -10,7 +10,14 @@ crdtsync-core = { path = "../core" }
 # A server-side operator tool, never the wasm-embeddable core.
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+# The outbound peer dial supplies its own `rustls::ClientConfig` (the cluster's
+# trust anchors, optionally this node's client identity), so it needs the rustls
+# connector without either bundled root store. `__rustls-tls` is the feature that
+# gates `Connector::Rustls`; the two public aliases reach it only by also pulling
+# a root-store crate this build never consults, and an ambient root store is
+# exactly what §Peer Transport refuses to trust. It brings no new crate — rustls,
+# rustls-pki-types and tokio-rustls are all already in the tree.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # Anonymous-mode actor ids are minted from system entropy at the transport
 # layer, kept out of the Miri-gated pure-logic core.

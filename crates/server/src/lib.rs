@@ -24,6 +24,7 @@ pub mod authz;
 pub mod auto_version;
 pub mod blobs;
 pub mod clock;
+pub mod dial;
 pub mod event;
 pub mod gossip;
 pub mod index;
@@ -63,7 +64,8 @@ pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry}
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{Branch, RoomLog, RoomMeta, Snapshot, Store, StoredOp};
 pub use tls::{
-    actor_from_client_cert, server_config_from_pem, server_config_from_pem_with_client_ca,
+    actor_from_client_cert, client_config_from_pem, client_config_from_pem_with_identity,
+    server_config_from_pem, server_config_from_pem_with_client_ca,
     server_config_from_pem_with_client_ca_mode, ClientAuthMode, TlsConfigError,
 };
 pub use webhook::{WebhookConfig, WebhookSink};

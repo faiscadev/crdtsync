@@ -17,7 +17,19 @@
 //! node is single-node and serves every room locally. A clustered node also needs
 //! `CRDTSYNC_CLUSTER_SECRET` — the shared credential that admits a link to this
 //! node's replication/gossip plane, at least 32 bytes and identical across the
-//! cluster (`openssl rand -hex 32`); without it a node with peers refuses to start. Set `CRDTSYNC_BLOB_ADDR` to
+//! cluster (`openssl rand -hex 32`); without it a node with peers refuses to start.
+//! A member's advertise address declares the transport its peers dial it over —
+//! `wss://host:port` terminates TLS, `ws://host:port` or a bare `host:port` does
+//! not — so a cluster part-way through a TLS rollout may hold both. Dialing a
+//! `wss://` member needs `CRDTSYNC_CLUSTER_CA`, a PEM trust bundle the member's
+//! certificate must chain to (nothing ambient stands in for it: the cluster secret
+//! is a bearer credential written over that link); `CRDTSYNC_CLUSTER_CLIENT_CERT` +
+//! `CRDTSYNC_CLUSTER_CLIENT_KEY` additionally present this node's own identity, so
+//! one handshake authenticates both ends when peers also set
+//! `CRDTSYNC_TLS_CLIENT_CA`. Set `CRDTSYNC_CLUSTER_REQUIRE_TLS=1` to declare the
+//! rollout finished and refuse a plaintext member outright. A node whose advertised
+//! transport disagrees with the one it terminates refuses to start rather than
+//! binding a listener its own peers cannot speak to. Set `CRDTSYNC_BLOB_ADDR` to
 //! serve the out-of-band blob upload/fetch HTTP plane there — a client stores a
 //! large blob and fetches it by handle; its store root is `CRDTSYNC_BLOB_ROOT` or
 //! a `blobs/` subdirectory of `CRDTSYNC_DATA_DIR`, and requests authenticate
@@ -52,10 +64,10 @@ use crdtsync_server::auth::CredentialsFileError;
 use crdtsync_server::membership::{Membership, MembershipConfigError};
 use crdtsync_server::runtime::{serve_with_authorizer_handle, ServeConfig};
 use crdtsync_server::{
-    serve_admin, serve_audit, serve_blobs, server_config_from_pem,
-    server_config_from_pem_with_client_ca_mode, AllowAll, AuditLog, Authorizer, BlobStore,
-    ClientAuthMode, PermitAll, SchemaRegistry, StaticTokens, Store, SystemClock, TlsConfigError,
-    Verifier, WebhookConfig, DEFAULT_REPLICATION_FACTOR,
+    client_config_from_pem, client_config_from_pem_with_identity, serve_admin, serve_audit,
+    serve_blobs, server_config_from_pem, server_config_from_pem_with_client_ca_mode, AllowAll,
+    AuditLog, Authorizer, BlobStore, ClientAuthMode, PermitAll, SchemaRegistry, StaticTokens,
+    Store, SystemClock, TlsConfigError, Verifier, WebhookConfig, DEFAULT_REPLICATION_FACTOR,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::rustls;
@@ -234,6 +246,81 @@ fn tls_config() -> std::io::Result<Option<Arc<rustls::ServerConfig>>> {
     }
 }
 
+/// The client-side TLS config for this run's outbound peer dials: the trust
+/// anchors at `CRDTSYNC_CLUSTER_CA` a TLS member is authenticated against before
+/// the link presents the cluster secret, optionally presenting this node's own
+/// identity from `CRDTSYNC_CLUSTER_CLIENT_CERT` + `CRDTSYNC_CLUSTER_CLIENT_KEY` so
+/// one handshake authenticates both ends. Unset, the node dials plaintext members
+/// only — and refuses to start if any member advertises `wss://`.
+///
+/// The client identity is deliberately its own pair rather than the listener's
+/// cert: a server certificate commonly carries `serverAuth` alone, so reusing it
+/// would work in a lab and be rejected at the handshake in a deployment that issues
+/// its certificates properly. Setting only one half of the pair, or either half
+/// without the trust bundle, is a clean startup error.
+fn peer_tls_config() -> std::io::Result<Option<Arc<rustls::ClientConfig>>> {
+    let invalid =
+        |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string());
+    let build = |e: TlsConfigError| {
+        let kind = match &e {
+            TlsConfigError::Io { source, .. } => source.kind(),
+            _ => std::io::ErrorKind::InvalidData,
+        };
+        std::io::Error::new(kind, e)
+    };
+    let identity =
+        match (
+            path_var("CRDTSYNC_CLUSTER_CLIENT_CERT")?,
+            path_var("CRDTSYNC_CLUSTER_CLIENT_KEY")?,
+        ) {
+            (Some(cert), Some(key)) => Some((cert, key)),
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => return Err(invalid(
+                "CRDTSYNC_CLUSTER_CLIENT_CERT and CRDTSYNC_CLUSTER_CLIENT_KEY must both be set to \
+                 present a peer client identity",
+            )),
+        };
+    match (path_var("CRDTSYNC_CLUSTER_CA")?, identity) {
+        (Some(ca), Some((cert, key))) => Ok(Some(
+            client_config_from_pem_with_identity(ca, cert, key).map_err(build)?,
+        )),
+        (Some(ca), None) => Ok(Some(client_config_from_pem(ca).map_err(build)?)),
+        (None, Some(_)) => Err(invalid(
+            "CRDTSYNC_CLUSTER_CLIENT_CERT requires CRDTSYNC_CLUSTER_CA: a peer identity is only \
+             presented on a link whose far end this node can authenticate",
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Whether this deployment refuses to dial a member that advertises plaintext,
+/// from `CRDTSYNC_CLUSTER_REQUIRE_TLS` — how an operator declares a TLS rollout
+/// finished. A cluster may otherwise mix transports, which is the only way to reach
+/// an all-TLS cluster without restarting every node at one instant.
+///
+/// Absence is `false`; `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` select it
+/// (case-insensitively). Any other value is a clean startup error — resolving an
+/// unrecognized value would resolve it to the *permissive* setting, which is the
+/// one an operator setting this variable is trying to leave.
+fn require_peer_tls() -> std::io::Result<bool> {
+    parse_require_peer_tls(path_var("CRDTSYNC_CLUSTER_REQUIRE_TLS")?.as_deref())
+}
+
+/// Parse the `CRDTSYNC_CLUSTER_REQUIRE_TLS` value. See [`require_peer_tls`].
+fn parse_require_peer_tls(value: Option<&str>) -> std::io::Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("CRDTSYNC_CLUSTER_REQUIRE_TLS must be a boolean, got `{other}`"),
+        )),
+    }
+}
+
 /// The zone-master key for the run: the 32 bytes sealing cross-zone-move capability
 /// tokens, read from `CRDTSYNC_ZONE_KEY` as 64 hex digits, else `None` (the
 /// cross-zone-move escape hatch stays off — every crossing rejected). A key of the
@@ -347,6 +434,8 @@ async fn main() -> std::io::Result<()> {
             membership: membership()?,
             cluster_secret: cluster_secret()?,
             tls,
+            peer_tls: peer_tls_config()?,
+            require_peer_tls: require_peer_tls()?,
             zone_key: zone_key()?,
             audit_log: audit_log.clone(),
             ..ServeConfig::default()
@@ -417,7 +506,7 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_zone_key;
+    use super::{decode_zone_key, parse_require_peer_tls};
 
     #[test]
     fn a_valid_64_hex_key_decodes() {
@@ -453,5 +542,30 @@ mod tests {
         hex.push('é'); // 2 bytes (0xC3 0xA9)
         assert_eq!(hex.len(), 64);
         assert!(decode_zone_key(&hex).is_err());
+    }
+
+    #[test]
+    fn an_absent_require_peer_tls_is_off() {
+        assert!(!parse_require_peer_tls(None).unwrap());
+    }
+
+    #[test]
+    fn require_peer_tls_reads_either_spelling_of_a_boolean() {
+        for on in ["1", "true", "TRUE", " Yes ", "on"] {
+            assert!(parse_require_peer_tls(Some(on)).unwrap(), "{on}");
+        }
+        for off in ["0", "false", "No", "off"] {
+            assert!(!parse_require_peer_tls(Some(off)).unwrap(), "{off}");
+        }
+    }
+
+    /// An unrecognized value resolves to the *permissive* setting if it resolves at
+    /// all — which is the one an operator setting this variable is leaving. So it
+    /// does not resolve.
+    #[test]
+    fn an_unrecognized_require_peer_tls_is_a_startup_error() {
+        for bad in ["", "yes please", "2", "require"] {
+            assert!(parse_require_peer_tls(Some(bad)).is_err(), "{bad}");
+        }
     }
 }

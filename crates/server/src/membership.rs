@@ -188,10 +188,10 @@ impl Membership {
         replication_factor: usize,
     ) -> Self {
         let members: Vec<NodeId> = std::iter::once(self_id.clone()).chain(peers).collect();
-        // A member seeded without a distinct advertise address dials at its node id
-        // — the identity every seed peer is derived from (`NodeId::from_addr`), so
-        // the id and the dial address coincide. `self` overrides this in
-        // `from_static_config` when a separate advertise address was configured.
+        // Every seeded member dials at its node id — the identity each is derived
+        // from (`NodeId::from_addr`), so the id and the dial address are the same
+        // string, self included. Gossip may later record a distinct address for a
+        // member it learns; a seeded one has none to distinguish.
         let addrs = members
             .iter()
             .map(|node| (node.clone(), node.as_bytes().to_vec()))

@@ -31,7 +31,6 @@ use tokio::sync::mpsc::{
 use tokio::sync::oneshot;
 use tokio_rustls::rustls;
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, COOKIE, SEC_WEBSOCKET_PROTOCOL};
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -39,6 +38,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Authorizer, PermitAll};
+use crate::dial::{PeerDialer, PeerStream};
 use crate::gossip::{GossipMember, GossipWireMember};
 use crate::membership::Membership;
 use crate::placement::NodeId;
@@ -118,6 +118,18 @@ pub struct ServeConfig {
     /// `None` (the default) binds plaintext, unchanged. Build it with
     /// [`server_config_from_pem`](crate::tls::server_config_from_pem).
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Client-side TLS for this node's outbound peer dials: the trust anchors a
+    /// TLS member is authenticated against before the link presents the cluster
+    /// secret, and optionally this node's own client identity so one handshake
+    /// authenticates both ends. Required whenever any member advertises `wss://`.
+    /// Build it with [`client_config_from_pem`](crate::tls::client_config_from_pem).
+    pub peer_tls: Option<Arc<rustls::ClientConfig>>,
+    /// Refuse to dial a member that advertises plaintext — how a deployment
+    /// declares its TLS rollout finished. Mixed transports are otherwise allowed,
+    /// because a live cluster cannot switch every node at one instant; but one
+    /// plaintext member still writes the deployment-wide cluster secret in the
+    /// clear, so the end state wants saying out loud rather than assuming.
+    pub require_peer_tls: bool,
     /// The 32-byte zone-master key sealing cross-zone-move capability tokens.
     /// `Some` enables the authorized cross-zone-move escape hatch; `None` (the
     /// default) leaves it off, so every cross-zone move stays rejected. Server
@@ -142,6 +154,8 @@ impl Default for ServeConfig {
             membership: None,
             cluster_secret: None,
             tls: None,
+            peer_tls: None,
+            require_peer_tls: false,
             zone_key: None,
             audit_log: None,
         }
@@ -343,6 +357,10 @@ async fn start_registry(
     // not at all. Checked first, ahead of the log replay and the accept loop, so a
     // misconfigured cluster fails immediately rather than after a long startup.
     let peer_secret = cluster_secret(&config)?;
+    // Resolve the transport of every configured member and refuse a deployment
+    // whose advertised transports cannot be honored — the silent non-convergence
+    // this replaces was a TLS listener whose peers dialed plaintext forever.
+    let dialer = peer_dialer(&config, peer_secret)?;
     // The read is blocking, so it runs on the blocking pool to keep the runtime
     // free for other tasks.
     let (rooms, store) = match store {
@@ -368,7 +386,7 @@ async fn start_registry(
     // channel the registry actor routes replication to, and reads the follower's
     // acks back into the actor as `Cmd::PeerAck`. Single-node (no membership) opens
     // no peer connections, so a plain deployment is unchanged.
-    let cluster = config.membership.as_ref().zip(peer_secret.as_ref());
+    let cluster = config.membership.as_ref().zip(dialer.as_ref());
     let peer_conns = spawn_peers(server, cluster, &cmds);
     // Run the anti-entropy gossip loop here, on this I/O-enabled runtime, behind the
     // same cluster gate as replication: it periodically gossips this node's member
@@ -764,6 +782,96 @@ fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
     }
 }
 
+/// Build the dialer every outbound node-to-node link runs under, validating that
+/// this deployment's advertised transports can actually be honored. A single-node
+/// deployment has no peer plane and gets none — peer-dial TLS material configured
+/// there is the same misconfiguration `cluster_secret` refuses for a secret without
+/// a membership.
+///
+/// The four refusals are all the same failure the operator would otherwise meet as
+/// a cluster that starts, binds, and never converges:
+///
+///  - a member's advertise address that resolves to no endpoint at all;
+///  - **this node's own advertised transport disagreeing with the one it
+///    terminates** — a node that terminates TLS while telling its peers to dial
+///    `ws://` (or the reverse) is unreachable to every one of them, which is the
+///    defect this unit exists to remove;
+///  - a `wss://` member with no trust anchors to authenticate it against, so the
+///    link could only hand the bearer secret to an unverified far end;
+///  - a plaintext member — self included, since a node that requires TLS of its
+///    peers and does not terminate it is refused by every peer running the same
+///    policy — in a deployment that declared its rollout finished.
+///
+/// A member *learned* after startup cannot be checked here; the same rules apply at
+/// its dial, and it is not dialed if they fail.
+fn peer_dialer(
+    config: &ServeConfig,
+    secret: Option<Arc<[u8]>>,
+) -> std::io::Result<Option<PeerDialer>> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
+    let (Some(membership), Some(secret)) = (&config.membership, secret) else {
+        if config.peer_tls.is_some() || config.require_peer_tls {
+            return Err(invalid(
+                "peer TLS configuration needs a cluster membership: single-node mode dials no \
+                 peers"
+                    .to_string(),
+            ));
+        }
+        return Ok(None);
+    };
+    let dialer = PeerDialer::new(secret, config.peer_tls.clone(), config.require_peer_tls);
+    let mut plaintext_peers = Vec::new();
+    for (node, addr) in membership.known_members() {
+        let addr = String::from_utf8_lossy(&addr).into_owned();
+        if membership.is_self(&node) {
+            // Self is not dialed; this address is the string its peers know it by,
+            // so what it declares is the transport every one of them will dial, and
+            // it must match the transport this node terminates.
+            let endpoint = crate::dial::PeerEndpoint::parse(&addr)
+                .map_err(|e| invalid(format!("this node's advertise address `{addr}`: {e}")))?;
+            if endpoint.is_tls() != config.tls.is_some() {
+                return Err(invalid(match endpoint.is_tls() {
+                    true => format!(
+                        "this node advertises `{addr}` but terminates no TLS, so every peer's \
+                         dial would fail: configure a TLS cert or advertise `ws://`"
+                    ),
+                    false => format!(
+                        "this node terminates TLS but advertises `{addr}`, so every peer would \
+                         dial plaintext into an encrypted listener: advertise `wss://`"
+                    ),
+                }));
+            }
+            if !endpoint.is_tls() && config.require_peer_tls {
+                return Err(invalid(format!(
+                    "this node refuses plaintext peer links but advertises `{addr}`: a node that \
+                     requires TLS of its peers must terminate it itself, or every peer running \
+                     the same policy refuses it"
+                )));
+            }
+            continue;
+        }
+        match dialer.endpoint(&addr) {
+            Ok(endpoint) if !endpoint.is_tls() => plaintext_peers.push(addr),
+            Ok(_) => {}
+            Err(e) => return Err(invalid(format!("cluster member `{addr}`: {e}"))),
+        }
+    }
+    // A cluster mid-rollout is allowed to mix transports — it is the only way to
+    // reach an all-TLS cluster without a flag-day restart — but the cluster secret
+    // is deployment-wide, so a single plaintext peer keeps exposing it and the
+    // operator is told which.
+    if config.tls.is_some() && !plaintext_peers.is_empty() {
+        eprintln!(
+            "crdtsync: this node terminates TLS but {} of its peers advertise plaintext ({}); \
+             the cluster secret is written in the clear on those links. Finish the rollout and \
+             set CRDTSYNC_CLUSTER_REQUIRE_TLS=1 to refuse them.",
+            plaintext_peers.len(),
+            plaintext_peers.join(", "),
+        );
+    }
+    Ok(Some(dialer))
+}
+
 /// Open an outbound peer connection to every cluster member other than self,
 /// returning the frame channel for each. Each spawned task owns the socket to one
 /// follower: it dials, presents the cluster secret, redials on drop, sends the
@@ -772,28 +880,28 @@ fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
 /// deployment dials no peers.
 fn spawn_peers(
     server: ClientId,
-    cluster: Option<(&Membership, &Arc<[u8]>)>,
+    cluster: Option<(&Membership, &PeerDialer)>,
     cmds: &UnboundedSender<Cmd>,
 ) -> HashMap<NodeId, Sender<Message>> {
     let mut peer_conns = HashMap::new();
-    let Some((membership, secret)) = cluster else {
+    let Some((membership, dialer)) = cluster else {
         return peer_conns;
     };
-    for member in membership.members() {
-        if membership.is_self(member) {
+    for (member, addr) in membership.known_members() {
+        if membership.is_self(&member) {
             continue;
         }
-        let addr = String::from_utf8_lossy(member.as_bytes()).into_owned();
+        let addr = String::from_utf8_lossy(&addr).into_owned();
         let (tx, rx) = channel::<Message>(PEER_FRAME_CAPACITY);
         tokio::spawn(peer_connection(
             server,
-            secret.clone(),
+            dialer.clone(),
             member.clone(),
             addr,
             rx,
             cmds.clone(),
         ));
-        peer_conns.insert(member.clone(), tx);
+        peer_conns.insert(member, tx);
     }
     peer_conns
 }
@@ -805,14 +913,14 @@ fn spawn_peers(
 /// back in.
 fn spawn_gossip(
     server: ClientId,
-    cluster: Option<(&Membership, &Arc<[u8]>)>,
+    cluster: Option<(&Membership, &PeerDialer)>,
     cmds: &UnboundedSender<Cmd>,
 ) {
-    let Some((membership, secret)) = cluster else {
+    let Some((membership, dialer)) = cluster else {
         return;
     };
     let self_id = membership.self_id().clone();
-    tokio::spawn(gossip_loop(server, secret.clone(), self_id, cmds.clone()));
+    tokio::spawn(gossip_loop(server, dialer.clone(), self_id, cmds.clone()));
 }
 
 /// The anti-entropy gossip round loop: each tick, snapshot this node's known
@@ -822,7 +930,7 @@ fn spawn_gossip(
 /// command channel closes (the registry shut down).
 async fn gossip_loop(
     server: ClientId,
-    secret: Arc<[u8]>,
+    dialer: PeerDialer,
     self_id: NodeId,
     cmds: UnboundedSender<Cmd>,
 ) {
@@ -850,7 +958,7 @@ async fn gossip_loop(
         let frame = crate::gossip::gossip_frame(&members);
         // A successful direct round is first-hand proof the peer is alive and
         // carries the liveness it advertised back.
-        let direct = crate::gossip::gossip_exchange(&addr, server, &secret, frame).await;
+        let direct = crate::gossip::gossip_exchange(&addr, server, &dialer, frame).await;
         // On a direct failure, ask a few other members for a second opinion (SWIM
         // ping-req) before counting the failure toward suspicion: a peer any relay
         // still reaches is not falsely suspected. The direct and indirect signals
@@ -858,7 +966,7 @@ async fn gossip_loop(
         let indirect = if direct.is_some() {
             Vec::new()
         } else {
-            indirect_probe(server, &secret, &members, &self_id, &peer, &peer_addr).await
+            indirect_probe(server, &dialer, &members, &self_id, &peer, &peer_addr).await
         };
         let reachable = crate::gossip::probe_outcome(direct.is_some(), &indirect);
         // A direct success carries the liveness the peer advertised back; an
@@ -884,7 +992,7 @@ async fn gossip_loop(
 /// itself unreachable) is no evidence either way.
 async fn indirect_probe(
     server: ClientId,
-    secret: &Arc<[u8]>,
+    dialer: &PeerDialer,
     members: &[GossipMember],
     self_id: &NodeId,
     peer: &NodeId,
@@ -897,9 +1005,9 @@ async fn indirect_probe(
         .map(|(_relay, relay_addr)| {
             let relay_addr = String::from_utf8_lossy(&relay_addr).into_owned();
             let peer_addr = peer_addr.to_vec();
-            let secret = secret.clone();
+            let dialer = dialer.clone();
             async move {
-                crate::gossip::ping_req_exchange(&relay_addr, server, &secret, &peer_addr).await
+                crate::gossip::ping_req_exchange(&relay_addr, server, &dialer, &peer_addr).await
             }
         })
         .collect();
@@ -976,6 +1084,39 @@ impl RefusalStreak {
     }
 }
 
+/// How many consecutive dials that never opened a link are tolerated before the
+/// node says so. A peer restarting or briefly unreachable costs a few; a peer this
+/// node can never reach — the wrong transport advertised, a certificate that chains
+/// to nothing this node trusts, a plaintext member a required-TLS deployment
+/// refuses — costs every one of them forever, and the symptom is otherwise a
+/// cluster that silently never converges.
+const PEER_UNREACHED_STREAK_WARN: u32 = 5;
+
+/// Consecutive dials to one peer that produced no link at all — distinct from
+/// [`RefusalStreak`], which counts links that *opened* and were then dropped. A
+/// dial that never opens is how a transport or trust misconfiguration presents.
+#[derive(Default)]
+struct DialStreak {
+    n: u32,
+}
+
+impl DialStreak {
+    /// Fold in a failed dial, returning whether to tell the operator now. Reported
+    /// every [`PEER_UNREACHED_STREAK_WARN`] failures rather than once, so an
+    /// operator attaching late still sees a permanent misconfiguration. The count
+    /// saturates rather than wrapping, which at the ceiling reports every dial —
+    /// louder rather than quieter.
+    fn observe(&mut self) -> bool {
+        self.n = self.n.saturating_add(1);
+        self.n % PEER_UNREACHED_STREAK_WARN == 0
+    }
+
+    /// A dial that opened a link: the peer is reachable, so the streak restarts.
+    fn reset(&mut self) {
+        self.n = 0;
+    }
+}
+
 /// Own the socket to one follower: dial it, relay the replication frames that
 /// arrive on `frames`, and forward the follower's acks back to the registry as
 /// [`Cmd::PeerAck`]. A dial failure or a dropped socket redials after a short
@@ -987,15 +1128,20 @@ impl RefusalStreak {
 /// how briefly each lived ([`RefusalStreak`]): the operator is told, and the redial
 /// backs off so a peer that will never accept is not dialed, and catch-up-encoded
 /// for, several times a second forever.
+///
+/// A dial that opens *no* link is the other shape ([`DialStreak`]) — the peer is
+/// down, or its advertised transport is one this node cannot honor. The operator is
+/// told after a run of them too, and a failure that no redial can fix
+/// ([`DialError::is_permanent`]) waits the long cadence rather than retrying, and
+/// reporting the follower down, four times a second forever.
 async fn peer_connection(
     server: ClientId,
-    secret: Arc<[u8]>,
+    dialer: PeerDialer,
     follower: NodeId,
     addr: String,
     mut frames: Receiver<Message>,
     cmds: UnboundedSender<Cmd>,
 ) {
-    let url = format!("ws://{addr}/");
     // Report the follower's reachability to the registry — the failover liveness
     // signal (Unit 6a). A down follower is skipped when electing a room's effective
     // leader, so a dead primary's rooms promote to the next live replica.
@@ -1006,9 +1152,11 @@ async fn peer_connection(
         });
     };
     let mut refusals = RefusalStreak::default();
+    let mut unreached = DialStreak::default();
     loop {
-        match connect_peer(&url, server, &secret).await {
-            Some((write, read)) => {
+        match connect_peer(&dialer, &addr, server).await {
+            Ok((write, read)) => {
+                unreached.reset();
                 mark(true);
                 let up = std::time::Instant::now();
                 // Pump until the socket or the frame channel closes, then redial.
@@ -1027,11 +1175,21 @@ async fn peer_connection(
                 // The link dropped: the follower is unreachable until it redials.
                 mark(false);
             }
-            None => {
+            Err(reason) => {
                 mark(false);
+                if unreached.observe() {
+                    eprintln!(
+                        "crdtsync: this node has not opened a link to peer {addr} in \
+                         {PEER_UNREACHED_STREAK_WARN} attempts: {reason}",
+                    );
+                }
                 // The frame channel closed while unreachable — nothing more to do.
                 if frames.is_closed() {
                     return;
+                }
+                if reason.is_permanent() {
+                    tokio::time::sleep(PEER_REFUSED_REDIAL_MAX).await;
+                    continue;
                 }
             }
         }
@@ -1039,18 +1197,35 @@ async fn peer_connection(
     }
 }
 
-type PeerWrite = futures_util::stream::SplitSink<WsStream, WsMessage>;
-type PeerRead = futures_util::stream::SplitStream<WsStream>;
-type WsStream =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type PeerWrite = futures_util::stream::SplitSink<PeerStream, WsMessage>;
+type PeerRead = futures_util::stream::SplitStream<PeerStream>;
 
-/// Dial the follower and open the relay peer connection: the 8-byte header, an
-/// empty-`app_id` `Hello` that resolves to a relay, then the `PeerAuth` carrying
-/// the cluster secret — which is what admits the link to the follower's peer plane,
-/// since the `Hello` names the same reserved replica id every node dials under.
-/// `None` if the dial or any opening frame fails.
-async fn connect_peer(url: &str, server: ClientId, secret: &[u8]) -> Option<(PeerWrite, PeerRead)> {
-    let (ws, _) = connect_async(url).await.ok()?;
+/// Dial the follower over the transport its advertise address declares and open
+/// the relay peer connection: the 8-byte header, an empty-`app_id` `Hello` that
+/// resolves to a relay, then the `PeerAuth` carrying the cluster secret — which is
+/// what admits the link to the follower's peer plane, since the `Hello` names the
+/// same reserved replica id every node dials under.
+///
+/// On a TLS member the dial has already verified the follower's certificate
+/// against this node's peer trust anchors by the time the header is written, so the
+/// secret is never presented to an unauthenticated far end.
+async fn connect_peer(
+    dialer: &PeerDialer,
+    addr: &str,
+    server: ClientId,
+) -> Result<(PeerWrite, PeerRead), crate::dial::DialError> {
+    let ws = dialer.connect(addr).await?;
+    let opened = open_peer_link(ws, server, dialer.secret()).await;
+    opened.ok_or(crate::dial::DialError::Unreachable)
+}
+
+/// Write the opening frames of a peer link on an open socket, returning its halves.
+/// `None` if any of them fails to write.
+async fn open_peer_link(
+    ws: PeerStream,
+    server: ClientId,
+    secret: &[u8],
+) -> Option<(PeerWrite, PeerRead)> {
     let (mut write, read) = ws.split();
     write
         .send(WsMessage::Binary(encode_header(PROTOCOL_VERSION).to_vec()))
@@ -1453,5 +1628,46 @@ mod tests {
         streak.observe(REFUSED);
         streak.observe(REFUSED);
         assert_eq!(streak.redial_delay(), PEER_REFUSED_REDIAL_MAX);
+    }
+
+    #[test]
+    fn a_run_of_failed_dials_warns_at_the_threshold() {
+        let mut streak = DialStreak::default();
+        for _ in 1..PEER_UNREACHED_STREAK_WARN {
+            assert!(!streak.observe(), "warned before the threshold");
+        }
+        assert!(streak.observe(), "did not warn at the threshold");
+    }
+
+    /// A peer this node can never reach — the wrong transport advertised, a cert
+    /// chaining to nothing it trusts — is reported every run, not once, so an
+    /// operator attaching late still sees it.
+    #[test]
+    fn a_permanent_dial_failure_warns_every_run() {
+        let mut streak = DialStreak::default();
+        let warns = (0..PEER_UNREACHED_STREAK_WARN * 4)
+            .filter(|_| streak.observe())
+            .count();
+        assert_eq!(warns, 4);
+    }
+
+    #[test]
+    fn a_dial_that_opened_a_link_clears_the_streak() {
+        let mut streak = DialStreak::default();
+        for _ in 1..PEER_UNREACHED_STREAK_WARN {
+            streak.observe();
+        }
+        streak.reset();
+        for _ in 1..PEER_UNREACHED_STREAK_WARN {
+            assert!(!streak.observe(), "the streak did not reset");
+        }
+    }
+
+    #[test]
+    fn the_dial_streak_saturates_without_overflowing() {
+        let mut streak = DialStreak { n: u32::MAX - 1 };
+        streak.observe();
+        streak.observe();
+        streak.observe();
     }
 }

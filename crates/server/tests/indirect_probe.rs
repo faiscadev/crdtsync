@@ -46,6 +46,12 @@ fn cluster() -> Vec<GossipMember> {
 /// node's peer plane only on a link that presented it (C10).
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
+/// The dialer these socket tests dial under: this cluster's secret, no client-side
+/// TLS — every node here advertises a bare `host:port`, which is plaintext.
+fn plaintext_dialer() -> crdtsync_server::dial::PeerDialer {
+    crdtsync_server::dial::PeerDialer::new(std::sync::Arc::from(CLUSTER_SECRET), None, false)
+}
+
 #[test]
 fn relays_exclude_self_and_target() {
     let members = cluster();
@@ -216,7 +222,7 @@ async fn ping_req_confirms_a_known_live_member() {
     let relay = tokio::spawn(serve_with(relay_l, cid(0xF0), None, config));
 
     // Ask the relay for its view of B — a member it knows and holds live.
-    let verdict = ping_req_exchange(&relay_addr, cid(0xEE), CLUSTER_SECRET, B.as_bytes())
+    let verdict = ping_req_exchange(&relay_addr, cid(0xEE), &plaintext_dialer(), B.as_bytes())
         .await
         .expect("the relay answers a ping-ack");
     assert!(verdict, "the relay vouches for a known, live member");
@@ -243,7 +249,7 @@ async fn ping_req_declines_a_stranger() {
 
     // Ask about D — not one of the relay's members: it never vouches for a
     // stranger (nor dials it), so the answer is unreachable, not optimistic.
-    let verdict = ping_req_exchange(&relay_addr, cid(0xEE), CLUSTER_SECRET, D.as_bytes())
+    let verdict = ping_req_exchange(&relay_addr, cid(0xEE), &plaintext_dialer(), D.as_bytes())
         .await
         .expect("the relay still answers a ping-ack");
     assert!(!verdict, "the relay does not vouch for a non-member");
@@ -261,6 +267,7 @@ async fn ping_req_to_an_unreachable_relay_is_no_evidence() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_relay = l.local_addr().unwrap().to_string();
     drop(l);
-    let verdict = ping_req_exchange(&dead_relay, cid(0xEE), CLUSTER_SECRET, C.as_bytes()).await;
+    let verdict =
+        ping_req_exchange(&dead_relay, cid(0xEE), &plaintext_dialer(), C.as_bytes()).await;
     assert_eq!(verdict, None, "an unreachable relay yields no verdict");
 }
