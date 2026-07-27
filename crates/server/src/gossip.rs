@@ -206,15 +206,23 @@ pub fn probe_outcome(direct_reachable: bool, indirect: &[Option<bool>]) -> bool 
 pub async fn ping_req_exchange(
     relay_addr: &str,
     server: ClientId,
+    secret: &[u8],
     target_addr: &[u8],
 ) -> Option<bool> {
     let frame = Message::PingReq {
         target: target_addr.to_vec(),
     };
-    relay_roundtrip(relay_addr, server, frame, PING_REQ_TIMEOUT, |m| match m {
-        Message::PingAck { reachable } => Some(reachable),
-        _ => None,
-    })
+    relay_roundtrip(
+        relay_addr,
+        server,
+        secret,
+        frame,
+        PING_REQ_TIMEOUT,
+        |m| match m {
+            Message::PingAck { reachable } => Some(reachable),
+            _ => None,
+        },
+    )
     .await
     .flatten()
 }
@@ -228,9 +236,10 @@ pub async fn ping_req_exchange(
 pub async fn gossip_exchange(
     addr: &str,
     server: ClientId,
+    secret: &[u8],
     frame: Message,
 ) -> Option<Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>> {
-    relay_roundtrip(addr, server, frame, GOSSIP_TIMEOUT, |m| match m {
+    relay_roundtrip(addr, server, secret, frame, GOSSIP_TIMEOUT, |m| match m {
         Message::Gossip { members } => Some(members),
         _ => None,
     })
@@ -241,15 +250,16 @@ pub async fn gossip_exchange(
 /// Open an ephemeral relay connection to `addr`, push one `frame`, and pull the
 /// peer's reply, returning the first inbound message `extract` accepts. Shared by
 /// the node-to-node exchanges (gossip anti-entropy and ping-req): the 8-byte
-/// header, the empty-`app_id` Hello that resolves to a relay so the peer accepts
-/// the node frame that follows, the send, then the read loop that skips control
-/// frames until `extract` yields. `None` on any dial/handshake/send failure, on a
-/// close before a match, or if nothing matches within `timeout`. The outer `Option`
-/// (from the timeout) and the inner (from the read) both collapse to "no reply", so
-/// callers `.flatten()`.
+/// header, the empty-`app_id` Hello that resolves to a relay, the `PeerAuth` that
+/// admits the link to the peer's node-to-node plane, the send, then the read loop
+/// that skips control frames until `extract` yields. `None` on any
+/// dial/handshake/send failure, on a close before a match, or if nothing matches
+/// within `timeout`. The outer `Option` (from the timeout) and the inner (from the
+/// read) both collapse to "no reply", so callers `.flatten()`.
 async fn relay_roundtrip<T>(
     addr: &str,
     server: ClientId,
+    secret: &[u8],
     frame: Message,
     timeout: Duration,
     extract: impl Fn(Message) -> Option<T>,
@@ -262,9 +272,8 @@ async fn relay_roundtrip<T>(
             .send(WsMessage::Binary(encode_header(PROTOCOL_VERSION).to_vec()))
             .await
             .ok()?;
-        // An empty-`app_id` Hello resolves to a relay, so the peer accepts the
-        // node-to-node frame that follows. It advertises no codec: this link
-        // pushes a frame and reads for one reply shape, with nowhere to fold a
+        // An empty-`app_id` Hello resolves to a relay. It advertises no codec: this
+        // link pushes a frame and reads for one reply shape, with nowhere to fold a
         // selection, so it must not invite one — it speaks the codec silence
         // carries. Negotiating peer links waits on a second codec existing.
         let hello = Message::Hello {
@@ -275,6 +284,16 @@ async fn relay_roundtrip<T>(
         };
         write
             .send(WsMessage::Binary(encode_message(&hello)))
+            .await
+            .ok()?;
+        // The cluster secret is what admits the node-to-node frame that follows —
+        // the Hello names the reserved replica id every node dials under, so it
+        // distinguishes nothing.
+        let auth = Message::PeerAuth {
+            secret: secret.to_vec(),
+        };
+        write
+            .send(WsMessage::Binary(encode_message(&auth)))
             .await
             .ok()?;
         write

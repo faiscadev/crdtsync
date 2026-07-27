@@ -970,6 +970,9 @@ impl ClientSession {
             Message::PingAck { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent a ping-ack"))
             }
+            Message::PeerAuth { .. } => {
+                Err(ClientError::UnexpectedMessage("server sent a peer auth"))
+            }
         }
     }
 

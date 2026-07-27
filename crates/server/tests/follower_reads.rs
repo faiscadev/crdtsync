@@ -65,6 +65,7 @@ fn node(self_addr: Option<&str>) -> Registry {
     r.set_clock(Arc::new(ManualClock::new(0)));
     if let Some(addr) = self_addr {
         r.set_membership(membership_for(addr));
+        r.set_cluster_secret(CLUSTER_SECRET.to_vec());
     }
     r
 }
@@ -150,7 +151,7 @@ fn caught_up_follower(leader: &mut Registry, room: &[u8], writes: usize) -> Regi
     commit_writes(leader, room, writes);
     let frames = leader.take_replication();
     let mut follower = node(Some(B));
-    let peer = follower.connect();
+    let peer = peer_conn(&mut follower);
     for (nodeid, frame) in frames {
         if nodeid == b {
             assert!(follower.deliver(peer, frame), "follower applies the frame");
@@ -162,6 +163,26 @@ fn caught_up_follower(leader: &mut Registry, room: &[u8], writes: usize) -> Regi
         "the follower reached the leader's watermark"
     );
     follower
+}
+
+/// The cluster secret these nodes share — what admits a node-to-node link to a
+/// peer's replication plane. A connection that has not presented it reaches none
+/// of the node-to-node handlers (C10).
+const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
+
+/// A connection admitted to `r`'s peer plane, as a member's dialed link is.
+fn peer_conn(r: &mut Registry) -> ConnId {
+    let id = r.connect();
+    assert!(
+        r.deliver(
+            id,
+            Message::PeerAuth {
+                secret: CLUSTER_SECRET.to_vec(),
+            },
+        ),
+        "the cluster secret admits a peer",
+    );
+    id
 }
 
 // --- bounded staleness: a caught-up follower serves the read locally ---

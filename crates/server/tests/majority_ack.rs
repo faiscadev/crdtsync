@@ -433,6 +433,10 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// The cluster secret the two socket nodes share — what admits the leader's
+/// dialed link to the follower's peer plane (C10).
+const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
+
 /// A two-member cluster, self chosen by `me`, at replication factor 2 — so a
 /// room's replica set is the primary plus one follower and a majority is both.
 fn two_node_membership(me: &str, other: &str) -> Membership {
@@ -556,6 +560,7 @@ async fn a_client_write_acks_only_after_the_follower_holds_it() {
         None,
         ServeConfig {
             membership: Some(two_node_membership(&follower_addr, &leader_addr)),
+            cluster_secret: Some(CLUSTER_SECRET.to_vec()),
             ..ServeConfig::default()
         },
     ));
@@ -565,6 +570,7 @@ async fn a_client_write_acks_only_after_the_follower_holds_it() {
         None,
         ServeConfig {
             membership: Some(two_node_membership(&leader_addr, &follower_addr)),
+            cluster_secret: Some(CLUSTER_SECRET.to_vec()),
             ..ServeConfig::default()
         },
     ));
@@ -610,6 +616,7 @@ async fn a_client_write_stalls_with_no_follower() {
         None,
         ServeConfig {
             membership: Some(two_node_membership(&leader_addr, &follower_addr)),
+            cluster_secret: Some(CLUSTER_SECRET.to_vec()),
             ..ServeConfig::default()
         },
     ));

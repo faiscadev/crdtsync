@@ -14,7 +14,10 @@
 //! cluster — the node holds its member view and placement, deriving its own id
 //! from `CRDTSYNC_NODE_ID` or `CRDTSYNC_ADVERTISE_ADDR`, with
 //! `CRDTSYNC_REPLICATION_FACTOR` overriding the per-room replica count; unset, the
-//! node is single-node and serves every room locally. Set `CRDTSYNC_BLOB_ADDR` to
+//! node is single-node and serves every room locally. A clustered node also needs
+//! `CRDTSYNC_CLUSTER_SECRET` — the shared credential that admits a link to this
+//! node's replication/gossip plane, at least 32 bytes and identical across the
+//! cluster (`openssl rand -hex 32`); without it a node with peers refuses to start. Set `CRDTSYNC_BLOB_ADDR` to
 //! serve the out-of-band blob upload/fetch HTTP plane there — a client stores a
 //! large blob and fetches it by handle; its store root is `CRDTSYNC_BLOB_ROOT` or
 //! a `blobs/` subdirectory of `CRDTSYNC_DATA_DIR`, and requests authenticate
@@ -159,6 +162,25 @@ fn membership() -> std::io::Result<Option<Membership>> {
                 std::io::Error::new(kind, e)
             })?;
     Ok(Some(m))
+}
+
+/// The node's cluster secret for the run, read from `CRDTSYNC_CLUSTER_SECRET`. It
+/// is the whole of a node's peer authentication — what admits a link to this node's
+/// replication, gossip and probe plane — so every node in one cluster carries the
+/// same value and nobody else does. Required alongside `CRDTSYNC_CLUSTER_PEERS`, and
+/// at least `MIN_CLUSTER_SECRET_LEN` bytes; `serve` refuses to start otherwise, so a
+/// clustered node never comes up with an open or a closed peer plane by accident.
+/// Generate one with `openssl rand -hex 32`.
+///
+/// Surrounding whitespace is trimmed, as the peer list's entries are: the secret is
+/// compared byte for byte, so a value sourced from a file or a mounted k8s secret —
+/// which carries a trailing newline — would otherwise differ from the same value
+/// exported in a shell and the cluster would simply never converge. A secret that is
+/// only whitespace is no secret and reads as unset.
+fn cluster_secret() -> std::io::Result<Option<Vec<u8>>> {
+    Ok(path_var("CRDTSYNC_CLUSTER_SECRET")?
+        .map(|raw| raw.trim().as_bytes().to_vec())
+        .filter(|secret| !secret.is_empty()))
 }
 
 /// The TLS termination config for the run: a `rustls::ServerConfig` loaded from
@@ -323,6 +345,7 @@ async fn main() -> std::io::Result<()> {
             schema: schema.clone(),
             webhook: webhook()?,
             membership: membership()?,
+            cluster_secret: cluster_secret()?,
             tls,
             zone_key: zone_key()?,
             audit_log: audit_log.clone(),

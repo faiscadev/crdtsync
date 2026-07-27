@@ -1069,9 +1069,10 @@ pub fn step(
         Message::Branches { .. } => violation("client sent a branch set"),
         // A redirect is the server's own routing reply; a client never sends one.
         Message::Redirect { .. } => violation("client sent a redirect"),
-        // Replication frames travel node-to-node between replicas — the registry
-        // handles them off the client session path. A client that sends one on
-        // its own data plane commits a protocol violation.
+        // Replication frames travel node-to-node between replicas, on a connection
+        // that has presented the cluster secret — the registry handles them there,
+        // off the client session path. One arriving here came from a connection with
+        // no claim on the peer plane, so it is the protocol violation it looks like.
         Message::Replicate { .. } => violation("client sent a replicate"),
         Message::ReplicaAck { .. } => violation("client sent a replica ack"),
         Message::ReplicateSnapshot { .. } => violation("client sent a replicate snapshot"),
@@ -1083,6 +1084,10 @@ pub fn step(
         // services off the client session path; a client that sends one violates.
         Message::PingReq { .. } => violation("client sent a ping-req"),
         Message::PingAck { .. } => violation("client sent a ping-ack"),
+        // The registry answers a peer-plane admission itself, ahead of the session
+        // step, so one reaching a session came from a caller driving `step` directly
+        // — never the client data plane, where it is a violation like the rest.
+        Message::PeerAuth { .. } => violation("client sent a peer auth"),
     }
 }
 

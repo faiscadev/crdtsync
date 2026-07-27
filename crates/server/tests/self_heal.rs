@@ -54,6 +54,7 @@ fn node(self_addr: Option<&str>) -> Registry {
     r.set_clock(Arc::new(ManualClock::new(0)));
     if let Some(addr) = self_addr {
         r.set_membership(membership_for(addr));
+        r.set_cluster_secret(CLUSTER_SECRET.to_vec());
     }
     r
 }
@@ -137,12 +138,32 @@ fn ops_dialed_to(frames: &[(NodeId, Message)], b: &NodeId) -> usize {
 
 /// Apply every frame dialed to `b` into `follower`.
 fn apply_to(follower: &mut Registry, frames: Vec<(NodeId, Message)>, b: &NodeId) {
-    let peer = follower.connect();
+    let peer = peer_conn(follower);
     for (n, frame) in frames {
         if &n == b {
             assert!(follower.deliver(peer, frame));
         }
     }
+}
+
+/// The cluster secret these nodes share — what admits a node-to-node link to a
+/// peer's replication plane. A connection that has not presented it reaches none
+/// of the node-to-node handlers (C10).
+const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
+
+/// A connection admitted to `r`'s peer plane, as a member's dialed link is.
+fn peer_conn(r: &mut Registry) -> ConnId {
+    let id = r.connect();
+    assert!(
+        r.deliver(
+            id,
+            Message::PeerAuth {
+                secret: CLUSTER_SECRET.to_vec(),
+            },
+        ),
+        "the cluster secret admits a peer",
+    );
+    id
 }
 
 // --- a wiped follower reporting a lower head is caught up from THERE, not its ack ---
@@ -396,7 +417,7 @@ fn a_follower_reports_and_the_leader_catches_it_up_through_the_frame() {
 
     // The leader receives the self-describing report and catches B up from head 0
     // (fail-closed, empty manifest) — no connection identity needed.
-    let peer = leader.connect();
+    let peer = peer_conn(&mut leader);
     for (_, frame) in reports {
         leader.deliver(peer, frame);
     }
@@ -457,7 +478,7 @@ fn reporting_a_room_this_node_does_not_lead_dials_nothing() {
     // Seed the room on A via a replicated frame so it exists in A's hub.
     let mut w = doc(7);
     let ops = w.transact(|tx| tx.register(b"x", Scalar::Int(1)));
-    let peer = a_node.connect();
+    let peer = peer_conn(&mut a_node);
     a_node.deliver(
         peer,
         Message::Replicate {

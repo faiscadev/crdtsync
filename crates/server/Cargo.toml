@@ -52,6 +52,9 @@ x509-parser = "0.16"
 # ChaCha20-Poly1305 (RustCrypto) is constant-time in software with no AES-NI
 # dependency; the crypto lives in the server, never the wasm-embeddable core.
 chacha20poly1305 = "0.10"
+# A presented cluster secret is compared against the configured one in constant
+# time, so a rejected peer link leaks nothing about how far the guess matched.
+subtle = "2"
 
 [[bin]]
 name = "crdtsync-server"
