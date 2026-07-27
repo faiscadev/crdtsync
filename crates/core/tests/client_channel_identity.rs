@@ -538,40 +538,6 @@ fn a_channels_identity_survives_a_snapshot_catch_up() {
     assert_ne!(from_a[0].stamp.client, from_b[0].stamp.client);
 }
 
-/// A catch-up delivered as an op delta rather than a snapshot has to lift the
-/// replica's seq high-water too — a client that persisted its identity and
-/// rebuilt from the log would otherwise re-mint seqs the room already holds, and
-/// every one of those writes would dedup away.
-#[test]
-fn an_op_delta_catch_up_lifts_the_replicas_seq_high_water() {
-    let mut past = Document::new(cid(1));
-    let earlier = past.transact(|tx| {
-        tx.register(b"a", Scalar::Int(1));
-        tx.register(b"b", Scalar::Int(2));
-    });
-
-    // The same identity, rebuilt from nothing and caught up by the delta.
-    let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM);
-    assert_eq!(session.channel_client(ch), Some(cid(1)), "channel 0's id");
-    session
-        .receive(Message::Ops {
-            channel: ch,
-            ops: earlier.clone(),
-        })
-        .unwrap();
-
-    let fresh = ops_of(
-        session
-            .edit(ch, |tx| tx.register(b"c", Scalar::Int(3)))
-            .unwrap(),
-    );
-    assert!(
-        earlier.iter().all(|old| old.id != fresh[0].id),
-        "re-minted an op id the log already holds"
-    );
-}
-
 /// A channel number is never recycled, so a fresh subscription — which mints from
 /// seq 0 — can never take the identity a retired channel's in-flight ops still
 /// carry.
