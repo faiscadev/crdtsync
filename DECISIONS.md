@@ -7,7 +7,7 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
-## 2026-07-27 · C10 unauthenticated peer plane (#PR) · the node-to-node frames are gated on a deployment cluster secret presented per link, and are a client-plane violation everywhere else
+## 2026-07-27 · C10 unauthenticated peer plane (#353) · the node-to-node frames are gated on a deployment cluster secret presented per link, and are a client-plane violation everywhere else
 
 **The defect.** `Registry::deliver` intercepted `Replicate`, `ReplicateSnapshot`, `Gossip`, `FollowerHeads` and `PingReq` ahead of the client session step, for **any** connection — no Hello, no `Auth`, no author check — and `apply_replicate` called `hub.ingest` directly. On any clustered node a bare socket that had said nothing at all could push arbitrary ops into any room in that node's replica set, and an ordinary subscriber then read them. Measured during C6, not argued: a probe sweeping room names and epochs against a 5-member/N=3 node had the frame accepted for every room the node replicates, and every one of those writes was served to a normal reader — including ops authored under the node's own replica identity, which the client-path op gate refuses. Bypassed in one frame: the identity reservation, the doc-ACL write tier, the schema tier, the cross-zone token gate, and leadership. The `Message::Replicate { .. } => violation("client sent a replicate")` arm in `session.rs` was dead code; nothing reached it.
 
