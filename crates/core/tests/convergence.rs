@@ -556,3 +556,106 @@ fn pooled_ops_converge_under_every_permutation() {
         );
     }
 }
+
+/// Deliver `ops` to a fresh replica in `rounds` independently shuffled passes,
+/// so every op arrives out of order and is re-delivered, then fingerprint it.
+fn converge_shuffled(ops: &[Op], client: u8, rounds: usize, rng: &mut Rng) -> String {
+    let mut d = Document::new(cid(client));
+    for _ in 0..rounds {
+        for op in shuffle(ops, rng) {
+            d.apply(&op);
+        }
+    }
+    fingerprint(&d)
+}
+
+/// Atomic grouping must not change what a set of ops merges to. The same
+/// identically-seeded generator drives two pools — one shipping each burst as an
+/// atomic transaction, one streaming the same edits ungrouped — and both must
+/// converge under shuffled re-delivery. Grouping is a visibility boundary; a
+/// member whose container is displaced when its group commits has to wait for
+/// the container rather than apply into it and lose its effect.
+#[test]
+fn atomic_groups_do_not_change_what_ops_merge_to() {
+    // Miri interprets every op, and this sweep folds each pool many times over;
+    // keep its share of the core Miri shard small — a native run covers the band.
+    let seeds = if cfg!(miri) { 1 } else { 120 };
+    let shuffles = if cfg!(miri) { 2 } else { 6 };
+    for seed in 0..seeds {
+        for &atomic in &[true, false] {
+            let mut rng = Rng::new(seed);
+            let mut replicas = [
+                Document::new(cid(1)),
+                Document::new(cid(2)),
+                Document::new(cid(3)),
+            ];
+            let mut pool: Vec<Op> = Vec::new();
+            let mut delivered = [0usize; 3];
+            for _ in 0..14 {
+                let which = rng.below(replicas.len());
+                if rng.below(2) == 0 {
+                    for op in &pool[delivered[which]..] {
+                        replicas[which].apply(op);
+                    }
+                    delivered[which] = pool.len();
+                }
+                // A burst of 1–3 edits, shipped as one atomic transaction or as
+                // the same ops ungrouped.
+                let burst = 1 + rng.below(3);
+                if atomic {
+                    replicas[which].begin_atomic();
+                    for _ in 0..burst {
+                        let _ = random_edit(&mut replicas[which], &mut rng);
+                    }
+                    pool.extend(replicas[which].commit_atomic());
+                } else {
+                    for _ in 0..burst {
+                        let ops = random_edit(&mut replicas[which], &mut rng);
+                        pool.extend(ops);
+                    }
+                }
+            }
+            // Guard the oracle against a silently empty or single-member pool:
+            // groups of one commit the moment they arrive and would exercise none
+            // of the multi-member commit path this test exists for.
+            assert!(
+                pool.len() > 10,
+                "seed {seed}: the generator produced too little to exercise a group"
+            );
+            let tagged = pool.iter().filter(|op| op.tx.is_some()).count();
+            if atomic {
+                assert_eq!(tagged, pool.len(), "seed {seed}: every op rides a group");
+                assert!(
+                    pool.iter()
+                        .any(|op| op.tx.as_ref().is_some_and(|tx| tx.count > 1)),
+                    "seed {seed}: no group holds more than one member"
+                );
+            } else {
+                assert_eq!(tagged, 0, "seed {seed}: the control ships nothing tagged");
+            }
+
+            let reference = converge(&pool, 100);
+            for round in 0..shuffles {
+                assert_eq!(
+                    converge_shuffled(&pool, 130 + round as u8, 2, &mut rng),
+                    reference,
+                    "seed {seed}: atomic={atomic} shuffle {round} diverged"
+                );
+            }
+
+            // The authors themselves are replicas: each has applied its own edits
+            // eagerly and every peer op it was handed, so folding in the whole
+            // pool must land them on the same state as a fresh replica.
+            for (i, r) in replicas.iter_mut().enumerate() {
+                for op in shuffle(&pool, &mut rng) {
+                    r.apply(&op);
+                }
+                assert_eq!(
+                    fingerprint(r),
+                    reference,
+                    "seed {seed}: atomic={atomic} author {i} diverged from a fresh replica"
+                );
+            }
+        }
+    }
+}
