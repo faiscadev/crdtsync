@@ -23,6 +23,12 @@
 //! same frames from a bare socket.
 
 use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 use crdtsync_core::protocol::{Channel, PROTOCOL_VERSION};
 use crdtsync_core::{
@@ -768,13 +774,6 @@ async fn a_secret_without_a_cluster_refuses_to_start() {
 
 // --- over real sockets ---
 
-use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-
-use futures_util::{SinkExt, StreamExt};
-use std::time::Duration;
-
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// A two-member cluster, self chosen by `me`, at replication factor 2 — a room's
@@ -792,7 +791,7 @@ fn clustered(me: &str, other: &str) -> ServeConfig {
 }
 
 async fn send_frame(ws: &mut Ws, msg: &Message) {
-    ws.send(WsMessage::Binary(encode_message(msg).into()))
+    ws.send(WsMessage::Binary(encode_message(msg)))
         .await
         .unwrap();
 }
@@ -801,11 +800,9 @@ async fn send_frame(ws: &mut Ws, msg: &Message) {
 /// stranger who can reach the port has to do before a node-to-node frame.
 async fn open_bare(addr: &str) -> Ws {
     let (mut ws, _) = connect_async(format!("ws://{addr}/")).await.unwrap();
-    ws.send(WsMessage::Binary(
-        encode_header(PROTOCOL_VERSION).to_vec().into(),
-    ))
-    .await
-    .unwrap();
+    ws.send(WsMessage::Binary(encode_header(PROTOCOL_VERSION).to_vec()))
+        .await
+        .unwrap();
     ws
 }
 
@@ -954,6 +951,68 @@ async fn two_real_nodes_still_replicate_end_to_end() {
             assert_eq!(ops.len(), 1, "the follower served the replicated write")
         }
         other => panic!("the follower did not serve the replicated write: {other:?}"),
+    }
+
+    leader.abort();
+    follower.abort();
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)] // binds and dials loopback servers over real sockets
+async fn two_real_nodes_with_different_secrets_do_not_replicate() {
+    // The counterfactual to the test above, and the thing an operator most needs to
+    // be true: a node whose secret does not match the cluster's is refused at the
+    // peer plane exactly as a stranger is. The leader's dial is accepted at the TCP
+    // level and then dropped, so the write never reaches a majority and its Accepted
+    // is never released — the same fail-closed shape as having no follower at all.
+    let follower_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let follower_addr = follower_listener.local_addr().unwrap().to_string();
+    let leader_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_addr = leader_listener.local_addr().unwrap().to_string();
+    let room = room_led_by(&leader_addr, &follower_addr);
+
+    let mut odd_one_out = clustered(&follower_addr, &leader_addr);
+    odd_one_out.cluster_secret = Some(b"a-different-cluster-secret-entirely".to_vec());
+    let follower = tokio::spawn(serve_with(follower_listener, cid(0xF0), None, odd_one_out));
+    let leader = tokio::spawn(serve_with(
+        leader_listener,
+        cid(0xFF),
+        None,
+        clustered(&leader_addr, &follower_addr),
+    ));
+
+    let mut writer = open_client(&leader_addr).await;
+    subscribe(&mut writer, &room).await;
+    send_frame(
+        &mut writer,
+        &Message::Ops {
+            channel: CH,
+            ops: doc(1).transact(|tx| tx.register(b"k", Scalar::Int(1))),
+        },
+    )
+    .await;
+
+    assert!(
+        next_matching(&mut writer, Duration::from_secs(5), |m| matches!(
+            m,
+            Message::Accepted { .. }
+        ))
+        .await
+        .is_none(),
+        "the leader acked a write a mismatched-secret follower cannot have held",
+    );
+
+    // And nothing reached the follower's replica: a reader there is served an empty
+    // room (or redirected to the leader), never the write the leader committed.
+    let mut reader = open_client(&follower_addr).await;
+    let served = subscribe(&mut reader, &room).await;
+    match served {
+        Some(Message::Ops { ops, .. }) => assert!(
+            ops.is_empty(),
+            "the write reached a follower that never presented the cluster secret",
+        ),
+        Some(Message::Redirect { .. }) | None => {}
+        other => panic!("unexpected subscribe reply: {other:?}"),
     }
 
     leader.abort();

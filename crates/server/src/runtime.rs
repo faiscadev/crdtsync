@@ -913,10 +913,17 @@ async fn indirect_probe(
     results
 }
 
-/// How many consecutive links that came up and immediately closed are tolerated
-/// before the node says so. A follower restarting drops one or two links in a row;
-/// a cluster secret that does not match drops every one of them forever, and the
-/// symptom is otherwise a cluster that silently never converges.
+/// How long a link must survive to count as one the peer accepted. A refused link
+/// is closed as soon as the peer reads the opening frames, so it dies in about a
+/// round trip; a link that carried real traffic and then dropped lived orders of
+/// magnitude longer. Loopback round trips are well under a millisecond and a
+/// cross-datacenter one is a few, so this separates the two by a wide margin.
+const PEER_LINK_MIN_HEALTHY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How many consecutive short-lived links are tolerated before the node says so.
+/// A follower restarting drops one or two in a row; a cluster secret that does not
+/// match drops every one of them forever, and the symptom is otherwise a cluster
+/// that silently never converges.
 const PEER_REJECTION_STREAK_WARN: u32 = 20;
 
 /// Own the socket to one follower: dial it, relay the replication frames that
@@ -927,9 +934,12 @@ const PEER_REJECTION_STREAK_WARN: u32 = 20;
 ///
 /// A link the follower *refuses* — a cluster secret that does not match its own —
 /// looks like any other dropped socket from here: the dial only proves the opening
-/// frames were written, never that they were accepted. So a run of links that come
-/// up and close without carrying anything is reported once, naming the peer, rather
-/// than left as a silent redial loop.
+/// frames were written, never that they were accepted. What separates the two is
+/// how long the link lived, so a run of links that die within a round trip of
+/// coming up is reported once, naming the peer, rather than left as a silent redial
+/// loop. Whether a link carried a frame says nothing: this node queues a
+/// `FollowerHeads` for every peer the moment its link comes up, so even a refused
+/// link is written to before the peer's close arrives.
 async fn peer_connection(
     server: ClientId,
     secret: Arc<[u8]>,
@@ -948,27 +958,31 @@ async fn peer_connection(
             live,
         });
     };
-    // Consecutive links that carried nothing at all — the signature of a peer that
-    // refuses this node's cluster secret. Reset by any link that exchanges a frame.
-    let mut barren_links: u32 = 0;
+    // Consecutive links the peer closed within a round trip of accepting them — the
+    // signature of a peer refusing this node's cluster secret. Reset by any link
+    // that survived long enough to have been admitted.
+    let mut refused_links: u32 = 0;
     loop {
         match connect_peer(&url, server, &secret).await {
             Some((write, read)) => {
                 mark(true);
+                let up = std::time::Instant::now();
                 // Pump until the socket or the frame channel closes, then redial.
-                let (channel_closed, exchanged) =
-                    pump_peer(write, read, &follower, &mut frames, &cmds).await;
-                if channel_closed {
+                if pump_peer(write, read, &follower, &mut frames, &cmds).await {
                     // The frame channel closed — the registry is gone; stop.
                     return;
                 }
-                barren_links = if exchanged { 0 } else { barren_links + 1 };
-                if barren_links == PEER_REJECTION_STREAK_WARN {
+                refused_links = if up.elapsed() < PEER_LINK_MIN_HEALTHY {
+                    refused_links.saturating_add(1)
+                } else {
+                    0
+                };
+                if refused_links == PEER_REJECTION_STREAK_WARN {
                     eprintln!(
-                        "crdtsync: peer {addr} keeps closing this node's link without \
-                         exchanging a frame — the usual cause is a CRDTSYNC_CLUSTER_SECRET \
-                         that does not match the rest of the cluster; this node will not \
-                         replicate to it until they agree",
+                        "crdtsync: peer {addr} keeps closing this node's link as soon as it \
+                         opens — the usual cause is a CRDTSYNC_CLUSTER_SECRET that does not \
+                         match the rest of the cluster; this node will not replicate to it \
+                         until they agree",
                     );
                 }
                 // The link dropped: the follower is unreachable until it redials.
@@ -1027,19 +1041,15 @@ async fn connect_peer(url: &str, server: ClientId, secret: &[u8]) -> Option<(Pee
 }
 
 /// Relay frames to the follower and its acks back, until the socket errors or the
-/// frame channel closes. Returns `(frame channel closed, link carried a frame)` —
-/// the first so the caller stops rather than redials, the second so a run of links
-/// that carried nothing can be reported as the refusal it probably is.
+/// frame channel closes. Returns whether the frame channel closed (the registry
+/// shut down), so the caller stops rather than redials.
 async fn pump_peer(
     mut write: PeerWrite,
     mut read: PeerRead,
     follower: &NodeId,
     frames: &mut Receiver<Message>,
     cmds: &UnboundedSender<Cmd>,
-) -> (bool, bool) {
-    // Whether this link ever carried a frame in either direction — a refused link
-    // is closed by the peer before anything crosses it.
-    let mut exchanged = false;
+) -> bool {
     loop {
         tokio::select! {
             frame = frames.recv() => match frame {
@@ -1049,15 +1059,13 @@ async fn pump_peer(
                         .await
                         .is_err()
                     {
-                        return (false, exchanged);
+                        return false;
                     }
-                    exchanged = true;
                 }
-                None => return (true, exchanged),
+                None => return true,
             },
             inbound = read.next() => match inbound {
                 Some(Ok(WsMessage::Binary(bytes))) => {
-                    exchanged = true;
                     if let Ok(Message::ReplicaAck { room, through_seq }) = decode_message(&bytes) {
                         let _ = cmds.send(Cmd::PeerAck {
                             follower: follower.clone(),
@@ -1067,7 +1075,7 @@ async fn pump_peer(
                     }
                 }
                 Some(Ok(_)) => continue,
-                Some(Err(_)) | None => return (false, exchanged),
+                Some(Err(_)) | None => return false,
             },
         }
     }
