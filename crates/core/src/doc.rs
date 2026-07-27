@@ -2256,9 +2256,6 @@ impl Document {
     /// The id is [derived](TxId::derive) from the members' own sequences, so it is
     /// as durable as the op ids it sits beside and needs no state of its own.
     fn tag_atomic(&self, ops: Vec<Op>) -> Vec<Op> {
-        if ops.is_empty() {
-            return ops;
-        }
         let Ok(count) = u32::try_from(ops.len()) else {
             return ops;
         };
