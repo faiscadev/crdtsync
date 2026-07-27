@@ -972,7 +972,11 @@ async fn two_real_nodes_with_different_secrets_do_not_replicate() {
     let room = room_led_by(&leader_addr, &follower_addr);
 
     let mut odd_one_out = clustered(&follower_addr, &leader_addr);
-    odd_one_out.cluster_secret = Some(b"a-different-cluster-secret-entirely".to_vec());
+    // Long enough to start with, and not this cluster's — derived from the floor so
+    // a shortened literal cannot silently turn this into a failed-startup test.
+    let other_secret = vec![b'z'; MIN_CLUSTER_SECRET_LEN];
+    assert_ne!(other_secret, SECRET, "the follower's secret must differ");
+    odd_one_out.cluster_secret = Some(other_secret);
     let follower = tokio::spawn(serve_with(follower_listener, cid(0xF0), None, odd_one_out));
     let leader = tokio::spawn(serve_with(
         leader_listener,
@@ -982,7 +986,13 @@ async fn two_real_nodes_with_different_secrets_do_not_replicate() {
     ));
 
     let mut writer = open_client(&leader_addr).await;
-    subscribe(&mut writer, &room).await;
+    // The leader really does lead the room and serve the write — so the missing
+    // Accepted below isolates to replication, not to a redirect or a refused write.
+    let served = subscribe(&mut writer, &room).await;
+    assert!(
+        matches!(served, Some(Message::Ops { .. } | Message::Snapshot { .. })),
+        "the leader did not serve the room it leads, got {served:?}",
+    );
     send_frame(
         &mut writer,
         &Message::Ops {
@@ -991,6 +1001,19 @@ async fn two_real_nodes_with_different_secrets_do_not_replicate() {
         },
     )
     .await;
+    // The leader ingested it locally: a second reader there is served it. So the
+    // missing Accepted below is the follower's absence, not a write that never
+    // landed.
+    let mut on_leader = open_client(&leader_addr).await;
+    let served = subscribe(&mut on_leader, &room).await;
+    match served {
+        Some(Message::Ops { ops, .. }) => assert_eq!(
+            ops.len(),
+            1,
+            "the leader never ingested the write — the test is not measuring replication",
+        ),
+        other => panic!("the leader did not serve its own committed write: {other:?}"),
+    }
 
     assert!(
         next_matching(&mut writer, Duration::from_secs(5), |m| matches!(

@@ -74,8 +74,9 @@ const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// The shortest cluster secret a clustered node will start with. The secret is
 /// the only thing separating a cluster member from anyone who can reach the peer
 /// port, and a rejected guess costs an attacker nothing but a reconnect, so a
-/// short one is brute-forceable rather than merely weak. Thirty-two bytes is what
-/// `openssl rand -hex 32` produces and matches the zone-master key's discipline.
+/// short one is brute-forceable rather than merely weak. Thirty-two bytes matches
+/// the zone-master key's discipline; `openssl rand -hex 32` clears it comfortably,
+/// emitting 64 characters for 32 bytes of entropy.
 pub const MIN_CLUSTER_SECRET_LEN: usize = 32;
 
 /// Runtime policy: how the ephemeral-awareness sweep runs (how long a
@@ -914,17 +915,64 @@ async fn indirect_probe(
 }
 
 /// How long a link must survive to count as one the peer accepted. A refused link
-/// is closed as soon as the peer reads the opening frames, so it dies in about a
-/// round trip; a link that carried real traffic and then dropped lived orders of
-/// magnitude longer. Loopback round trips are well under a millisecond and a
-/// cross-datacenter one is a few, so this separates the two by a wide margin.
+/// is closed as soon as the peer reads the opening frames — nothing is queued to
+/// flush, so the writer-drain grace never engages and the socket dies in about a
+/// round trip (measured at well under 2ms on loopback). A link that carried real
+/// traffic and then dropped lived orders of magnitude longer, so this separates the
+/// two by a wide margin even across a datacenter.
 const PEER_LINK_MIN_HEALTHY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How many consecutive short-lived links are tolerated before the node says so.
-/// A follower restarting drops one or two in a row; a cluster secret that does not
-/// match drops every one of them forever, and the symptom is otherwise a cluster
-/// that silently never converges.
-const PEER_REJECTION_STREAK_WARN: u32 = 20;
+/// A follower restarting drops one or two in a row; a peer that refuses this node
+/// drops every one of them forever, and the symptom is otherwise a cluster that
+/// silently never converges.
+const PEER_REJECTION_STREAK_WARN: u32 = 5;
+
+/// The longest a redial waits while a peer keeps refusing. Each refusal doubles the
+/// wait from [`PEER_REDIAL_DELAY`] up to this, so a peer that will never accept
+/// costs a dial every few seconds instead of four a second — each of which, because
+/// a link coming up drives the late-joiner catch-up, would otherwise re-encode this
+/// node's whole backlog for that peer (a full snapshot below the compaction floor).
+/// A peer that starts accepting again reconverges within one of these.
+const PEER_REFUSED_REDIAL_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Consecutive peer links that died as soon as they opened — the signature of a
+/// peer refusing this node's cluster secret. The dialer cannot observe admission
+/// directly (`connect_peer` returns once its opening frames are written, never that
+/// they were accepted) and cannot infer it from traffic either, since this node
+/// queues a `FollowerHeads` for every peer the moment its link comes up and so
+/// writes to a refused link before the close arrives. What does separate the two is
+/// how long the link lived.
+#[derive(Default)]
+struct RefusalStreak {
+    /// Consecutive links shorter than [`PEER_LINK_MIN_HEALTHY`]. Reset by any link
+    /// that lived long enough to have been admitted.
+    n: u32,
+}
+
+impl RefusalStreak {
+    /// Fold in a link that lived `lifetime`, returning whether to tell the operator
+    /// now. A permanent refusal reports every [`PEER_REJECTION_STREAK_WARN`] links
+    /// rather than once, so an operator attaching late still sees it.
+    fn observe(&mut self, lifetime: std::time::Duration) -> bool {
+        if lifetime >= PEER_LINK_MIN_HEALTHY {
+            self.n = 0;
+            return false;
+        }
+        self.n = self.n.saturating_add(1);
+        self.n % PEER_REJECTION_STREAK_WARN == 0
+    }
+
+    /// How long to wait before redialing: the steady cadence while the peer is
+    /// merely unreachable, doubling per consecutive refusal to
+    /// [`PEER_REFUSED_REDIAL_MAX`] so a peer that will never accept is not dialed —
+    /// and catch-up-encoded for — four times a second forever.
+    fn redial_delay(&self) -> std::time::Duration {
+        PEER_REDIAL_DELAY
+            .saturating_mul(1u32 << self.n.min(8))
+            .min(PEER_REFUSED_REDIAL_MAX)
+    }
+}
 
 /// Own the socket to one follower: dial it, relay the replication frames that
 /// arrive on `frames`, and forward the follower's acks back to the registry as
@@ -933,13 +981,10 @@ const PEER_REJECTION_STREAK_WARN: u32 = 20;
 /// only when the frame channel closes (the registry shut down).
 ///
 /// A link the follower *refuses* — a cluster secret that does not match its own —
-/// looks like any other dropped socket from here: the dial only proves the opening
-/// frames were written, never that they were accepted. What separates the two is
-/// how long the link lived, so a run of links that die within a round trip of
-/// coming up is reported once, naming the peer, rather than left as a silent redial
-/// loop. Whether a link carried a frame says nothing: this node queues a
-/// `FollowerHeads` for every peer the moment its link comes up, so even a refused
-/// link is written to before the peer's close arrives.
+/// looks like any other dropped socket from here, so a run of them is recognised by
+/// how briefly each lived ([`RefusalStreak`]): the operator is told, and the redial
+/// backs off so a peer that will never accept is not dialed, and catch-up-encoded
+/// for, several times a second forever.
 async fn peer_connection(
     server: ClientId,
     secret: Arc<[u8]>,
@@ -958,10 +1003,7 @@ async fn peer_connection(
             live,
         });
     };
-    // Consecutive links the peer closed within a round trip of accepting them — the
-    // signature of a peer refusing this node's cluster secret. Reset by any link
-    // that survived long enough to have been admitted.
-    let mut refused_links: u32 = 0;
+    let mut refusals = RefusalStreak::default();
     loop {
         match connect_peer(&url, server, &secret).await {
             Some((write, read)) => {
@@ -972,17 +1014,12 @@ async fn peer_connection(
                     // The frame channel closed — the registry is gone; stop.
                     return;
                 }
-                refused_links = if up.elapsed() < PEER_LINK_MIN_HEALTHY {
-                    refused_links.saturating_add(1)
-                } else {
-                    0
-                };
-                if refused_links == PEER_REJECTION_STREAK_WARN {
+                if refusals.observe(up.elapsed()) {
                     eprintln!(
                         "crdtsync: peer {addr} keeps closing this node's link as soon as it \
-                         opens — the usual cause is a CRDTSYNC_CLUSTER_SECRET that does not \
-                         match the rest of the cluster; this node will not replicate to it \
-                         until they agree",
+                         opens — usually a CRDTSYNC_CLUSTER_SECRET that does not match the \
+                         rest of the cluster, or a protocol version this node cannot speak; \
+                         this node will not replicate to it until that is fixed",
                     );
                 }
                 // The link dropped: the follower is unreachable until it redials.
@@ -996,7 +1033,7 @@ async fn peer_connection(
                 }
             }
         }
-        tokio::time::sleep(PEER_REDIAL_DELAY).await;
+        tokio::time::sleep(refusals.redial_delay()).await;
     }
 }
 
@@ -1310,4 +1347,101 @@ where
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A link that lived long enough to have been admitted.
+    const HEALTHY: Duration = Duration::from_secs(1);
+    /// A link closed as soon as it opened — what a refusal looks like.
+    const REFUSED: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn a_healthy_link_never_warns() {
+        let mut streak = RefusalStreak::default();
+        for _ in 0..100 {
+            assert!(!streak.observe(HEALTHY));
+        }
+    }
+
+    #[test]
+    fn a_run_of_refusals_warns_at_the_threshold() {
+        let mut streak = RefusalStreak::default();
+        for _ in 1..PEER_REJECTION_STREAK_WARN {
+            assert!(!streak.observe(REFUSED), "warned before the threshold");
+        }
+        assert!(streak.observe(REFUSED), "the threshold link warns");
+    }
+
+    #[test]
+    fn a_permanent_refusal_keeps_reporting() {
+        // One line at startup is easily missed; a condition that never clears is
+        // reported once per threshold run so a late-attaching operator still sees it.
+        let mut streak = RefusalStreak::default();
+        let warnings = (0..PEER_REJECTION_STREAK_WARN * 4)
+            .filter(|_| streak.observe(REFUSED))
+            .count();
+        assert_eq!(warnings, 4);
+    }
+
+    #[test]
+    fn one_healthy_link_clears_the_streak() {
+        // A follower restarting drops a link or two; that must not accumulate toward
+        // a refusal verdict once it comes back.
+        let mut streak = RefusalStreak::default();
+        for _ in 1..PEER_REJECTION_STREAK_WARN {
+            streak.observe(REFUSED);
+        }
+        assert!(!streak.observe(HEALTHY));
+        for _ in 1..PEER_REJECTION_STREAK_WARN {
+            assert!(!streak.observe(REFUSED), "the streak did not reset");
+        }
+    }
+
+    /// The boundary itself: a link exactly at the threshold counts as admitted, so
+    /// the check is `>=` and not a strict `>`.
+    #[test]
+    fn a_link_at_the_healthy_boundary_is_not_a_refusal() {
+        let mut streak = RefusalStreak::default();
+        assert!(!streak.observe(PEER_LINK_MIN_HEALTHY));
+        assert_eq!(streak.redial_delay(), PEER_REDIAL_DELAY);
+    }
+
+    #[test]
+    fn refusals_back_the_redial_off_to_a_cap() {
+        let mut streak = RefusalStreak::default();
+        assert_eq!(
+            streak.redial_delay(),
+            PEER_REDIAL_DELAY,
+            "an unreachable peer keeps the steady cadence",
+        );
+        let mut previous = PEER_REDIAL_DELAY;
+        for _ in 0..40 {
+            streak.observe(REFUSED);
+            let delay = streak.redial_delay();
+            assert!(delay >= previous, "the backoff went backwards");
+            assert!(
+                delay <= PEER_REFUSED_REDIAL_MAX,
+                "the backoff passed its cap"
+            );
+            previous = delay;
+        }
+        assert_eq!(
+            previous, PEER_REFUSED_REDIAL_MAX,
+            "a peer that never accepts settles at the cap",
+        );
+    }
+
+    /// The counter saturates rather than overflowing on a node left running for
+    /// years against a peer that never accepts.
+    #[test]
+    fn the_streak_saturates_without_overflowing() {
+        let mut streak = RefusalStreak { n: u32::MAX - 1 };
+        streak.observe(REFUSED);
+        streak.observe(REFUSED);
+        assert_eq!(streak.redial_delay(), PEER_REFUSED_REDIAL_MAX);
+    }
 }
