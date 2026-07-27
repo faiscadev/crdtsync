@@ -7,6 +7,48 @@
 
 use crate::clientid::ClientId;
 
+/// The highest lamport a *folded op* may raise a partition clock to.
+///
+/// An op's lamport is a bare `u64` off the wire, and a partition clock is a
+/// running maximum over the lamports it folds — so without a bound one op parks
+/// a replica's clock wherever it likes, including where the next local mint
+/// leaves the space. The clamp is a constant rather than a function of local
+/// state, so every replica clamps the same op to the same value and clocks stay
+/// convergent.
+///
+/// The op itself is still applied: refusing it would trade a panic for a
+/// divergence (a replica whose clock an admissible op parked at the gate mints
+/// one above it, which every peer then refuses) and would buy nothing on
+/// ordering, since a peer wanting to dominate LWW sits one below whatever the
+/// gate is.
+///
+/// A clock this high is not reachable by honest means. A clock advances by one
+/// per op and one per inserted codepoint, so reaching it takes 2^62 real edits
+/// in a single partition.
+pub const LAMPORT_WIRE_CEILING: u64 = u64::MAX >> 2;
+
+/// The highest clock a *decoded snapshot* may declare, for the root partition
+/// and for each zone. A snapshot declaring more is **refused**, never clamped.
+///
+/// A stored clock is its author's high-water over the ids it has published, so a
+/// decode that lowered one would hand the replica node ids that are still live in
+/// the state it just decoded, and a sequence drops a re-issued id as a replay —
+/// the write is lost on the author and on every peer, silently. Refusing keeps
+/// anything above the ceiling unreadable, so nothing above it is ever lowered,
+/// and it leaves `encode_state`'s byte-stability contract intact.
+///
+/// It sits above [`LAMPORT_WIRE_CEILING`] on purpose, and the gap is the runway a
+/// wire-clamped replica mints into: without it, one hostile op would leave a
+/// replica unable to reload its own snapshot.
+pub const LAMPORT_STATE_CEILING: u64 = u64::MAX >> 1;
+
+// Both gaps are what make the arithmetic downstream of a clock total: the runway
+// below the state ceiling keeps it off an honest replica's own snapshot, and the
+// half above it is entered one local mint at a time.
+const _: () = assert!(LAMPORT_WIRE_CEILING < LAMPORT_STATE_CEILING);
+const _: () = assert!(LAMPORT_STATE_CEILING - LAMPORT_WIRE_CEILING == 1 << 62);
+const _: () = assert!(u64::MAX - LAMPORT_STATE_CEILING == 1 << 63);
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Stamp {
     pub lamport: u64,

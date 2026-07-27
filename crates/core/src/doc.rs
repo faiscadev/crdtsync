@@ -31,7 +31,7 @@ use crate::ranged::{RangeAnchor, RangedElement, RangedInit, RangedPayload};
 use crate::repair::{keyed_repairs, Repair, RepairId};
 use crate::scalar::Scalar;
 use crate::schema::{MarkFlavor, Schema};
-use crate::stamp::Stamp;
+use crate::stamp::{Stamp, LAMPORT_STATE_CEILING, LAMPORT_WIRE_CEILING};
 use crate::text::Text;
 use crate::treemove::TreeMoves;
 use crate::undo::{History, Intention, Landing, Snap, Step as Inverse, MAX_SNAPSHOT_DEPTH};
@@ -1631,7 +1631,13 @@ impl Document {
             });
         }
         let client = cur.client()?;
-        let lamport = cur.u64()?;
+        // A declared clock is as unbounded as an op's lamport and lands straight in
+        // the slot the next local mint reads, so the root clock and every zone clock
+        // below are bounded at [`LAMPORT_STATE_CEILING`] — by **refusal**, never by
+        // a clamp. A stored clock is its author's own high-water over the ids it has
+        // published, so lowering one hands the replica ids that are still live in the
+        // state it just decoded.
+        let lamport = clock_within_ceiling(cur.u64()?, "document: root clock")?;
         let seq = cur.u64()?;
 
         let zone_clock_count = cur.u32()?;
@@ -1639,7 +1645,7 @@ impl Document {
             HashMap::with_capacity((zone_clock_count as usize).min(1024));
         for _ in 0..zone_clock_count {
             let zone = cur.u32()?;
-            let lamport = cur.u64()?;
+            let lamport = clock_within_ceiling(cur.u64()?, "document: zone clock")?;
             if zone_clocks.insert(zone, lamport).is_some() {
                 return Err(DecodeError::BadTag {
                     what: "document: duplicate zone clock",
@@ -2203,6 +2209,18 @@ impl Document {
         if self.seen.contains(&op.id) || self.buffered.contains(&op.id) {
             return false;
         }
+        // A node's id is its op's stamp, so an op whose stamp names a client other
+        // than its author mints ids inside *that* client's id space — and the
+        // clock, bounded above [`LAMPORT_WIRE_CEILING`], no longer moves past them
+        // to keep their owner's next mint clear. Every op this codebase emits
+        // stamps under its author, including the server's reveal shells, so this
+        // refuses only a malformed op. It is a categorical check, not a threshold
+        // one: no honest op sits near its boundary, so nothing is one op away from
+        // it, and being a pure function of the op it refuses the same set on every
+        // replica.
+        if op.stamp.client != op.id.client {
+            return false;
+        }
         // An atomic-transaction member is always held first; its group commits
         // together once every member is present. A lone (single-member) tx
         // completes immediately. A member whose own dependencies are unmet at
@@ -2234,7 +2252,16 @@ impl Document {
         // order-independent, so two replicas folding the same ops converge to
         // identical clocks. An op in one zone leaves every other zone's clock
         // untouched, so it forms no causal edge across the partition boundary.
-        let last = op.stamp.lamport.saturating_add(span(&op.kind) - 1);
+        //
+        // What the fold may do to the clock is bounded at
+        // [`LAMPORT_WIRE_CEILING`]; the op itself is applied either way. The
+        // whole reservation is clamped, not the base, because a run is as long as
+        // its text.
+        let last = op
+            .stamp
+            .lamport
+            .saturating_add(span(&op.kind) - 1)
+            .min(LAMPORT_WIRE_CEILING);
         self.advance_clock(op.zone, last);
         self.apply_kind(op.target, &op.kind, op.stamp, op.id.client);
     }
@@ -2530,14 +2557,23 @@ impl Document {
         // container), so its zone — the created child's, for a container-create —
         // resolves now.
         let zone = self.zone_of_op(target, &kind);
-        let base = self.clock(zone) + 1;
+        // Only local minting enters the space above [`LAMPORT_STATE_CEILING`],
+        // one step per real edit, so the end of it is 2^63 mints away in this
+        // partition. At that end there is no unused stamp left, so the invariant
+        // is stated rather than handled: every other answer re-issues one.
+        let base = self
+            .clock(zone)
+            .checked_add(1)
+            .expect("a partition's lamport space outlives the replica");
         let stamp = Stamp {
             lamport: base,
             client: self.client,
             offset: 0,
         };
         // Reserve the rest of a run's char_ids so the next op sorts after it.
-        let last = base + (span(&kind) - 1);
+        let last = base
+            .checked_add(span(&kind) - 1)
+            .expect("a local run fits its partition's lamport space");
         self.advance_clock(zone, last);
         let id = self.mint_op_id();
         let author = self.client;
@@ -4388,6 +4424,16 @@ fn acl_id(stamp: Stamp) -> ElementId {
 
 /// How many consecutive char_ids an op consumes from its stamp. A text run
 /// takes one per codepoint; every other op takes one.
+/// A declared partition clock, refused rather than clamped when it sits above
+/// [`LAMPORT_STATE_CEILING`]. See [`Document::read_state`]'s use — the bound has
+/// to be a refusal, because a clock is a high-water over ids already published.
+fn clock_within_ceiling(lamport: u64, what: &'static str) -> Result<u64, DecodeError> {
+    if lamport > LAMPORT_STATE_CEILING {
+        return Err(DecodeError::BadTag { what, tag: 0 });
+    }
+    Ok(lamport)
+}
+
 fn span(kind: &OpKind) -> u64 {
     match kind {
         OpKind::TextInsert { s, .. } => s.chars().count().max(1) as u64,
