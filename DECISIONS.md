@@ -7,7 +7,7 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
-## 2026-07-27 · C8 unbounded wire lamport (#PR) · the bound lives in the clock merge, as a clamp on what a folded op may do to a partition clock — not as an acceptance gate, and not at `u64::MAX`
+## 2026-07-27 · C8 unbounded wire lamport (#355) · the bound lives in the clock merge, as a clamp on what a folded op may do to a partition clock — not as an acceptance gate, and not at `u64::MAX`
 
 **The defect.** `apply_now` raised a partition clock to `op.stamp.lamport.saturating_add(span - 1)` with nothing bounding `lamport` off the wire, and `emit_stamped` stamped the next local edit with a bare `self.clock(zone) + 1`. One op from any peer carrying `lamport: u64::MAX` therefore overflowed the very next ordinary local edit — a panic in debug, a wrap to 0 in release. Reproduced in five lines. It is strictly more reachable than the op-seq primitive C6 removed: no id guessing, no catch-up, no forged authorship, and the server's own room replica folds every op it ingests. The `Message::Snapshot` / `ReplicateSnapshot` path carries the same primitive by another door — `encode_state` writes the root clock and every zone clock, and `read_state` read them straight back into the slot the next mint reads.
 
