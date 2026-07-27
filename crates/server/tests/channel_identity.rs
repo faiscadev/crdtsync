@@ -142,13 +142,29 @@ fn two_channel_conn(r: &mut Registry) -> ConnId {
     conn
 }
 
+/// A batch the gate admitted is acknowledged through its author's seq frontier —
+/// the positive signal, which "no violation" alone would not distinguish from a
+/// batch dropped for some other reason.
+fn assert_accepted(r: &mut Registry, conn: ConnId, channel: Channel) {
+    let out = r.take_outbox(conn);
+    assert!(
+        !out.iter().any(is_violation),
+        "the batch was refused: {out:?}"
+    );
+    assert!(
+        out.iter()
+            .any(|m| matches!(m, Message::Accepted { channel: c, .. } if *c == channel)),
+        "the batch was not acknowledged on {channel:?}: {out:?}"
+    );
+}
+
 #[test]
-fn the_first_channel_writes_under_the_connections_own_identity() {
+fn channel_zero_writes_under_the_connections_own_identity() {
     let mut r = registry();
     let conn = two_channel_conn(&mut r);
 
     assert!(r.deliver(conn, ops_frame(Channel(0), cid(1), b"x")));
-    assert!(!r.take_outbox(conn).iter().any(is_violation));
+    assert_accepted(&mut r, conn, Channel(0));
 }
 
 #[test]
@@ -157,7 +173,7 @@ fn a_further_channel_writes_under_its_derived_identity() {
     let conn = two_channel_conn(&mut r);
 
     assert!(r.deliver(conn, ops_frame(Channel(1), cid(1).for_channel(1), b"x")));
-    assert!(!r.take_outbox(conn).iter().any(is_violation));
+    assert_accepted(&mut r, conn, Channel(1));
 }
 
 // The gate binds each identity to the channel its batch names: a batch carrying

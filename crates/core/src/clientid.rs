@@ -35,16 +35,28 @@ impl ClientId {
     /// channel gives each its own op-id, stamp, transaction-group, and
     /// counter-tally space.
     ///
-    /// The first channel is the replica the connection declared itself to be, so
-    /// it authors under this id unchanged: an app that persists a client id keeps
-    /// it on its primary subscription, across restarts and reconnects. Every
-    /// further channel takes a UUIDv5 over this id as namespace and the channel
-    /// number as name — distinct from the declared id and from each other, and
-    /// (being v5) never equal to a [`generate`](Self::generate)d v7 one.
+    /// Channel 0 is the replica the connection declared itself to be, so it
+    /// authors under this id unchanged: a session's first subscription carries the
+    /// id its embedder chose, and keeps it across a reconnect (a resume reuses the
+    /// channel). Channel numbers are assigned in subscribe order and never
+    /// recycled, so a *later* subscription is channel 0 only if it is the
+    /// session's first — that is deliberate, since reusing a freed number would
+    /// hand a fresh replica, minting from seq 0, the identity of the ops the old
+    /// one still has in flight.
     ///
-    /// The derivation is pure — no [`Host`] entropy — so both ends of the wire
-    /// compute it: a server that knows the connection's Hello id and the channel
-    /// an op batch names re-derives the identity that batch must carry.
+    /// Every further channel takes a UUIDv5 over this id as namespace and the
+    /// channel number's four big-endian bytes as name — distinct from the declared
+    /// id and from each other. Distinctness from *another connection's* id rests
+    /// on the 122 random bits an embedder mints its own id from, not on the UUID
+    /// version field: ids arrive through [`from_bytes`](Self::from_bytes), which
+    /// stamps no version.
+    ///
+    /// The derivation is protocol, not a local convenience: it is pure — no
+    /// [`Host`] entropy — so both ends of the wire compute it, and a server that
+    /// knows the connection's Hello id and the channel an op batch names
+    /// re-derives the identity that batch must carry. Its namespace, byte width,
+    /// and endianness are therefore fixed; changing any of them rebinds every
+    /// deployed client's identity.
     pub fn for_channel(&self, channel: u32) -> Self {
         match channel {
             0 => *self,

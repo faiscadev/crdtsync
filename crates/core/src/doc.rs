@@ -2167,6 +2167,16 @@ impl Document {
     /// and route it.
     fn apply_now(&mut self, op: &Op) {
         self.seen.insert(op.id);
+        // An op this replica authored, arriving back through a catch-up delta,
+        // holds a seq this replica must never mint again — a re-mint would collide
+        // with an op already durable and be deduped away, losing the write. A live
+        // replica is already past it, so this only bites where the counter was
+        // lost: a client that persisted its identity and rebuilt from an op delta
+        // rather than a snapshot, which is the one restore path that does not run
+        // through `decode_state_as`.
+        if op.id.client == self.client {
+            self.seq = self.seq.max(op.id.seq.saturating_add(1));
+        }
         // A text run occupies one char_id per codepoint from the op's stamp;
         // the clock must clear the last of them, not just the base. The op's zone
         // is honored from the envelope, never re-derived: the sender resolved it
@@ -4292,9 +4302,11 @@ fn ranged_id(stamp: Stamp) -> ElementId {
 /// dedup stably (a resumed catch-up re-derives the same shell) and never collide with a
 /// real authored op the reader also receives. The client is derived from the node under
 /// a fixed reveal namespace: deterministic and unique per node (so two revealed nodes
-/// never alias), and a derived id (UUIDv5) is disjoint from a real replica's ClientId
-/// (UUIDv7), so it can never equal a real op's id. `seq` is 0 — the derived client is a
-/// namespace of one.
+/// never alias). It cannot equal a real op's id: a replica's identity is either the one
+/// its embedder chose or a [`for_channel`](ClientId::for_channel) derivation of it, and
+/// neither shares this namespace, so a collision would take a SHA-1 collision across
+/// different namespace-and-name inputs. `seq` is 0 — the derived client is a namespace
+/// of one.
 fn reveal_op_id(node: ElementId) -> OpId {
     let ns = ElementId::from_bytes(*b"crdtsync\0reveal\0");
     let derived = ElementId::derive(ns, &node.as_bytes(), ElementKind::XmlElement);
