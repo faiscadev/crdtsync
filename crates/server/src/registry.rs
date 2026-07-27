@@ -1445,27 +1445,24 @@ impl Registry {
             // a batch touching one subtree resolves once — memoized per distinct path to
             // avoid re-hashing the actor per op.
             let mut verdict: HashMap<&[u8], bool> = HashMap::new();
-            let readable: Vec<Op> = broadcast
-                .iter()
-                .zip(&op_paths)
-                .filter_map(|(op, paths)| {
-                    let ok = paths.iter().all(|path| {
-                        *verdict.entry(path).or_insert_with(|| {
-                            crate::acl::recipient_reads_path(
-                                authorizer,
-                                &records,
-                                creator.as_deref(),
-                                &index,
-                                schema.as_deref(),
-                                identity,
-                                room,
-                                path,
-                            )
-                        })
-                    });
-                    ok.then(|| op.clone())
+            let readable: Vec<Op> = crate::session::retain_atomic_cloned(broadcast, |i, _| {
+                // `op_paths` parallels `broadcast`, so the op's governing path set is
+                // its own position in it.
+                op_paths[i].iter().all(|path| {
+                    *verdict.entry(path).or_insert_with(|| {
+                        crate::acl::recipient_reads_path(
+                            authorizer,
+                            &records,
+                            creator.as_deref(),
+                            &index,
+                            schema.as_deref(),
+                            identity,
+                            room,
+                            path,
+                        )
+                    })
                 })
-                .collect();
+            });
             if readable.is_empty() {
                 continue;
             }
@@ -1516,6 +1513,14 @@ impl Registry {
                     // into place. The shell and content carry the move's zone so the
                     // per-channel zone filter keeps them together.
                     let mut prefix: Vec<Op> = Vec::new();
+                    // The log the back-fill reads already holds this batch, and a
+                    // revealed node's subtree can be exactly what the batch edits — so
+                    // an op is back-filled only if the batch is not already carrying
+                    // it. A second, untagged copy would be the one the recipient folds
+                    // and the batch's own copy would be discarded as an id it already
+                    // holds, taking that op out of its transaction's count for good.
+                    let carried: HashSet<crdtsync_core::OpId> =
+                        readable.iter().map(|op| op.id).collect();
                     for shell in shells {
                         let OpKind::XmlReveal { node, .. } = &shell.kind else {
                             continue;
@@ -1537,6 +1542,7 @@ impl Registry {
                                 )
                             })
                             .into_iter()
+                            .filter(|op| !carried.contains(&op.id))
                             .map(|mut op| {
                                 op.zone = zone;
                                 op

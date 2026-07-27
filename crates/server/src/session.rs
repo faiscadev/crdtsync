@@ -32,6 +32,101 @@ use crate::schema_registry::{Resolution, SchemaRegistry};
 use crate::zonetoken::CrossZoneGrant;
 use crate::{Catchup, DiffError, Hub, RoomId, StoredOp, MAIN_BRANCH};
 
+/// A unit of delivery that carries one [`Op`] — what every per-recipient filter
+/// keeps or withholds, whether it flows as a bare op (fan-out) or as a log record
+/// (catch-up).
+pub(crate) trait CarriesOp {
+    fn op(&self) -> &Op;
+    fn op_mut(&mut self) -> &mut Op;
+}
+
+impl CarriesOp for Op {
+    fn op(&self) -> &Op {
+        self
+    }
+    fn op_mut(&mut self) -> &mut Op {
+        self
+    }
+}
+
+impl CarriesOp for StoredOp {
+    fn op(&self) -> &Op {
+        &self.op
+    }
+    fn op_mut(&mut self) -> &mut Op {
+        &mut self.op
+    }
+}
+
+/// Keep what `keep` admits — by position in `items` and by value — untagging the
+/// survivors of every atomic transaction the filter splits.
+///
+/// This is the shape every per-recipient redaction seam takes — the catch-up
+/// delta's read and zone filters, the live fan-out's read filter, the per-channel
+/// zone filter — and the destranding is not optional at any of them: a survivor
+/// still carrying the group's `count` is buffered at the recipient against a member
+/// that will never arrive, invisible to it forever. See
+/// [`destrand_split`](crdtsync_core::destrand_split) for why the survivors ride
+/// rather than being dropped with their group.
+///
+/// The reach is this batch: a member already delivered in an earlier one is past
+/// untagging, so a group split across two deliveries with the cut in the second
+/// leaves the first delivery's members waiting. Evicting a group that can never
+/// complete is the recipient's own concern.
+pub(crate) fn retain_atomic<T: CarriesOp>(
+    items: Vec<T>,
+    mut keep: impl FnMut(usize, &T) -> bool,
+) -> Vec<T> {
+    let verdicts: Vec<bool> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| keep(i, item))
+        .collect();
+    let split = crdtsync_core::split_groups(
+        items
+            .iter()
+            .zip(&verdicts)
+            .filter(|(_, keep)| !**keep)
+            .map(|(item, _)| item.op()),
+    );
+    let mut kept: Vec<T> = items
+        .into_iter()
+        .zip(verdicts)
+        .filter_map(|(item, keep)| keep.then_some(item))
+        .collect();
+    crdtsync_core::destrand_split(kept.iter_mut().map(CarriesOp::op_mut), &split);
+    kept
+}
+
+/// [`retain_atomic`] over a borrowed batch, cloning only what it keeps — the shape
+/// the fan-out seams take, where one batch is filtered once per recipient and
+/// cloning what every one of them withholds is the cost of the whole redaction.
+pub(crate) fn retain_atomic_cloned<T: CarriesOp + Clone>(
+    items: &[T],
+    mut keep: impl FnMut(usize, &T) -> bool,
+) -> Vec<T> {
+    let verdicts: Vec<bool> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| keep(i, item))
+        .collect();
+    let split = crdtsync_core::split_groups(
+        items
+            .iter()
+            .zip(&verdicts)
+            .filter(|(_, keep)| !**keep)
+            .map(|(item, _)| item.op()),
+    );
+    let mut kept: Vec<T> = items
+        .iter()
+        .zip(&verdicts)
+        .filter(|(_, keep)| **keep)
+        .map(|(item, _)| item.clone())
+        .collect();
+    crdtsync_core::destrand_split(kept.iter_mut().map(CarriesOp::op_mut), &split);
+    kept
+}
+
 /// How long a freshly issued cross-zone-move capability token stays valid, in the
 /// wall-clock milliseconds the session's `now` carries. A short life is sufficient —
 /// a client requests a token and immediately redeems it in the same interaction — and
@@ -201,11 +296,7 @@ impl Session {
         };
         match &sub.zones {
             None => batch.to_vec(),
-            Some(_) => batch
-                .iter()
-                .filter(|op| zone_admits(&sub.zones, op.zone))
-                .cloned()
-                .collect(),
+            Some(_) => retain_atomic_cloned(batch, |_, op| zone_admits(&sub.zones, op.zone)),
         }
     }
 
@@ -546,28 +637,25 @@ pub fn step(
                         delta
                     } else {
                         let ranged_anchors = hub.ranged_anchors(&room);
-                        delta
-                            .into_iter()
-                            .filter(|rec| {
-                                // Require-all over the op's governing path set — a Ranged
-                                // op's distinct anchor seq paths, one path for every other
-                                // op — so a range replays only where both endpoints read.
-                                op_read_paths(&index, &ranged_anchors, &records, &rec.op)
-                                    .iter()
-                                    .all(|p| {
-                                        recipient_reads_path(
-                                            authorizer,
-                                            &records,
-                                            creator.as_deref(),
-                                            &index,
-                                            schema,
-                                            identity,
-                                            &room,
-                                            p,
-                                        )
-                                    })
-                            })
-                            .collect()
+                        retain_atomic(delta, |_, rec| {
+                            // Require-all over the op's governing path set — a Ranged
+                            // op's distinct anchor seq paths, one path for every other
+                            // op — so a range replays only where both endpoints read.
+                            op_read_paths(&index, &ranged_anchors, &records, &rec.op)
+                                .iter()
+                                .all(|p| {
+                                    recipient_reads_path(
+                                        authorizer,
+                                        &records,
+                                        creator.as_deref(),
+                                        &index,
+                                        schema,
+                                        identity,
+                                        &room,
+                                        p,
+                                    )
+                                })
+                        })
                     };
                     // Then keep only the ops in this subscription's authorized zones
                     // — the root partition plus its zones — so a zone-scoped or
@@ -576,10 +664,7 @@ pub fn step(
                     // A no-zones room (`None`) skips the filter, byte-identical to
                     // before zones.
                     let delta = match &zones {
-                        Some(_) => delta
-                            .into_iter()
-                            .filter(|rec| zone_admits(&zones, rec.op.zone))
-                            .collect(),
+                        Some(_) => retain_atomic(delta, |_, rec| zone_admits(&zones, rec.op.zone)),
                         None => delta,
                     };
                     // Reveal-on-move-in: prepend a shell for every movable node born in

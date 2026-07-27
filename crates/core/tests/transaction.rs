@@ -568,3 +568,219 @@ fn a_snapshot_holding_two_complete_transactions_decodes_the_same_way_every_time(
     // first and its write survives the takeover.
     assert_eq!(first, (4, Some(Scalar::Int(9))));
 }
+
+// --- A filter that splits a group ------------------------------------------
+//
+// Three per-recipient redaction seams withhold individual ops from a batch: the
+// catch-up delta's read and zone filters and the live fan-out's read filter. A
+// withheld member leaves the survivors carrying a `count` their bucket can never
+// reach, so the recipient buffers them against a member that will never arrive.
+// `split_groups` + `destrand_split` are the shared rule those seams apply — the
+// one the migration translation seam already applied alone.
+
+/// The group `ops` belongs to, as its members carry it.
+fn group_of(ops: &[Op]) -> (ClientId, crdtsync_core::TxId) {
+    let tx = ops[0].tx.expect("an atomic member carries its group");
+    (ops[0].id.client, tx.id)
+}
+
+#[test]
+fn a_survivor_of_a_split_group_is_stranded_while_it_keeps_its_tag() {
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"kept", Scalar::Int(1));
+        tx.register(b"withheld", Scalar::Int(2));
+    });
+
+    // Delivering the survivor tagged is the defect: it is held, invisible, and no
+    // later traffic completes its group.
+    let mut b = doc(2);
+    assert!(
+        !b.apply(&ops[0]),
+        "a lone member of a group does not commit"
+    );
+    assert_eq!(reg(&b, b"kept"), None);
+    for i in 0..8 {
+        let later = a.transact(|tx| tx.register(b"later", Scalar::Int(i)));
+        for op in &later {
+            b.apply(op);
+        }
+    }
+    assert_eq!(
+        reg(&b, b"kept"),
+        None,
+        "later traffic cannot complete a group whose member was withheld"
+    );
+}
+
+#[test]
+fn destranding_a_split_group_lands_its_survivors() {
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"kept", Scalar::Int(1));
+        tx.register(b"withheld", Scalar::Int(2));
+    });
+
+    // What a filter does when it withholds `ops[1]`: name the split group, then
+    // untag what it still delivers.
+    let split = crdtsync_core::split_groups(&ops[1..]);
+    assert_eq!(
+        split.iter().copied().collect::<Vec<_>>(),
+        vec![group_of(&ops)],
+        "the withheld member names its own group"
+    );
+    let mut delivered = ops[..1].to_vec();
+    crdtsync_core::destrand_split(&mut delivered, &split);
+    assert!(delivered[0].tx.is_none(), "a survivor rides untagged");
+
+    let mut b = doc(2);
+    assert!(b.apply(&delivered[0]), "a destranded survivor applies now");
+    assert_eq!(reg(&b, b"kept"), Some(Scalar::Int(1)));
+    assert_eq!(
+        b.seen().collect::<Vec<_>>(),
+        vec![delivered[0].id],
+        "the survivor is applied, not held"
+    );
+}
+
+#[test]
+fn destranding_leaves_an_uncut_group_atomic() {
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"one", Scalar::Int(1));
+        tx.register(b"two", Scalar::Int(2));
+    });
+    // A filter that withholds nothing names no split group, so every tag survives.
+    let split = crdtsync_core::split_groups(std::iter::empty());
+    let mut delivered = ops.clone();
+    crdtsync_core::destrand_split(&mut delivered, &split);
+    assert_eq!(delivered, ops, "an uncut batch is delivered unchanged");
+
+    let mut b = doc(2);
+    b.apply(&delivered[0]);
+    assert_eq!(reg(&b, b"one"), None, "the group is still all-or-nothing");
+    b.apply(&delivered[1]);
+    assert_eq!(reg(&b, b"one"), Some(Scalar::Int(1)));
+    assert_eq!(reg(&b, b"two"), Some(Scalar::Int(2)));
+}
+
+#[test]
+fn destranding_cuts_only_the_split_group() {
+    let mut a = doc(1);
+    let cut = a.atomic_transact(|tx| {
+        tx.register(b"c1", Scalar::Int(1));
+        tx.register(b"c2", Scalar::Int(2));
+    });
+    let whole = a.atomic_transact(|tx| {
+        tx.register(b"w1", Scalar::Int(3));
+        tx.register(b"w2", Scalar::Int(4));
+    });
+    let split = crdtsync_core::split_groups(&cut[1..]);
+    let mut delivered: Vec<Op> = cut[..1].iter().chain(&whole).cloned().collect();
+    crdtsync_core::destrand_split(&mut delivered, &split);
+    assert!(
+        delivered[0].tx.is_none(),
+        "the cut group's survivor is untagged"
+    );
+    assert!(
+        delivered[1..].iter().all(|op| op.tx.is_some()),
+        "a group the filter carried whole keeps its tags"
+    );
+
+    let mut b = doc(2);
+    for op in &delivered {
+        b.apply(op);
+    }
+    for (key, want) in [(&b"c1"[..], 1), (&b"w1"[..], 3), (&b"w2"[..], 4)] {
+        assert_eq!(reg(&b, key), Some(Scalar::Int(want)));
+    }
+    assert_eq!(reg(&b, b"c2"), None, "the withheld member never arrived");
+}
+
+#[test]
+fn a_destranded_survivor_still_waits_on_its_own_dependencies() {
+    // C1's rule: completeness is the only group-level gate, and each member passes
+    // the readiness gate at its own apply moment. Destranding hands a survivor to
+    // that same gate — it applies when its target is reachable, not before.
+    let mut a = doc(1);
+    let create = a.transact(|tx| {
+        tx.map(b"m");
+    });
+    let ops = a.atomic_transact(|tx| {
+        tx.map(b"m").register(b"inner", Scalar::Int(7));
+        tx.register(b"withheld", Scalar::Int(2));
+    });
+    let split = crdtsync_core::split_groups(&ops[1..]);
+    let mut delivered = ops[..1].to_vec();
+    crdtsync_core::destrand_split(&mut delivered, &split);
+
+    let mut b = doc(2);
+    assert!(
+        !b.apply(&delivered[0]),
+        "the survivor's target is not reachable yet"
+    );
+    for op in &create {
+        b.apply(op);
+    }
+    assert_eq!(
+        nested(&b, b"m", b"inner"),
+        Some(Scalar::Int(7)),
+        "it drains once its own dependency lands"
+    );
+}
+
+#[test]
+fn a_group_built_over_a_reused_sequence_does_not_collide_with_the_first() {
+    // A filter that withholds an op from its *author's* catch-up leaves a hole in
+    // the sequences the replica holds, and a hole is free again. Two groups can
+    // therefore share a lowest member seq — which is why the group id is derived
+    // from the whole member set.
+    let mut a = doc(1);
+    let first = a.atomic_transact(|tx| {
+        tx.register(b"f1", Scalar::Int(1));
+        tx.register(b"f2", Scalar::Int(2));
+        tx.register(b"f3", Scalar::Int(3));
+    });
+    assert_eq!(
+        first.iter().map(|op| op.id.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    // The replica restarts holding everything but seq 0, so seq 0 is free.
+    let mut restarted = doc(1);
+    for op in &first[1..] {
+        restarted.apply(op);
+    }
+    let second = restarted.atomic_transact(|tx| {
+        tx.register(b"s1", Scalar::Int(4));
+        tx.register(b"s2", Scalar::Int(5));
+        tx.register(b"s3", Scalar::Int(6));
+    });
+    assert_eq!(
+        second.iter().map(|op| op.id.seq).collect::<Vec<_>>(),
+        vec![0, 3, 4],
+        "the hole at seq 0 is re-minted"
+    );
+    assert_ne!(
+        group_of(&first),
+        group_of(&second),
+        "two groups sharing a lowest member seq landed in one bucket"
+    );
+
+    // A peer holding the first group partially does not have it completed by the
+    // second group's members.
+    let mut peer = doc(2);
+    for op in &first[1..] {
+        peer.apply(op);
+    }
+    for op in &second {
+        peer.apply(op);
+    }
+    assert_eq!(reg(&peer, b"f2"), None, "a partial group stayed hidden");
+    for key in [&b"s1"[..], b"s2", b"s3"] {
+        assert!(
+            reg(&peer, key).is_some(),
+            "the second group committed whole beside the stale partial"
+        );
+    }
+}

@@ -2051,6 +2051,145 @@ fn a_live_reader_is_revealed_a_born_denied_nodes_whole_subtree_on_the_move_in() 
 }
 
 #[test]
+fn a_live_reveal_back_fill_does_not_strand_an_atomic_group() {
+    // The reveal back-fill replays committed history selected by a subtree crossed with
+    // a read verdict, so it never carries a transaction whole: the card's insert targets
+    // colB's children (outside the card's own subtree), the grandchild's targets the
+    // card's. A tagged back-filled member would wait on a count its bucket can never
+    // reach, and the live reader would materialize an empty card forever. Same fixture
+    // as the deep live reveal above, with the birth batch made atomic.
+    let mut r = registry();
+    let alice = auth(&mut r, 1, "t-alice");
+    assert!(subscribe(&mut r, alice));
+    r.take_outbox(alice);
+    let mut alice_doc = Document::new(cid(1));
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"bob")),
+            &col(COL_A),
+        ),
+    );
+    submit(&mut r, alice, xml_fragment(&mut alice_doc, &col(COL_A)));
+    let born = alice_doc.atomic_transact(|tx| {
+        let mut fb = tx.xml_fragment(COL_B);
+        let mut kids = fb.children();
+        let mut card = kids.insert_element(0, b"card");
+        card.children().insert_element(0, b"gc");
+    });
+    assert!(
+        born.iter().all(|op| op.tx.is_some()),
+        "the birth batch is one atomic group"
+    );
+    submit(&mut r, alice, born);
+    r.take_outbox(alice);
+
+    let bob = auth(&mut r, 2, "t-bob");
+    assert!(subscribe(&mut r, bob));
+    let mut replica = Document::new(cid(2));
+    for op in received_ops(&mut r, bob) {
+        replica.apply(&op);
+    }
+
+    submit(
+        &mut r,
+        alice,
+        crdtsync_core::path::xml_move_child(&mut alice_doc, &col(COL_B), 0, &col(COL_A), 0),
+    );
+    let revealed = received_ops(&mut r, bob);
+    assert!(
+        revealed.iter().all(|op| op.tx.is_none()),
+        "a back-filled op rides untagged"
+    );
+    for op in &revealed {
+        replica.apply(op);
+    }
+    assert_eq!(
+        board_render(&replica),
+        "colA=frag(card(gc())) colB=absent",
+        "the back-filled grandchild stranded in the reader's buffer",
+    );
+}
+
+#[test]
+fn a_live_reveal_back_fill_does_not_duplicate_the_batch_it_rides_with() {
+    // The back-fill replays the revealed node's subtree out of the room log, which by
+    // fan-out time already holds the batch being delivered. An op in both reaches the
+    // reader twice in one frame — untagged in the prefix, tagged in the batch — and the
+    // tagged copy is discarded on arrival as an id already held, so its group never
+    // reaches its count and the readable move never commits.
+    let mut r = registry();
+    let alice = auth(&mut r, 1, "t-alice");
+    assert!(subscribe(&mut r, alice));
+    r.take_outbox(alice);
+    let mut alice_doc = Document::new(cid(1));
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"bob")),
+            &col(COL_A),
+        ),
+    );
+    submit(&mut r, alice, xml_fragment(&mut alice_doc, &col(COL_A)));
+    // Two cards born in the denied column.
+    submit(
+        &mut r,
+        alice,
+        alice_doc.transact(|tx| {
+            let mut fb = tx.xml_fragment(COL_B);
+            let mut kids = fb.children();
+            kids.insert_element(0, b"card");
+            kids.insert_element(1, b"card2");
+        }),
+    );
+    r.take_outbox(alice);
+
+    let bob = auth(&mut r, 2, "t-bob");
+    assert!(subscribe(&mut r, bob));
+    let mut replica = Document::new(cid(2));
+    for op in received_ops(&mut r, bob) {
+        replica.apply(&op);
+    }
+
+    // One atomic group, both members readable to bob: `card` moves into the readable
+    // column, and `card2` moves into `card` — the second move targets `card`'s own
+    // children, so `card`'s back-fill replays it straight out of this batch.
+    let card = xml_child_id(&alice_doc, COL_B, 0);
+    let card2 = xml_child_id(&alice_doc, COL_B, 1);
+    let dest = frag_id(&alice_doc, COL_A);
+    submit(
+        &mut r,
+        alice,
+        alice_doc.atomic_transact(|tx| {
+            tx.move_xml(card, dest, 0);
+            tx.move_xml(card2, card, 0);
+        }),
+    );
+    let got = received_ops(&mut r, bob);
+    let ids: Vec<_> = got.iter().map(|op| op.id).collect();
+    let mut uniq = ids.clone();
+    uniq.sort_by_key(|id| (id.client.as_bytes(), id.seq));
+    uniq.dedup();
+    assert_eq!(
+        ids.len(),
+        uniq.len(),
+        "an op reached the reader twice in one frame"
+    );
+    for op in &got {
+        replica.apply(op);
+    }
+    assert_eq!(
+        board_render(&replica),
+        "colA=frag(card(card2())) colB=absent",
+        "the group never committed at the reader",
+    );
+}
+
+#[test]
 fn a_whole_document_reader_receives_a_born_denied_node_unredacted() {
     // Regression: the creator (owns `/`) reads every column, so a born-in-colB card is
     // delivered by its ordinary create + move — never a reveal synthesis — and converges

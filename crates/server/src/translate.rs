@@ -12,11 +12,11 @@
 //! Pure over the registry, no connection state; the live fan-out seam and the
 //! cold-start snapshot both drive it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crdtsync_core::doc::SlotFate;
 use crdtsync_core::migration::{reachable_down, Migration, OpRewrite, Step};
-use crdtsync_core::op::{OpId, OpKind, TxId};
+use crdtsync_core::op::{OpId, OpKind};
 use crdtsync_core::schema::Schema;
 use crdtsync_core::stamp::Stamp;
 use crdtsync_core::{ClientId, Document, ElementId, Op, Scalar};
@@ -210,35 +210,23 @@ impl Chain {
                 }
             })
             .collect();
-        // A transaction with any dropped member cannot reach its count here.
-        let mut poisoned: HashSet<(ClientId, TxId)> = HashSet::new();
-        for (op, r) in ops.iter().zip(&rewritten) {
-            if matches!(r, OpRewrite::Drop) {
-                if let Some(tx) = &op.tx {
-                    poisoned.insert((op.id.client, tx.id));
-                }
-            }
-        }
-        ops.iter()
-            .zip(rewritten)
-            .filter_map(|(op, r)| {
-                let out = match r {
-                    OpRewrite::Keep(out) => out,
-                    OpRewrite::Drop => return None,
-                };
-                let poisoned_group = op
-                    .tx
-                    .as_ref()
-                    .is_some_and(|tx| poisoned.contains(&(op.id.client, tx.id)));
-                // A survivor of a poisoned group is destranded so it applies
-                // standalone; a survivor of an intact group keeps its tag.
-                Some(if poisoned_group {
-                    Op { tx: None, ..out }
-                } else {
-                    out
-                })
+        // A transaction with any dropped member cannot reach its count here, so its
+        // survivors ride untagged and apply standalone.
+        let split = crdtsync_core::split_groups(
+            ops.iter()
+                .zip(&rewritten)
+                .filter(|(_, r)| matches!(r, OpRewrite::Drop))
+                .map(|(op, _)| op),
+        );
+        let mut out: Vec<Op> = rewritten
+            .into_iter()
+            .filter_map(|r| match r {
+                OpRewrite::Keep(out) => Some(out),
+                OpRewrite::Drop => None,
             })
-            .collect()
+            .collect();
+        crdtsync_core::destrand_split(&mut out, &split);
+        out
     }
 }
 

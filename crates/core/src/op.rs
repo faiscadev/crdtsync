@@ -7,6 +7,10 @@
 //! whose id it has already applied. Authorship, scope, schema version, and
 //! wall time are wire/server concerns and live outside the core.
 
+use std::collections::HashSet;
+
+use uuid::Uuid;
+
 use crate::acl::{AclEffect, AclGrant, AclScope, AclSubject};
 use crate::clientid::ClientId;
 use crate::elementid::ElementId;
@@ -26,6 +30,41 @@ pub struct OpId {
 /// share one id.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TxId(pub u64);
+
+impl TxId {
+    /// Derive a group's id from the sequences of its members, via the same pure
+    /// `uuid::Uuid::new_v5` hash [`ElementId::derive`] uses (no platform inputs),
+    /// with the digest's two halves folded into the id's 64 bits.
+    ///
+    /// A receiver buckets buffered members by `(author client, tx id)`, so a group id
+    /// has to be as durable as the op ids it sits beside — peers hold partial groups
+    /// across a disconnect, and a restore keeps the client id. The members' own
+    /// sequences already are, so the id needs no state of its own.
+    ///
+    /// It is the whole member set that is hashed, not one representative sequence. A
+    /// replica reads its next sequence off the ids it holds, so a sequence it does
+    /// not hold — a write the room refused, or one a read or zone filter withheld
+    /// from its own catch-up — is free again, and a group built over that hole shares
+    /// its lowest member with the group that first used it. Distinct member sets
+    /// collide here only at the 64-bit birthday bound, which no client's group count
+    /// approaches; identical ones mean the op ids collided first.
+    pub fn derive(seqs: impl IntoIterator<Item = u64>) -> Self {
+        let mut seqs: Vec<u64> = seqs.into_iter().collect();
+        seqs.sort_unstable();
+        let mut name = Vec::with_capacity(seqs.len() * 8);
+        for seq in seqs {
+            name.extend_from_slice(&seq.to_be_bytes());
+        }
+        // v5 overwrites six bits of the digest with the version and variant
+        // constants; folding the halves together carries the rest into all 64.
+        let digest = Uuid::new_v5(&Uuid::nil(), &name).into_bytes();
+        let mut low = [0u8; 8];
+        let mut high = [0u8; 8];
+        low.copy_from_slice(&digest[..8]);
+        high.copy_from_slice(&digest[8..]);
+        Self(u64::from_be_bytes(low) ^ u64::from_be_bytes(high))
+    }
+}
 
 /// An op's membership in an atomic transaction: the shared [`TxId`] and the size
 /// of the group, so a receiver knows when every member has arrived and can apply
@@ -267,6 +306,48 @@ impl Op {
             kind,
             tx: None,
             zone: None,
+        }
+    }
+}
+
+/// The atomic groups that withholding `dropped` splits — one `(author, group id)`
+/// key per transaction with a member the sender is not delivering.
+///
+/// A per-op filter that drops a single member leaves the survivors carrying a
+/// `count` their bucket can never reach: the recipient holds them against a member
+/// that will never arrive, so they stay invisible to it forever while their ids
+/// still count as ones it holds. Naming the split groups lets the filter deliver
+/// the survivors untagged instead — see [`destrand_split`].
+pub fn split_groups<'a>(dropped: impl IntoIterator<Item = &'a Op>) -> HashSet<(ClientId, TxId)> {
+    dropped
+        .into_iter()
+        .filter_map(|op| op.tx.map(|tx| (op.id.client, tx.id)))
+        .collect()
+}
+
+/// Clear the transaction tag of every op in one of `split`, so a survivor of a
+/// split group merges standalone.
+///
+/// Delivering the survivors (rather than dropping the group whole) is a
+/// convergence requirement: every op the recipient may receive has to reach it, or
+/// the recipient diverges from the correct projection of the sender's state. The
+/// transaction's atomic-view boundary is lost at such a recipient — unavoidably,
+/// since it cannot see the member that was withheld — but the underlying ops still
+/// merge, so state converges. A group the filter carried whole keeps its tags and
+/// stays atomic.
+pub fn destrand_split<'a>(
+    ops: impl IntoIterator<Item = &'a mut Op>,
+    split: &HashSet<(ClientId, TxId)>,
+) {
+    if split.is_empty() {
+        return;
+    }
+    for op in ops {
+        if op
+            .tx
+            .is_some_and(|tx| split.contains(&(op.id.client, tx.id)))
+        {
+            op.tx = None;
         }
     }
 }
