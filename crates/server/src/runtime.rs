@@ -1366,7 +1366,7 @@ mod tests {
     /// "a healthy link clears the streak". Assert the shape they rely on.
     #[test]
     fn the_warn_threshold_leaves_room_to_not_warn() {
-        assert!(PEER_REJECTION_STREAK_WARN > 1);
+        const { assert!(PEER_REJECTION_STREAK_WARN > 1) };
     }
 
     #[test]
