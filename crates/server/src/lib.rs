@@ -704,6 +704,13 @@ impl Hub {
         }
     }
 
+    /// The identity this node's room replicas are held under. Reserved to the
+    /// node: the handshake refuses a connection declaring it, so no client can
+    /// author ops carrying it into a room's log.
+    pub fn replica_identity(&self) -> ClientId {
+        self.server
+    }
+
     /// Register an [`EventSink`] to observe the engine's lifecycle events. Several
     /// may be registered; each is notified of every event, in registration order.
     pub fn add_event_sink(&mut self, sink: Box<dyn EventSink>) {

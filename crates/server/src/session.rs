@@ -288,6 +288,16 @@ pub fn step(
             if session.client.is_some() {
                 return violation("already said hello");
             }
+            // The node's own replica identity is reserved. Channel 0 authors under
+            // the declared id unchanged, so a connection allowed to declare it
+            // could push ops carrying the node's identity into a room's log — and
+            // that identity is a fixed, publicly guessable constant, not the 122
+            // random bits a client's is drawn from. The declared id is the whole
+            // chokepoint: every further channel authors under `for_channel` of it,
+            // which never lands back on the node's.
+            if client == hub.replica_identity() {
+                return violation("hello declared the node's replica identity");
+            }
             // Settle the codec before anything else: a client that shares none
             // with this build cannot be answered in bytes it can read, so it is
             // refused here rather than served a frame it would misdecode.

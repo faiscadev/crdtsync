@@ -307,6 +307,8 @@ async fn main() -> std::io::Result<()> {
         None => None,
     };
     // The server never mints ops; its replicas only merge, so a fixed id is fine.
+    // It is reserved rather than secret: the handshake refuses a connection that
+    // declares it, so no client can author under the node's identity.
     // Both seams default to their permissive dev-mode value when unconfigured, so
     // one serve path covers every combination.
     // A handle onto the running registry accompanies the data plane: the blob
