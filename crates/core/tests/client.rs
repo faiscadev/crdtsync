@@ -686,7 +686,7 @@ fn a_snapshot_replaces_prior_local_state_with_the_server_state() {
 }
 
 #[test]
-fn edits_after_a_snapshot_still_carry_the_clients_own_id() {
+fn edits_after_a_snapshot_still_carry_the_channels_own_id() {
     let mut srv = srv();
     srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
@@ -703,7 +703,8 @@ fn edits_after_a_snapshot_still_carry_the_clients_own_id() {
     let outbound = session
         .edit(ch, |tx| tx.register(b"b", Scalar::Int(2)))
         .unwrap();
-    assert!(ops_of(outbound).iter().all(|op| op.id.client == cid(2)));
+    let mine = cid(2).for_channel(ch.0);
+    assert!(ops_of(outbound).iter().all(|op| op.id.client == mine));
 }
 
 // --- unsubscribe ---

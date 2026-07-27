@@ -1115,10 +1115,15 @@ fn handle_ops(
     let Some(Subscription { room, branch, .. }) = session.channels.get(&channel).cloned() else {
         return violation("ops on an unbound channel");
     };
-    // Every op must carry the client declared at Hello, so a connection's ops stay
-    // self-consistent. Authenticating that the client is who it claims is the
-    // transport's credential check; this driver only enforces consistency.
-    if ops.iter().any(|op| op.id.client != client) {
+    // Every op must carry the replica identity this channel authors under —
+    // `for_channel` of the client declared at Hello — so a connection's ops stay
+    // self-consistent and each channel keeps its own op-id space. Two channels of
+    // one connection can be bound to the same room, and identities shared across
+    // them would make one channel's ops dedup away as duplicates of the other's.
+    // Authenticating that the client is who it claims is the transport's
+    // credential check; this driver only enforces consistency.
+    let authoring = client.for_channel(channel.0);
+    if ops.iter().any(|op| op.id.client != authoring) {
         return violation("op client mismatch");
     }
     // An `XmlReveal` is a redaction-time synthesis the server injects into a partial

@@ -22,8 +22,10 @@ fn registry() -> Registry {
     Registry::new(cid(0xFF))
 }
 
-fn doc(first: u8) -> Document {
-    Document::new(cid(first))
+/// The replica a connection authors `channel` under — each channel holds its
+/// own, under the identity derived for it from the Hello id.
+fn doc_on(client: u8, channel: u32) -> Document {
+    Document::new(cid(client).for_channel(channel))
 }
 
 const ROOM_A: &[u8] = b"room-a";
@@ -106,7 +108,7 @@ fn one_connection_holds_two_rooms_at_once() {
     r.take_outbox(peer_a);
     r.take_outbox(peer_b);
 
-    let ops_a = doc(1).transact(|tx| tx.register(b"x", Scalar::Int(1)));
+    let ops_a = doc_on(1, 1).transact(|tx| tx.register(b"x", Scalar::Int(1)));
     r.deliver(
         a,
         Message::Ops {
@@ -140,7 +142,7 @@ fn a_broadcast_is_tagged_with_each_peers_own_channel() {
     r.take_outbox(b);
     r.take_outbox(c);
 
-    let ops = doc(1).transact(|tx| tx.register(b"x", Scalar::Int(1)));
+    let ops = doc_on(1, 1).transact(|tx| tx.register(b"x", Scalar::Int(1)));
     r.deliver(
         a,
         Message::Ops {
@@ -181,8 +183,8 @@ fn a_connection_receives_broadcasts_on_each_of_its_rooms() {
     r.take_outbox(wa);
     r.take_outbox(wb);
 
-    let ops_a = doc(2).transact(|tx| tx.register(b"a", Scalar::Int(1)));
-    let ops_b = doc(3).transact(|tx| tx.register(b"b", Scalar::Int(2)));
+    let ops_a = doc_on(2, 1).transact(|tx| tx.register(b"a", Scalar::Int(1)));
+    let ops_b = doc_on(3, 1).transact(|tx| tx.register(b"b", Scalar::Int(2)));
     r.deliver(
         wa,
         Message::Ops {
@@ -229,7 +231,7 @@ fn unsubscribe_stops_delivery_on_that_channel() {
     ));
     r.take_outbox(b);
 
-    let ops = doc(1).transact(|tx| tx.register(b"x", Scalar::Int(1)));
+    let ops = doc_on(1, 1).transact(|tx| tx.register(b"x", Scalar::Int(1)));
     r.deliver(
         a,
         Message::Ops {
@@ -275,7 +277,7 @@ fn ops_on_an_unbound_channel_are_a_violation() {
     subscribe(&mut r, a, 1, ROOM_A);
     r.take_outbox(a);
 
-    let ops = doc(1).transact(|tx| tx.register(b"x", Scalar::Int(1)));
+    let ops = doc_on(1, 2).transact(|tx| tx.register(b"x", Scalar::Int(1)));
     let keep_open = r.deliver(
         a,
         Message::Ops {

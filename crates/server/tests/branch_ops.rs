@@ -17,10 +17,6 @@ fn cid(first: u8) -> ClientId {
     ClientId::from_bytes(b)
 }
 
-fn doc(first: u8) -> Document {
-    Document::new(cid(first))
-}
-
 fn registry() -> Registry {
     Registry::new(cid(0xFF))
 }
@@ -60,9 +56,11 @@ fn joined(r: &mut Registry, client: u8) -> ConnId {
     id
 }
 
-/// Ingest a register-write through the connection so the room has state.
+/// Ingest a register-write through the connection so the room has state. Each
+/// channel holds its own replica, authoring under the identity derived for it.
 fn write_age(r: &mut Registry, id: ConnId, channel: Channel, value: i64) {
-    let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(value)));
+    let mut replica = Document::new(cid(1).for_channel(channel.0));
+    let ops = replica.transact(|tx| tx.register(b"age", Scalar::Int(value)));
     assert!(r.deliver(id, Message::Ops { channel, ops }));
     r.take_outbox(id);
 }
