@@ -256,26 +256,39 @@ fn distinct_op_ids_alone_do_not_save_two_inserts_that_share_a_stamp() {
     assert_eq!(left.next_seq(), 0);
     assert_eq!(right.next_seq(), 0);
 
+    // `tx.list` re-emits the container create, so each batch is [create, insert]
+    // and the insert — the op whose node id is at stake — is [1].
     let from_left = left.transact(|tx| tx.list(b"xs").insert(0, Scalar::Int(1)));
     let mut from_right = right.transact(|tx| tx.list(b"xs").insert(0, Scalar::Int(2)));
+    assert_eq!(from_left.len(), 2);
+    assert_eq!(from_right.len(), 2);
     assert_eq!(
-        from_left[0].id, from_right[0].id,
-        "one identity at seq 0 is one op id"
+        from_left[1].id, from_right[1].id,
+        "one identity at one seq is one op id"
     );
     assert_eq!(
-        from_left[0].stamp, from_right[0].stamp,
+        from_left[1].stamp, from_right[1].stamp,
         "one identity at one lamport is one stamp"
     );
 
-    // Repair only the envelope, as a channel-scoped seq would: this assignment is
-    // the whole of the hypothetical fix.
-    from_right[0].id.seq = 99;
-    assert_ne!(from_left[0].id, from_right[0].id);
+    // Repair the envelope across the whole batch, as a channel-scoped seq would:
+    // these assignments are the entirety of the hypothetical fix.
+    for (i, op) in from_right.iter_mut().enumerate() {
+        op.id.seq = 90 + i as u64;
+    }
+    assert_ne!(from_left[1].id, from_right[1].id);
 
     let mut peer = peer();
-    for op in create.iter().chain(&from_left).chain(&from_right) {
+    for op in create.iter().chain(&from_left) {
         peer.apply(op);
     }
+    // Every one of the right-hand ops is genuinely folded in — nothing is dropped
+    // as a duplicate. Without this the conclusion below could not tell the stamp
+    // collision apart from the `OpId` dedup the repair was meant to remove.
+    assert!(
+        from_right.iter().all(|op| peer.apply(op)),
+        "an op was dedup-dropped, so this no longer isolates the stamp collision"
+    );
     assert_eq!(
         list_len(&peer, b"xs"),
         1,
