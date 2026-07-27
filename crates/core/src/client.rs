@@ -2,7 +2,8 @@
 //!
 //! A [`ClientSession`] is the client-side mirror of the server's session
 //! driver. It opens with Hello, then holds several room subscriptions at once —
-//! each on its own [`Channel`], with its own local [`Document`] and caught-up
+//! each on its own [`Channel`], with its own local [`Document`], its own derived
+//! replica identity ([`ClientId::for_channel`]), and its own caught-up
 //! sequence. Subscribe assigns the next channel and draws the server's catch-up
 //! — an op delta or a whole-replica [`Message::Snapshot`]. Inbound frames route
 //! to a room by their channel; a reconnect resumes each room from where it left
@@ -255,7 +256,10 @@ impl ClientSession {
                 room: room.to_vec(),
                 branch: branch.to_vec(),
                 zone: zone.to_vec(),
-                doc: Document::new(self.client),
+                // Each channel authors under its own derived replica identity, so
+                // two channels bound to one room never mint the same op id or
+                // stamp for unrelated edits.
+                doc: Document::new(self.client.for_channel(channel.0)),
                 last_seen_seq: 0,
                 outbox: Vec::new(),
                 awareness: HashMap::new(),
@@ -720,12 +724,13 @@ impl ClientSession {
                     .rooms
                     .get_mut(&channel)
                     .ok_or(ClientError::UnknownChannel(channel))?;
-                // Adopt the server's state but keep our own identity and op-seq
-                // high-water mark for the ops we author next, so a re-mint can't
-                // collide with an op already made durable. A decode failure
-                // leaves the room untouched.
-                let mut doc = Document::decode_state_as(self.client, room.doc.next_seq(), &state)
-                    .map_err(|_| ClientError::BadSnapshot)?;
+                // Adopt the server's state but keep this channel's own identity
+                // and op-seq high-water mark for the ops we author next, so a
+                // re-mint can't collide with an op already made durable. A decode
+                // failure leaves the room untouched.
+                let mut doc =
+                    Document::decode_state_as(room.doc.client(), room.doc.next_seq(), &state)
+                        .map_err(|_| ClientError::BadSnapshot)?;
                 // Carry the undo origin across, so edits authored after a
                 // late-join or a reconnect catch-up stay recorded. The recorded
                 // *stack* does not survive: its inverses restore state the
@@ -963,6 +968,19 @@ impl ClientSession {
                 Err(ClientError::UnexpectedMessage("server sent a ping-ack"))
             }
         }
+    }
+
+    /// The identity this session declares at Hello — the connection's, from
+    /// which each channel's replica identity derives.
+    pub fn client(&self) -> ClientId {
+        self.client
+    }
+
+    /// The replica identity `channel` authors under —
+    /// [`for_channel`](ClientId::for_channel) of the session's id, and the client
+    /// every op on that channel carries. `None` if the channel isn't held.
+    pub fn channel_client(&self, channel: Channel) -> Option<ClientId> {
+        self.rooms.get(&channel).map(|r| r.doc.client())
     }
 
     /// The local replica for `channel`'s room, if held.

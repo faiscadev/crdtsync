@@ -67,6 +67,62 @@ fn generate_timestamp_is_big_endian_prefix() {
     assert_eq!(&bytes[0..6], &ts[2..8]);
 }
 
+// --- per-channel replica identities ---
+
+#[test]
+fn for_channel_is_deterministic() {
+    assert_eq!(cid(1).for_channel(3), cid(1).for_channel(3));
+}
+
+#[test]
+fn for_channel_distinguishes_channels() {
+    let ids: Vec<ClientId> = (0..64u32).map(|c| cid(1).for_channel(c)).collect();
+    for (i, a) in ids.iter().enumerate() {
+        for b in &ids[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+}
+
+#[test]
+fn for_channel_distinguishes_sessions() {
+    assert_ne!(cid(1).for_channel(1), cid(2).for_channel(1));
+}
+
+// The first channel is the replica the connection declared itself to be, so a
+// persisted client id keeps authoring the app's primary subscription.
+#[test]
+fn the_first_channel_keeps_the_declared_id() {
+    assert_eq!(cid(1).for_channel(0), cid(1));
+}
+
+// Every further channel is its own replica, never the declared one.
+#[test]
+fn a_further_channel_is_never_the_declared_id() {
+    for channel in 1..64u32 {
+        assert_ne!(cid(1).for_channel(channel), cid(1));
+    }
+}
+
+// v5, so a derived channel identity can never equal a `generate`d (v7) one.
+#[test]
+fn a_derived_channel_id_is_v5() {
+    let bytes = cid(1).for_channel(1).as_bytes();
+    assert_eq!(bytes[6] >> 4, 0x5);
+    assert_eq!(bytes[8] >> 6, 0b10);
+}
+
+// The channel number feeds the derivation as its four big-endian bytes, so every
+// bit of it is distinguishing — adjacent and far-apart channels alike.
+#[test]
+fn for_channel_distinguishes_high_channel_numbers() {
+    assert_ne!(
+        cid(1).for_channel(u32::MAX),
+        cid(1).for_channel(u32::MAX - 1)
+    );
+    assert_ne!(cid(1).for_channel(1 << 24), cid(1).for_channel(1));
+}
+
 #[test]
 fn generate_distinct_entropy_distinct_id() {
     let a = ClientId::generate(&TestHost {
