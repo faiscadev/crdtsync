@@ -7,7 +7,7 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
-## 2026-07-27 · C9 projected-snapshot frontier (#PR) · a projection keeps the ids belonging to its *recipient* and scrubs every other author's — the state encoding is the carrier, not a new wire field
+## 2026-07-27 · C9 projected-snapshot frontier (#357) · a projection keeps the ids belonging to its *recipient* and scrubs every other author's — the state encoding is the carrier, not a new wire field
 
 **The defect.** `project_zones` and `project_read_paths` cleared the causal `seen` frontier before a projected snapshot was encoded: an emptied frontier leaks no op count of the partition it withholds. Since C6, minting walks the ids a replica holds, so an emptied frontier is also the evidence a restarting reader needs about *itself*. A client that persists its `ClientId`, restarts, and adopts a zone-scoped or read-path-projected snapshot fell back to `decode_state_as`'s `next_seq` — 0 for a fresh replica — and re-minted into ids the room's log already holds. An `OpId` is the dedup key, so every one of those writes was dropped at ingest with nothing downstream able to detect it: the loss C6 removed on the other two catch-up paths, surviving on the restore path of every partial reader.
 
