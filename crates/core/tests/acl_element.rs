@@ -641,7 +641,7 @@ fn a_projection_redacts_an_unresolvable_element_tuple_by_root_read() {
 
     // A root-reading projection keeps the tuple (root fallback) — as the op-stream does.
     let mut keep = Document::decode_state(&d.encode_state()).expect("round-trip");
-    keep.project_read_paths(|_path| true);
+    keep.project_read_paths(|_path| true, None);
     assert!(
         keep.acl_tuple(gid.get()).is_some(),
         "a root reader keeps the unresolvable-element tuple, matching the op-stream"
@@ -650,7 +650,7 @@ fn a_projection_redacts_an_unresolvable_element_tuple_by_root_read() {
     // A projection that cannot read root drops it — as the op-stream withholds a
     // root-gated op from a non-root reader.
     let mut cut = Document::decode_state(&d.encode_state()).expect("round-trip");
-    cut.project_read_paths(|path| !path.is_empty());
+    cut.project_read_paths(|path| !path.is_empty(), None);
     assert!(
         cut.acl_tuple(gid.get()).is_none(),
         "a reader that cannot read root drops the unresolvable-element tuple"

@@ -281,7 +281,9 @@ impl Document {
     }
 
     /// The ids of every op this replica has applied — the dedup set, so a
-    /// reconstructing server can restore its own dedup from a decoded snapshot.
+    /// reconstructing server can restore its own dedup from a decoded snapshot. In a
+    /// projection that withheld something it is instead what the *recipient*
+    /// published, one of several ways such a document is not a live replica.
     pub fn seen(&self) -> impl Iterator<Item = OpId> + '_ {
         self.seen.iter().copied()
     }
@@ -1056,14 +1058,27 @@ impl Document {
     /// a room's zones is served a snapshot narrowed by this projection, so an
     /// unauthorized zone is wholly absent rather than redacted-but-present.
     ///
+    /// `recipient` is the replica identity this snapshot is served to: the causal
+    /// frontier is cut back to the ids that replica itself published and every other
+    /// author's go, so the withheld partition's op count stays absent while the
+    /// recipient can still tell which of its own ids the room's log holds (minting
+    /// walks them). `None` names no recipient and scrubs the frontier whole — right
+    /// for a projection no replica will author from, and a re-mint hazard for one
+    /// that will.
+    ///
     /// Sound only as the final transform before [`encode_state`](Self::encode_state)
-    /// on a throwaway copy: it clears the causal `seen` frontier (a below-floor
-    /// subscriber only ever ingests ops after the snapshot's sequence, so it needs
-    /// no prior dedup, and an emptied frontier leaks no op count of the hidden
-    /// partition) and leaves the derived move relation filtered only in its
-    /// persisted log — neither is a valid live-replica state. A schema with no zones
-    /// leaves the document untouched.
-    pub fn project_zones(&mut self, schema: &Schema, authorized: &HashSet<u32>) {
+    /// on a throwaway copy: it scrubs the causal `seen` frontier and leaves the
+    /// derived move relation filtered only in its persisted log — neither is a valid
+    /// live-replica state. A schema with no zones leaves the document untouched; a
+    /// set covering every declared zone does not — it still runs, and still scrubs,
+    /// so a whole-zone subscriber is served the room's replica by the caller
+    /// declining to project at all.
+    pub fn project_zones(
+        &mut self,
+        schema: &Schema,
+        authorized: &HashSet<u32>,
+        recipient: Option<ClientId>,
+    ) {
         if schema.zones().is_empty() {
             return;
         }
@@ -1155,14 +1170,14 @@ impl Document {
         self.moves
             .retain(|child, parent| !purge.contains(&child) && !purge.contains(&parent));
         self.zone_clocks.retain(|zone, _| authorized.contains(zone));
-        // The causal frontier and buffer, scrubbed of the hidden partition: `seen`
-        // is emptied (a below-floor subscriber dedups nothing before the snapshot
-        // sequence, and an emptied set carries no op count), and buffered ops are
-        // filtered to the authorized partitions.
-        self.seen.clear();
+        // The causal frontier and buffer, scrubbed of the hidden partition: buffered
+        // ops are filtered to the authorized partitions, and `seen` is cut back to
+        // the ids the recipient itself published.
+        let published = self.published_by(recipient);
         self.buffer
             .retain(|op| op.zone.is_none_or(|zone| authorized.contains(&zone)));
         self.buffered = self.buffer.iter().map(|op| op.id).collect();
+        self.scrub_frontier_to(published);
     }
 
     /// Project this replica in place to the paths a reader may read, dropping every
@@ -1191,13 +1206,24 @@ impl Document {
     /// is readable (require-all, so a mark leaks no content-region info at an unreadable
     /// endpoint). A whole-document reader is left untouched, byte-identical on re-encode.
     ///
+    /// `recipient` is the replica identity this snapshot is served to: the causal
+    /// frontier is cut back to the ids that replica itself published and every other
+    /// author's go, so the denied subtrees' op count stays absent while the recipient
+    /// can still tell which of its own ids the room's log holds (minting walks them).
+    /// `None` names no recipient and scrubs the frontier whole — right for a projection
+    /// no replica will author from, and a re-mint hazard for one that will.
+    ///
     /// Sound only as the final transform before [`encode_state`](Self::encode_state) on
-    /// a throwaway copy: like [`project_zones`](Self::project_zones) it clears the causal
-    /// `seen` frontier and the buffer once anything is dropped (a below-floor subscriber
-    /// dedups nothing before the snapshot's sequence, and an emptied frontier leaks no op
-    /// count of a hidden subtree) and leaves the derived move relation filtered only in
-    /// its persisted log — neither a valid live-replica state.
-    pub fn project_read_paths(&mut self, reads: impl Fn(&[Vec<u8>]) -> bool) {
+    /// a throwaway copy: like [`project_zones`](Self::project_zones) it scrubs the causal
+    /// `seen` frontier and clears the buffer once anything is dropped (a below-floor
+    /// subscriber dedups nothing before the snapshot's sequence) and leaves the derived
+    /// move relation filtered only in its persisted log — neither a valid live-replica
+    /// state.
+    pub fn project_read_paths(
+        &mut self,
+        reads: impl Fn(&[Vec<u8>]) -> bool,
+        recipient: Option<ClientId>,
+    ) {
         let root = self.root_id();
         let paths = self.element_paths();
         let root_reads = reads(&[]);
@@ -1369,18 +1395,77 @@ impl Document {
                 && !list_denied(&XmlElement::children_id(parent))
         });
         // Once anything is dropped, scrub the causal frontier and buffer of the hidden
-        // state so neither leaks an op count, and rebuild the tree-move fold so the
-        // derived parents and `moved_away` overlay match the filtered log a reload
-        // replays — a node kept at its readable origin renders there, not at the denied
-        // destination it was folded to, so the projected snapshot is byte-stable through
-        // a round-trip. A pure identity projection (a whole-document reader) leaves both
-        // untouched, staying byte-identical on re-encode.
+        // state so neither leaks another replica's op count, and rebuild the tree-move
+        // fold so the derived parents and `moved_away` overlay match the filtered log a
+        // reload replays — a node kept at its readable origin renders there, not at the
+        // denied destination it was folded to, so the projected snapshot is byte-stable
+        // through a round-trip. A pure identity projection (a whole-document reader)
+        // leaves both untouched, staying byte-identical on re-encode.
         if !purge.is_empty() || cut_leaf || acl_cut || ranged_cut || !root_reads {
+            let published = self.published_by(recipient);
             self.refold_projected_moves();
-            self.seen.clear();
             self.buffer.clear();
             self.buffered.clear();
+            self.scrub_frontier_to(published);
         }
+    }
+
+    /// The ids `recipient` published that this replica holds — its entries in the
+    /// dedup set and in the buffer alike, read before either is scrubbed of a
+    /// withheld partition.
+    fn published_by(&self, recipient: Option<ClientId>) -> HashSet<OpId> {
+        let Some(client) = recipient else {
+            return HashSet::new();
+        };
+        self.seen
+            .iter()
+            .chain(self.buffered.iter())
+            .filter(|id| id.client == client)
+            .copied()
+            .collect()
+    }
+
+    /// Cut the causal frontier back to `published` — the ids the recipient of a
+    /// projected snapshot authored itself, as [`published_by`](Self::published_by)
+    /// read them before the projection scrubbed anything — minus whatever survived
+    /// in the buffer, which already holds them.
+    ///
+    /// A projection withholds a partition, so it cannot serve that partition's
+    /// frontier: the ids of ops the recipient may not read would name their
+    /// existence and count. What it can serve back is the recipient's *own*
+    /// authorship, which the recipient originated and which no scrub protects it
+    /// from. That is also what it must serve back: minting walks the ids the replica
+    /// holds ([`free_seq`](Self::free_seq)), so a recipient that persists its
+    /// identity and adopts a snapshot naming none of its own ids mints straight into
+    /// ids the room's log already holds — every one of those writes deduped away at
+    /// ingest, silently. A run with a hole in it is the same case one step on: the
+    /// position a replica reports is the first sequence it has not published, so a
+    /// hole is where a projected snapshot is adopted, and every id *above* the hole
+    /// re-mints unless the frontier names them. (A redacted op delta is what leaves
+    /// the hole, by withholding a member the recipient authored on a path it may no
+    /// longer read; closing that seam needs a carrier for the ids an Ops frame
+    /// withholds, which no frame has.)
+    ///
+    /// So the frontier a projected snapshot carries names one replica: the one
+    /// adopting it. The existence and count of every *other* replica's ops in the
+    /// withheld partition stay absent, which is what the scrub is for. What the
+    /// recipient learns of its own run is bounded by who may present its identity:
+    /// the id is declared, and authenticating the declaration is the transport's
+    /// credential check, not this projection's — the same trust boundary that
+    /// already lets a declarer author under that identity.
+    ///
+    /// The frontier a projection leaves is what the recipient *published*, which in
+    /// a scrubbed buffer is wider than what it applied: an own op the buffer held is
+    /// named here once the buffer goes, because a free id is the worse answer — the
+    /// replica would author a second, different op under an identity the room's log
+    /// already binds. A projected document is not a live replica in the first place
+    /// (its buffer and move relation are filtered too), and the ops behind those ids
+    /// sit below the snapshot's sequence, so no later delivery meets them.
+    fn scrub_frontier_to(&mut self, published: HashSet<OpId>) {
+        self.seen = published
+            .into_iter()
+            .filter(|id| !self.buffered.contains(id))
+            .collect();
     }
 
     /// The synthetic [`XmlReveal`](crate::op::OpKind::XmlReveal) shell ops that reveal,
@@ -1598,9 +1683,9 @@ impl Document {
     /// typically a server's room replica, which merges under its own identity —
     /// and says nothing about the ids this replica has published, so it is
     /// replaced rather than merged in. What the adopting replica has published
-    /// comes from two places instead: the dedup set the snapshot carries, which
-    /// minting walks, and `next_seq` for a projected snapshot, whose dedup set is
-    /// scrubbed of the partition it withholds.
+    /// comes from the ids the snapshot carries and minting walks — its dedup set and
+    /// its buffer, a projected snapshot's cut back to the recipient's own so the walk
+    /// still reaches them. `next_seq` is where that walk starts.
     pub fn decode_state_as(
         client: ClientId,
         next_seq: u64,
