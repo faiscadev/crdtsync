@@ -180,6 +180,64 @@ fn a_gap_in_the_durable_run_is_reused_and_the_published_ids_are_skipped() {
 }
 
 #[test]
+fn an_op_of_this_replica_still_held_in_the_buffer_is_not_a_free_id() {
+    // An op waiting on its transaction group — or on a target no create has made
+    // reachable — is buffered with its id out of the dedup set, and it is as
+    // published as any other: the room's log holds it. A catch-up delta split
+    // across frames delivers exactly this state.
+    let mut author = Document::new(cid(1));
+    let plain = author.transact(|tx| tx.set(b"k", Scalar::Int(0)));
+    let group = author.atomic_transact(|tx| {
+        tx.set(b"x", Scalar::Int(1));
+        tx.set(b"y", Scalar::Int(2));
+    });
+    assert_eq!(seqs(&plain), vec![0]);
+    assert_eq!(seqs(&group), vec![1, 2]);
+
+    // The group's second member has not landed, so the first waits in the buffer
+    // with its id out of the dedup set. Minting it back would leave the replica
+    // holding two different ops under one identity once the buffer drains —
+    // divergence, not a dropped write, since each peer keeps whichever it saw
+    // first.
+    let mut restored = Document::new(cid(1));
+    restored.apply(&plain[0]);
+    restored.apply(&group[0]);
+    assert_eq!(
+        restored.next_seq(),
+        2,
+        "an id held for an incomplete group was reported free"
+    );
+    let local = restored.transact(|tx| tx.set(b"after", Scalar::Int(9)));
+    assert!(
+        local[0].id != group[0].id,
+        "minted an id the buffer was already holding"
+    );
+}
+
+#[test]
+fn a_completed_group_leaves_the_counter_past_every_member() {
+    // The catch-up shape: the whole delta arrives, the group completes, and the
+    // counter clears every member it carried — a buffered member counts while it
+    // waits and is still counted once it lands.
+    let mut author = Document::new(cid(1));
+    let plain = author.transact(|tx| tx.set(b"k", Scalar::Int(0)));
+    let group = author.atomic_transact(|tx| {
+        tx.set(b"x", Scalar::Int(1));
+        tx.set(b"y", Scalar::Int(2));
+    });
+
+    let mut restored = Document::new(cid(1));
+    for op in plain.iter().chain(group.iter()) {
+        restored.apply(op);
+    }
+    assert_eq!(restored.next_seq(), 3);
+    assert_eq!(
+        seqs(&restored.transact(|tx| tx.set(b"after", Scalar::Int(9)))),
+        vec![3]
+    );
+}
+
+#[test]
 fn a_delta_holding_no_op_of_this_replica_leaves_the_counter_at_zero() {
     let (_, foreign) = authored(cid(2), 4);
     let mut doc = Document::new(cid(1));
@@ -267,6 +325,22 @@ fn a_ceiling_frame_survives_a_snapshot_round_trip_without_moving_the_counter() {
     assert_eq!(back.next_seq(), 0);
 }
 
+#[test]
+fn a_state_whose_counter_is_at_the_end_of_the_space_is_refused() {
+    // The counter names the next id to mint, so the end of the space names none:
+    // a replica restored onto it could only re-issue an id it already published.
+    // Reaching it by minting takes 2^64 ops, so a state carrying it is malformed
+    // — and refused loudly rather than decoded into a replica that mints one id
+    // forever.
+    let mut state = Document::new(cid(1)).encode_state();
+    // The counter follows the version byte, the client id, and the lamport clock.
+    let at = 1 + 16 + 8;
+    state[at..at + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+
+    assert!(Document::decode_state(&state).is_err());
+    assert!(Document::decode_state_as(cid(2), 0, &state).is_err());
+}
+
 // --- the server's replica, and the snapshot it serves ---
 
 #[test]
@@ -304,7 +378,9 @@ fn an_adopted_snapshot_does_not_import_the_snapshot_authors_counter() {
 fn an_adopting_replica_keeps_the_high_water_it_was_handed() {
     // The live session's counter is the caller's contribution: a projected
     // snapshot arrives with its dedup set scrubbed, so the handed high-water is
-    // the only evidence of what this replica already published.
+    // the only evidence of what this replica already published. It answers for a
+    // session that stayed up across the catch-up; a session rebuilt from nothing
+    // reports 0 and has no other evidence to offer.
     let (author, durable) = authored(cid(1), 3);
     let mut server = Document::new(cid(9));
     for op in &durable {

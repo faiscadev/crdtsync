@@ -705,8 +705,8 @@ impl Hub {
     }
 
     /// The identity this node's room replicas are held under. Reserved to the
-    /// node: the op gate refuses a batch authored under it, so no client's write
-    /// enters a room's log carrying the node's identity.
+    /// node: the op gate refuses a client batch authored under it, so no write on
+    /// the client path enters a room's log carrying the node's identity.
     pub fn replica_identity(&self) -> ClientId {
         self.server
     }

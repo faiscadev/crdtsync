@@ -1537,29 +1537,37 @@ impl Document {
     }
 
     /// The first sequence at or past `seq` this replica has not published, read
-    /// off the dedup set.
+    /// off the ids it holds.
     ///
-    /// The op-seq position walks that set rather than tracking a high-water read
+    /// The op-seq position walks those ids rather than tracking a high-water read
     /// off arriving ops. A catch-up hands a replica back the ops it authored
     /// before a restart — as an op delta, or inside a snapshot it adopts, since
-    /// the dedup set rides the state encoding — and an id minted a second time is
+    /// both id sets ride the state encoding — and an id minted a second time is
     /// dropped at every peer's dedup set, so the write is lost with nothing
     /// downstream able to detect it. Reading the ids the replica already holds
     /// keeps the position's only input to evidence it folded itself: no `seq` off
     /// the wire is ever assigned to it, and one step per held id means no frame
-    /// can drive it toward the end of the space, where a mint would have to reuse
-    /// an id already published.
+    /// can drive it toward the end of the space.
+    ///
+    /// Held, not merely applied: an op waiting on its transaction group or on an
+    /// unreachable target sits in the buffer with its id out of `seen`, and it is
+    /// as published as any other — the room's log holds it, and a re-mint of its
+    /// id would leave the replica applying two different ops under one identity
+    /// once the buffer drains.
     fn free_seq(&self, mut seq: u64) -> u64 {
-        while self.seen.contains(&OpId {
-            client: self.client,
-            seq,
-        }) {
+        loop {
+            let id = OpId {
+                client: self.client,
+                seq,
+            };
+            if !self.seen.contains(&id) && !self.buffered.contains(&id) {
+                return seq;
+            }
             let Some(next) = seq.checked_add(1) else {
-                break;
+                return seq;
             };
             seq = next;
         }
-        seq
     }
 
     /// The current lamport high-water of a replication partition: the root clock
@@ -1607,6 +1615,17 @@ impl Document {
         let client = cur.client()?;
         let lamport = cur.u64()?;
         let seq = cur.u64()?;
+        // The counter names the next id the replica will mint, so the end of the
+        // space names none — a replica restored onto it could only re-issue an id
+        // it has already published. No replica reaches it by minting (that is 2^64
+        // authored ops), so a state carrying it is malformed, and refusing it here
+        // keeps the position on a value minting can always move off.
+        if seq == u64::MAX {
+            return Err(DecodeError::BadTag {
+                what: "document: op sequence at the end of the space",
+                tag: 0,
+            });
+        }
 
         let zone_clock_count = cur.u32()?;
         let mut zone_clocks: HashMap<u32, u64> =
