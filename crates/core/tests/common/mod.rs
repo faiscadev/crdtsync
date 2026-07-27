@@ -76,3 +76,40 @@ pub fn assert_scalar(e: &Element, expected: Scalar) {
         _ => panic!("expected a SCALAR element"),
     }
 }
+
+/// The state codec's fixed header: a version byte, the client id, the root
+/// lamport clock, then the op-seq position — every integer little-endian. The
+/// helpers below patch one field of an encoded snapshot so a test can hand a
+/// decoder a clock or a counter no encoder would write.
+const STATE_CLOCK_AT: usize = 1 + 16;
+const STATE_SEQ_AT: usize = STATE_CLOCK_AT + 8;
+/// The zone clocks follow the header: a `u32` count, then `(u32 zone, u64
+/// lamport)` per entry, zone-id sorted.
+const STATE_ZONE_CLOCKS_AT: usize = STATE_SEQ_AT + 8;
+
+/// `bytes` with the encoded root lamport clock replaced by `lamport`.
+pub fn with_root_clock(mut bytes: Vec<u8>, lamport: u64) -> Vec<u8> {
+    bytes[STATE_CLOCK_AT..STATE_CLOCK_AT + 8].copy_from_slice(&lamport.to_le_bytes());
+    bytes
+}
+
+/// `bytes` with the encoded op-seq position replaced by `seq`.
+pub fn with_seq(mut bytes: Vec<u8>, seq: u64) -> Vec<u8> {
+    bytes[STATE_SEQ_AT..STATE_SEQ_AT + 8].copy_from_slice(&seq.to_le_bytes());
+    bytes
+}
+
+/// `bytes` with the clock of the sole encoded zone replaced by `lamport`.
+/// Panics unless exactly one zone clock is present, so a codec change that moves
+/// the field fails loudly rather than patching the wrong bytes.
+pub fn with_only_zone_clock(mut bytes: Vec<u8>, lamport: u64) -> Vec<u8> {
+    let count = u32::from_le_bytes(
+        bytes[STATE_ZONE_CLOCKS_AT..STATE_ZONE_CLOCKS_AT + 4]
+            .try_into()
+            .expect("four bytes"),
+    );
+    assert_eq!(count, 1, "expected exactly one encoded zone clock");
+    let at = STATE_ZONE_CLOCKS_AT + 4 + 4;
+    bytes[at..at + 8].copy_from_slice(&lamport.to_le_bytes());
+    bytes
+}

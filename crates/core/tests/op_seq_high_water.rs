@@ -38,7 +38,7 @@ use crdtsync_core::client::ClientSession;
 use crdtsync_core::{ClientId, Document, Element, Message, Op, OpId, Scalar};
 
 mod common;
-use common::cid;
+use common::{cid, with_seq};
 
 const ROOM: &[u8] = b"room-a";
 
@@ -329,15 +329,6 @@ fn a_ceiling_frame_survives_a_snapshot_round_trip_without_moving_the_counter() {
     doc.apply(&op_at_seq(cid(1), b"forged", u64::MAX));
     let back = Document::decode_state(&doc.encode_state()).expect("decodes");
     assert_eq!(back.next_seq(), 0);
-}
-
-/// `bytes` with the encoded op-seq position replaced by `seq`. The position
-/// follows the version byte, the client id, and the lamport clock, little-endian
-/// like every other integer in the state codec.
-fn with_seq(mut bytes: Vec<u8>, seq: u64) -> Vec<u8> {
-    let at = 1 + 16 + 8;
-    bytes[at..at + 8].copy_from_slice(&seq.to_le_bytes());
-    bytes
 }
 
 #[test]

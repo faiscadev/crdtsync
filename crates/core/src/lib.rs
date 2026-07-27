@@ -72,7 +72,7 @@ pub use schema::{
     Action, Auth, AwarenessEntry, Effect, Grant, MarkDef, MarkExpand, MarkFlavor, Schema,
     SchemaError, SchemaErrorKind, Subject, SubjectClass, TemplateVar, TypeDef,
 };
-pub use stamp::Stamp;
+pub use stamp::{Stamp, LAMPORT_STATE_CEILING, LAMPORT_WIRE_CEILING};
 pub use text::Text;
 pub use undo::UndoManager;
 pub use xml::{XmlElement, XmlFragment};
