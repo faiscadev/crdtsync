@@ -1,18 +1,21 @@
-//! A node's replica identity is the node's alone — no connection may declare it.
+//! A node's replica identity is the node's alone — no client may author under it.
 //!
 //! Every room a node serves is held as a [`Document`] authored under one node-wide
 //! [`ClientId`], and in production that id is the fixed all-zero constant — public,
 //! and guessable by anyone. Channel 0 authors under the id a connection declares at
-//! Hello unchanged, so without a gate a client can declare the node's own identity
-//! and push ops into the room's log carrying it.
+//! Hello unchanged, so without a gate a client can write ops into the room's log
+//! carrying the node's own identity.
 //!
 //! That is the one identity in the system an attacker does not have to guess 122
 //! random bits for, and the node's replica is the amplifier behind it: its
 //! `encode_state` rides every catch-up snapshot the node serves and every
-//! compaction it writes, so anything a frame can install in that replica reaches
-//! every client that later joins. The declared id is the single chokepoint —
-//! `for_channel` of any other id never lands on it — so the handshake refuses it
-//! and the connection closes before it can bind a channel.
+//! compaction it writes.
+//!
+//! The reservation is on *authorship*, not on the declaration. A node-to-node link
+//! says Hello under its own node id — and every node ships with the same fixed
+//! constant — so refusing the declaration would refuse replication itself. The op
+//! gate is the seam where the harm would land, and it already re-derives the
+//! identity each channel authors under, so it is where the identity is reserved.
 
 use crdtsync_core::client::ClientSession;
 use crdtsync_core::protocol::Channel;
@@ -25,7 +28,7 @@ fn cid(first: u8) -> ClientId {
     ClientId::from_bytes(b)
 }
 
-/// The node identity `crdtsync-server`'s binary serves under.
+/// The node identity the `crdtsync-server` binary serves under.
 fn production_node_id() -> ClientId {
     ClientId::from_bytes([0; 16])
 }
@@ -65,7 +68,7 @@ fn hello(r: &mut Registry, client: ClientId) -> ConnId {
     id
 }
 
-fn subscribe(r: &mut Registry, id: ConnId, channel: Channel, room: &[u8], last_seen_seq: u64) {
+fn subscribe(r: &mut Registry, id: ConnId, channel: Channel, room: &[u8]) {
     assert!(r.deliver(
         id,
         Message::Subscribe {
@@ -73,7 +76,7 @@ fn subscribe(r: &mut Registry, id: ConnId, channel: Channel, room: &[u8], last_s
             room: room.to_vec(),
             branch: Vec::new(),
             zone: Vec::new(),
-            last_seen_seq,
+            last_seen_seq: 0,
         }
     ));
 }
@@ -88,67 +91,49 @@ fn received_ops(msgs: Vec<Message>) -> Vec<Op> {
         .collect()
 }
 
-// --- the handshake gate ---
+/// A one-op `Message::Ops` on `channel` authored under `client`.
+fn ops_frame(channel: Channel, client: ClientId, key: &[u8]) -> Message {
+    let ops = Document::new(client).transact(|tx| tx.set(key, Scalar::Int(1)));
+    Message::Ops { channel, ops }
+}
+
+// --- the reserved identity ---
 
 #[test]
-fn a_hello_declaring_the_nodes_replica_identity_is_refused() {
+fn a_batch_authored_under_the_nodes_replica_identity_is_refused() {
     let mut r = Registry::new(cid(0xFF));
-    let conn = r.connect();
-    assert!(
-        !r.deliver(conn, hello_msg(cid(0xFF))),
-        "the connection stayed open"
-    );
-    assert!(r.take_outbox(conn).iter().any(is_violation));
-}
-
-#[test]
-fn the_production_node_identity_is_refused() {
-    // The shipped binary serves under the all-zero id — the guessable case the
-    // gate exists for, pinned so a change to that constant cannot quietly reopen it.
-    let mut r = Registry::new(production_node_id());
-    let conn = r.connect();
-    assert!(!r.deliver(conn, hello_msg(production_node_id())));
-    assert!(r.take_outbox(conn).iter().any(is_violation));
-}
-
-#[test]
-fn a_hello_under_any_other_identity_is_accepted() {
-    let mut r = Registry::new(production_node_id());
-    let conn = r.connect();
-    assert!(r.deliver(conn, hello_msg(cid(1))));
-    assert!(!r.take_outbox(conn).iter().any(is_violation));
-}
-
-#[test]
-fn a_refused_connection_binds_no_channel_and_writes_no_op() {
-    let mut r = Registry::new(cid(0xFF));
-    let attacker = r.connect();
-    r.deliver(attacker, hello_msg(cid(0xFF)));
+    let attacker = hello(&mut r, cid(0xFF));
+    subscribe(&mut r, attacker, Channel(0), ROOM);
     r.take_outbox(attacker);
 
-    // With no Hello settled the connection can neither subscribe nor write, so
-    // nothing authored under the node's identity reaches the room.
-    r.deliver(
-        attacker,
-        Message::Subscribe {
-            channel: Channel(0),
-            room: ROOM.to_vec(),
-            branch: Vec::new(),
-            zone: Vec::new(),
-            last_seen_seq: 0,
-        },
-    );
-    let forged = Document::new(cid(0xFF)).transact(|tx| tx.set(b"x", Scalar::Int(1)));
-    r.deliver(
-        attacker,
-        Message::Ops {
-            channel: Channel(0),
-            ops: forged,
-        },
-    );
+    r.deliver(attacker, ops_frame(Channel(0), cid(0xFF), b"x"));
+    assert!(r.take_outbox(attacker).iter().any(is_violation));
+}
+
+#[test]
+fn the_production_node_identity_is_refused_as_an_author() {
+    // The shipped binary serves under the all-zero id — the guessable case the
+    // reservation exists for, pinned so a change to that constant cannot quietly
+    // reopen it.
+    let mut r = Registry::new(production_node_id());
+    let attacker = hello(&mut r, production_node_id());
+    subscribe(&mut r, attacker, Channel(0), ROOM);
+    r.take_outbox(attacker);
+
+    r.deliver(attacker, ops_frame(Channel(0), production_node_id(), b"x"));
+    assert!(r.take_outbox(attacker).iter().any(is_violation));
+}
+
+#[test]
+fn no_op_under_the_nodes_identity_reaches_the_rooms_log() {
+    let mut r = Registry::new(cid(0xFF));
+    let attacker = hello(&mut r, cid(0xFF));
+    subscribe(&mut r, attacker, Channel(0), ROOM);
+    r.take_outbox(attacker);
+    r.deliver(attacker, ops_frame(Channel(0), cid(0xFF), b"x"));
 
     let observer = hello(&mut r, cid(1));
-    subscribe(&mut r, observer, Channel(0), ROOM, 0);
+    subscribe(&mut r, observer, Channel(0), ROOM);
     let ops = received_ops(r.take_outbox(observer));
     assert!(
         ops.iter().all(|op| op.id.client != cid(0xFF)),
@@ -156,7 +141,38 @@ fn a_refused_connection_binds_no_channel_and_writes_no_op() {
     );
 }
 
-// --- the catch-up path the identity gate protects ---
+#[test]
+fn a_batch_under_any_other_identity_is_still_accepted() {
+    let mut r = Registry::new(production_node_id());
+    let writer = hello(&mut r, cid(1));
+    subscribe(&mut r, writer, Channel(0), ROOM);
+    r.take_outbox(writer);
+
+    r.deliver(writer, ops_frame(Channel(0), cid(1), b"x"));
+    let out = r.take_outbox(writer);
+    assert!(
+        !out.iter().any(is_violation),
+        "refused a valid batch: {out:?}"
+    );
+    assert!(out.iter().any(|m| matches!(m, Message::Accepted { .. })));
+}
+
+#[test]
+fn a_connection_may_still_say_hello_under_the_nodes_identity() {
+    // A node-to-node link opens with a Hello declaring the connecting node's own
+    // id, and every node ships with the same fixed constant — so the reservation
+    // must refuse authorship, never the declaration, or replication would refuse
+    // itself. The handshake settles; only a write under the identity is refused.
+    let mut r = Registry::new(production_node_id());
+    let peer = r.connect();
+    assert!(
+        r.deliver(peer, hello_msg(production_node_id())),
+        "the node's own Hello was refused — peer links open this way"
+    );
+    assert!(!r.take_outbox(peer).iter().any(is_violation));
+}
+
+// --- the catch-up path the reservation protects ---
 
 #[test]
 fn a_restarted_client_caught_up_by_an_op_delta_keeps_its_writes() {
@@ -211,7 +227,7 @@ fn a_restarted_client_caught_up_by_an_op_delta_keeps_its_writes() {
 
     // A fresh joiner reads the room's log: the post-restart write must be in it.
     let observer = hello(&mut r, cid(2));
-    subscribe(&mut r, observer, Channel(0), ROOM, 0);
+    subscribe(&mut r, observer, Channel(0), ROOM);
     let mut replica = Document::new(cid(3));
     for op in received_ops(r.take_outbox(observer)) {
         replica.apply(&op);

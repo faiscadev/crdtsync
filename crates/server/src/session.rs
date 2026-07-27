@@ -288,16 +288,6 @@ pub fn step(
             if session.client.is_some() {
                 return violation("already said hello");
             }
-            // The node's own replica identity is reserved. Channel 0 authors under
-            // the declared id unchanged, so a connection allowed to declare it
-            // could push ops carrying the node's identity into a room's log — and
-            // that identity is a fixed, publicly guessable constant, not the 122
-            // random bits a client's is drawn from. The declared id is the whole
-            // chokepoint: every further channel authors under `for_channel` of it,
-            // which never lands back on the node's.
-            if client == hub.replica_identity() {
-                return violation("hello declared the node's replica identity");
-            }
             // Settle the codec before anything else: a client that shares none
             // with this build cannot be answered in bytes it can read, so it is
             // refused here rather than served a frame it would misdecode.
@@ -1135,6 +1125,17 @@ fn handle_ops(
     let authoring = client.for_channel(channel.0);
     if ops.iter().any(|op| op.id.client != authoring) {
         return violation("op client mismatch");
+    }
+    // The node's own replica identity is reserved: no op carrying it may enter a
+    // room's log. Channel 0 authors under the declared Hello id unchanged, and a
+    // node's id is a fixed, publicly guessable constant rather than the 122 random
+    // bits a client's is drawn from — so it is the one identity a client can write
+    // under on purpose, into the very replica whose `encode_state` rides every
+    // catch-up snapshot the node serves. The reservation sits here rather than at
+    // the handshake because a node-to-node link legitimately says Hello under its
+    // own node id; it is authorship, not the declaration, that has to be refused.
+    if authoring == hub.replica_identity() {
+        return violation("ops authored under the node's replica identity");
     }
     // An `XmlReveal` is a redaction-time synthesis the server injects into a partial
     // reader's stream — never an authored op. A client that submits one is rejected
