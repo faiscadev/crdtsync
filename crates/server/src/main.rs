@@ -297,9 +297,28 @@ fn peer_tls_config() -> std::io::Result<Option<Arc<rustls::ClientConfig>>> {
 /// from `CRDTSYNC_CLUSTER_REQUIRE_TLS` — how an operator declares a TLS rollout
 /// finished. A cluster may otherwise mix transports, which is the only way to reach
 /// an all-TLS cluster without restarting every node at one instant.
+///
+/// Absence is `false`; `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off` select it
+/// (case-insensitively). Any other value is a clean startup error — resolving an
+/// unrecognized value would resolve it to the *permissive* setting, which is the
+/// one an operator setting this variable is trying to leave.
 fn require_peer_tls() -> std::io::Result<bool> {
-    Ok(path_var("CRDTSYNC_CLUSTER_REQUIRE_TLS")?
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes")))
+    parse_require_peer_tls(path_var("CRDTSYNC_CLUSTER_REQUIRE_TLS")?.as_deref())
+}
+
+/// Parse the `CRDTSYNC_CLUSTER_REQUIRE_TLS` value. See [`require_peer_tls`].
+fn parse_require_peer_tls(value: Option<&str>) -> std::io::Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("CRDTSYNC_CLUSTER_REQUIRE_TLS must be a boolean, got `{other}`"),
+        )),
+    }
 }
 
 /// The zone-master key for the run: the 32 bytes sealing cross-zone-move capability
@@ -487,7 +506,7 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_zone_key;
+    use super::{decode_zone_key, parse_require_peer_tls};
 
     #[test]
     fn a_valid_64_hex_key_decodes() {
@@ -523,5 +542,30 @@ mod tests {
         hex.push('é'); // 2 bytes (0xC3 0xA9)
         assert_eq!(hex.len(), 64);
         assert!(decode_zone_key(&hex).is_err());
+    }
+
+    #[test]
+    fn an_absent_require_peer_tls_is_off() {
+        assert!(!parse_require_peer_tls(None).unwrap());
+    }
+
+    #[test]
+    fn require_peer_tls_reads_either_spelling_of_a_boolean() {
+        for on in ["1", "true", "TRUE", " Yes ", "on"] {
+            assert!(parse_require_peer_tls(Some(on)).unwrap(), "{on}");
+        }
+        for off in ["0", "false", "No", "off"] {
+            assert!(!parse_require_peer_tls(Some(off)).unwrap(), "{off}");
+        }
+    }
+
+    /// An unrecognized value resolves to the *permissive* setting if it resolves at
+    /// all — which is the one an operator setting this variable is leaving. So it
+    /// does not resolve.
+    #[test]
+    fn an_unrecognized_require_peer_tls_is_a_startup_error() {
+        for bad in ["", "yes please", "2", "require"] {
+            assert!(parse_require_peer_tls(Some(bad)).is_err(), "{bad}");
+        }
     }
 }

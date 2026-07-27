@@ -49,6 +49,13 @@ use crdtsync_server::{
 
 const CH: Channel = Channel(0);
 
+/// How long a positive convergence assertion waits. Generous rather than tight:
+/// these tests stand up real nodes that dial, complete a TLS handshake, and
+/// replicate, and a loaded machine running the whole suite in parallel makes a
+/// short bound measure the machine rather than the code. A *negative* assertion
+/// never leans on this — each has its own bound inside the code under test.
+const CONVERGE: Duration = Duration::from_secs(60);
+
 /// The deployment's cluster secret — what every node in one cluster holds and
 /// nobody else does.
 const SECRET: &[u8] = b"cluster-secret-of-at-least-32-bytes";
@@ -253,6 +260,25 @@ async fn next_matching(
     .flatten()
 }
 
+/// Retry `round` until it yields, or [`CONVERGE`] elapses — the gossip loop retries
+/// a round every tick in exactly this way, so a positive assertion about an
+/// exchange measures whether it can happen at all rather than whether it happened
+/// inside one attempt's own timeout on a loaded machine. A *negative* assertion
+/// never uses this: one attempt failing is the whole of what it asserts.
+async fn retrying<T, F: std::future::Future<Output = Option<T>>>(
+    round: impl Fn() -> F,
+) -> Option<T> {
+    let deadline = std::time::Instant::now() + CONVERGE;
+    loop {
+        if let Some(value) = round().await {
+            return Some(value);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
 /// Subscribe `ws` to `room` and return the reply that settled it.
 async fn subscribe(ws: &mut Ws, room: &[u8]) -> Option<Message> {
     send_frame(
@@ -266,7 +292,7 @@ async fn subscribe(ws: &mut Ws, room: &[u8]) -> Option<Message> {
         },
     )
     .await;
-    next_matching(ws, Duration::from_secs(10), |m| {
+    next_matching(ws, CONVERGE, |m| {
         matches!(
             m,
             Message::Ops { .. } | Message::Snapshot { .. } | Message::Redirect { .. }
@@ -292,11 +318,9 @@ async fn write_reaches_the_follower(writer: &mut Ws, room: &[u8]) -> bool {
         },
     )
     .await;
-    next_matching(writer, Duration::from_secs(10), |m| {
-        matches!(m, Message::Accepted { .. })
-    })
-    .await
-    .is_some()
+    next_matching(writer, CONVERGE, |m| matches!(m, Message::Accepted { .. }))
+        .await
+        .is_some()
 }
 
 // --- the whole peer plane over TLS ---
@@ -423,24 +447,26 @@ async fn anti_entropy_and_ping_req_round_trip_over_tls() {
         Some(client_config_from_pem(&ca.ca_path).unwrap()),
         false,
     );
-    let members = gossip_exchange(
-        &addr,
-        cid(0),
-        &dialer,
-        gossip_frame(&[(
-            NodeId::from("10.0.0.9:9000"),
-            b"10.0.0.9:9000".to_vec(),
-            1,
-            MemberState::Alive,
-        )]),
-    )
+    let members = retrying(|| {
+        gossip_exchange(
+            &addr,
+            cid(0),
+            &dialer,
+            gossip_frame(&[(
+                NodeId::from("10.0.0.9:9000"),
+                b"10.0.0.9:9000".to_vec(),
+                1,
+                MemberState::Alive,
+            )]),
+        )
+    })
     .await;
     assert!(
         members.is_some_and(|m| !m.is_empty()),
         "the anti-entropy exchange did not complete over TLS",
     );
 
-    let verdict = ping_req_exchange(&addr, cid(0), &dialer, b"10.0.0.9:9000").await;
+    let verdict = retrying(|| ping_req_exchange(&addr, cid(0), &dialer, b"10.0.0.9:9000")).await;
     assert!(
         verdict.is_some(),
         "the ping-req did not round-trip over TLS",

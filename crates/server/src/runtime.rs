@@ -1128,6 +1128,12 @@ impl DialStreak {
 /// how briefly each lived ([`RefusalStreak`]): the operator is told, and the redial
 /// backs off so a peer that will never accept is not dialed, and catch-up-encoded
 /// for, several times a second forever.
+///
+/// A dial that opens *no* link is the other shape ([`DialStreak`]) — the peer is
+/// down, or its advertised transport is one this node cannot honor. The operator is
+/// told after a run of them too, and a failure that no redial can fix
+/// ([`DialError::is_permanent`]) waits the long cadence rather than retrying, and
+/// reporting the follower down, four times a second forever.
 async fn peer_connection(
     server: ClientId,
     dialer: PeerDialer,
@@ -1180,6 +1186,10 @@ async fn peer_connection(
                 // The frame channel closed while unreachable — nothing more to do.
                 if frames.is_closed() {
                     return;
+                }
+                if reason.is_permanent() {
+                    tokio::time::sleep(PEER_REFUSED_REDIAL_MAX).await;
+                    continue;
                 }
             }
         }

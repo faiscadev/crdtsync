@@ -170,6 +170,20 @@ impl std::fmt::Display for DialError {
     }
 }
 
+impl DialError {
+    /// Whether redialing can never succeed without a configuration change. The
+    /// three configuration arms are decided before a socket is opened, so retrying
+    /// one costs nothing but produces nothing either — a caller redials it on the
+    /// slow cadence rather than the one it uses for a peer that is merely down and
+    /// may come back at any moment.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            DialError::Address(_) | DialError::PlaintextRefused | DialError::NoTrustAnchors => true,
+            DialError::Unreachable => false,
+        }
+    }
+}
+
 impl std::error::Error for DialError {}
 
 /// Everything an outbound node-to-node link needs: the cluster secret it presents
@@ -345,6 +359,17 @@ mod tests {
             plain_dialer().endpoint("http://10.0.0.1:9000"),
             Err(DialError::Address(BadPeerAddress::UnknownScheme(_)))
         ));
+    }
+
+    #[test]
+    fn a_configuration_refusal_is_permanent_and_an_unreachable_peer_is_not() {
+        // A peer that is merely down may come back at any moment and is redialed on
+        // the fast cadence; a transport or trust refusal is decided before a socket
+        // opens, so retrying it four times a second produces nothing.
+        assert!(DialError::Address(BadPeerAddress::Empty).is_permanent());
+        assert!(DialError::PlaintextRefused.is_permanent());
+        assert!(DialError::NoTrustAnchors.is_permanent());
+        assert!(!DialError::Unreachable.is_permanent());
     }
 
     #[test]

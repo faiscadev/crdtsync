@@ -255,8 +255,9 @@ pub async fn gossip_exchange(
 /// empty-`app_id` Hello that resolves to a relay, the `PeerAuth` that admits the
 /// link to the peer's node-to-node plane, the send, then the read loop that skips
 /// control frames until `extract` yields. `None` on any dial/handshake/send
-/// failure, on a close before a match, or if nothing matches within `timeout`. The outer `Option` (from the timeout) and the inner (from the
-/// read) both collapse to "no reply", so callers `.flatten()`.
+/// failure, on a close before a match, or if nothing matches within `timeout`. The
+/// outer `Option` (from the timeout) and the inner (from the read) both collapse to
+/// "no reply", so callers `.flatten()`.
 async fn relay_roundtrip<T>(
     addr: &str,
     server: ClientId,
