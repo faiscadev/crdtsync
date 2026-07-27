@@ -917,9 +917,9 @@ async fn indirect_probe(
 /// How long a link must survive to count as one the peer accepted. A refused link
 /// is closed as soon as the peer reads the opening frames — nothing is queued to
 /// flush, so the writer-drain grace never engages and the socket dies in about a
-/// round trip (measured at well under 2ms on loopback). A link that carried real
-/// traffic and then dropped lived orders of magnitude longer, so this separates the
-/// two by a wide margin even across a datacenter.
+/// round trip (measured well under 10ms on loopback, against this threshold). A
+/// link that carried real traffic and then dropped lived orders of magnitude
+/// longer, so the two separate by a wide margin even across a datacenter.
 const PEER_LINK_MIN_HEALTHY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How many consecutive short-lived links are tolerated before the node says so.
@@ -953,7 +953,9 @@ struct RefusalStreak {
 impl RefusalStreak {
     /// Fold in a link that lived `lifetime`, returning whether to tell the operator
     /// now. A permanent refusal reports every [`PEER_REJECTION_STREAK_WARN`] links
-    /// rather than once, so an operator attaching late still sees it.
+    /// rather than once, so an operator attaching late still sees it. The count
+    /// saturates rather than wrapping, which at the ceiling reports every link — a
+    /// position some 4 billion refusals away, and louder rather than quieter.
     fn observe(&mut self, lifetime: std::time::Duration) -> bool {
         if lifetime >= PEER_LINK_MIN_HEALTHY {
             self.n = 0;
@@ -1358,6 +1360,14 @@ mod tests {
     const HEALTHY: Duration = Duration::from_secs(1);
     /// A link closed as soon as it opened — what a refusal looks like.
     const REFUSED: Duration = Duration::from_millis(1);
+
+    /// The tests below count runs up to the threshold, so a threshold of one would
+    /// collapse their loops to nothing and stop pinning "does not warn early" and
+    /// "a healthy link clears the streak". Assert the shape they rely on.
+    #[test]
+    fn the_warn_threshold_leaves_room_to_not_warn() {
+        assert!(PEER_REJECTION_STREAK_WARN > 1);
+    }
 
     #[test]
     fn a_healthy_link_never_warns() {

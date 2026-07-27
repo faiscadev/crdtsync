@@ -806,13 +806,16 @@ async fn open_bare(addr: &str) -> Ws {
     ws
 }
 
-/// Open the client end: the header, then Hello + Auth, draining the AuthOk.
-async fn open_client(addr: &str) -> Ws {
+/// Open the client end as `client`: the header, then Hello + Auth, draining the
+/// AuthOk. Two connections to one node must name different clients — a client id is
+/// an addressing handle a node tracks presence under, so reusing one has the second
+/// connection displace the first's.
+async fn open_client(addr: &str, client: ClientId) -> Ws {
     let mut ws = open_bare(addr).await;
     send_frame(
         &mut ws,
         &Message::Hello {
-            client: cid(1),
+            client,
             app_id: Vec::new(),
             schema_version: 0,
             codecs: Vec::new(),
@@ -918,7 +921,7 @@ async fn two_real_nodes_still_replicate_end_to_end() {
         clustered(&leader_addr, &follower_addr),
     ));
 
-    let mut writer = open_client(&leader_addr).await;
+    let mut writer = open_client(&leader_addr, cid(1)).await;
     subscribe(&mut writer, &room).await;
     send_frame(
         &mut writer,
@@ -944,7 +947,7 @@ async fn two_real_nodes_still_replicate_end_to_end() {
 
     // And the follower's own replica holds it: a reader there is served the write
     // out of the replicated copy rather than redirected to the leader.
-    let mut reader = open_client(&follower_addr).await;
+    let mut reader = open_client(&follower_addr, cid(2)).await;
     let served = subscribe(&mut reader, &room).await;
     match served {
         Some(Message::Ops { ops, .. }) => {
@@ -985,7 +988,7 @@ async fn two_real_nodes_with_different_secrets_do_not_replicate() {
         clustered(&leader_addr, &follower_addr),
     ));
 
-    let mut writer = open_client(&leader_addr).await;
+    let mut writer = open_client(&leader_addr, cid(1)).await;
     // The leader really does lead the room and serve the write — so the missing
     // Accepted below isolates to replication, not to a redirect or a refused write.
     let served = subscribe(&mut writer, &room).await;
@@ -1004,7 +1007,7 @@ async fn two_real_nodes_with_different_secrets_do_not_replicate() {
     // The leader ingested it locally: a second reader there is served it. So the
     // missing Accepted below is the follower's absence, not a write that never
     // landed.
-    let mut on_leader = open_client(&leader_addr).await;
+    let mut on_leader = open_client(&leader_addr, cid(3)).await;
     let served = subscribe(&mut on_leader, &room).await;
     match served {
         Some(Message::Ops { ops, .. }) => assert_eq!(
@@ -1027,7 +1030,7 @@ async fn two_real_nodes_with_different_secrets_do_not_replicate() {
 
     // And nothing reached the follower's replica: a reader there is served an empty
     // room (or redirected to the leader), never the write the leader committed.
-    let mut reader = open_client(&follower_addr).await;
+    let mut reader = open_client(&follower_addr, cid(2)).await;
     let served = subscribe(&mut reader, &room).await;
     match served {
         Some(Message::Ops { ops, .. }) => assert!(

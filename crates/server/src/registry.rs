@@ -513,9 +513,10 @@ impl Registry {
     ///
     /// Fail-closed and silent. A node with no configured secret has no peer plane to
     /// open, so it refuses; so does any mismatch. Either way the connection is dropped
-    /// with no reply, and the comparison is constant-time, so a rejected attempt
-    /// reveals neither whether a secret is configured nor how far a guess matched.
-    /// Returns whether the connection stays open.
+    /// with no reply — which is what hides whether a secret is configured at all, since
+    /// the unconfigured case returns before comparing anything. Where a secret *is*
+    /// configured the comparison is constant-time over the content, so a rejection
+    /// leaks no prefix of it. Returns whether the connection stays open.
     fn authenticate_peer(&mut self, id: ConnId, presented: &[u8]) -> bool {
         let Some(expected) = &self.cluster_secret else {
             return false;
