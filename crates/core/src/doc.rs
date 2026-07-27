@@ -1607,9 +1607,19 @@ impl Document {
         bytes: &[u8],
     ) -> Result<Document, DecodeError> {
         let mut doc = Document::decode_state(bytes)?;
-        doc.client = client;
-        doc.seq = next_seq;
+        doc.adopt_as(client, next_seq);
         Ok(doc)
+    }
+
+    /// Take over a decoded snapshot as `client`, authoring from `next_seq` — the
+    /// second half of [`decode_state_as`](Self::decode_state_as), separated so an
+    /// adopter can decode first and derive its own position only once the bytes
+    /// are known good. Deriving that position walks the ids the adopting replica
+    /// holds, and a snapshot that fails to decode must not be able to make it
+    /// repeat that walk.
+    pub fn adopt_as(&mut self, client: ClientId, next_seq: u64) {
+        self.client = client;
+        self.seq = next_seq;
     }
 
     fn read_state(cur: &mut Cursor) -> Result<Document, DecodeError> {

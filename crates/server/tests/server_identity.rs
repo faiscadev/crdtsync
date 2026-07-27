@@ -125,7 +125,7 @@ fn the_production_node_identity_is_refused_as_an_author() {
 }
 
 #[test]
-fn no_op_under_the_nodes_identity_reaches_the_rooms_log() {
+fn a_refused_batch_leaves_no_trace_in_the_rooms_log() {
     let mut r = Registry::new(cid(0xFF));
     let attacker = hello(&mut r, cid(0xFF));
     subscribe(&mut r, attacker, Channel(0), ROOM);
