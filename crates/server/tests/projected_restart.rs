@@ -169,6 +169,15 @@ fn submit(r: &mut Registry, id: ConnId, ops: Vec<Op>) {
     ));
 }
 
+/// Hand a session every reply waiting for its connection.
+fn drain_into(r: &mut Registry, conn: ConnId, session: &mut ClientSession) {
+    for reply in r.take_outbox(conn) {
+        session
+            .receive(reply)
+            .expect("the session folds its replies");
+    }
+}
+
 /// The ops in a batch of reply frames, flattened.
 fn ops_in(replies: Vec<Message>) -> Vec<Op> {
     replies
@@ -505,4 +514,136 @@ fn a_partial_readers_snapshot_names_no_other_replicas_ids() {
         "the projected frontier names an author other than the recipient",
     );
     assert!(projected.get(b"b").is_none());
+}
+
+#[test]
+fn a_restarted_reader_does_not_re_mint_on_a_second_channel() {
+    // A channel authors under `for_channel` of the id declared at Hello, so the
+    // frontier a projection keeps has to be cut to *that* identity — the connection's
+    // own id answers only for channel 0. A session's second subscription to the room
+    // is where a mistake here hides.
+    let (mut r, _alice_doc, _alice) = acl_room();
+
+    // Two channels of one session on the room; bob authors on the second.
+    let mut bob = ClientSession::new(cid(2));
+    let conn = r.connect();
+    assert!(r.deliver(conn, bob.hello()));
+    assert!(r.deliver(conn, bob.auth(b"t-bob")));
+    for _ in 0..2 {
+        let (_, subscribe) = bob.subscribe(ROOM);
+        assert!(r.deliver(conn, subscribe));
+    }
+    drain_into(&mut r, conn, &mut bob);
+    let second = Channel(1);
+    assert_ne!(
+        bob.document(second)
+            .expect("the second channel is held")
+            .client(),
+        cid(2),
+        "the second channel authors under a derived identity",
+    );
+
+    let mut durable: HashSet<OpId> = HashSet::new();
+    for i in 0..3 {
+        let frame = bob
+            .edit(second, |tx| {
+                tx.map(b"a")
+                    .register(&format!("v{i}").into_bytes(), Scalar::Int(i));
+            })
+            .expect("the channel is held");
+        if let Message::Ops { ops, .. } = &frame {
+            durable.extend(ops.iter().map(|op| op.id));
+        }
+        assert!(r.deliver(conn, frame));
+    }
+    r.take_outbox(conn);
+    r.hub_mut().compact(ROOM).expect("compact");
+
+    // The restart, subscribing in the same order so the second channel is the same
+    // replica identity as before.
+    let mut back = ClientSession::new(cid(2));
+    let conn2 = r.connect();
+    assert!(r.deliver(conn2, back.hello()));
+    assert!(r.deliver(conn2, back.auth(b"t-bob2")));
+    for _ in 0..2 {
+        let (_, subscribe) = back.subscribe(ROOM);
+        assert!(r.deliver(conn2, subscribe));
+    }
+    drain_into(&mut r, conn2, &mut back);
+
+    let frame = back
+        .edit(second, |tx| {
+            tx.map(b"a").register(b"after", Scalar::Int(9));
+        })
+        .expect("the channel is held");
+    if let Message::Ops { ops, .. } = &frame {
+        for op in ops {
+            assert!(
+                !durable.contains(&op.id),
+                "re-minted an id the room's log already holds",
+            );
+        }
+    }
+    assert!(r.deliver(conn2, frame));
+    assert_eq!(
+        nested(&room_doc(&r), b"a", b"after"),
+        Some(9),
+        "the post-restart write was deduped away",
+    );
+}
+
+#[test]
+fn a_hello_after_a_subscribe_is_refused() {
+    // A transport-authenticated connection carries an identity without having
+    // declared a client id, so it may subscribe before Hello. Declaring one
+    // afterwards would hand a replica identity to a channel whose catch-up was
+    // already served — served, therefore, with the frontier of that identity's own
+    // ids scrubbed rather than kept.
+    let (mut r, _alice_doc, _alice) = acl_room();
+    let conn = r.connect_authenticated(Identity::new(b"bob".to_vec()));
+    assert!(r.deliver(
+        conn,
+        Message::Subscribe {
+            channel: Channel(0),
+            room: ROOM.to_vec(),
+            branch: Vec::new(),
+            zone: Vec::new(),
+            last_seen_seq: 0,
+        }
+    ));
+    r.take_outbox(conn);
+    assert!(
+        !r.deliver(
+            conn,
+            Message::Hello {
+                client: cid(2),
+                app_id: Vec::new(),
+                schema_version: 0,
+                codecs: Vec::new(),
+            }
+        ),
+        "a Hello naming an id for an already-bound channel was accepted",
+    );
+
+    // The ordinary order is untouched: Hello, then Subscribe.
+    let ok = r.connect_authenticated(Identity::new(b"bob".to_vec()));
+    assert!(r.deliver(
+        ok,
+        Message::Hello {
+            client: cid(2),
+            app_id: Vec::new(),
+            schema_version: 0,
+            codecs: Vec::new(),
+        }
+    ));
+    assert!(r.deliver(
+        ok,
+        Message::Subscribe {
+            channel: Channel(0),
+            room: ROOM.to_vec(),
+            branch: Vec::new(),
+            zone: Vec::new(),
+            last_seen_seq: 0,
+        }
+    ));
 }

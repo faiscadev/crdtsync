@@ -282,9 +282,8 @@ impl Document {
 
     /// The ids of every op this replica has applied — the dedup set, so a
     /// reconstructing server can restore its own dedup from a decoded snapshot. In a
-    /// projected snapshot it is instead what the recipient *published*
-    /// ([`scrub_frontier_to`](Self::scrub_frontier_to)), one of several ways such a
-    /// document is not a live replica.
+    /// projection that withheld something it is instead what the *recipient*
+    /// published, one of several ways such a document is not a live replica.
     pub fn seen(&self) -> impl Iterator<Item = OpId> + '_ {
         self.seen.iter().copied()
     }
@@ -1059,9 +1058,13 @@ impl Document {
     /// a room's zones is served a snapshot narrowed by this projection, so an
     /// unauthorized zone is wholly absent rather than redacted-but-present.
     ///
-    /// `recipient` is the replica identity this snapshot is served to — see
-    /// [`scrub_frontier_to`](Self::scrub_frontier_to) for what the causal frontier
-    /// keeps of it and why everything else goes.
+    /// `recipient` is the replica identity this snapshot is served to: the causal
+    /// frontier is cut back to the ids that replica itself published and every other
+    /// author's go, so the withheld partition's op count stays absent while the
+    /// recipient can still tell which of its own ids the room's log holds (minting
+    /// walks them). `None` names no recipient and scrubs the frontier whole — right
+    /// for a projection no replica will author from, and a re-mint hazard for one
+    /// that will.
     ///
     /// Sound only as the final transform before [`encode_state`](Self::encode_state)
     /// on a throwaway copy: it scrubs the causal `seen` frontier and leaves the
@@ -1203,9 +1206,12 @@ impl Document {
     /// is readable (require-all, so a mark leaks no content-region info at an unreadable
     /// endpoint). A whole-document reader is left untouched, byte-identical on re-encode.
     ///
-    /// `recipient` is the replica identity this snapshot is served to — see
-    /// [`scrub_frontier_to`](Self::scrub_frontier_to) for what the causal frontier keeps
-    /// of it and why everything else goes.
+    /// `recipient` is the replica identity this snapshot is served to: the causal
+    /// frontier is cut back to the ids that replica itself published and every other
+    /// author's go, so the denied subtrees' op count stays absent while the recipient
+    /// can still tell which of its own ids the room's log holds (minting walks them).
+    /// `None` names no recipient and scrubs the frontier whole — right for a projection
+    /// no replica will author from, and a re-mint hazard for one that will.
     ///
     /// Sound only as the final transform before [`encode_state`](Self::encode_state) on
     /// a throwaway copy: like [`project_zones`](Self::project_zones) it scrubs the causal
@@ -1432,9 +1438,13 @@ impl Document {
     /// holds ([`free_seq`](Self::free_seq)), so a recipient that persists its
     /// identity and adopts a snapshot naming none of its own ids mints straight into
     /// ids the room's log already holds — every one of those writes deduped away at
-    /// ingest, silently. A run with a hole in it — a replica caught up by a delta
-    /// that withheld a member it authored — is the same case one step on: the
-    /// position it adopts at is the hole, and every id above the hole re-mints.
+    /// ingest, silently. A run with a hole in it is the same case one step on: the
+    /// position a replica reports is the first sequence it has not published, so a
+    /// hole is where a projected snapshot is adopted, and every id *above* the hole
+    /// re-mints unless the frontier names them. (A redacted op delta is what leaves
+    /// the hole, by withholding a member the recipient authored on a path it may no
+    /// longer read; closing that seam needs a carrier for the ids an Ops frame
+    /// withholds, which no frame has.)
     ///
     /// So the frontier a projected snapshot carries names one replica: the one
     /// adopting it. The existence and count of every *other* replica's ops in the
