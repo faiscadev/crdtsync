@@ -704,6 +704,16 @@ impl Hub {
         }
     }
 
+    /// The identity this node authors its own room replicas under — the one a
+    /// fresh room is created with. Reserved to the node: the op gate refuses a
+    /// client batch authored under it, so no write on the client path enters a
+    /// room's log carrying it. A room installed from a decoded snapshot keeps the
+    /// identity that encoded it, so this is what the node would author as, not a
+    /// claim about every replica it currently holds.
+    pub fn replica_identity(&self) -> ClientId {
+        self.server
+    }
+
     /// Register an [`EventSink`] to observe the engine's lifecycle events. Several
     /// may be registered; each is notified of every event, in registration order.
     pub fn add_event_sink(&mut self, sink: Box<dyn EventSink>) {

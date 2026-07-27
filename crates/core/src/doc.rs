@@ -1530,10 +1530,52 @@ impl Document {
         }
     }
 
-    /// The next per-client op sequence this replica will mint — its op-seq
-    /// high-water mark.
+    /// The next per-client op sequence this replica will mint — the first one it
+    /// has not already published.
     pub fn next_seq(&self) -> u64 {
-        self.seq
+        self.free_seq(self.seq)
+    }
+
+    /// The first sequence at or past `seq` this replica has not published, read
+    /// off the ids it holds.
+    ///
+    /// The op-seq position walks those ids rather than tracking a high-water read
+    /// off arriving ops. A catch-up hands a replica back the ops it authored
+    /// before a restart — as an op delta, or inside a snapshot it adopts, since
+    /// both id sets ride the state encoding — and an id minted a second time is
+    /// dropped at every peer's dedup set, so the write is lost with nothing
+    /// downstream able to detect it. Reading the ids the replica already holds
+    /// keeps the position's only input to evidence it folded itself: no `seq` off
+    /// the wire is ever assigned to it, and one step per held id means no frame
+    /// can drive it toward the end of the space.
+    ///
+    /// Held, not merely applied: an op waiting on its transaction group or on an
+    /// unreachable target sits in the buffer with its id out of `seen`, and it is
+    /// as published as any other — the room's log holds it, and a re-mint of its
+    /// id would leave the replica applying two different ops under one identity
+    /// once the buffer drains.
+    ///
+    /// The search wraps at the end of the space rather than stopping there. A
+    /// sequence space is a finite *set*, not a ladder, and what a replica holds is
+    /// bounded by its memory — so a free sequence always exists, and the position
+    /// is a search hint rather than a frontier. One step per held id is enough to
+    /// reach one: after that many misses the ids seen were all distinct and all
+    /// held, so the next candidate cannot be. That is what makes an exhausted
+    /// counter unrepresentable — a decoded position near the end of the space
+    /// costs a few wrapped steps, not a replica that re-issues one id forever.
+    fn free_seq(&self, from: u64) -> u64 {
+        let mut seq = from;
+        for _ in 0..self.seen.len() + self.buffered.len() {
+            let id = OpId {
+                client: self.client,
+                seq,
+            };
+            if !self.seen.contains(&id) && !self.buffered.contains(&id) {
+                return seq;
+            }
+            seq = seq.wrapping_add(1);
+        }
+        seq
     }
 
     /// The current lamport high-water of a replication partition: the root clock
@@ -1546,20 +1588,38 @@ impl Document {
     }
 
     /// Rebuild a replica from a snapshot but author future ops under `client`
-    /// with an op counter no lower than `next_seq`, rather than the identity and
-    /// counter the snapshot was encoded with. A replica adopting a snapshot
-    /// keeps its own identity and its own op-seq high-water mark, so it never
-    /// re-mints an `OpId` it already made durable (which a peer would dedup away,
-    /// diverging silently).
+    /// from the op counter `next_seq`, rather than the identity and counter the
+    /// snapshot was encoded with. A replica adopting a snapshot keeps its own
+    /// identity and its own op-seq position, so it never re-mints an `OpId` it
+    /// already made durable (which a peer would dedup away, losing the write
+    /// silently).
+    ///
+    /// The counter the snapshot carries belongs to whoever *authored* it —
+    /// typically a server's room replica, which merges under its own identity —
+    /// and says nothing about the ids this replica has published, so it is
+    /// replaced rather than merged in. What the adopting replica has published
+    /// comes from two places instead: the dedup set the snapshot carries, which
+    /// minting walks, and `next_seq` for a projected snapshot, whose dedup set is
+    /// scrubbed of the partition it withholds.
     pub fn decode_state_as(
         client: ClientId,
         next_seq: u64,
         bytes: &[u8],
     ) -> Result<Document, DecodeError> {
         let mut doc = Document::decode_state(bytes)?;
-        doc.client = client;
-        doc.seq = doc.seq.max(next_seq);
+        doc.adopt_as(client, next_seq);
         Ok(doc)
+    }
+
+    /// Take over a decoded snapshot as `client`, authoring from `next_seq` — the
+    /// second half of [`decode_state_as`](Self::decode_state_as), separated so an
+    /// adopter can decode first and derive its own position only once the bytes
+    /// are known good. Deriving that position walks the ids the adopting replica
+    /// holds, and a snapshot that fails to decode must not be able to make it
+    /// repeat that walk.
+    pub fn adopt_as(&mut self, client: ClientId, next_seq: u64) {
+        self.client = client;
+        self.seq = next_seq;
     }
 
     fn read_state(cur: &mut Cursor) -> Result<Document, DecodeError> {
@@ -2441,6 +2501,19 @@ impl Document {
         Some(idxs.into_iter().map(|i| self.buffer.remove(i)).collect())
     }
 
+    /// Take the next op id this replica has not published, recording it as taken
+    /// and advancing the counter past it.
+    fn mint_op_id(&mut self) -> OpId {
+        self.seq = self.free_seq(self.seq);
+        let id = OpId {
+            client: self.client,
+            seq: self.seq,
+        };
+        self.seq = self.seq.wrapping_add(1);
+        self.seen.insert(id);
+        id
+    }
+
     /// Mint identity + causal position for a local edit, apply it, and record
     /// the op on the in-progress transact.
     fn emit(&mut self, target: ElementId, kind: OpKind) {
@@ -2466,12 +2539,7 @@ impl Document {
         // Reserve the rest of a run's char_ids so the next op sorts after it.
         let last = base + (span(&kind) - 1);
         self.advance_clock(zone, last);
-        let id = OpId {
-            client: self.client,
-            seq: self.seq,
-        };
-        self.seq += 1;
-        self.seen.insert(id);
+        let id = self.mint_op_id();
         let author = self.client;
         // The record-seam: the inverse is read off the state this op is about to
         // overwrite, so it must be taken before the op lands.

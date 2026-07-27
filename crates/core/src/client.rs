@@ -725,12 +725,15 @@ impl ClientSession {
                     .get_mut(&channel)
                     .ok_or(ClientError::UnknownChannel(channel))?;
                 // Adopt the server's state but keep this channel's own identity
-                // and op-seq high-water mark for the ops we author next, so a
-                // re-mint can't collide with an op already made durable. A decode
-                // failure leaves the room untouched.
+                // and op-seq position for the ops we author next, so a re-mint
+                // can't collide with an op already made durable. A decode failure
+                // leaves the room untouched — and costs nothing beyond the decode,
+                // since the position is derived only once the bytes are known
+                // good; reading it walks the ids this replica holds, which a
+                // malformed frame must not be able to make it repeat.
                 let mut doc =
-                    Document::decode_state_as(room.doc.client(), room.doc.next_seq(), &state)
-                        .map_err(|_| ClientError::BadSnapshot)?;
+                    Document::decode_state(&state).map_err(|_| ClientError::BadSnapshot)?;
+                doc.adopt_as(room.doc.client(), room.doc.next_seq());
                 // Carry the undo origin across, so edits authored after a
                 // late-join or a reconnect catch-up stay recorded. The recorded
                 // *stack* does not survive: its inverses restore state the
