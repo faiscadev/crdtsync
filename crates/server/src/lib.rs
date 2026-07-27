@@ -1648,6 +1648,15 @@ impl Hub {
     /// fan-out applies, so a deep deny inside the revealed subtree drops the same slots the
     /// snapshot projection does. Empty for an unknown room or a node with no subtree.
     ///
+    /// Every back-filled op rides untagged. A back-fill is a replay of committed
+    /// history assembled around one node, so its selection — a subtree crossed with a
+    /// read verdict — carries no transaction whole; and a group-mate the reader
+    /// already holds, applied or buffered, discards the replay on arrival rather than
+    /// counting it. Either way a tagged member would wait on a count its bucket can
+    /// never reach. The caller owes the converse: the log this reads includes the
+    /// batch being delivered, so an op that batch already carries must not be
+    /// back-filled beside it.
+    ///
     /// [`recipient_reads_path`]: crate::acl::recipient_reads_path
     pub fn reveal_backfill(
         &self,
@@ -1673,7 +1682,10 @@ impl Hub {
                     .iter()
                     .all(|p| reads(p))
             })
-            .map(|rec| rec.op.clone())
+            .map(|rec| Op {
+                tx: None,
+                ..rec.op.clone()
+            })
             .collect()
     }
 

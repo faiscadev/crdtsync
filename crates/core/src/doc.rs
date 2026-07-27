@@ -1172,10 +1172,21 @@ impl Document {
         self.zone_clocks.retain(|zone, _| authorized.contains(zone));
         // The causal frontier and buffer, scrubbed of the hidden partition: buffered
         // ops are filtered to the authorized partitions, and `seen` is cut back to
-        // the ids the recipient itself published.
+        // the ids the recipient itself published. Filtering the buffer splits any
+        // atomic group that straddles the cut, so its survivors are untagged — the
+        // state-side face of the rule every per-op delivery filter applies, since a
+        // group missing a member here can never complete at the recipient either. A
+        // group wholly inside the authorized partitions keeps its tag and its
+        // all-or-nothing commit.
         let published = self.published_by(recipient);
+        let split = crate::op::split_groups(
+            self.buffer
+                .iter()
+                .filter(|op| op.zone.is_some_and(|zone| !authorized.contains(&zone))),
+        );
         self.buffer
             .retain(|op| op.zone.is_none_or(|zone| authorized.contains(&zone)));
+        crate::op::destrand_split(self.buffer.iter_mut(), &split);
         self.buffered = self.buffer.iter().map(|op| op.id).collect();
         self.scrub_frontier_to(published);
     }
@@ -2242,24 +2253,16 @@ impl Document {
     /// Tag a group's ops as one atomic transaction. An empty group is left
     /// untagged.
     ///
-    /// The id is the group's lowest member seq. A receiver buckets buffered
-    /// members by `(author client, tx id)`, so a group id has to be as durable as
-    /// the op ids it sits beside: peers hold partial groups across a disconnect,
-    /// and a restore keeps the client id, so an id minted from a counter of its
-    /// own would collide with a group still in flight — merging two unrelated
-    /// groups into one bucket, whose size gate then commits a mixed set and
-    /// strands the remainder for good. A seq is minted once per op and carried,
-    /// not reset, by the restore paths that preserve identity, so deriving the
-    /// group id from one makes it exactly as unique as the op ids beside it, with
-    /// no separate state to persist.
+    /// The id is [derived](TxId::derive) from the members' own sequences, so it is
+    /// as durable as the op ids it sits beside and needs no state of its own.
     fn tag_atomic(&self, ops: Vec<Op>) -> Vec<Op> {
+        if ops.is_empty() {
+            return ops;
+        }
         let Ok(count) = u32::try_from(ops.len()) else {
             return ops;
         };
-        let Some(seq) = ops.iter().map(|op| op.id.seq).min() else {
-            return ops;
-        };
-        let id = TxId(seq);
+        let id = TxId::derive(ops.iter().map(|op| op.id.seq));
         ops.into_iter()
             .map(|mut op| {
                 op.tx = Some(Tx { id, count });

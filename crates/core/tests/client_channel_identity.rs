@@ -333,8 +333,8 @@ fn atomic_groups_on_two_channels_land_in_distinct_buckets() {
             .unwrap(),
     );
 
-    // The group id is the group's lowest member seq, so two channels that both
-    // start at seq 0 name the same TxId — only the author client keeps the
+    // The group id is derived from its members' sequences, so two channels that
+    // both start at seq 0 name the same TxId — only the author client keeps the
     // receiver's `(client, tx id)` buckets apart.
     let group = |ops: &[Op]| -> (ClientId, TxId) {
         let tx = ops[0].tx.expect("an atomic member carries its group");
