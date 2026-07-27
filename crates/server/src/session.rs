@@ -288,16 +288,6 @@ pub fn step(
             if session.client.is_some() {
                 return violation("already said hello");
             }
-            // A connection authenticated by its transport (an accept-verified
-            // credential, mTLS, anonymous mode) carries an identity without having
-            // declared a client id, so it may subscribe before Hello. Naming the id
-            // afterwards would hand a replica identity to channels whose catch-up was
-            // already served — served, therefore, without the frontier of the ids that
-            // identity has published, which is what a projection cuts back to. The
-            // declaration has to precede the channels it authors under.
-            if !session.channels.is_empty() {
-                return violation("hello after subscribe");
-            }
             // Settle the codec before anything else: a client that shares none
             // with this build cannot be answered in bytes it can read, so it is
             // refused here rather than served a frame it would misdecode.
@@ -412,6 +402,16 @@ pub fn step(
             let Some(identity) = session.identity() else {
                 return violation("subscribe before auth");
             };
+            // A connection authenticated by its transport (an accept-verified
+            // credential, mTLS, anonymous mode) holds an identity without having
+            // declared a client id, so it reaches here having said nothing. A channel's
+            // catch-up is narrowed to the replica identity that channel authors under —
+            // a projected snapshot carries the frontier of the ids that identity has
+            // published, and nothing else — so the declaration has to precede the
+            // channel, not merely the writes.
+            if session.client.is_none() {
+                return violation("subscribe before hello");
+            }
             if session.channels.contains_key(&channel) {
                 return violation("channel already subscribed");
             }
