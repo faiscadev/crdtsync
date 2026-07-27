@@ -655,8 +655,7 @@ pub fn step(
                 Catchup::Snapshot { seq, state } => {
                     // The replica identity this channel's snapshot is served to — what
                     // the recipient authors under, and so the one author whose ids the
-                    // projections keep in the frontier they otherwise scrub. A
-                    // projection has no way to know who it serves; this caller does.
+                    // projections keep in the frontier they otherwise scrub.
                     let recipient = session.client.map(|c| c.for_channel(channel.0));
                     let reads_all = records.is_empty()
                         || reads_whole_document(

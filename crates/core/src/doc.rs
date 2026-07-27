@@ -281,7 +281,10 @@ impl Document {
     }
 
     /// The ids of every op this replica has applied — the dedup set, so a
-    /// reconstructing server can restore its own dedup from a decoded snapshot.
+    /// reconstructing server can restore its own dedup from a decoded snapshot. In a
+    /// projected snapshot it is instead what the recipient *published*
+    /// ([`scrub_frontier_to`](Self::scrub_frontier_to)), one of several ways such a
+    /// document is not a live replica.
     pub fn seen(&self) -> impl Iterator<Item = OpId> + '_ {
         self.seen.iter().copied()
     }
@@ -1061,10 +1064,12 @@ impl Document {
     /// keeps of it and why everything else goes.
     ///
     /// Sound only as the final transform before [`encode_state`](Self::encode_state)
-    /// on a throwaway copy: it scrubs the causal `seen` frontier (a below-floor
-    /// subscriber dedups nothing before the snapshot's sequence) and leaves the
+    /// on a throwaway copy: it scrubs the causal `seen` frontier and leaves the
     /// derived move relation filtered only in its persisted log — neither is a valid
-    /// live-replica state. A schema with no zones leaves the document untouched.
+    /// live-replica state. A schema with no zones leaves the document untouched; a
+    /// set covering every declared zone does not — it still runs, and still scrubs,
+    /// so a whole-zone subscriber is served the room's replica by the caller
+    /// declining to project at all.
     pub fn project_zones(
         &mut self,
         schema: &Schema,
@@ -1427,13 +1432,25 @@ impl Document {
     /// holds ([`free_seq`](Self::free_seq)), so a recipient that persists its
     /// identity and adopts a snapshot naming none of its own ids mints straight into
     /// ids the room's log already holds — every one of those writes deduped away at
-    /// ingest, silently. A recipient whose run has a hole (a member of its catch-up
-    /// withheld by the same per-op filter) is the same case without a restart: the
-    /// position it adopts at is the hole, and everything above it re-mints.
+    /// ingest, silently. A run with a hole in it — a replica caught up by a delta
+    /// that withheld a member it authored — is the same case one step on: the
+    /// position it adopts at is the hole, and every id above the hole re-mints.
     ///
     /// So the frontier a projected snapshot carries names one replica: the one
     /// adopting it. The existence and count of every *other* replica's ops in the
-    /// withheld partition stay absent, which is what the scrub is for.
+    /// withheld partition stay absent, which is what the scrub is for. What the
+    /// recipient learns of its own run is bounded by who may present its identity:
+    /// the id is declared, and authenticating the declaration is the transport's
+    /// credential check, not this projection's — the same trust boundary that
+    /// already lets a declarer author under that identity.
+    ///
+    /// The frontier a projection leaves is what the recipient *published*, which in
+    /// a scrubbed buffer is wider than what it applied: an own op the buffer held is
+    /// named here once the buffer goes, because a free id is the worse answer — the
+    /// replica would author a second, different op under an identity the room's log
+    /// already binds. A projected document is not a live replica in the first place
+    /// (its buffer and move relation are filtered too), and the ops behind those ids
+    /// sit below the snapshot's sequence, so no later delivery meets them.
     fn scrub_frontier_to(&mut self, published: HashSet<OpId>) {
         self.seen = published
             .into_iter()
@@ -1656,8 +1673,8 @@ impl Document {
     /// typically a server's room replica, which merges under its own identity —
     /// and says nothing about the ids this replica has published, so it is
     /// replaced rather than merged in. What the adopting replica has published
-    /// comes from the dedup set the snapshot carries, which minting walks — a
-    /// projected snapshot's is scrubbed to the recipient's own ids, so the walk
+    /// comes from the ids the snapshot carries and minting walks — its dedup set and
+    /// its buffer, a projected snapshot's cut back to the recipient's own so the walk
     /// still reaches them. `next_seq` is where that walk starts.
     pub fn decode_state_as(
         client: ClientId,

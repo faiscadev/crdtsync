@@ -8,18 +8,19 @@
 //! snapshot mints straight into ids the room's log already holds. An `OpId` is the
 //! dedup key, so every one of those writes is dropped at ingest, silently.
 //!
-//! It is not only a restart. The op-seq position is the first sequence the replica
-//! has not published — a *hole*, not a high-water — so a session that stayed up but
-//! whose catch-up had a member withheld (the same per-op filter the fan-out applies)
-//! reports the hole, adopts a projected snapshot at it, and re-mints every id above
-//! it. Any hole in the run is enough.
+//! Nor is a fresh replica the worst of it. The op-seq position is the first sequence
+//! the replica has not published — a *hole*, not a high-water — so a replica caught
+//! up by a delta that withheld a member it authored (the same per-op filter the
+//! fan-out applies) reports the hole, adopts a projected snapshot at it, and re-mints
+//! every id above the hole as well. Any hole in the run is enough.
 //!
 //! So the frontier a projection serves names exactly one replica: the one adopting
 //! the snapshot. Its own authorship is the one thing a scrub can hand back to it
 //! without telling it anything about the withheld partition — the recipient
 //! originated those ops. Every *other* replica's ids go, so the existence and count
 //! of their ops in the withheld partition stay absent, which is what the scrub is
-//! for.
+//! for. What a recipient learns of its own run is bounded by who may present its
+//! identity, which is the transport's credential check rather than this seam's.
 
 use std::collections::HashSet;
 
@@ -196,19 +197,33 @@ fn a_projection_naming_no_recipient_scrubs_the_frontier_whole() {
 }
 
 #[test]
-fn an_unprojected_snapshot_still_carries_the_whole_frontier() {
-    // The scrub belongs to the projections. A whole-document, whole-zone reader is
-    // served the room's replica verbatim, every author's ids included.
+fn a_zone_projection_authorized_for_every_zone_still_scrubs() {
+    // Projecting is not the identity even when nothing is withheld: the pass scrubs
+    // whatever set it is handed, so a whole-zone subscriber is served the room's
+    // replica by its caller declining to project at all — not by this pass turning
+    // into a no-op. `project_read_paths` carries that guard itself (a whole-document
+    // reader drops nothing, so it scrubs nothing); zones does not.
     let (_, ops) = reader_run();
     let mut other = replica(cid(3));
+    for op in &ops {
+        other.apply(op);
+    }
     let foreign = other.transact(|tx| {
         tx.map(b"loose").register(b"o", Scalar::Int(7));
     });
-    let mut room = room(&ops);
+    let mut all = room(&ops);
     for op in &foreign {
-        room.apply(op);
+        all.apply(op);
     }
-    assert_eq!(authors(&room), HashSet::from([reader(), cid(3)]));
+    assert_eq!(authors(&all), HashSet::from([reader(), cid(3)]));
+
+    all.project_zones(
+        &zoned(),
+        &HashSet::from([zone_of(b"board"), zone_of(b"notes")]),
+        Some(reader()),
+    );
+    assert_eq!(authors(&all), HashSet::from([reader()]));
+    assert!(all.get(b"notes").is_some(), "no zone was withheld");
 }
 
 // --- the restart: a fresh replica adopting a projected snapshot ---
@@ -284,11 +299,11 @@ fn the_write_after_a_projected_read_catch_up_reaches_the_room() {
     assert_eq!(nested(&room, b"board", b"b"), Some(1));
 }
 
-// --- the wider case: a hole left by a withheld member, with no restart at all ---
+// --- the wider case: a hole in the run, not just an empty one ---
 
-/// The reader's live replica of its own run with zb's ops withheld — what the per-op
-/// filter delivers a za-scoped session that never went away. Its position is the
-/// hole zb left, and it has published ids above it.
+/// The reader's replica of its own run with zb's ops withheld — what the per-op
+/// filter delivers a za-scoped catch-up. Its position is the hole zb left, and it has
+/// published ids above the hole.
 fn live_with_zb_withheld(ops: &[Op]) -> Document {
     let mut d = Document::new(reader());
     let zb = zone_of(b"notes");
@@ -309,9 +324,9 @@ fn a_hole_left_by_a_withheld_member_is_not_the_position_to_mint_from() {
         ops.len(),
     );
 
-    // The session stayed up: it adopts the projected snapshot at the hole it
-    // reports. Every id above the hole is still the room's, and the hole itself is
-    // an id the room holds — zb's op — so neither is free.
+    // It adopts the projected snapshot at the hole it reports. Every id above the
+    // hole is still the room's, and the hole itself is an id the room holds — zb's
+    // op — so neither is free.
     let projected = zone_projected(&ops, Some(reader()));
     let mut adopted = restored(&projected, hole);
     let fresh = adopted.transact(|tx| {
@@ -377,6 +392,48 @@ fn an_id_the_room_holds_only_in_its_buffer_is_not_re_minted() {
             "{label}: the buffered id was reported free",
         );
     }
+}
+
+#[test]
+fn an_own_id_the_withheld_partition_buffered_survives_the_projection() {
+    // The frontier is read before the buffer is filtered, so an own op waiting in the
+    // partition the projection drops is as published as one waiting in a partition it
+    // keeps: the buffered zb member goes with its zone, its id does not.
+    let (mut d, ops) = reader_run();
+    let group = d.atomic_transact(|tx| {
+        tx.map(b"notes").register(b"g1", Scalar::Int(1));
+        tx.map(b"notes").register(b"g2", Scalar::Int(2));
+    });
+    let mut held = room(&ops);
+    held.apply(&group[0]);
+    held.project_zones(&zoned(), &za_only(), Some(reader()));
+
+    assert!(
+        held.seen().any(|id| id == group[0].id),
+        "the withheld partition's buffered own id was dropped with its op",
+    );
+    assert_eq!(restored(&held, 0).next_seq(), group[0].id.seq + 1);
+}
+
+#[test]
+fn a_projected_frontier_names_no_id_the_buffer_still_holds() {
+    // The dedup set is what a replica applied and the buffer what it holds unapplied;
+    // an id in both is a state no decode accepts. A frontier cut back to the
+    // recipient's own ids has to stay clear of what the buffer still carries.
+    let (mut d, ops) = reader_run();
+    let group = d.atomic_transact(|tx| {
+        tx.map(b"loose").register(b"g1", Scalar::Int(1));
+        tx.map(b"loose").register(b"g2", Scalar::Int(2));
+    });
+    let mut held = room(&ops);
+    held.apply(&group[0]);
+    held.project_zones(&zoned(), &za_only(), Some(reader()));
+
+    assert!(
+        !held.seen().any(|id| id == group[0].id),
+        "an id the retained buffer holds was also named in the frontier",
+    );
+    Document::decode_state(&held.encode_state()).expect("the projected snapshot decodes");
 }
 
 // --- the privacy property the scrub exists for ---
