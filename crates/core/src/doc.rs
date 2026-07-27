@@ -1530,10 +1530,36 @@ impl Document {
         }
     }
 
-    /// The next per-client op sequence this replica will mint — its op-seq
-    /// high-water mark.
+    /// The next per-client op sequence this replica will mint — the first one it
+    /// has not already published.
     pub fn next_seq(&self) -> u64 {
-        self.seq
+        self.free_seq(self.seq)
+    }
+
+    /// The first sequence at or past `seq` this replica has not published, read
+    /// off the dedup set.
+    ///
+    /// The op-seq position walks that set rather than tracking a high-water read
+    /// off arriving ops. A catch-up hands a replica back the ops it authored
+    /// before a restart — as an op delta, or inside a snapshot it adopts, since
+    /// the dedup set rides the state encoding — and an id minted a second time is
+    /// dropped at every peer's dedup set, so the write is lost with nothing
+    /// downstream able to detect it. Reading the ids the replica already holds
+    /// keeps the position's only input to evidence it folded itself: no `seq` off
+    /// the wire is ever assigned to it, and one step per held id means no frame
+    /// can drive it toward the end of the space, where a mint would have to reuse
+    /// an id already published.
+    fn free_seq(&self, mut seq: u64) -> u64 {
+        while self.seen.contains(&OpId {
+            client: self.client,
+            seq,
+        }) {
+            let Some(next) = seq.checked_add(1) else {
+                break;
+            };
+            seq = next;
+        }
+        seq
     }
 
     /// The current lamport high-water of a replication partition: the root clock
@@ -2449,33 +2475,16 @@ impl Document {
         Some(idxs.into_iter().map(|i| self.buffer.remove(i)).collect())
     }
 
-    /// Take the next op id this replica has not published, advancing the counter
-    /// past it.
-    ///
-    /// The counter walks the dedup set rather than tracking a high-water read off
-    /// arriving ops. A catch-up hands a replica back the ops it authored before a
-    /// restart — as an op delta, or inside a snapshot it adopts — and an id minted
-    /// a second time is dropped at every peer's dedup set, so the write is lost
-    /// with nothing downstream able to detect it. Walking the ids the replica
-    /// already holds keeps the counter's only input to evidence it folded itself:
-    /// no `seq` off the wire is ever assigned to it, and one step per held id
-    /// means no frame can drive it toward the end of the space, where a mint would
-    /// have to reuse an id already published.
+    /// Take the next op id this replica has not published, recording it as taken
+    /// and advancing the counter past it.
     fn mint_op_id(&mut self) -> OpId {
-        while self.seen.contains(&OpId {
-            client: self.client,
-            seq: self.seq,
-        }) {
-            let Some(next) = self.seq.checked_add(1) else {
-                break;
-            };
-            self.seq = next;
-        }
+        self.seq = self.free_seq(self.seq);
         let id = OpId {
             client: self.client,
             seq: self.seq,
         };
         self.seq = self.seq.saturating_add(1);
+        self.seen.insert(id);
         id
     }
 
@@ -2505,7 +2514,6 @@ impl Document {
         let last = base + (span(&kind) - 1);
         self.advance_clock(zone, last);
         let id = self.mint_op_id();
-        self.seen.insert(id);
         let author = self.client;
         // The record-seam: the inverse is read off the state this op is about to
         // overwrite, so it must be taken before the op lands.

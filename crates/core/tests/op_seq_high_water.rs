@@ -148,6 +148,20 @@ fn the_writes_after_an_op_delta_catch_up_reach_a_peer() {
 }
 
 #[test]
+fn the_reported_next_seq_is_the_id_a_catch_up_left_free() {
+    // `next_seq` is what a session hands `decode_state_as` when it adopts a
+    // snapshot, so it has to answer for the durable run the catch-up delivered —
+    // not for the position the counter happens to sit at.
+    let (_, durable) = authored(cid(1), 3);
+    let mut restored = Document::new(cid(1));
+    assert_eq!(restored.next_seq(), 0);
+    for op in &durable {
+        restored.apply(op);
+    }
+    assert_eq!(restored.next_seq(), 3);
+}
+
+#[test]
 fn a_gap_in_the_durable_run_is_reused_and_the_published_ids_are_skipped() {
     // The counter is not "the highest id seen plus one" — it is the next id this
     // replica has not published. A hole left by an op the room never kept is a
