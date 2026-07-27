@@ -1445,6 +1445,7 @@ impl Registry {
             // a batch touching one subtree resolves once — memoized per distinct path to
             // avoid re-hashing the actor per op.
             let mut verdict: HashMap<&[u8], bool> = HashMap::new();
+            debug_assert_eq!(op_paths.len(), broadcast.len());
             let readable: Vec<Op> = crate::session::retain_atomic_cloned(broadcast, |i, _| {
                 // `op_paths` parallels `broadcast`, so the op's governing path set is
                 // its own position in it.
@@ -1513,13 +1514,13 @@ impl Registry {
                     // into place. The shell and content carry the move's zone so the
                     // per-channel zone filter keeps them together.
                     let mut prefix: Vec<Op> = Vec::new();
-                    // The log the back-fill reads already holds this batch, and a
-                    // revealed node's subtree can be exactly what the batch edits — so
-                    // an op is back-filled only if the batch is not already carrying
-                    // it. A second, untagged copy would be the one the recipient folds
-                    // and the batch's own copy would be discarded as an id it already
-                    // holds, taking that op out of its transaction's count for good.
-                    let carried: HashSet<crdtsync_core::OpId> =
+                    // An op is back-filled only if this frame is not already carrying
+                    // it — neither in the batch nor in an earlier shell's back-fill,
+                    // since a revealed node's subtree contains its revealed descendants'.
+                    // A second, untagged copy would be the one the recipient folds while
+                    // the batch's own copy is discarded as an id it already holds, taking
+                    // that op out of its transaction's count for good.
+                    let mut carried: HashSet<crdtsync_core::OpId> =
                         readable.iter().map(|op| op.id).collect();
                     for shell in shells {
                         let OpKind::XmlReveal { node, .. } = &shell.kind else {
@@ -1528,8 +1529,8 @@ impl Registry {
                         let node = *node;
                         let zone = shell.zone;
                         prefix.push(shell);
-                        prefix.extend(
-                            hub.reveal_backfill(room, node, &records, |p| {
+                        let backfill: Vec<Op> = hub
+                            .reveal_backfill(room, node, &records, |p| {
                                 crate::acl::recipient_reads_path(
                                     authorizer,
                                     &records,
@@ -1542,12 +1543,13 @@ impl Registry {
                                 )
                             })
                             .into_iter()
-                            .filter(|op| !carried.contains(&op.id))
+                            .filter(|op| carried.insert(op.id))
                             .map(|mut op| {
                                 op.zone = zone;
                                 op
-                            }),
-                        );
+                            })
+                            .collect();
+                        prefix.extend(backfill);
                     }
                     prefix.into_iter().chain(readable).collect()
                 }

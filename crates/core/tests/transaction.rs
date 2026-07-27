@@ -571,10 +571,11 @@ fn a_snapshot_holding_two_complete_transactions_decodes_the_same_way_every_time(
 
 // --- A filter that splits a group ------------------------------------------
 //
-// Three per-recipient redaction seams withhold individual ops from a batch: the
-// catch-up delta's read and zone filters and the live fan-out's read filter. A
-// withheld member leaves the survivors carrying a `count` their bucket can never
-// reach, so the recipient buffers them against a member that will never arrive.
+// Several per-recipient redaction seams withhold individual ops from a batch: the
+// catch-up delta's read and zone filters, the live fan-out's read filter, the
+// per-channel zone filter, and the zone projection's buffer. A withheld member
+// leaves the survivors carrying a `count` their bucket can never reach, so the
+// recipient buffers them against a member that will never arrive.
 // `split_groups` + `destrand_split` are the shared rule those seams apply — the
 // one the migration translation seam already applied alone.
 

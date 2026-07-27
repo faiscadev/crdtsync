@@ -2135,7 +2135,8 @@ fn a_live_reveal_back_fill_does_not_duplicate_the_batch_it_rides_with() {
         ),
     );
     submit(&mut r, alice, xml_fragment(&mut alice_doc, &col(COL_A)));
-    // Two cards born in the denied column.
+    // Two cards born in the denied column, the second carrying a grandchild — so a
+    // reveal of both nests, and `card`'s back-fill covers `card2`'s subtree as well.
     submit(
         &mut r,
         alice,
@@ -2143,7 +2144,9 @@ fn a_live_reveal_back_fill_does_not_duplicate_the_batch_it_rides_with() {
             let mut fb = tx.xml_fragment(COL_B);
             let mut kids = fb.children();
             kids.insert_element(0, b"card");
-            kids.insert_element(1, b"card2");
+            kids.insert_element(1, b"card2")
+                .children()
+                .insert_element(0, b"gc2");
         }),
     );
     r.take_outbox(alice);
@@ -2184,7 +2187,7 @@ fn a_live_reveal_back_fill_does_not_duplicate_the_batch_it_rides_with() {
     }
     assert_eq!(
         board_render(&replica),
-        "colA=frag(card(card2())) colB=absent",
+        "colA=frag(card(card2(gc2()))) colB=absent",
         "the group never committed at the reader",
     );
 }
