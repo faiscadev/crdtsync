@@ -2169,9 +2169,9 @@ impl Document {
             // The drain replays these straight through `apply_now`, so an op the
             // live `apply` seam would refuse must not reach state through the
             // snapshot seam instead.
-            if !stamp_names_its_author(op) || !stamp_occupies_a_mintable_position(op) {
+            if !op.is_admissible() {
                 return Err(DecodeError::BadTag {
-                    what: "document: buffered op stamped outside the id space",
+                    what: "document: buffered op no replica can hold",
                     tag: 0,
                 });
             }
@@ -2548,52 +2548,22 @@ impl Document {
         evicted
     }
 
-    /// Fold a foreign op into local state. An op whose target isn't reachable
-    /// yet is buffered and returns `false`; it replays once a create makes the
-    /// target reachable. Returns `false` for an already-applied or already-held
-    /// op. Returns `true` only when the op is applied now.
+    /// Fold a foreign op into local state. Returns `true` only when the op is
+    /// applied now.
+    ///
+    /// `false` covers three unrelated situations, and only the last is permanent:
+    /// the op is already applied or already held (a duplicate); it is admissible but
+    /// not applicable yet, so it is buffered and replays once a create makes its
+    /// target reachable or its transaction group completes; or it is one
+    /// [`Op::is_admissible`] refuses, which no later arrival changes. A caller that
+    /// must tell "not yet" from "never" — an ingest seam deciding what to log, dedup
+    /// and acknowledge — asks the op, since the refusal is a function of the op
+    /// alone and never of this document's state.
     pub fn apply(&mut self, op: &Op) -> bool {
         if self.seen.contains(&op.id) || self.buffered.contains(&op.id) {
             return false;
         }
-        // A node's id is its op's stamp, so an op whose stamp names a client other
-        // than its author mints ids inside *that* client's id space. Every op this
-        // codebase emits stamps under its author, including the server's reveal
-        // shells, so this refuses only a malformed op; being a pure function of the
-        // op, it refuses the same set on every replica.
-        //
-        // What it does **not** do is protect that id space: both fields come off the
-        // same op, so a peer authoring under the victim's `ClientId` satisfies it.
-        // Keeping the victim's next mint off ids planted under its own id is
-        // [`mint_floor`](Self::mint_floor)'s job, on this path and on the buffer a
-        // decode drains alike. This raises the bar to impersonating an identity
-        // rather than merely naming one, which is a transport-authenticated claim.
-        if !stamp_names_its_author(op) {
-            return false;
-        }
-        // The ids an op reserves are recorded against its author's high-water, and
-        // that high-water is stored, so it has to stay inside what a decode admits —
-        // hence a bound on the *position a stamp may occupy*. Refusal, not a clamp,
-        // and for the same reason a stored clock is refused: a stamp is an id, so
-        // lowering one aliases whatever already holds it. Being a pure function of
-        // the op, every replica refuses exactly the same set, so the judgement is
-        // convergent rather than a divergence — and the local mint stops at the same
-        // constant ([`mint_position`]), so no replica emits what this rejects.
-        if !stamp_occupies_a_mintable_position(op) {
-            return false;
-        }
-        // A member declaring a group size outside the representable range is
-        // refused, on the same terms and for the same reason as the stamp above:
-        // no honest op carries one ([`MAX_TX_MEMBERS`] bounds the mint), the
-        // judgement is on the member alone, and refusing holds nothing — the point
-        // of the bound being that such a member would wait in the buffer for a
-        // completion no arrival brings. The codec refuses the same op at the wire
-        // boundary; this is the seam an in-process relay or an SDK reaches without
-        // crossing one.
-        if op
-            .tx
-            .is_some_and(|tx| !(1..=MAX_TX_MEMBERS).contains(&tx.count))
-        {
+        if !op.is_admissible() {
             return false;
         }
         // An atomic-transaction member is always held first; its group commits
@@ -5037,6 +5007,57 @@ fn mint_position(from: u64, span: u64, client: ClientId) -> Option<Stamp> {
         client,
         offset: 0,
     })
+}
+
+impl Op {
+    /// Whether any replica may hold this op at all — the judgement
+    /// [`Document::apply`] makes before it decides whether the op applies *now*.
+    ///
+    /// An inadmissible op is refused **forever**, by every replica: each condition
+    /// below reads the op and nothing else, so two replicas at unrelated states
+    /// reach the same verdict and the network converges on the op's absence rather
+    /// than splitting over it. That is what makes rejecting it safe, and it is the
+    /// line an ingest seam needs: an admissible op that does not apply yet is
+    /// *waiting* — held until a create makes its target reachable or its
+    /// transaction group completes — so it is state worth logging, fanning out and
+    /// acknowledging, while an inadmissible one is worth none of those. Admissible
+    /// says only that no rule forbids the op outright; it does not promise the op
+    /// applies, and an already-applied op stays admissible.
+    ///
+    /// Nothing this codebase emits is inadmissible — the mint is bounded by the same
+    /// constants — so refusing one costs an honest peer nothing.
+    pub fn is_admissible(&self) -> bool {
+        // A node's id is its op's stamp, so an op whose stamp names a client other
+        // than its author mints ids inside *that* client's id space. Every op this
+        // codebase emits stamps under its author, including the server's reveal
+        // shells.
+        //
+        // What this does **not** do is protect that id space: both fields come off
+        // the same op, so a peer authoring under the victim's `ClientId` satisfies
+        // it. Keeping the victim's next mint off ids planted under its own id is
+        // [`Document::mint_floor`]'s job, on the apply path and on the buffer a
+        // decode drains alike. This raises the bar to impersonating an identity
+        // rather than merely naming one, which is a transport-authenticated claim.
+        stamp_names_its_author(self)
+            // The ids an op reserves are recorded against its author's high-water,
+            // and that high-water is stored, so it has to stay inside what a decode
+            // admits — hence a bound on the *position a stamp may occupy*. Refusal,
+            // not a clamp, and for the same reason a stored clock is refused: a
+            // stamp is an id, so lowering one aliases whatever already holds it. The
+            // local mint stops at the same constant ([`mint_position`]), so no
+            // replica emits what this rejects.
+            && stamp_occupies_a_mintable_position(self)
+            // A member declaring a group size outside the representable range is
+            // refused on the same terms: no honest op carries one ([`MAX_TX_MEMBERS`]
+            // bounds the mint), and refusing holds nothing — the point of the bound
+            // being that such a member would wait in the buffer for a completion no
+            // arrival brings. The codec refuses the same op at the wire boundary;
+            // this is the seam an in-process relay or an SDK reaches without
+            // crossing one.
+            && self
+                .tx
+                .is_none_or(|tx| (1..=MAX_TX_MEMBERS).contains(&tx.count))
+    }
 }
 
 /// Whether an op's stamp names the client that authored it. A node's id is its

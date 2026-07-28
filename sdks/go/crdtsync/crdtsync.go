@@ -500,6 +500,12 @@ const (
 	// runtime-kind mismatch at a declared slot — recoverable, the connection stays
 	// open, the author keeps its ops.
 	SchemaViolation ErrorCode = 8
+	// MalformedOp is the server refusing ops no replica can hold — a stamp not
+	// naming its author, a stamp outside the position an id may occupy, or a
+	// transaction member declaring a group size no group can have. Recoverable, the
+	// connection stays open, the author keeps its ops; nothing this SDK mints is
+	// malformed, so meeting it means a client bug.
+	MalformedOp ErrorCode = 9
 )
 
 // Rejected is an op batch the server refused, surfaced by TakeRejected for the

@@ -139,14 +139,18 @@ fn snapshot_seen(log: &RoomLog) -> HashSet<OpId> {
 }
 
 /// The canonical retained tail: `log.ops` with every op the snapshot already
-/// covers, and any earlier duplicate, filtered out — in order. These are exactly
-/// the ops that advance the sequence past the floor, mirroring the dedup the hub
-/// runs on replay, so the op at tail index `i` carries server sequence
-/// `floor + i + 1` even when a crash left the snapshot and log overlapping.
+/// covers, any earlier duplicate, and anything no replica can hold filtered out —
+/// in order. These are exactly the ops that advance the sequence past the floor,
+/// mirroring what the hub commits on replay, so the op at tail index `i` carries
+/// server sequence `floor + i + 1` even when a crash left the snapshot and log
+/// overlapping. The admissibility filter is what keeps that mirroring exact
+/// against bytes this node did not write, rather than resting on the ingest seam
+/// having kept an inadmissible record off the disk in the first place.
 fn canonical_tail(log: &RoomLog) -> Vec<StoredOp> {
     let mut seen = snapshot_seen(log);
     log.ops
         .iter()
+        .filter(|stored| stored.op.is_admissible())
         .filter(|stored| seen.insert(stored.op.id))
         .cloned()
         .collect()

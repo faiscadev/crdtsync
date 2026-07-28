@@ -131,6 +131,7 @@ class ErrorCode(enum.IntEnum):
     UPDATE_REQUIRED = 6
     NOT_FOUND = 7
     SCHEMA_VIOLATION = 8
+    MALFORMED_OP = 9
 
 
 class DiffKind(enum.IntEnum):

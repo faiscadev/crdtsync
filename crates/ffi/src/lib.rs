@@ -2041,7 +2041,7 @@ pub unsafe extern "C" fn crdtsync_client_subscribe_zone(
 /// Forbidden, `6` UpdateRequired — the `onUpdateRequired` signal — `7` NotFound,
 /// a diff query over an absent version or branch, `8` SchemaViolation — the
 /// enforcing server refused ops that would introduce a non-repairable schema
-/// violation.
+/// violation, `9` MalformedOp — the server refused ops no replica can hold.
 fn error_code_discriminant(code: ErrorCode) -> i32 {
     match code {
         ErrorCode::ProtocolViolation => 0,
@@ -2053,6 +2053,7 @@ fn error_code_discriminant(code: ErrorCode) -> i32 {
         ErrorCode::UpdateRequired => 6,
         ErrorCode::NotFound => 7,
         ErrorCode::SchemaViolation => 8,
+        ErrorCode::MalformedOp => 9,
     }
 }
 

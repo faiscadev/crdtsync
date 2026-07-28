@@ -317,6 +317,7 @@ fn every_error_code_round_trips() {
         ErrorCode::UpdateRequired,
         ErrorCode::NotFound,
         ErrorCode::SchemaViolation,
+        ErrorCode::MalformedOp,
     ] {
         round_trips(Message::Error {
             code,
@@ -385,6 +386,7 @@ fn ops_rejected_round_trips_every_reason_code() {
         ErrorCode::UpdateRequired,
         ErrorCode::NotFound,
         ErrorCode::SchemaViolation,
+        ErrorCode::MalformedOp,
     ] {
         round_trips(Message::OpsRejected {
             channel: Channel(1),

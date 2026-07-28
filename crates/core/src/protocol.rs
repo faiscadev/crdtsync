@@ -156,6 +156,18 @@ pub enum ErrorCode {
     /// rejection. Distinct from [`Forbidden`](ErrorCode::Forbidden), which is an
     /// authorization denial. Recoverable: the connection stays open.
     SchemaViolation,
+    /// The submitted ops include one no replica can hold — a stamp naming a client
+    /// other than its author, a stamp outside the position an id may occupy, or a
+    /// transaction member declaring a group size no group can have. The refusal is a
+    /// pure function of the op ([`Op::is_admissible`](crate::Op::is_admissible)), so
+    /// every replica refuses exactly the same ops and the network converges on their
+    /// absence; the server therefore refuses the batch at ingress rather than
+    /// logging, deduping and fanning out a write that lands nowhere. Distinct from
+    /// [`ProtocolViolation`](ErrorCode::ProtocolViolation): the frame was
+    /// well-formed, so the connection stays open and the author keeps its ops —
+    /// though a client emitting one has a bug, since nothing this codebase mints is
+    /// inadmissible.
+    MalformedOp,
 }
 
 /// Which pair of named states a [`Message::DiffQuery`] compares: two saved
@@ -1405,6 +1417,7 @@ fn error_code_tag(code: ErrorCode) -> u16 {
         ErrorCode::UpdateRequired => 6,
         ErrorCode::NotFound => 7,
         ErrorCode::SchemaViolation => 8,
+        ErrorCode::MalformedOp => 9,
     }
 }
 
@@ -1419,6 +1432,7 @@ fn error_code(tag: u16) -> Result<ErrorCode, ProtocolError> {
         6 => Ok(ErrorCode::UpdateRequired),
         7 => Ok(ErrorCode::NotFound),
         8 => Ok(ErrorCode::SchemaViolation),
+        9 => Ok(ErrorCode::MalformedOp),
         tag => Err(ProtocolError::BadTag {
             what: "error code",
             tag: tag as u8,

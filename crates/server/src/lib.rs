@@ -1048,6 +1048,13 @@ impl Hub {
         // under its name is a stale orphan (a former writable fork's, left by a
         // repoint whose best-effort tail removal failed) — dropped, so it never folds
         // onto the published base.
+        //
+        // A record no replica can hold is dropped here as it is on the write path.
+        // The bytes are supplied by whoever hands the store over, so the tail is not
+        // necessarily one this node wrote: admitting such a record would seed the
+        // branch's dedup set with an id that lands nowhere — swallowing the author's
+        // corrected resend under it — and count toward a head every filtering peer
+        // computes one lower.
         if !log.branch_ops.is_empty() {
             let published: HashSet<Vec<u8>> = self
                 .branches
@@ -1064,6 +1071,10 @@ impl Hub {
                 if published.contains(&branch) {
                     continue;
                 }
+                let ops: Vec<StoredOp> = ops
+                    .into_iter()
+                    .filter(|rec| rec.op.is_admissible())
+                    .collect();
                 let seen = ops.iter().map(|rec| rec.op.id).collect();
                 logs.insert(branch, BranchLog { ops, seen });
             }
@@ -1159,11 +1170,16 @@ impl Hub {
 
     /// Apply a client's ops to `room` (creating it if new), tagging each with
     /// the `schema_version` it was created under — the writing connection's
-    /// enforced version, or `None` for a relay op with no schema. Skips any op
-    /// already seen. A new op is durably logged before it is applied, so the
-    /// merged state and the catch-up log never expose a write the disk has not
-    /// accepted. Returns the ops newly applied, in server-sequence order — the
-    /// batch to broadcast to the room's subscribers.
+    /// enforced version, or `None` for a relay op with no schema. Drops any op no
+    /// replica can hold ([`Op::is_admissible`]) before anything else, then skips any
+    /// already seen — an op `Document::apply` refuses permanently is never logged,
+    /// deduped or returned, so it neither reaches the disk nor swallows a corrected
+    /// resend under its id, in this batch or a later one. An op that is merely
+    /// *waiting* is admissible and is logged and returned as usual. A new op is
+    /// durably logged before it is applied, so the merged state and the catch-up log
+    /// never expose a write the disk has not accepted. Returns the ops newly
+    /// applied, in server-sequence order — the batch to broadcast to the room's
+    /// subscribers.
     pub fn ingest(
         &mut self,
         room: &[u8],
@@ -1178,15 +1194,32 @@ impl Hub {
     }
 
     /// Commit already-tagged records — the shared body of live [`ingest`](Hub::ingest)
-    /// and store replay. Dedups against the room's seen set and within the batch,
-    /// persists the fresh records (when a store is attached), then applies and
-    /// logs them. Replay passes the records decoded from disk, preserving each
-    /// op's own creation version rather than re-tagging the batch.
+    /// and store replay. Drops the records no replica can hold, dedups against the
+    /// room's seen set and within the batch, persists what is left (when a store is
+    /// attached), then applies and logs them. Replay passes the records decoded from
+    /// disk, preserving each op's own creation version rather than re-tagging the
+    /// batch.
     fn ingest_records(&mut self, room: &[u8], records: Vec<StoredOp>) -> io::Result<Vec<Op>> {
         let server = self.server;
         let key = room;
         // The records not already logged, deduped within the batch too — the set
         // that would grow the log.
+        //
+        // An inadmissible op is dropped here rather than committed. `apply` refuses
+        // it permanently, so logging it would durably retain, dedup, fan out and
+        // replay a write that lands nowhere — and, worse, swallow the author's
+        // corrected resend of the same `OpId` forever. The judgement is a pure
+        // function of the op, so every replica refuses the same set and the room
+        // converges on its absence. This is the seam's own invariant, not the
+        // session's: a `Replicate` frame from a peer reaches
+        // [`ingest`](Hub::ingest) without crossing `handle_ops`, which is where a
+        // *client's* batch is refused recoverably so its author keeps its ops
+        // instead of being told they landed.
+        //
+        // A merely *unapplicable* op is not dropped: an op waiting on an absent
+        // target or an incomplete transaction group is admissible, and is logged,
+        // retained and fanned out exactly as before, because a later arrival
+        // commits it.
         let fresh: Vec<StoredOp> = {
             let room = self
                 .rooms
@@ -1195,6 +1228,7 @@ impl Hub {
             let mut batch = HashSet::new();
             records
                 .into_iter()
+                .filter(|rec| rec.op.is_admissible())
                 .filter(|rec| !room.seen.contains(&rec.op.id) && batch.insert(rec.op.id))
                 .collect()
         };
@@ -1234,8 +1268,9 @@ impl Hub {
 
     /// Apply a client's ops to a non-`main` branch of `room`, appending them to
     /// that branch's divergent tail and advancing its head — never `main`'s log.
-    /// Each is tagged with the writer's `schema_version`, deduped against the
-    /// branch's own seen set (and within the batch), and durably logged before it
+    /// Each is tagged with the writer's `schema_version`, dropped if no replica can
+    /// hold it ([`Op::is_admissible`], as on `main`), then deduped against the
+    /// branch's own seen set and within the batch, and durably logged before it
     /// is applied. Returns the ops newly appended, in order — the batch to fan out
     /// to the `(room, branch)` stream's subscribers. A `main` branch delegates to
     /// [`ingest`](Hub::ingest); an unknown branch appends nothing.
@@ -1263,7 +1298,11 @@ impl Hub {
             .into_iter()
             .map(|op| StoredOp::new(op, schema_version))
             .collect();
-        // The records not already in the branch's tail, deduped within the batch.
+        // The records not already in the branch's tail, deduped within the batch,
+        // and never one no replica can hold. A tail is folded into a document only
+        // when the branch is materialized, so an inadmissible op admitted here would
+        // sit durable and undetected until then and be dropped at the fold — the
+        // same land-nowhere write as on `main`, deferred.
         let fresh: Vec<StoredOp> = {
             let log = self
                 .branch_logs
@@ -1274,6 +1313,7 @@ impl Hub {
             let mut batch = HashSet::new();
             records
                 .into_iter()
+                .filter(|rec| rec.op.is_admissible())
                 .filter(|rec| !log.seen.contains(&rec.op.id) && batch.insert(rec.op.id))
                 .collect()
         };
