@@ -625,6 +625,8 @@ Snapshots are the storage primitive. Versioning is the user-facing layer on top.
 
 Snapshot + entry in a versions index. List, paginate, rename, delete are first-class.
 
+A version *read* is a redacted read. The captured bytes are the room's own state at an earlier sequence, so they carry every partition the room carried; serving them is subject to the same per-recipient redactions the live catch-up applies — the doc-ACL path projection, then the zone projection — narrowed to the requesting channel's zone scope, and carrying only the requesting replica's own causal frontier. **Current** policy governs a version read; the version's own captured ACL state does not, or a revoked grant would be reachable by fetching a version taken before the revocation. An element-scoped grant, though, resolves against the *version's* tree — an element's redaction path is where it stood at capture — since a grant that resolves to no live path is inert, and an inert deny over a version's bytes is the whole version. State that cannot be projected is refused rather than served unnarrowed.
+
 ## Auto-Version Triggers
 
 Versions can be created declaratively in response to engine events (`before-publish`, `after-restore`, `before-migration`, ...) or schedules.
