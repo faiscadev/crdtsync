@@ -91,6 +91,15 @@ impl PeerEndpoint {
         if authority.is_empty() {
             return Err(BadPeerAddress::Empty);
         }
+        // An authority that names no host — an IPv6 literal left unbracketed, or one
+        // opening with its port separator — is dialable by nobody and bindable to no
+        // certificate. Refused here so every consumer inherits it: a configured member
+        // fails startup, a gossiped one is classified a *permanent* dial failure rather
+        // than redialed forever, and the host is the one part of an address this crate
+        // reads twice.
+        if host_of(authority).is_none() {
+            return Err(BadPeerAddress::NoHost);
+        }
         let scheme = transport.scheme();
         // A bare authority is dialed at the root path, as every advertise address
         // in a cluster is; one that already carries a path keeps it verbatim.
@@ -125,12 +134,19 @@ pub fn member_host(addr: &[u8]) -> Option<String> {
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(&endpoint.url);
+    host_of(authority).map(|host| host.to_ascii_lowercase())
+}
+
+/// The host an authority names, with its port and path stripped. A bracketed IPv6
+/// literal keeps its brackets off but its colons intact, so `[::1]:9000` is `::1`
+/// rather than everything up to the last colon. `None` when it names none.
+fn host_of(authority: &str) -> Option<&str> {
     let authority = authority.split('/').next().unwrap_or(authority);
     let host = match authority.strip_prefix('[') {
         Some(rest) => rest.split(']').next()?,
         None => authority.split(':').next()?,
     };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    (!host.is_empty()).then_some(host)
 }
 
 /// Whether a verified peer certificate's subject `name` establishes the connection
@@ -191,6 +207,9 @@ pub(crate) fn is_ip_literal(name: &str) -> bool {
 pub enum BadPeerAddress {
     /// The address, or its authority after a scheme, is empty.
     Empty,
+    /// The authority names no host — an unbracketed IPv6 literal, or an address
+    /// opening with its port separator.
+    NoHost,
     /// The address carries a scheme that is not `ws` or `wss`.
     UnknownScheme(String),
 }
@@ -199,6 +218,11 @@ impl std::fmt::Display for BadPeerAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BadPeerAddress::Empty => write!(f, "the address is empty"),
+            BadPeerAddress::NoHost => write!(
+                f,
+                "the address names no host, so no peer can dial it — use `host:port`, \
+                 bracketing an IPv6 literal"
+            ),
             BadPeerAddress::UnknownScheme(scheme) => write!(
                 f,
                 "`{scheme}://` is not a peer transport — use `wss://host:port`, \
@@ -412,6 +436,36 @@ mod tests {
             PeerEndpoint::parse("http://10.0.0.1:9000"),
             Err(BadPeerAddress::UnknownScheme("http".to_string()))
         );
+    }
+
+    #[test]
+    fn an_address_naming_no_host_is_refused() {
+        // Dialable by nobody and bindable to no certificate, so it fails at the parse
+        // every consumer shares: a configured member at startup, a gossiped one as a
+        // *permanent* dial failure rather than one redialed forever.
+        for addr in ["::1:9000", ":9000", "[]:9000", "ws:///path", "wss://:9000"] {
+            assert_eq!(
+                PeerEndpoint::parse(addr),
+                Err(BadPeerAddress::NoHost),
+                "{addr}"
+            );
+            assert_eq!(member_host(addr.as_bytes()), None, "{addr}");
+        }
+        assert!(DialError::Address(BadPeerAddress::NoHost).is_permanent());
+    }
+
+    #[test]
+    fn a_bracketed_literal_and_a_bare_host_still_parse() {
+        // The refusal must not catch a legitimate address on its way past.
+        for addr in [
+            "[::1]:9000",
+            "wss://[2001:db8::1]:9000",
+            "node-a",
+            "node-a:9000/x",
+        ] {
+            assert!(PeerEndpoint::parse(addr).is_ok(), "{addr}");
+            assert!(member_host(addr.as_bytes()).is_some(), "{addr}");
+        }
     }
 
     #[test]

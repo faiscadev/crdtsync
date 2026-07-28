@@ -52,8 +52,10 @@
 //! refuse any peer link that presents none; a node that requires it while verifying no
 //! client certificate, while presenting no identity of its own, or while holding a
 //! member whose advertise address names no host, refuses to start. Two refusals do not
-//! wait for that policy: an advertise address that names no host at all is refused
-//! outright (no peer could dial it), and a node that sets `CRDTSYNC_TLS_CLIENT_CA`
+//! wait for that policy: an advertise address that names no host is refused outright,
+//! this node's and any configured member's alike (no peer could dial it, and a
+//! gossip-learned one is classified a permanent dial failure rather than redialed
+//! forever), and a node that sets `CRDTSYNC_TLS_CLIENT_CA`
 //! while presenting a peer certificate that names no host matching the id it dials
 //! under refuses to start too, since every peer applying the same binding refuses its
 //! links. A node holding such a certificate *without* `CRDTSYNC_TLS_CLIENT_CA` cannot

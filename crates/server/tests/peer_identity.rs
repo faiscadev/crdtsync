@@ -1071,7 +1071,7 @@ mod live {
     async fn open_plain_client(addr: &str, client: ClientId) -> Ws {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
-            .unwrap();
+            .expect("the node refused to start over a certificate no peer will ever ask it for");
         ws.send(WsMessage::Binary(encode_header(PROTOCOL_VERSION).to_vec()))
             .await
             .unwrap();

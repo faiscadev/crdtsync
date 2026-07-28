@@ -883,9 +883,10 @@ fn peer_identity_policy(config: &ServeConfig) -> std::io::Result<()> {
     // that may be perfectly inert, or starting silently into a cluster that will refuse
     // every link it opens.
     //
-    // A self address that names no host is `peer_dialer`'s refusal, which reports the
-    // problem it actually is; repeating it here as a certificate naming the wrong host
-    // would send the operator to the wrong file.
+    // A self address that names no host is refused for being unaddressable — by the
+    // member loop below where identity is required, by the dial policy otherwise —
+    // and either message names the problem it actually is. Repeating it here as a
+    // certificate naming the wrong host would send the operator to the wrong file.
     if let (Some(own_hosts), Some(membership)) = (&config.peer_client_identity, &config.membership)
     {
         let self_addr = membership.self_id().as_bytes();
@@ -956,7 +957,9 @@ fn peer_identity_policy(config: &ServeConfig) -> std::io::Result<()> {
 /// The four refusals are all the same failure the operator would otherwise meet as
 /// a cluster that starts, binds, and never converges:
 ///
-///  - a member's advertise address that resolves to no endpoint at all;
+///  - a member's advertise address that resolves to no endpoint at all — an unknown
+///    scheme, an empty authority, or one naming no host, which is dialable by nobody
+///    and bindable to no certificate;
 ///  - **this node's own advertised transport disagreeing with the one it
 ///    terminates** — a node that terminates TLS while telling its peers to dial
 ///    `ws://` (or the reverse) is unreachable to every one of them, which is the
@@ -999,17 +1002,6 @@ fn peer_dialer(
             // it must match the transport this node terminates.
             let endpoint = crate::dial::PeerEndpoint::parse(&addr)
                 .map_err(|e| invalid(format!("this node's advertise address `{addr}`: {e}")))?;
-            // An address that parses but names no host — an IPv6 literal left
-            // unbracketed, or one opening with its port separator — is dialable by
-            // nobody, and it is also the one shape no certificate could ever be bound
-            // to. Refused here rather than by the identity policy, because it is the
-            // address that is wrong however the deployment is configured.
-            if crate::dial::member_host(addr.as_bytes()).is_none() {
-                return Err(invalid(format!(
-                    "this node's advertise address `{addr}` names no host, so no peer can dial \
-                     it: address this node as `host:port`, bracketing an IPv6 literal"
-                )));
-            }
             if endpoint.is_tls() != config.tls.is_some() {
                 return Err(invalid(match endpoint.is_tls() {
                     true => format!(
