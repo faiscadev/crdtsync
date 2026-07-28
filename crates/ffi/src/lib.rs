@@ -1249,20 +1249,24 @@ pub unsafe extern "C" fn crdtsync_doc_resolve_position(
 }
 
 /// Fold an encoded op log (as returned by an edit) from a peer into the
-/// document. Returns the number of ops applied now (a duplicate or one buffered
-/// pending its target counts as not-applied), or -1 on a bad handle or
-/// malformed bytes.
+/// document. Returns the number of ops the fold took as they arrived — a
+/// duplicate and one buffered pending its target both count as not-applied, and
+/// so does a buffered op that a *later op in the same batch* releases — or -1 on
+/// a bad handle or malformed bytes.
 ///
 /// **`out_refused` is what separates "not yet" from "never"**, and the two want
 /// opposite responses. It receives the count of ops in the batch that no replica
-/// will ever hold ([`Op::is_admissible`]'s complement — a stamp naming a client
-/// other than the op's author, a stamp outside the position an id may occupy, a
-/// transaction size no group can have). A buffered op is *waiting*, so the fold
-/// keeps it and a later arrival commits it; a refused op is a bug in whoever
-/// wrote it, and there is no server between an offline, P2P or relayed peer and
-/// this fold to answer `MalformedOp` on the app's behalf. Zero is the honest-peer
-/// reading — nothing this codebase emits is refused. A null pointer skips the
-/// write, as does every -1 outcome, which decodes no batch to judge.
+/// will ever hold: the stamp conditions [`Op::is_admissible`] names — a stamp
+/// naming a client other than the op's author, or one outside the position an id
+/// may occupy — since the codec refuses its third, a transaction size no group
+/// can have, at the frame. A buffered op is *waiting*, so the fold keeps it and a
+/// later arrival commits it; a refused op is a bug in whoever wrote it, and there
+/// is no server between an offline, P2P or relayed peer and this fold to answer
+/// `MalformedOp` on the app's behalf. The batch's admissible ops still apply —
+/// unlike the server's ingress, which refuses the whole frame because its ack
+/// frontier is a max over it. Zero is the honest-peer reading, and the count is
+/// written on every outcome (`-1` included, having judged no op), so a caller may
+/// reuse the variable across batches. A null pointer skips the write.
 ///
 /// # Safety
 /// `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`];
@@ -1274,6 +1278,9 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
     len: usize,
     out_refused: *mut u32,
 ) -> i32 {
+    if !out_refused.is_null() {
+        *out_refused = 0;
+    }
     catch_unwind(AssertUnwindSafe(|| {
         if doc.is_null() {
             return -1;

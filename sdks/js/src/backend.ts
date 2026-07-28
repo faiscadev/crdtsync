@@ -73,7 +73,7 @@ export interface Backend {
 
 /** What one fold of a peer's ops did — see `Doc.applyUpdate`. */
 export interface ApplyOutcome {
-  /** How many ops the fold took now; `-1` when the batch was malformed. */
+  /** How many ops the fold took as they arrived; `-1` when the batch was malformed. */
   readonly applied: number;
   /** How many ops no replica will ever hold. */
   readonly refused: number;

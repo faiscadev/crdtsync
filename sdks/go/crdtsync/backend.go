@@ -238,7 +238,7 @@ func (c *ClientBackend) CommitAtomic() []byte { return c.client.CommitAtomic(c.c
 // Apply refuses: a networked replica folds a peer's work in through the frames
 // its provider receives, never through a side channel that would bypass the
 // outbox and the server sequence.
-func (c *ClientBackend) Apply([]byte) (int, int) { return -1, 0 }
+func (c *ClientBackend) Apply([]byte) (applied, refused int) { return -1, 0 }
 
 // Close is a no-op — the provider owns the wire client and closes it.
 func (c *ClientBackend) Close() {}

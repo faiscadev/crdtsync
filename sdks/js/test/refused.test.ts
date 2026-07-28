@@ -41,7 +41,10 @@ function log(...ops: Uint8Array[]): Uint8Array {
 // node ids inside that client's id space, which no replica will ever hold.
 const STAMP_CLIENT = 4 + 16 + 8 + 8;
 
-function forgeStampClient(frame: Uint8Array): Uint8Array {
+function forgeStampClient(frame: Uint8Array, author: Uint8Array): Uint8Array {
+  // Read the field back first, so a codec reordering fails here by name rather
+  // than as an unexplained "nothing was refused" further down.
+  expect([...frame.subarray(STAMP_CLIENT, STAMP_CLIENT + 16)]).toEqual([...author]);
   const forged = frame.slice();
   forged.fill(0xff, STAMP_CLIENT, STAMP_CLIENT + 16);
   return forged;
@@ -64,8 +67,9 @@ describe("refused ops", () => {
     const [create, write] = opened;
     const [later] = frames(emitted[1]);
 
+    const forged = forgeStampClient(later, cid(1));
     const b = new Doc({ clientId: cid(2) });
-    const outcome = b.applyUpdate(log(forgeStampClient(later), write));
+    const outcome = b.applyUpdate(log(forged, write));
     expect(outcome.applied).toBe(0);
     expect(outcome.refused).toBe(1);
 
@@ -74,6 +78,28 @@ describe("refused ops", () => {
     expect(b.applyUpdate(log(create))).toEqual({ applied: 1, refused: 0 });
     expect(b.getMap("root").get("k")).toBe(1);
     expect(b.getMap("root").get("k2")).toBeUndefined();
+
+    // A replay of what already landed is a duplicate, never a refusal.
+    expect(b.applyUpdate(log(create, write))).toEqual({ applied: 0, refused: 0 });
+  });
+
+  it("applies the rest of a batch carrying one forgery", () => {
+    const a = new Doc({ clientId: cid(1) });
+    const emitted: Uint8Array[] = [];
+    a.on("update", (e) => {
+      if (e.origin === "local") emitted.push(e.ops);
+    });
+    a.getMap("root").set("k", 1);
+    a.getMap("root").set("k2", 2);
+    const [create, write] = frames(emitted[0]);
+    const [later] = frames(emitted[1]);
+
+    // The everyday shape: one forgery riding a stream of honest ops. The refusal
+    // is per op, not per batch.
+    const b = new Doc({ clientId: cid(2) });
+    const outcome = b.applyUpdate(log(forgeStampClient(later, cid(1)), create, write));
+    expect(outcome).toEqual({ applied: 2, refused: 1 });
+    expect(b.getMap("root").get("k")).toBe(1);
   });
 
   it("judges a malformed batch as neither applied nor refused", () => {

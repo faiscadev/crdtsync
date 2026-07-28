@@ -31,32 +31,52 @@ def frames(log: bytes) -> List[bytes]:
     return out
 
 
-def forge_stamp_client(frame: bytes) -> bytes:
+def forge_stamp_client(frame: bytes, author: bytes) -> bytes:
+    # Read the field back first, so a codec reordering fails here by name rather
+    # than as an unexplained "nothing was refused" further down.
+    assert frame[_STAMP_CLIENT : _STAMP_CLIENT + 16] == author
     return frame[:_STAMP_CLIENT] + b"\xff" * 16 + frame[_STAMP_CLIENT + 16 :]
 
 
-def test_a_refused_op_is_counted_apart_from_a_buffered_one():
-    a = Doc(cid(1))
+def opened_map(first: int):
+    """A doc that wrote twice into one map, with its (create, write, later) ops.
+    The first write into a map is two ops — the container create, then the write
+    into it; a second write is one op, targeting the same container."""
+    d = Doc(cid(first))
     emitted = []
-    a.on_update(lambda e: emitted.append(e.ops) if e.origin == "local" else None)
-
-    # The first write into a map is two ops: the container create, then the write
-    # into it. A second write is one op, targeting the same container.
-    a.get_map("root").set("k", 1)
-    a.get_map("root").set("k2", 2)
+    d.on_update(lambda e: emitted.append(e.ops) if e.origin == "local" else None)
+    d.get_map("root").set("k", 1)
+    d.get_map("root").set("k2", 2)
     opened = frames(emitted[0])
     assert len(opened) == 2
-    create, write = opened
     (later,) = frames(emitted[1])
+    return opened[0], opened[1], later
+
+
+def test_a_refused_op_is_counted_apart_from_a_buffered_one():
+    create, write, later = opened_map(1)
 
     b = Doc(cid(2))
-    assert b.apply_update(forge_stamp_client(later) + write) == (0, 1)
+    assert b.apply_update(forge_stamp_client(later, cid(1)) + write) == (0, 1)
 
     # The buffered op was waiting, not refused: the create releases it. The forged
     # one is gone for good, though its target is now reachable.
     assert b.apply_update(create) == (1, 0)
     assert b.get_map("root").get("k") == 1
     assert b.get_map("root").get("k2") is None
+
+    # A replay of what already landed is a duplicate, never a refusal.
+    assert b.apply_update(create + write) == (0, 0)
+
+
+def test_the_rest_of_a_batch_carrying_one_forgery_applies():
+    create, write, later = opened_map(1)
+
+    # The everyday shape: one forgery riding a stream of honest ops. The refusal
+    # is per op, not per batch.
+    b = Doc(cid(2))
+    assert b.apply_update(forge_stamp_client(later, cid(1)) + create + write) == (2, 1)
+    assert b.get_map("root").get("k") == 1
 
 
 def test_a_malformed_batch_is_neither_applied_nor_refused():

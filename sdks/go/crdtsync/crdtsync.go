@@ -552,8 +552,8 @@ func (d *Document) ResolvePosition(path [][]byte, pos []byte) (uint, bool) {
 
 // --- sync ---
 
-// Apply folds a peer's encoded ops in. It returns how many ops applied now (-1
-// on a malformed batch) beside how many no replica will ever hold.
+// Apply folds a peer's encoded ops in. It returns how many ops applied as they
+// arrived (-1 on a malformed batch) beside how many no replica will ever hold.
 func (d *Document) Apply(ops []byte) (applied, refused int) {
 	pp, pl := bytesArg(ops)
 	var r C.uint32_t

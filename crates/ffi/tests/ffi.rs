@@ -1167,12 +1167,14 @@ fn applying_garbage_bytes_is_reported_not_fatal() {
         let c = client(1);
         let doc = crdtsync_doc_new(c.as_ptr());
         let junk = [0xFFu8; 8];
+        // Seeded, so the count is proven written rather than merely left alone —
+        // a caller reusing one variable across batches must not read the last one.
         let mut refused = 7u32;
         assert_eq!(
             crdtsync_doc_apply(doc, junk.as_ptr(), junk.len(), &mut refused),
             -1
         );
-        assert_eq!(refused, 7, "a batch that never decoded judges no op");
+        assert_eq!(refused, 0, "a batch that never decoded judges no op");
         crdtsync_doc_free(doc);
     }
 }
@@ -1186,6 +1188,7 @@ fn a_refused_op_is_counted_apart_from_a_buffered_one() {
         let nested = register_int(a, &path(&[b"nested", b"k"]), 1);
         let mut ops = crdtsync_core::decode_ops(std::slice::from_raw_parts(nested.ptr, nested.len))
             .expect("a nested write decodes");
+        assert_eq!(ops.len(), 2);
         let write = ops.pop().expect("the write is the last op");
         let create = ops.pop().expect("the container create is the first op");
 
@@ -1196,12 +1199,13 @@ fn a_refused_op_is_counted_apart_from_a_buffered_one() {
         let mut forged =
             crdtsync_core::decode_ops(std::slice::from_raw_parts(forged_buf.ptr, forged_buf.len))
                 .expect("a register write decodes");
+        assert_eq!(forged.len(), 1);
         let mut refused_op = forged.pop().expect("a register write is one op");
         refused_op.stamp.client = crdtsync_core::ClientId::from_bytes([9u8; 16]);
         assert!(!refused_op.is_admissible());
 
         let b = crdtsync_doc_new(client(2).as_ptr());
-        let batch = crdtsync_core::encode_ops(&[refused_op, write]);
+        let batch = crdtsync_core::encode_ops(&[refused_op.clone(), write.clone()]);
         let mut refused = 0u32;
         assert_eq!(
             crdtsync_doc_apply(b, batch.as_ptr(), batch.len(), &mut refused),
@@ -1211,7 +1215,7 @@ fn a_refused_op_is_counted_apart_from_a_buffered_one() {
         assert_eq!(refused, 1, "only the forged op is refused forever");
 
         // The buffered op was waiting, not refused: the create releases it.
-        let tail = crdtsync_core::encode_ops(&[create]);
+        let tail = crdtsync_core::encode_ops(&[create.clone()]);
         let mut none_refused = 0u32;
         assert_eq!(
             crdtsync_doc_apply(b, tail.as_ptr(), tail.len(), &mut none_refused),
@@ -1221,11 +1225,33 @@ fn a_refused_op_is_counted_apart_from_a_buffered_one() {
         assert_eq!(get_int(b, &path(&[b"nested", b"k"])), (1, 1));
         assert_eq!(get_int(b, &path(&[b"forged"])).0, 0, "the forgery is gone");
 
+        // A replay of what already landed is a duplicate, never a refusal.
+        let replay = crdtsync_core::encode_ops(&[create.clone(), write.clone()]);
+        let mut replay_refused = 0u32;
+        assert_eq!(
+            crdtsync_doc_apply(b, replay.as_ptr(), replay.len(), &mut replay_refused),
+            0
+        );
+        assert_eq!(replay_refused, 0);
+
+        // The everyday shape: one forgery riding a stream of honest ops. The rest
+        // of the batch applies — the refusal is per op, not per batch.
+        let c = crdtsync_doc_new(client(4).as_ptr());
+        let mixed = crdtsync_core::encode_ops(&[refused_op, create, write]);
+        let mut mixed_refused = 0u32;
+        assert_eq!(
+            crdtsync_doc_apply(c, mixed.as_ptr(), mixed.len(), &mut mixed_refused),
+            2
+        );
+        assert_eq!(mixed_refused, 1);
+        assert_eq!(get_int(c, &path(&[b"nested", b"k"])), (1, 1));
+
         crdtsync_buf_free(nested);
         crdtsync_buf_free(forged_buf);
         crdtsync_doc_free(a);
         crdtsync_doc_free(other);
         crdtsync_doc_free(b);
+        crdtsync_doc_free(c);
     }
 }
 

@@ -174,8 +174,8 @@ class Rejected(NamedTuple):
 
 class ApplyOutcome(NamedTuple):
     """What one fold of a peer's ops did, returned by :meth:`Doc.apply_update`.
-    ``applied`` is how many ops the fold took now (``-1`` for a malformed batch),
-    ``refused`` how many no replica will ever hold."""
+    ``applied`` is how many ops the fold took as they arrived (``-1`` for a
+    malformed batch), ``refused`` how many no replica will ever hold."""
 
     applied: int
     refused: int
@@ -1280,8 +1280,8 @@ class Document:
     # --- sync ---
 
     def apply(self, ops: bytes) -> ApplyOutcome:
-        """Fold a peer's encoded ops in. Returns how many applied now (``-1`` on a
-        malformed batch) beside how many no replica will ever hold."""
+        """Fold a peer's encoded ops in. Returns how many applied as they arrived
+        (``-1`` on a malformed batch) beside how many no replica will ever hold."""
         refused = ctypes.c_uint32(0)
         applied = _LIB.crdtsync_doc_apply(self._handle, ops, len(ops), ctypes.byref(refused))
         return ApplyOutcome(applied=applied, refused=refused.value)
@@ -3065,13 +3065,15 @@ class Doc:
         doc syncs through its provider.
 
         The outcome separates an op that did not apply *yet* from one that never
-        will. ``applied`` counts what the fold took now; an op it did not take may
-        be a duplicate, or be waiting — buffered until a create makes its target
-        reachable or its transaction group completes, which a later update does.
-        ``refused`` counts what no replica will ever hold, which is a bug in
-        whoever wrote it: offline, P2P and relayed peers reach this fold with no
-        server between them to reject such an op first, so a non-zero ``refused``
-        is the only signal the app gets that a peer's edits are dropped for good."""
+        will. ``applied`` counts what the fold took as the ops arrived; one it did
+        not take may be a duplicate, or be waiting — buffered until a create makes
+        its target reachable or its transaction group completes, which a later
+        update does, including one later in this same batch (released that way, it
+        is not counted). ``refused`` counts what no replica will ever hold, which
+        is a bug in whoever wrote it: offline, P2P and relayed peers reach this
+        fold with no server between them to reject such an op first, so a non-zero
+        ``refused`` is the only signal the app gets that a peer's edits are dropped
+        for good. The rest of the batch still applies."""
         before = self._backend.encode_state() if self._observing() else None
         outcome = self._backend.apply(ops)
         if outcome.applied > 0:

@@ -677,19 +677,21 @@ impl WasmDocument {
     }
 
     /// Fold a peer's encoded ops in, as `{ applied, refused }`: `applied` the
-    /// number the fold took now (`-1` on a malformed batch), `refused` the number
-    /// no replica will ever hold.
+    /// number the fold took as they arrived (`-1` on a malformed batch), `refused`
+    /// the number no replica will ever hold.
     ///
     /// **The two zeros mean opposite things.** An op that did not apply may be a
     /// duplicate, or be *waiting* — buffered until a create makes its target
-    /// reachable or its transaction group completes, which a later arrival does —
-    /// while a refused op ([`Op::is_admissible`]'s complement: a stamp naming a
-    /// client other than the op's author, a stamp outside the position an id may
-    /// occupy, a transaction size no group can have) is a bug in whoever wrote it,
-    /// and no arrival lifts it. Offline, P2P and relayed peers reach this fold with
-    /// no server between them to answer `MalformedOp`, so the count is the app's
-    /// only signal. A malformed batch decodes nothing to judge, so it reports
-    /// `refused: 0`.
+    /// reachable or its transaction group completes, which a later arrival does,
+    /// including one later in this same batch, which `applied` does not count —
+    /// while a refused op is a bug in whoever wrote it, and no arrival lifts it.
+    /// The refusal is the stamp conditions [`Op::is_admissible`] names, the codec
+    /// having refused its third (a transaction size no group can have) at the
+    /// frame. Offline, P2P and relayed peers reach this fold with no server between
+    /// them to answer `MalformedOp`, so the count is the app's only signal; the
+    /// batch's admissible ops still apply, unlike at the server's ingress, which
+    /// refuses the whole frame because its ack frontier is a max over it. A
+    /// malformed batch decodes nothing to judge, so it reports `refused: 0`.
     pub fn apply(&mut self, ops: &[u8]) -> JsValue {
         let Ok(ops) = decode_ops(ops) else {
             return apply_outcome_to_js(-1, 0);

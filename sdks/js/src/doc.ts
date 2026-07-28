@@ -119,13 +119,15 @@ export class Doc {
    * networked document syncs through its provider.
    *
    * The outcome separates an op that did not apply *yet* from one that never
-   * will. `applied` counts what the fold took now; an op it did not take may be
-   * a duplicate, or be waiting — buffered until a create makes its target
-   * reachable or its transaction group completes, which a later update does.
-   * `refused` counts what no replica will ever hold, which is a bug in whoever
-   * wrote it: offline, P2P and relayed peers reach this fold with no server
-   * between them to reject such an op first, so a non-zero `refused` is the only
-   * signal the app gets that a peer's edits are being dropped for good. */
+   * will. `applied` counts what the fold took as the ops arrived; one it did not
+   * take may be a duplicate, or be waiting — buffered until a create makes its
+   * target reachable or its transaction group completes, which a later update
+   * does, including one later in this same batch (released that way, it is not
+   * counted). `refused` counts what no replica will ever hold, which is a bug in
+   * whoever wrote it: offline, P2P and relayed peers reach this fold with no
+   * server between them to reject such an op first, so a non-zero `refused` is
+   * the only signal the app gets that a peer's edits are dropped for good. The
+   * rest of the batch still applies. */
   applyUpdate(ops: Uint8Array): ApplyOutcome {
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const outcome = this.backend.apply(ops);

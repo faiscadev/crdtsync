@@ -388,13 +388,14 @@ func (d *Doc) SetSchema(schema []byte) bool {
 // networked doc syncs through its provider and refuses with -1.
 //
 // The two counts separate an op that did not apply yet from one that never will.
-// applied is what the fold took now; an op it did not take may be a duplicate, or
-// be waiting — buffered until a create makes its target reachable or its
-// transaction group completes, which a later update does. refused is what no
+// applied is what the fold took as the ops arrived; one it did not take may be a
+// duplicate, or be waiting — buffered until a create makes its target reachable or
+// its transaction group completes, which a later update does, including one later
+// in this same batch (released that way, it is not counted). refused is what no
 // replica will ever hold, which is a bug in whoever wrote it: offline, P2P and
 // relayed peers reach this fold with no server between them to reject such an op
-// first, so a non-zero refused is the only signal the app gets that a peer's
-// edits are dropped for good.
+// first, so a non-zero refused is the only signal the app gets that a peer's edits
+// are dropped for good. The rest of the batch still applies.
 func (d *Doc) ApplyUpdate(ops []byte) (applied, refused int) {
 	d.mu.Lock()
 	var before []byte
