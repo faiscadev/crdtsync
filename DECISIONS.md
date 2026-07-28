@@ -7,7 +7,7 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
-## 2026-07-28 · C26 refused-op signal (#PR) · the SDK fold answers two counts, because at the seam with no server the applied count alone renders a permanent refusal as silence
+## 2026-07-28 · C26 refused-op signal (#370) · the SDK fold answers two counts, because at the seam with no server the applied count alone renders a permanent refusal as silence
 
 **Changed:** ARCHITECTURE's §SDK-Ergonomic-Surface gains the fold's report — `applyUpdate` and its per-language equivalents answer how many ops applied now *beside* how many no replica will ever hold — and that report joins the language-agnostic contract every SDK realizes.
 
