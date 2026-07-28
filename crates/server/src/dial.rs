@@ -172,7 +172,8 @@ pub fn cert_names_member(name: &[u8], addr: &[u8]) -> bool {
 /// `node-a` name one host, and a certificate and an advertise address need not agree on
 /// which spelling to use.
 fn normalized(name: &str) -> String {
-    name.trim().trim_end_matches('.').to_ascii_lowercase()
+    let name = name.trim();
+    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
 }
 
 /// Whether `name` is an IP address rather than a host name, judged after the same
@@ -180,7 +181,7 @@ fn normalized(name: &str) -> String {
 /// name a host consults this, so it and [`cert_names_member`] can never disagree about
 /// what an address is: a `dNSName` of `10.0.0.6.` must not pass the reader as a name
 /// and then match an IP-advertised member as an address.
-pub fn is_ip_literal(name: &str) -> bool {
+pub(crate) fn is_ip_literal(name: &str) -> bool {
     normalized(name).parse::<std::net::IpAddr>().is_ok()
 }
 
@@ -608,6 +609,17 @@ mod tests {
         assert!(is_ip_literal("::1."));
         assert!(!is_ip_literal("node-a.internal."));
         assert!(cert_names_member(b"10.0.0.6.", b"wss://10.0.0.6:9000"));
+    }
+
+    #[test]
+    fn only_one_root_label_folds() {
+        // A name carries at most one root label, so folding a run of them would widen
+        // what binds a member for no reason a certificate or an address ever needs.
+        assert!(!cert_names_member(
+            b"node-a.internal..",
+            b"wss://node-a.internal:9000"
+        ));
+        assert!(!cert_names_member(b"10.0.0.6..", b"wss://10.0.0.6:9000"));
     }
 
     #[test]

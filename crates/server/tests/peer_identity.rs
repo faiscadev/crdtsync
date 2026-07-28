@@ -1487,6 +1487,40 @@ mod live {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)] // binds and dials a loopback listener
+    async fn a_certificate_for_another_host_still_starts_where_no_peer_asks_for_one() {
+        // The other side of that refusal, and the reason it is conditioned rather than
+        // absolute. A client certificate is only sent when the acceptor asks for one,
+        // so in a cluster where no listener verifies client certificates the binding
+        // never runs and a certificate naming something else — a URI-SAN service
+        // identity, a CN-only one, a wildcard — is inert. Refusing to start there would
+        // break a working deployment to warn about a failure that cannot happen.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let served = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_with(
+                listener,
+                cid(0xFF),
+                None,
+                ServeConfig {
+                    membership: Some(two_node_membership(&addr, "10.0.0.2:9000")),
+                    cluster_secret: Some(SECRET.to_vec()),
+                    require_peer_identity: false,
+                    client_cert_verification: false,
+                    peer_client_identity: Some(vec![b"elsewhere.example".to_vec()]),
+                    ..ServeConfig::default()
+                },
+            ),
+        )
+        .await;
+        assert!(
+            served.is_err(),
+            "the node refused to start over a certificate no peer will ever ask it for: {served:?}",
+        );
+    }
+
+    #[tokio::test]
     #[cfg_attr(miri, ignore)] // binds a loopback listener
     async fn requiring_peer_identity_without_an_identity_of_its_own_refuses_to_start() {
         // The symmetry `CRDTSYNC_CLUSTER_REQUIRE_TLS` already has: a node that demands

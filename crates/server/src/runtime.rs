@@ -151,7 +151,8 @@ pub struct ServeConfig {
     /// `rustls::ClientConfig` does not expose. `None` presents no identity at all, and
     /// every peer running an identity-requiring policy then refuses this node; a
     /// certificate naming hosts that do not include this node's own advertise host is
-    /// refused by them just as surely, so requiring identity checks it here. A
+    /// refused by them just as surely, so it is checked at startup wherever this node
+    /// verifies client certificates — whether or not identity is required. A
     /// declaration, as above.
     pub peer_client_identity: Option<Vec<Vec<u8>>>,
     /// The 32-byte zone-master key sealing cross-zone-move capability tokens.
@@ -832,12 +833,14 @@ fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
 
 /// Refuse a deployment whose peer-identity policy cannot be honored.
 ///
-/// One refusal stands on its own, whatever the policy says: **a certificate this node
-/// presents on its dials must name the host of the id it dials under.** A peer applies
-/// its own binding to it, and that binding refuses a presented certificate which binds
-/// nothing — so a node with a certificate for the wrong host has every link refused by
-/// every peer that verifies client certificates, silently, whether or not *this*
-/// deployment requires identity. It is decidable here, so it is decided here.
+/// One refusal does not wait for the policy: **a certificate this node presents on its
+/// dials must name the host of the id it dials under.** A peer applies its own binding
+/// to it, and that binding refuses a presented certificate which binds nothing — so a
+/// node with a certificate for the wrong host has every link refused, silently, whether
+/// or not *this* deployment requires identity. It is decidable here, so it is decided
+/// here — but only where this node verifies client certificates, which mirrors whether
+/// its peers request one at all: where none does, the certificate is never presented,
+/// the binding never runs, and one naming something else is inert rather than fatal.
 ///
 /// The rest apply only where identity is *required*, since requiring it means refusing
 /// every peer link that carries no verified certificate naming a member, which needs
@@ -867,13 +870,25 @@ fn peer_identity_policy(config: &ServeConfig) -> std::io::Result<()> {
         |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string());
     // The peers apply this node's own rule to this node's own certificate, so that half
     // of their decision is decidable here — and it binds whether or not this deployment
-    // requires identity of them.
-    if let (Some(own_hosts), Some(membership)) = (&config.peer_client_identity, &config.membership)
-    {
+    // requires identity *of them*. It is conditioned on this node verifying client
+    // certificates, because that mirrors whether the peers request one at all: where no
+    // listener does, no certificate is ever presented, the binding never runs, and a
+    // certificate that names something else — a URI-SAN service identity, a CN-only
+    // one, a wildcard — is simply inert rather than a link nobody will accept.
+    //
+    // A self address that names no host is left to `peer_dialer`, which refuses it with
+    // the message for the problem it actually is; reporting it here as a certificate
+    // that names the wrong host would send the operator to the wrong file.
+    if let (Some(own_hosts), Some(membership), true) = (
+        &config.peer_client_identity,
+        &config.membership,
+        config.client_cert_verification,
+    ) {
         let self_addr = membership.self_id().as_bytes();
-        if !own_hosts
-            .iter()
-            .any(|host| crate::dial::cert_names_member(host, self_addr))
+        if crate::dial::member_host(self_addr).is_some()
+            && !own_hosts
+                .iter()
+                .any(|host| crate::dial::cert_names_member(host, self_addr))
         {
             return Err(invalid(&format!(
                 "this node's peer certificate names no host binding it to the node id it dials \
