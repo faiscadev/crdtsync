@@ -659,3 +659,121 @@ fn atomic_groups_do_not_change_what_ops_merge_to() {
         }
     }
 }
+
+/// A rewritten `count` must not make convergence depend on delivery order. The
+/// same pool is built as atomic groups and then re-tagged by a hostile relay —
+/// sizes no arrival meets, and sizes a group's members do not share — and every
+/// replica must fold it to one state on the ops alone, before any eviction.
+///
+/// Whether a *bucket* looks unreachable is a property of which of its members
+/// have landed, so nothing may be decided from it: a replica that released a
+/// bucket the moment its members disagreed would release a different set from one
+/// served the same ops in another order, and the member that arrived after the
+/// release would be held against a size its bucket had already given up on. Only
+/// a judgement on a member's own declared size is order-free. Eviction then has to
+/// leave them converged too, on whatever each was still holding.
+#[test]
+fn rewritten_group_counts_converge_under_every_order() {
+    let seeds = if cfg!(miri) { 1 } else { 60 };
+    let shuffles = if cfg!(miri) { 2 } else { 6 };
+    for seed in 0..seeds {
+        let mut rng = Rng::new(seed);
+        let mut author = Document::new(cid(1));
+        let mut pool: Vec<Op> = Vec::new();
+        for _ in 0..8 {
+            author.begin_atomic();
+            for _ in 0..1 + rng.below(3) {
+                let _ = random_edit(&mut author, &mut rng);
+            }
+            pool.extend(author.commit_atomic());
+        }
+        assert!(
+            pool.len() > 8,
+            "seed {seed}: too little to exercise a group"
+        );
+
+        // The relay rewrites one member in three: a size no arrival meets, or one
+        // its group-mates do not share.
+        let forged: Vec<Op> = pool
+            .iter()
+            .enumerate()
+            .map(|(i, op)| {
+                let mut op = op.clone();
+                if i % 3 == 0 {
+                    let tx = op.tx.expect("every op rides a group");
+                    op.tx = Some(match rng.below(3) {
+                        0 => crdtsync_core::Tx { count: 0, ..tx },
+                        1 => crdtsync_core::Tx {
+                            count: u32::MAX,
+                            ..tx
+                        },
+                        _ => crdtsync_core::Tx {
+                            count: tx.count + 1,
+                            ..tx
+                        },
+                    });
+                }
+                op
+            })
+            .collect();
+        assert!(
+            forged.iter().zip(&pool).any(|(f, o)| f.tx != o.tx),
+            "seed {seed}: the relay rewrote nothing"
+        );
+
+        let held = converge_shuffled(&forged, 100, 1, &mut Rng::new(seed));
+        let evicted = converge_evicting(&forged, 100, &mut Rng::new(seed));
+        for round in 0..shuffles {
+            assert_eq!(
+                converge_shuffled(&forged, 140 + round as u8, 1, &mut rng),
+                held,
+                "seed {seed}: shuffle {round} diverged on the ops alone"
+            );
+            assert_eq!(
+                converge_evicting(&forged, 140 + round as u8, &mut rng),
+                evicted,
+                "seed {seed}: shuffle {round} diverged after eviction"
+            );
+        }
+
+        // A rewrite consistent across every member of a group is one no receiver
+        // can tell from an honest group of that size, so it *does* commit — at
+        // that size, over whichever members the order delivered first. Eviction is
+        // what converges it, and it has to converge it from every order.
+        let shrunk: Vec<Op> = pool
+            .iter()
+            .map(|op| {
+                let mut op = op.clone();
+                if let Some(tx) = op.tx {
+                    if tx.count > 1 {
+                        op.tx = Some(crdtsync_core::Tx {
+                            count: tx.count - 1,
+                            ..tx
+                        });
+                    }
+                }
+                op
+            })
+            .collect();
+        let reference = converge_evicting(&shrunk, 100, &mut Rng::new(seed));
+        for round in 0..shuffles {
+            assert_eq!(
+                converge_evicting(&shrunk, 160 + round as u8, &mut rng),
+                reference,
+                "seed {seed}: shuffle {round} diverged on a group rewritten smaller"
+            );
+        }
+    }
+}
+
+/// Deliver `ops` shuffled, then evict whatever the replica is still holding —
+/// the policy every deployment runs, and what makes a group nobody will complete
+/// converge rather than sit.
+fn converge_evicting(ops: &[Op], client: u8, rng: &mut Rng) -> String {
+    let mut d = Document::new(cid(client));
+    for op in shuffle(ops, rng) {
+        d.apply(&op);
+    }
+    d.evict_partial_transactions();
+    fingerprint(&d)
+}

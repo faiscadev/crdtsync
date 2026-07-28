@@ -11,7 +11,7 @@ use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::elementid::{ElementId, ElementKind};
 use crate::list::{Anchor, Side};
-use crate::op::{Op, OpId, OpKind, Tx, TxId};
+use crate::op::{Op, OpId, OpKind, Tx, TxId, MAX_TX_MEMBERS};
 use crate::ranged::{is_composite_payload_kind, RangeAnchor, RangedInit};
 use crate::scalar::{BlobRef, Scalar};
 use crate::stamp::Stamp;
@@ -858,10 +858,22 @@ impl<'a> Cursor<'a> {
         let kind = self.opkind()?;
         let tx = match self.u8()? {
             0 => None,
-            1 => Some(Tx {
-                id: TxId(self.u64()?),
-                count: self.u32()?,
-            }),
+            1 => {
+                let id = TxId(self.u64()?);
+                let count = self.u32()?;
+                // A size of zero is a completion no arrival reaches; one past the
+                // cap is a group no sender may mint. Either way the members would
+                // wait in the receiver's buffer for good and ride every snapshot
+                // taken of it, so the size is refused where it arrives rather than
+                // bounded once it is already held.
+                if !(1..=MAX_TX_MEMBERS).contains(&count) {
+                    return Err(DecodeError::BadTag {
+                        what: "tx member count out of range",
+                        tag: 0,
+                    });
+                }
+                Some(Tx { id, count })
+            }
             tag => return Err(DecodeError::BadTag { what: "tx", tag }),
         };
         let zone = match self.u8()? {
