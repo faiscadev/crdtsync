@@ -1048,6 +1048,13 @@ impl Hub {
         // under its name is a stale orphan (a former writable fork's, left by a
         // repoint whose best-effort tail removal failed) — dropped, so it never folds
         // onto the published base.
+        //
+        // A record no replica can hold is dropped here as it is on the write path.
+        // The bytes are supplied by whoever hands the store over, so the tail is not
+        // necessarily one this node wrote: admitting such a record would seed the
+        // branch's dedup set with an id that lands nowhere — swallowing the author's
+        // corrected resend under it — and count toward a head every filtering peer
+        // computes one lower.
         if !log.branch_ops.is_empty() {
             let published: HashSet<Vec<u8>> = self
                 .branches
@@ -1064,6 +1071,10 @@ impl Hub {
                 if published.contains(&branch) {
                     continue;
                 }
+                let ops: Vec<StoredOp> = ops
+                    .into_iter()
+                    .filter(|rec| rec.op.is_admissible())
+                    .collect();
                 let seen = ops.iter().map(|rec| rec.op.id).collect();
                 logs.insert(branch, BranchLog { ops, seen });
             }
@@ -1160,7 +1171,12 @@ impl Hub {
     /// Apply a client's ops to `room` (creating it if new), tagging each with
     /// the `schema_version` it was created under — the writing connection's
     /// enforced version, or `None` for a relay op with no schema. Skips any op
-    /// already seen. A new op is durably logged before it is applied, so the
+    /// already seen, and drops any no replica can hold
+    /// ([`Op::is_admissible`]) — an op `Document::apply` refuses permanently is
+    /// never logged, deduped or returned, so it neither reaches the disk nor
+    /// swallows a corrected resend under its id. An op that is merely *waiting* is
+    /// admissible and is logged and returned as usual. A new op is durably logged
+    /// before it is applied, so the
     /// merged state and the catch-up log never expose a write the disk has not
     /// accepted. Returns the ops newly applied, in server-sequence order — the
     /// batch to broadcast to the room's subscribers.
@@ -1253,7 +1269,8 @@ impl Hub {
     /// Apply a client's ops to a non-`main` branch of `room`, appending them to
     /// that branch's divergent tail and advancing its head — never `main`'s log.
     /// Each is tagged with the writer's `schema_version`, deduped against the
-    /// branch's own seen set (and within the batch), and durably logged before it
+    /// branch's own seen set (and within the batch), dropped if no replica can hold
+    /// it ([`Op::is_admissible`], as on `main`), and durably logged before it
     /// is applied. Returns the ops newly appended, in order — the batch to fan out
     /// to the `(room, branch)` stream's subscribers. A `main` branch delegates to
     /// [`ingest`](Hub::ingest); an unknown branch appends nothing.

@@ -32,7 +32,7 @@ use crdtsync_core::{
 };
 use crdtsync_server::auth::AllowAll;
 use crdtsync_server::replay::{head_seq, reconstruct_at};
-use crdtsync_server::store::{RoomLog, Store, StoredOp};
+use crdtsync_server::store::{Branch, RoomLog, Store, StoredOp};
 use crdtsync_server::{step, Hub, PermitAll, SchemaRegistry, Session};
 
 const ROOM: &[u8] = b"room-1";
@@ -328,6 +328,50 @@ fn a_buffered_op_is_still_logged_broadcast_and_acked() {
         h.get(ROOM, b"nested").is_some(),
         "the held write applied once its container arrived"
     );
+}
+
+/// The branch-tail restore path bypasses `ingest_branch` and installs a stored tail
+/// verbatim, so it holds the rule on its own. The bytes come from whoever hands the
+/// store over: a record admitted here would seed the branch's dedup set with an id
+/// that lands nowhere, and count toward a head every filtering peer computes one
+/// lower.
+#[test]
+fn restoring_a_branch_tail_drops_a_refused_record() {
+    let good = honest_op(cid(2));
+    let mut refused = offset_stamp_op(cid(2));
+    refused.id.seq = good.id.seq + 1;
+
+    let log = RoomLog {
+        branches: vec![Branch {
+            name: b"feature".to_vec(),
+            fork_point: 0,
+            head: 2,
+            published: false,
+        }],
+        branch_ops: vec![(
+            b"feature".to_vec(),
+            vec![
+                StoredOp::new(good.clone(), None),
+                StoredOp::new(refused.clone(), None),
+            ],
+        )],
+        ..RoomLog::default()
+    };
+    let mut h = Hub::from_rooms(cid(0xFF), vec![(ROOM.to_vec(), log)]).expect("the room restores");
+
+    assert_eq!(
+        h.branch(ROOM, b"feature").map(|b| b.head),
+        Some(1),
+        "the head counts only the record a replica can hold"
+    );
+
+    // And the refused id was not seeded into the branch's dedup set.
+    let mut resend = honest_op(cid(2));
+    resend.id = refused.id;
+    let applied = h
+        .ingest_branch(ROOM, b"feature", vec![resend.clone()], None)
+        .expect("a store-less ingest never fails");
+    assert_eq!(applied, vec![resend], "the refused id was never deduped");
 }
 
 /// The read-only replay tooling numbers a room's sequences from the same tail the
