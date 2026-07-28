@@ -2171,7 +2171,7 @@ impl Document {
             // snapshot seam instead.
             if !op.is_admissible() {
                 return Err(DecodeError::BadTag {
-                    what: "document: buffered op stamped outside the id space",
+                    what: "document: buffered op no replica can hold",
                     tag: 0,
                 });
             }

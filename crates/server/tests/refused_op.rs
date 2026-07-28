@@ -1,25 +1,27 @@
-//! An op the replica refuses must not be logged, deduped, fanned out or acked.
+//! An op no replica can hold is refused at ingress, never logged or acknowledged.
 //!
-//! `Document::apply` answers `false` for three unrelated situations, and only two
-//! of them mean "not yet": an op already applied or already held (a duplicate), an
-//! op whose target is not reachable yet or whose transaction group is incomplete (a
-//! wait, which a later arrival ends), and an op the replica **refuses forever** — a
-//! stamp naming a client other than its author, a stamp outside the position an id
-//! may occupy, or a transaction member declaring a group size no group can have.
-//! The third set is a pure function of the op, so every replica refuses exactly the
-//! same ops and the judgement is convergent rather than a divergence.
+//! `Document::apply` answers `false` for three unrelated situations, and only one
+//! of them is permanent. An op already applied or already held is a **duplicate**.
+//! An op whose target is not reachable yet, or whose atomic-transaction group is
+//! incomplete, is **waiting** — a later arrival commits it. An op whose stamp names
+//! a client other than its author, whose stamp sits outside the position an id may
+//! occupy, or which declares a transaction size no group can have, is **refused
+//! forever**: that set is [`Op::is_admissible`]'s complement, a pure function of the
+//! op, so every replica refuses exactly the same ops and the room converges on their
+//! absence rather than splitting over them.
 //!
-//! The ingest seam collapsed the three: it appended to the store *before* applying,
-//! discarded the bool, and entered the room's dedup set and retained log
-//! unconditionally. A refused op therefore became durable, permanently deduped
-//! against a corrected resend of the same `OpId`, broadcast to every peer, replayed
-//! on every room reload, and — because `handle_ops` acks a `through` computed over
-//! the whole submitted batch — positively acked while landing nowhere.
+//! Only the permanent set may be dropped, and the distinction is what the ingest
+//! path turns on. A refused op that reached the log would be durable, entered in the
+//! room's dedup set — swallowing the author's corrected resend under the same
+//! `OpId` forever — fanned out to every peer, replayed on each reload, and acked
+//! `Accepted`, because the ack frontier is a max over the whole submitted batch. So
+//! the session refuses the batch recoverably (`OpsRejected` / `MalformedOp`), the
+//! author keeps its ops, and the ingest seams drop such a record before persisting
+//! it — the seams matter on their own, since a peer's `Replicate` frame reaches them
+//! without crossing the session.
 //!
-//! The refusal is now a gate at ingress, beside the other author checks: the batch
-//! comes back as a recoverable `OpsRejected`, nothing is persisted, and the author
-//! keeps its ops. The waiting cases are untouched — a buffered op is still logged,
-//! still fanned out, and still acked, because it is state a later op completes.
+//! A waiting op is not refused: it is logged, fanned out and acked as it lands,
+//! because it is state its group or its create completes.
 
 use std::sync::Mutex;
 
@@ -89,14 +91,21 @@ fn zero_count_tx_op(client: ClientId) -> Op {
     op
 }
 
-/// A write to a container no op in the batch creates — admissible, but not
-/// applicable yet. It is buffered, and must be logged, fanned out and acked exactly
-/// as before.
-fn buffered_op(client: ClientId) -> Op {
+/// A container create and the write into it, as `(create, write)`. Submitted alone
+/// the write is admissible but not applicable yet, so the replica holds it; the
+/// create releases it.
+fn buffered_pair(client: ClientId) -> (Op, Op) {
     let mut d = Document::new(client);
     let mut ops = d.transact(|tx| tx.map(b"nested").register(b"k", Scalar::Int(1)));
-    // Drop the create, keeping the write that depends on it.
-    ops.pop().expect("the nested write is the last op")
+    let write = ops.pop().expect("the nested write is the last op");
+    let create = ops.pop().expect("the container create is the first op");
+    assert!(ops.is_empty(), "a nested register write is exactly two ops");
+    (create, write)
+}
+
+/// The dependent half of [`buffered_pair`] — held when it arrives on its own.
+fn buffered_op(client: ClientId) -> Op {
+    buffered_pair(client).1
 }
 
 // --- the wire path through the session ---
@@ -154,9 +163,17 @@ fn submit(h: &mut Hub, s: &mut Session, ops: Vec<Op>) -> crdtsync_server::Respon
 }
 
 fn is_accepted(r: &crdtsync_server::Response) -> bool {
-    r.replies
-        .iter()
-        .any(|m| matches!(m, Message::Accepted { .. }))
+    accepted_through(r).is_some()
+}
+
+/// The frontier an `Accepted` acknowledges — the sequence the author prunes its
+/// outbox through, and so the value that decides whether a refused op was reported
+/// as landed.
+fn accepted_through(r: &crdtsync_server::Response) -> Option<u64> {
+    r.replies.iter().find_map(|m| match m {
+        Message::Accepted { through, .. } => Some(*through),
+        _ => None,
+    })
 }
 
 fn rejected_seqs(r: &crdtsync_server::Response) -> Option<Vec<u64>> {
@@ -180,8 +197,8 @@ fn joined(client: ClientId) -> (Hub, Session) {
 
 // --- a refused op is rejected at ingress ---
 
-/// The whole shape of the defect in one case: refused, so nothing is acked, nothing
-/// is logged, nothing is broadcast, and the room is left exactly as it was.
+/// The whole rule in one case: a refused op is acked by nothing, logged by nothing,
+/// broadcast to nobody, and leaves the room exactly as it was.
 #[test]
 fn a_refused_op_is_rejected_never_logged_acked_or_fanned_out() {
     let (mut h, mut s) = joined(cid(1));
@@ -202,8 +219,8 @@ fn a_refused_op_is_rejected_never_logged_acked_or_fanned_out() {
     assert!(h.get(ROOM, b"title").is_none(), "no state lands");
 }
 
-/// Each permanent refusal is reached over the wire: none of the three is caught by
-/// an earlier gate, so each would otherwise be logged and acked.
+/// Each permanent refusal is reachable over the wire — no earlier gate in
+/// `handle_ops` catches any of them, so each depends on this one.
 #[test]
 fn every_permanent_refusal_is_rejected_at_ingress() {
     for (name, op) in [
@@ -233,24 +250,35 @@ fn every_permanent_refusal_is_rejected_at_ingress() {
 fn one_refused_op_rejects_the_whole_batch() {
     let (mut h, mut s) = joined(cid(1));
     let good = honest_op(cid(1));
-    let bad = offset_stamp_op(cid(1));
+    // Distinct sequences, so the rejection names the admissible op's own frontier
+    // rather than collapsing onto the refused one's.
+    let mut bad = offset_stamp_op(cid(1));
+    bad.id.seq = good.id.seq + 1;
+    assert_ne!(good.id.seq, bad.id.seq);
 
     let r = submit(&mut h, &mut s, vec![good.clone(), bad.clone()]);
 
-    assert!(!is_accepted(&r));
+    assert!(!is_accepted(&r), "the admissible half is not acked either");
     assert_eq!(
         rejected_seqs(&r),
         Some(vec![good.id.seq, bad.id.seq]),
         "the author keeps the whole batch"
     );
     assert_eq!(h.seq(ROOM), 0, "neither op lands");
+    assert!(h.get(ROOM, b"title").is_none(), "and no state does");
+
+    // Resubmitted without the refused op, the same admissible op is accepted — the
+    // rejection was the batch's company, not anything about this op.
+    let r = submit(&mut h, &mut s, vec![good.clone()]);
+    assert_eq!(accepted_through(&r), Some(good.id.seq));
+    assert_eq!(h.seq(ROOM), 1);
 }
 
 // --- the dedup set is not poisoned ---
 
-/// The durable consequence: a refused op used to enter the room's seen set, so the
-/// author's corrected resend under the same `OpId` was swallowed as a duplicate —
-/// forever, and across a reload.
+/// The durable half of the rule: a refused op leaves no entry in the room's seen
+/// set, so the author's corrected resend under the same `OpId` still lands rather
+/// than being swallowed as a duplicate — forever, and across a reload.
 #[test]
 fn a_refused_op_does_not_dedup_a_corrected_resend() {
     let (mut h, mut s) = joined(cid(1));
@@ -269,18 +297,36 @@ fn a_refused_op_does_not_dedup_a_corrected_resend() {
 
 // --- the waiting cases are untouched ---
 
-/// A buffered op also answers `false` from `apply`, and must keep being logged,
-/// broadcast and acked: it is state a later op completes, not a refusal.
+/// A buffered op also answers `false` from `apply`, and is logged, broadcast and
+/// acked all the same: it is state a later op completes, not a refusal.
 #[test]
 fn a_buffered_op_is_still_logged_broadcast_and_acked() {
     let (mut h, mut s) = joined(cid(1));
-    let op = buffered_op(cid(1));
+    let (create, write) = buffered_pair(cid(1));
 
-    let r = submit(&mut h, &mut s, vec![op.clone()]);
-
-    assert!(is_accepted(&r), "a waiting op is acked");
-    assert_eq!(r.broadcast, vec![op], "and fans out to peers");
+    // The dependent write alone: admissible, so logged, fanned out and acked — but
+    // held rather than applied, since its container does not exist yet.
+    let r = submit(&mut h, &mut s, vec![write.clone()]);
+    assert_eq!(
+        accepted_through(&r),
+        Some(write.id.seq),
+        "a waiting op is acked"
+    );
+    assert_eq!(r.broadcast, vec![write], "and fans out to peers");
     assert_eq!(h.seq(ROOM), 1, "and is retained for catch-up");
+    assert!(
+        h.get(ROOM, b"nested").is_none(),
+        "but nothing of it has landed — it is waiting, not applied"
+    );
+
+    // The create it waits on releases it, which is what makes holding it correct.
+    let r = submit(&mut h, &mut s, vec![create.clone()]);
+    assert_eq!(accepted_through(&r), Some(create.id.seq));
+    assert_eq!(h.seq(ROOM), 2);
+    assert!(
+        h.get(ROOM, b"nested").is_some(),
+        "the held write applied once its container arrived"
+    );
 }
 
 /// The other waiting case: a transaction member whose group is incomplete. It is
@@ -386,18 +432,30 @@ fn a_branch_tail_never_holds_a_refused_op() {
         .fork_branch(ROOM, b"feature", b"main", 1)
         .expect("a store-less fork never fails"));
 
+    let good = honest_op(cid(2));
     let mut bad = offset_stamp_op(cid(2));
-    bad.id.seq = 5;
+    bad.id.seq = good.id.seq + 1;
+
     let applied = h
-        .ingest_branch(ROOM, b"feature", vec![bad], None)
+        .ingest_branch(ROOM, b"feature", vec![bad.clone(), good.clone()], None)
         .expect("a store-less ingest never fails");
 
-    assert!(applied.is_empty(), "the refused op is not appended");
+    // The positive control: the admissible op in the same batch does append, so the
+    // branch write path is exercised rather than merely absent.
+    assert_eq!(applied, vec![good], "only the refused op is dropped");
     assert_eq!(
         h.branch(ROOM, b"feature").map(|b| b.head),
-        Some(1),
-        "and does not advance the branch head"
+        Some(2),
+        "the branch head advances by exactly the appended op"
     );
+
+    // And the refused op left no entry in the tail's own dedup set.
+    let mut resend = honest_op(cid(2));
+    resend.id = bad.id;
+    let applied = h
+        .ingest_branch(ROOM, b"feature", vec![resend.clone()], None)
+        .expect("a store-less ingest never fails");
+    assert_eq!(applied, vec![resend], "the refused id was never deduped");
 }
 
 /// The durable half: a refused op never reaches the store, so a reload does not
@@ -405,9 +463,8 @@ fn a_branch_tail_never_holds_a_refused_op() {
 #[test]
 #[cfg_attr(miri, ignore = "real filesystem I/O, which Miri does not model")]
 fn a_refused_op_never_reaches_the_store() {
-    let dir = std::env::temp_dir().join(format!("crdtsync-refused-op-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the temp dir is creatable");
+    let tmp = tempdir();
+    let dir = tmp.0.as_path();
 
     let good = honest_op(cid(1));
     let mut bad = offset_stamp_op(cid(1));
@@ -426,8 +483,23 @@ fn a_refused_op_never_reaches_the_store() {
     .expect("the reload succeeds");
     assert_eq!(h.seq(ROOM), 1, "only the admissible op was persisted");
     assert!(h.get(ROOM, b"title").is_some(), "and it replays into state");
+}
 
+/// A scratch directory that removes itself, so a failing assertion leaves nothing
+/// behind. The name carries the pid, and there is one per process.
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempdir() -> TempDir {
+    let dir = std::env::temp_dir().join(format!("crdtsync-refused-op-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the temp dir is creatable");
+    TempDir(dir)
 }
 
 /// A refusal is a pure function of the op, so the predicate the server gates on is
