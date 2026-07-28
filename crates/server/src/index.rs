@@ -403,18 +403,45 @@ mod tests {
         );
     }
 
+    /// A room holding one XML node inside the `board` zone, and the batch that
+    /// moves it out to the unzoned `loose` fragment — a real crossing, so the
+    /// readable path has a non-trivial verdict to reach.
+    fn room_with_a_zoned_node() -> (Vec<u8>, Vec<Op>, ElementId) {
+        let mut doc = Document::new(ClientId::from_bytes([2; 16]));
+        let mut node = ElementId::from_bytes([0u8; 16]);
+        doc.transact(|tx| {
+            node = tx
+                .xml_fragment(b"board")
+                .children()
+                .insert_element(0, b"a")
+                .id();
+            tx.xml_fragment(b"loose");
+        });
+        let state = doc.encode_state();
+        let loose = crdtsync_core::XmlFragment::node_id(doc.root_id(), b"loose");
+        let ops = doc.transact(|tx| tx.move_xml(node, loose, 0));
+        (state, ops, node)
+    }
+
     #[test]
     fn a_readable_state_still_answers_both_gates() {
-        let state = Document::new(ClientId::from_bytes([2; 16])).encode_state();
+        // Not just "does not refuse": a readable state has to reach the verdict the
+        // simulation actually computes. A batch whose answer is the *empty* one on
+        // both gates would pass this test with the gates deleted, so the zone gate
+        // is asked about a genuine crossing and the schema gate about a state whose
+        // conformance it had to walk to establish.
+        let (state, ops, moved) = room_with_a_zoned_node();
+        let crossings =
+            zone_crossings_over(&state, &ops, &zoned_schema()).expect("a readable state answers");
+        assert_eq!(crossings.len(), 1, "the crossing was not reported");
+        assert_eq!(crossings[0].node, moved);
+        assert!(!introduces_violation_over(&state, &ops, &zoned_schema()));
+
+        // And the trivial batch still answers trivially, from the same state.
         assert_eq!(
             zone_crossings_over(&state, &a_move(), &zoned_schema()),
             Some(Vec::new()),
             "a move of a node the document does not hold crosses nothing"
         );
-        assert!(!introduces_violation_over(
-            &state,
-            &a_move(),
-            &zoned_schema()
-        ));
     }
 }

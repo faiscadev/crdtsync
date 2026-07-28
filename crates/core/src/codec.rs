@@ -454,12 +454,13 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
 pub(crate) struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
-    /// While tracking, the highest `(lamport, offset)` reached by any stamp read
-    /// under each client id. A snapshot's stamps *are* the ids the replica holds,
-    /// so reading them back as they decode is what recovers a replica's id-space
-    /// high-water without storing it beside them — see
-    /// [`Document::read_state`](crate::doc::Document::decode_state).
-    stamp_high_water: HashMap<ClientId, (u64, u64)>,
+    /// While tracking, the highest lamport reached by any stamp read under each
+    /// client id. A snapshot's own stamps are ids it visibly holds, so reading them
+    /// back as they decode is the **floor** under the high-water the snapshot
+    /// declares — see
+    /// [`Document::read_state`](crate::doc::Document::decode_state). Off by default
+    /// so the op path pays nothing.
+    stamp_high_water: HashMap<ClientId, u64>,
     tracking_stamps: bool,
 }
 
@@ -474,14 +475,14 @@ impl<'a> Cursor<'a> {
     }
 
     /// Start recording the stamps read from here on, discarding anything an
-    /// enclosing frame already read. Off by default so the op path pays nothing.
+    /// enclosing frame already read.
     pub(crate) fn track_stamps(&mut self) {
         self.stamp_high_water.clear();
         self.tracking_stamps = true;
     }
 
     /// Stop recording and take what was read.
-    pub(crate) fn take_stamp_high_water(&mut self) -> HashMap<ClientId, (u64, u64)> {
+    pub(crate) fn take_stamp_high_water(&mut self) -> HashMap<ClientId, u64> {
         self.tracking_stamps = false;
         std::mem::take(&mut self.stamp_high_water)
     }
@@ -581,8 +582,8 @@ impl<'a> Cursor<'a> {
             _ => self.u64()?,
         };
         if self.tracking_stamps {
-            let slot = self.stamp_high_water.entry(client).or_insert((0, 0));
-            *slot = (*slot).max((lamport, offset));
+            let slot = self.stamp_high_water.entry(client).or_insert(0);
+            *slot = (*slot).max(lamport);
         }
         Ok(Stamp {
             lamport,

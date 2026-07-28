@@ -14,7 +14,7 @@
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::{ClientId, Element, Op, Scalar};
-use crdtsync_server::store::Store;
+use crdtsync_server::store::{Branch, RoomLog, Snapshot, Store};
 use crdtsync_server::{Catchup, Hub};
 use std::fs;
 
@@ -70,6 +70,7 @@ fn reopen_with_corrupt_draft_base(dir: &std::path::Path) -> Hub {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // drives the store on the filesystem
 fn publishing_over_an_unreadable_base_leaves_the_published_branch_alone() {
     let tmp = tempdir();
     let published_before = {
@@ -112,6 +113,7 @@ fn publishing_over_an_unreadable_base_leaves_the_published_branch_alone() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // drives the store on the filesystem
 fn an_unreadable_base_serves_no_catch_up() {
     let tmp = tempdir();
     drop(seeded(tmp.path()));
@@ -122,6 +124,87 @@ fn an_unreadable_base_serves_no_catch_up() {
     assert!(
         matches!(hub.catch_up_branch(ROOM, DRAFT, 0), Catchup::Unavailable),
         "an unreadable base served a delta"
+    );
+}
+
+// --- the same two rules, with no store behind them ---
+//
+// The pair above proves the durable path end to end and needs a real filesystem,
+// which Miri's isolation refuses. These reach the same seams through
+// `Hub::from_rooms`, so the rules themselves stay under the memory gate.
+
+/// A room restored from a hand-built log: `key = 1` in its snapshot, a `draft`
+/// branch whose owned base is `base`, and a `published` branch holding the same
+/// snapshot state.
+fn room_from(base: &[u8]) -> Hub {
+    let mut author = Document::new(cid(1));
+    let ops = reg(&mut author, b"key", 1);
+    let state = author.encode_state();
+    let log = RoomLog {
+        snapshot: Some(Snapshot {
+            base_seq: ops.len() as u64,
+            state: state.clone(),
+        }),
+        branches: vec![
+            Branch {
+                name: b"main".to_vec(),
+                fork_point: 0,
+                head: ops.len() as u64,
+                published: false,
+            },
+            Branch {
+                name: DRAFT.to_vec(),
+                fork_point: ops.len() as u64,
+                head: ops.len() as u64,
+                published: false,
+            },
+            Branch {
+                name: PUBLISHED.to_vec(),
+                fork_point: ops.len() as u64,
+                head: ops.len() as u64,
+                published: true,
+            },
+        ],
+        branch_bases: vec![(DRAFT.to_vec(), base.to_vec()), (PUBLISHED.to_vec(), state)],
+        active_branch: Some(DRAFT.to_vec()),
+        ..RoomLog::default()
+    };
+    Hub::from_rooms(cid(SERVER), vec![(ROOM.to_vec(), log)]).unwrap()
+}
+
+#[test]
+fn an_unreadable_base_serves_no_catch_up_in_memory() {
+    let mut hub = room_from(b"not a snapshot");
+    assert!(
+        matches!(hub.catch_up_branch(ROOM, DRAFT, 0), Catchup::Unavailable),
+        "an unreadable base served a delta"
+    );
+    // A readable one still serves, so the refusal is the decode's and not the seam
+    // refusing everything.
+    let mut author = Document::new(cid(1));
+    reg(&mut author, b"key", 1);
+    let mut ok = room_from(&author.encode_state());
+    assert!(
+        !matches!(ok.catch_up_branch(ROOM, DRAFT, 0), Catchup::Unavailable),
+        "a readable base was refused"
+    );
+}
+
+#[test]
+fn publishing_over_an_unreadable_base_leaves_the_published_branch_alone_in_memory() {
+    let mut hub = room_from(b"not a snapshot");
+    assert!(
+        !hub.publish(ROOM, PUBLISHED).unwrap(),
+        "a source whose state cannot be read publishes nothing"
+    );
+    let after = match hub.catch_up_branch(ROOM, PUBLISHED, 0) {
+        Catchup::Snapshot { state, .. } => state,
+        _ => panic!("the published branch owns a base"),
+    };
+    assert_eq!(
+        int_in(&after, b"key"),
+        1,
+        "publish froze an empty replica over the published branch"
     );
 }
 

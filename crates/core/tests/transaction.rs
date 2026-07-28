@@ -9,6 +9,7 @@
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::Tx;
+use crdtsync_core::stamp::LAMPORT_STATE_CEILING;
 use crdtsync_core::{ClientId, Element, Op, Scalar};
 
 fn cid(first: u8) -> ClientId {
@@ -240,9 +241,15 @@ fn ops_from_a_plain_transact_carry_no_tx() {
 fn a_tx_textinsert_at_the_lamport_ceiling_keeps_every_codepoint() {
     // A complete one-member atomic tx runs the readiness check, whose TextInsert
     // arm derives a char_id stamp per codepoint from the op's wire-derived
-    // lamport. At the ceiling that derivation must neither overflow-panic nor
-    // collapse two codepoints onto one saturated stamp: every codepoint survives
-    // with a distinct id, through the public apply() boundary.
+    // lamport. At the very top of the id space that derivation must neither
+    // overflow-panic nor collapse two codepoints onto one saturated stamp: every
+    // codepoint survives with a distinct id, through the public apply() boundary.
+    //
+    // The run is based so its *last* codepoint lands exactly on
+    // `LAMPORT_STATE_CEILING`, the highest id any stamp may occupy — a run
+    // reaching past it reserves ids that do not exist and is refused whole
+    // (`a_tx_textinsert_past_the_id_space_is_refused_whole`), so this is the
+    // furthest a surviving run can reach.
     let mut d = doc(1);
     d.transact(|tx| {
         tx.text(b"body");
@@ -259,7 +266,7 @@ fn a_tx_textinsert_at_the_lamport_ceiling_keeps_every_codepoint() {
             seq: 0,
         },
         stamp: crdtsync_core::Stamp {
-            lamport: u64::MAX,
+            lamport: LAMPORT_STATE_CEILING - 1,
             client: attacker,
             offset: 0,
         },
@@ -292,6 +299,59 @@ fn a_tx_textinsert_at_the_lamport_ceiling_keeps_every_codepoint() {
         ids[0], ids[1],
         "codepoints must not collapse to one char_id"
     );
+}
+
+#[test]
+fn a_tx_textinsert_past_the_id_space_is_refused_whole() {
+    // The other side of the same boundary. A run reserves one id per codepoint, so
+    // a base inside the space can still reach past it — and the ids past the end do
+    // not exist, so the op is refused rather than saturated onto the last one. The
+    // refusal is on the reservation, not the base, and it holds through the atomic
+    // path exactly as it does through the plain one: a member the readiness check
+    // would fold must not reach state by the group seam instead.
+    let mut d = doc(1);
+    d.transact(|tx| {
+        tx.text(b"body");
+    });
+    let text_id = match d.get(b"body") {
+        Some(Element::Text(t)) => t.borrow().id(),
+        _ => panic!("text not created"),
+    };
+
+    let attacker = cid(9);
+    let op = Op {
+        id: crdtsync_core::OpId {
+            client: attacker,
+            seq: 0,
+        },
+        stamp: crdtsync_core::Stamp {
+            // One past the base the sibling test uses: the second codepoint would
+            // land on `LAMPORT_STATE_CEILING + 1`.
+            lamport: LAMPORT_STATE_CEILING,
+            client: attacker,
+            offset: 0,
+        },
+        target: text_id,
+        kind: crdtsync_core::OpKind::TextInsert {
+            s: "ab".to_string(),
+            anchor: crdtsync_core::Anchor {
+                parent: None,
+                side: crdtsync_core::Side::Right,
+            },
+        },
+        tx: Some(Tx {
+            id: crdtsync_core::TxId(1),
+            count: 1,
+        }),
+        zone: None,
+    };
+    assert!(!d.apply(&op), "a run reaching past the id space is refused");
+
+    let text = match d.get(b"body") {
+        Some(Element::Text(t)) => t,
+        _ => panic!("text missing"),
+    };
+    assert_eq!(text.borrow().len(), 0, "no codepoint of it landed");
 }
 
 /// The live length of the List in a top-level slot.

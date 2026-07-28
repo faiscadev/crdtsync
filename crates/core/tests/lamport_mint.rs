@@ -22,10 +22,27 @@
 //!   longer depends on it for id-freedom — the high-water above carries that — so
 //!   the pair holds together where neither half does alone.
 //!
-//! The high-water is derived from the ids the replica holds, never stored beside
-//! them: a decoded snapshot's stamps are read back as they decode, so a reload and
-//! a snapshot adopted under a different client id both recover it exactly, and no
-//! byte of the state encoding moves.
+//! * **The high-water is stored beside the clocks, and bounded like one.** It
+//!   cannot be recovered from the content: a tombstoned sequence run persists as
+//!   `(head, len)` and only the head is a stamp on the wire, a counter persists no
+//!   stamp at all, and an ACL or ranged entry persists only the id *derived* from
+//!   one — so deleting a plant would hide up to a chunk of ids from anything that
+//!   read them back off a decode. Storing it also makes a projection safe by
+//!   default (a projection mutates a live document and leaves the field alone,
+//!   scrubbed to the recipient's own entry) and carries the record through
+//!   `adopt_as`. Being stored, it has to stay decodable: a declared high-water
+//!   above [`LAMPORT_STATE_CEILING`] is refused, never clamped, on the same
+//!   reasoning a stored clock is.
+//! * **The mint can refuse, and that is structural.** Bounding what the record may
+//!   hold bounds where a stamp may sit, and at the top of that space no answer is
+//!   total: clamping the record re-issues an id that is already live (measured —
+//!   a replica at the ceiling mints `CEILING + 1`, records it clamped back to
+//!   `CEILING`, and mints `CEILING + 1` again, forever), and the sub-lamport
+//!   `offset` is no second dimension to escape into, because `stamp_key` is
+//!   `lamport ++ client` and two stamps differing only in offset derive the *same*
+//!   ACL, ranged and XML-child ids. So exhaustion is a refused edit
+//!   ([`Document::can_mint`]) — and the wire gate stops at the same constant, so
+//!   no replica ever emits what its peers reject.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::Op;
@@ -34,7 +51,7 @@ use crdtsync_core::stamp::{LAMPORT_STATE_CEILING, LAMPORT_WIRE_CEILING};
 use crdtsync_core::{ClientId, Element, OpKind, Scalar, Stamp};
 
 mod common;
-use common::{cid, with_only_zone_clock, with_root_clock};
+use common::{cid, with_only_zone_clock, with_root_clock, with_stamp_high_water};
 
 // ---------------------------------------------------------------------------
 // Helpers.
@@ -47,16 +64,6 @@ fn text_of(doc: &Document, key: &[u8]) -> String {
     };
     let s = t.borrow().as_string();
     s
-}
-
-/// The node ids of a text's first `count` characters.
-fn text_ids(doc: &Document, key: &[u8], count: usize) -> Vec<Stamp> {
-    let Some(Element::Text(t)) = doc.get(key) else {
-        panic!("text materialised");
-    };
-    let ids = t.borrow().node_ids(0, count);
-    assert_eq!(ids.len(), count, "text holds fewer than {count} chars");
-    ids
 }
 
 /// Every char id a text holds.
@@ -102,6 +109,18 @@ fn schema_with_zone() -> Schema {
     .expect("schema parses")
 }
 
+/// Every char id a text holds, or none when the key holds no text — the shape a
+/// refused create leaves.
+fn text_ids_or_none(doc: &Document, key: &[u8]) -> Vec<Stamp> {
+    match doc.get(key) {
+        Some(Element::Text(t)) => {
+            let t = t.borrow();
+            t.node_ids(0, t.len())
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Every stamp is distinct.
 fn assert_all_distinct(ids: &[Stamp], what: &str) {
     let mut sorted = ids.to_vec();
@@ -144,10 +163,210 @@ fn an_impersonating_peer_cannot_plant_a_victims_next_stamps() {
 }
 
 #[test]
+fn a_deleted_plant_still_holds_its_ids_across_a_reload() {
+    // Why the high-water is **stored** rather than read back off the content as a
+    // snapshot decodes. A sequence encodes a dead run as `(head, len)`, so only the
+    // head is a stamp on the wire and up to a whole chunk of a run's ids would be
+    // invisible to anything reconstructing the record from what it reads. Deleting
+    // the junk a plant inserted is the obvious thing a user does, so this is the
+    // mainline path, not a corner: the ids stay held, and the victim's next write
+    // after the reload lands rather than being dropped as a replay.
+    let victim = cid(1);
+    let attacker = cid(9);
+
+    let mut doc = Document::new(victim);
+    assert!(doc.apply(&op_at_lamport(attacker, b"k", LAMPORT_WIRE_CEILING)));
+    for op in &impersonated_run(victim, b"t", "MMMM", LAMPORT_WIRE_CEILING + 1) {
+        doc.apply(op);
+    }
+    // The user deletes the whole plant, leaving a tombstoned run behind.
+    doc.transact(|tx| tx.text(b"t").delete(0, 4));
+    assert_eq!(text_of(&doc, b"t"), "");
+
+    let mut back = Document::decode_state(&doc.encode_state()).expect("its own snapshot decodes");
+    back.transact(|tx| tx.text(b"t").insert(0, "A"));
+    assert_eq!(
+        text_of(&back, b"t"),
+        "A",
+        "the write landed on a tombstoned planted id and was dropped as a replay"
+    );
+}
+
+#[test]
+fn a_counter_run_leaves_no_stamp_behind_and_the_record_still_holds() {
+    // The same gap from the other direction: a counter tally persists no stamp at
+    // all, so a record rebuilt from a snapshot's content would not see the ids a
+    // counter op consumed. Stored, it does.
+    let victim = cid(1);
+    let attacker = cid(9);
+
+    let mut doc = Document::new(victim);
+    assert!(doc.apply(&op_at_lamport(attacker, b"k", LAMPORT_WIRE_CEILING)));
+    let mut plant = Document::new(victim).transact(|tx| {
+        tx.inc(b"c", 1);
+    });
+    for op in plant.iter_mut() {
+        op.stamp.lamport = LAMPORT_WIRE_CEILING + 1;
+        doc.apply(op);
+    }
+
+    let back = Document::decode_state(&doc.encode_state()).expect("its own snapshot decodes");
+    let mut back = back;
+    let minted = back.transact(|tx| tx.set(b"probe", Scalar::Int(1)))[0].stamp;
+    assert!(
+        minted.lamport > LAMPORT_WIRE_CEILING + 1,
+        "the reload minted onto an id a counter op already spent"
+    );
+}
+
+#[test]
+fn a_projection_keeps_the_recipients_own_high_water() {
+    // A projection drops content wholesale, so a record derived from content could
+    // not survive one. Stored on the document, it does — and the projection cuts it
+    // to the recipient's own entry, on exactly the reasoning the causal frontier is
+    // cut on (`state_project_seen` pins the leak this closes).
+    let victim = cid(1);
+    let server = cid(7);
+
+    let mut room = Document::new(server);
+    room.set_schema(schema_with_zone());
+    // The plant sits above the wire ceiling, so the room's own clock is clamped
+    // below it and cannot stand in for the record — only the recipient's entry can.
+    assert!(room.apply(&op_at_lamport(cid(3), b"k", LAMPORT_WIRE_CEILING)));
+    for op in &impersonated_run(victim, b"t", "MMMM", LAMPORT_WIRE_CEILING + 1) {
+        room.apply(op);
+    }
+    let live = all_text_ids(&room, b"t");
+    // Into a zone the recipient may not read, so the projection has content to drop.
+    for op in &Document::new(cid(4)).transact(|tx| {
+        tx.map(b"board").set(b"hidden", Scalar::Int(1));
+    }) {
+        room.apply(op);
+    }
+
+    room.project_zones(&schema_with_zone(), &Default::default(), Some(victim));
+    assert!(
+        room.get(b"board").is_none(),
+        "the withheld partition survived the projection"
+    );
+    let mut adopted = Document::decode_state_as(victim, 0, &room.encode_state())
+        .expect("a projected snapshot decodes");
+    let minted = adopted.transact(|tx| tx.set(b"probe", Scalar::Int(1)))[0].stamp;
+    assert!(
+        !live.contains(&minted),
+        "the adopting replica re-issued an id the room already holds"
+    );
+    assert!(
+        minted.lamport > LAMPORT_WIRE_CEILING + 4,
+        "the projection dropped the recipient's own high-water"
+    );
+}
+
+#[test]
+fn a_snapshot_cannot_under_declare_the_ids_it_visibly_holds() {
+    // The record is stored, and a stored figure is supplied by whoever hands the
+    // bytes over — exactly the kind of input this whole unit says a mint must not
+    // trust. So the declaration only ever *raises*: it is floored by every stamp
+    // the decode reads, and under-declaring buys nothing.
+    //
+    // Without the floor, a 24-byte edit to an otherwise honest snapshot — dropping
+    // the record to zero entries — hands the reload the planted ids back and the
+    // victim's next write is dropped as a replay, on it and on every peer.
+    let victim = cid(1);
+    let attacker = cid(9);
+
+    let mut doc = Document::new(victim);
+    assert!(doc.apply(&op_at_lamport(attacker, b"k", LAMPORT_WIRE_CEILING)));
+    for op in &impersonated_run(victim, b"t", "MMMM", LAMPORT_WIRE_CEILING + 1) {
+        doc.apply(op);
+    }
+    let live = all_text_ids(&doc, b"t");
+
+    for declared in [
+        Vec::new(),
+        vec![(victim, 0)],
+        vec![(victim, LAMPORT_WIRE_CEILING)],
+    ] {
+        let lowered = with_stamp_high_water(doc.encode_state(), &declared);
+        let mut back = Document::decode_state(&lowered).expect("a decodable snapshot");
+        back.transact(|tx| tx.text(b"t").insert(0, "A"));
+        assert_eq!(
+            text_of(&back, b"t"),
+            "AMMMM",
+            "an under-declared record handed the mint a live id"
+        );
+        let after = all_text_ids(&back, b"t");
+        assert_all_distinct(&after, "under-declared record");
+        assert!(
+            !live.contains(&after[0]),
+            "re-issued a stamp the state carried"
+        );
+    }
+}
+
+#[test]
+fn a_snapshot_declaring_a_record_past_the_id_space_is_refused() {
+    // The declaration lands in the slot the next local mint reads, so it is bounded
+    // on the same terms as a clock — refused above the ceiling, never clamped, since
+    // lowering one hands the replica live ids back. And a repeated entry is refused
+    // rather than resolved, so no decode has to pick a winner.
+    let me = cid(1);
+    let other = cid(2);
+    let mut doc = Document::new(me);
+    doc.transact(|tx| tx.set(b"k", Scalar::Int(1)));
+    let bytes = doc.encode_state();
+
+    for declared in [
+        vec![(me, LAMPORT_STATE_CEILING + 1)],
+        vec![(me, u64::MAX)],
+        vec![(me, 5), (me, 6)],
+    ] {
+        assert!(
+            Document::decode_state(&with_stamp_high_water(bytes.clone(), &declared)).is_err(),
+            "a record at {declared:?} was accepted"
+        );
+    }
+    // Exactly the ceiling is a legal declaration, and it spends the id space.
+    let at = with_stamp_high_water(bytes.clone(), &[(me, LAMPORT_STATE_CEILING)]);
+    let spent = Document::decode_state(&at).expect("a decodable snapshot");
+    assert!(!spent.can_mint(None));
+    // Another client's entry at the ceiling leaves this replica's own mint alone.
+    let theirs = with_stamp_high_water(bytes, &[(other, LAMPORT_STATE_CEILING)]);
+    let mine = Document::decode_state(&theirs).expect("a decodable snapshot");
+    assert!(mine.can_mint(None));
+}
+
+#[test]
+fn a_refused_mint_takes_the_whole_transaction() {
+    // A transact is one intention, and its later edits address what its earlier ones
+    // created. If a refused create still let the writes into it through, they would
+    // address a container no replica can ever hold — and a peer buffers such an op
+    // forever, waiting on an arrival that cannot come. So the refusal takes the rest
+    // of the transaction, and the next one starts clean.
+    let me = cid(1);
+    let mut doc = Document::new(me);
+    doc.set_schema(schema_with_zone());
+    assert!(doc.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING)));
+
+    let ops = doc.transact(|tx| {
+        tx.map(b"board").set(b"a", Scalar::Int(1));
+        tx.set(b"b", Scalar::Int(2));
+        tx.text(b"t").insert(0, "x");
+    });
+    assert!(
+        ops.is_empty(),
+        "a torn transaction emitted {} ops",
+        ops.len()
+    );
+    assert!(doc.get(b"b").is_none() && doc.get(b"t").is_none());
+    assert!(Document::decode_state(&doc.encode_state()).is_ok());
+}
+
+#[test]
 fn a_planted_run_survives_a_reload_without_taking_the_next_mint() {
-    // The high-water is derived from the ids the replica holds, so it has to come
-    // back off a snapshot — otherwise the reload mints straight onto the plant
-    // that the snapshot's own clamped clock does not cover.
+    // The record is stored beside the clocks, so it comes back off a snapshot —
+    // otherwise the reload mints straight onto the plant that the snapshot's own
+    // clamped clock does not cover.
     let victim = cid(1);
     let attacker = cid(9);
 
@@ -370,27 +589,55 @@ fn a_plant_still_waiting_in_the_buffer_is_already_held() {
 
 #[test]
 fn a_stamp_at_the_end_of_the_space_does_not_take_the_next_mint_out() {
-    // One op is enough to put a replica's own high-water at the very top, and the
-    // mint has to stay total there: no panic, no wrap, and no id it already holds.
+    // One op under the victim's own id is enough to try to put its high-water at
+    // the top of the space, and the replica has to stay total there: no panic, no
+    // wrap, and no id it already holds. The whole region past
+    // `LAMPORT_STATE_CEILING` is refused, so nothing of any of these lands and the
+    // mint is untouched.
+    //
+    // A bound placed only on the last position of all — `(u64::MAX, u64::MAX)` —
+    // is not enough, and this pins why: the position one below it was admitted,
+    // parked the victim's high-water there, and made the *second* local edit after
+    // it panic. Both edits run here.
     let victim = cid(1);
-    let mut doc = Document::new(victim);
+    for offset in [u64::MAX, u64::MAX - 1, 0] {
+        let mut doc = Document::new(victim);
+        let mut end = op_at_lamport(victim, b"k", u64::MAX);
+        end.stamp.offset = offset;
+        assert!(
+            !doc.apply(&end),
+            "a stamp past the id space is admissible at offset {offset}"
+        );
+        assert!(doc.get(b"k").is_none(), "nothing of it landed");
 
-    // The last position of all is refused: there is nothing past it to mint.
-    let mut end = op_at_lamport(victim, b"k", u64::MAX);
-    end.stamp.offset = u64::MAX;
-    assert!(!doc.apply(&end), "an op with no successor is admissible");
+        let first = doc.transact(|tx| tx.set(b"a", Scalar::Int(1)))[0].stamp;
+        let second = doc.transact(|tx| tx.set(b"b", Scalar::Int(2)))[0].stamp;
+        assert_all_distinct(&[first, second], "mints after a refused top-of-space op");
+        assert!(Document::decode_state(&doc.encode_state()).is_ok());
+    }
+}
+
+#[test]
+fn a_stamp_off_the_lamport_axis_is_refused_because_the_derived_ids_ignore_it() {
+    // The sub-lamport `offset` is a tiebreak inside one run, not a second dimension
+    // an id may live in: `stamp_key` — the derived-id input for an ACL tuple, a
+    // ranged element and an XML child — is `lamport ++ client` and omits it. Two
+    // stamps differing only there would derive one id and the second create would
+    // be dropped. No honest stamp carries one, so the position is refused, which is
+    // also what makes the lamport-only high-water a complete record.
+    let attacker = cid(9);
+    let mut doc = Document::new(cid(1));
+    let mut off_axis = op_at_lamport(attacker, b"k", 4);
+    off_axis.stamp.offset = 1;
+    assert!(
+        !doc.apply(&off_axis),
+        "a stamp off the lamport axis is refused"
+    );
     assert!(doc.get(b"k").is_none(), "nothing of it landed");
 
-    // One below it is ordinary, and the mint counts past it rather than onto it.
-    let mut top = op_at_lamport(victim, b"k", u64::MAX);
-    top.stamp.offset = u64::MAX - 1;
-    assert!(doc.apply(&top));
-    let minted = doc.transact(|tx| tx.set(b"probe", Scalar::Int(1)))[0].stamp;
-    assert!(
-        (minted.lamport, minted.offset) > (top.stamp.lamport, top.stamp.offset),
-        "the mint did not count past the stamp it holds"
-    );
-    assert!(Document::decode_state(&doc.encode_state()).is_ok());
+    // The same position on the axis is ordinary.
+    let on_axis = op_at_lamport(attacker, b"k", 4);
+    assert!(doc.apply(&on_axis));
 }
 
 #[test]
@@ -488,10 +735,13 @@ fn a_text_run_at_the_ceiling_still_re_decodes() {
     // clock furthest past a bound in one op — a point check on a range problem.
     let mut src = Document::new(cid(1));
     src.transact(|tx| tx.set(b"k", Scalar::Int(1)));
-    let at = with_root_clock(src.encode_state(), LAMPORT_STATE_CEILING - 2);
+    // Nine ids left: the text create, then one per codepoint, the last landing
+    // exactly on the ceiling.
+    let at = with_root_clock(src.encode_state(), LAMPORT_STATE_CEILING - 9);
 
     let mut doc = Document::decode_state(&at).expect("a decodable snapshot");
     doc.transact(|tx| tx.text(b"t").insert(0, "ABCDEFGH"));
+    assert!(!doc.can_mint(None), "the run took the space to its end");
     Document::decode_state(&doc.encode_state()).expect("a replica can reload its own snapshot");
     assert_eq!(text_of(&doc, b"t"), "ABCDEFGH");
     assert_all_distinct(&all_text_ids(&doc, b"t"), "ceiling run");
@@ -500,15 +750,21 @@ fn a_text_run_at_the_ceiling_still_re_decodes() {
 #[test]
 fn every_reachable_clock_round_trips_and_never_re_issues_a_stamp() {
     // The sweep the two halves have to hold together on: every start a snapshot
-    // may legally declare, edited and reloaded, with no iteration excused. A
-    // reload must decode, must not lose the write, and must not hand a live stamp
-    // back to the mint.
+    // may legally declare, edited and reloaded, with **no iteration excused** —
+    // including the two at the very top, where the space runs out mid-sweep and
+    // the answer is a refusal rather than a lost write.
+    //
+    // The rule each iteration is held to, whether or not there was room: the
+    // reload decodes, the ids it decoded are exactly where they were, no stamp is
+    // re-issued, and a write lands *precisely* when an op was emitted for it — so
+    // a refusal can never present as a silent drop.
     for start in [
         0,
         1 << 20,
         LAMPORT_WIRE_CEILING - 1,
         LAMPORT_WIRE_CEILING,
         LAMPORT_WIRE_CEILING + 1,
+        LAMPORT_STATE_CEILING - 5,
         LAMPORT_STATE_CEILING - 4,
         LAMPORT_STATE_CEILING - 1,
         LAMPORT_STATE_CEILING,
@@ -516,23 +772,39 @@ fn every_reachable_clock_round_trips_and_never_re_issues_a_stamp() {
         let seed = with_root_clock(Document::new(cid(1)).encode_state(), start);
         let mut doc = Document::decode_state_as(cid(1), 0, &seed).expect("decodes");
         doc.transact(|tx| tx.text(b"t").insert(0, "AB"));
-        let live = text_ids(&doc, b"t", 2);
+        let live = text_ids_or_none(&doc, b"t");
 
         let mut back = Document::decode_state(&doc.encode_state()).unwrap_or_else(|e| {
             panic!("a replica could not reload its own snapshot at {start}: {e:?}")
         });
-        back.transact(|tx| tx.text(b"t").insert(2, "C"));
+        let emitted = back.transact(|tx| tx.text(b"t").insert(live.len(), "C"));
+        let after = text_ids_or_none(&back, b"t");
+
         assert_eq!(
-            text_of(&back, b"t"),
-            "ABC",
-            "reload lost a write at {start}"
+            after[..live.len()],
+            live[..],
+            "reload moved the ids it decoded at {start}"
         );
-        let after = text_ids(&back, b"t", 3);
-        assert_eq!(after[..2], live[..], "reload moved the ids it decoded");
-        assert!(
-            !live.contains(&after[2]),
-            "re-issued a live stamp at {start}"
+        assert_all_distinct(&after, &format!("reload at {start}"));
+        let inserted = emitted
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::TextInsert { .. }));
+        assert_eq!(
+            after.len() > live.len(),
+            inserted,
+            "a write landed without an op, or an op landed nowhere, at {start}"
         );
+        assert_eq!(
+            inserted,
+            start <= LAMPORT_STATE_CEILING - 5,
+            "the space ran out at a different start than {start}"
+        );
+        for op in &emitted {
+            assert!(
+                op.stamp.lamport <= LAMPORT_STATE_CEILING,
+                "minted past the id space at {start}"
+            );
+        }
     }
 }
 
@@ -640,4 +912,45 @@ fn a_zone_still_folds_independently_though_its_mint_counts_globally() {
         before,
         "a zoned fold advanced the root clock"
     );
+}
+
+#[test]
+fn a_saturated_high_water_refuses_rather_than_re_issuing_one_stamp() {
+    // The measured boundary that forces the mint to be refusable at all. A stamp
+    // on the last id of the space is a legal position, so it is admitted and it
+    // saturates its author's high-water. From there:
+    //
+    // * clamping the record re-issues: the mint would take `CEILING + 1`, record it
+    //   back down to `CEILING`, and take `CEILING + 1` again on the next edit —
+    //   one id for every later edit, and one derived `acl_id`/`ranged_id`/XML-child
+    //   id too, since those read the lamport and the client alone;
+    // * not clamping it leaves the replica unable to reload its own snapshot.
+    //
+    // So the mint refuses, visibly, and nothing is re-issued.
+    let me = cid(1);
+    let mut doc = Document::new(me);
+    assert!(
+        doc.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING)),
+        "the last id of the space is a legal position"
+    );
+
+    assert!(!doc.can_mint(None), "the id space is spent");
+    let first = doc.transact(|tx| tx.set(b"a", Scalar::Int(1)));
+    let second = doc.transact(|tx| tx.set(b"b", Scalar::Int(2)));
+    assert!(
+        first.is_empty() && second.is_empty(),
+        "a refused edit emits nothing"
+    );
+    assert!(doc.get(b"a").is_none(), "and changes no state");
+    assert!(
+        Document::decode_state(&doc.encode_state()).is_ok(),
+        "the replica can still reload its own snapshot"
+    );
+
+    // One id below it, the same edits mint and stay distinct.
+    let mut room = Document::new(me);
+    assert!(room.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING - 1)));
+    let minted = room.transact(|tx| tx.set(b"a", Scalar::Int(1)))[0].stamp;
+    assert_eq!(minted.lamport, LAMPORT_STATE_CEILING);
+    assert!(!room.can_mint(None), "and that was the last one");
 }

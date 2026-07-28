@@ -99,6 +99,36 @@ pub fn with_seq(mut bytes: Vec<u8>, seq: u64) -> Vec<u8> {
     bytes
 }
 
+/// The byte offset of the encoded stamp-high-water section — a `u32` count then
+/// `(ClientId, u64 lamport)` per entry, client-id sorted — which follows the
+/// variable-length zone clocks.
+fn stamp_high_water_at(bytes: &[u8]) -> usize {
+    let zones = u32::from_le_bytes(
+        bytes[STATE_ZONE_CLOCKS_AT..STATE_ZONE_CLOCKS_AT + 4]
+            .try_into()
+            .expect("four bytes"),
+    ) as usize;
+    STATE_ZONE_CLOCKS_AT + 4 + zones * (4 + 8)
+}
+
+/// `bytes` with the encoded stamp high-water section replaced by `entries` — the
+/// declaration a snapshot makes about the ids each client holds. Entries are
+/// written in the order given, so a test can hand the decoder a duplicate or an
+/// out-of-order record as well as an under-declared one.
+pub fn with_stamp_high_water(bytes: Vec<u8>, entries: &[(ClientId, u64)]) -> Vec<u8> {
+    let at = stamp_high_water_at(&bytes);
+    let old = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as usize;
+    let end = at + 4 + old * (16 + 8);
+    let mut out = bytes[..at].to_vec();
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (client, lamport) in entries {
+        out.extend_from_slice(&client.as_bytes());
+        out.extend_from_slice(&lamport.to_le_bytes());
+    }
+    out.extend_from_slice(&bytes[end..]);
+    out
+}
+
 /// `bytes` with the clock of the sole encoded zone replaced by `lamport`.
 /// Panics unless exactly one zone clock is present, so a codec change that moves
 /// the field fails loudly rather than patching the wrong bytes.

@@ -57,7 +57,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 11;
+const STATE_VERSION: u8 = 12;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -195,11 +195,33 @@ pub struct Document {
     /// ([`adopt_as`](Self::adopt_as)) must read that identity's high-water, not the
     /// encoder's.
     ///
-    /// Derived from the ids the replica holds — recorded as stamps are applied and
-    /// read back off a snapshot as it decodes — never stored beside them, on the
-    /// same reasoning as [`free_seq`](Self::free_seq): a position handed to a
-    /// replica by anyone else is a position it can be made to re-issue from.
-    stamp_high_water: HashMap<ClientId, (u64, u64)>,
+    /// Carried in the state encoding beside the clocks, because it cannot be
+    /// recovered from the content: a tombstoned sequence run stores `(head, len)`
+    /// and only the head is a stamp on the wire, a counter stores no stamp at all,
+    /// and an ACL or ranged entry stores only the id *derived* from one. A
+    /// projection that drops content therefore keeps this untouched — conservative
+    /// in the only direction that is safe, and what lets a zone- or read-scoped
+    /// snapshot be adopted without re-issuing the recipient's own live ids.
+    ///
+    /// Only the lamport is kept. A stamp's derived-id key ([`stamp_key`]) is
+    /// `lamport ++ client` and does not include the sub-lamport `offset`, so two
+    /// stamps differing only in offset derive the *same* ACL, ranged and XML-child
+    /// ids — the offset is a tiebreak inside one run, never a dimension a mint may
+    /// move in.
+    stamp_high_water: HashMap<ClientId, u64>,
+    /// Set when a mint inside the current [`transact`](Self::transact) was refused,
+    /// and read by every later mint in it.
+    ///
+    /// A refusal has to take the whole transaction, not just the edit that hit it.
+    /// The edits in one transact describe one intention and the later ones address
+    /// what the earlier ones created — so a create refused in an exhausted partition
+    /// would leave the writes into it addressing a container no replica will ever
+    /// hold, and a peer buffers such an op forever waiting on an arrival that cannot
+    /// come. Refusing the rest keeps a refusal what it claims to be: nothing
+    /// emitted, nothing changed.
+    ///
+    /// Not persisted: it lives for the duration of one transaction.
+    mint_refused: bool,
     seq: u64,
     /// When recording an atomic transaction (between `begin_atomic` and
     /// `commit_atomic`), the ops emitted so far accumulate here instead of being
@@ -279,6 +301,7 @@ impl Document {
             lamport: 0,
             zone_clocks: HashMap::new(),
             stamp_high_water: HashMap::new(),
+            mint_refused: false,
             seq: 0,
             atomic: None,
             seen: HashSet::new(),
@@ -933,6 +956,16 @@ impl Document {
             put_u64(&mut out, *lamport);
         }
 
+        // The id-space high-water of every client whose stamps this replica holds,
+        // id-sorted for a deterministic encoding.
+        let mut high_water: Vec<(&ClientId, &u64)> = self.stamp_high_water.iter().collect();
+        high_water.sort_by_key(|(client, _)| client.as_bytes());
+        put_u32(&mut out, len_u32(high_water.len()));
+        for (client, lamport) in high_water {
+            out.extend_from_slice(&client.as_bytes());
+            put_u64(&mut out, *lamport);
+        }
+
         encode_registry(&mut out, &self.counters, |c, o| {
             c.borrow().encode_state_into(o)
         });
@@ -1206,6 +1239,7 @@ impl Document {
         crate::op::destrand_split(self.buffer.iter_mut(), &split);
         self.buffered = self.buffer.iter().map(|op| op.id).collect();
         self.scrub_frontier_to(published);
+        self.scrub_high_water_to(recipient);
     }
 
     /// Project this replica in place to the paths a reader may read, dropping every
@@ -1435,6 +1469,7 @@ impl Document {
             self.buffer.clear();
             self.buffered.clear();
             self.scrub_frontier_to(published);
+            self.scrub_high_water_to(recipient);
         }
     }
 
@@ -1494,6 +1529,36 @@ impl Document {
             .into_iter()
             .filter(|id| !self.buffered.contains(id))
             .collect();
+    }
+
+    /// Cut the id-space high-water back to the recipient's own entry plus whatever
+    /// the *surviving* content still shows, on exactly the reasoning
+    /// [`scrub_frontier_to`](Self::scrub_frontier_to) cuts the causal frontier on.
+    ///
+    /// The map is keyed by client and every other client's entry counts what that
+    /// replica minted — including in the partition this projection withholds. Serving
+    /// the pre-projection figure lets a zone-scoped subscriber read how busy a zone
+    /// it cannot see is, which is the inference the scrub exists to close.
+    ///
+    /// The recipient's own entry stays, and must: a replica that persists its
+    /// identity and adopts a snapshot naming none of its own ids mints straight onto
+    /// ids the room already holds, and a sequence drops a re-issued id as a replay.
+    /// What the recipient learns from its own entry is its own authorship.
+    ///
+    /// The re-floor is not optional. **A document's record always dominates the
+    /// stamps its own content carries** — that is the invariant
+    /// [`read_state`](Self::read_state) enforces on the way in, by flooring a
+    /// declared record with what the bytes visibly hold, and a projection that left
+    /// the record below its own surviving content would decode to a document
+    /// different from itself. Reading it back through the codec, rather than walking
+    /// the registries by hand, is what keeps the two definitions from drifting; a
+    /// projection is O(document) several times over already.
+    fn scrub_high_water_to(&mut self, recipient: Option<ClientId>) {
+        self.stamp_high_water
+            .retain(|client, _| Some(*client) == recipient);
+        if let Ok(own) = Document::decode_state(&self.encode_state()) {
+            self.stamp_high_water = own.stamp_high_water.clone();
+        }
     }
 
     /// The synthetic [`XmlReveal`](crate::op::OpKind::XmlReveal) shell ops that reveal,
@@ -1736,10 +1801,8 @@ impl Document {
     }
 
     fn read_state(cur: &mut Cursor) -> Result<Document, DecodeError> {
-        // A snapshot's stamps are the ids the replica holds, so recording them as
-        // they decode is what restores `stamp_high_water` — including under a client
-        // id the stored clock does not cover, which is the whole point of keeping
-        // the mint off the clock.
+        // A snapshot's own stamps are ids it visibly holds, so they are read back as
+        // they decode and used as the **floor** under the high-water it declares.
         cur.track_stamps();
         let version = cur.u8()?;
         if version != STATE_VERSION {
@@ -1767,6 +1830,23 @@ impl Document {
             if zone_clocks.insert(zone, lamport).is_some() {
                 return Err(DecodeError::BadTag {
                     what: "document: duplicate zone clock",
+                    tag: 0,
+                });
+            }
+        }
+
+        let high_water_count = cur.u32()?;
+        let mut stamp_high_water: HashMap<ClientId, u64> =
+            HashMap::with_capacity((high_water_count as usize).min(1024));
+        for _ in 0..high_water_count {
+            let client = cur.client()?;
+            // A declared high-water lands in the slot the next local mint reads, so
+            // it is bounded on the same terms as a clock: refused above the ceiling,
+            // never clamped, since lowering one hands the replica live ids back.
+            let lamport = clock_within_ceiling(cur.u64()?, "document: stamp high-water")?;
+            if stamp_high_water.insert(client, lamport).is_some() {
+                return Err(DecodeError::BadTag {
+                    what: "document: duplicate stamp high-water",
                     tag: 0,
                 });
             }
@@ -2050,9 +2130,9 @@ impl Document {
             // The drain replays these straight through `apply_now`, so an op the
             // live `apply` seam would refuse must not reach state through the
             // snapshot seam instead.
-            if !stamp_names_its_author(op) || !stamp_leaves_a_successor(op) {
+            if !stamp_names_its_author(op) || !stamp_occupies_a_mintable_position(op) {
                 return Err(DecodeError::BadTag {
-                    what: "document: buffered op the mint could not count past",
+                    what: "document: buffered op stamped outside the id space",
                     tag: 0,
                 });
             }
@@ -2076,15 +2156,32 @@ impl Document {
             root_id,
         );
 
-        // The encoded buffer decodes through a cursor of its own, so its stamps are
-        // not in the tracked total — and a waiting op's ids are held just as much as
-        // an applied one's. Fold them in here rather than relying on the drain: an
-        // op that stays buffered never reaches `apply_kind` at all.
-        let mut stamp_high_water = cur.take_stamp_high_water();
+        // **The declared record is a floor-raiser, never a lowerer.** A snapshot is
+        // supplied by whoever hands the bytes over, so a declared position is exactly
+        // the kind of input C17 says the mint must not trust: under-declaring the
+        // record would otherwise be free, and the replica would mint straight onto
+        // ids the very bytes it just decoded carry. So the declaration is combined
+        // with what the snapshot *visibly* holds — every stamp the decode read, plus
+        // the whole reservation of every op still waiting in the encoded buffer,
+        // whose ids are as published as an applied op's — and the higher wins.
+        //
+        // Storing it is still what makes the record complete: a tombstoned run
+        // persists as `(head, len)` so only the head is a stamp on the wire, a
+        // counter persists no stamp, and an ACL or ranged entry persists only the id
+        // derived from one. Those are what the declaration covers and the floor
+        // cannot see. What is left is a snapshot that both hides ids in one of those
+        // shapes *and* under-declares — unreachable from the bytes either way, and
+        // the residual this design names.
+        let observed = cur.take_stamp_high_water();
+        for (client, lamport) in observed {
+            let slot = stamp_high_water.entry(client).or_insert(0);
+            *slot = (*slot).max(clock_within_ceiling(lamport, "document: stamp in state")?);
+        }
         for op in &buffer {
-            let slot = stamp_high_water.entry(op.stamp.client).or_insert((0, 0));
+            let slot = stamp_high_water.entry(op.stamp.client).or_insert(0);
             *slot = (*slot).max(reservation_end(op.stamp, span(&op.kind)));
         }
+
         let mut doc = Document {
             client,
             root,
@@ -2105,10 +2202,8 @@ impl Document {
             acl,
             lamport,
             zone_clocks,
-            // Every stamp the snapshot carries was read back as it decoded, so the
-            // id-space high-water comes off the state itself — including of a client
-            // the encoder's own clamped clock never covered.
             stamp_high_water,
+            mint_refused: false,
             seq,
             atomic: None,
             seen,
@@ -2230,6 +2325,7 @@ impl Document {
         F: FnOnce(&mut MapCursor),
     {
         self.pending.clear();
+        self.mint_refused = false;
         let root_id = self.root_id();
         {
             let mut cursor = MapCursor {
@@ -2392,7 +2488,18 @@ impl Document {
         // [`mint_floor`](Self::mint_floor)'s job, on this path and on the buffer a
         // decode drains alike. This raises the bar to impersonating an identity
         // rather than merely naming one, which is a transport-authenticated claim.
-        if !stamp_names_its_author(op) || !stamp_leaves_a_successor(op) {
+        if !stamp_names_its_author(op) {
+            return false;
+        }
+        // The ids an op reserves are recorded against its author's high-water, and
+        // that high-water is stored, so it has to stay inside what a decode admits —
+        // hence a bound on the *position a stamp may occupy*. Refusal, not a clamp,
+        // and for the same reason a stored clock is refused: a stamp is an id, so
+        // lowering one aliases whatever already holds it. Being a pure function of
+        // the op, every replica refuses exactly the same set, so the judgement is
+        // convergent rather than a divergence — and the local mint stops at the same
+        // constant ([`mint_position`]), so no replica emits what this rejects.
+        if !stamp_occupies_a_mintable_position(op) {
             return false;
         }
         // A member declaring a group size outside the representable range is
@@ -2479,11 +2586,11 @@ impl Document {
     /// are no longer compact. Nothing orders differently for it: folding still
     /// advances one partition's clock alone, so the per-zone streams stay causally
     /// independent, and the numbering was never a guarantee to anyone.
-    fn mint_floor(&self, zone: Option<u32>) -> (u64, u64) {
-        let clock = (self.clock(zone), 0);
+    fn mint_floor(&self, zone: Option<u32>) -> u64 {
+        let clock = self.clock(zone);
         match self.stamp_high_water.get(&self.client) {
-            Some(own) if *own > clock => *own,
-            _ => clock,
+            Some(own) => clock.max(*own),
+            None => clock,
         }
     }
 
@@ -2493,9 +2600,21 @@ impl Document {
     /// published while it waits as after it lands ([`free_seq`](Self::free_seq)'s
     /// rule, for the same reason: no peer resends it).
     ///
+    /// The recorded reach is held to [`LAMPORT_STATE_CEILING`] so that what
+    /// [`encode_state`](Self::encode_state) writes here is always inside what
+    /// [`read_state`](Self::read_state) admits — C18's contract, structurally rather
+    /// than by argument. Every seam into this one already refuses a stamp reaching
+    /// past the ceiling ([`stamp_occupies_a_mintable_position`] on the way in,
+    /// [`mint_position`] on the way out), so the clamp discards nothing; the
+    /// assertion is what would catch a seam that stopped doing so.
     fn record_stamp(&mut self, stamp: Stamp, span: u64) {
-        let slot = self.stamp_high_water.entry(stamp.client).or_insert((0, 0));
-        *slot = (*slot).max(reservation_end(stamp, span));
+        let reach = reservation_end(stamp, span);
+        debug_assert!(
+            reach <= LAMPORT_STATE_CEILING,
+            "a stamp reaching past the id space was installed"
+        );
+        let slot = self.stamp_high_water.entry(stamp.client).or_insert(0);
+        *slot = (*slot).max(reach.min(LAMPORT_STATE_CEILING));
     }
 
     /// The current lamport high-water of a partition: the root clock for `None`,
@@ -2801,7 +2920,12 @@ impl Document {
     /// Like [`emit`](Self::emit), returning the stamp minted for the op — so a
     /// caller that creates a stamp-keyed child (an XML sequence child) can derive
     /// its id without re-minting.
-    fn emit_stamped(&mut self, target: ElementId, kind: OpKind) -> Stamp {
+    ///
+    /// `None` when this replica's id space is spent in the target's partition: the
+    /// edit is refused whole, emits no op and changes no state. See
+    /// [`can_mint`](Self::can_mint) — a caller that derives a child id from the
+    /// stamp must refuse alongside, or it would name a child no op creates.
+    fn emit_stamped(&mut self, target: ElementId, kind: OpKind) -> Option<Stamp> {
         // The op is stamped from its own partition's clock, so an edit in one zone
         // never advances another's and the op carries which partition it belongs
         // to. The target already exists (a mutation names a materialised
@@ -2817,16 +2941,21 @@ impl Document {
         // stamp names its author, so those planted ids are the only ones a local
         // mint can collide with, and clearing them is exactly the discipline
         // [`free_seq`](Self::free_seq) already applies to the op-seq position.
-        let stamp = next_stamp(self.mint_floor(zone), self.client);
-        // Reserve the rest of a run's char_ids so the next op sorts after it. The
-        // carry into `offset` keeps every codepoint distinct at the top of the space.
-        let last = stamp.run_member(span(&kind) - 1);
-        // The clock the snapshot stores is bounded on the way out by the same
-        // constant [`read_state`](Self::read_state) enforces on the way in, so
-        // `encode_state` can never emit a clock its own decoder refuses. Clamping it
-        // costs nothing the mint needs, precisely because the mint reads the id-space
-        // high-water above rather than this slot.
-        self.advance_clock(zone, last.lamport.min(LAMPORT_STATE_CEILING));
+        if self.mint_refused {
+            return None;
+        }
+        let span = span(&kind);
+        let Some(stamp) = mint_position(self.mint_floor(zone), span, self.client) else {
+            self.mint_refused = true;
+            return None;
+        };
+        // Reserve the rest of a run's char_ids so the next op sorts after it.
+        let last = stamp.lamport + span - 1;
+        // The clock a snapshot stores is bounded on the way out by the same constant
+        // [`read_state`](Self::read_state) enforces on the way in, so `encode_state`
+        // can never emit a clock its own decoder refuses. The mint above already
+        // stops at that constant, so this only restates it.
+        self.advance_clock(zone, last);
         let id = self.mint_op_id();
         let author = self.client;
         // The record-seam: the inverse is read off the state this op is about to
@@ -2845,7 +2974,24 @@ impl Document {
             tx: None,
             zone,
         });
-        stamp
+        Some(stamp)
+    }
+
+    /// Whether this replica still holds an unspent id in `zone`'s partition — the
+    /// predicate a refused edit reports on.
+    ///
+    /// False only at exhaustion: the mint counts on from the higher of the partition
+    /// clock and this replica's own id-space high-water, and both stop at
+    /// [`LAMPORT_STATE_CEILING`]. Honest traffic reaches it after 2^63 edits; a peer
+    /// impersonating this replica's `ClientId` can put it there in one op, which is
+    /// the same residual [`mint_floor`](Self::mint_floor) already carries — and a
+    /// refused edit is the fail-closed answer to it, not a re-issued live id.
+    ///
+    /// A multi-codepoint text insert reserves one id per codepoint, so it can be
+    /// refused where a single-id edit is still admitted; this reports the
+    /// single-id case.
+    pub fn can_mint(&self, zone: Option<u32>) -> bool {
+        mint_position(self.mint_floor(zone), 1, self.client).is_some()
     }
 
     /// A target is reachable when it names a materialised container that is
@@ -3644,7 +3790,9 @@ impl Document {
                 grantor,
                 was,
             } => {
-                let stamp = self.emit_stamped(
+                // A refused mint emits nothing, so there is no new element for the
+                // steps stacked beneath to be re-pointed at.
+                let Some(stamp) = self.emit_stamped(
                     target,
                     OpKind::AclGrant {
                         subject,
@@ -3653,7 +3801,9 @@ impl Document {
                         scope,
                         grantor,
                     },
-                );
+                ) else {
+                    return;
+                };
                 self.history.substitute_element(was, acl_id(stamp));
             }
             Inverse::ReviveItem {
@@ -3662,7 +3812,10 @@ impl Document {
                 value,
                 was,
             } => {
-                let now = self.emit_stamped(list, OpKind::ListInsert { value, anchor });
+                let Some(now) = self.emit_stamped(list, OpKind::ListInsert { value, anchor })
+                else {
+                    return;
+                };
                 self.history.substitute(list, was, now);
             }
             Inverse::ReviveRun {
@@ -3671,7 +3824,9 @@ impl Document {
                 s,
                 was,
             } => {
-                let now = self.emit_stamped(text, OpKind::TextInsert { s, anchor });
+                let Some(now) = self.emit_stamped(text, OpKind::TextInsert { s, anchor }) else {
+                    return;
+                };
                 for (i, old) in was.into_iter().enumerate() {
                     self.history.substitute(text, old, now.run_member(i as u64));
                 }
@@ -4293,7 +4448,8 @@ impl Document {
     fn revive_node(&mut self, list: ElementId, anchor: Anchor, node: Snap) -> Option<Stamp> {
         match node {
             Snap::Text(s) => {
-                let stamp = self.emit_stamped(list, OpKind::XmlInsertChild { tag: None, anchor });
+                let stamp =
+                    self.emit_stamped(list, OpKind::XmlInsertChild { tag: None, anchor })?;
                 let child = xml_child_id(list, stamp, ElementKind::Text);
                 self.fill_text(child, s);
                 Some(stamp)
@@ -4309,7 +4465,7 @@ impl Document {
                         tag: Some(tag),
                         anchor,
                     },
-                );
+                )?;
                 let child = xml_child_id(list, stamp, ElementKind::XmlElement);
                 self.fill_slots(XmlElement::attrs_id(child), attrs);
                 self.fill_children(XmlElement::children_id(child), children);
@@ -4343,7 +4499,7 @@ impl Document {
                 payload: init,
                 name,
             },
-        );
+        )?;
         let ranged = ranged_id(stamp);
         match payload {
             Snap::Map(slots) => self.fill_slots(payload_id(ranged, ElementKind::Map), slots),
@@ -4688,32 +4844,53 @@ fn clock_within_ceiling(lamport: u64, what: &'static str) -> Result<u64, DecodeE
     Ok(lamport)
 }
 
-/// The stamp `client` mints to sit strictly past the `(lamport, offset)` position
-/// `from` — the next free position in that client's id space.
+/// A stamp no op can ever occupy, for deriving the handle a refused mutation hands
+/// back — an id that addresses nothing, so every edit through it is a no-op.
 ///
-/// The lamport carries the position while there is room, so an op stamp keeps
-/// `offset == 0` as every other seam expects. At the very top of the lamport space
-/// the offset carries it instead, the same second dimension
-/// [`Stamp::run_member`](crate::stamp::Stamp::run_member) uses to keep a ceiling
-/// run's codepoints distinct: a stamp space is two-dimensional, so exhausting it
-/// takes 2^128 ids and only a crafted snapshot could declare a position with
-/// neither left.
-fn next_stamp(from: (u64, u64), client: ClientId) -> Stamp {
-    match from.0.checked_add(1) {
-        Some(lamport) => Stamp {
-            lamport,
-            client,
-            offset: 0,
-        },
-        None => Stamp {
-            lamport: u64::MAX,
-            client,
-            offset: from
-                .1
-                .checked_add(1)
-                .expect("a client's stamp space outlives the replica"),
-        },
+/// `u64::MAX` is above [`LAMPORT_STATE_CEILING`], and every seam that installs a
+/// stamp refuses one reaching past that ceiling
+/// ([`stamp_occupies_a_mintable_position`], [`mint_position`]). So no element can
+/// exist at an id derived from here, on this replica or any other — which is what a
+/// handle to nothing has to guarantee, or a caller could delete a stranger's
+/// element through it.
+fn unmintable_stamp(client: ClientId) -> Stamp {
+    Stamp {
+        lamport: u64::MAX,
+        client,
+        offset: 0,
     }
+}
+
+/// The stamp `client` mints to sit strictly past lamport `from` in its own id
+/// space, reserving `span` consecutive ids from there — or `None` when the whole
+/// reservation would not fit under [`LAMPORT_STATE_CEILING`].
+///
+/// **Refusal is the only total answer at the top of the space**, which is why the
+/// mint returns an `Option` at all. Clamping would re-issue an id that is already
+/// live: two edits would take one stamp, and so would the ids they derive, since
+/// [`stamp_key`] reads the lamport and the client alone. Moving into the
+/// sub-lamport `offset` instead is no escape for the same reason — that dimension
+/// is not in the key. And letting it run past the ceiling puts the replica's own
+/// high-water outside what [`Document::read_state`] admits, so the replica could
+/// not reload the snapshot it just wrote.
+///
+/// The bound is the one a wire stamp is held to as well
+/// ([`stamp_occupies_a_mintable_position`]), so a minted op is always inside what
+/// every peer admits — a refusal here is never a divergence, it is the same edge
+/// every replica sees.
+///
+/// `offset` is always `0`: the reservation fits below the ceiling, so counting a
+/// run's codepoints up from the base never carries.
+fn mint_position(from: u64, span: u64, client: ClientId) -> Option<Stamp> {
+    let lamport = from.checked_add(1)?;
+    if lamport.checked_add(span - 1)? > LAMPORT_STATE_CEILING {
+        return None;
+    }
+    Some(Stamp {
+        lamport,
+        client,
+        offset: 0,
+    })
 }
 
 /// Whether an op's stamp names the client that authored it. A node's id is its
@@ -4723,25 +4900,36 @@ fn stamp_names_its_author(op: &Op) -> bool {
     op.stamp.client == op.id.client
 }
 
-/// The `(lamport, offset)` position the last id of `stamp`'s reservation occupies.
-/// A text run takes one per codepoint and carries into the offset at the top of the
-/// lamport space, so the reservation, not the base, is what a high-water records.
-fn reservation_end(stamp: Stamp, span: u64) -> (u64, u64) {
-    let last = stamp.run_member(span - 1);
-    (last.lamport, last.offset)
+/// The lamport the last id of `stamp`'s reservation occupies. A text run takes one
+/// per codepoint, so the reservation, not the base, is what a high-water records.
+fn reservation_end(stamp: Stamp, span: u64) -> u64 {
+    stamp.lamport.saturating_add(span - 1)
 }
 
-/// Whether an op leaves its author a stamp to mint next — that is, whether its
-/// reservation stops short of the very end of that author's stamp space.
+/// Whether `op`'s stamp sits where an id may exist at all: inside the lamport
+/// space, and off the sub-lamport dimension.
 ///
-/// Refusing the one position past which there is no successor is categorical, not a
-/// threshold: it is the end of a 2^128 space, so no honest replica is near it (nor
-/// can one reach it — a mint would have to exhaust the space first), and being a
-/// pure function of the op every replica refuses the same set. Without it, one op
-/// carrying that position under a victim's client id takes the arithmetic out from
-/// under the victim's next edit.
-fn stamp_leaves_a_successor(op: &Op) -> bool {
-    reservation_end(op.stamp, span(&op.kind)) < (u64::MAX, u64::MAX)
+/// **The bound is [`LAMPORT_STATE_CEILING`], the same constant a decoded clock and
+/// a decoded high-water are held to, and the same one [`mint_position`] stops the
+/// local mint at.** One constant for the whole id space is what keeps the rule
+/// convergent: a replica emits exactly the set its peers admit, so an honest mint
+/// is never refused by the network. Bounding a wire stamp at
+/// [`LAMPORT_WIRE_CEILING`] instead would break that — one op stamped at the wire
+/// ceiling parks a folding replica's clock there, its next honest mint is one
+/// above, and every peer refuses it. [`LAMPORT_WIRE_CEILING`] bounds what a *fold*
+/// may do to a **clock**, which is a different question; the runway between the two
+/// is what a clock-parked replica still mints into, 2^62 ids of it.
+///
+/// **`offset` must be zero.** [`stamp_key`] — the derived-id input for an ACL
+/// tuple, a ranged element and an XML sequence child — is `lamport ++ client` and
+/// omits the offset, so two stamps differing only there derive the *same* id and
+/// the second create is silently dropped. No honest stamp carries one: a mint emits
+/// `offset == 0`, and [`Stamp::run_member`] only carries into the offset past
+/// `u64::MAX`, which the lamport bound above puts out of reach. So the sub-lamport
+/// dimension is not a place an op may be, and refusing it is what makes the
+/// lamport-only high-water a complete record of the ids a client holds.
+fn stamp_occupies_a_mintable_position(op: &Op) -> bool {
+    op.stamp.offset == 0 && reservation_end(op.stamp, span(&op.kind)) <= LAMPORT_STATE_CEILING
 }
 
 /// How many consecutive char_ids an op consumes from its stamp. A text run
@@ -5396,15 +5584,22 @@ impl RangedCursor<'_> {
         name: Option<Vec<u8>>,
     ) -> ElementId {
         let root = self.doc.root_id();
-        let stamp = self.doc.emit_stamped(
-            root,
-            OpKind::RangedCreate {
-                start,
-                end,
-                payload,
-                name,
-            },
-        );
+        // A refused mint creates nothing, so the handle names nothing: an
+        // unoccupiable stamp, which every later edit through it resolves to absent.
+        // See [`Document::can_mint`] — the id space is spent, so an `Option` here
+        // would only restate a document-wide condition at every mutation.
+        let stamp = self
+            .doc
+            .emit_stamped(
+                root,
+                OpKind::RangedCreate {
+                    start,
+                    end,
+                    payload,
+                    name,
+                },
+            )
+            .unwrap_or_else(|| unmintable_stamp(self.doc.client));
         ranged_id(stamp)
     }
 
@@ -5527,16 +5722,21 @@ impl AclCursor<'_> {
         grantor: ClientId,
     ) -> ElementId {
         let root = self.doc.root_id();
-        let stamp = self.doc.emit_stamped(
-            root,
-            OpKind::AclGrant {
-                subject,
-                grant,
-                effect,
-                scope,
-                grantor,
-            },
-        );
+        // A refused mint grants nothing, so the handle names nothing — the same
+        // unoccupiable-stamp convention a refused ranged create returns.
+        let stamp = self
+            .doc
+            .emit_stamped(
+                root,
+                OpKind::AclGrant {
+                    subject,
+                    grant,
+                    effect,
+                    scope,
+                    grantor,
+                },
+            )
+            .unwrap_or_else(|| unmintable_stamp(self.doc.client));
         acl_id(stamp)
     }
 
@@ -5610,27 +5810,25 @@ pub struct XmlChildrenCursor<'a> {
 
 impl XmlChildrenCursor<'_> {
     /// Emit an `XmlInsertChild` for a child of `kind` at live `index`, returning
-    /// the child's derived id. Emits nothing when the children List is not
-    /// materialised — an op the author never applied would diverge a peer that
-    /// has the List — so a would-be child id is returned with no op behind it.
-    /// (That branch is unreachable through the public API: a cursor is only
-    /// handed out for a List a create already registered; it is a defensive
-    /// placeholder, not a live path.)
+    /// the child's derived id.
+    ///
+    /// Two cases emit nothing and hand back an id derived from an unoccupiable
+    /// stamp, so the cursor built on it addresses nothing and every edit through it
+    /// is a no-op: the children List is not materialised (an op the author never
+    /// applied would diverge a peer that has the List — unreachable through the
+    /// public API, since a cursor is only handed out for a List a create already
+    /// registered), or the mint refused because this replica's id space is spent
+    /// ([`Document::can_mint`]).
     fn insert_child(&mut self, index: usize, tag: Option<Vec<u8>>, kind: ElementKind) -> ElementId {
+        let absent = unmintable_stamp(self.doc.client);
         let anchor = match self.doc.lists.get(&self.list_id) {
             Some(list) => list.borrow().place(index),
-            None => {
-                let zero = Stamp {
-                    lamport: 0,
-                    client: ClientId::from_bytes([0u8; 16]),
-                    offset: 0,
-                };
-                return xml_child_id(self.list_id, zero, kind);
-            }
+            None => return xml_child_id(self.list_id, absent, kind),
         };
         let stamp = self
             .doc
-            .emit_stamped(self.list_id, OpKind::XmlInsertChild { tag, anchor });
+            .emit_stamped(self.list_id, OpKind::XmlInsertChild { tag, anchor })
+            .unwrap_or(absent);
         xml_child_id(self.list_id, stamp, kind)
     }
 
