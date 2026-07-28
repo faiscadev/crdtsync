@@ -493,16 +493,29 @@ fn a_snapshot_declaring_a_zone_clock_above_the_ceiling_is_refused() {
     let at = with_only_zone_clock(src.encode_state(), LAMPORT_STATE_CEILING);
     let mut doc = Document::decode_state(&at).expect("a decodable snapshot");
     doc.set_schema(schema_with_zone());
-    // The zone's own id space is spent; the root partition's is not, so the
-    // refusal is per-partition exactly as the clock is.
+    // The *capacity* is per-partition, exactly as the clock is: zone 0 is spent and
+    // the root is not.
     assert!(!doc.can_mint(Some(0)));
     assert!(doc.can_mint(None));
-    assert!(doc
-        .transact(|tx| {
-            tx.map(b"board").set(b"probe", Scalar::Int(1));
-        })
-        .iter()
-        .all(|op| op.zone != Some(0)));
+
+    // The *refusal* is not. A zoned edit is refused, and because the latch is
+    // document-global it takes the rest of that transaction with it — the batch is
+    // empty, not merely free of zoned ops.
+    let zoned = doc.transact(|tx| {
+        tx.map(b"board").set(b"probe", Scalar::Int(1));
+        tx.set(b"root_probe", Scalar::Int(1));
+    });
+    assert!(
+        zoned.is_empty(),
+        "a refused zoned edit let the rest of its transaction through: {zoned:?}"
+    );
+    assert!(doc.get(b"root_probe").is_none());
+
+    // The next transaction starts clean, so the root partition's room is real and
+    // the latch did not outlive the intention that set it.
+    let root = doc.transact(|tx| tx.set(b"root_probe", Scalar::Int(1)));
+    assert_eq!(root.len(), 1, "the root partition had no room after all");
+    assert_eq!(root[0].zone, None);
 }
 
 #[test]
@@ -777,9 +790,13 @@ fn a_reload_at_the_top_of_the_space_refuses_rather_than_re_issuing() {
                 "minted past the id space at {start}"
             );
         }
-        assert!(
-            !back.can_mint(None) || after.len() > live.len(),
-            "a replica that could still mint refused the write at {start}"
+        // The write lands exactly when the space allowed it — `can_mint` cannot be
+        // used as the oracle here, since it folds in the refusal latch this very
+        // transaction may have just set.
+        assert_eq!(
+            after.len() > live.len(),
+            start <= LAMPORT_STATE_CEILING - 5,
+            "the space ran out at a different start than {start}"
         );
         Document::decode_state(&back.encode_state()).expect("still reloads");
     }

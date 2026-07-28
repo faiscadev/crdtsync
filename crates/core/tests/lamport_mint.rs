@@ -268,6 +268,73 @@ fn a_projection_keeps_the_recipients_own_high_water() {
 }
 
 #[test]
+fn a_projection_withholds_every_other_clients_entry_and_re_floors() {
+    // The two halves of the scrub, each pinned on its own. The *withholding* half is
+    // a privacy rule: another client's entry counts what that replica minted inside
+    // the partition this projection drops, so serving it lets a zone-scoped
+    // subscriber read how busy a zone it cannot see is. The *re-floor* half is a
+    // correctness rule: a projected document must still dominate the content that
+    // survived, or its own snapshot decodes to something different from itself.
+    let recipient = cid(1);
+    let other = cid(2);
+
+    let mut room = Document::new(cid(7));
+    room.set_schema(schema_with_zone());
+    // The other client's activity is a counter in the withheld zone — it persists no
+    // stamp, so only its record entry could reveal it. Stamped far above anything the
+    // surviving content reaches, so the probe below cannot be satisfied by a clock.
+    let mut author = Document::new(other);
+    author.set_schema(schema_with_zone());
+    let mut hidden = author.transact(|tx| {
+        tx.map(b"board").inc(b"hits", 1);
+    });
+    for op in hidden.iter_mut() {
+        assert_eq!(op.zone, Some(0), "the batch belongs to the withheld zone");
+        op.stamp.lamport = 500;
+        room.apply(op);
+    }
+    // Content the recipient keeps, authored by a third client, so the re-floor has
+    // something to recover that the scrub does not hand back.
+    for op in &impersonated_run(cid(3), b"t", "MMMM", 90) {
+        room.apply(op);
+    }
+    let kept = all_text_ids(&room, b"t");
+
+    assert_eq!(
+        room.zone_clock(None),
+        93,
+        "the zoned batch left the root clock alone"
+    );
+    room.project_zones(&schema_with_zone(), &Default::default(), Some(recipient));
+    assert!(room.get(b"board").is_none(), "the withheld zone survived");
+    let bytes = room.encode_state();
+
+    // Withheld: nothing in the served bytes carries the other client's position.
+    let served = Document::decode_state(&bytes).expect("a projected snapshot decodes");
+    let mut probe = Document::decode_state_as(other, 0, &bytes).expect("decodes");
+    let minted = probe.transact(|tx| tx.set(b"probe", Scalar::Int(1)))[0].stamp;
+    assert!(
+        minted.lamport < 500,
+        "the projection served the withheld zone's author position: {}",
+        minted.lamport
+    );
+
+    // Re-floored: the surviving content is still dominated, so the snapshot decodes
+    // to itself and a re-encode is byte-identical.
+    assert_eq!(
+        served.encode_state(),
+        bytes,
+        "a projected snapshot does not decode to itself"
+    );
+    let mut adopted = Document::decode_state_as(cid(3), 0, &bytes).expect("decodes");
+    let re = adopted.transact(|tx| tx.set(b"probe", Scalar::Int(1)))[0].stamp;
+    assert!(
+        !kept.contains(&re),
+        "the adopting replica re-issued an id the projected content still holds"
+    );
+}
+
+#[test]
 fn a_snapshot_cannot_under_declare_a_tombstoned_runs_tail() {
     // The floor has to read a run's *reach*, not its head. A dead sequence run
     // encodes as `(head, length)` and only the head is a stamp on the wire, so a
