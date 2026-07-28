@@ -1261,13 +1261,13 @@ pub unsafe extern "C" fn crdtsync_doc_resolve_position(
 /// may occupy — since the codec refuses its third, a transaction size no group
 /// can have, at the frame. A buffered op is *waiting*, so the fold keeps it and a
 /// later arrival commits it; a refused op is a bug in whoever wrote it, and there
-/// is no server between an offline, P2P or relayed peer and this fold to answer
-/// `MalformedOp` on the app's behalf. A refused op does not hold back the rest of
-/// the batch — unlike at the server's ingress, which refuses the whole frame
-/// because its ack frontier is a max over it. Zero is the honest-peer reading,
-/// and the count is written on every outcome (`-1` included, having judged no
-/// op), so a caller may reuse the variable across batches. A null pointer skips
-/// the write.
+/// is no server between this fold and a peer it reaches offline, directly, or
+/// over a byte pipe the app carries itself, to answer `MalformedOp` on the app's
+/// behalf. A refused op does not hold back the rest of the batch — unlike at the
+/// server's ingress, which refuses the whole frame because its ack frontier is a
+/// max over it. Zero is the honest-peer reading, and the count is written on
+/// every outcome, `-1` included, so a caller may reuse the variable across
+/// batches. A null pointer skips the write.
 ///
 /// # Safety
 /// `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`];
@@ -1279,8 +1279,6 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
     len: usize,
     out_refused: *mut u32,
 ) -> i32 {
-    // Both counts leave the closure together, so the outcome the caller reads and
-    // the one it is told about are the same one.
     let (applied, refused) = catch_unwind(AssertUnwindSafe(|| {
         if doc.is_null() {
             return (-1, 0);
