@@ -1272,6 +1272,28 @@ fn handle_ops(
     {
         return violation("client authored a reveal op");
     }
+    // An op no replica can hold is refused here, so the batch is never logged,
+    // deduped, fanned out or acknowledged. `Document::apply` refuses it whatever
+    // path it arrives by, and the ingest seam drops it; what this gate adds is the
+    // *answer to the author* — without it the write is acked `Accepted` (the ack
+    // frontier is a max over the whole submitted batch), the client prunes it from
+    // its outbox, and the edit is lost with nothing reported anywhere.
+    //
+    // Recoverable rather than a disconnect: the frame is well-formed and the rest of
+    // the connection's traffic is unaffected, so the author keeps its ops and
+    // surfaces the rejection, as an authz or schema refusal does. It refuses the
+    // whole batch, not the offending op — the ack frontier covers the batch, so
+    // acking the admissible half would acknowledge the refused op's sequence with
+    // it.
+    //
+    // The judgement is a pure function of the op, so every replica refuses exactly
+    // the same set: rejecting converges the room on the op's absence rather than
+    // splitting it, which is what makes refusing safe where dropping state would not
+    // be. Nothing this codebase mints is inadmissible, so an honest client never
+    // meets this.
+    if !ops.iter().all(Op::is_admissible) {
+        return ops_rejected(channel, &ops, ErrorCode::MalformedOp);
+    }
     // A write is served only by the room's leader. A subscribe to a non-led room is
     // already redirected, so a bound channel here implies leadership; the guard still
     // holds if a write reaches a non-leader — it is redirected, not ingested, so a
