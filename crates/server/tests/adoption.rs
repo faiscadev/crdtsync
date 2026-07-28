@@ -584,8 +584,10 @@ fn a_pending_members_verification_does_not_count() {
     // Two nodes minted together would otherwise vouch each other in without a single
     // established member ever reaching either. Only an adopted member's claim counts.
     let mut m = membership_for(SELF_ADDR);
+    // On *different* hosts, so nothing but their pending status keeps their word out:
+    // the trust-unit count would otherwise reach the bar on the pair alone.
     let first = NodeId::from("10.9.9.9:9000");
-    let second = NodeId::from("10.9.9.9:9001");
+    let second = NodeId::from("10.9.9.8:9000");
     for node in [&first, &second] {
         m.add_member((*node).clone(), node.as_bytes().to_vec());
     }
@@ -605,6 +607,12 @@ fn a_pending_members_verification_does_not_count() {
     m.merge_liveness(&NodeId::from("10.0.0.1:9000"), claim(&first));
     assert!(!m.is_adopted(&first));
     assert!(!m.is_adopted(&second));
+
+    // A second *adopted* member is what carries it, so the refusal is about who
+    // vouched and not about the shape of the evidence.
+    m.merge_liveness(&NodeId::from("10.0.0.2:9000"), claim(&first));
+    assert!(m.is_adopted(&first));
+    assert!(!m.is_adopted(&second));
 }
 
 // --- the address a member is verified at is the address its id names ---
@@ -618,9 +626,24 @@ fn a_member_is_dialed_at_its_own_id_whatever_address_a_tuple_carries() {
     // then verified different endpoints and placed rooms differently, forever. A node
     // id is an advertise address, so the second name is dropped and the dial address is
     // a function of the id alone.
-    let mut poisoned = membership_for(SELF_ADDR);
     let joiner = NodeId::from("10.9.9.9:9000");
-    poisoned.add_member(joiner.clone(), b"10.6.6.6:9000".to_vec());
+    let foreign = b"10.6.6.6:9000".to_vec();
+    // Poisoned through the additive path on one node and through the anti-entropy
+    // merge on another — both are ways a peer's tuple reaches the roster, and the rule
+    // has to hold on each or the two disagree.
+    let mut poisoned = membership_for(SELF_ADDR);
+    poisoned.add_member(joiner.clone(), foreign.clone());
+    let mut merged = membership_for(SELF_ADDR);
+    merged.merge_liveness(
+        &NodeId::from("10.0.0.1:9000"),
+        [(
+            joiner.clone(),
+            foreign.clone(),
+            0,
+            MemberState::Alive,
+            false,
+        )],
+    );
     let mut clean = membership_for(SELF_ADDR);
     clean.add_member(joiner.clone(), joiner.as_bytes().to_vec());
 
@@ -631,6 +654,7 @@ fn a_member_is_dialed_at_its_own_id_whatever_address_a_tuple_carries() {
             .map(|(_, addr)| addr)
     };
     assert_eq!(dial_of(&poisoned), Some(joiner.as_bytes().to_vec()));
+    assert_eq!(dial_of(&merged), Some(joiner.as_bytes().to_vec()));
     assert_eq!(dial_of(&poisoned), dial_of(&clean));
 
     // So the same evidence places the same rooms on both, whichever address was
@@ -972,14 +996,16 @@ fn a_sibling_on_a_members_own_host_does_not_vouch_for_it() {
     let sibling = NodeId::from("10.0.0.1:9002");
     m.add_member(sibling.clone(), sibling.as_bytes().to_vec());
 
+    // One voucher on the candidate's own host and one elsewhere: two members, two node
+    // ids, and only *one* trust unit that is not the candidate itself.
     vouch(&mut m, "10.0.0.1:9000", &sibling);
-    vouch(&mut m, "10.0.0.1:9001", &sibling);
+    vouch(&mut m, "10.0.0.2:9000", &sibling);
     assert!(
         !m.is_adopted(&sibling),
         "its own host does not vouch for it"
     );
 
-    vouch(&mut m, "10.0.0.2:9000", &sibling);
+    // A second host does — this node, which reached it over its own link.
     m.note_verified(&sibling);
     assert!(m.is_adopted(&sibling), "two other hosts do");
 }
