@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Scalar};
 use crdtsync_server::membership::Membership;
+use crdtsync_server::placement::NodeId;
 use crdtsync_server::{ConnId, ManualClock, Registry};
 
 const CH: Channel = Channel(0);
@@ -158,12 +159,24 @@ fn originated_epoch(r: &mut Registry) -> Option<u64> {
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
 /// A connection admitted to `r`'s peer plane, as a member's dialed link is.
-fn peer_conn(r: &mut Registry) -> ConnId {
+fn peer_conn(r: &mut Registry, room: &[u8]) -> ConnId {
+    let node = r
+        .membership()
+        .and_then(|m| m.replicas_for(room).into_iter().find(|n| !m.is_self(n)))
+        .unwrap_or_else(|| NodeId::from("10.0.0.1:9000"));
+    peer_conn_as(r, &node)
+}
+
+/// A connection admitted to the peer plane as the member `node` — peer admission
+/// binds the link to a member, and every node-to-node frame on it is decided
+/// against that identity rather than anything the frame itself names.
+fn peer_conn_as(r: &mut Registry, node: &NodeId) -> ConnId {
     let id = r.connect();
     assert!(
         r.deliver(
             id,
             Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
                 secret: CLUSTER_SECRET.to_vec(),
             },
         ),
@@ -181,7 +194,7 @@ fn a_higher_epoch_replicate_is_applied_by_a_follower() {
     let room = room_self_follows(&m);
     let mut r = registry();
     let mut w = doc(9);
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, &room);
 
     assert!(r.deliver(peer, replicate(&mut w, &room, 1, b"a", 1)));
     assert_eq!(r.hub().seq(&room), 1, "the first leader's frame applied");
@@ -205,7 +218,7 @@ fn a_lower_epoch_replicate_is_fenced() {
     let room = room_self_follows(&m);
     let mut r = registry();
     let mut w = doc(9);
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, &room);
 
     // The room advances to epoch 2 under the promoted leader.
     assert!(r.deliver(peer, replicate(&mut w, &room, 1, b"a", 1)));
@@ -214,7 +227,7 @@ fn a_lower_epoch_replicate_is_fenced() {
     r.take_outbox(peer);
 
     // The stale primary replays at epoch 1 — fenced.
-    let stale = peer_conn(&mut r);
+    let stale = peer_conn(&mut r, &room);
     let kept = r.deliver(stale, replicate(&mut w, &room, 1, b"resurrected", 999));
     assert!(
         kept,
@@ -239,7 +252,7 @@ fn an_equal_epoch_replicate_still_applies() {
     let room = room_self_follows(&m);
     let mut r = registry();
     let mut w = doc(9);
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, &room);
 
     assert!(r.deliver(peer, replicate(&mut w, &room, 3, b"a", 1)));
     assert!(r.deliver(peer, replicate(&mut w, &room, 3, b"b", 2)));
@@ -260,7 +273,7 @@ fn a_promotion_bumps_the_epoch() {
     let mut r = registry();
     let mut w = doc(9);
     let c = client(&mut r);
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, &room);
 
     // While a follower, self observes epoch 5 from the live primary.
     assert!(r.deliver(peer, replicate(&mut w, &room, 5, b"seed", 1)));
@@ -301,7 +314,7 @@ fn a_rejected_frame_does_not_churn_a_leaders_epoch() {
     assert_eq!(originated_epoch(&mut r), Some(1));
 
     // A high-epoch frame on a non-main branch is rejected — it never applies.
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, &room);
     let mut frame = replicate(&mut w, &room, 99, b"v", 2);
     if let Message::Replicate { branch, .. } = &mut frame {
         *branch = b"feature".to_vec();
@@ -348,7 +361,7 @@ fn a_recovered_primary_steps_down_and_reconciles() {
 
     // The new leader's epoch-2 stream reaches self (as the placement primary, now
     // live again). Self steps down and applies it — converging on the new log.
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, &room);
     assert!(
         r.deliver(peer, replicate(&mut w, &room, 2, b"v", 2)),
         "self accepts the higher-epoch leader even as the placement primary",
@@ -389,7 +402,7 @@ fn a_follower_converges_on_the_new_leader_and_a_fenced_op_stays_out() {
     let mut r = registry();
     let mut old = doc(10);
     let mut new = doc(20);
-    let old_leader = peer_conn(&mut r);
+    let old_leader = peer_conn(&mut r, &room);
 
     // The old leader (epoch 1) commits a tail: a, then b.
     assert!(r.deliver(old_leader, replicate(&mut old, &room, 1, b"a", 1)));
@@ -399,7 +412,7 @@ fn a_follower_converges_on_the_new_leader_and_a_fenced_op_stays_out() {
 
     // The new leader takes over at epoch 2 with its own commit `c` (it never saw
     // `b`). The follower applies it — converging on the new leader's stream.
-    let new_leader = peer_conn(&mut r);
+    let new_leader = peer_conn(&mut r, &room);
     assert!(r.deliver(new_leader, replicate(&mut new, &room, 2, b"c", 3)));
     assert_eq!(
         r.hub().seq(&room),
@@ -434,7 +447,7 @@ fn single_node_ignores_the_epoch() {
     // refused by the cluster gate rather than for want of admission.
     r.set_cluster_secret(CLUSTER_SECRET.to_vec());
     let mut w = doc(9);
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, b"any");
     assert!(!r.deliver(peer, replicate(&mut w, b"any", 9, b"a", 1)));
     assert!(!r.deliver(peer, replicate(&mut w, b"any", 1, b"a", 1)));
     assert_eq!(r.hub().seq(b"any"), 0, "single-node applies no replicate");

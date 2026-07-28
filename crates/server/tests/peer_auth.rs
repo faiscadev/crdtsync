@@ -43,6 +43,9 @@ use crdtsync_server::{ConnId, ManualClock, Registry};
 const CH: Channel = Channel(0);
 const N: usize = 3;
 const SELF_ADDR: &str = "10.0.0.6:9000";
+/// Another member's advertise address — the id a peer link claims where the room
+/// under test places no other replica.
+const PEER_ADDR: &str = "10.0.0.1:9000";
 
 /// The deployment's cluster secret — what every node in one cluster holds and
 /// nobody else does.
@@ -106,14 +109,26 @@ fn registry() -> Registry {
     r
 }
 
-/// A connection admitted to the peer plane — what a legitimate member's link is
-/// once it has presented the secret.
-fn peer(r: &mut Registry) -> ConnId {
+/// A connection admitted to the peer plane as `room`'s leader — what a legitimate
+/// member's link is once it has presented the secret and named itself. The
+/// admission is the secret; the id it names is the member every gate downstream
+/// decides against, so it must be one that could really lead the room.
+fn peer(r: &mut Registry, room: &[u8]) -> ConnId {
+    let node = r
+        .membership()
+        .and_then(|m| m.replicas_for(room).into_iter().find(|n| !m.is_self(n)))
+        .unwrap_or_else(|| NodeId::from(PEER_ADDR));
+    peer_as(r, &node)
+}
+
+/// A connection admitted to the peer plane as the member `node`.
+fn peer_as(r: &mut Registry, node: &NodeId) -> ConnId {
     let id = r.connect();
     assert!(
         r.deliver(
             id,
             Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
                 secret: SECRET.to_vec(),
             },
         ),
@@ -432,6 +447,7 @@ fn a_wrong_secret_admits_nothing() {
     let kept = r.deliver(
         stranger,
         Message::PeerAuth {
+            node: PEER_ADDR.as_bytes().to_vec(),
             secret: b"cluster-secret-of-at-least-32-byteS".to_vec(),
         },
     );
@@ -447,6 +463,7 @@ fn a_wrong_secret_admits_nothing() {
     r.deliver(
         retry,
         Message::PeerAuth {
+            node: PEER_ADDR.as_bytes().to_vec(),
             secret: b"wrong".to_vec(),
         },
     );
@@ -460,7 +477,13 @@ fn an_empty_secret_admits_nothing() {
     // against a node whose own secret was set empty (which configures none).
     let mut r = registry();
     let stranger = r.connect();
-    assert!(!r.deliver(stranger, Message::PeerAuth { secret: Vec::new() },));
+    assert!(!r.deliver(
+        stranger,
+        Message::PeerAuth {
+            node: PEER_ADDR.as_bytes().to_vec(),
+            secret: Vec::new(),
+        },
+    ));
 
     let mut unset = Registry::new(cid(0xFF));
     unset.set_clock(Arc::new(ManualClock::new(0)));
@@ -468,7 +491,13 @@ fn an_empty_secret_admits_nothing() {
     unset.set_cluster_secret(Vec::new());
     let stranger = unset.connect();
     assert!(
-        !unset.deliver(stranger, Message::PeerAuth { secret: Vec::new() },),
+        !unset.deliver(
+            stranger,
+            Message::PeerAuth {
+                node: PEER_ADDR.as_bytes().to_vec(),
+                secret: Vec::new(),
+            },
+        ),
         "an empty secret configures no peer plane, so it opens none",
     );
 }
@@ -488,6 +517,7 @@ fn a_node_with_no_secret_has_no_peer_plane() {
         !r.deliver(
             stranger,
             Message::PeerAuth {
+                node: PEER_ADDR.as_bytes().to_vec(),
                 secret: SECRET.to_vec(),
             },
         ),
@@ -573,7 +603,7 @@ fn peer_admission_confers_no_client_rights() {
     let m = membership_for(SELF_ADDR);
     let room = room_self_follows(&m);
     let mut r = registry();
-    let p = peer(&mut r);
+    let p = peer(&mut r, &room);
 
     // Reach the room the only way a client can — and be refused at the handshake.
     let kept = r.deliver(p, sub(&room));
@@ -587,7 +617,7 @@ fn peer_admission_is_per_connection() {
     let m = membership_for(SELF_ADDR);
     let room = room_self_follows(&m);
     let mut r = registry();
-    let admitted = peer(&mut r);
+    let admitted = peer(&mut r, &room);
     let stranger = r.connect();
 
     assert!(!r.deliver(stranger, replicate(&mut doc(9), &room, 1, b"planted", 1)));
@@ -609,7 +639,7 @@ fn an_admitted_peer_replicates_as_before() {
     let m = membership_for(SELF_ADDR);
     let room = room_self_follows(&m);
     let mut r = registry();
-    let p = peer(&mut r);
+    let p = peer(&mut r, &room);
     let mut w = doc(9);
 
     assert!(r.deliver(p, replicate(&mut w, &room, 1, b"a", 1)));
@@ -636,11 +666,13 @@ fn an_admitted_peer_may_send_every_node_to_node_frame() {
     let room = room_self_follows(&m);
     let mut r = registry();
 
-    let snap = peer(&mut r);
+    let snap = peer(&mut r, &room);
     assert!(r.deliver(snap, replicate_snapshot(&room, 1)));
     assert_eq!(r.hub().seq(&room), 1, "the state transfer installed");
 
-    let gossiper = peer(&mut r);
+    // A gossip introduces the node that sent it (C13 — a peer introduces itself and
+    // nobody else), so the gossiper here is a joiner naming its own address.
+    let gossiper = peer_as(&mut r, &NodeId::from("10.9.9.9:9000"));
     let before = r.known_members().len();
     assert!(r.deliver(
         gossiper,
@@ -656,14 +688,14 @@ fn an_admitted_peer_may_send_every_node_to_node_frame() {
     assert_eq!(
         r.known_members().len(),
         before + 1,
-        "a member's gossip joins the advertised node",
+        "a member's gossip joins the node it introduced itself as",
     );
     assert!(r
         .take_outbox(gossiper)
         .iter()
         .any(|m| matches!(m, Message::Gossip { .. })));
 
-    let prober = peer(&mut r);
+    let prober = peer(&mut r, &room);
     assert!(r.deliver(
         prober,
         Message::PingReq {
@@ -692,7 +724,7 @@ fn an_admitted_peers_head_report_still_dials_a_catch_up() {
         .into_iter()
         .find(|n| !m.is_self(n))
         .expect("the room has a follower");
-    let p = peer(&mut r);
+    let p = peer(&mut r, &room);
     assert!(r.deliver(
         p,
         Message::FollowerHeads {

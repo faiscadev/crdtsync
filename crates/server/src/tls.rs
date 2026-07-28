@@ -14,10 +14,14 @@
 //! mTLS (client-cert authentication) is opt-in on top of that: configure a
 //! trust-anchor bundle and [`server_config_from_pem_with_client_ca`] swaps the
 //! `with_no_client_auth` slot for a [`WebPkiClientVerifier`] against those roots.
-//! A verified client cert's identity (its SAN, falling back to CN) is extracted
-//! with [`actor_from_client_cert`] and bound as the connection's authenticated
-//! actor — the same ACL principal an in-band credential establishes, reached over
-//! the transport instead.
+//! A verified client cert is read by two rules that are deliberately not the same.
+//! [`actor_from_client_cert`] is its subject as an ACL principal — a DNS, e-mail or
+//! URI SAN, else an IP SAN, else the Common Name — bound as the connection's
+//! authenticated actor, the same principal an in-band credential establishes, reached
+//! over the transport instead. [`host_names_from_client_cert`] is the narrower one the
+//! peer plane binds a *member* to: only the `dNSName` and `iPAddress` SANs, which are
+//! the kinds that name a host a CA vouches for reaching, and only where a `dNSName` is
+//! not itself an address.
 //!
 //! [`ClientAuthMode`] selects how strict the client-cert requirement is:
 //!
@@ -401,32 +405,302 @@ fn load_roots(
     Ok(roots)
 }
 
-/// The actor identity a verified client certificate authenticates as: the leaf
-/// cert's Subject Alternative Name (the first DNS, email, or URI entry), falling
-/// back to its Subject Common Name. `None` when the cert parses but carries
-/// neither — the caller treats that as a rejection, never as an anonymous or
-/// default actor, so an identity-less cert cannot slip past authentication.
+/// The textual form of an IP-address SAN's octets — dotted-quad for a v4 entry and
+/// the canonical compressed form for a v6 one, matching how an advertise address
+/// spells a host. `None` for any other length, which is not an IP address at all.
+fn ip_san(octets: &[u8]) -> Option<String> {
+    match octets.len() {
+        4 => {
+            let v4: [u8; 4] = octets.try_into().ok()?;
+            Some(std::net::Ipv4Addr::from(v4).to_string())
+        }
+        16 => {
+            let v6: [u8; 16] = octets.try_into().ok()?;
+            Some(std::net::Ipv6Addr::from(v6).to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The actor a verified client certificate authenticates as: its first Subject
+/// Alternative Name that names a principal — a DNS name, an e-mail address or a URI —
+/// then its first IP-address SAN, then its Subject Common Name. `None` when the cert
+/// parses but names nothing at all: the caller treats that as a rejection, never as an
+/// anonymous or default actor, so an identity-less cert cannot slip past
+/// authentication.
 ///
-/// The returned bytes are the UTF-8 of the name, fed into the same
-/// authenticated-actor plumbing an in-band credential's actor uses.
+/// The IP fallback sits *after* the named kinds so that a certificate spelling its
+/// subject both ways — `DNS:alice` alongside `IP:10.0.0.6`, whatever order the issuer
+/// emitted them in — authorizes as the name rather than the address. An ACL principal
+/// should not depend on SAN ordering.
+///
+/// The returned bytes are the UTF-8 of the name, fed into the same authenticated-actor
+/// plumbing an in-band credential's actor uses.
 pub fn actor_from_client_cert(leaf: &CertificateDer<'_>) -> Option<Vec<u8>> {
     let (_, cert) = X509Certificate::from_der(leaf.as_ref()).ok()?;
+    let mut ip = None;
     if let Ok(Some(san)) = cert.subject_alternative_name() {
         for name in &san.value.general_names {
-            let value = match name {
-                GeneralName::DNSName(s) | GeneralName::RFC822Name(s) | GeneralName::URI(s) => *s,
+            match name {
+                GeneralName::DNSName(s) | GeneralName::RFC822Name(s) | GeneralName::URI(s)
+                    if !s.is_empty() =>
+                {
+                    return Some(s.as_bytes().to_vec())
+                }
+                GeneralName::IPAddress(octets) if ip.is_none() => ip = ip_san(octets),
                 _ => continue,
-            };
-            if !value.is_empty() {
-                return Some(value.as_bytes().to_vec());
             }
         }
     }
-    let cn = cert
+    if let Some(addr) = ip {
+        return Some(addr.into_bytes());
+    }
+    return cert
         .subject()
         .iter_common_name()
         .filter_map(|cn| cn.as_str().ok())
         .find(|cn| !cn.is_empty())
         .map(|cn| cn.as_bytes().to_vec());
-    cn
+}
+
+/// Every *host* a verified client certificate names: its `dNSName` and `iPAddress`
+/// Subject Alternative Names, in certificate order, less any `dNSName` that is really
+/// an IP literal — an address is matched only against an `iPAddress` SAN, or the kind
+/// filter below would be undone one field over. Empty when it names no host.
+///
+/// This is deliberately a narrower reading than [`actor_from_client_cert`], and the
+/// difference is the whole of what makes a peer binding mean anything. A member's
+/// identity is the host of its advertise address, so only the SAN kinds that *are*
+/// host names may establish it — the same two kinds a TLS client checks when it
+/// verifies an acceptor against the address it dialed, which is the symmetry the
+/// binding rests on. An e-mail or URI SAN, and the Common Name, are free text a CA
+/// fills in for a subject rather than an address it vouches for reaching; admitting
+/// them would let a certificate legitimately issued for one node carry another node's
+/// host and speak as it, which is exactly the impersonation the binding exists to
+/// stop. There is no Common Name fallback here for the same reason.
+///
+/// All of them, not just the first, because a node certificate conventionally names
+/// its host several ways at once — `DNS:node-a.internal` alongside `IP:10.0.0.6` — and
+/// a cluster member is addressed by whichever of those its advertise address happens to
+/// spell.
+///
+/// A wildcard SAN is returned verbatim and therefore binds nothing, since
+/// [`cert_names_member`](crate::dial::cert_names_member) compares whole names. That is
+/// deliberate: `*.internal` would bind *every* member of that domain to one
+/// certificate, which is the per-member identity given up rather than established.
+pub fn host_names_from_client_cert(leaf: &CertificateDer<'_>) -> Vec<Vec<u8>> {
+    let Ok((_, cert)) = X509Certificate::from_der(leaf.as_ref()) else {
+        return Vec::new();
+    };
+    let mut hosts = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            let value = match name {
+                // A DNS name that is an IP literal is not one: RFC 6125 matches an
+                // address only against an `iPAddress` SAN, and admitting it here would
+                // undo the kind filter one field over — a certificate issued for one
+                // node carrying another node's address in a field that is not an
+                // address. Judged by the binding's own normalization, so a spelling it
+                // would fold into an address (`10.0.0.6.`) cannot pass here as a name.
+                GeneralName::DNSName(s) if !s.is_empty() && !crate::dial::is_ip_literal(s) => {
+                    (*s).to_string()
+                }
+                GeneralName::IPAddress(octets) => match ip_san(octets) {
+                    Some(addr) => addr,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            hosts.push(value.into_bytes());
+        }
+    }
+    hosts
+}
+
+/// The hosts the leading certificate in the PEM file at `path` names — this node's
+/// own peer identity, read from the same file its dials present. A deployment that
+/// requires peer identity checks it against its own advertise address before anything
+/// dials, so a certificate that names the wrong host is a startup error rather than a
+/// cluster whose every peer refuses this node.
+pub fn host_names_from_pem(path: impl AsRef<Path>) -> Result<Vec<Vec<u8>>, TlsConfigError> {
+    let path = path.as_ref();
+    let certs = load_certs(path)?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| TlsConfigError::NoCertificate(path.to_path_buf()))?;
+    Ok(host_names_from_client_cert(leaf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{actor_from_client_cert, host_names_from_client_cert, ip_san};
+    use tokio_rustls::rustls::pki_types::CertificateDer;
+
+    /// A self-signed leaf naming `sans` (rcgen reads an IP literal as an IP SAN and
+    /// anything else as a DNS name) with Common Name `cn`, as DER.
+    fn leaf(cn: &str, sans: &[&str]) -> CertificateDer<'static> {
+        let mut params =
+            rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        CertificateDer::from(cert.der().to_vec())
+    }
+
+    /// A self-signed leaf whose only SAN is the e-mail address `email`.
+    fn leaf_with_email(cn: &str, email: &str) -> CertificateDer<'static> {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::Rfc822Name(email.try_into().unwrap())];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        CertificateDer::from(cert.der().to_vec())
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn every_host_a_certificate_names_is_read_in_certificate_order() {
+        // A node cert conventionally spells its host both ways at once, and the member
+        // is addressed by whichever one its advertise address uses — so the peer
+        // binding needs all of them, not the leading one.
+        let der = leaf("node-a", &["node-a.internal", "10.0.0.6"]);
+        assert_eq!(
+            host_names_from_client_cert(&der),
+            vec![b"node-a.internal".to_vec(), b"10.0.0.6".to_vec()],
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn an_email_san_names_no_host() {
+        // The binding's whole point: a certificate an authority issued for one subject
+        // must not be able to carry another node's host in a field that is free text
+        // rather than an address. It still authenticates an actor.
+        let der = leaf_with_email("node-a", "node-b.internal");
+        assert!(host_names_from_client_cert(&der).is_empty());
+        assert_eq!(
+            actor_from_client_cert(&der).as_deref(),
+            Some(&b"node-b.internal"[..]),
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_uri_san_names_no_host() {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::URI("node-b.internal".try_into().unwrap())];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "node-a");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = CertificateDer::from(params.self_signed(&key).unwrap().der().to_vec());
+        assert!(host_names_from_client_cert(&der).is_empty());
+        assert_eq!(
+            actor_from_client_cert(&der).as_deref(),
+            Some(&b"node-b.internal"[..]),
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_dns_name_that_is_an_address_names_no_host() {
+        // RFC 6125 matches an address only against an `iPAddress` SAN. Admitting a
+        // `dNSName` that happens to be an IP literal would undo the kind filter one
+        // field over — a certificate for one node carrying another node's address in a
+        // field that is not an address.
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::DnsName("10.0.0.6".try_into().unwrap())];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "node-a");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = CertificateDer::from(params.self_signed(&key).unwrap().der().to_vec());
+        assert!(host_names_from_client_cert(&der).is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_dns_name_that_is_an_address_with_a_root_label_names_no_host() {
+        // The skip is judged by the binding's own normalization, so a spelling the
+        // comparison would fold into an address cannot pass here as a name.
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::DnsName("10.0.0.6.".try_into().unwrap())];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "node-a");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = CertificateDer::from(params.self_signed(&key).unwrap().der().to_vec());
+        assert!(host_names_from_client_cert(&der).is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_common_name_names_no_host() {
+        // The same, for the CN — which the actor rule *does* fall back to.
+        let der = leaf("node-b.internal", &[]);
+        assert!(host_names_from_client_cert(&der).is_empty());
+        assert_eq!(
+            actor_from_client_cert(&der).as_deref(),
+            Some(&b"node-b.internal"[..]),
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_session_authenticates_as_a_name_rather_than_an_address() {
+        // An ACL principal must not depend on the order an issuer emitted its SANs in,
+        // so the named kinds are preferred over an IP whichever way round they appear.
+        for sans in [
+            ["10.0.0.6", "alice"].as_slice(),
+            ["alice", "10.0.0.6"].as_slice(),
+        ] {
+            let der = leaf("node-a", sans);
+            assert_eq!(
+                actor_from_client_cert(&der).as_deref(),
+                Some(&b"alice"[..]),
+                "{sans:?}",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_certificate_naming_only_an_address_authenticates_as_it() {
+        let der = leaf("node-a", &["10.0.0.6"]);
+        assert_eq!(
+            actor_from_client_cert(&der).as_deref(),
+            Some(&b"10.0.0.6"[..]),
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_certificate_naming_nothing_authenticates_as_nothing() {
+        // Fail-closed: the caller rejects such a link rather than admitting it
+        // anonymously.
+        let der = leaf("", &[]);
+        assert_eq!(actor_from_client_cert(&der), None);
+        assert!(host_names_from_client_cert(&der).is_empty());
+    }
+
+    #[test]
+    fn an_ip_address_san_reads_as_the_address_a_member_advertises() {
+        assert_eq!(ip_san(&[127, 0, 0, 1]).as_deref(), Some("127.0.0.1"));
+        assert_eq!(ip_san(&[10, 0, 0, 6]).as_deref(), Some("10.0.0.6"));
+        let mut v6 = [0u8; 16];
+        v6[15] = 1;
+        assert_eq!(ip_san(&v6).as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn octets_of_no_address_length_read_as_nothing() {
+        assert_eq!(ip_san(&[]), None);
+        assert_eq!(ip_san(&[127, 0, 0]), None);
+        assert_eq!(ip_san(&[0u8; 17]), None);
+    }
 }

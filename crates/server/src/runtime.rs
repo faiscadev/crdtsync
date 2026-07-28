@@ -130,6 +130,31 @@ pub struct ServeConfig {
     /// plaintext member still writes the deployment-wide cluster secret in the
     /// clear, so the end state wants saying out loud rather than assuming.
     pub require_peer_tls: bool,
+    /// Refuse a peer link that presents no verified client certificate naming a
+    /// member — how a deployment declares that its members are *identified* and not
+    /// merely secret-holding. Off by default, which admits a link at the node id it
+    /// claims and so trusts every admitted member alike, exactly as a deployment
+    /// with no peer certificates must. Turning it on requires the other two halves of
+    /// the same posture (`client_cert_verification` and `peer_client_identity`), so
+    /// a node cannot demand of its peers what it does not itself present or check.
+    pub require_peer_identity: bool,
+    /// Whether this node's listener verifies client certificates — mirrors the
+    /// client-CA trust bundle the `tls` config was built with, which
+    /// `rustls::ServerConfig` does not expose. Without it no inbound link ever
+    /// carries a certificate, so no peer identity can be established. A *declaration*,
+    /// not a derivation: nothing cross-checks it against the config it describes, so
+    /// claiming it of a config built without a client CA yields a node that starts and
+    /// then refuses every peer link.
+    pub client_cert_verification: bool,
+    /// The hosts the client certificate this node presents on its peer dials names —
+    /// mirrors the identity the `peer_tls` config was built with, which
+    /// `rustls::ClientConfig` does not expose. `None` presents no identity at all, and
+    /// every peer running an identity-requiring policy then refuses this node; a
+    /// certificate naming hosts that do not include this node's own advertise host is
+    /// refused by them just as surely, so it is checked at startup wherever this node
+    /// verifies client certificates — whether or not identity is required. A
+    /// declaration, as above.
+    pub peer_client_identity: Option<Vec<Vec<u8>>>,
     /// The 32-byte zone-master key sealing cross-zone-move capability tokens.
     /// `Some` enables the authorized cross-zone-move escape hatch; `None` (the
     /// default) leaves it off, so every cross-zone move stays rejected. Server
@@ -156,6 +181,9 @@ impl Default for ServeConfig {
             tls: None,
             peer_tls: None,
             require_peer_tls: false,
+            require_peer_identity: false,
+            client_cert_verification: false,
+            peer_client_identity: None,
             zone_key: None,
             audit_log: None,
         }
@@ -180,14 +208,15 @@ enum Cmd {
     /// Open a connection, registering its outbound sink and a one-shot the actor
     /// fires to close a dropped connection. Any credential presented at the
     /// upgrade travels with it; the actor verifies it and replies with the
-    /// [`ConnOutcome`]. `cert_actor` is the identity a verified mTLS client cert
-    /// already established at the transport — when set it authenticates the
-    /// connection directly, ahead of any in-band credential.
+    /// [`ConnOutcome`]. `cert_identity` is what a verified mTLS client cert already
+    /// established at the transport — the actor it authenticates, which takes the
+    /// connection directly ahead of any in-band credential, and every host it names,
+    /// which is what the peer plane may bind a member to.
     Connect {
         writer: Sender<Message>,
         closer: oneshot::Sender<()>,
         credential: Option<Vec<u8>>,
-        cert_actor: Option<Vec<u8>>,
+        cert_identity: Option<(Vec<u8>, Vec<Vec<u8>>)>,
         reply: oneshot::Sender<ConnOutcome>,
     },
     /// Route one inbound message, replying whether the connection stays open.
@@ -357,6 +386,10 @@ async fn start_registry(
     // not at all. Checked first, ahead of the log replay and the accept loop, so a
     // misconfigured cluster fails immediately rather than after a long startup.
     let peer_secret = cluster_secret(&config)?;
+    // Refuse a deployment that demands peer identity without the two halves that
+    // could establish one, ahead of the dial policy for the same reason: it would
+    // otherwise present as a cluster whose every peer link is refused.
+    peer_identity_policy(&config)?;
     // Resolve the transport of every configured member and refuse a deployment
     // whose advertised transports cannot be honored — the silent non-convergence
     // this replaces was a TLS listener whose peers dialed plaintext forever.
@@ -444,11 +477,11 @@ async fn accept_loop(
                         // fall through. No peer cert means server-auth-only TLS or a
                         // request-mode certless client, so there is no cert actor and
                         // the credential/anonymous path applies.
-                        let cert_actor = match peer_cert_actor(&tls) {
-                            Ok(actor) => actor,
+                        let cert_identity = match peer_cert_identity(&tls) {
+                            Ok(identity) => identity,
                             Err(()) => return,
                         };
-                        handle(tls, cmds, cert_actor).await;
+                        handle(tls, cmds, cert_identity).await;
                     }
                 });
             }
@@ -459,22 +492,35 @@ async fn accept_loop(
     }
 }
 
-/// The authenticated actor a verified mTLS client cert establishes for its
-/// connection, read off the accepted TLS session's peer certificates.
+/// What a verified mTLS client cert establishes for its connection, read off the
+/// accepted TLS session's peer certificates: the actor it authenticates as, and every
+/// *host* it names.
 ///
-/// `Ok(None)` is a certless connection: the peer presented no cert — either mTLS
-/// is not configured (server-auth-only TLS) or it is configured in request mode
-/// (which admits cert absence) — and the connection authenticates through the
-/// credential/anonymous path instead. `Ok(Some(actor))` is a verified client cert whose
-/// leaf yields a SAN/CN identity. `Err(())` is the fail-closed case: a trusted
-/// cert that carries no usable identity — rejected, never admitted anonymously.
-fn peer_cert_actor(
+/// The two are read by different rules and are not interchangeable. The actor is the
+/// certificate's subject as an ACL principal — a name, an e-mail, a URI, or failing
+/// those an address or the Common Name. The hosts are only its `dNSName`/`iPAddress`
+/// SANs, since a peer link binds to the host of a member's advertise address and
+/// nothing else a certificate carries is an address a CA vouches for reaching
+/// ([`host_names_from_client_cert`](crate::tls::host_names_from_client_cert)).
+///
+/// `Ok(None)` is a certless connection: the peer presented no cert — either mTLS is
+/// not configured (server-auth-only TLS) or it is configured in request mode (which
+/// admits cert absence) — and the connection authenticates through the
+/// credential/anonymous path instead. `Ok(Some(..))` is a verified client cert that
+/// authenticates an actor; its host list may still be empty, which simply binds no
+/// member. `Err(())` is the fail-closed case: a trusted cert that names no actor at
+/// all — rejected, never admitted anonymously.
+#[allow(clippy::type_complexity)]
+fn peer_cert_identity(
     tls: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-) -> Result<Option<Vec<u8>>, ()> {
+) -> Result<Option<(Vec<u8>, Vec<Vec<u8>>)>, ()> {
     let (_, conn) = tls.get_ref();
     match conn.peer_certificates() {
         None | Some([]) => Ok(None),
-        Some([leaf, ..]) => crate::tls::actor_from_client_cert(leaf).map(Some).ok_or(()),
+        Some([leaf, ..]) => {
+            let actor = crate::tls::actor_from_client_cert(leaf).ok_or(())?;
+            Ok(Some((actor, crate::tls::host_names_from_client_cert(leaf))))
+        }
     }
 }
 
@@ -573,6 +619,7 @@ async fn registry_actor(
     if let Some(secret) = config.cluster_secret.clone() {
         reg.set_cluster_secret(secret);
     }
+    reg.set_require_peer_identity(config.require_peer_identity);
     if let Some(webhook) = webhook {
         reg.add_event_sink(Box::new(webhook));
     }
@@ -589,7 +636,7 @@ async fn registry_actor(
                         writer,
                         closer,
                         credential,
-                        cert_actor,
+                        cert_identity,
                         reply,
                     } => {
                         // A verified mTLS client cert has already established this
@@ -601,10 +648,12 @@ async fn registry_actor(
                         // Auth phase; a bad one is refused. With neither the
                         // connection is anonymous if policy allows, else it must
                         // authenticate in band.
-                        let outcome = match (cert_actor, credential) {
-                            (Some(actor), _) => ConnOutcome::Open {
-                                id: reg
-                                    .connect_authenticated(Identity::new(actor.clone())),
+                        let outcome = match (cert_identity, credential) {
+                            (Some((actor, hosts)), _) => ConnOutcome::Open {
+                                id: reg.connect_cert_authenticated(
+                                    Identity::new(actor.clone()),
+                                    hosts,
+                                ),
                                 authok: Some(actor),
                             },
                             (None, Some(cred)) => match reg.verify_credential(&cred) {
@@ -782,6 +831,123 @@ fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
     }
 }
 
+/// Refuse a deployment whose peer-identity policy cannot be honored.
+///
+/// One refusal does not wait for the policy: **a certificate this node presents on its
+/// dials must name the host of the id it dials under.** A peer applies its own binding
+/// to it, and that binding refuses a presented certificate which binds nothing — so a
+/// node with a certificate for the wrong host has every link refused, silently, whether
+/// or not *this* deployment requires identity. It is decidable here, so it is decided
+/// here — but *fatally* only where this node verifies client certificates, which is a
+/// proxy for whether its peers request one: exact in a homogeneous deployment, wrong in
+/// both directions during a rolling change. Where this node's own evidence says no
+/// certificate is asked for it warns instead, since the deployment may be perfectly
+/// inert and breaking it to report a failure that may not exist is the worse error.
+///
+/// The rest apply only where identity is *required*, since requiring it means refusing
+/// every peer link that carries no verified certificate naming a member, which needs
+/// the whole posture in place:
+///
+///  - a cluster at all — a single-node deployment has no peer plane to identify;
+///  - **a listener that verifies client certificates**, or no inbound link ever
+///    carries one and every peer is refused;
+///  - **a client identity of this node's own on its outbound dials**, or every peer
+///    running the same policy refuses this node — the same symmetry
+///    `CRDTSYNC_CLUSTER_REQUIRE_TLS` has, where a node that requires TLS of its peers
+///    must terminate it itself;
+///  - **a member set whose every advertise address names a host**, since the host is
+///    what a certificate binds to and a member whose address yields none could never
+///    be identified.
+///
+/// A member's *advertised transport* is deliberately not among them: the scheme
+/// describes that member's own listener, while the link carrying its identity into
+/// this node is the one it dials — which lands on this node's listener and presents
+/// its certificate whatever it advertises for itself. Refusing the secret to a
+/// plaintext member is `CRDTSYNC_CLUSTER_REQUIRE_TLS`'s separate declaration.
+///
+/// Each is the cluster-wide non-convergence an operator would otherwise meet as links
+/// that open and immediately close.
+fn peer_identity_policy(config: &ServeConfig) -> std::io::Result<()> {
+    let invalid =
+        |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string());
+    // The peers apply this node's own rule to this node's own certificate, so that half
+    // of their decision is decidable here — and it binds whether or not this deployment
+    // requires identity *of them*.
+    //
+    // Whether it is *fatal* turns on whether a peer will ever ask for the certificate,
+    // which this node cannot see. Its own listener is the only evidence available, and
+    // it is a proxy: exact in the homogeneous deployment the docs prescribe, and wrong
+    // in both directions during a rolling change, when the two settings land on a node
+    // one at a time. So the node refuses where its own evidence says a certificate is
+    // asked for, and says so out loud otherwise — rather than breaking a deployment
+    // that may be perfectly inert, or starting silently into a cluster that will refuse
+    // every link it opens.
+    //
+    // A self address that names no host is refused for being unaddressable — by the
+    // member loop below where identity is required, by the dial policy otherwise —
+    // and either message names the problem it actually is. Repeating it here as a
+    // certificate naming the wrong host would send the operator to the wrong file.
+    if let (Some(own_hosts), Some(membership)) = (&config.peer_client_identity, &config.membership)
+    {
+        let self_addr = membership.self_id().as_bytes();
+        let unbound = crate::dial::member_host(self_addr).is_some()
+            && !own_hosts
+                .iter()
+                .any(|host| crate::dial::cert_names_member(host, self_addr));
+        if unbound {
+            let addr = String::from_utf8_lossy(self_addr);
+            let advice = format!(
+                "this node's peer certificate names no host binding it to the node id it dials \
+                 under, `{addr}`: give the certificate an iPAddress SAN for that address, or a \
+                 dNSName SAN for that host name"
+            );
+            if config.client_cert_verification {
+                return Err(invalid(&format!(
+                    "{advice} — every peer that verifies client certificates refuses its links"
+                )));
+            }
+            eprintln!(
+                "crdtsync: {advice}. This node verifies no client certificate itself, so it \
+                 cannot tell whether its peers request one; where any of them does, it will \
+                 refuse every link this node opens."
+            );
+        }
+    }
+    if !config.require_peer_identity {
+        return Ok(());
+    }
+    let Some(membership) = &config.membership else {
+        return Err(invalid(
+            "requiring peer identity needs a cluster membership: single-node mode has no peer \
+             plane",
+        ));
+    };
+    if !config.client_cert_verification {
+        return Err(invalid(
+            "this node requires an identified peer but verifies no client certificate: set \
+             CRDTSYNC_TLS_CLIENT_CA, or no peer link can present an identity and every one is \
+             refused",
+        ));
+    }
+    if config.peer_client_identity.is_none() {
+        return Err(invalid(
+            "this node requires an identified peer but presents no identity of its own: set \
+             CRDTSYNC_CLUSTER_CLIENT_CERT and CRDTSYNC_CLUSTER_CLIENT_KEY, or every peer running \
+             the same policy refuses it",
+        ));
+    }
+    for (node, _) in membership.known_members() {
+        if crate::dial::member_host(node.as_bytes()).is_none() {
+            let addr = String::from_utf8_lossy(node.as_bytes());
+            return Err(invalid(&format!(
+                "cluster member `{addr}` names no host, so no certificate could identify it: an \
+                 identified cluster addresses each member as `host:port` (bracket an IPv6 literal)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build the dialer every outbound node-to-node link runs under, validating that
 /// this deployment's advertised transports can actually be honored. A single-node
 /// deployment has no peer plane and gets none — peer-dial TLS material configured
@@ -791,7 +957,9 @@ fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
 /// The four refusals are all the same failure the operator would otherwise meet as
 /// a cluster that starts, binds, and never converges:
 ///
-///  - a member's advertise address that resolves to no endpoint at all;
+///  - a member's advertise address that resolves to no endpoint at all — an unknown
+///    scheme, an empty authority, or one naming no host, which is dialable by nobody
+///    and bindable to no certificate;
 ///  - **this node's own advertised transport disagreeing with the one it
 ///    terminates** — a node that terminates TLS while telling its peers to dial
 ///    `ws://` (or the reverse) is unreachable to every one of them, which is the
@@ -819,7 +987,12 @@ fn peer_dialer(
         }
         return Ok(None);
     };
-    let dialer = PeerDialer::new(secret, config.peer_tls.clone(), config.require_peer_tls);
+    let dialer = PeerDialer::new(
+        Arc::from(membership.self_id().as_bytes()),
+        secret,
+        config.peer_tls.clone(),
+        config.require_peer_tls,
+    );
     let mut plaintext_peers = Vec::new();
     for (node, addr) in membership.known_members() {
         let addr = String::from_utf8_lossy(&addr).into_owned();
@@ -1168,8 +1341,12 @@ async fn peer_connection(
                     eprintln!(
                         "crdtsync: peer {addr} keeps closing this node's link as soon as it \
                          opens — usually a CRDTSYNC_CLUSTER_SECRET that does not match the \
-                         rest of the cluster, or a protocol version this node cannot speak; \
-                         this node will not replicate to it until that is fixed",
+                         rest of the cluster, a peer certificate that does not name this \
+                         node's advertise host (or none at all where the peer requires one), \
+                         or a protocol version this node cannot speak. A peer that has not \
+                         yet learned this node, or that places its rooms differently, drops \
+                         links the same way for the few gossip rounds a join takes to \
+                         converge; a streak that does not end is a misconfiguration",
                     );
                 }
                 // The link dropped: the follower is unreachable until it redials.
@@ -1202,9 +1379,10 @@ type PeerRead = futures_util::stream::SplitStream<PeerStream>;
 
 /// Dial the follower over the transport its advertise address declares and open
 /// the relay peer connection: the 8-byte header, an empty-`app_id` `Hello` that
-/// resolves to a relay, then the `PeerAuth` carrying the cluster secret — which is
-/// what admits the link to the follower's peer plane, since the `Hello` names the
-/// same reserved replica id every node dials under.
+/// resolves to a relay, then the `PeerAuth` carrying the cluster secret and this
+/// node's own id — the secret is what admits the link to the follower's peer plane
+/// and the id is the member it is admitted as, since the `Hello` names the same
+/// reserved replica id every node dials under.
 ///
 /// On a TLS member the dial has already verified the follower's certificate
 /// against this node's peer trust anchors by the time the header is written, so the
@@ -1215,7 +1393,7 @@ async fn connect_peer(
     server: ClientId,
 ) -> Result<(PeerWrite, PeerRead), crate::dial::DialError> {
     let ws = dialer.connect(addr).await?;
-    let opened = open_peer_link(ws, server, dialer.secret()).await;
+    let opened = open_peer_link(ws, server, dialer.node(), dialer.secret()).await;
     opened.ok_or(crate::dial::DialError::Unreachable)
 }
 
@@ -1224,6 +1402,7 @@ async fn connect_peer(
 async fn open_peer_link(
     ws: PeerStream,
     server: ClientId,
+    node: &[u8],
     secret: &[u8],
 ) -> Option<(PeerWrite, PeerRead)> {
     let (mut write, read) = ws.split();
@@ -1245,6 +1424,7 @@ async fn open_peer_link(
         .await
         .ok()?;
     let auth = Message::PeerAuth {
+        node: node.to_vec(),
         secret: secret.to_vec(),
     };
     write
@@ -1361,11 +1541,15 @@ fn query_credential(req: &Request) -> Option<Vec<u8>> {
 
 /// Drive one connection: handshake, then the message loop, then teardown.
 /// Generic over the transport so the same driver serves a plaintext `TcpStream`
-/// and a TLS-wrapped stream — the wire protocol is transport-agnostic. `cert_actor`
-/// is the identity a verified mTLS client cert established at the transport, if
-/// any; it authenticates the connection ahead of any in-band credential.
-async fn handle<S>(stream: S, cmds: UnboundedSender<Cmd>, cert_actor: Option<Vec<u8>>)
-where
+/// and a TLS-wrapped stream — the wire protocol is transport-agnostic.
+/// `cert_identity` is what a verified mTLS client cert established at the transport,
+/// if any: the actor it authenticates ahead of any in-band credential, and the hosts
+/// it names.
+async fn handle<S>(
+    stream: S,
+    cmds: UnboundedSender<Cmd>,
+    cert_identity: Option<(Vec<u8>, Vec<Vec<u8>>)>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Read any credential off the upgrade request across the supported carriers.
@@ -1399,7 +1583,7 @@ where
             writer: out.clone(),
             closer: close_tx,
             credential,
-            cert_actor,
+            cert_identity,
             reply: reply_tx,
         })
         .is_err()

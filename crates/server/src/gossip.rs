@@ -112,11 +112,13 @@ pub fn merge_into(membership: &mut Membership, payload: Vec<(Vec<u8>, Vec<u8>, u
 /// its (now-merged) view back and `initiator` merges that. Both hold the merged
 /// liveness afterward. **Only the `initiator` credits the peer reachable** — it is
 /// the side that directly probed. This mirrors the wire path faithfully: the dialed
-/// node ([`Registry::apply_gossip`]) merges the frame but cannot identify the dialer
-/// to credit it, so a node learns a peer alive on its *own* next initiated round,
-/// not from being dialed. (Crediting an inbound sender — and so tolerating a one-way
-/// partition where A can reach B but not vice-versa — needs sender identification or
-/// SWIM indirect probing, a deferred refinement.)
+/// node ([`Registry::apply_gossip`]) merges the frame but does not credit the dialer
+/// reachable from it, so a node learns a peer alive on its *own* next initiated round,
+/// not from being dialed. The dialer's identity is now known — the link is bound to a
+/// member — so what holds the credit back is no longer that: an inbound frame proves
+/// only that the sender reached *here*, and the reverse path is what this node's own
+/// probe measures. The one-way partition it would otherwise tolerate is already
+/// covered by SWIM indirect probing.
 pub fn exchange(initiator: &mut Membership, peer: &mut Membership) {
     let peer_id = peer.self_id().clone();
     peer.merge_liveness(initiator.known_liveness());
@@ -287,10 +289,12 @@ async fn relay_roundtrip<T>(
             .send(WsMessage::Binary(encode_message(&hello)))
             .await
             .ok()?;
-        // The cluster secret is what admits the node-to-node frame that follows —
-        // the Hello names the reserved replica id every node dials under, so it
-        // distinguishes nothing.
+        // The cluster secret is what admits the node-to-node frame that follows, and
+        // the node id is what the relay binds this link's identity to — the Hello
+        // names the reserved replica id every node dials under, so it distinguishes
+        // nothing.
         let auth = Message::PeerAuth {
+            node: dialer.node().to_vec(),
             secret: dialer.secret().to_vec(),
         };
         write

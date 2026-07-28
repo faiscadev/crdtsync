@@ -162,12 +162,24 @@ fn client(r: &mut Registry) -> crdtsync_server::ConnId {
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
 /// A connection admitted to `r`'s peer plane, as a member's dialed link is.
-fn peer_conn(r: &mut Registry) -> ConnId {
+fn peer_conn(r: &mut Registry, room: &[u8]) -> ConnId {
+    let node = r
+        .membership()
+        .and_then(|m| m.replicas_for(room).into_iter().find(|n| !m.is_self(n)))
+        .unwrap_or_else(|| NodeId::from("10.0.0.1:9000"));
+    peer_conn_as(r, &node)
+}
+
+/// A connection admitted to the peer plane as the member `node` — peer admission
+/// binds the link to a member, and every node-to-node frame on it is decided
+/// against that identity rather than anything the frame itself names.
+fn peer_conn_as(r: &mut Registry, node: &NodeId) -> ConnId {
     let id = r.connect();
     assert!(
         r.deliver(
             id,
             Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
                 secret: CLUSTER_SECRET.to_vec(),
             },
         ),
@@ -374,7 +386,7 @@ fn a_follower_applies_only_while_its_leader_is_live() {
     // The leader is explicitly live (its relay link is up), so self stays a
     // follower — the steady-state Unit-4 path, unchanged by liveness tracking.
     r.set_peer_liveness(primary.clone(), true);
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, &room);
 
     // While self follows, a Replicate from the leader applies.
     let ops = doc(1).transact(|tx| tx.register(b"a", Scalar::Int(1)));
@@ -394,7 +406,7 @@ fn a_follower_applies_only_while_its_leader_is_live() {
     // the (now down) old primary — a self-led room never accepts a Replicate.
     r.set_peer_liveness(primary, false);
     let ops = doc(1).transact(|tx| tx.register(b"b", Scalar::Int(2)));
-    let peer2 = peer_conn(&mut r);
+    let peer2 = peer_conn(&mut r, &room);
     assert!(
         !r.deliver(
             peer2,

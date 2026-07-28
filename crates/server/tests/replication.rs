@@ -120,12 +120,24 @@ fn room_led_by_a_with_b_follower() -> Vec<u8> {
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
 /// A connection admitted to `r`'s peer plane, as a member's dialed link is.
-fn peer_conn(r: &mut Registry) -> ConnId {
+fn peer_conn(r: &mut Registry, room: &[u8]) -> ConnId {
+    let node = r
+        .membership()
+        .and_then(|m| m.replicas_for(room).into_iter().find(|n| !m.is_self(n)))
+        .unwrap_or_else(|| NodeId::from("10.0.0.1:9000"));
+    peer_conn_as(r, &node)
+}
+
+/// A connection admitted to the peer plane as the member `node` — peer admission
+/// binds the link to a member, and every node-to-node frame on it is decided
+/// against that identity rather than anything the frame itself names.
+fn peer_conn_as(r: &mut Registry, node: &NodeId) -> ConnId {
     let id = r.connect();
     assert!(
         r.deliver(
             id,
             Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
                 secret: CLUSTER_SECRET.to_vec(),
             },
         ),
@@ -228,7 +240,7 @@ fn a_follower_applies_a_replicate_and_advances_the_leader_watermark() {
 
     // B, a follower of the room, applies it into its own replica.
     let mut follower = node(Some(B));
-    let peer = peer_conn(&mut follower);
+    let peer = peer_conn(&mut follower, &room);
     assert!(follower.deliver(peer, frame));
     assert_eq!(follower.hub().seq(&room), 1, "the op reached B's replica");
     let outbox = follower.take_outbox(peer);
@@ -268,7 +280,7 @@ fn a_follower_drops_a_branch_replicate() {
     // apply it to a branch it may not hold and falsely ack.
     let room = room_led_by_a_with_b_follower();
     let mut follower = node(Some(B));
-    let peer = peer_conn(&mut follower);
+    let peer = peer_conn(&mut follower, &room);
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
     let kept = follower.deliver(
         peer,
@@ -335,7 +347,7 @@ fn a_follower_ignores_a_replicate_for_a_room_it_leads() {
         .expect("a room A leads");
 
     let mut leader = node(Some(A));
-    let peer = peer_conn(&mut leader);
+    let peer = peer_conn(&mut leader, &room);
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
     let kept = leader.deliver(
         peer,
@@ -386,7 +398,7 @@ fn single_node_rejects_a_replicate() {
     // A secret with no membership: the peer plane opens, so the frames below are
     // refused by the cluster gate rather than for want of admission.
     r.set_cluster_secret(CLUSTER_SECRET.to_vec());
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, b"any-room");
     let ops = doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)));
     let kept = r.deliver(
         peer,
@@ -499,6 +511,7 @@ async fn a_follower_applies_a_replicate_over_the_socket_and_acks() {
     send_frame(
         &mut ws,
         &Message::PeerAuth {
+            node: leader_addr.as_bytes().to_vec(),
             secret: CLUSTER_SECRET.to_vec(),
         },
     )
@@ -551,6 +564,7 @@ async fn a_leader_dials_a_follower_and_sends_a_replicate() {
     // link before any node-to-node frame, or a real follower would refuse it — so
     // assert the PeerAuth arrives first.
     let expected_room = room.clone();
+    let expected_leader = leader_id.clone().into_bytes();
     let follower = tokio::spawn(async move {
         let (stream, _) = follower_listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
@@ -558,10 +572,14 @@ async fn a_leader_dials_a_follower_and_sends_a_replicate() {
         loop {
             match ws.next().await.unwrap().unwrap() {
                 WsMessage::Binary(b) => match decode_message(&b) {
-                    Ok(Message::PeerAuth { secret }) => {
+                    Ok(Message::PeerAuth { node, secret }) => {
                         assert_eq!(
                             secret, CLUSTER_SECRET,
                             "the link presents the cluster secret"
+                        );
+                        assert_eq!(
+                            node, expected_leader,
+                            "the link claims the dialing node's own id"
                         );
                         admitted = true;
                     }

@@ -49,7 +49,12 @@ const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 /// The dialer these socket tests dial under: this cluster's secret, no client-side
 /// TLS — every node here advertises a bare `host:port`, which is plaintext.
 fn plaintext_dialer() -> crdtsync_server::dial::PeerDialer {
-    crdtsync_server::dial::PeerDialer::new(std::sync::Arc::from(CLUSTER_SECRET), None, false)
+    crdtsync_server::dial::PeerDialer::new(
+        std::sync::Arc::from(&b"10.0.0.9:9000"[..]),
+        std::sync::Arc::from(CLUSTER_SECRET),
+        None,
+        false,
+    )
 }
 
 #[test]

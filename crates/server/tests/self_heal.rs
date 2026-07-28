@@ -137,8 +137,8 @@ fn ops_dialed_to(frames: &[(NodeId, Message)], b: &NodeId) -> usize {
 }
 
 /// Apply every frame dialed to `b` into `follower`.
-fn apply_to(follower: &mut Registry, frames: Vec<(NodeId, Message)>, b: &NodeId) {
-    let peer = peer_conn(follower);
+fn apply_to(follower: &mut Registry, frames: Vec<(NodeId, Message)>, b: &NodeId, leader: &NodeId) {
+    let peer = peer_conn_as(follower, leader);
     for (n, frame) in frames {
         if &n == b {
             assert!(follower.deliver(peer, frame));
@@ -152,12 +152,24 @@ fn apply_to(follower: &mut Registry, frames: Vec<(NodeId, Message)>, b: &NodeId)
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
 /// A connection admitted to `r`'s peer plane, as a member's dialed link is.
-fn peer_conn(r: &mut Registry) -> ConnId {
+fn peer_conn(r: &mut Registry, room: &[u8]) -> ConnId {
+    let node = r
+        .membership()
+        .and_then(|m| m.replicas_for(room).into_iter().find(|n| !m.is_self(n)))
+        .unwrap_or_else(|| NodeId::from("10.0.0.1:9000"));
+    peer_conn_as(r, &node)
+}
+
+/// A connection admitted to the peer plane as the member `node` — peer admission
+/// binds the link to a member, and every node-to-node frame on it is decided
+/// against that identity rather than anything the frame itself names.
+fn peer_conn_as(r: &mut Registry, node: &NodeId) -> ConnId {
     let id = r.connect();
     assert!(
         r.deliver(
             id,
             Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
                 secret: CLUSTER_SECRET.to_vec(),
             },
         ),
@@ -211,7 +223,7 @@ fn a_fully_wiped_follower_at_zero_gets_the_whole_log_byte_identically() {
     assert_eq!(ops_dialed_to(&frames, &b), 3, "the whole log is dialed");
 
     let mut follower = node(Some(B));
-    apply_to(&mut follower, frames, &b);
+    apply_to(&mut follower, frames, &b, &NodeId::from_addr(A));
     assert_eq!(follower.hub().seq(&room), 3);
     assert_eq!(
         follower.hub().export_room(&room),
@@ -254,7 +266,7 @@ fn a_wiped_below_floor_follower_reporting_gets_a_snapshot() {
     );
 
     let mut follower = node(Some(B));
-    apply_to(&mut follower, frames, &b);
+    apply_to(&mut follower, frames, &b, &NodeId::from_addr(A));
     assert_eq!(follower.hub().seq(&room), 3);
     assert_eq!(
         follower.hub().export_room(&room),
@@ -397,7 +409,8 @@ fn a_follower_reports_and_the_leader_catches_it_up_through_the_frame() {
     leader.take_replication();
 
     // A brand-new follower B (holding nothing) reports its heads to its leader A. Its
-    // manifest is empty (it holds no rooms yet), and the frame names B as reporter.
+    // manifest is empty (it holds no rooms yet), and the frame names B as reporter —
+    // which its own link must have been admitted as.
     let mut follower = node(Some(B));
     follower.report_heads_to(&a);
     let reports = follower.take_replication();
@@ -415,9 +428,10 @@ fn a_follower_reports_and_the_leader_catches_it_up_through_the_frame() {
         other => panic!("expected FollowerHeads, got {other:?}"),
     }
 
-    // The leader receives the self-describing report and catches B up from head 0
-    // (fail-closed, empty manifest) — no connection identity needed.
-    let peer = peer_conn(&mut leader);
+    // The leader receives B's report on B's own link and catches it up from head 0
+    // (fail-closed, empty manifest). The reporter it names must be the member the
+    // link was admitted as (C13) — a node reports its own heads and no other's.
+    let peer = peer_conn_as(&mut leader, &b);
     for (_, frame) in reports {
         leader.deliver(peer, frame);
     }
@@ -428,7 +442,7 @@ fn a_follower_reports_and_the_leader_catches_it_up_through_the_frame() {
         "the leader dials the whole log"
     );
 
-    apply_to(&mut follower, frames, &b);
+    apply_to(&mut follower, frames, &b, &NodeId::from_addr(A));
     assert_eq!(follower.hub().seq(&room), 3);
     assert_eq!(
         follower.hub().export_room(&room),
@@ -478,7 +492,7 @@ fn reporting_a_room_this_node_does_not_lead_dials_nothing() {
     // Seed the room on A via a replicated frame so it exists in A's hub.
     let mut w = doc(7);
     let ops = w.transact(|tx| tx.register(b"x", Scalar::Int(1)));
-    let peer = peer_conn(&mut a_node);
+    let peer = peer_conn(&mut a_node, &room);
     a_node.deliver(
         peer,
         Message::Replicate {

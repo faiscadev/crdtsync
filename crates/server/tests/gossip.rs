@@ -105,19 +105,38 @@ fn tuple(
 /// of the node-to-node handlers (C10).
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
-/// The dialer these socket tests dial under: this cluster's secret, no client-side
-/// TLS — every node here advertises a bare `host:port`, which is plaintext.
-fn plaintext_dialer() -> crdtsync_server::dial::PeerDialer {
-    crdtsync_server::dial::PeerDialer::new(std::sync::Arc::from(CLUSTER_SECRET), None, false)
+/// The dialer these socket tests dial under, claiming to be the member `node`:
+/// this cluster's secret, no client-side TLS — every node here advertises a bare
+/// `host:port`, which is plaintext. The claimed id is what the dialed node binds the
+/// link to, and a peer introduces only itself (C13).
+fn plaintext_dialer_as(node: &str) -> crdtsync_server::dial::PeerDialer {
+    crdtsync_server::dial::PeerDialer::new(
+        std::sync::Arc::from(node.as_bytes()),
+        std::sync::Arc::from(CLUSTER_SECRET),
+        None,
+        false,
+    )
 }
 
 /// A connection admitted to `r`'s peer plane, as a member's dialed link is.
-fn peer_conn(r: &mut Registry) -> ConnId {
+fn peer_conn(r: &mut Registry, room: &[u8]) -> ConnId {
+    let node = r
+        .membership()
+        .and_then(|m| m.replicas_for(room).into_iter().find(|n| !m.is_self(n)))
+        .unwrap_or_else(|| NodeId::from("10.0.0.1:9000"));
+    peer_conn_as(r, &node)
+}
+
+/// A connection admitted to the peer plane as the member `node` — peer admission
+/// binds the link to a member, and every node-to-node frame on it is decided
+/// against that identity rather than anything the frame itself names.
+fn peer_conn_as(r: &mut Registry, node: &NodeId) -> ConnId {
     let id = r.connect();
     assert!(
         r.deliver(
             id,
             Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
                 secret: CLUSTER_SECRET.to_vec(),
             },
         ),
@@ -322,7 +341,7 @@ fn a_single_node_registry_knows_no_members_and_ignores_gossip() {
     assert!(r.membership().is_none());
 
     // A stray Gossip frame on a single-node node drops the connection.
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, b"any-room");
     let kept = r.deliver(
         peer,
         Message::Gossip {
@@ -739,7 +758,9 @@ async fn a_gossip_exchange_over_the_socket_merges_and_replies() {
     };
     let server = tokio::spawn(serve_with(listener, cid(0xFF), None, config));
 
-    // Advertise C to the node and read back the set it now knows.
+    // C dials in and introduces itself, then reads back the set the node now knows.
+    // A peer introduces only itself, so this is the join path: C learns A and B from
+    // the reply and goes on to introduce itself to each of them directly.
     let frame = Message::Gossip {
         members: vec![(
             C.as_bytes().to_vec(),
@@ -748,18 +769,18 @@ async fn a_gossip_exchange_over_the_socket_merges_and_replies() {
             MemberState::Alive,
         )],
     };
-    let learned = gossip_exchange(&addr, cid(0xEE), &plaintext_dialer(), frame)
+    let learned = gossip_exchange(&addr, cid(0xEE), &plaintext_dialer_as(C), frame)
         .await
         .expect("the node replies with its member set");
 
-    // The reply carries the node's members — its original A and B, plus the C we
-    // just taught it (the union is bidirectional in one exchange).
+    // The reply carries the node's members — its original A and B, plus the C that
+    // just introduced itself (the union is bidirectional in one exchange).
     let ids: Vec<Vec<u8>> = learned.iter().map(|(n, ..)| n.clone()).collect();
     assert!(ids.contains(&A.as_bytes().to_vec()), "reply includes A");
     assert!(ids.contains(&B.as_bytes().to_vec()), "reply includes B");
     assert!(
         ids.contains(&C.as_bytes().to_vec()),
-        "reply includes the learned C"
+        "reply includes the joined C"
     );
     server.abort();
 }
