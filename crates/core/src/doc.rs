@@ -2050,9 +2050,9 @@ impl Document {
             // The drain replays these straight through `apply_now`, so an op the
             // live `apply` seam would refuse must not reach state through the
             // snapshot seam instead.
-            if !stamp_names_its_author(op) {
+            if !stamp_names_its_author(op) || !stamp_leaves_a_successor(op) {
                 return Err(DecodeError::BadTag {
-                    what: "document: buffered op stamped under another client",
+                    what: "document: buffered op the mint could not count past",
                     tag: 0,
                 });
             }
@@ -2076,7 +2076,15 @@ impl Document {
             root_id,
         );
 
-        let stamp_high_water = cur.take_stamp_high_water();
+        // The encoded buffer decodes through a cursor of its own, so its stamps are
+        // not in the tracked total — and a waiting op's ids are held just as much as
+        // an applied one's. Fold them in here rather than relying on the drain: an
+        // op that stays buffered never reaches `apply_kind` at all.
+        let mut stamp_high_water = cur.take_stamp_high_water();
+        for op in &buffer {
+            let slot = stamp_high_water.entry(op.stamp.client).or_insert((0, 0));
+            *slot = (*slot).max(reservation_end(op.stamp, span(&op.kind)));
+        }
         let mut doc = Document {
             client,
             root,
@@ -2384,7 +2392,7 @@ impl Document {
         // [`mint_floor`](Self::mint_floor)'s job, on this path and on the buffer a
         // decode drains alike. This raises the bar to impersonating an identity
         // rather than merely naming one, which is a transport-authenticated claim.
-        if !stamp_names_its_author(op) {
+        if !stamp_names_its_author(op) || !stamp_leaves_a_successor(op) {
             return false;
         }
         // A member declaring a group size outside the representable range is
@@ -2406,12 +2414,19 @@ impl Document {
         // completes immediately. A member whose own dependencies are unmet at
         // that point keeps waiting on its own, so `apply` reports `false` for it.
         if op.tx.is_some() {
+            self.record_stamp(op.stamp, span(&op.kind));
             self.buffered.insert(op.id);
             self.buffer.push(op.clone());
             self.drain_buffer();
             return self.seen.contains(&op.id);
         }
         if !self.ready(op) {
+            // A waiting op's ids are as published as an applied one's — the room's
+            // log holds it and no peer resends it — so the mint has to clear them
+            // now, not once the buffer drains. Otherwise which replica re-mints onto
+            // them is a function of arrival order, and two replicas that folded the
+            // same ops disagree.
+            self.record_stamp(op.stamp, span(&op.kind));
             self.buffered.insert(op.id);
             self.buffer.push(op.clone());
             return false;
@@ -2447,52 +2462,40 @@ impl Document {
     }
 
     /// The highest stamp position a local mint in `zone` must clear: the partition
-    /// clock, or this replica's own id-space high-water where no clock vouches for
-    /// the stamps under its client id.
+    /// clock, and this replica's whole id-space high-water.
     ///
-    /// The high-water carries no partition — a snapshot's stamps decode long before
-    /// a schema resolves their zones — so reading it unconditionally would drag
-    /// every zone up to whatever the busiest partition reached and cost the per-zone
-    /// causal independence the replication streams are built on. It is read exactly
-    /// where [`vouched_stamps`](Self::vouched_stamps) says the clocks stop speaking
-    /// for the document's own contents, which in an ordinary document is nowhere:
-    /// the clock alone decides and each partition keeps counting from its own. Where
-    /// it does fire it is deliberately read across every partition, since the stamp
-    /// it carries has no zone — no honest replica is there, and clearing a planted
-    /// id in the wrong partition too costs nothing real.
+    /// The high-water is read **unconditionally**, across every partition. A stamp
+    /// is a document-global id — a `RangedElement`'s and an ACL tuple's ids derive
+    /// from one alone, and the tree-move log orders every move by one — so no
+    /// per-partition rule can make a mint unique, and every attempt to scope this to
+    /// "the partitions whose clocks fall short" is defeated by the same two inputs:
+    /// a snapshot may declare any clock it likes, and an op's envelope names its own
+    /// partition, so a peer can raise one partition's clock while planting ids that
+    /// land in another's containers. The clock's own guarantees are per-partition and
+    /// bounded; this one is neither, which is exactly why the mint reads it.
+    ///
+    /// The cost is that a partition's mint counts on from the replica's own global
+    /// stamp position rather than from that partition's clock, so a zone's lamports
+    /// are no longer compact. Nothing orders differently for it: folding still
+    /// advances one partition's clock alone, so the per-zone streams stay causally
+    /// independent, and the numbering was never a guarantee to anyone.
     fn mint_floor(&self, zone: Option<u32>) -> (u64, u64) {
         let clock = (self.clock(zone), 0);
-        let vouched = self.vouched_stamps();
         match self.stamp_high_water.get(&self.client) {
-            Some(own) if own.0 > vouched && *own > clock => *own,
+            Some(own) if *own > clock => *own,
             _ => clock,
         }
     }
 
-    /// The lamport up to which this document's clocks vouch for the stamps it
-    /// holds — at or below it, some clock is an upper bound over them and the mint
-    /// needs nothing else.
-    ///
-    /// Two things end that. A clock never rises past [`LAMPORT_WIRE_CEILING`] on a
-    /// fold, so above the clamp it is no evidence at all — a clock sitting higher
-    /// got there by *local* minting in some partition and says nothing about what a
-    /// peer planted in another. And a clock only vouches as far as it has reached,
-    /// which a snapshot may simply have declared below the stamps it carries.
-    fn vouched_stamps(&self) -> u64 {
-        self.zone_clocks
-            .values()
-            .copied()
-            .fold(self.lamport, u64::max)
-            .min(LAMPORT_WIRE_CEILING)
-    }
-
     /// Record `stamp`'s whole reservation against its author's id-space high-water.
-    /// Every stamp this replica applies passes here, so the high-water covers ops
-    /// folded off the wire, ops drained out of the buffer, and local mints alike.
+    /// Every stamp this replica holds passes here — ops folded off the wire, ops
+    /// still waiting in the buffer, and local mints alike — because an id is as
+    /// published while it waits as after it lands ([`free_seq`](Self::free_seq)'s
+    /// rule, for the same reason: no peer resends it).
+    ///
     fn record_stamp(&mut self, stamp: Stamp, span: u64) {
-        let last = stamp.run_member(span - 1);
         let slot = self.stamp_high_water.entry(stamp.client).or_insert((0, 0));
-        *slot = (*slot).max((last.lamport, last.offset));
+        *slot = (*slot).max(reservation_end(stamp, span));
     }
 
     /// The current lamport high-water of a partition: the root clock for `None`,
@@ -4718,6 +4721,27 @@ fn next_stamp(from: (u64, u64), client: ClientId) -> Stamp {
 /// this codebase emits carries one.
 fn stamp_names_its_author(op: &Op) -> bool {
     op.stamp.client == op.id.client
+}
+
+/// The `(lamport, offset)` position the last id of `stamp`'s reservation occupies.
+/// A text run takes one per codepoint and carries into the offset at the top of the
+/// lamport space, so the reservation, not the base, is what a high-water records.
+fn reservation_end(stamp: Stamp, span: u64) -> (u64, u64) {
+    let last = stamp.run_member(span - 1);
+    (last.lamport, last.offset)
+}
+
+/// Whether an op leaves its author a stamp to mint next — that is, whether its
+/// reservation stops short of the very end of that author's stamp space.
+///
+/// Refusing the one position past which there is no successor is categorical, not a
+/// threshold: it is the end of a 2^128 space, so no honest replica is near it (nor
+/// can one reach it — a mint would have to exhaust the space first), and being a
+/// pure function of the op every replica refuses the same set. Without it, one op
+/// carrying that position under a victim's client id takes the arithmetic out from
+/// under the victim's next edit.
+fn stamp_leaves_a_successor(op: &Op) -> bool {
+    reservation_end(op.stamp, span(&op.kind)) < (u64::MAX, u64::MAX)
 }
 
 /// How many consecutive char_ids an op consumes from its stamp. A text run

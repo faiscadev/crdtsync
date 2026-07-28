@@ -264,6 +264,136 @@ fn another_partitions_clock_does_not_vouch_for_a_plant_above_the_clamp() {
 }
 
 #[test]
+fn an_op_tagged_into_another_partition_cannot_hide_a_plant() {
+    // An op's envelope names its own partition and the fold honours it, but the ids
+    // it plants land wherever its *target* lives. So a peer raises zone 0's clock
+    // while planting in the root, and any rule that let one partition's clock speak
+    // for another would hand the plant straight back to the mint — with no clamp and
+    // no ceiling involved, on a brand-new document.
+    let victim = cid(1);
+    let mut doc = Document::new(victim);
+
+    let mut plant = impersonated_run(victim, b"t", "MMMM", 1);
+    for op in plant.iter_mut() {
+        op.zone = Some(0);
+        assert!(doc.apply(op), "the plant landed");
+    }
+    assert_eq!(doc.zone_clock(None), 0, "the root clock never moved");
+
+    doc.transact(|tx| tx.text(b"t").insert(0, "A"));
+    doc.transact(|tx| tx.text(b"t").insert(1, "B"));
+    assert_eq!(
+        text_of(&doc, b"t"),
+        "ABMMMM",
+        "a zone-tagged op hid a plant from the root partition's mint"
+    );
+    assert_all_distinct(&all_text_ids(&doc, b"t"), "cross-partition plant");
+}
+
+#[test]
+fn a_second_partitions_clock_does_not_cover_a_lowered_root_clock() {
+    // The snapshot half of the same shape: a declared root clock below the stamps
+    // the state carries, with a zone clock high enough that "some clock reaches this
+    // far" would be satisfied by it.
+    let mut src = Document::new(cid(1));
+    src.set_schema(schema_with_zone());
+    src.transact(|tx| tx.text(b"t").insert(0, "MMMM"));
+    for i in 0..30 {
+        src.transact(|tx| {
+            tx.map(b"board").set(b"busy", Scalar::Int(i));
+        });
+    }
+    let live = all_text_ids(&src, b"t");
+    let lowered = with_root_clock(src.encode_state(), 0);
+
+    let mut doc = Document::decode_state(&lowered).expect("a decodable snapshot");
+    doc.transact(|tx| tx.text(b"t").insert(0, "A"));
+    assert_eq!(
+        text_of(&doc, b"t"),
+        "AMMMM",
+        "a zone clock covered for a lowered root clock"
+    );
+    let after = all_text_ids(&doc, b"t");
+    assert_all_distinct(&after, "lowered root clock beside a busy zone");
+    assert!(
+        !live.contains(&after[0]),
+        "re-issued a stamp the state held"
+    );
+}
+
+#[test]
+fn a_plant_still_waiting_in_the_buffer_is_already_held() {
+    // An op whose target has not arrived sits in the buffer with its ids as
+    // published as any other — the room's log holds it and no peer resends it. If
+    // the mint only cleared *applied* stamps, which replica re-mints onto them would
+    // be a function of arrival order, and two replicas folding the same ops would
+    // disagree rather than merely lose a write.
+    let victim = cid(1);
+    let mut plant = impersonated_run(victim, b"t", "MMMM", 1);
+    for (i, op) in plant.iter_mut().enumerate() {
+        op.id.seq = 5_000 + i as u64;
+    }
+    let (create, insert) = (plant[0].clone(), plant[1].clone());
+
+    // X sees the run first: its container has not arrived, so it waits — and the
+    // victim then writes into that same text itself.
+    let mut x = Document::new(victim);
+    assert!(!x.apply(&insert), "the run waits on its container");
+    x.transact(|tx| tx.text(b"t").insert(0, "A"));
+    x.apply(&create);
+
+    // Y sees the whole batch before the victim writes.
+    let mut y = Document::new(victim);
+    y.apply(&create);
+    y.apply(&insert);
+    y.transact(|tx| tx.text(b"t").insert(0, "A"));
+
+    // The two replicas author *different* "A" ops — an insert's anchor is whatever
+    // its author saw — so their renderings need not match. What must match is that
+    // neither lost a write and neither re-issued an id: with the buffer invisible to
+    // the high-water, X mints straight onto the run waiting in it and drops as many
+    // of its codepoints as it overlapped.
+    for (name, doc) in [("x", &x), ("y", &y)] {
+        assert_eq!(
+            all_text_ids(doc, b"t").len(),
+            5,
+            "{name} lost a write: {:?}",
+            text_of(doc, b"t")
+        );
+        assert!(
+            text_of(doc, b"t").contains('A'),
+            "{name} lost the victim's own"
+        );
+        assert_all_distinct(&all_text_ids(doc, b"t"), name);
+    }
+}
+
+#[test]
+fn a_stamp_at_the_end_of_the_space_does_not_take_the_next_mint_out() {
+    // One op is enough to put a replica's own high-water at the very top, and the
+    // mint has to stay total there: no panic, no wrap, and no id it already holds.
+    let victim = cid(1);
+    let mut doc = Document::new(victim);
+
+    // The last position of all is refused: there is nothing past it to mint.
+    let mut end = op_at_lamport(victim, b"k", u64::MAX);
+    end.stamp.offset = u64::MAX;
+    assert!(!doc.apply(&end), "an op with no successor is admissible");
+    assert!(doc.get(b"k").is_none(), "nothing of it landed");
+
+    // One below it is ordinary, and the mint counts past it rather than onto it.
+    let mut top = op_at_lamport(victim, b"k", u64::MAX);
+    top.stamp.offset = u64::MAX - 1;
+    assert!(doc.apply(&top));
+    let minted = doc.transact(|tx| tx.set(b"probe", Scalar::Int(1)))[0].stamp;
+    assert!(
+        (minted.lamport, minted.offset) > (top.stamp.lamport, top.stamp.offset),
+        "the mint did not count past the stamp it holds"
+    );
+    assert!(Document::decode_state(&doc.encode_state()).is_ok());
+}
+
+#[test]
 fn a_plant_in_a_zone_does_not_take_that_zones_next_mint() {
     // The mint reads its own partition's clock, so the plant has to be cleared in
     // whichever partition it lands in.
@@ -471,15 +601,17 @@ fn a_large_but_legitimate_clock_still_mints_and_replicates() {
 }
 
 #[test]
-fn a_zone_keeps_counting_from_its_own_clock() {
-    // The high-water is read only past the clamp, so below it each partition still
-    // counts from its own clock alone — the causal independence the per-zone
-    // streams are built on. A high-water read unconditionally would drag every
-    // zone up to whatever the busiest partition reached.
+fn a_zone_still_folds_independently_though_its_mint_counts_globally() {
+    // A stamp is a document-global id, so the mint counts on from the replica's own
+    // global position and a zone's lamports are no longer compact. What the per-zone
+    // streams actually need is untouched: **folding** an op still advances that op's
+    // partition alone, so two zones stay causally independent.
     let mut doc = Document::new(cid(1));
     doc.set_schema(schema_with_zone());
     doc.transact(|tx| tx.set(b"top", Scalar::Int(1)));
     doc.transact(|tx| tx.set(b"top", Scalar::Int(2)));
+    let root_clock = doc.zone_clock(None);
+
     let zoned = doc.transact(|tx| {
         tx.map(b"board").set(b"k", Scalar::Int(1));
     });
@@ -489,6 +621,23 @@ fn a_zone_keeps_counting_from_its_own_clock() {
         .expect("a zoned op")
         .stamp
         .lamport;
-    assert_eq!(zone_lamport, 1, "a zone counts from its own clock");
-    assert_eq!(doc.zone_clock(None), 2, "the root partition kept its own");
+    assert!(
+        zone_lamport > root_clock,
+        "the mint counted on from the replica's own stamp position"
+    );
+
+    // Folding a peer's zoned op leaves the root partition where it was.
+    let mut peer = Document::new(cid(2));
+    peer.set_schema(schema_with_zone());
+    let before = doc.zone_clock(None);
+    for op in &peer.transact(|tx| {
+        tx.map(b"board").set(b"k", Scalar::Int(9));
+    }) {
+        doc.apply(op);
+    }
+    assert_eq!(
+        doc.zone_clock(None),
+        before,
+        "a zoned fold advanced the root clock"
+    );
 }
