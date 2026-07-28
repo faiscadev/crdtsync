@@ -476,7 +476,7 @@ fn a_claim_is_recorded_against_the_member_whose_link_carried_it() {
     let mut m = membership_for(SELF_ADDR);
     let joiner = NodeId::from("10.9.9.9:9000");
     let voucher = NodeId::from("10.0.0.1:9000");
-    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    m.add_member(joiner.clone());
     m.merge_liveness(
         &voucher,
         [(
@@ -513,7 +513,7 @@ fn one_members_verification_does_not_place_a_node() {
     // place it itself.
     let mut m = membership_for(SELF_ADDR);
     let joiner = NodeId::from("10.9.9.9:9000");
-    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    m.add_member(joiner.clone());
 
     m.merge_liveness(
         &NodeId::from("10.0.0.1:9000"),
@@ -534,7 +534,7 @@ fn enough_members_verifications_place_a_node() {
     // room its id places on.
     let mut m = membership_for(SELF_ADDR);
     let joiner = NodeId::from("10.9.9.9:9000");
-    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    m.add_member(joiner.clone());
     for voucher in ["10.0.0.1:9000", "10.0.0.2:9000"] {
         m.merge_liveness(
             &NodeId::from(voucher),
@@ -563,7 +563,7 @@ fn the_same_members_verification_twice_is_still_one_voucher() {
     // re-gossips its own claim every round does not accumulate into a majority of one.
     let mut m = membership_for(SELF_ADDR);
     let joiner = NodeId::from("10.9.9.9:9000");
-    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    m.add_member(joiner.clone());
     for _ in 0..8 {
         m.merge_liveness(
             &NodeId::from("10.0.0.1:9000"),
@@ -589,7 +589,7 @@ fn a_pending_members_verification_does_not_count() {
     let first = NodeId::from("10.9.9.9:9000");
     let second = NodeId::from("10.9.9.8:9000");
     for node in [&first, &second] {
-        m.add_member((*node).clone(), node.as_bytes().to_vec());
+        m.add_member((*node).clone());
     }
     let claim = |about: &NodeId| {
         [(
@@ -632,7 +632,7 @@ fn a_member_is_dialed_at_its_own_id_whatever_address_a_tuple_carries() {
     // merge on another — both are ways a peer's tuple reaches the roster, and the rule
     // has to hold on each or the two disagree.
     let mut poisoned = membership_for(SELF_ADDR);
-    poisoned.add_member(joiner.clone(), foreign.clone());
+    poisoned.add_member(joiner.clone());
     let mut merged = membership_for(SELF_ADDR);
     merged.merge_liveness(
         &NodeId::from("10.0.0.1:9000"),
@@ -645,7 +645,7 @@ fn a_member_is_dialed_at_its_own_id_whatever_address_a_tuple_carries() {
         )],
     );
     let mut clean = membership_for(SELF_ADDR);
-    clean.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    clean.add_member(joiner.clone());
 
     let dial_of = |m: &Membership| {
         m.known_members()
@@ -778,13 +778,13 @@ fn adoption_is_independent_of_the_order_the_evidence_arrives() {
     )];
 
     let mut forward = membership_for(SELF_ADDR);
-    forward.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    forward.add_member(joiner.clone());
     for v in vouchers {
         forward.merge_liveness(&NodeId::from(v), claim.clone());
     }
 
     let mut backward = membership_for(SELF_ADDR);
-    backward.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    backward.add_member(joiner.clone());
     for v in vouchers.iter().rev() {
         backward.merge_liveness(&NodeId::from(*v), claim.clone());
     }
@@ -816,7 +816,7 @@ fn a_reaped_member_loses_its_place_and_its_vouches() {
     let mut m = membership_for(SELF_ADDR);
     let departing = NodeId::from("10.0.0.1:9000");
     let joiner = NodeId::from("10.9.9.9:9000");
-    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    m.add_member(joiner.clone());
     m.merge_liveness(
         &departing,
         [(
@@ -975,7 +975,7 @@ fn two_ids_on_one_host_are_one_voucher() {
     // once between them; a member on a second host is what carries it.
     let mut m = shared_host_membership();
     let joiner = NodeId::from("10.9.9.9:9000");
-    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    m.add_member(joiner.clone());
 
     vouch(&mut m, "10.0.0.1:9000", &joiner);
     vouch(&mut m, "10.0.0.1:9001", &joiner);
@@ -994,7 +994,7 @@ fn a_sibling_on_a_members_own_host_does_not_vouch_for_it() {
     // one trust unit, and the whole bar is that a member cannot place a node by itself.
     let mut m = shared_host_membership();
     let sibling = NodeId::from("10.0.0.1:9002");
-    m.add_member(sibling.clone(), sibling.as_bytes().to_vec());
+    m.add_member(sibling.clone());
 
     // One voucher on the candidate's own host and one elsewhere: two members, two node
     // ids, and only *one* trust unit that is not the candidate itself.
@@ -1021,7 +1021,7 @@ fn a_certified_member_still_mints_ids_on_its_own_host() {
     // rather than ids, which is a placement change, not an evidence one.
     let mut m = membership_for(SELF_ADDR);
     let minted = NodeId::from("10.0.0.1:9999");
-    m.add_member(minted.clone(), minted.as_bytes().to_vec());
+    m.add_member(minted.clone());
     vouch(&mut m, "10.0.0.2:9000", &minted);
     vouch(&mut m, "10.0.0.3:9000", &minted);
     assert!(
@@ -1087,7 +1087,7 @@ fn a_node_that_knows_only_itself_places_on_what_it_has_reached() {
     let first = NodeId::from("10.9.9.9:9000");
     let second = NodeId::from("10.9.9.8:9000");
     for node in [&first, &second] {
-        alone.add_member((*node).clone(), node.as_bytes().to_vec());
+        alone.add_member((*node).clone());
     }
 
     alone.note_verified(&first);
@@ -1103,10 +1103,123 @@ fn a_node_that_knows_only_itself_places_on_what_it_has_reached() {
     // adopted from birth and there is a cluster to agree with.
     let mut seeded =
         Membership::from_static_config(None, Some(SELF_ADDR), "10.0.0.1:9000", N).unwrap();
-    seeded.add_member(first.clone(), first.as_bytes().to_vec());
+    seeded.add_member(first.clone());
     seeded.note_verified(&first);
     assert!(
         !seeded.is_adopted(&first),
         "one voucher is short of the bar"
+    );
+}
+
+// --- a trust unit is a machine, whatever the host is spelled like ---
+
+#[test]
+fn two_spellings_of_one_host_are_one_voucher() {
+    // A host is the unit because a host is what a certificate names — so the two have
+    // to agree on when two spellings are one host. The binding compares IP literals as
+    // addresses and drops the root label; reading the host as raw text here would let
+    // one machine present as several vouchers, which is the mint one level up.
+    for (a, b) in [
+        ("evil.example:9000", "evil.example.:9001"),
+        ("EVIL.example:9000", "evil.EXAMPLE:9001"),
+        (
+            "[2001:db8::6]:9000",
+            "[2001:0db8:0000:0000:0000:0000:0000:0006]:9001",
+        ),
+        ("wss://10.0.0.1:9000", "10.0.0.1:9001"),
+    ] {
+        assert_eq!(
+            crdtsync_server::dial::member_trust_unit(a.as_bytes()),
+            crdtsync_server::dial::member_trust_unit(b.as_bytes()),
+            "{a} and {b} are one machine",
+        );
+    }
+}
+
+#[test]
+fn a_machine_holding_two_spellings_still_vouches_once() {
+    // The consequence, end to end: a member that grinds a second id under an alias of
+    // its own host holds two node ids and one trust unit, so it cannot carry a joiner
+    // into the ring on its own word.
+    let mut m = Membership::from_static_config(
+        None,
+        Some(SELF_ADDR),
+        "evil.example:9000,evil.example.:9001,10.0.0.1:9000",
+        N,
+    )
+    .unwrap();
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone());
+
+    vouch(&mut m, "evil.example:9000", &joiner);
+    vouch(&mut m, "evil.example.:9001", &joiner);
+    assert!(!m.is_adopted(&joiner), "one machine, one voucher");
+
+    vouch(&mut m, "10.0.0.1:9000", &joiner);
+    assert!(m.is_adopted(&joiner), "a second machine carries it");
+}
+
+// --- the ring is a fixpoint, and the bar does not move under it ---
+
+#[test]
+fn adopting_a_member_makes_its_own_vouch_count_in_the_same_pass() {
+    // The evidence is a chain: one member clears the bar and its word is then what
+    // carries the next. Evaluating it in a single pass would make the ring depend on
+    // how many times the evidence happened to be re-merged, which is the same
+    // history-dependence deriving the set exists to remove.
+    let mut m = membership_for(SELF_ADDR);
+    let first = NodeId::from("10.9.9.9:9000");
+    let second = NodeId::from("10.9.9.8:9000");
+    for node in [&first, &second] {
+        m.add_member((*node).clone());
+    }
+    // `second` is vouched by one established member and by `first`, whose own word is
+    // worth nothing until `first` itself clears the bar.
+    vouch(&mut m, "10.0.0.3:9000", &second);
+    m.merge_liveness(
+        &first,
+        [(
+            second.clone(),
+            second.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )],
+    );
+    vouch(&mut m, "10.0.0.1:9000", &first);
+    assert!(!m.is_adopted(&first), "still one voucher short");
+    assert!(!m.is_adopted(&second));
+
+    vouch(&mut m, "10.0.0.2:9000", &first);
+    assert!(m.is_adopted(&first));
+    assert!(
+        m.is_adopted(&second),
+        "and the newly-adopted member's vouch carried the next, in the same pass",
+    );
+}
+
+#[test]
+fn reaping_a_seed_does_not_lower_the_bar() {
+    // The bar is decided at construction, not read off a set that shrinks. A node given
+    // one seed peer that later departs would otherwise fall to the single-node rule and
+    // start placing on one vouch, while every peer still held the constant — a ring
+    // split off an ordinary retirement.
+    let mut m = Membership::from_static_config(None, Some(SELF_ADDR), "10.0.0.1:9000", N).unwrap();
+    let seed = NodeId::from("10.0.0.1:9000");
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone());
+
+    for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+        m.note_gossip_unreachable(&seed);
+    }
+    for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+        m.reap_dead();
+    }
+    assert!(!m.is_member(&seed), "the seed departed");
+
+    m.note_verified(&joiner);
+    assert!(
+        !m.is_adopted(&joiner),
+        "and this node still holds the constant bar",
     );
 }

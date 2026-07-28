@@ -63,7 +63,7 @@ use std::collections::{HashMap, HashSet};
 
 use crdtsync_core::MemberState;
 
-use crate::dial::member_host;
+use crate::dial::member_trust_unit;
 use crate::placement::{Cluster, NodeId};
 
 /// Consecutive failed direct gossip probes to a member before this node escalates
@@ -220,8 +220,17 @@ pub struct Membership {
     reaped: HashMap<NodeId, u32>,
     /// The members this node was *configured* with — `self` and the seed peers. The
     /// root of trust a cluster starts from, adopted from birth because there is no
-    /// earlier authority for them to be vouched for by.
+    /// earlier authority for them to be vouched for by. Reaping removes a member from
+    /// it: a configured node that departed durably is gone, and the ring is derived
+    /// from this set.
     configured: HashSet<NodeId>,
+    /// Whether this node was configured with **no peers at all** — the single-node
+    /// deployment, which uses the bootstrap bar ([`adoption_bar`](Self::adoption_bar)).
+    /// Fixed at construction rather than read off `configured`, which shrinks: a bar
+    /// that followed the live set would collapse to one the moment a node's last seed
+    /// was reaped, and that node would then place on a single vouch while every peer
+    /// still held the constant — a ring split off an ordinary retirement.
+    solitary: bool,
     /// The members rooms are actually placed on — the subset of the roster the
     /// [`Cluster`] above is built from: the configured members plus every
     /// gossip-learned member the evidence now carries. **Derived, never accumulated**
@@ -268,6 +277,7 @@ impl Membership {
         // root of trust a cluster starts from, and there is no earlier authority for
         // it to be vouched for by.
         let configured: HashSet<NodeId> = members.iter().cloned().collect();
+        let solitary = configured.len() <= 1;
         Self {
             self_id,
             cluster: Cluster::new(members),
@@ -278,6 +288,7 @@ impl Membership {
             reaped: HashMap::new(),
             adopted: configured.clone(),
             configured,
+            solitary,
             verifiers: HashMap::new(),
         }
     }
@@ -329,11 +340,11 @@ impl Membership {
         self.cluster.nodes()
     }
 
-    /// Learn a member — the anti-entropy union gossip applies for each `(node, addr)`
-    /// pair a peer advertises. The advertised `addr` is **not** what the member is
-    /// dialed at; see [`add_members`](Self::add_members).
-    pub fn add_member(&mut self, node: NodeId, addr: Vec<u8>) {
-        self.add_members(std::iter::once((node, addr)));
+    /// Learn a member — the anti-entropy union gossip applies for each node a peer
+    /// advertises. **The address such a tuple carries is no argument here**, because it
+    /// is not what the member is dialed at; see [`add_members`](Self::add_members).
+    pub fn add_member(&mut self, node: NodeId) {
+        self.add_members(std::iter::once(node));
     }
 
     /// Union a batch of learned members into the roster — dialable, probable and
@@ -344,7 +355,7 @@ impl Membership {
     /// is neither placeable nor dialable, so a malformed gossip pair cannot poison the
     /// set. `self` is a member from construction and is never relearned.
     ///
-    /// **A member is recorded at its own id, whatever address the pair carries.** A
+    /// **A member is recorded at its own id.** A
     /// node id *is* an advertise address, so a second address for the same member is a
     /// second, unauthenticated name for one thing — and the ring turns on it, because a
     /// node dials a member to verify it. Keeping the advertised one made the roster
@@ -353,9 +364,9 @@ impl Membership {
     /// different order verified different endpoints and placed rooms differently,
     /// forever. Ignoring it makes the dial address a function of the id alone, which
     /// every node agrees on by construction.
-    pub fn add_members(&mut self, members: impl IntoIterator<Item = (NodeId, Vec<u8>)>) {
+    pub fn add_members(&mut self, members: impl IntoIterator<Item = NodeId>) {
         let mut added = false;
-        for (node, addr) in members {
+        for node in members {
             // A reaped member is never re-added by a plain re-advertise: only a live
             // return (an `Alive` tuple through `merge_liveness`) escapes the
             // tombstone, so a bare gossip of the member's address — which carries no
@@ -366,7 +377,6 @@ impl Membership {
             {
                 continue;
             }
-            let _ = addr;
             self.liveness
                 .insert(node.clone(), MemberLiveness::new(0, MemberState::Alive));
             let dial = node.as_bytes().to_vec();
@@ -599,8 +609,12 @@ impl Membership {
     /// which is the mint one level up. Its own host is excluded for the same reason: a
     /// member vouching for a sibling on its own host is vouching for itself. A member
     /// whose id names no host counts for nobody — there is no unit to attribute it to.
+    ///
+    /// The host is reduced by [`member_trust_unit`], the same relation the certificate
+    /// binding compares by, so two spellings of one host are one voucher. Reading it as
+    /// raw text would have let one machine present as several.
     fn verifier_units(&self, node: &NodeId) -> usize {
-        let Some(own_host) = member_host(node.as_bytes()) else {
+        let Some(own_unit) = member_trust_unit(node.as_bytes()) else {
             return 0;
         };
         let Some(verifiers) = self.verifiers.get(node) else {
@@ -609,8 +623,8 @@ impl Membership {
         verifiers
             .iter()
             .filter(|v| self.adopted.contains(*v))
-            .filter_map(|v| member_host(v.as_bytes()))
-            .filter(|host| host != &own_host)
+            .filter_map(|v| member_trust_unit(v.as_bytes()))
+            .filter(|unit| unit != &own_unit)
             .collect::<HashSet<_>>()
             .len()
     }
@@ -651,17 +665,17 @@ impl Membership {
     /// How many trust units must vouch for a member before it is placed:
     /// [`ADOPTION_VERIFIERS`], except for a node **configured with no peers at all**.
     ///
-    /// That exception is narrow and it keys on configuration, not on the running set,
-    /// so it is a fixed property of a node rather than a bar that moves as the ring
-    /// grows. A node whose config names no peer has no cluster to be outvoted by, and
-    /// the constant would freeze it forever — a second voucher can only ever come from
-    /// a member it has already adopted — so the cluster it places on is exactly the
-    /// members it has itself reached. That is the single-node deployment; a node
+    /// That exception is narrow and it is decided **once, at construction**, so it is a
+    /// fixed property of a node rather than a bar that moves as the cluster changes
+    /// under it. A node whose config names no peer has no cluster to be outvoted by,
+    /// and the constant would freeze it forever — a second voucher can only ever come
+    /// from a member it has already adopted — so the cluster it places on is exactly
+    /// the members it has itself reached. That is the single-node deployment; a node
     /// meant to join a cluster is given a seed peer, which is adopted from birth and
     /// lifts it past this case at boot. Configure one: a node with none takes the ring
     /// from whoever reaches it.
     fn adoption_bar(&self) -> usize {
-        match self.configured.len() <= 1 {
+        match self.solitary {
             true => 1,
             false => ADOPTION_VERIFIERS,
         }

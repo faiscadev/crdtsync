@@ -137,6 +137,25 @@ pub fn member_host(addr: &[u8]) -> Option<String> {
     host_of(authority).map(|host| host.to_ascii_lowercase())
 }
 
+/// The **trust unit** an advertise address belongs to: its host reduced to the one
+/// form the certificate binding compares. `None` when the address names no host.
+///
+/// A host is what a certificate names, so a host is the unit that decides how many
+/// *independent* parties have vouched for a member. That count is only meaningful if
+/// two spellings of one host reduce to one unit — and the binding
+/// ([`cert_names_member`]) already treats them as one: it lowercases, drops the root
+/// label, and compares IP literals as addresses rather than as text. Reading the host
+/// as raw text here while the binding read it semantically would let one machine
+/// present as several: `evil.example` beside `evil.example.`, or an IPv6 literal
+/// beside its expanded form, are one certificate and would have been two vouchers.
+pub fn member_trust_unit(addr: &[u8]) -> Option<String> {
+    let host = normalized(&member_host(addr)?);
+    Some(match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => host,
+    })
+}
+
 /// The host an authority names, with its port and path stripped. A bracketed IPv6
 /// literal keeps its brackets off but its colons intact, so `[::1]:9000` is `::1`
 /// rather than everything up to the last colon. `None` when it names none.

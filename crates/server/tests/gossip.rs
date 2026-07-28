@@ -244,12 +244,12 @@ fn placement_is_independent_of_the_order_members_are_learned() {
     let self_addr = "10.0.0.9:9000";
     // One node learns B then C; another learns C then B.
     let mut bc = alone(self_addr);
-    bc.add_member(NodeId::from_addr(B), B.as_bytes().to_vec());
-    bc.add_member(NodeId::from_addr(C), C.as_bytes().to_vec());
+    bc.add_member(NodeId::from_addr(B));
+    bc.add_member(NodeId::from_addr(C));
 
     let mut cb = alone(self_addr);
-    cb.add_member(NodeId::from_addr(C), C.as_bytes().to_vec());
-    cb.add_member(NodeId::from_addr(B), B.as_bytes().to_vec());
+    cb.add_member(NodeId::from_addr(C));
+    cb.add_member(NodeId::from_addr(B));
 
     assert_eq!(
         member_set(&bc),
@@ -291,7 +291,7 @@ fn add_member_is_idempotent_for_a_known_member() {
     let before = member_set(&m);
     // Re-adding an existing member (even with a different address) is a no-op: the
     // set and placement are untouched.
-    m.add_member(NodeId::from_addr(B), b"different:1234".to_vec());
+    m.add_member(NodeId::from_addr(B));
     assert_eq!(member_set(&m), before);
     // The first-learned address wins — no churn.
     let b_addr = m
@@ -308,7 +308,7 @@ fn a_member_with_an_empty_node_id_is_dropped() {
     // dialable, so it must not poison the member set.
     let mut m = seeded(A, B);
     let before = member_set(&m);
-    m.add_member(NodeId::from(Vec::new()), b"10.0.0.9:9000".to_vec());
+    m.add_member(NodeId::from(Vec::new()));
     assert_eq!(member_set(&m), before, "an empty-id member is not added");
     // The same guard holds through the wire merge path.
     merge_into(
@@ -336,9 +336,9 @@ fn a_member_with_an_empty_node_id_is_dropped() {
 fn a_batch_add_unions_every_new_member_at_once() {
     let mut m = alone("10.0.0.9:9000");
     m.add_members(vec![
-        (NodeId::from_addr(A), A.as_bytes().to_vec()),
-        (NodeId::from_addr(B), B.as_bytes().to_vec()),
-        (NodeId::from_addr(A), A.as_bytes().to_vec()), // duplicate within the batch
+        NodeId::from_addr(A),
+        NodeId::from_addr(B),
+        NodeId::from_addr(A), // duplicate within the batch
     ]);
     let mut expected = vec![
         NodeId::from_addr("10.0.0.9:9000"),
@@ -414,7 +414,7 @@ fn a_member_learned_by_gossip_becomes_a_placement_target() {
         .iter()
         .all(|room| m.primary_for(room) == Some(NodeId::from_addr(self_addr))));
 
-    m.add_member(newcomer_id.clone(), newcomer.as_bytes().to_vec());
+    m.add_member(newcomer_id.clone());
     // Learned, but pending: it is dialed and gossiped about, and placed nowhere.
     assert!(sample_rooms()
         .iter()

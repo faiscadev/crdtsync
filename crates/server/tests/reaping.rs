@@ -219,7 +219,7 @@ fn a_reaped_member_is_not_relearned_from_stale_gossip() {
         "stale Dead gossip does not resurrect a reaped member"
     );
     // The additive union path is likewise blocked.
-    m.add_member(d.clone(), D.as_bytes().to_vec());
+    m.add_member(d.clone());
     assert!(
         !m.is_member(&d),
         "a plain re-advertise does not resurrect it either"
@@ -277,6 +277,26 @@ fn a_returned_member_with_a_higher_incarnation_is_resurrected() {
     );
     assert!(m.is_member(&d), "a genuinely-returned node rejoins");
     assert_eq!(m.gossip_state(&d), MemberState::Alive);
+    // It rejoins the *roster*, not the ring: reaping struck it from the configured
+    // members, so it is a fresh join and the cluster verifies it again before rooms are
+    // placed on it (C25).
+    assert!(
+        !m.is_adopted(&d),
+        "a returned member is pending until verified"
+    );
+    for voucher in [A, B] {
+        m.merge_liveness(
+            &nid(voucher),
+            [(
+                d.clone(),
+                D.as_bytes().to_vec(),
+                reap_inc + 1,
+                MemberState::Alive,
+                true,
+            )],
+        );
+    }
+    assert!(m.is_adopted(&d), "and takes its place back once it is");
 }
 
 #[test]
