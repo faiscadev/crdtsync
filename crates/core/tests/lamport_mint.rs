@@ -231,12 +231,15 @@ fn a_projection_keeps_the_recipients_own_high_water() {
     let mut room = Document::new(server);
     room.set_schema(schema_with_zone());
     // The plant sits above the wire ceiling, so the room's own clock is clamped
-    // below it and cannot stand in for the record — only the recipient's entry can.
+    // below it and cannot stand in for the record. And it is a **counter** tally,
+    // which persists no stamp at all — so the projection's own re-floor cannot see
+    // it either, and the recipient's stored entry is the only thing left that does.
     assert!(room.apply(&op_at_lamport(cid(3), b"k", LAMPORT_WIRE_CEILING)));
-    for op in &impersonated_run(victim, b"t", "MMMM", LAMPORT_WIRE_CEILING + 1) {
-        room.apply(op);
+    let mut plant = Document::new(victim).transact(|tx| tx.inc(b"c", 1));
+    for op in plant.iter_mut() {
+        op.stamp.lamport = LAMPORT_WIRE_CEILING + 1;
+        assert!(room.apply(op));
     }
-    let live = all_text_ids(&room, b"t");
     // Into a zone the recipient may not read, so the projection has content to drop.
     for op in &Document::new(cid(4)).transact(|tx| {
         tx.map(b"board").set(b"hidden", Scalar::Int(1));
@@ -253,12 +256,71 @@ fn a_projection_keeps_the_recipients_own_high_water() {
         .expect("a projected snapshot decodes");
     let minted = adopted.transact(|tx| tx.set(b"probe", Scalar::Int(1)))[0].stamp;
     assert!(
-        !live.contains(&minted),
-        "the adopting replica re-issued an id the room already holds"
+        minted.lamport > LAMPORT_WIRE_CEILING + 1,
+        "the projection dropped the recipient's own record"
     );
+}
+
+#[test]
+fn a_snapshot_cannot_under_declare_a_tombstoned_runs_tail() {
+    // The floor has to read a run's *reach*, not its head. A dead sequence run
+    // encodes as `(head, length)` and only the head is a stamp on the wire, so a
+    // snapshot that plants a run, lets it be deleted, and then declares a record at
+    // the head under-declares by the whole length of its own tombstone — and the
+    // length is right there in the record, three bytes along.
+    //
+    // Deleting a plant is the obvious thing a user does, so this is the mainline
+    // path: the reload minted straight onto ids the bytes it had just decoded held,
+    // and the victim's next write was swallowed as a replay.
+    let victim = cid(1);
+    let mut doc = Document::new(victim);
+    for op in &impersonated_run(victim, b"t", "MMMMMMMM", 100) {
+        assert!(doc.apply(op));
+    }
+    let run: Vec<Stamp> = all_text_ids(&doc, b"t");
+    assert_eq!(run.len(), 8);
+    doc.transact(|tx| tx.text(b"t").delete(0, 8));
+    assert_eq!(text_of(&doc, b"t"), "", "the plant is a tombstone now");
+
+    // Declare both the clock and the record at the run's *head*: values the decode's
+    // own floor would produce from the head alone, so nothing is refused.
+    let lowered = with_stamp_high_water(with_root_clock(doc.encode_state(), 100), &[(victim, 100)]);
+    let mut back = Document::decode_state(&lowered).expect("a decodable snapshot");
+    back.transact(|tx| tx.text(b"t").insert(0, "A"));
+    assert_eq!(
+        text_of(&back, b"t"),
+        "A",
+        "the write landed on a tombstoned id"
+    );
+    let minted = all_text_ids(&back, b"t")[0];
     assert!(
-        minted.lamport > LAMPORT_WIRE_CEILING + 4,
-        "the projection dropped the recipient's own high-water"
+        !run.contains(&minted),
+        "re-issued an id the tombstoned run still holds"
+    );
+}
+
+#[test]
+fn a_snapshots_waiting_buffer_is_counted_even_when_the_record_omits_it() {
+    // An op waiting on its target is not in the content, so only the encoded buffer
+    // carries its ids — and its reservation is as published as an applied op's. A
+    // declaration that omits it must not let the mint re-issue it.
+    let victim = cid(1);
+    let mut plant = impersonated_run(victim, b"t", "MMMM", 60);
+    for (i, op) in plant.iter_mut().enumerate() {
+        op.id.seq = 5_000 + i as u64;
+    }
+    let run = plant.pop().expect("the run op");
+    assert!(matches!(run.kind, OpKind::TextInsert { .. }));
+
+    let mut doc = Document::new(victim);
+    assert!(!doc.apply(&run), "the run waits on its container");
+    let stripped = with_stamp_high_water(with_root_clock(doc.encode_state(), 0), &[]);
+
+    let mut back = Document::decode_state(&stripped).expect("a decodable snapshot");
+    let minted = back.transact(|tx| tx.set(b"probe", Scalar::Int(1)))[0].stamp;
+    assert!(
+        minted.lamport > 63,
+        "the mint re-issued an id the waiting buffer holds"
     );
 }
 
@@ -334,6 +396,51 @@ fn a_snapshot_declaring_a_record_past_the_id_space_is_refused() {
     let theirs = with_stamp_high_water(bytes, &[(other, LAMPORT_STATE_CEILING)]);
     let mine = Document::decode_state(&theirs).expect("a decodable snapshot");
     assert!(mine.can_mint(None));
+}
+
+#[test]
+fn the_refusal_latch_spans_an_intention_and_no_further() {
+    // The latch has to cover exactly one intention. An atomic group is several
+    // `transact` calls and one all-or-nothing delivery, so clearing between them
+    // would tear the group the latch exists to keep whole; and a *later* intention
+    // has to get a fresh answer, or a run refused for its length would go on
+    // refusing the single-id edits a subsequent undo is made of.
+    let me = cid(1);
+
+    // An atomic group: the first transact exhausts, the second must not slip through.
+    let mut doc = Document::new(me);
+    assert!(doc.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING)));
+    doc.begin_atomic();
+    doc.transact(|tx| tx.set(b"a", Scalar::Int(1)));
+    doc.transact(|tx| tx.set(b"b", Scalar::Int(2)));
+    assert!(
+        doc.commit_atomic().is_empty(),
+        "a torn atomic group reached the wire"
+    );
+    assert!(doc.get(b"b").is_none());
+
+    // And the latch does not outlive the intention. Here the text create fits and
+    // the run behind it does not, so the batch is cut at the refusal — what the
+    // latch guarantees is that nothing *after* it is emitted, not that the ops
+    // before it are taken back (they are already applied locally, and dropping
+    // them would diverge the author from its peers). One id is left, and the next
+    // transaction gets it.
+    let mut room = Document::new(me);
+    assert!(room.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING - 2)));
+    let cut = room.transact(|tx| tx.text(b"t").insert(0, "abcd"));
+    assert!(
+        cut.iter()
+            .all(|op| !matches!(op.kind, OpKind::TextInsert { .. })),
+        "a run reaching past the end of the space was emitted"
+    );
+    assert_eq!(text_of(&room, b"t"), "", "and none of it landed");
+    let next = room.transact(|tx| tx.set(b"a", Scalar::Int(1)));
+    assert_eq!(
+        next.len(),
+        1,
+        "the latch outlived the transaction that set it"
+    );
+    assert_eq!(next[0].stamp.lamport, LAMPORT_STATE_CEILING);
 }
 
 #[test]

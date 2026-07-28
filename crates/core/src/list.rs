@@ -370,6 +370,12 @@ impl List {
                     tag: 0,
                 });
             }
+            // The run holds every id from its head to `last`, but only the head is a
+            // stamp on the wire — so the tail is reported explicitly, or a snapshot
+            // could under-declare its id-space record by the length of its own
+            // tombstones. Deleting a planted run is what makes that the mainline
+            // path rather than a corner.
+            cur.note_stamp_reach(start.client, last);
             list.add_dead(start, length, anchor.parent, anchor.side);
         }
 

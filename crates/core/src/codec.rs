@@ -481,6 +481,20 @@ impl<'a> Cursor<'a> {
         self.tracking_stamps = true;
     }
 
+    /// Record that `client`'s ids reach at least `lamport`, for a stamp the stream
+    /// stores compressed rather than one id at a time.
+    ///
+    /// A dead sequence run encodes as `(head, length)` — only the head passes
+    /// [`stamp`](Self::stamp), and the ids behind it are exactly the ones a plant
+    /// leaves behind once a user deletes it. Reading the head alone would let a
+    /// snapshot under-declare its record by the length of its own tombstones.
+    pub(crate) fn note_stamp_reach(&mut self, client: ClientId, lamport: u64) {
+        if self.tracking_stamps {
+            let slot = self.stamp_high_water.entry(client).or_insert(0);
+            *slot = (*slot).max(lamport);
+        }
+    }
+
     /// Stop recording and take what was read.
     pub(crate) fn take_stamp_high_water(&mut self) -> HashMap<ClientId, u64> {
         self.tracking_stamps = false;
@@ -582,6 +596,16 @@ impl<'a> Cursor<'a> {
             _ => self.u64()?,
         };
         if self.tracking_stamps {
+            // The sub-lamport dimension is not a place an id may be: `stamp_key`
+            // omits it, so two stamps differing only there derive one ACL, ranged
+            // and XML-child id. `Document::apply` refuses an op that sits there, and
+            // a state stream must not reach state by the other seam instead.
+            if offset != 0 {
+                return Err(DecodeError::BadTag {
+                    what: "stamp: off the lamport axis",
+                    tag: 0,
+                });
+            }
             let slot = self.stamp_high_water.entry(client).or_insert(0);
             *slot = (*slot).max(lamport);
         }

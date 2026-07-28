@@ -212,15 +212,19 @@ pub struct Document {
     /// Set when a mint inside the current [`transact`](Self::transact) was refused,
     /// and read by every later mint in it.
     ///
-    /// A refusal has to take the whole transaction, not just the edit that hit it.
-    /// The edits in one transact describe one intention and the later ones address
-    /// what the earlier ones created — so a create refused in an exhausted partition
-    /// would leave the writes into it addressing a container no replica will ever
-    /// hold, and a peer buffers such an op forever waiting on an arrival that cannot
-    /// come. Refusing the rest keeps a refusal what it claims to be: nothing
-    /// emitted, nothing changed.
+    /// A refusal has to take the rest of the intention, not just the edit that hit
+    /// it. The edits in one transact address what the earlier ones created — so a
+    /// create refused in an exhausted partition would leave the writes into it
+    /// naming a container no replica will ever hold, and a peer buffers such an op
+    /// forever waiting on an arrival that cannot come.
     ///
-    /// Not persisted: it lives for the duration of one transaction.
+    /// It cuts the batch at the refusal; it does not take back what came before.
+    /// Those ops are already applied to local state, and dropping them from the
+    /// batch while keeping them locally is precisely a divergence. What the latch
+    /// guarantees is that every op that *is* emitted names something that exists.
+    ///
+    /// Not persisted: it lives for the duration of one intention — an atomic group
+    /// is several transacts and one delivery, so it spans them all.
     mint_refused: bool,
     seq: u64,
     /// When recording an atomic transaction (between `begin_atomic` and
@@ -1554,9 +1558,20 @@ impl Document {
     /// the registries by hand, is what keeps the two definitions from drifting; a
     /// projection is O(document) several times over already.
     fn scrub_high_water_to(&mut self, recipient: Option<ClientId>) {
+        let before = self.stamp_high_water.len();
         self.stamp_high_water
             .retain(|client, _| Some(*client) == recipient);
-        if let Ok(own) = Document::decode_state(&self.encode_state()) {
+        // Nothing withheld, nothing to restore: the record already dominates the
+        // content, so an identity projection pays neither the encode nor the decode.
+        if self.stamp_high_water.len() == before {
+            return;
+        }
+        let round_trip = Document::decode_state(&self.encode_state());
+        debug_assert!(
+            round_trip.is_ok(),
+            "a projected replica could not decode its own snapshot"
+        );
+        if let Ok(own) = round_trip {
             self.stamp_high_water = own.stamp_high_water.clone();
         }
     }
@@ -2177,10 +2192,6 @@ impl Document {
             let slot = stamp_high_water.entry(client).or_insert(0);
             *slot = (*slot).max(clock_within_ceiling(lamport, "document: stamp in state")?);
         }
-        for op in &buffer {
-            let slot = stamp_high_water.entry(op.stamp.client).or_insert(0);
-            *slot = (*slot).max(reservation_end(op.stamp, span(&op.kind)));
-        }
 
         let mut doc = Document {
             client,
@@ -2325,7 +2336,13 @@ impl Document {
         F: FnOnce(&mut MapCursor),
     {
         self.pending.clear();
-        self.mint_refused = false;
+        // The latch spans a whole intention, so it clears at the start of one and
+        // not at every `transact`: an atomic group is several transacts and one
+        // all-or-nothing delivery, and clearing between them would tear exactly the
+        // group the latch exists to keep whole.
+        if !self.recording_intention() {
+            self.mint_refused = false;
+        }
         let root_id = self.root_id();
         {
             let mut cursor = MapCursor {
@@ -2367,6 +2384,10 @@ impl Document {
     pub fn begin_atomic(&mut self) {
         if self.atomic.is_none() {
             self.atomic = Some(Vec::new());
+            // Opening a group starts an intention, so the mint answers it afresh —
+            // `transact` will not clear the latch from here on, because from here on
+            // it is *inside* the group.
+            self.mint_refused = false;
         }
     }
 
@@ -2609,6 +2630,13 @@ impl Document {
     /// assertion is what would catch a seam that stopped doing so.
     fn record_stamp(&mut self, stamp: Stamp, span: u64) {
         let reach = reservation_end(stamp, span);
+        // A floor of zero says nothing — the map is only ever read as a lower bound —
+        // and every `XmlReveal` shell derives its own `ClientId` and stamps at
+        // lamport 0, so recording them would add a dead entry per revealed node to
+        // memory and to every later snapshot, growing with reveal traffic.
+        if reach == 0 {
+            return;
+        }
         debug_assert!(
             reach <= LAMPORT_STATE_CEILING,
             "a stamp reaching past the id space was installed"
@@ -3655,6 +3683,9 @@ impl Document {
     /// [`end_intention`](Self::end_intention) records as one undo step, however
     /// many transacts it spans. Nests.
     pub fn begin_intention(&mut self) {
+        if !self.recording_intention() {
+            self.mint_refused = false;
+        }
         self.history.open_group();
     }
 
@@ -3718,6 +3749,10 @@ impl Document {
             steps,
             atomic,
         } = intention;
+        // A replay is a fresh intention, so it gets a fresh answer from the mint —
+        // a run refused for its length must not go on refusing the single-id edits
+        // a later undo is made of.
+        self.mint_refused = false;
         let saved = self.history.begin_replay(&origin, landing);
         if atomic {
             self.begin_atomic();
@@ -4849,10 +4884,15 @@ fn clock_within_ceiling(lamport: u64, what: &'static str) -> Result<u64, DecodeE
 ///
 /// `u64::MAX` is above [`LAMPORT_STATE_CEILING`], and every seam that installs a
 /// stamp refuses one reaching past that ceiling
-/// ([`stamp_occupies_a_mintable_position`], [`mint_position`]). So no element can
-/// exist at an id derived from here, on this replica or any other — which is what a
-/// handle to nothing has to guarantee, or a caller could delete a stranger's
-/// element through it.
+/// ([`stamp_occupies_a_mintable_position`], [`mint_position`]), so no *op* can put
+/// an element here on this replica or any other — which is what a handle to nothing
+/// has to guarantee, or a caller could delete a stranger's element through it.
+///
+/// It is not absolute. The ranged and ACL registries decode their keys as raw
+/// [`ElementId`]s, so a crafted snapshot can plant an entry at the derived id
+/// directly — which, together with a declared record at the ceiling to force the
+/// refusal, aims a refused create's handle at an attacker-chosen element. Both
+/// halves take a hand-built snapshot; a replica that only ever folds ops is exact.
 fn unmintable_stamp(client: ClientId) -> Stamp {
     Stamp {
         lamport: u64::MAX,
