@@ -5,7 +5,9 @@
 //! Run with `wasm-pack test --node crates/wasm`.
 
 use crdtsync_core::path::encode_path;
+use crdtsync_core::{decode_ops, encode_ops, ClientId};
 use crdtsync_wasm::WasmDocument;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
 fn cid(first: u8) -> Vec<u8> {
@@ -23,6 +25,24 @@ fn path(keys: &[&str]) -> Vec<u8> {
     encode_path(&keys)
 }
 
+/// A field of the `{ applied, refused }` object a fold reports.
+fn count(outcome: &JsValue, field: &str) -> i32 {
+    js_sys::Reflect::get(outcome, &JsValue::from_str(field))
+        .ok()
+        .and_then(|v| v.as_f64())
+        .expect("a fold reports both counts") as i32
+}
+
+/// How many ops the fold took now.
+fn applied(outcome: JsValue) -> i32 {
+    count(&outcome, "applied")
+}
+
+/// How many ops the fold refused forever.
+fn refused(outcome: JsValue) -> i32 {
+    count(&outcome, "refused")
+}
+
 #[wasm_bindgen_test]
 fn a_bad_client_id_is_rejected() {
     assert!(WasmDocument::new(&[0u8; 4]).is_err());
@@ -35,7 +55,7 @@ fn register_reads_back_and_converges() {
     let p = path(&["age"]);
     let ops = a.register_int(&p, 30);
     assert_eq!(a.get_int(&p), Some(30));
-    assert_eq!(b.apply(&ops), 1);
+    assert_eq!(applied(b.apply(&ops)), 1);
     assert_eq!(b.get_int(&p), Some(30));
 }
 
@@ -78,11 +98,11 @@ fn a_decoded_document_dedups_and_converges() {
 
     let mut back = WasmDocument::decode_state(&a.encode_state()).ok().unwrap();
     // A replay of a covered op is a no-op; a later peer op still lands.
-    assert_eq!(back.apply(&reg), 0);
+    assert_eq!(applied(back.apply(&reg)), 0);
     let mut b = doc(2);
     b.apply(&reg);
     let hit = b.inc(&path(&["hits"]), 4);
-    assert_eq!(back.apply(&hit), 1);
+    assert_eq!(applied(back.apply(&hit)), 1);
     assert_eq!(back.get_counter(&path(&["hits"])), Some(4));
 }
 
@@ -177,7 +197,36 @@ fn a_text_relative_position_round_trips() {
 #[wasm_bindgen_test]
 fn apply_rejects_garbage() {
     let mut a = doc(1);
-    assert_eq!(a.apply(&[0xff; 8]), -1);
+    let outcome = a.apply(&[0xff; 8]);
+    assert_eq!(applied(outcome.clone()), -1);
+    // A batch that never decoded carries no op to judge.
+    assert_eq!(refused(outcome), 0);
+}
+
+#[wasm_bindgen_test]
+fn a_refused_op_is_counted_apart_from_a_buffered_one() {
+    let mut a = doc(1);
+    // A nested write is two ops: the container create, then the write into it.
+    // Held back, the create leaves the write waiting on a target it cannot reach.
+    let mut nested = decode_ops(&a.register_int(&path(&["nested", "k"]), 1)).unwrap();
+    let write = nested.pop().unwrap();
+    let create = nested.pop().unwrap();
+
+    // An op whose stamp names a client other than its author mints ids in that
+    // client's id space — a refusal every replica makes on the op alone.
+    let mut forged = decode_ops(&doc(3).register_int(&path(&["forged"]), 9)).unwrap();
+    let mut refused_op = forged.pop().unwrap();
+    refused_op.stamp.client = ClientId::from_bytes([9u8; 16]);
+
+    let mut b = doc(2);
+    let outcome = b.apply(&encode_ops(&[refused_op, write]));
+    assert_eq!(applied(outcome.clone()), 0, "neither op applies now");
+    assert_eq!(refused(outcome), 1, "only the forged op is refused forever");
+
+    // The buffered op was waiting, not refused: the create releases it.
+    assert_eq!(applied(b.apply(&encode_ops(&[create]))), 1);
+    assert_eq!(b.get_int(&path(&["nested", "k"])), Some(1));
+    assert_eq!(b.get_int(&path(&["forged"])), None);
 }
 
 #[wasm_bindgen_test]
@@ -1059,7 +1108,7 @@ fn a_blob_converges_on_a_peer() {
     let mut b = doc(2);
     let p = path(&["pic"]);
     let ops = a.set_blob(&p, "image/png", b"tiny-png").expect("inlines");
-    assert!(b.apply(&ops) >= 1);
+    assert!(applied(b.apply(&ops)) >= 1);
     assert_eq!(
         get_u8array(&b.get_blob(&p), "inline"),
         Some(b"tiny-png".to_vec())
@@ -1117,12 +1166,12 @@ fn acl_grant_returns_id_and_ops_and_converges() {
     let ops = get_bytes_field(&grant, "ops");
     assert_eq!(id.len(), 16, "a grant hands back a 16-byte id");
     assert!(!ops.is_empty(), "a grant emits ops");
-    assert!(b.apply(&ops) >= 1, "the grant tuple converges");
+    assert!(applied(b.apply(&ops)) >= 1, "the grant tuple converges");
 
     // Revoke by the returned id.
     let rev = a.acl_revoke(&id).unwrap();
     assert!(!rev.is_empty(), "revoking a held tuple emits ops");
-    assert!(b.apply(&rev) >= 1, "the revoke converges");
+    assert!(applied(b.apply(&rev)) >= 1, "the revoke converges");
 }
 
 #[wasm_bindgen_test]
@@ -1163,7 +1212,7 @@ fn acl_grant_marshals_a_role_deny_to_a_group() {
     assert_eq!(*g, crdtsync_core::AclGrant::Role(b"reviewer".to_vec()));
     assert_eq!(*effect, crdtsync_core::AclEffect::Deny);
 
-    assert!(b.apply(&ops) >= 1);
+    assert!(applied(b.apply(&ops)) >= 1);
 }
 
 #[wasm_bindgen_test]

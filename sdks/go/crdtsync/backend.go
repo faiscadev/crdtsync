@@ -72,9 +72,10 @@ type Backend interface {
 	SetSchema(schema []byte) bool
 	TakeRepairs() [][]Step
 
-	// Apply folds a peer's ops in, returning the count applied. A networked
-	// backend syncs through its provider instead and refuses with -1.
-	Apply(ops []byte) int
+	// Apply folds a peer's ops in, returning the count applied beside the count
+	// no replica will ever hold. A networked backend syncs through its provider
+	// instead and refuses with -1.
+	Apply(ops []byte) (applied, refused int)
 
 	// Close releases what the backend owns.
 	Close()
@@ -237,7 +238,7 @@ func (c *ClientBackend) CommitAtomic() []byte { return c.client.CommitAtomic(c.c
 // Apply refuses: a networked replica folds a peer's work in through the frames
 // its provider receives, never through a side channel that would bypass the
 // outbox and the server sequence.
-func (c *ClientBackend) Apply([]byte) int { return -1 }
+func (c *ClientBackend) Apply([]byte) (int, int) { return -1, 0 }
 
 // Close is a no-op — the provider owns the wire client and closes it.
 func (c *ClientBackend) Close() {}

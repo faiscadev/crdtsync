@@ -7,6 +7,18 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
+## 2026-07-28 · C26 refused-op signal (#PR) · the SDK fold answers two counts, because at the seam with no server the applied count alone renders a permanent refusal as silence
+
+**Changed:** ARCHITECTURE's §SDK-Ergonomic-Surface gains the fold's report — `applyUpdate` and its per-language equivalents answer how many ops applied now *beside* how many no replica will ever hold — and that report joins the language-agnostic contract every SDK realizes.
+
+**Why the seam needs it at all.** C19 (#367) closed the server side: `handle_ops` answers `OpsRejected`/`MalformedOp` and the ingest seams drop such a record, so an app talking to a server learns of a refusal through the `onOpsRejected` surface it already has. The fold this unit touches is the one with nothing upstream — two docs exchanging op bytes offline, peer-to-peer, or through a relay that carries no schema and validates nothing. There the app's only report was `filter(|op| doc.apply(op)).count()`, and `Document::apply`'s `false` covers three unrelated situations of which only one is permanent. A buffered op and an op no replica will ever hold were both "not counted", so a peer with a buggy or hostile writer saw edits vanish with no signal — and the two want opposite responses, wait versus surface a client bug.
+
+**Judged by C19's predicate, not a second copy of it.** Every binding classifies with `Op::is_admissible`, the public pure predicate #367 introduced, so the SDK seam and the server's ingress boundary cannot drift into disagreeing about which refusals are permanent. Nothing new is computed and no core surface was added; the fold simply stops discarding an answer the op already carries.
+
+**Two counts, not a drained refused-op list.** A drain (`takeRefused`, mirroring `takeRepairs`/`takeRejected`) would carry the offending op's bytes, which is strictly more information. It was rejected: it is per-handle state whose lifetime and clearing rules are a second thing to reason about, it needs a semantically muddy stub on every client-backed replica (whose refusals arrive as the server's `OpsRejected` instead), and a refusal is a fact about *this batch* — reporting it anywhere but this call's own return invites the same silence the unit exists to remove. A count is the smallest thing that makes the two cases distinguishable, which is the whole requirement.
+
+**The shape is per-language idiom over one contract.** The C ABI takes a nullable `uint32_t *out_refused` out-parameter, left untouched on the `-1` outcomes because a batch that never decoded carries no op to judge; wasm returns `{ applied, refused }`; JS an `ApplyOutcome` object; Python an `ApplyOutcome` named tuple; Go a second return value. Each is the shape that language already uses for a two-valued answer, and all five report the same two numbers.
+
 ## 2026-07-28 · C19 refused-op ack (#367) · `Document::apply`'s `false` is split into "not yet" and "never", and only "never" may be dropped, logged by nobody and acked by nobody
 
 **Changed:** ARCHITECTURE's op-ingress description gains the refusal boundary — a server refuses at ingress an op no replica can hold, on the same terms as the schema-violation reject it already documents, and the retained log's contract becomes *only ops the replica applied or is holding*.

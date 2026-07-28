@@ -384,24 +384,32 @@ func (d *Doc) SetSchema(schema []byte) bool {
 	return d.backend.SetSchema(schema)
 }
 
-// ApplyUpdate folds a peer's update ops into this replica; returns the count
-// applied. Local docs only — a networked doc syncs through its provider and
-// refuses with -1.
-func (d *Doc) ApplyUpdate(ops []byte) int {
+// ApplyUpdate folds a peer's update ops into this replica. Local docs only — a
+// networked doc syncs through its provider and refuses with -1.
+//
+// The two counts separate an op that did not apply yet from one that never will.
+// applied is what the fold took now; an op it did not take may be a duplicate, or
+// be waiting — buffered until a create makes its target reachable or its
+// transaction group completes, which a later update does. refused is what no
+// replica will ever hold, which is a bug in whoever wrote it: offline, P2P and
+// relayed peers reach this fold with no server between them to reject such an op
+// first, so a non-zero refused is the only signal the app gets that a peer's
+// edits are dropped for good.
+func (d *Doc) ApplyUpdate(ops []byte) (applied, refused int) {
 	d.mu.Lock()
 	var before []byte
 	if d.observingLocked() {
 		before = d.backend.EncodeState()
 	}
-	applied := d.backend.Apply(ops)
+	applied, refused = d.backend.Apply(ops)
 	if applied <= 0 {
 		d.mu.Unlock()
-		return applied
+		return applied, refused
 	}
 	plan := d.planDispatchLocked("remote", ops, before)
 	d.mu.Unlock()
 	plan.run()
-	return applied
+	return applied, refused
 }
 
 // applyRemote brackets a provider-driven inbound receive with reactivity. The

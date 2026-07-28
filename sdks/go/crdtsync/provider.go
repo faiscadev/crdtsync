@@ -47,8 +47,8 @@ func (p *Provider) onUpdate(e UpdateEvent) {
 }
 
 // Receive folds a peer's ops into the bound doc (firing "remote" reactivity);
-// returns the count applied.
-func (p *Provider) Receive(ops []byte) int {
+// returns what the fold applied beside what it refused forever.
+func (p *Provider) Receive(ops []byte) (applied, refused int) {
 	return p.doc.ApplyUpdate(ops)
 }
 

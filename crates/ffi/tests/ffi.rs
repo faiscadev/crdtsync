@@ -28,7 +28,7 @@ fn path(keys: &[&[u8]]) -> Vec<u8> {
 }
 
 unsafe fn exchange(dst: *mut CrdtDoc, ops: &CrdtBuf) {
-    crdtsync_doc_apply(dst, ops.ptr, ops.len);
+    crdtsync_doc_apply(dst, ops.ptr, ops.len, ptr::null_mut());
 }
 
 unsafe fn register_int(doc: *mut CrdtDoc, p: &[u8], v: i64) -> CrdtBuf {
@@ -648,7 +648,7 @@ fn a_decoded_snapshot_still_dedups_and_converges() {
         let reloaded = crdtsync_doc_decode_state(snap.ptr, snap.len);
 
         assert_eq!(
-            crdtsync_doc_apply(reloaded, reg.ptr, reg.len),
+            crdtsync_doc_apply(reloaded, reg.ptr, reg.len, ptr::null_mut()),
             0,
             "replay is deduped"
         );
@@ -657,7 +657,7 @@ fn a_decoded_snapshot_still_dedups_and_converges() {
         exchange(b, &reg);
         let hit = inc(b, &path(&[b"hits"]), 4);
         assert_eq!(
-            crdtsync_doc_apply(reloaded, hit.ptr, hit.len),
+            crdtsync_doc_apply(reloaded, hit.ptr, hit.len, ptr::null_mut()),
             1,
             "later op applies"
         );
@@ -1167,8 +1167,65 @@ fn applying_garbage_bytes_is_reported_not_fatal() {
         let c = client(1);
         let doc = crdtsync_doc_new(c.as_ptr());
         let junk = [0xFFu8; 8];
-        assert_eq!(crdtsync_doc_apply(doc, junk.as_ptr(), junk.len()), -1);
+        let mut refused = 7u32;
+        assert_eq!(
+            crdtsync_doc_apply(doc, junk.as_ptr(), junk.len(), &mut refused),
+            -1
+        );
+        assert_eq!(refused, 7, "a batch that never decoded judges no op");
         crdtsync_doc_free(doc);
+    }
+}
+
+#[test]
+fn a_refused_op_is_counted_apart_from_a_buffered_one() {
+    unsafe {
+        let a = crdtsync_doc_new(client(1).as_ptr());
+        // A nested write is two ops: the container create, then the write into it.
+        // Held back, the create leaves the write waiting on an unreachable target.
+        let nested = register_int(a, &path(&[b"nested", b"k"]), 1);
+        let mut ops = crdtsync_core::decode_ops(std::slice::from_raw_parts(nested.ptr, nested.len))
+            .expect("a nested write decodes");
+        let write = ops.pop().expect("the write is the last op");
+        let create = ops.pop().expect("the container create is the first op");
+
+        // An op whose stamp names a client other than its author mints ids in that
+        // client's id space — a refusal every replica makes on the op alone.
+        let other = crdtsync_doc_new(client(3).as_ptr());
+        let forged_buf = register_int(other, &path(&[b"forged"]), 9);
+        let mut forged =
+            crdtsync_core::decode_ops(std::slice::from_raw_parts(forged_buf.ptr, forged_buf.len))
+                .expect("a register write decodes");
+        let mut refused_op = forged.pop().expect("a register write is one op");
+        refused_op.stamp.client = crdtsync_core::ClientId::from_bytes([9u8; 16]);
+        assert!(!refused_op.is_admissible());
+
+        let b = crdtsync_doc_new(client(2).as_ptr());
+        let batch = crdtsync_core::encode_ops(&[refused_op, write]);
+        let mut refused = 0u32;
+        assert_eq!(
+            crdtsync_doc_apply(b, batch.as_ptr(), batch.len(), &mut refused),
+            0,
+            "neither op applies now"
+        );
+        assert_eq!(refused, 1, "only the forged op is refused forever");
+
+        // The buffered op was waiting, not refused: the create releases it.
+        let tail = crdtsync_core::encode_ops(&[create]);
+        let mut none_refused = 0u32;
+        assert_eq!(
+            crdtsync_doc_apply(b, tail.as_ptr(), tail.len(), &mut none_refused),
+            1
+        );
+        assert_eq!(none_refused, 0);
+        assert_eq!(get_int(b, &path(&[b"nested", b"k"])), (1, 1));
+        assert_eq!(get_int(b, &path(&[b"forged"])).0, 0, "the forgery is gone");
+
+        crdtsync_buf_free(nested);
+        crdtsync_buf_free(forged_buf);
+        crdtsync_doc_free(a);
+        crdtsync_doc_free(other);
+        crdtsync_doc_free(b);
     }
 }
 
@@ -1197,7 +1254,10 @@ fn a_null_document_is_handled_not_dereferenced() {
             crdtsync_doc_get_int(ptr::null(), p.as_ptr(), p.len(), &mut out),
             -1
         );
-        assert_eq!(crdtsync_doc_apply(ptr::null_mut(), b"".as_ptr(), 0), -1);
+        assert_eq!(
+            crdtsync_doc_apply(ptr::null_mut(), b"".as_ptr(), 0, ptr::null_mut()),
+            -1
+        );
     }
 }
 
@@ -1208,7 +1268,7 @@ fn a_null_data_pointer_is_rejected_not_dereferenced() {
         let doc = crdtsync_doc_new(c.as_ptr());
         let mut out: i64 = 0;
         assert_eq!(crdtsync_doc_get_int(doc, ptr::null(), 4, &mut out), 0);
-        assert_eq!(crdtsync_doc_apply(doc, ptr::null(), 8), -1);
+        assert_eq!(crdtsync_doc_apply(doc, ptr::null(), 8, ptr::null_mut()), -1);
         let buf = crdtsync_doc_register_int(doc, ptr::null(), 4, 1);
         assert_eq!(buf.len, 0, "a null path yields no ops");
         crdtsync_buf_free(buf);
@@ -1461,9 +1521,9 @@ fn a_doc_atomic_transaction_commits_all_or_nothing() {
         let first = crdtsync_core::encode_ops(&ops[..1]);
         let rest = crdtsync_core::encode_ops(&ops[1..]);
 
-        crdtsync_doc_apply(b, first.as_ptr(), first.len());
+        crdtsync_doc_apply(b, first.as_ptr(), first.len(), ptr::null_mut());
         assert_eq!(get_int(b, &x).0, 0, "partial tx is invisible");
-        crdtsync_doc_apply(b, rest.as_ptr(), rest.len());
+        crdtsync_doc_apply(b, rest.as_ptr(), rest.len(), ptr::null_mut());
         assert_eq!(get_int(b, &x), (1, 1));
         assert_eq!(get_int(b, &y), (1, 2));
 

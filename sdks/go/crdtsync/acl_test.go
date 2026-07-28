@@ -31,7 +31,7 @@ func TestAclGrantToAnActorKeyConverges(t *testing.T) {
 	if len(id) != 16 || len(ops) == 0 {
 		t.Fatal("a grant to an actor key emits an id and ops")
 	}
-	if n := b.Apply(ops); n < 1 {
+	if n, _ := b.Apply(ops); n < 1 {
 		t.Fatalf("the grant converges, applied %d", n)
 	}
 }
@@ -49,7 +49,7 @@ func TestAclGrantReturnsIdAndConverges(t *testing.T) {
 	if len(ops) == 0 {
 		t.Fatal("a grant emits ops")
 	}
-	if n := b.Apply(ops); n < 1 {
+	if n, _ := b.Apply(ops); n < 1 {
 		t.Fatalf("the grant tuple converges on a peer, applied %d", n)
 	}
 }
@@ -71,7 +71,7 @@ func TestAclRevokeByReturnedID(t *testing.T) {
 	if len(rev) == 0 {
 		t.Fatal("revoking a held tuple emits ops")
 	}
-	if n := b.Apply(rev); n < 1 {
+	if n, _ := b.Apply(rev); n < 1 {
 		t.Fatalf("the revoke converges, applied %d", n)
 	}
 }
@@ -86,7 +86,7 @@ func TestAclClassSubjectMarshals(t *testing.T) {
 	if len(id) != 16 || len(ops) == 0 {
 		t.Fatal("a class-subject grant emits an id and ops")
 	}
-	if n := b.Apply(ops); n < 1 {
+	if n, _ := b.Apply(ops); n < 1 {
 		t.Fatalf("the grant converges, applied %d", n)
 	}
 }

@@ -676,12 +676,27 @@ impl WasmDocument {
         Ok(changes.iter().map(change_to_js).collect())
     }
 
-    /// Fold a peer's encoded ops in. Returns the number applied, -1 on error.
-    pub fn apply(&mut self, ops: &[u8]) -> i32 {
-        match decode_ops(ops) {
-            Ok(ops) => ops.iter().filter(|op| self.inner.apply(op)).count() as i32,
-            Err(_) => -1,
-        }
+    /// Fold a peer's encoded ops in, as `{ applied, refused }`: `applied` the
+    /// number the fold took now (`-1` on a malformed batch), `refused` the number
+    /// no replica will ever hold.
+    ///
+    /// **The two zeros mean opposite things.** An op that did not apply may be a
+    /// duplicate, or be *waiting* — buffered until a create makes its target
+    /// reachable or its transaction group completes, which a later arrival does —
+    /// while a refused op ([`Op::is_admissible`]'s complement: a stamp naming a
+    /// client other than the op's author, a stamp outside the position an id may
+    /// occupy, a transaction size no group can have) is a bug in whoever wrote it,
+    /// and no arrival lifts it. Offline, P2P and relayed peers reach this fold with
+    /// no server between them to answer `MalformedOp`, so the count is the app's
+    /// only signal. A malformed batch decodes nothing to judge, so it reports
+    /// `refused: 0`.
+    pub fn apply(&mut self, ops: &[u8]) -> JsValue {
+        let Ok(ops) = decode_ops(ops) else {
+            return apply_outcome_to_js(-1, 0);
+        };
+        let refused = ops.iter().filter(|op| !op.is_admissible()).count() as i32;
+        let applied = ops.iter().filter(|op| self.inner.apply(op)).count() as i32;
+        apply_outcome_to_js(applied, refused)
     }
 
     /// Begin recording an atomic transaction; edits accumulate until commit.
@@ -1975,6 +1990,14 @@ fn resolved_mark_to_js(mark: &ResolvedMark) -> JsValue {
             set(&obj, "value", &arr.into());
         }
     }
+    obj.into()
+}
+
+/// One fold's outcome as a plain JS object: `{ applied, refused }`.
+fn apply_outcome_to_js(applied: i32, refused: i32) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(&obj, "applied", &JsValue::from_f64(applied as f64));
+    set(&obj, "refused", &JsValue::from_f64(refused as f64));
     obj.into()
 }
 

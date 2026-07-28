@@ -13,7 +13,7 @@ def test_register_reads_back_and_converges():
     with Document(cid(1)) as a, Document(cid(2)) as b:
         ops = a.register_int([b"age"], 30)
         assert a.get_int([b"age"]) == 30
-        assert b.apply(ops) == 1
+        assert b.apply(ops).applied == 1
         assert b.get_int([b"age"]) == 30
 
 
@@ -106,7 +106,7 @@ def test_out_of_range_arguments_raise():
 
 def test_apply_rejects_garbage():
     with Document(cid(1)) as a:
-        assert a.apply(b"\xff\xff\xff\xff\xff\xff\xff\xff") == -1
+        assert a.apply(b"\xff\xff\xff\xff\xff\xff\xff\xff") == (-1, 0)
 
 
 def test_encode_path_shape():

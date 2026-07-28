@@ -525,9 +525,24 @@ int32_t crdtsync_doc_resolve_position(const CrdtDoc *doc,
 // pending its target counts as not-applied), or -1 on a bad handle or
 // malformed bytes.
 //
+// **`out_refused` is what separates "not yet" from "never"**, and the two want
+// opposite responses. It receives the count of ops in the batch that no replica
+// will ever hold ([`Op::is_admissible`]'s complement — a stamp naming a client
+// other than the op's author, a stamp outside the position an id may occupy, a
+// transaction size no group can have). A buffered op is *waiting*, so the fold
+// keeps it and a later arrival commits it; a refused op is a bug in whoever
+// wrote it, and there is no server between an offline, P2P or relayed peer and
+// this fold to answer `MalformedOp` on the app's behalf. Zero is the honest-peer
+// reading — nothing this codebase emits is refused. A null pointer skips the
+// write, as does every -1 outcome, which decodes no batch to judge.
+//
 // # Safety
-// `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`].
-int32_t crdtsync_doc_apply(CrdtDoc *doc, const uint8_t *bytes, uintptr_t len);
+// `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`];
+// `out_refused` is null or points to a writable `u32`.
+int32_t crdtsync_doc_apply(CrdtDoc *doc,
+                           const uint8_t *bytes,
+                           uintptr_t len,
+                           uint32_t *out_refused);
 
 // Begin recording an atomic transaction: until [`crdtsync_doc_commit_atomic`],
 // edits accumulate into one group and each returns an empty ops buffer.

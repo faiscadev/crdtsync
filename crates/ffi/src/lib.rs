@@ -1253,13 +1253,26 @@ pub unsafe extern "C" fn crdtsync_doc_resolve_position(
 /// pending its target counts as not-applied), or -1 on a bad handle or
 /// malformed bytes.
 ///
+/// **`out_refused` is what separates "not yet" from "never"**, and the two want
+/// opposite responses. It receives the count of ops in the batch that no replica
+/// will ever hold ([`Op::is_admissible`]'s complement — a stamp naming a client
+/// other than the op's author, a stamp outside the position an id may occupy, a
+/// transaction size no group can have). A buffered op is *waiting*, so the fold
+/// keeps it and a later arrival commits it; a refused op is a bug in whoever
+/// wrote it, and there is no server between an offline, P2P or relayed peer and
+/// this fold to answer `MalformedOp` on the app's behalf. Zero is the honest-peer
+/// reading — nothing this codebase emits is refused. A null pointer skips the
+/// write, as does every -1 outcome, which decodes no batch to judge.
+///
 /// # Safety
-/// `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`].
+/// `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`];
+/// `out_refused` is null or points to a writable `u32`.
 #[no_mangle]
 pub unsafe extern "C" fn crdtsync_doc_apply(
     doc: *mut CrdtDoc,
     bytes: *const u8,
     len: usize,
+    out_refused: *mut u32,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         if doc.is_null() {
@@ -1270,7 +1283,12 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
             return -1;
         };
         match crdtsync_core::decode_ops(raw) {
-            Ok(ops) => ops.iter().filter(|op| handle.doc.apply(op)).count() as i32,
+            Ok(ops) => {
+                if !out_refused.is_null() {
+                    *out_refused = ops.iter().filter(|op| !op.is_admissible()).count() as u32;
+                }
+                ops.iter().filter(|op| handle.doc.apply(op)).count() as i32
+            }
             Err(_) => -1,
         }
     }))
