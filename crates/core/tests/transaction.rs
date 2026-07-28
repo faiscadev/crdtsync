@@ -785,3 +785,556 @@ fn a_group_built_over_a_reused_sequence_does_not_collide_with_the_first() {
         );
     }
 }
+
+// --- malformed group sizes ---
+//
+// `count` is an instruction to hold the group's members until that many arrive.
+// A rewritten one instructs the receiver to hold them for good: nothing else
+// releases a group, and `encode_state` carries the buffer, so the next replica
+// starts holding them too. The bound at the decode boundary keeps the
+// unreachable sizes off the wire and a member carrying one past `apply` is
+// untagged on its own account; unanimity across a bucket keeps a group's size
+// from being whichever member landed first; and eviction is the way out for a
+// group that is merely never completed, whatever left it that way.
+
+/// `op` re-tagged as a member of group `id` declaring `count` members — the
+/// envelope rewrite a hostile peer or a relay can perform on a member in flight.
+fn retagged(op: &Op, id: crdtsync_core::TxId, count: u32) -> Op {
+    let mut op = op.clone();
+    op.tx = Some(Tx { id, count });
+    op
+}
+
+/// The group id a tagged op carries.
+fn tx_id(op: &Op) -> crdtsync_core::TxId {
+    op.tx.expect("an atomic member carries its group").id
+}
+
+/// A two-member atomic group over `x` and `y`, and its author.
+fn pair() -> (Document, Vec<Op>) {
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.register(b"y", Scalar::Int(2));
+    });
+    (a, ops)
+}
+
+#[test]
+fn the_codec_refuses_a_group_that_declares_no_members() {
+    let (_, ops) = pair();
+    let forged = retagged(&ops[0], tx_id(&ops[0]), 0);
+    assert!(
+        crdtsync_core::decode_op(&crdtsync_core::encode_op(&forged)).is_err(),
+        "a group of zero members completes on no arrival"
+    );
+}
+
+#[test]
+fn the_codec_refuses_a_group_past_the_member_cap() {
+    let (_, ops) = pair();
+    for count in [crdtsync_core::MAX_TX_MEMBERS + 1, u32::MAX] {
+        let forged = retagged(&ops[0], tx_id(&ops[0]), count);
+        assert!(
+            crdtsync_core::decode_op(&crdtsync_core::encode_op(&forged)).is_err(),
+            "a group of {count} members is past the cap"
+        );
+    }
+}
+
+#[test]
+fn the_codec_carries_a_group_at_the_member_cap() {
+    let (_, ops) = pair();
+    let capped = retagged(&ops[0], tx_id(&ops[0]), crdtsync_core::MAX_TX_MEMBERS);
+    assert_eq!(
+        crdtsync_core::decode_op(&crdtsync_core::encode_op(&capped)).expect("decode"),
+        capped,
+        "the cap itself is a declarable size"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "thousand-member groups are slow under Miri")]
+fn the_member_cap_is_the_largest_group_a_local_transaction_tags() {
+    let mut a = doc(1);
+    let capped = a.atomic_transact(|tx| {
+        for i in 0..crdtsync_core::MAX_TX_MEMBERS {
+            tx.register(format!("k{i}").as_bytes(), Scalar::Int(i64::from(i)));
+        }
+    });
+    assert_eq!(capped.len() as u32, crdtsync_core::MAX_TX_MEMBERS);
+    assert!(
+        capped
+            .iter()
+            .all(|op| op.tx.map(|tx| tx.count) == Some(crdtsync_core::MAX_TX_MEMBERS)),
+        "the cap itself is a taggable size"
+    );
+
+    let mut b = doc(1);
+    let over = b.atomic_transact(|tx| {
+        for i in 0..=crdtsync_core::MAX_TX_MEMBERS {
+            tx.register(format!("k{i}").as_bytes(), Scalar::Int(i64::from(i)));
+        }
+    });
+    assert_eq!(over.len() as u32, crdtsync_core::MAX_TX_MEMBERS + 1);
+    assert!(
+        over.iter().all(|op| op.tx.is_none()),
+        "a group no receiver may accept is streamed rather than tagged"
+    );
+
+    // Untagged, the oversized group's ops still cross the wire and still merge —
+    // which tagging them would have cost, the codec refusing the whole frame.
+    let mut c = doc(2);
+    for op in &over {
+        let wire = crdtsync_core::decode_op(&crdtsync_core::encode_op(op)).expect("decode");
+        c.apply(&wire);
+    }
+    assert_eq!(reg(&c, b"k0"), Some(Scalar::Int(0)));
+    assert_eq!(
+        reg(&c, format!("k{}", crdtsync_core::MAX_TX_MEMBERS).as_bytes()),
+        Some(Scalar::Int(i64::from(crdtsync_core::MAX_TX_MEMBERS)))
+    );
+}
+
+#[test]
+fn a_member_declaring_a_size_outside_the_cap_is_refused_on_arrival() {
+    // An op reaching `apply` without crossing the codec — an in-process relay, an
+    // SDK handing one over — carries a size the boundary never checked. The
+    // judgement is the member's own, so it holds nothing whatever else has landed,
+    // and refusing means it is not held at all: the honest member under the same
+    // id still arrives and still completes its group.
+    for count in [0, crdtsync_core::MAX_TX_MEMBERS + 1, u32::MAX] {
+        let (a, ops) = pair();
+        let forged = retagged(&ops[0], tx_id(&ops[0]), count);
+
+        let mut b = doc(2);
+        assert!(!b.apply(&forged), "a size of {count} is not applied");
+        assert_eq!(reg(&b, b"x"), None);
+        assert!(!b.apply(&ops[1]), "the honest member is still held");
+        assert!(
+            b.apply(&ops[0]),
+            "the refused size of {count} left nothing holding its id"
+        );
+        assert_eq!(reg(&b, b"x"), reg(&a, b"x"));
+        assert_eq!(reg(&b, b"y"), reg(&a, b"y"));
+
+        // And the refusal does not depend on what has landed before it.
+        let mut c = doc(2);
+        assert!(!c.apply(&ops[1]));
+        assert!(!c.apply(&forged), "a size of {count} is refused either way");
+        assert_eq!(reg(&c, b"y"), None);
+    }
+}
+
+#[test]
+fn a_rewritten_first_member_count_does_not_commit_the_group_at_the_wrong_size() {
+    // Three members; the one that lands first is rewritten to declare two. Read
+    // off that member, the size is met by the pair — committing a group two
+    // thirds of the way through, and leaving the third holding a size its bucket
+    // has already spent. The bucket has to agree on its size instead.
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.register(b"y", Scalar::Int(2));
+        tx.register(b"z", Scalar::Int(3));
+    });
+    assert_eq!(ops.len(), 3);
+    let id = tx_id(&ops[0]);
+
+    let mut b = doc(2);
+    assert!(!b.apply(&retagged(&ops[0], id, 2)));
+    assert!(!b.apply(&ops[1]));
+    assert_eq!(reg(&b, b"x"), None, "the pair is not the group");
+    assert_eq!(reg(&b, b"y"), None, "the pair is not the group");
+
+    // The third arrives; the bucket still names no size, so nothing commits —
+    // and eviction is what releases all three.
+    assert!(!b.apply(&ops[2]));
+    assert_eq!(reg(&b, b"z"), None);
+    assert_eq!(b.evict_partial_transactions(), 1);
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
+    }
+}
+
+#[test]
+fn a_bucket_whose_members_disagree_on_the_size_never_completes() {
+    // The disagreement arriving last is the other half: the bucket is at its
+    // declared size in members, and still names no group.
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.register(b"y", Scalar::Int(2));
+        tx.register(b"z", Scalar::Int(3));
+    });
+    let id = tx_id(&ops[0]);
+
+    let mut b = doc(2);
+    b.apply(&ops[0]);
+    b.apply(&ops[1]);
+    assert!(!b.apply(&retagged(&ops[2], id, 2)));
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(
+            reg(&b, key),
+            None,
+            "member {key:?} committed a size-3 bucket"
+        );
+    }
+    assert_eq!(b.evict_partial_transactions(), 1);
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), reg(&a, key));
+    }
+}
+
+#[test]
+fn a_rewritten_count_holds_the_same_set_whatever_order_it_arrives_in() {
+    // Whether a bucket looks unreachable depends on which of its members have
+    // landed, so nothing may be decided from that: two replicas served the same
+    // ops in different orders would then release different sets and diverge.
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.register(b"y", Scalar::Int(2));
+        tx.register(b"z", Scalar::Int(3));
+    });
+    let id = tx_id(&ops[0]);
+    let forged = [ops[0].clone(), ops[1].clone(), retagged(&ops[2], id, 2)];
+
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [2, 0, 1],
+        [2, 1, 0],
+        [1, 2, 0],
+        [1, 0, 2],
+    ] {
+        let mut b = doc(2);
+        for i in order {
+            b.apply(&forged[i]);
+        }
+        for key in [&b"x"[..], b"y", b"z"] {
+            assert_eq!(reg(&b, key), None, "order {order:?} released {key:?} early");
+        }
+        b.evict_partial_transactions();
+        for key in [&b"x"[..], b"y", b"z"] {
+            assert_eq!(
+                reg(&b, key),
+                reg(&a, key),
+                "order {order:?} stranded {key:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_group_rewritten_smaller_on_every_member_commits_a_subset_the_order_picks() {
+    // The shape no count rule reaches, pinned as what it is rather than claimed
+    // fixed: a rewrite consistent across every member is, to a receiver, an honest
+    // group of the smaller size followed by a stray. It commits at the size it was
+    // told, and *which* members that is belongs to the arrival order — so two
+    // replicas disagree until each evicts. Closing it needs a record that a group
+    // id has been resolved, which is state of its own (KANBAN C18).
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.register(b"y", Scalar::Int(2));
+        tx.register(b"z", Scalar::Int(3));
+    });
+    let id = tx_id(&ops[0]);
+    let shrunk: Vec<Op> = ops.iter().map(|op| retagged(op, id, 2)).collect();
+
+    let mut first = doc(2);
+    for op in &shrunk {
+        first.apply(op);
+    }
+    let mut last = doc(3);
+    for op in shrunk.iter().rev() {
+        last.apply(op);
+    }
+    assert_ne!(
+        reg(&first, b"x").is_some(),
+        reg(&last, b"x").is_some(),
+        "the arrival order decides which members the rewritten size commits"
+    );
+
+    // Eviction is what closes it, and it closes it the same way on both.
+    assert_eq!(first.evict_partial_transactions(), 1);
+    assert_eq!(last.evict_partial_transactions(), 1);
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&first, key), reg(&a, key));
+        assert_eq!(reg(&last, key), reg(&a, key));
+    }
+}
+
+#[test]
+fn two_envelopes_of_one_member_leave_the_bucket_reading_whichever_landed_first() {
+    // `apply` dedups on op id before it looks at the tag, so when one member
+    // arrives twice under different envelopes the bucket keeps whichever won the
+    // race — a hostile duplicate, or a destranded copy racing the tagged one
+    // across two delivery seams. The size the bucket then reads is the arrival
+    // order's. Pinned as what it is: the record that would settle it is the one
+    // a resolved bucket key does not keep (KANBAN C18).
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.register(b"y", Scalar::Int(2));
+        tx.register(b"z", Scalar::Int(3));
+    });
+    let dup = retagged(&ops[2], tx_id(&ops[0]), 2);
+
+    let mut honest_first = doc(2);
+    for op in [&ops[0], &ops[1], &ops[2], &dup] {
+        honest_first.apply(op);
+    }
+    let mut dup_first = doc(3);
+    for op in [&ops[0], &ops[1], &dup, &ops[2]] {
+        dup_first.apply(op);
+    }
+    assert_ne!(
+        reg(&honest_first, b"x").is_some(),
+        reg(&dup_first, b"x").is_some(),
+        "the envelope that won the dedup decides the bucket's size"
+    );
+
+    // Eviction closes it, and closes it the same way on both.
+    honest_first.evict_partial_transactions();
+    dup_first.evict_partial_transactions();
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&honest_first, key), reg(&a, key));
+        assert_eq!(reg(&dup_first, key), reg(&a, key));
+    }
+}
+
+#[test]
+fn a_snapshot_holding_more_members_than_the_count_declares_evicts() {
+    // The presentation of that shape that never commits at all: a buffer decoded
+    // already holding more members than their unanimous size admits, so the bucket
+    // is never *at* its size. It reaches a replica the way any buffer does —
+    // inside a peer-supplied snapshot, whose framed op log is spliced here with
+    // the same public codec that wrote it.
+    let (mut a, ops) = pair();
+    let extra = a.transact(|tx| tx.register(b"z", Scalar::Int(3)));
+    let id = tx_id(&ops[0]);
+
+    let mut b = doc(2);
+    b.apply(&ops[0]);
+    let snapshot = b.encode_state();
+
+    // `encode_state` ends on the framed buffer behind its own u32 length, so
+    // replacing the tail from that length onwards rewrites the buffer whole.
+    let held = crdtsync_core::encode_ops(&ops[..1]);
+    let at = snapshot
+        .windows(held.len())
+        .position(|w| w == held)
+        .expect("the buffered member is framed in the snapshot");
+    assert_eq!(
+        at + held.len(),
+        snapshot.len(),
+        "the buffer is the state stream's last section"
+    );
+    let overfull = crdtsync_core::encode_ops(&[
+        retagged(&ops[0], id, 2),
+        retagged(&ops[1], id, 2),
+        retagged(&extra[0], id, 2),
+    ]);
+    let mut forged = snapshot[..at - 4].to_vec();
+    forged.extend_from_slice(&(overfull.len() as u32).to_le_bytes());
+    forged.extend_from_slice(&overfull);
+
+    let mut restored = Document::decode_state(&forged).expect("decode");
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&restored, key), None, "an overfull bucket committed");
+    }
+    assert_eq!(restored.evict_partial_transactions(), 1);
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(
+            reg(&restored, key),
+            reg(&a, key),
+            "member {key:?} stayed buffered"
+        );
+    }
+}
+
+// --- evicting a partial transaction ---
+
+#[test]
+fn evicting_a_partial_transaction_lands_its_members() {
+    let (a, ops) = pair();
+    let mut b = doc(2);
+    assert!(!b.apply(&ops[0]));
+    assert_eq!(
+        reg(&b, b"x"),
+        None,
+        "the member is held while the group can"
+    );
+
+    assert_eq!(b.evict_partial_transactions(), 1);
+    assert_eq!(
+        reg(&b, b"x"),
+        reg(&a, b"x"),
+        "an evicted member merges standalone"
+    );
+
+    // A member arriving after its group was evicted is a group of its own again:
+    // it holds until the next eviction, which is why eviction is a policy the
+    // caller repeats rather than a one-off.
+    assert!(!b.apply(&ops[1]));
+    assert_eq!(b.evict_partial_transactions(), 1);
+    assert_eq!(reg(&b, b"y"), reg(&a, b"y"));
+}
+
+#[test]
+fn eviction_counts_the_transactions_it_gives_up_on() {
+    let mut a = doc(1);
+    let first = a.atomic_transact(|tx| {
+        tx.register(b"f1", Scalar::Int(1));
+        tx.register(b"f2", Scalar::Int(2));
+    });
+    let second = a.atomic_transact(|tx| {
+        tx.register(b"s1", Scalar::Int(3));
+        tx.register(b"s2", Scalar::Int(4));
+    });
+
+    let mut b = doc(2);
+    b.apply(&first[0]);
+    b.apply(&second[0]);
+    assert_eq!(b.evict_partial_transactions(), 2, "two groups were partial");
+    assert_eq!(b.evict_partial_transactions(), 0, "none is left to evict");
+}
+
+#[test]
+fn eviction_leaves_a_complete_transaction_atomic() {
+    let (mut a, ops) = pair();
+    let mut b = doc(2);
+    for op in &ops {
+        b.apply(op);
+    }
+    assert_eq!(
+        b.evict_partial_transactions(),
+        0,
+        "a group that committed is not a group waiting"
+    );
+    assert_eq!(reg(&b, b"x"), reg(&a, b"x"));
+    assert_eq!(reg(&b, b"y"), reg(&a, b"y"));
+
+    // And a group still arriving beside it keeps its atomic boundary: eviction
+    // counts and releases the waiting group only.
+    let second = a.atomic_transact(|tx| {
+        tx.register(b"p", Scalar::Int(8));
+        tx.register(b"q", Scalar::Int(9));
+    });
+    assert!(!b.apply(&second[0]));
+    assert_eq!(b.evict_partial_transactions(), 1, "only the partial group");
+    assert_eq!(reg(&b, b"p"), reg(&a, b"p"));
+    assert_eq!(reg(&b, b"q"), None);
+}
+
+#[test]
+fn an_evicted_member_is_neither_reapplied_nor_its_id_freed() {
+    // The buffer is where a replica's own ops wait after a catch-up, and the op
+    // counter walks the ids it holds. Eviction moves a member from held-and-
+    // waiting to held-and-applied, so the counter must not see an id go free,
+    // and a resend of the member must still dedup away.
+    let (a, ops) = pair();
+    let mut b = doc(2);
+    b.apply(&ops[0]);
+    b.adopt_as(a.client(), 0);
+    let before = b.next_seq();
+
+    assert_eq!(b.evict_partial_transactions(), 1);
+    assert_eq!(
+        b.next_seq(),
+        before,
+        "an evicted member's id is still published"
+    );
+    assert!(
+        !b.apply(&ops[0]),
+        "a resend of an evicted member is a no-op"
+    );
+    assert_eq!(reg(&b, b"x"), reg(&a, b"x"));
+}
+
+#[test]
+fn an_evicted_member_whose_target_is_unreachable_keeps_waiting() {
+    // Eviction gives up on the group, not on the readiness gate: a member whose
+    // container has not arrived waits on alone, untagged, and lands when the
+    // create does — never applied into a container that does not exist.
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.map(b"profile").register(b"name", Scalar::Int(7));
+    });
+    assert!(ops.len() >= 2, "a create plus a set");
+
+    let mut b = doc(2);
+    b.apply(&ops[ops.len() - 1]);
+    assert_eq!(b.evict_partial_transactions(), 1);
+    assert!(
+        b.get(b"profile").is_none(),
+        "the set did not conjure its container"
+    );
+
+    for op in &ops[..ops.len() - 1] {
+        b.apply(op);
+    }
+    b.evict_partial_transactions();
+    assert_eq!(nested(&b, b"profile", b"name"), Some(Scalar::Int(7)));
+}
+
+#[test]
+fn a_partial_transaction_evicts_after_a_snapshot_restore() {
+    // The buffer rides the state encoding, so a group held across a restart is
+    // held by the replica that decodes it — and evictable there.
+    let (a, ops) = pair();
+    let mut b = doc(2);
+    b.apply(&ops[0]);
+
+    let mut restored = Document::decode_state(&b.encode_state()).expect("decode");
+    assert_eq!(
+        reg(&restored, b"x"),
+        None,
+        "the member survived the restart"
+    );
+    assert_eq!(restored.evict_partial_transactions(), 1);
+    assert_eq!(reg(&restored, b"x"), reg(&a, b"x"));
+
+    // An evicted buffer is not a buffer that re-holds the member on the next
+    // round trip: the member is applied state now, and nothing is left to evict.
+    let mut again = Document::decode_state(&restored.encode_state()).expect("decode");
+    assert_eq!(reg(&again, b"x"), reg(&a, b"x"));
+    assert_eq!(again.evict_partial_transactions(), 0);
+}
+
+#[test]
+fn eager_and_deferred_eviction_reach_the_same_state() {
+    // The atomic view is what eviction spends; convergence is not. A replica that
+    // gives up after every arrival and one that gives up once at the end fold the
+    // same ops to the same state, and both to the author's.
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.map(b"profile").register(b"name", Scalar::Int(7));
+        tx.register(b"y", Scalar::Int(2));
+    });
+
+    let mut eager = doc(2);
+    let mut deferred = doc(3);
+    for (i, op) in ops.iter().enumerate() {
+        eager.apply(op);
+        eager.evict_partial_transactions();
+        deferred.apply(&ops[ops.len() - 1 - i]);
+    }
+    deferred.evict_partial_transactions();
+
+    for key in [&b"x"[..], b"y"] {
+        assert_eq!(reg(&eager, key), reg(&a, key));
+        assert_eq!(reg(&deferred, key), reg(&a, key));
+    }
+    assert_eq!(
+        nested(&eager, b"profile", b"name"),
+        nested(&a, b"profile", b"name")
+    );
+    assert_eq!(
+        nested(&deferred, b"profile", b"name"),
+        nested(&a, b"profile", b"name")
+    );
+}

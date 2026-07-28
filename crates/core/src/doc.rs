@@ -26,7 +26,7 @@ use crate::elementid::{ElementId, ElementKind};
 use crate::list::{Anchor, List, Side};
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::marks::{MarkState, ResolvedMark};
-use crate::op::{Op, OpId, OpKind, Tx, TxId};
+use crate::op::{Op, OpId, OpKind, Tx, TxId, MAX_TX_MEMBERS};
 use crate::ranged::{RangeAnchor, RangedElement, RangedInit, RangedPayload};
 use crate::repair::{keyed_repairs, Repair, RepairId};
 use crate::scalar::Scalar;
@@ -2231,7 +2231,8 @@ impl Document {
     }
 
     /// Close the atomic transaction opened by [`begin_atomic`] and return its ops,
-    /// tagged as one group for all-or-nothing delivery. Returns empty (and tags
+    /// tagged as one group for all-or-nothing delivery — untagged, and so
+    /// streamed, if the group is past [`MAX_TX_MEMBERS`]. Returns empty (and tags
     /// nothing) if no edits were recorded or no transaction was open.
     pub fn commit_atomic(&mut self) -> Vec<Op> {
         // With no transaction open there is nothing to close — and nothing to
@@ -2250,14 +2251,19 @@ impl Document {
         self.atomic.is_some()
     }
 
-    /// Tag a group's ops as one atomic transaction. An empty group is left
-    /// untagged.
+    /// Tag a group's ops as one atomic transaction. A group whose size is outside
+    /// the representable range — empty, or past [`MAX_TX_MEMBERS`] — is left
+    /// untagged, so its ops stream and merge individually. Tagging it would put a
+    /// size on the wire every recipient's codec refuses, and the refusal is of the
+    /// whole framed batch, so an oversized transaction would become dropped ops
+    /// rather than a non-atomic one.
     ///
     /// The id is [derived](TxId::derive) from the members' own sequences, so it is
     /// as durable as the op ids it sits beside and needs no state of its own.
     fn tag_atomic(&self, ops: Vec<Op>) -> Vec<Op> {
-        let Ok(count) = u32::try_from(ops.len()) else {
-            return ops;
+        let count = match u32::try_from(ops.len()) {
+            Ok(count) if (1..=MAX_TX_MEMBERS).contains(&count) => count,
+            _ => return ops,
         };
         let id = TxId::derive(ops.iter().map(|op| op.id.seq));
         ops.into_iter()
@@ -2271,6 +2277,8 @@ impl Document {
     /// Like [`transact`](Self::transact), but tag the emitted ops as one atomic
     /// transaction. A receiver holds the members until the whole group arrives,
     /// then applies them together, so no peer observes a partial transaction. A
+    /// group past [`MAX_TX_MEMBERS`] is emitted untagged and streams instead —
+    /// see [`tag_atomic`](Self::tag_atomic). A
     /// member whose own dependencies are still unmet when the group arrives keeps
     /// waiting on its own — grouping never changes what a set of ops merges to,
     /// and such a member almost never has an effect the current state could show
@@ -2284,6 +2292,40 @@ impl Document {
         self.begin_atomic();
         let _ = self.transact(f);
         self.commit_atomic()
+    }
+
+    /// Give up on every atomic transaction still waiting in the buffer: untag its
+    /// held members so each merges standalone. Returns how many transactions were
+    /// evicted.
+    ///
+    /// Completeness is the only thing that releases a group, and a member no
+    /// arrival brings is indistinguishable from one still in flight, so this is a
+    /// way to give up rather than a rule — how long to wait first is the caller's
+    /// policy, the core reading no clock. ARCHITECTURE §Opt-In: Atomic states what
+    /// it costs, and why a replica that never calls it does not converge with one
+    /// that does.
+    ///
+    /// A member still passes the ordinary readiness gate, so one whose target is
+    /// unreachable waits on in the buffer as an untagged op, and the ids stay held
+    /// either way — an evicted member is applied or still buffered, never free for
+    /// the sequence counter to mint again.
+    ///
+    /// A member arriving after its group was evicted rejoins that group's bucket
+    /// still carrying the size the group declared, which the remainder can no
+    /// longer reach: the eviction left no record, so nothing distinguishes it from
+    /// the first member of a fresh group. It waits until the next call, which is
+    /// why this is a policy the caller repeats rather than a one-shot repair.
+    pub fn evict_partial_transactions(&mut self) -> usize {
+        let groups = self.tx_buckets();
+        if groups.is_empty() {
+            return 0;
+        }
+        let evicted = groups.len();
+        for i in groups.into_values().flatten() {
+            self.buffer[i].tx = None;
+        }
+        self.drain_buffer();
+        evicted
     }
 
     /// Fold a foreign op into local state. An op whose target isn't reachable
@@ -2304,6 +2346,20 @@ impl Document {
         // it, and being a pure function of the op it refuses the same set on every
         // replica.
         if op.stamp.client != op.id.client {
+            return false;
+        }
+        // A member declaring a group size outside the representable range is
+        // refused, on the same terms and for the same reason as the stamp above:
+        // no honest op carries one ([`MAX_TX_MEMBERS`] bounds the mint), the
+        // judgement is on the member alone, and refusing holds nothing — the point
+        // of the bound being that such a member would wait in the buffer for a
+        // completion no arrival brings. The codec refuses the same op at the wire
+        // boundary; this is the seam an in-process relay or an SDK reaches without
+        // crossing one.
+        if op
+            .tx
+            .is_some_and(|tx| !(1..=MAX_TX_MEMBERS).contains(&tx.count))
+        {
             return false;
         }
         // An atomic-transaction member is always held first; its group commits
@@ -2584,12 +2640,7 @@ impl Document {
     /// ops arrive — so a group-wide resolution gate would make commit a window
     /// arrival order decides, and the same ops would fold to different states.
     fn take_complete_tx(&mut self) -> Option<Vec<Op>> {
-        let mut groups: HashMap<(ClientId, TxId), Vec<usize>> = HashMap::new();
-        for (i, op) in self.buffer.iter().enumerate() {
-            if let Some(tx) = &op.tx {
-                groups.entry((op.id.client, tx.id)).or_default().push(i);
-            }
-        }
+        let groups = self.tx_buckets();
         // Lowest buffer position wins when more than one group is complete, so
         // the commit order is the buffer's, not the hash map's. Draining to a
         // fixpoint after every fold keeps a replica's own buffer down to at most
@@ -2600,17 +2651,41 @@ impl Document {
         let complete = groups
             .into_values()
             .filter(|idxs| {
-                let count = self.buffer[idxs[0]]
-                    .tx
-                    .as_ref()
-                    .map_or(0, |tx| tx.count as usize);
-                idxs.len() == count
+                self.tx_declared_count(idxs)
+                    .is_some_and(|count| count as usize == idxs.len())
             })
             .min_by_key(|idxs| idxs[0])?;
         // Remove in descending index order so earlier indices stay valid.
         let mut idxs = complete;
         idxs.sort_unstable_by(|a, b| b.cmp(a));
         Some(idxs.into_iter().map(|i| self.buffer.remove(i)).collect())
+    }
+
+    /// The buffer positions of every held transaction member, bucketed by the
+    /// `(author, group id)` key a group is identified by.
+    fn tx_buckets(&self) -> HashMap<(ClientId, TxId), Vec<usize>> {
+        let mut groups: HashMap<(ClientId, TxId), Vec<usize>> = HashMap::new();
+        for (i, op) in self.buffer.iter().enumerate() {
+            if let Some(tx) = &op.tx {
+                groups.entry((op.id.client, tx.id)).or_default().push(i);
+            }
+        }
+        groups
+    }
+
+    /// The size the members held at `idxs` declare, or `None` if they do not all
+    /// declare the same one — a bucket without unanimity names no group, so it is
+    /// never complete.
+    ///
+    /// The size is the group's, not that of whichever member the buffer holds
+    /// first: read off one member, a rewritten envelope chooses when the group
+    /// commits. It bounds what a rewrite buys rather than removing it — a rewrite
+    /// consistent across every member is one no receiver can tell from an honest
+    /// group of that size (ARCHITECTURE §Opt-In: Atomic).
+    fn tx_declared_count(&self, idxs: &[usize]) -> Option<u32> {
+        let mut counts = idxs.iter().map(|&i| self.buffer[i].tx.map(|tx| tx.count));
+        let first = counts.next().flatten()?;
+        counts.all(|count| count == Some(first)).then_some(first)
     }
 
     /// Take the next op id this replica has not published, recording it as taken

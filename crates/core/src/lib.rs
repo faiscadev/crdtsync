@@ -60,7 +60,7 @@ pub use json::Json;
 pub use list::{Anchor, List, Side};
 pub use map::Map;
 pub use marks::{MarkState, ResolvedMark};
-pub use op::{destrand_split, split_groups, Op, OpId, OpKind, Tx, TxId};
+pub use op::{destrand_split, split_groups, Op, OpId, OpKind, Tx, TxId, MAX_TX_MEMBERS};
 pub use protocol::{
     decode_header, decode_message, encode_header, encode_message, select_codec, BranchInfo,
     Channel, DiffKind, ErrorCode, MemberState, Message, ProtocolError, CODEC_V1, SUPPORTED_CODECS,

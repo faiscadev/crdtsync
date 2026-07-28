@@ -75,6 +75,17 @@ pub struct Tx {
     pub count: u32,
 }
 
+/// The largest member count an atomic transaction may declare — ARCHITECTURE
+/// §Scope Constraints.
+///
+/// A `count` is an instruction to the receiver to hold the group's members until
+/// that many have arrived, so an unbounded one is an instruction to hold them for
+/// as long as the sender likes: nothing else releases a group, and the state
+/// encoding carries the buffer, so a restart hands the same members back. The
+/// bound is a protocol constant rather than a setting because both ends decide
+/// completeness from it — see ARCHITECTURE §Scope Constraints.
+pub const MAX_TX_MEMBERS: u32 = 1000;
+
 /// A primitive mutation, addressed by the key of a slot in the target Map.
 /// The receiver reaches the child through the map's get-or-create, re-deriving
 /// its id. Leaf children (Register, Counter) are created implicitly by their
