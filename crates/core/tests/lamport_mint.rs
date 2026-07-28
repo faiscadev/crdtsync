@@ -407,17 +407,54 @@ fn the_refusal_latch_spans_an_intention_and_no_further() {
     // refusing the single-id edits a subsequent undo is made of.
     let me = cid(1);
 
-    // An atomic group: the first transact exhausts, the second must not slip through.
+    // An atomic group whose first transact is refused **on span alone**, with room
+    // left for the edits after it. That asymmetry is the whole test: at full
+    // exhaustion every transact refuses on its own merits and the latch is never
+    // consulted, so a group planted at the ceiling would pass with the latch gone.
+    // Here the four-codepoint run does not fit and the single-id write after it
+    // would — so only the latch keeps the group whole.
     let mut doc = Document::new(me);
-    assert!(doc.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING)));
+    assert!(doc.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING - 2)));
     doc.begin_atomic();
-    doc.transact(|tx| tx.set(b"a", Scalar::Int(1)));
+    doc.transact(|tx| tx.text(b"t").insert(0, "abcd"));
     doc.transact(|tx| tx.set(b"b", Scalar::Int(2)));
+    let group = doc.commit_atomic();
     assert!(
-        doc.commit_atomic().is_empty(),
-        "a torn atomic group reached the wire"
+        group
+            .iter()
+            .all(|op| !matches!(op.kind, OpKind::MapSet { .. })),
+        "an edit after a refused one joined the group"
     );
-    assert!(doc.get(b"b").is_none());
+    assert!(
+        doc.get(b"b").is_none(),
+        "a torn atomic group reached local state"
+    );
+
+    // Full exhaustion refuses the group outright, latch or no latch.
+    let mut spent = Document::new(me);
+    assert!(spent.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING)));
+    spent.begin_atomic();
+    spent.transact(|tx| tx.set(b"a", Scalar::Int(1)));
+    spent.transact(|tx| tx.set(b"b", Scalar::Int(2)));
+    assert!(
+        spent.commit_atomic().is_empty(),
+        "an exhausted atomic group reached the wire"
+    );
+
+    // An atomic group nested in an explicit intention joins it, so opening the
+    // group must not hand the mint a fresh answer mid-intention.
+    let mut nested = Document::new(me);
+    assert!(nested.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING - 2)));
+    nested.begin_intention();
+    nested.transact(|tx| tx.text(b"t").insert(0, "abcd"));
+    nested.begin_atomic();
+    nested.transact(|tx| tx.set(b"b", Scalar::Int(2)));
+    let inner = nested.commit_atomic();
+    nested.end_intention();
+    assert!(
+        inner.is_empty() && nested.get(b"b").is_none(),
+        "opening a nested group cleared the latch mid-intention"
+    );
 
     // And the latch does not outlive the intention. Here the text create fits and
     // the run behind it does not, so the batch is cut at the refusal — what the

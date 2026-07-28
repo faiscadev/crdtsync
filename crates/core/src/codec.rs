@@ -14,7 +14,7 @@ use crate::list::{Anchor, Side};
 use crate::op::{Op, OpId, OpKind, Tx, TxId, MAX_TX_MEMBERS};
 use crate::ranged::{is_composite_payload_kind, RangeAnchor, RangedInit};
 use crate::scalar::{BlobRef, Scalar};
-use crate::stamp::Stamp;
+use crate::stamp::{Stamp, LAMPORT_STATE_CEILING};
 use std::collections::HashMap;
 
 /// Why a byte string could not be decoded into an op.
@@ -481,15 +481,28 @@ impl<'a> Cursor<'a> {
         self.tracking_stamps = true;
     }
 
-    /// Record that `client`'s ids reach at least `lamport`, for a stamp the stream
-    /// stores compressed rather than one id at a time.
+    /// Record that `client`'s ids reach at least `lamport` — a **node id** the
+    /// stream carries, which is what the id-space record is a high-water over.
     ///
-    /// A dead sequence run encodes as `(head, length)` — only the head passes
-    /// [`stamp`](Self::stamp), and the ids behind it are exactly the ones a plant
-    /// leaves behind once a user deletes it. Reading the head alone would let a
-    /// snapshot under-declare its record by the length of its own tombstones.
+    /// Called explicitly rather than from [`stamp`](Self::stamp), because most
+    /// stamps a state stream carries are not ids the replica holds: an anchor's
+    /// parent and a range anchor's position *reference* ids, and one may name a
+    /// client whose own op has not arrived. Flooring on those would invent record
+    /// entries the encoder never had, so a decoded replica could not reproduce its
+    /// own bytes.
+    ///
+    /// A dead sequence run needs it for the other reason: it encodes as
+    /// `(head, length)`, so only the head is a stamp at all, and the ids behind it
+    /// are exactly the ones a plant leaves once a user deletes it.
+    ///
+    /// Two positions are skipped rather than recorded. A zero reach says nothing and
+    /// [`Document::record_stamp`](crate::doc::Document) does not store one, so
+    /// reading it back would invent an entry. A reach past
+    /// [`LAMPORT_STATE_CEILING`] cannot come from an op any gate admits, and
+    /// recording it would put the record outside what this decoder accepts — the
+    /// mint stops at the ceiling either way, so it can never collide with one.
     pub(crate) fn note_stamp_reach(&mut self, client: ClientId, lamport: u64) {
-        if self.tracking_stamps {
+        if self.tracking_stamps && lamport != 0 && lamport <= LAMPORT_STATE_CEILING {
             let slot = self.stamp_high_water.entry(client).or_insert(0);
             *slot = (*slot).max(lamport);
         }
@@ -595,20 +608,6 @@ impl<'a> Cursor<'a> {
             0 => 0,
             _ => self.u64()?,
         };
-        if self.tracking_stamps {
-            // The sub-lamport dimension is not a place an id may be: `stamp_key`
-            // omits it, so two stamps differing only there derive one ACL, ranged
-            // and XML-child id. `Document::apply` refuses an op that sits there, and
-            // a state stream must not reach state by the other seam instead.
-            if offset != 0 {
-                return Err(DecodeError::BadTag {
-                    what: "stamp: off the lamport axis",
-                    tag: 0,
-                });
-            }
-            let slot = self.stamp_high_water.entry(client).or_insert(0);
-            *slot = (*slot).max(lamport);
-        }
         Ok(Stamp {
             lamport,
             client,

@@ -185,7 +185,7 @@ pub struct Document {
     /// with no zones.
     zone_clocks: HashMap<u32, u64>,
     /// The id-space high-water of every client whose stamps this replica holds:
-    /// the highest `(lamport, offset)` reached by any stamp under that id, run
+    /// the highest lamport reached by any stamp under that id, run
     /// reservations included. A partition clock is bounded, so it is not an upper
     /// bound over the stamps present in the document — this is, and it is what
     /// [`emit_stamped`](Self::emit_stamped) mints above, so a local mint clears its
@@ -196,21 +196,28 @@ pub struct Document {
     /// encoder's.
     ///
     /// Carried in the state encoding beside the clocks, because it cannot be
-    /// recovered from the content: a tombstoned sequence run stores `(head, len)`
-    /// and only the head is a stamp on the wire, a counter stores no stamp at all,
-    /// and an ACL or ranged entry stores only the id *derived* from one. A
-    /// projection that drops content therefore keeps this untouched — conservative
-    /// in the only direction that is safe, and what lets a zone- or read-scoped
-    /// snapshot be adopted without re-issuing the recipient's own live ids.
+    /// recovered from the content alone: a counter stores no stamp, and an ACL or
+    /// ranged entry stores only the id *derived* from one. What a decode *can* see —
+    /// a sequence's node ids, a dead run's whole reach, and the reservations of the
+    /// ops still in the encoded buffer — is used as a **floor** under the stored
+    /// figure, since a stored figure is supplied by whoever hands the bytes over and
+    /// under-declaring it must buy nothing ([`read_state`](Self::read_state)).
+    ///
+    /// A projection cuts it to the recipient's own entry and then re-floors from the
+    /// content that survived ([`scrub_high_water_to`](Self::scrub_high_water_to)):
+    /// every other client's entry counts what that replica minted inside the
+    /// withheld partition, and the recipient's own is what lets a zone- or
+    /// read-scoped snapshot be adopted without re-issuing its live ids.
     ///
     /// Only the lamport is kept. A stamp's derived-id key ([`stamp_key`]) is
     /// `lamport ++ client` and does not include the sub-lamport `offset`, so two
     /// stamps differing only in offset derive the *same* ACL, ranged and XML-child
     /// ids — the offset is a tiebreak inside one run, never a dimension a mint may
-    /// move in.
+    /// move in, and an op that sits there is refused
+    /// ([`stamp_occupies_a_mintable_position`]).
     stamp_high_water: HashMap<ClientId, u64>,
-    /// Set when a mint inside the current [`transact`](Self::transact) was refused,
-    /// and read by every later mint in it.
+    /// Set when a mint inside the current intention was refused, and read by every
+    /// later mint in it.
     ///
     /// A refusal has to take the rest of the intention, not just the edit that hit
     /// it. The edits in one transact address what the earlier ones created — so a
@@ -2190,7 +2197,15 @@ impl Document {
         let observed = cur.take_stamp_high_water();
         for (client, lamport) in observed {
             let slot = stamp_high_water.entry(client).or_insert(0);
-            *slot = (*slot).max(clock_within_ceiling(lamport, "document: stamp in state")?);
+            *slot = (*slot).max(lamport);
+        }
+        // The encoded buffer decodes through a cursor of its own, and a waiting op's
+        // ids are held just as much as an applied one's — the room's log carries it
+        // and no peer resends it. An op that stays buffered never reaches
+        // `apply_kind`, so the drain cannot stand in for this.
+        for op in &buffer {
+            let slot = stamp_high_water.entry(op.stamp.client).or_insert(0);
+            *slot = (*slot).max(reservation_end(op.stamp, span(&op.kind)));
         }
 
         let mut doc = Document {
@@ -2383,11 +2398,14 @@ impl Document {
     /// say) must therefore not commit a group it did not open.
     pub fn begin_atomic(&mut self) {
         if self.atomic.is_none() {
+            // Read before the group opens: an atomic group nested inside an explicit
+            // intention joins that intention rather than starting one, so clearing
+            // here would tear exactly what the latch protects.
+            let opens_an_intention = !self.recording_intention();
             self.atomic = Some(Vec::new());
-            // Opening a group starts an intention, so the mint answers it afresh —
-            // `transact` will not clear the latch from here on, because from here on
-            // it is *inside* the group.
-            self.mint_refused = false;
+            if opens_an_intention {
+                self.mint_refused = false;
+            }
         }
     }
 
@@ -3019,7 +3037,7 @@ impl Document {
     /// refused where a single-id edit is still admitted; this reports the
     /// single-id case.
     pub fn can_mint(&self, zone: Option<u32>) -> bool {
-        mint_position(self.mint_floor(zone), 1, self.client).is_some()
+        !self.mint_refused && mint_position(self.mint_floor(zone), 1, self.client).is_some()
     }
 
     /// A target is reachable when it names a materialised container that is
