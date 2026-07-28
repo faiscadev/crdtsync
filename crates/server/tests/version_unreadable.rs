@@ -14,14 +14,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
+use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::Channel;
-use crdtsync_core::{ClientId, Document, ErrorCode, Message, Op, Scalar, Schema};
+use crdtsync_core::{AclEffect, ClientId, Document, ErrorCode, Message, Op, Scalar, Schema};
+use crdtsync_server::acl::actor_key;
 use crdtsync_server::{
     Action, ConnId, Identity, Registry, Resource, SchemaRegistry, StaticTokens, Store,
 };
 
 const ROOM: &[u8] = b"room-u";
-const APP: &[u8] = b"z";
+const ZONE_APP: &[u8] = b"z";
+const TUPLE_APP: &[u8] = b"t";
 const CH: Channel = Channel(0);
 const V1: &[u8] = b"v1";
 
@@ -33,6 +37,15 @@ const ZONED: &str = r#"{
         "Sect": { "kind": "map" }
     },
     "zones": { "za": "/board", "zb": "/notes" }
+}"#;
+
+/// The same shape with no zones, so only the doc-ACL half of the guard can fire.
+const TUPLED: &str = r#"{
+    "schema": "t", "version": 1, "root": "Doc",
+    "types": {
+        "Doc": { "kind": "map", "children": { "board": "Sect", "notes": "Sect" } },
+        "Sect": { "kind": "map" }
+    }
 }"#;
 
 fn cid(first: u8) -> ClientId {
@@ -58,7 +71,8 @@ fn zone_authorizer(id: &Identity, _action: Action, res: &Resource) -> bool {
 
 fn wire(r: &mut Registry) {
     let mut sr = SchemaRegistry::new();
-    sr.register(APP, 1, ZONED.as_bytes(), b"").unwrap();
+    sr.register(ZONE_APP, 1, ZONED.as_bytes(), b"").unwrap();
+    sr.register(TUPLE_APP, 1, TUPLED.as_bytes(), b"").unwrap();
     r.set_schema_registry(Arc::new(Mutex::new(sr)));
     let mut t = StaticTokens::new();
     for (credential, actor) in [("c-author", "author"), ("c-reader", "reader")] {
@@ -69,13 +83,13 @@ fn wire(r: &mut Registry) {
 }
 
 /// Hello + Auth + Subscribe to `zone`, holding the room on `CH`.
-fn joined(r: &mut Registry, client: u8, credential: &str, zone: &[u8]) -> ConnId {
+fn joined(r: &mut Registry, client: u8, credential: &str, app: &[u8], zone: &[u8]) -> ConnId {
     let id = r.connect();
     assert!(r.deliver(
         id,
         Message::Hello {
             client: cid(client),
-            app_id: APP.to_vec(),
+            app_id: app.to_vec(),
             schema_version: 1,
             codecs: Vec::new(),
         }
@@ -146,14 +160,15 @@ fn rewrite_version_state(dir: &Path, state: &[u8]) {
     fs::write(path, buf).expect("the versions file rewrites");
 }
 
-/// A store-backed room seeded in both zones with a named version, then damaged so
-/// that version's captured state no longer decodes. Returns the reopened registry.
-fn damaged_room(dir: &Path) -> Registry {
+/// A store-backed room under `app`, seeded and versioned, then damaged so that
+/// version's captured state no longer decodes. `tuple` adds a doc-ACL record, the
+/// other half of what makes a version narrowable. Returns the reopened registry.
+fn damaged_room(dir: &Path, app: &[u8], src: &str, tuple: bool) -> Registry {
     {
         let mut r = store_at(dir);
-        let author = joined(&mut r, 1, "c-author", b"");
+        let author = joined(&mut r, 1, "c-author", app, b"");
         let mut doc = Document::new(cid(1));
-        doc.set_schema(Schema::parse(ZONED).expect("the zoned schema parses"));
+        doc.set_schema(Schema::parse(src).expect("the schema parses"));
         submit(
             &mut r,
             author,
@@ -162,6 +177,21 @@ fn damaged_room(dir: &Path) -> Registry {
                 tx.map(b"notes").register(b"nseed", Scalar::Int(0));
             }),
         );
+        if tuple {
+            submit(
+                &mut r,
+                author,
+                doc.transact(|tx| {
+                    tx.acl().grant(
+                        AclSubject::Actor(actor_key(b"reader")),
+                        AclGrant::Capability(Capability::Read),
+                        AclEffect::Allow,
+                        encode_path(&[b"board"]),
+                        actor_key(b"author"),
+                    );
+                }),
+            );
+        }
         assert!(r.deliver(
             author,
             Message::VersionCreate {
@@ -178,8 +208,8 @@ fn damaged_room(dir: &Path) -> Registry {
 #[test]
 fn a_zone_limited_reader_is_refused_an_undecodable_version() {
     let dir = tempdir();
-    let mut r = damaged_room(dir.path());
-    let reader = joined(&mut r, 2, "c-reader", b"za");
+    let mut r = damaged_room(dir.path(), ZONE_APP, ZONED, false);
+    let reader = joined(&mut r, 2, "c-reader", ZONE_APP, b"za");
 
     match &fetch(&mut r, reader)[..] {
         [Message::Error { code, .. }] => assert_eq!(*code, ErrorCode::Internal),
@@ -192,10 +222,39 @@ fn a_whole_room_reader_is_still_served_an_undecodable_version() {
     // The refusal is scoped to readers a redaction could apply to — nothing else
     // becomes unavailable because one archived state stopped decoding.
     let dir = tempdir();
-    let mut r = damaged_room(dir.path());
-    let author = joined(&mut r, 1, "c-author", b"");
+    let mut r = damaged_room(dir.path(), ZONE_APP, ZONED, false);
+    let author = joined(&mut r, 1, "c-author", ZONE_APP, b"");
 
     match &fetch(&mut r, author)[..] {
+        [Message::VersionState { state, .. }] => assert_eq!(state, b"not a document"),
+        other => panic!("expected the version's state, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_reader_of_a_room_holding_doc_acl_state_is_refused_an_undecodable_version() {
+    // The other half of "narrowable": no zones at all, one doc-ACL tuple. The guard
+    // asks whether a redaction *could* apply to these bytes, not whether it would
+    // have cut anything — an unreadable state cannot answer the second question.
+    let dir = tempdir();
+    let mut r = damaged_room(dir.path(), TUPLE_APP, TUPLED, true);
+    let reader = joined(&mut r, 2, "c-reader", TUPLE_APP, b"");
+
+    match &fetch(&mut r, reader)[..] {
+        [Message::Error { code, .. }] => assert_eq!(*code, ErrorCode::Internal),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_zoneless_tuple_free_room_still_serves_its_version() {
+    // And the no-redaction-possible path is untouched: no zones, no doc-ACL state,
+    // the captured bytes as they always were.
+    let dir = tempdir();
+    let mut r = damaged_room(dir.path(), TUPLE_APP, TUPLED, false);
+    let reader = joined(&mut r, 2, "c-reader", TUPLE_APP, b"");
+
+    match &fetch(&mut r, reader)[..] {
         [Message::VersionState { state, .. }] => assert_eq!(state, b"not a document"),
         other => panic!("expected the version's state, got {other:?}"),
     }

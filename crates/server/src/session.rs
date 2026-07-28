@@ -1007,11 +1007,6 @@ pub fn step(
             };
             match hub.version_state(&room, &name) {
                 Some(state) => {
-                    // A version's captured state is served — an auditable history
-                    // read, distinct from the live subscribe stream. Record it
-                    // through the audit seam (the read was already authorized by
-                    // `version_room` above, so the verdict is granted).
-                    authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     let seq = hub.version_seq(&room, &name).unwrap_or(0);
                     let state = state.to_vec();
                     // A version is the room's own state at an earlier sequence, so it
@@ -1028,33 +1023,43 @@ pub fn step(
                         .channels
                         .get(&channel)
                         .and_then(|sub| sub.zones.clone());
+                    // Whether either redaction has anything to say here at all. A room
+                    // with no doc-ACL state and a channel that is not zone-limited is
+                    // served the captured bytes as it always was, without paying a decode.
+                    let narrowable =
+                        !records.is_empty() || zone_narrowing(schema, &zones).is_some();
                     // Element-scoped grants resolve against the *version's* tree: an
                     // element's redaction path is where it stood when the version was
                     // captured, not where it stands in the live room.
-                    let decoded = Document::decode_state(&state);
-                    // A version's bytes come back off durable storage, so unlike a
-                    // snapshot materialized this instant they can fail to decode here.
-                    // Undecodable is unprojectable, and the unnarrowed bytes still carry
-                    // whatever a redaction would have cut, so a reader that any
-                    // redaction could apply to is refused rather than served them.
-                    if decoded.is_err()
-                        && (!records.is_empty() || zone_narrowing(schema, &zones).is_some())
-                    {
-                        // Say so without closing: one archived state is unreadable, the
-                        // live stream this channel carries is not.
-                        return Response {
-                            replies: vec![Message::Error {
-                                code: ErrorCode::Internal,
-                                message: "version state is unreadable".to_string(),
-                                details: Vec::new(),
-                            }],
-                            ..Response::default()
-                        };
-                    }
-                    let index = match &decoded {
-                        Ok(doc) if !records.is_empty() => crate::index::element_paths(doc),
-                        _ => HashMap::new(),
+                    let index = if narrowable {
+                        match Document::decode_state(&state) {
+                            Ok(doc) if !records.is_empty() => crate::index::element_paths(&doc),
+                            Ok(_) => HashMap::new(),
+                            // A version's bytes come back off durable storage, so unlike a
+                            // snapshot materialized this instant they can fail to decode.
+                            // Undecodable is unprojectable, and the unnarrowed bytes still
+                            // carry whatever a redaction would have cut — so say so, without
+                            // closing: one archived state is unreadable, the live stream
+                            // this channel carries is not.
+                            Err(_) => {
+                                return Response {
+                                    replies: vec![Message::Error {
+                                        code: ErrorCode::Internal,
+                                        message: "version state is unreadable".to_string(),
+                                        details: Vec::new(),
+                                    }],
+                                    ..Response::default()
+                                }
+                            }
+                        }
+                    } else {
+                        HashMap::new()
                     };
+                    // The version's state is being served — an auditable history read,
+                    // distinct from the live subscribe stream. Record it through the audit
+                    // seam once it is actually going out (the read was authorized by
+                    // `version_room` above, so the verdict is granted).
+                    authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     // The replica identity this channel authors under — the one author
                     // whose ids a projection keeps in the frontier it otherwise scrubs,
                     // so a reader that adopts this version does not re-mint into ids
@@ -1759,17 +1764,23 @@ fn zone_readable(
 }
 
 /// The `(schema, authorized set)` a zone projection would genuinely narrow by, or
-/// `None` when it would be a no-op — a whole-zone subscriber (its set covers every
-/// declared zone), a no-zones room, or a relay, each of which takes a state verbatim,
-/// byte-identical to a zoneless one. The single home of that rule, so
+/// `None` when it would be a no-op — a whole-zone subscriber (its set holds every
+/// declared zone id), a no-zones room, or a relay, each of which takes a state
+/// verbatim, byte-identical to a zoneless one. The single home of that rule, so
 /// [`project_snapshot_zones`] and a caller that must know whether narrowing is even
 /// possible cannot drift apart.
+///
+/// "Whole-zone" is decided by containment over the declared ids rather than by
+/// cardinality: a set resolved against one schema version can outlive it on a bound
+/// channel, and a count that happens to match a later schema's zone count says
+/// nothing about *which* partitions it names.
 fn zone_narrowing<'a>(
     schema: Option<&'a Schema>,
     zones: &'a Option<HashSet<u32>>,
 ) -> Option<(&'a Schema, &'a HashSet<u32>)> {
     let (schema, set) = (schema?, zones.as_ref()?);
-    (!schema.zones().is_empty() && set.len() != schema.zones().len()).then_some((schema, set))
+    let declared = schema.zones().len() as u32;
+    (declared > 0 && !(0..declared).all(|id| set.contains(&id))).then_some((schema, set))
 }
 
 /// Narrow a catch-up snapshot to a zone-limited subscriber's authorized partitions,
