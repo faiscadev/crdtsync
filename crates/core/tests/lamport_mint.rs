@@ -16,11 +16,13 @@
 //!   clamp stops the clock under it, and the victim's next edits land on ids the
 //!   sequence already holds and are dropped as replays.
 //! * **`encode_state` never emits bytes `decode_state` refuses.** A stored clock is
-//!   bounded on the way in, so it has to be bounded on the way out too: the local
-//!   mint's clock advance is clamped at the same [`LAMPORT_STATE_CEILING`] the
-//!   decoder enforces. Clamping the *clock* is safe precisely because the mint no
-//!   longer depends on it for id-freedom — the high-water above carries that — so
-//!   the pair holds together where neither half does alone.
+//!   bounded on the way in, so it has to be bounded on the way out too. Nothing
+//!   clamps at the emit site: the mint *refuses* when a reservation would pass
+//!   [`LAMPORT_STATE_CEILING`], so the clock it advances is already under the bound
+//!   the decoder enforces. The three writers of a clock — a fold (clamped at the
+//!   wire ceiling), a mint (refused past the state ceiling) and a decode (refused
+//!   above it) — are then all inside it, and the pair holds together where neither
+//!   half does alone.
 //!
 //! * **The high-water is stored beside the clocks, and bounded like one.** It
 //!   cannot be recovered from the content: a tombstoned sequence run persists as
@@ -164,13 +166,17 @@ fn an_impersonating_peer_cannot_plant_a_victims_next_stamps() {
 
 #[test]
 fn a_deleted_plant_still_holds_its_ids_across_a_reload() {
-    // Why the high-water is **stored** rather than read back off the content as a
-    // snapshot decodes. A sequence encodes a dead run as `(head, len)`, so only the
-    // head is a stamp on the wire and up to a whole chunk of a run's ids would be
-    // invisible to anything reconstructing the record from what it reads. Deleting
-    // the junk a plant inserted is the obvious thing a user does, so this is the
-    // mainline path, not a corner: the ids stay held, and the victim's next write
-    // after the reload lands rather than being dropped as a replay.
+    // A sequence encodes a dead run as `(head, len)`, so only the head is a stamp on
+    // the wire and the ids behind it would be invisible to anything reading stamps
+    // alone. The floor is told the run's whole *reach* for exactly this reason.
+    // Deleting the junk a plant inserted is the obvious thing a user does, so this
+    // is the mainline path, not a corner: the ids stay held, and the victim's next
+    // write after the reload lands rather than being dropped as a replay.
+    //
+    // What this does *not* pin is that the record is stored — the reach alone
+    // carries it here. `a_counter_run_leaves_no_stamp_behind_and_the_record_still_holds`
+    // and `a_projection_keeps_the_recipients_own_high_water` are the two that fail
+    // if storage goes, because neither leaves a stamp for a floor to read.
     let victim = cid(1);
     let attacker = cid(9);
 

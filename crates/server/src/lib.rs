@@ -455,9 +455,10 @@ pub enum Catchup {
     /// treat `seq` as the sequence it has now caught up to.
     Snapshot { seq: u64, state: Vec<u8> },
     /// The stream cannot be served: the branch owns a base this node cannot decode,
-    /// so neither the state nor a delta over it is known. Distinct from an empty
-    /// delta on purpose — reading "unknown" as "nothing to send" is what let a
-    /// publish freeze an empty document over a live branch.
+    /// so what it would serve *below the fork point* is unknown. A subscriber already
+    /// past the fork point still gets its tail delta — it holds the base already.
+    /// Distinct from an empty delta on purpose — reading "unknown" as "nothing to
+    /// send" is what let a publish freeze an empty document over a live branch.
     Unavailable,
 }
 

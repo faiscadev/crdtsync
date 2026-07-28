@@ -1915,6 +1915,9 @@ impl Document {
             Vec::with_capacity((log_count as usize).min(1024));
         for _ in 0..log_count {
             let stamp = cur.stamp()?;
+            // A move's stamp orders the log and dedups it exactly, so a re-issued
+            // one makes the move a silent no-op. It is an id this replica holds.
+            cur.note_stamp_reach(stamp.client, stamp.lamport);
             let node = cur.element_id()?;
             let parent = cur.element_id()?;
             move_log.push((stamp, node, parent));
@@ -1954,10 +1957,14 @@ impl Document {
             let start = cur.range_anchor()?;
             let end = cur.range_anchor()?;
             let payload = match cur.u8()? {
-                0 => Payload::Scalar {
-                    value: cur.scalar()?,
-                    stamp: cur.stamp()?,
-                },
+                0 => {
+                    let value = cur.scalar()?;
+                    let stamp = cur.stamp()?;
+                    // A ranged scalar payload resolves LWW on this stamp, so it is
+                    // held for the same reason a register's is.
+                    cur.note_stamp_reach(stamp.client, stamp.lamport);
+                    Payload::Scalar { value, stamp }
+                }
                 1 => {
                     let kind = cur.composite_payload_kind()?;
                     // A valid snapshot encodes the payload container into the
@@ -2183,17 +2190,25 @@ impl Document {
         // the kind of input C17 says the mint must not trust: under-declaring the
         // record would otherwise be free, and the replica would mint straight onto
         // ids the very bytes it just decoded carry. So the declaration is combined
-        // with what the snapshot *visibly* holds — every stamp the decode read, plus
-        // the whole reservation of every op still waiting in the encoded buffer,
-        // whose ids are as published as an applied op's — and the higher wins.
+        // with what the snapshot *visibly* holds, and the higher wins.
         //
-        // Storing it is still what makes the record complete: a tombstoned run
-        // persists as `(head, len)` so only the head is a stamp on the wire, a
-        // counter persists no stamp, and an ACL or ranged entry persists only the id
-        // derived from one. Those are what the declaration covers and the floor
-        // cannot see. What is left is a snapshot that both hides ids in one of those
-        // shapes *and* under-declares — unreachable from the bytes either way, and
-        // the residual this design names.
+        // What the floor reads is every stamp the stream carries that **is an id
+        // this replica holds**: a sequence's live node ids and each dead run's whole
+        // reach (only its head is a stamp on the wire), a map slot's stamp and the
+        // create-stamp a deleted container retains, a register's and a ranged scalar
+        // payload's LWW stamp, a move-log entry's stamp, and the whole reservation of
+        // every op still waiting in the encoded buffer — a waiting op's ids are as
+        // published as an applied one's. It deliberately does *not* read a stamp that
+        // merely **references** an id (an anchor's parent, a range anchor's
+        // position): those may name a client whose own op has not arrived, so
+        // flooring on them would invent record entries the encoder never held and a
+        // decoded replica could not reproduce its own bytes.
+        //
+        // Storing the record is still what makes it complete, because two shapes
+        // leave no stamp at all: a counter tally, and the ACL or ranged entry that
+        // persists only the id *derived* from one. Those are what the declaration
+        // covers and the floor cannot see — and what is left, a snapshot that hides
+        // ids in one of them *and* under-declares, is the residual this design names.
         let observed = cur.take_stamp_high_water();
         for (client, lamport) in observed {
             let slot = stamp_high_water.entry(client).or_insert(0);
@@ -4906,11 +4921,13 @@ fn clock_within_ceiling(lamport: u64, what: &'static str) -> Result<u64, DecodeE
 /// an element here on this replica or any other — which is what a handle to nothing
 /// has to guarantee, or a caller could delete a stranger's element through it.
 ///
-/// It is not absolute. The ranged and ACL registries decode their keys as raw
-/// [`ElementId`]s, so a crafted snapshot can plant an entry at the derived id
-/// directly — which, together with a declared record at the ceiling to force the
-/// refusal, aims a refused create's handle at an attacker-chosen element. Both
-/// halves take a hand-built snapshot; a replica that only ever folds ops is exact.
+/// It is not absolute. *Every* registry — counter, list, text, map, XML element and
+/// fragment, ranged and ACL — decodes its keys as raw [`ElementId`]s, so a crafted
+/// snapshot can plant an entry at the derived id directly. That includes the
+/// sequence registries a refused XML child insert resolves through, which is where
+/// this handle is most used. Together with a declared record at the ceiling to force
+/// the refusal, it aims the handle at an attacker-chosen element. Both halves take a
+/// hand-built snapshot; a replica that only ever folds ops is exact.
 fn unmintable_stamp(client: ClientId) -> Stamp {
     Stamp {
         lamport: u64::MAX,

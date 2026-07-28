@@ -454,8 +454,11 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
 pub(crate) struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
-    /// While tracking, the highest lamport reached by any stamp read under each
-    /// client id. A snapshot's own stamps are ids it visibly holds, so reading them
+    /// While tracking, the highest lamport reached by each client id — over the
+    /// stamps [`note_stamp_reach`](Self::note_stamp_reach) is explicitly told about,
+    /// not every stamp read. A state stream carries stamps that only *reference* an
+    /// id (an anchor's parent, a range anchor's position), and flooring on those
+    /// would invent entries the encoder never held. A snapshot's own stamps are ids it visibly holds, so reading them
     /// back as they decode is the **floor** under the high-water the snapshot
     /// declares — see
     /// [`Document::read_state`](crate::doc::Document::decode_state). Off by default
@@ -495,16 +498,21 @@ impl<'a> Cursor<'a> {
     /// `(head, length)`, so only the head is a stamp at all, and the ids behind it
     /// are exactly the ones a plant leaves once a user deletes it.
     ///
-    /// Two positions are skipped rather than recorded. A zero reach says nothing and
+    /// A zero reach is skipped: it says nothing, and
     /// [`Document::record_stamp`](crate::doc::Document) does not store one, so
-    /// reading it back would invent an entry. A reach past
-    /// [`LAMPORT_STATE_CEILING`] cannot come from an op any gate admits, and
-    /// recording it would put the record outside what this decoder accepts — the
-    /// mint stops at the ceiling either way, so it can never collide with one.
+    /// reading it back would invent an entry the encoder never wrote.
+    ///
+    /// A reach past [`LAMPORT_STATE_CEILING`] is **clamped to it, not skipped** —
+    /// the same thing `record_stamp` does, and the two writers of one record have to
+    /// agree. Skipping looks safe for a point stamp (the mint cannot reach past the
+    /// ceiling, so it could not collide) but is wrong for a *range*: a dead run
+    /// reports `head + length - 1`, so a run straddling the ceiling would be dropped
+    /// whole — including the mintable ids below it that the run genuinely holds.
+    /// Lengthening a plant would then defeat the floor that a shorter one trips.
     pub(crate) fn note_stamp_reach(&mut self, client: ClientId, lamport: u64) {
-        if self.tracking_stamps && lamport != 0 && lamport <= LAMPORT_STATE_CEILING {
+        if self.tracking_stamps && lamport != 0 {
             let slot = self.stamp_high_water.entry(client).or_insert(0);
-            *slot = (*slot).max(lamport);
+            *slot = (*slot).max(lamport.min(LAMPORT_STATE_CEILING));
         }
     }
 

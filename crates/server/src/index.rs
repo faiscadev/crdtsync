@@ -172,9 +172,10 @@ pub fn batch_zone_crossings(
     ops: &[Op],
     schema: &Schema,
 ) -> Option<Vec<ZoneCrossing>> {
-    // The short-circuit is the wrapper's, not the inner form's: a batch that moves
-    // nothing must not pay a whole-document encode, and every ordinary keystroke
-    // batch on a schema'd room reaches here.
+    // The short-circuit is here so a batch that moves nothing never pays a
+    // whole-document encode — every ordinary keystroke batch on a schema'd room
+    // reaches this line. The inner form repeats the test because it is also the
+    // seam the unreadable-state case is decided in, and it must stand alone there.
     if !ops.iter().any(|op| move_node(op).is_some()) {
         return Some(Vec::new());
     }
