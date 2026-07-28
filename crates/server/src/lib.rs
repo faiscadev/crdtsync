@@ -1170,16 +1170,16 @@ impl Hub {
 
     /// Apply a client's ops to `room` (creating it if new), tagging each with
     /// the `schema_version` it was created under — the writing connection's
-    /// enforced version, or `None` for a relay op with no schema. Skips any op
-    /// already seen, and drops any no replica can hold
-    /// ([`Op::is_admissible`]) — an op `Document::apply` refuses permanently is
-    /// never logged, deduped or returned, so it neither reaches the disk nor
-    /// swallows a corrected resend under its id. An op that is merely *waiting* is
-    /// admissible and is logged and returned as usual. A new op is durably logged
-    /// before it is applied, so the
-    /// merged state and the catch-up log never expose a write the disk has not
-    /// accepted. Returns the ops newly applied, in server-sequence order — the
-    /// batch to broadcast to the room's subscribers.
+    /// enforced version, or `None` for a relay op with no schema. Drops any op no
+    /// replica can hold ([`Op::is_admissible`]) before anything else, then skips any
+    /// already seen — an op `Document::apply` refuses permanently is never logged,
+    /// deduped or returned, so it neither reaches the disk nor swallows a corrected
+    /// resend under its id, in this batch or a later one. An op that is merely
+    /// *waiting* is admissible and is logged and returned as usual. A new op is
+    /// durably logged before it is applied, so the merged state and the catch-up log
+    /// never expose a write the disk has not accepted. Returns the ops newly
+    /// applied, in server-sequence order — the batch to broadcast to the room's
+    /// subscribers.
     pub fn ingest(
         &mut self,
         room: &[u8],
@@ -1268,9 +1268,9 @@ impl Hub {
 
     /// Apply a client's ops to a non-`main` branch of `room`, appending them to
     /// that branch's divergent tail and advancing its head — never `main`'s log.
-    /// Each is tagged with the writer's `schema_version`, deduped against the
-    /// branch's own seen set (and within the batch), dropped if no replica can hold
-    /// it ([`Op::is_admissible`], as on `main`), and durably logged before it
+    /// Each is tagged with the writer's `schema_version`, dropped if no replica can
+    /// hold it ([`Op::is_admissible`], as on `main`), then deduped against the
+    /// branch's own seen set and within the batch, and durably logged before it
     /// is applied. Returns the ops newly appended, in order — the batch to fan out
     /// to the `(room, branch)` stream's subscribers. A `main` branch delegates to
     /// [`ingest`](Hub::ingest); an unknown branch appends nothing.
