@@ -36,20 +36,27 @@
 //! which; with per-node certificates a link is bound to the member whose advertise
 //! **host** its certificate names, and the gates downstream of admission —
 //! replication, leadership, membership growth, durability watermarks — decide
-//! against that member. So issue each node a certificate whose SAN is its own
-//! advertise host, point `CRDTSYNC_CLUSTER_CLIENT_CERT`/`_KEY` at it, and set
-//! `CRDTSYNC_TLS_CLIENT_CA` so inbound peer links carry one too (`request` mode is
-//! enough — ordinary clients still connect without a certificate). Any of the names
-//! a certificate carries may be the one that binds it, so the conventional
-//! DNS-plus-IP node certificate works either way the address is spelled. Once every
-//! node has one, set `CRDTSYNC_CLUSTER_REQUIRE_PEER_IDENTITY=1` to refuse any peer
-//! link that presents none; a node that requires it while verifying no client
-//! certificate, while presenting no identity of its own, or while holding a member
-//! whose advertise address names no host, refuses to start. A member that advertises
-//! plaintext still identifies itself — the link carrying its identity here is the one
-//! it dials — so this requires no TLS rollout of its own. A certificate that *is*
-//! presented is decisive either way, so a cluster already running peer mTLS wants
-//! each node's certificate naming that node's advertise host before the upgrade. Set `CRDTSYNC_BLOB_ADDR` to
+//! against that member. Only a `dNSName` or `iPAddress` SAN names a host, never an
+//! e-mail, a URI or the Common Name, and never a wildcard; the conventional
+//! DNS-plus-IP node certificate works either way its address is spelled.
+//!
+//! To set it up: issue each node a certificate whose SAN is that node's own advertise
+//! host, point `CRDTSYNC_CLUSTER_CLIENT_CERT`/`_KEY` at it, and set
+//! `CRDTSYNC_TLS_CLIENT_CA` + `CRDTSYNC_TLS_CLIENT_AUTH=request` so inbound peer links
+//! carry a certificate while ordinary clients still connect without one (the default
+//! `require` would reject every certless client). **`CRDTSYNC_TLS_CLIENT_CA` is the
+//! authority for peer identity**, not `CRDTSYNC_CLUSTER_CA` — the certificate is
+//! verified by the listener, so that bundle must be no broader than the cluster's own
+//! CA, or any certificate it issues naming a member's host can speak as that member.
+//! Once every node has an identity, set `CRDTSYNC_CLUSTER_REQUIRE_PEER_IDENTITY=1` to
+//! refuse any peer link that presents none; a node that requires it while verifying no
+//! client certificate, while presenting no identity of its own or one that does not
+//! name its own advertise host, or while holding a member whose advertise address
+//! names no host, refuses to start. A member that advertises plaintext still
+//! identifies itself — the link carrying its identity here is the one it dials — so
+//! this requires no TLS rollout of its own. A certificate that *is* presented is
+//! decisive either way, so a cluster already running peer mTLS wants each node's
+//! certificate naming that node's advertise host before the upgrade. Set `CRDTSYNC_BLOB_ADDR` to
 //! serve the out-of-band blob upload/fetch HTTP plane there — a client stores a
 //! large blob and fetches it by handle; its store root is `CRDTSYNC_BLOB_ROOT` or
 //! a `blobs/` subdirectory of `CRDTSYNC_DATA_DIR`, and requests authenticate
@@ -84,10 +91,11 @@ use crdtsync_server::auth::CredentialsFileError;
 use crdtsync_server::membership::{Membership, MembershipConfigError};
 use crdtsync_server::runtime::{serve_with_authorizer_handle, ServeConfig};
 use crdtsync_server::{
-    client_config_from_pem, client_config_from_pem_with_identity, serve_admin, serve_audit,
-    serve_blobs, server_config_from_pem, server_config_from_pem_with_client_ca_mode, AllowAll,
-    AuditLog, Authorizer, BlobStore, ClientAuthMode, PermitAll, SchemaRegistry, StaticTokens,
-    Store, SystemClock, TlsConfigError, Verifier, WebhookConfig, DEFAULT_REPLICATION_FACTOR,
+    client_config_from_pem, client_config_from_pem_with_identity, host_names_from_pem, serve_admin,
+    serve_audit, serve_blobs, server_config_from_pem, server_config_from_pem_with_client_ca_mode,
+    AllowAll, AuditLog, Authorizer, BlobStore, ClientAuthMode, PermitAll, SchemaRegistry,
+    StaticTokens, Store, SystemClock, TlsConfigError, Verifier, WebhookConfig,
+    DEFAULT_REPLICATION_FACTOR,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::rustls;
@@ -284,7 +292,8 @@ fn tls_config_with_client_auth() -> std::io::Result<(Option<Arc<rustls::ServerCo
 /// would work in a lab and be rejected at the handshake in a deployment that issues
 /// its certificates properly. Setting only one half of the pair, or either half
 /// without the trust bundle, is a clean startup error.
-fn peer_tls_config() -> std::io::Result<(Option<Arc<rustls::ClientConfig>>, bool)> {
+#[allow(clippy::type_complexity)]
+fn peer_tls_config() -> std::io::Result<(Option<Arc<rustls::ClientConfig>>, Option<Vec<Vec<u8>>>)> {
     let invalid =
         |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string());
     let build = |e: TlsConfigError| {
@@ -307,16 +316,22 @@ fn peer_tls_config() -> std::io::Result<(Option<Arc<rustls::ClientConfig>>, bool
             )),
         };
     match (path_var("CRDTSYNC_CLUSTER_CA")?, identity) {
-        (Some(ca), Some((cert, key))) => Ok((
-            Some(client_config_from_pem_with_identity(ca, cert, key).map_err(build)?),
-            true,
-        )),
-        (Some(ca), None) => Ok((Some(client_config_from_pem(ca).map_err(build)?), false)),
+        (Some(ca), Some((cert, key))) => {
+            // The hosts this node's own certificate names, read from the same file the
+            // dials present, so the peer-identity policy can check them against this
+            // node's advertise address before anything dials.
+            let hosts = host_names_from_pem(&cert).map_err(build)?;
+            Ok((
+                Some(client_config_from_pem_with_identity(ca, cert, key).map_err(build)?),
+                Some(hosts),
+            ))
+        }
+        (Some(ca), None) => Ok((Some(client_config_from_pem(ca).map_err(build)?), None)),
         (None, Some(_)) => Err(invalid(
             "CRDTSYNC_CLUSTER_CLIENT_CERT requires CRDTSYNC_CLUSTER_CA: a peer identity is only \
              presented on a link whose far end this node can authenticate",
         )),
-        (None, None) => Ok((None, false)),
+        (None, None) => Ok((None, None)),
     }
 }
 

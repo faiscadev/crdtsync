@@ -833,7 +833,7 @@ mod live {
     use crdtsync_server::placement::NodeId;
     use crdtsync_server::runtime::{serve_with, ServeConfig};
     use crdtsync_server::{
-        client_config_from_pem, client_config_from_pem_with_identity,
+        client_config_from_pem, client_config_from_pem_with_identity, host_names_from_pem,
         server_config_from_pem_with_client_ca_mode, ClientAuthMode,
     };
 
@@ -972,7 +972,7 @@ mod live {
             ),
             require_peer_identity: true,
             client_cert_verification: true,
-            peer_client_identity: true,
+            peer_client_identity: Some(host_names_from_pem(&leaf.cert_path).unwrap()),
             ..ServeConfig::default()
         }
     }
@@ -1329,7 +1329,7 @@ mod live {
             ServeConfig {
                 require_peer_identity: true,
                 client_cert_verification: true,
-                peer_client_identity: true,
+                peer_client_identity: Some(vec![b"10.0.0.1".to_vec()]),
                 ..ServeConfig::default()
             },
         )
@@ -1349,7 +1349,7 @@ mod live {
                 membership: Some(two_node_membership("10.0.0.1:9000", "10.0.0.2:9000")),
                 cluster_secret: Some(SECRET.to_vec()),
                 require_peer_identity: true,
-                peer_client_identity: true,
+                peer_client_identity: Some(vec![b"10.0.0.1".to_vec()]),
                 ..ServeConfig::default()
             },
         )
@@ -1372,12 +1372,38 @@ mod live {
                 cluster_secret: Some(SECRET.to_vec()),
                 require_peer_identity: true,
                 client_cert_verification: true,
-                peer_client_identity: true,
+                peer_client_identity: Some(vec![b"10.0.0.1".to_vec()]),
                 ..ServeConfig::default()
             },
         )
         .await;
         assert!(e.to_string().contains("names no host"), "{e}");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // binds a loopback listener
+    async fn requiring_peer_identity_with_a_certificate_for_another_host_refuses_to_start() {
+        // The half of a peer's decision that is knowable here: the peers apply this
+        // node's own rule to this node's own certificate, so a certificate naming
+        // something other than this node's advertise host is refused by every one of
+        // them — a cluster that starts, binds and never converges.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let e = startup_error(
+            listener,
+            ServeConfig {
+                membership: Some(two_node_membership(
+                    "wss://10.0.0.1:9000",
+                    "wss://10.0.0.2:9000",
+                )),
+                cluster_secret: Some(SECRET.to_vec()),
+                require_peer_identity: true,
+                client_cert_verification: true,
+                peer_client_identity: Some(vec![b"elsewhere.example".to_vec()]),
+                ..ServeConfig::default()
+            },
+        )
+        .await;
+        assert!(e.to_string().contains("names no host matching"), "{e}");
     }
 
     #[tokio::test]

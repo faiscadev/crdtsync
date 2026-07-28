@@ -64,9 +64,10 @@ pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry}
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{Branch, RoomLog, RoomMeta, Snapshot, Store, StoredOp};
 pub use tls::{
-    client_config_from_pem, client_config_from_pem_with_identity, identities_from_client_cert,
-    server_config_from_pem, server_config_from_pem_with_client_ca,
-    server_config_from_pem_with_client_ca_mode, ClientAuthMode, TlsConfigError,
+    actor_from_client_cert, client_config_from_pem, client_config_from_pem_with_identity,
+    host_names_from_client_cert, host_names_from_pem, server_config_from_pem,
+    server_config_from_pem_with_client_ca, server_config_from_pem_with_client_ca_mode,
+    ClientAuthMode, TlsConfigError,
 };
 pub use webhook::{WebhookConfig, WebhookSink};
 pub use zonetoken::{CrossZoneGrant, ZoneSealer};

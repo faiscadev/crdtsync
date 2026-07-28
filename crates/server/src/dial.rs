@@ -575,6 +575,34 @@ mod tests {
     }
 
     #[test]
+    fn a_root_label_is_no_part_of_the_name() {
+        // A fully-qualified name and the same name without its trailing dot are one
+        // host, and a certificate and an advertise address need not agree on which
+        // spelling to use.
+        assert!(cert_names_member(
+            b"node-a.internal.",
+            b"wss://node-a.internal:9000"
+        ));
+        assert!(cert_names_member(
+            b"node-a.internal",
+            b"wss://node-a.internal.:9000"
+        ));
+    }
+
+    #[test]
+    fn a_wildcard_names_no_member() {
+        // Deliberate, and the reason the comparison is whole-name: `*.internal` would
+        // bind every member of that domain to one certificate, which gives up the
+        // per-member identity rather than establishing it. A TLS client accepts a
+        // wildcard for the host it dialed; a member's identity is not that question.
+        assert!(!cert_names_member(
+            b"*.internal",
+            b"wss://node-a.internal:9000"
+        ));
+        assert!(!cert_names_member(b"*", b"wss://node-a.internal:9000"));
+    }
+
+    #[test]
     fn an_empty_or_unusable_certificate_subject_establishes_nothing() {
         assert!(!cert_names_member(b"", b"wss://node-a.internal:9000"));
         assert!(!cert_names_member(b"   ", b"wss://node-a.internal:9000"));

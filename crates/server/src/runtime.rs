@@ -146,11 +146,14 @@ pub struct ServeConfig {
     /// claiming it of a config built without a client CA yields a node that starts and
     /// then refuses every peer link.
     pub client_cert_verification: bool,
-    /// Whether this node presents a client certificate of its own on the peer links
-    /// it dials — mirrors the identity the `peer_tls` config was built with, which
-    /// `rustls::ClientConfig` does not expose. Without it every peer running an
-    /// identity-requiring policy refuses this node. A declaration, as above.
-    pub peer_client_identity: bool,
+    /// The hosts the client certificate this node presents on its peer dials names —
+    /// mirrors the identity the `peer_tls` config was built with, which
+    /// `rustls::ClientConfig` does not expose. `None` presents no identity at all, and
+    /// every peer running an identity-requiring policy then refuses this node; a
+    /// certificate naming hosts that do not include this node's own advertise host is
+    /// refused by them just as surely, so requiring identity checks it here. A
+    /// declaration, as above.
+    pub peer_client_identity: Option<Vec<Vec<u8>>>,
     /// The 32-byte zone-master key sealing cross-zone-move capability tokens.
     /// `Some` enables the authorized cross-zone-move escape hatch; `None` (the
     /// default) leaves it off, so every cross-zone move stays rejected. Server
@@ -179,7 +182,7 @@ impl Default for ServeConfig {
             require_peer_tls: false,
             require_peer_identity: false,
             client_cert_verification: false,
-            peer_client_identity: false,
+            peer_client_identity: None,
             zone_key: None,
             audit_log: None,
         }
@@ -204,15 +207,15 @@ enum Cmd {
     /// Open a connection, registering its outbound sink and a one-shot the actor
     /// fires to close a dropped connection. Any credential presented at the
     /// upgrade travels with it; the actor verifies it and replies with the
-    /// [`ConnOutcome`]. `cert_names` are the identities a verified mTLS client cert
-    /// already established at the transport — when set the leading one authenticates
-    /// the connection directly, ahead of any in-band credential, and all of them are
-    /// what the peer plane may bind a member to.
+    /// [`ConnOutcome`]. `cert_identity` is what a verified mTLS client cert already
+    /// established at the transport — the actor it authenticates, which takes the
+    /// connection directly ahead of any in-band credential, and every host it names,
+    /// which is what the peer plane may bind a member to.
     Connect {
         writer: Sender<Message>,
         closer: oneshot::Sender<()>,
         credential: Option<Vec<u8>>,
-        cert_names: Option<Vec<Vec<u8>>>,
+        cert_identity: Option<(Vec<u8>, Vec<Vec<u8>>)>,
         reply: oneshot::Sender<ConnOutcome>,
     },
     /// Route one inbound message, replying whether the connection stays open.
@@ -473,11 +476,11 @@ async fn accept_loop(
                         // fall through. No peer cert means server-auth-only TLS or a
                         // request-mode certless client, so there is no cert actor and
                         // the credential/anonymous path applies.
-                        let cert_names = match peer_cert_names(&tls) {
-                            Ok(names) => names,
+                        let cert_identity = match peer_cert_identity(&tls) {
+                            Ok(identity) => identity,
                             Err(()) => return,
                         };
-                        handle(tls, cmds, cert_names).await;
+                        handle(tls, cmds, cert_identity).await;
                     }
                 });
             }
@@ -488,29 +491,34 @@ async fn accept_loop(
     }
 }
 
-/// The names a verified mTLS client cert establishes for its connection, read off
-/// the accepted TLS session's peer certificates — the leading one is the actor it
-/// authenticates as, and the peer plane weighs all of them against the member a link
-/// claims to be.
+/// What a verified mTLS client cert establishes for its connection, read off the
+/// accepted TLS session's peer certificates: the actor it authenticates as, and every
+/// *host* it names.
+///
+/// The two are read by different rules and are not interchangeable. The actor is the
+/// certificate's subject as an ACL principal — a name, an e-mail, a URI, or failing
+/// those an address or the Common Name. The hosts are only its `dNSName`/`iPAddress`
+/// SANs, since a peer link binds to the host of a member's advertise address and
+/// nothing else a certificate carries is an address a CA vouches for reaching
+/// ([`host_names_from_client_cert`](crate::tls::host_names_from_client_cert)).
 ///
 /// `Ok(None)` is a certless connection: the peer presented no cert — either mTLS is
 /// not configured (server-auth-only TLS) or it is configured in request mode (which
 /// admits cert absence) — and the connection authenticates through the
-/// credential/anonymous path instead. `Ok(Some(names))` is a verified client cert
-/// that names at least one identity. `Err(())` is the fail-closed case: a trusted
-/// cert that carries none — rejected, never admitted anonymously.
-fn peer_cert_names(
+/// credential/anonymous path instead. `Ok(Some(..))` is a verified client cert that
+/// authenticates an actor; its host list may still be empty, which simply binds no
+/// member. `Err(())` is the fail-closed case: a trusted cert that names no actor at
+/// all — rejected, never admitted anonymously.
+#[allow(clippy::type_complexity)]
+fn peer_cert_identity(
     tls: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-) -> Result<Option<Vec<Vec<u8>>>, ()> {
+) -> Result<Option<(Vec<u8>, Vec<Vec<u8>>)>, ()> {
     let (_, conn) = tls.get_ref();
     match conn.peer_certificates() {
         None | Some([]) => Ok(None),
         Some([leaf, ..]) => {
-            let names = crate::tls::identities_from_client_cert(leaf);
-            match names.is_empty() {
-                true => Err(()),
-                false => Ok(Some(names)),
-            }
+            let actor = crate::tls::actor_from_client_cert(leaf).ok_or(())?;
+            Ok(Some((actor, crate::tls::host_names_from_client_cert(leaf))))
         }
     }
 }
@@ -627,7 +635,7 @@ async fn registry_actor(
                         writer,
                         closer,
                         credential,
-                        cert_names,
+                        cert_identity,
                         reply,
                     } => {
                         // A verified mTLS client cert has already established this
@@ -639,20 +647,14 @@ async fn registry_actor(
                         // Auth phase; a bad one is refused. With neither the
                         // connection is anonymous if policy allows, else it must
                         // authenticate in band.
-                        let outcome = match (cert_names, credential) {
-                            (Some(names), _) => {
-                                // The leading name is the session's actor; every name
-                                // is kept, since the peer plane binds a link to the
-                                // member whichever way its certificate spells the host.
-                                let actor = names[0].clone();
-                                ConnOutcome::Open {
-                                    id: reg.connect_cert_authenticated(
-                                        Identity::new(actor.clone()),
-                                        names,
-                                    ),
-                                    authok: Some(actor),
-                                }
-                            }
+                        let outcome = match (cert_identity, credential) {
+                            (Some((actor, hosts)), _) => ConnOutcome::Open {
+                                id: reg.connect_cert_authenticated(
+                                    Identity::new(actor.clone()),
+                                    hosts,
+                                ),
+                                authok: Some(actor),
+                            },
                             (None, Some(cred)) => match reg.verify_credential(&cred) {
                                 Some(identity) => {
                                     let actor = identity.actor().to_vec();
@@ -835,10 +837,12 @@ fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
 ///  - a cluster at all — a single-node deployment has no peer plane to identify;
 ///  - **a listener that verifies client certificates**, or no inbound link ever
 ///    carries one and every peer is refused;
-///  - **a client identity of this node's own on its outbound dials**, or every peer
-///    running the same policy refuses this node — the same symmetry
-///    `CRDTSYNC_CLUSTER_REQUIRE_TLS` has, where a node that requires TLS of its peers
-///    must terminate it itself;
+///  - **a client identity of this node's own on its outbound dials, naming this
+///    node's own advertise host**, or every peer running the same policy refuses this
+///    node — the same symmetry `CRDTSYNC_CLUSTER_REQUIRE_TLS` has, where a node that
+///    requires TLS of its peers must terminate it itself. The peers apply this node's
+///    own rule to this node's own certificate, so that half of their decision is
+///    decidable here;
 ///  - **a member set whose every advertise address names a host**, since the host is
 ///    what a certificate binds to and a member whose address yields none could never
 ///    be identified.
@@ -870,12 +874,26 @@ fn peer_identity_policy(config: &ServeConfig) -> std::io::Result<()> {
              refused",
         ));
     }
-    if !config.peer_client_identity {
+    let Some(own_hosts) = &config.peer_client_identity else {
         return Err(invalid(
             "this node requires an identified peer but presents no identity of its own: set \
              CRDTSYNC_CLUSTER_CLIENT_CERT and CRDTSYNC_CLUSTER_CLIENT_KEY, or every peer running \
              the same policy refuses it",
         ));
+    };
+    // The peers apply this node's own rule to this node's own certificate, so the one
+    // half of their decision that is knowable here is checked here.
+    let self_addr = membership.self_id().as_bytes();
+    if !own_hosts
+        .iter()
+        .any(|host| crate::dial::cert_names_member(host, self_addr))
+    {
+        return Err(invalid(&format!(
+            "this node's peer certificate names no host matching its own advertise address `{}`, \
+             so every peer running the same policy refuses it: issue a certificate whose SAN is \
+             this node's advertise host",
+            String::from_utf8_lossy(self_addr),
+        )));
     }
     for (node, _) in membership.known_members() {
         let addr = String::from_utf8_lossy(node.as_bytes()).into_owned();
@@ -1480,11 +1498,15 @@ fn query_credential(req: &Request) -> Option<Vec<u8>> {
 
 /// Drive one connection: handshake, then the message loop, then teardown.
 /// Generic over the transport so the same driver serves a plaintext `TcpStream`
-/// and a TLS-wrapped stream — the wire protocol is transport-agnostic. `cert_names`
-/// are the identities a verified mTLS client cert established at the transport, if
-/// any; the leading one authenticates the connection ahead of any in-band credential.
-async fn handle<S>(stream: S, cmds: UnboundedSender<Cmd>, cert_names: Option<Vec<Vec<u8>>>)
-where
+/// and a TLS-wrapped stream — the wire protocol is transport-agnostic.
+/// `cert_identity` is what a verified mTLS client cert established at the transport,
+/// if any: the actor it authenticates ahead of any in-band credential, and the hosts
+/// it names.
+async fn handle<S>(
+    stream: S,
+    cmds: UnboundedSender<Cmd>,
+    cert_identity: Option<(Vec<u8>, Vec<Vec<u8>>)>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Read any credential off the upgrade request across the supported carriers.
@@ -1518,7 +1540,7 @@ where
             writer: out.clone(),
             closer: close_tx,
             credential,
-            cert_names,
+            cert_identity,
             reply: reply_tx,
         })
         .is_err()

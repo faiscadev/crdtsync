@@ -52,12 +52,14 @@ struct Conn {
     /// node-to-node handlers. Every gate downstream of admission reads *this*, never
     /// a node id a frame asserts.
     peer: Option<NodeId>,
-    /// Every name the verified mTLS client certificate this connection presented
-    /// carries. Empty on a plaintext or server-auth-only link, and on a connection
-    /// authenticated by an in-band credential — only a certificate the listener's
-    /// trust anchors verified lands here, so these are the only names
-    /// [`authenticate_peer`](Registry::authenticate_peer) will bind a member to.
-    cert_names: Vec<Vec<u8>>,
+    /// Every *host* the verified mTLS client certificate this connection presented
+    /// names — its `dNSName` and `iPAddress` SANs, and nothing else it carries. Empty
+    /// on a plaintext or server-auth-only link, on a connection authenticated by an
+    /// in-band credential, and on a certificate that names no host at all; only a
+    /// certificate the listener's trust anchors verified lands here, so these are the
+    /// only names [`authenticate_peer`](Registry::authenticate_peer) will bind a
+    /// member to.
+    cert_hosts: Vec<Vec<u8>>,
 }
 
 /// A client write-ack withheld pending majority replication. The leader owes the
@@ -549,11 +551,13 @@ impl Registry {
     /// identity rather than a node id a later frame asserts.
     ///
     /// The claim is only as strong as what establishes it. On a link carrying a
-    /// verified mTLS client certificate, one of the names that certificate carries
-    /// must bind the claim ([`cert_names_member`]) — the cluster's CA vouches for the
-    /// binding, so no member can speak as another. On an uncertified link the claim is
-    /// taken at face value, which still binds the link to one identity but vouches for
-    /// none; a deployment that will not have that sets
+    /// verified mTLS client certificate, one of the *hosts* that certificate names must
+    /// bind the claim ([`cert_names_member`]) — the trust anchors the listener verifies
+    /// client certificates against vouch for the binding, so no member can speak as
+    /// another. A certificate that names an actor but no host binds nothing, so it
+    /// reaches the peer plane exactly as a certless link does. On an uncertified link
+    /// the claim is taken at face value, which still binds the link to one identity but
+    /// vouches for none; a deployment that will not have that sets
     /// [`set_require_peer_identity`](Self::set_require_peer_identity) and every
     /// uncertified link is refused.
     ///
@@ -585,13 +589,13 @@ impl Registry {
         if conn.peer.is_some() {
             return false;
         }
-        match conn.cert_names.as_slice() {
+        match conn.cert_hosts.as_slice() {
             [] if self.require_peer_identity => return false,
             [] => {}
-            names => {
-                if !names
+            hosts => {
+                if !hosts
                     .iter()
-                    .any(|name| crate::dial::cert_names_member(name, claimed))
+                    .any(|host| crate::dial::cert_names_member(host, claimed))
                 {
                     return false;
                 }
@@ -1081,19 +1085,20 @@ impl Registry {
 
     /// Open a connection already authenticated as `identity` by a verified mTLS
     /// client certificate — [`connect_authenticated`](Self::connect_authenticated)
-    /// plus every name that certificate carries. Those names are what lets the peer
+    /// plus the `hosts` that certificate names. Those hosts are what lets the peer
     /// plane bind the link to a member: an in-band credential names an actor the
     /// deployment's verifier chose to trust, which says nothing about which node is on
-    /// the other end of the socket. The session's own actor stays the leading name, so
-    /// a certificate authenticates one actor however many ways it spells its host.
+    /// the other end of the socket. They are read by a narrower rule than the actor —
+    /// see [`host_names_from_client_cert`](crate::tls::host_names_from_client_cert) —
+    /// so a certificate may authenticate an actor and bind no member at all.
     pub fn connect_cert_authenticated(
         &mut self,
         identity: Identity,
-        names: Vec<Vec<u8>>,
+        hosts: Vec<Vec<u8>>,
     ) -> ConnId {
         let id = self.connect_authenticated(identity);
         if let Some(conn) = self.conns.get_mut(&id) {
-            conn.cert_names = names;
+            conn.cert_hosts = hosts;
         }
         id
     }
@@ -1107,7 +1112,7 @@ impl Registry {
                 session,
                 outbox: Vec::new(),
                 peer: None,
-                cert_names: Vec::new(),
+                cert_hosts: Vec::new(),
             },
         );
         self.hub.emit(EngineEvent::Connected { conn: id });
