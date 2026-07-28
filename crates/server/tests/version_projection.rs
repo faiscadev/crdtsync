@@ -769,3 +769,99 @@ fn a_version_is_narrowed_by_both_projections_at_once() {
         "the version served a subtree the reader is denied",
     );
 }
+
+// --- a zone set that outlives the schema it was resolved against ---
+
+/// Three zoned subtrees. A channel that cannot read `zsecret` resolves to `{1, 2}`.
+const DRIFT_V1: &str = r#"{
+    "schema": "d", "version": 1, "root": "Doc",
+    "types": {
+        "Doc": { "kind": "map", "children": {
+            "secret": "Sect", "board": "Sect", "notes": "Sect" } },
+        "Sect": { "kind": "map" }
+    },
+    "zones": { "zsecret": "/secret", "za": "/board", "zb": "/notes" }
+}"#;
+
+/// The same app, one zone fewer — so a set of two ids resolved against v1 has
+/// exactly as many members as v2 declares zones, while naming different ones.
+const DRIFT_V2: &str = r#"{
+    "schema": "d", "version": 2, "root": "Doc",
+    "types": {
+        "Doc": { "kind": "map", "children": {
+            "secret": "Sect", "board": "Sect", "notes": "Sect" } },
+        "Sect": { "kind": "map" }
+    },
+    "zones": { "zsecret": "/secret", "za": "/board" }
+}"#;
+
+const DRIFT_APP: &[u8] = b"d";
+
+/// `reader` is denied exactly one zone, so its set holds the other two.
+fn drift_authorizer(id: &Identity, _action: Action, res: &Resource) -> bool {
+    match res {
+        Resource::Zone { zone, .. } => {
+            let zone: &[u8] = zone;
+            id.actor() != b"reader" || zone != b"zsecret"
+        }
+        _ => true,
+    }
+}
+
+#[test]
+fn a_zone_set_that_outlived_its_schema_still_narrows() {
+    // A channel's zone ids are positions in the schema's zone order, resolved once at
+    // Subscribe; the room's governing version lifts underneath it when a newer client
+    // joins. Deciding "whole-zone" by counting members then says yes to a set that
+    // names none of the partitions the count was taken over — and serves the room
+    // whole. Containment over the declared ids does not care how many there are.
+    let mut sr = SchemaRegistry::new();
+    sr.register(DRIFT_APP, 1, DRIFT_V1.as_bytes(), b"").unwrap();
+    sr.register(
+        DRIFT_APP,
+        2,
+        DRIFT_V2.as_bytes(),
+        br#"{ "from": 1, "to": 2, "steps": [ { "kind": "addField", "type": "Sect", "field": "note", "fieldType": "int" } ] }"#,
+    )
+    .unwrap();
+    let mut r = Registry::new(cid(0xFF));
+    r.set_schema_registry(Arc::new(Mutex::new(sr)));
+    r.set_verifier(Box::new(tokens(&[
+        ("c-author", "author"),
+        ("c-reader", "reader"),
+    ])));
+    r.set_authorizer(Box::new(drift_authorizer));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+
+    let author = auth(&mut r, 1, "c-author", DRIFT_APP, 1);
+    subscribe(&mut r, author, b"");
+    let mut author_doc = Document::new(cid(1));
+    author_doc.set_schema(Schema::parse(DRIFT_V1).expect("v1 parses"));
+    submit(
+        &mut r,
+        author,
+        author_doc.transact(|tx| {
+            tx.map(b"secret").register(b"sseed", Scalar::Int(0));
+            tx.map(b"board").register(b"bseed", Scalar::Int(0));
+        }),
+    );
+
+    // The reader binds its channel under v1: `zsecret` is denied, so its set is the
+    // other two ids.
+    let reader = auth(&mut r, 2, "c-reader", DRIFT_APP, 1);
+    subscribe(&mut r, reader, b"");
+    create_version(&mut r, author, V1);
+
+    // A v2 client joins and the room's governing version lifts under the bound
+    // channel — two declared zones now, against a two-member set naming neither pair.
+    let newer = auth(&mut r, 3, "c-author", DRIFT_APP, 2);
+    subscribe(&mut r, newer, b"");
+
+    let served = Document::decode_state(&fetch_version(&mut r, reader, V1))
+        .expect("the served version state decodes");
+    assert_eq!(nested(&served, b"board", b"bseed"), Some(0));
+    assert!(
+        served.get(b"secret").is_none(),
+        "a stale zone set was mistaken for a whole-zone one",
+    );
+}
