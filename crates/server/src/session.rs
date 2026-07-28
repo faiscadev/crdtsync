@@ -997,12 +997,13 @@ pub fn step(
             versions_list(hub, channel, &room)
         }
         Message::VersionFetch { channel, name } => {
-            let Some(room) = version_room(session, channel, authorizer, schema, Action::Read)
-            else {
+            // The reader is resolved before the room, so the redaction below has the
+            // identity it narrows for without a second, unreachable lookup.
+            let Some(identity) = session.identity() else {
                 return version_denied(session, channel);
             };
-            // `version_room` resolved the room only for an authenticated session.
-            let Some(identity) = session.identity() else {
+            let Some(room) = version_room(session, channel, authorizer, schema, Action::Read)
+            else {
                 return version_denied(session, channel);
             };
             match hub.version_state(&room, &name) {
@@ -1023,9 +1024,13 @@ pub fn step(
                         .channels
                         .get(&channel)
                         .and_then(|sub| sub.zones.clone());
-                    // Whether either redaction has anything to say here at all. A room
-                    // with no doc-ACL state and a channel that is not zone-limited is
+                    // Whether either redaction is configured over these bytes at all. A
+                    // room with no doc-ACL state and a channel that is not zone-limited is
                     // served the captured bytes as it always was, without paying a decode.
+                    // This asks what could apply to the *room*, not what would apply to
+                    // *this reader* — the per-reader answer needs the element index, which
+                    // needs the decode, so a state that fails to decode can only be judged
+                    // by the coarser question.
                     let narrowable =
                         !records.is_empty() || zone_narrowing(schema, &zones).is_some();
                     // Element-scoped grants resolve against the *version's* tree: an

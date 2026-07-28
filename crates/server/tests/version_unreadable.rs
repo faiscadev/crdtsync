@@ -260,6 +260,23 @@ fn a_zoneless_tuple_free_room_still_serves_its_version() {
     }
 }
 
+#[test]
+fn the_creator_is_refused_too_once_the_room_holds_doc_acl_state() {
+    // The guard asks what could be redacted over the *room*, not what would be
+    // redacted for *this reader*: the per-reader answer needs the element index, the
+    // index needs the decode, and the decode is what failed. Judging it on an empty
+    // index would answer permissively, since an unresolvable element scope is inert.
+    // So the room's own creator is refused as well — coarse, and fail-closed.
+    let dir = tempdir();
+    let mut r = damaged_room(dir.path(), TUPLE_APP, TUPLED, true);
+    let creator = joined(&mut r, 1, "c-author", TUPLE_APP, b"");
+
+    match &fetch(&mut r, creator)[..] {
+        [Message::Error { code, .. }] => assert_eq!(*code, ErrorCode::Internal),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
 // --- a tempdir without pulling in a dev-dependency ---
 
 struct TempDir(PathBuf);
