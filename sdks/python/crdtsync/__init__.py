@@ -1281,7 +1281,9 @@ class Document:
 
     def apply(self, ops: bytes) -> ApplyOutcome:
         """Fold a peer's encoded ops in. Returns how many applied as they arrived
-        (``-1`` on a malformed batch) beside how many no replica will ever hold."""
+        (``-1`` on a malformed batch) beside how many no replica will ever hold. An
+        op a later op in the same batch releases from the buffer applies without
+        being counted."""
         refused = ctypes.c_uint32(0)
         applied = _LIB.crdtsync_doc_apply(self._handle, ops, len(ops), ctypes.byref(refused))
         return ApplyOutcome(applied=applied, refused=refused.value)
@@ -3062,7 +3064,8 @@ class Doc:
 
     def apply_update(self, ops: bytes) -> ApplyOutcome:
         """Fold a peer's update ops into this replica. Local docs only — a networked
-        doc syncs through its provider.
+        doc syncs through its provider, and raises here rather than answering an
+        outcome.
 
         The outcome separates an op that did not apply *yet* from one that never
         will. ``applied`` counts what the fold took as the ops arrived; one it did
@@ -3073,7 +3076,7 @@ class Doc:
         is a bug in whoever wrote it: offline, P2P and relayed peers reach this
         fold with no server between them to reject such an op first, so a non-zero
         ``refused`` is the only signal the app gets that a peer's edits are dropped
-        for good. The rest of the batch still applies."""
+        for good. A refused op does not hold back the rest of the batch."""
         before = self._backend.encode_state() if self._observing() else None
         outcome = self._backend.apply(ops)
         if outcome.applied > 0:

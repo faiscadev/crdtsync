@@ -18,8 +18,8 @@ import (
 // node ids inside that client's id space, which no replica will ever hold.
 const stampClientAt = 4 + 16 + 8 + 8
 
-// frames splits an op log, which frames each op as a u32 length then its body.
-func frames(log []byte) [][]byte {
+// opFrames splits an op log, which frames each op as a u32 length then its body.
+func opFrames(log []byte) [][]byte {
 	var out [][]byte
 	for at := 0; at < len(log); {
 		size := int(binary.LittleEndian.Uint32(log[at:]))
@@ -67,11 +67,14 @@ func openedMap(t *testing.T, first byte) (create, write, later []byte) {
 	})
 	d.GetMap("root").Set("k", int64(1))
 	d.GetMap("root").Set("k2", int64(2))
-	opened := frames(emitted[0])
+	if len(emitted) != 2 {
+		t.Fatalf("two writes emit two updates, got %d", len(emitted))
+	}
+	opened := opFrames(emitted[0])
 	if len(opened) != 2 {
 		t.Fatalf("opening a map is a create and a write, got %d ops", len(opened))
 	}
-	return opened[0], opened[1], frames(emitted[1])[0]
+	return opened[0], opened[1], opFrames(emitted[1])[0]
 }
 
 func TestARefusedOpIsCountedApartFromABufferedOne(t *testing.T) {

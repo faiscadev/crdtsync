@@ -534,11 +534,12 @@ int32_t crdtsync_doc_resolve_position(const CrdtDoc *doc,
 // can have, at the frame. A buffered op is *waiting*, so the fold keeps it and a
 // later arrival commits it; a refused op is a bug in whoever wrote it, and there
 // is no server between an offline, P2P or relayed peer and this fold to answer
-// `MalformedOp` on the app's behalf. The batch's admissible ops still apply —
-// unlike the server's ingress, which refuses the whole frame because its ack
-// frontier is a max over it. Zero is the honest-peer reading, and the count is
-// written on every outcome (`-1` included, having judged no op), so a caller may
-// reuse the variable across batches. A null pointer skips the write.
+// `MalformedOp` on the app's behalf. A refused op does not hold back the rest of
+// the batch — unlike at the server's ingress, which refuses the whole frame
+// because its ack frontier is a max over it. Zero is the honest-peer reading,
+// and the count is written on every outcome (`-1` included, having judged no
+// op), so a caller may reuse the variable across batches. A null pointer skips
+// the write.
 //
 // # Safety
 // `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`];

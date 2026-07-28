@@ -1262,11 +1262,12 @@ pub unsafe extern "C" fn crdtsync_doc_resolve_position(
 /// can have, at the frame. A buffered op is *waiting*, so the fold keeps it and a
 /// later arrival commits it; a refused op is a bug in whoever wrote it, and there
 /// is no server between an offline, P2P or relayed peer and this fold to answer
-/// `MalformedOp` on the app's behalf. The batch's admissible ops still apply —
-/// unlike the server's ingress, which refuses the whole frame because its ack
-/// frontier is a max over it. Zero is the honest-peer reading, and the count is
-/// written on every outcome (`-1` included, having judged no op), so a caller may
-/// reuse the variable across batches. A null pointer skips the write.
+/// `MalformedOp` on the app's behalf. A refused op does not hold back the rest of
+/// the batch — unlike at the server's ingress, which refuses the whole frame
+/// because its ack frontier is a max over it. Zero is the honest-peer reading,
+/// and the count is written on every outcome (`-1` included, having judged no
+/// op), so a caller may reuse the variable across batches. A null pointer skips
+/// the write.
 ///
 /// # Safety
 /// `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`];
@@ -1278,28 +1279,30 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
     len: usize,
     out_refused: *mut u32,
 ) -> i32 {
-    if !out_refused.is_null() {
-        *out_refused = 0;
-    }
-    catch_unwind(AssertUnwindSafe(|| {
+    // Both counts leave the closure together, so the outcome the caller reads and
+    // the one it is told about are the same one.
+    let (applied, refused) = catch_unwind(AssertUnwindSafe(|| {
         if doc.is_null() {
-            return -1;
+            return (-1, 0);
         }
         let handle = &mut *doc;
         let Some(raw) = as_slice(bytes, len) else {
-            return -1;
+            return (-1, 0);
         };
         match crdtsync_core::decode_ops(raw) {
             Ok(ops) => {
-                if !out_refused.is_null() {
-                    *out_refused = ops.iter().filter(|op| !op.is_admissible()).count() as u32;
-                }
-                ops.iter().filter(|op| handle.doc.apply(op)).count() as i32
+                let refused = ops.iter().filter(|op| !op.is_admissible()).count() as u32;
+                let applied = ops.iter().filter(|op| handle.doc.apply(op)).count() as i32;
+                (applied, refused)
             }
-            Err(_) => -1,
+            Err(_) => (-1, 0),
         }
     }))
-    .unwrap_or(-1)
+    .unwrap_or((-1, 0));
+    if !out_refused.is_null() {
+        *out_refused = refused;
+    }
+    applied
 }
 
 /// Begin recording an atomic transaction: until [`crdtsync_doc_commit_atomic`],

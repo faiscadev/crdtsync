@@ -116,7 +116,8 @@ export class Doc {
   }
 
   /** Fold a peer's update ops into this replica. Local documents only — a
-   * networked document syncs through its provider.
+   * networked document syncs through its provider, and throws here rather than
+   * answering an outcome.
    *
    * The outcome separates an op that did not apply *yet* from one that never
    * will. `applied` counts what the fold took as the ops arrived; one it did not
@@ -126,8 +127,8 @@ export class Doc {
    * counted). `refused` counts what no replica will ever hold, which is a bug in
    * whoever wrote it: offline, P2P and relayed peers reach this fold with no
    * server between them to reject such an op first, so a non-zero `refused` is
-   * the only signal the app gets that a peer's edits are dropped for good. The
-   * rest of the batch still applies. */
+   * the only signal the app gets that a peer's edits are dropped for good. A
+   * refused op does not hold back the rest of the batch. */
   applyUpdate(ops: Uint8Array): ApplyOutcome {
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const outcome = this.backend.apply(ops);

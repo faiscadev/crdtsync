@@ -688,16 +688,17 @@ impl WasmDocument {
     /// The refusal is the stamp conditions [`Op::is_admissible`] names, the codec
     /// having refused its third (a transaction size no group can have) at the
     /// frame. Offline, P2P and relayed peers reach this fold with no server between
-    /// them to answer `MalformedOp`, so the count is the app's only signal; the
-    /// batch's admissible ops still apply, unlike at the server's ingress, which
-    /// refuses the whole frame because its ack frontier is a max over it. A
-    /// malformed batch decodes nothing to judge, so it reports `refused: 0`.
+    /// them to answer `MalformedOp`, so the count is the app's only signal; a
+    /// refused op does not hold back the rest of the batch, unlike at the server's
+    /// ingress, which refuses the whole frame because its ack frontier is a max
+    /// over it. A malformed batch decodes nothing to judge, so it reports
+    /// `refused: 0`.
     pub fn apply(&mut self, ops: &[u8]) -> JsValue {
-        let Ok(ops) = decode_ops(ops) else {
+        let Ok(decoded) = decode_ops(ops) else {
             return apply_outcome_to_js(-1, 0);
         };
-        let refused = ops.iter().filter(|op| !op.is_admissible()).count() as i32;
-        let applied = ops.iter().filter(|op| self.inner.apply(op)).count() as i32;
+        let refused = decoded.iter().filter(|op| !op.is_admissible()).count() as i32;
+        let applied = decoded.iter().filter(|op| self.inner.apply(op)).count() as i32;
         apply_outcome_to_js(applied, refused)
     }
 

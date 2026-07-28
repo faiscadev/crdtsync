@@ -395,7 +395,7 @@ func (d *Doc) SetSchema(schema []byte) bool {
 // replica will ever hold, which is a bug in whoever wrote it: offline, P2P and
 // relayed peers reach this fold with no server between them to reject such an op
 // first, so a non-zero refused is the only signal the app gets that a peer's edits
-// are dropped for good. The rest of the batch still applies.
+// are dropped for good. A refused op does not hold back the rest of the batch.
 func (d *Doc) ApplyUpdate(ops []byte) (applied, refused int) {
 	d.mu.Lock()
 	var before []byte

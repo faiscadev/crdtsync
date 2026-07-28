@@ -47,6 +47,7 @@ def opened_map(first: int):
     d.on_update(lambda e: emitted.append(e.ops) if e.origin == "local" else None)
     d.get_map("root").set("k", 1)
     d.get_map("root").set("k2", 2)
+    assert len(emitted) == 2
     opened = frames(emitted[0])
     assert len(opened) == 2
     (later,) = frames(emitted[1])

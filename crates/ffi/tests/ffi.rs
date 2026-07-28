@@ -1167,8 +1167,8 @@ fn applying_garbage_bytes_is_reported_not_fatal() {
         let c = client(1);
         let doc = crdtsync_doc_new(c.as_ptr());
         let junk = [0xFFu8; 8];
-        // Seeded, so the count is proven written rather than merely left alone —
-        // a caller reusing one variable across batches must not read the last one.
+        // Seeded: a caller reusing one variable across batches must not read the
+        // previous batch's refusals as this one's.
         let mut refused = 7u32;
         assert_eq!(
             crdtsync_doc_apply(doc, junk.as_ptr(), junk.len(), &mut refused),
@@ -1237,7 +1237,7 @@ fn a_refused_op_is_counted_apart_from_a_buffered_one() {
         // The everyday shape: one forgery riding a stream of honest ops. The rest
         // of the batch applies — the refusal is per op, not per batch.
         let c = crdtsync_doc_new(client(4).as_ptr());
-        let mixed = crdtsync_core::encode_ops(&[refused_op, create, write]);
+        let mixed = crdtsync_core::encode_ops(&[refused_op, create.clone(), write.clone()]);
         let mut mixed_refused = 0u32;
         assert_eq!(
             crdtsync_doc_apply(c, mixed.as_ptr(), mixed.len(), &mut mixed_refused),
@@ -1246,12 +1246,25 @@ fn a_refused_op_is_counted_apart_from_a_buffered_one() {
         assert_eq!(mixed_refused, 1);
         assert_eq!(get_int(c, &path(&[b"nested", b"k"])), (1, 1));
 
+        // The count is of ops taken as they arrived: an op the fold buffers and a
+        // later op in the *same* batch releases lands without being counted.
+        let d = crdtsync_doc_new(client(5).as_ptr());
+        let out_of_order = crdtsync_core::encode_ops(&[write, create]);
+        let mut none = 0u32;
+        assert_eq!(
+            crdtsync_doc_apply(d, out_of_order.as_ptr(), out_of_order.len(), &mut none),
+            1
+        );
+        assert_eq!(none, 0);
+        assert_eq!(get_int(d, &path(&[b"nested", b"k"])), (1, 1), "both landed");
+
         crdtsync_buf_free(nested);
         crdtsync_buf_free(forged_buf);
         crdtsync_doc_free(a);
         crdtsync_doc_free(other);
         crdtsync_doc_free(b);
         crdtsync_doc_free(c);
+        crdtsync_doc_free(d);
     }
 }
 

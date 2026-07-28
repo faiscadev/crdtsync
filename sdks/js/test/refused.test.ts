@@ -50,22 +50,26 @@ function forgeStampClient(frame: Uint8Array, author: Uint8Array): Uint8Array {
   return forged;
 }
 
+/** A doc that wrote twice into one map, with its `create`, `write` and `later`
+ *  ops. The first write into a map is two ops — the container create, then the
+ *  write into it; a second write is one op, targeting that container. */
+function openedMap(first: number): [Uint8Array, Uint8Array, Uint8Array] {
+  const d = new Doc({ clientId: cid(first) });
+  const emitted: Uint8Array[] = [];
+  d.on("update", (e) => {
+    if (e.origin === "local") emitted.push(e.ops);
+  });
+  d.getMap("root").set("k", 1);
+  d.getMap("root").set("k2", 2);
+  expect(emitted.length).toBe(2);
+  const opened = frames(emitted[0]);
+  expect(opened.length).toBe(2);
+  return [opened[0], opened[1], frames(emitted[1])[0]];
+}
+
 describe("refused ops", () => {
   it("counts a permanent refusal apart from a buffered one", () => {
-    const a = new Doc({ clientId: cid(1) });
-    const emitted: Uint8Array[] = [];
-    a.on("update", (e) => {
-      if (e.origin === "local") emitted.push(e.ops);
-    });
-
-    // The first write into a map is two ops: the container create, then the
-    // write into it. A second write is one op, targeting the same container.
-    a.getMap("root").set("k", 1);
-    a.getMap("root").set("k2", 2);
-    const opened = frames(emitted[0]);
-    expect(opened.length).toBe(2);
-    const [create, write] = opened;
-    const [later] = frames(emitted[1]);
+    const [create, write, later] = openedMap(1);
 
     const forged = forgeStampClient(later, cid(1));
     const b = new Doc({ clientId: cid(2) });
@@ -84,15 +88,7 @@ describe("refused ops", () => {
   });
 
   it("applies the rest of a batch carrying one forgery", () => {
-    const a = new Doc({ clientId: cid(1) });
-    const emitted: Uint8Array[] = [];
-    a.on("update", (e) => {
-      if (e.origin === "local") emitted.push(e.ops);
-    });
-    a.getMap("root").set("k", 1);
-    a.getMap("root").set("k2", 2);
-    const [create, write] = frames(emitted[0]);
-    const [later] = frames(emitted[1]);
+    const [create, write, later] = openedMap(1);
 
     // The everyday shape: one forgery riding a stream of honest ops. The refusal
     // is per op, not per batch.
