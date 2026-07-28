@@ -1,0 +1,229 @@
+// Tampers with the durable versions file, which Miri does not model.
+#![cfg(not(miri))]
+
+//! A version whose captured state does not decode is refused, not served raw (C15).
+//!
+//! Version bytes come back off durable storage, so — unlike a snapshot materialized
+//! in the same instant by this build — failing to decode one is reachable: a codec
+//! revision, or a damaged file, leaves the live room fine and the archive unreadable.
+//! Undecodable is unprojectable, and unprojected bytes still carry everything a
+//! redaction would have cut, so a reader any redaction could apply to is refused.
+//! A reader entitled to the room whole is served them, exactly as before.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use crdtsync_core::protocol::Channel;
+use crdtsync_core::{ClientId, Document, ErrorCode, Message, Op, Scalar, Schema};
+use crdtsync_server::{
+    Action, ConnId, Identity, Registry, Resource, SchemaRegistry, StaticTokens, Store,
+};
+
+const ROOM: &[u8] = b"room-u";
+const APP: &[u8] = b"z";
+const CH: Channel = Channel(0);
+const V1: &[u8] = b"v1";
+
+/// One zoned map subtree (`/board` → za) beside a hidden one (`/notes` → zb).
+const ZONED: &str = r#"{
+    "schema": "z", "version": 1, "root": "Doc",
+    "types": {
+        "Doc": { "kind": "map", "children": { "board": "Sect", "notes": "Sect" } },
+        "Sect": { "kind": "map" }
+    },
+    "zones": { "za": "/board", "zb": "/notes" }
+}"#;
+
+fn cid(first: u8) -> ClientId {
+    let mut b = [0u8; 16];
+    b[0] = first;
+    ClientId::from_bytes(b)
+}
+
+/// `author` reaches both zones, `reader` only za.
+fn zone_authorizer(id: &Identity, _action: Action, res: &Resource) -> bool {
+    match res {
+        Resource::Zone { zone, .. } => {
+            let zone: &[u8] = zone;
+            match id.actor() {
+                b"author" => true,
+                b"reader" => zone == b"za",
+                _ => false,
+            }
+        }
+        _ => true,
+    }
+}
+
+fn wire(r: &mut Registry) {
+    let mut sr = SchemaRegistry::new();
+    sr.register(APP, 1, ZONED.as_bytes(), b"").unwrap();
+    r.set_schema_registry(Arc::new(Mutex::new(sr)));
+    let mut t = StaticTokens::new();
+    for (credential, actor) in [("c-author", "author"), ("c-reader", "reader")] {
+        t.insert(credential.as_bytes().to_vec(), actor.as_bytes().to_vec());
+    }
+    r.set_verifier(Box::new(t));
+    r.set_authorizer(Box::new(zone_authorizer));
+}
+
+/// Hello + Auth + Subscribe to `zone`, holding the room on `CH`.
+fn joined(r: &mut Registry, client: u8, credential: &str, zone: &[u8]) -> ConnId {
+    let id = r.connect();
+    assert!(r.deliver(
+        id,
+        Message::Hello {
+            client: cid(client),
+            app_id: APP.to_vec(),
+            schema_version: 1,
+            codecs: Vec::new(),
+        }
+    ));
+    assert!(r.deliver(
+        id,
+        Message::Auth {
+            credential: credential.as_bytes().to_vec(),
+        }
+    ));
+    assert!(r.deliver(
+        id,
+        Message::Subscribe {
+            channel: CH,
+            room: ROOM.to_vec(),
+            branch: Vec::new(),
+            zone: zone.to_vec(),
+            last_seen_seq: 0,
+        }
+    ));
+    r.take_outbox(id);
+    id
+}
+
+fn submit(r: &mut Registry, id: ConnId, ops: Vec<Op>) {
+    assert!(r.deliver(id, Message::Ops { channel: CH, ops }));
+    r.take_outbox(id);
+}
+
+fn fetch(r: &mut Registry, id: ConnId) -> Vec<Message> {
+    assert!(r.deliver(
+        id,
+        Message::VersionFetch {
+            channel: CH,
+            name: V1.to_vec(),
+        }
+    ));
+    r.take_outbox(id)
+}
+
+fn store_at(dir: &Path) -> Registry {
+    let store = Store::open(dir).expect("the store opens");
+    let mut r = Registry::with_store(cid(0xFF), store).expect("the registry loads");
+    wire(&mut r);
+    r
+}
+
+/// Overwrite the room's versions file with one record carrying `state` — the same
+/// framing `Store::write_versions` lays down: `name`, seq, no auto-version origin,
+/// ordinal, `state`, each byte string length-prefixed `u32` little-endian.
+fn rewrite_version_state(dir: &Path, state: &[u8]) {
+    let mut buf = Vec::new();
+    let put = |buf: &mut Vec<u8>, bytes: &[u8]| {
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    };
+    put(&mut buf, V1);
+    buf.extend_from_slice(&1u64.to_le_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    put(&mut buf, state);
+
+    let path = fs::read_dir(dir)
+        .expect("the store dir reads")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|e| e == "versions"))
+        .expect("the room's versions file exists");
+    fs::write(path, buf).expect("the versions file rewrites");
+}
+
+/// A store-backed room seeded in both zones with a named version, then damaged so
+/// that version's captured state no longer decodes. Returns the reopened registry.
+fn damaged_room(dir: &Path) -> Registry {
+    {
+        let mut r = store_at(dir);
+        let author = joined(&mut r, 1, "c-author", b"");
+        let mut doc = Document::new(cid(1));
+        doc.set_schema(Schema::parse(ZONED).expect("the zoned schema parses"));
+        submit(
+            &mut r,
+            author,
+            doc.transact(|tx| {
+                tx.map(b"board").register(b"bseed", Scalar::Int(0));
+                tx.map(b"notes").register(b"nseed", Scalar::Int(0));
+            }),
+        );
+        assert!(r.deliver(
+            author,
+            Message::VersionCreate {
+                channel: CH,
+                name: V1.to_vec(),
+            }
+        ));
+        r.take_outbox(author);
+    }
+    rewrite_version_state(dir, b"not a document");
+    store_at(dir)
+}
+
+#[test]
+fn a_zone_limited_reader_is_refused_an_undecodable_version() {
+    let dir = tempdir();
+    let mut r = damaged_room(dir.path());
+    let reader = joined(&mut r, 2, "c-reader", b"za");
+
+    match &fetch(&mut r, reader)[..] {
+        [Message::Error { code, .. }] => assert_eq!(*code, ErrorCode::Internal),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_whole_room_reader_is_still_served_an_undecodable_version() {
+    // The refusal is scoped to readers a redaction could apply to — nothing else
+    // becomes unavailable because one archived state stopped decoding.
+    let dir = tempdir();
+    let mut r = damaged_room(dir.path());
+    let author = joined(&mut r, 1, "c-author", b"");
+
+    match &fetch(&mut r, author)[..] {
+        [Message::VersionState { state, .. }] => assert_eq!(state, b"not a document"),
+        other => panic!("expected the version's state, got {other:?}"),
+    }
+}
+
+// --- a tempdir without pulling in a dev-dependency ---
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempdir() -> TempDir {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("crdtsync-version-unreadable-{pid}-{n}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    TempDir(dir)
+}

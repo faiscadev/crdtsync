@@ -1040,7 +1040,16 @@ pub fn step(
                     if decoded.is_err()
                         && (!records.is_empty() || zone_narrowing(schema, &zones).is_some())
                     {
-                        return internal("version state is unreadable");
+                        // Say so without closing: one archived state is unreadable, the
+                        // live stream this channel carries is not.
+                        return Response {
+                            replies: vec![Message::Error {
+                                code: ErrorCode::Internal,
+                                message: "version state is unreadable".to_string(),
+                                details: Vec::new(),
+                            }],
+                            ..Response::default()
+                        };
                     }
                     let index = match &decoded {
                         Ok(doc) if !records.is_empty() => crate::index::element_paths(doc),
