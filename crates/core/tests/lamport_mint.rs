@@ -217,6 +217,53 @@ fn a_snapshot_declaring_a_clock_below_its_own_stamps_does_not_take_the_next_mint
 }
 
 #[test]
+fn another_partitions_clock_does_not_vouch_for_a_plant_above_the_clamp() {
+    // A clock that climbed past the clamp got there by *local* minting in its own
+    // partition, so it is no evidence about what a peer planted in another one. A
+    // rule that read "some clock reaches at least this far" would be satisfied by
+    // that unrelated clock and hand the plant back to the mint.
+    let victim = cid(1);
+    let attacker = cid(9);
+
+    let mut doc = Document::new(victim);
+    doc.set_schema(schema_with_zone());
+
+    // Park both partitions at the clamp, then run the zone's clock well past it
+    // with the victim's own ordinary edits.
+    let mut park_root = op_at_lamport(attacker, b"k", LAMPORT_WIRE_CEILING);
+    park_root.zone = None;
+    assert!(doc.apply(&park_root));
+    let mut park_zone = Document::new(cid(8)).transact(|tx| tx.set(b"seed", Scalar::Int(1)));
+    park_zone[0].stamp.lamport = LAMPORT_WIRE_CEILING;
+    park_zone[0].zone = Some(0);
+    assert!(doc.apply(&park_zone[0]));
+    for i in 0..20 {
+        doc.transact(|tx| {
+            tx.map(b"board").set(b"busy", Scalar::Int(i));
+        });
+    }
+    assert!(doc.zone_clock(Some(0)) > LAMPORT_WIRE_CEILING + 8);
+
+    // Now plant in the *root*, inside the window that zone clock reaches over. The
+    // op ids are moved clear of the ones the victim has already published, which is
+    // the seq the impersonator would pick anyway.
+    for (i, op) in impersonated_run(victim, b"t", "MMMM", LAMPORT_WIRE_CEILING + 1)
+        .iter_mut()
+        .enumerate()
+    {
+        op.id.seq = 5_000 + i as u64;
+        assert!(doc.apply(op), "the plant landed");
+    }
+    doc.transact(|tx| tx.text(b"t").insert(0, "A"));
+    assert_eq!(
+        text_of(&doc, b"t"),
+        "AMMMM",
+        "a zone clock vouched for a plant in the root partition"
+    );
+    assert_all_distinct(&all_text_ids(&doc, b"t"), "root plant under a busy zone");
+}
+
+#[test]
 fn a_plant_in_a_zone_does_not_take_that_zones_next_mint() {
     // The mint reads its own partition's clock, so the plant has to be cleared in
     // whichever partition it lands in.

@@ -2447,35 +2447,43 @@ impl Document {
     }
 
     /// The highest stamp position a local mint in `zone` must clear: the partition
-    /// clock, or this replica's own id-space high-water when a stamp under its
-    /// client id sits past what *any* clock covers.
+    /// clock, or this replica's own id-space high-water where no clock vouches for
+    /// the stamps under its client id.
     ///
     /// The high-water carries no partition — a snapshot's stamps decode long before
     /// a schema resolves their zones — so reading it unconditionally would drag
     /// every zone up to whatever the busiest partition reached and cost the per-zone
     /// causal independence the replication streams are built on. It is read exactly
-    /// when no clock in the document covers it, which is when it is telling the mint
-    /// something no clock can: a stamp the clamp stopped a clock under, or one a
-    /// snapshot declared a clock below. In every ordinary document some partition's
-    /// clock covers every stamp it holds, so this reads the clock alone and each
-    /// partition keeps counting from its own. Where it does fire, it is deliberately
-    /// read across every partition: no honest replica is there, and clearing a
-    /// planted id in the wrong partition too costs nothing real.
+    /// where [`vouched_stamps`](Self::vouched_stamps) says the clocks stop speaking
+    /// for the document's own contents, which in an ordinary document is nowhere:
+    /// the clock alone decides and each partition keeps counting from its own. Where
+    /// it does fire it is deliberately read across every partition, since the stamp
+    /// it carries has no zone — no honest replica is there, and clearing a planted
+    /// id in the wrong partition too costs nothing real.
     fn mint_floor(&self, zone: Option<u32>) -> (u64, u64) {
         let clock = (self.clock(zone), 0);
+        let vouched = self.vouched_stamps();
         match self.stamp_high_water.get(&self.client) {
-            Some(own) if own.0 > self.covered_clock() && *own > clock => *own,
+            Some(own) if own.0 > vouched && *own > clock => *own,
             _ => clock,
         }
     }
 
-    /// The highest lamport any partition clock in this document reaches — the
-    /// frontier below which a clock vouches for every stamp the replica holds.
-    fn covered_clock(&self) -> u64 {
+    /// The lamport up to which this document's clocks vouch for the stamps it
+    /// holds — at or below it, some clock is an upper bound over them and the mint
+    /// needs nothing else.
+    ///
+    /// Two things end that. A clock never rises past [`LAMPORT_WIRE_CEILING`] on a
+    /// fold, so above the clamp it is no evidence at all — a clock sitting higher
+    /// got there by *local* minting in some partition and says nothing about what a
+    /// peer planted in another. And a clock only vouches as far as it has reached,
+    /// which a snapshot may simply have declared below the stamps it carries.
+    fn vouched_stamps(&self) -> u64 {
         self.zone_clocks
             .values()
             .copied()
             .fold(self.lamport, u64::max)
+            .min(LAMPORT_WIRE_CEILING)
     }
 
     /// Record `stamp`'s whole reservation against its author's id-space high-water.
