@@ -1,0 +1,810 @@
+//! C25 — rooms are placed on *adopted* members, so a node cannot mint an id into a
+//! replica set.
+//!
+//! C13 bound a peer link to a member and gated replication, leadership and durability
+//! on it. Every one of those gates asks the same question — is the sender in
+//! `replicas_for(room)` — and placement is HRW over the member set, a pure and
+//! publicly computable function, so **which rooms a node replicates follows from its
+//! node id**. The join path lets an unknown node introduce itself. So an admitted
+//! member ground an id that HRW placed on the room it wanted, introduced itself under
+//! it, and was inside that room's replica set: it could supersede the leader with a
+//! forged epoch, push ops in, and report heads that made majority-ack release a client
+//! `Accepted` for a write no majority held. Two lesser ways in had the same shape: the
+//! reply half of a gossip round adopted members freely, and a minted member polluted
+//! placement and quorum for the rooms it did *not* attack, so writes to them waited on
+//! acks that never came.
+//!
+//! Learning a member and placing rooms on it are now two admissions. A gossip-learned
+//! member is **pending** — dialed, probed and gossiped about, but in no room's replica
+//! set and no room's quorum — until the cluster adopts it. Adoption cannot be a local
+//! predicate, because placement must be identical on every node or the ring splits, so
+//! a node records only what it knows first-hand (it completed an identity-checked peer
+//! link to the member), that claim rides the same anti-entropy liveness does attributed
+//! to the node that made it, and a member is placed once `ADOPTION_VERIFIERS`
+//! already-adopted members have verified it. A member never verifies itself, so no node
+//! can place itself; configured members are adopted from birth, the operator's config
+//! being the root of trust.
+//!
+//! These drive the registry and the membership in process (no sockets), so they are
+//! deterministic and run under Miri.
+
+use std::sync::Arc;
+
+use crdtsync_core::protocol::Channel;
+use crdtsync_core::{ClientId, Document, MemberState, Message, Op, Scalar};
+use crdtsync_server::auth::Identity;
+use crdtsync_server::membership::{Membership, ADOPTION_VERIFIERS};
+use crdtsync_server::placement::{Cluster, NodeId};
+use crdtsync_server::{ConnId, ManualClock, Registry};
+
+const CH: Channel = Channel(0);
+
+/// One voucher can be the attacker itself, so the bar is more than one — the premise
+/// the test below rests on, checked where it cannot drift.
+const _: () = assert!(ADOPTION_VERIFIERS > 1);
+
+/// The deployment's cluster secret — what every node in one cluster holds.
+const SECRET: &[u8] = b"cluster-secret-of-at-least-32-bytes";
+
+/// This node's advertise address in the in-process cluster below.
+const SELF_ADDR: &str = "10.0.0.6:9000";
+
+/// The per-room replication factor. Five, so a room's majority is three and one
+/// follower's genuine ack is not on its own enough to release a write.
+const N: usize = 5;
+
+fn cid(first: u8) -> ClientId {
+    let mut b = [0u8; 16];
+    b[0] = first;
+    ClientId::from_bytes(b)
+}
+
+fn doc(first: u8) -> Document {
+    Document::new(cid(first))
+}
+
+/// The static member set every node's view is built from — larger than the
+/// replication factor, so a node leads some rooms and holds no replica of others.
+fn members_str() -> String {
+    (0..9)
+        .map(|i| format!("10.0.0.{i}:9000"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn membership_for(self_addr: &str) -> Membership {
+    Membership::from_static_config(None, Some(self_addr), &members_str(), N).unwrap()
+}
+
+/// A clustered registry with the cluster secret configured.
+fn registry() -> Registry {
+    let mut r = Registry::new(cid(0xFF));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+    r.set_membership(membership_for(SELF_ADDR));
+    r.set_cluster_secret(SECRET.to_vec());
+    r
+}
+
+/// A connection admitted to the peer plane as the member `node`, presenting no
+/// certificate — what a deployment that has issued none has.
+fn peer_as(r: &mut Registry, node: &NodeId) -> ConnId {
+    let id = r.connect();
+    assert!(
+        r.deliver(
+            id,
+            Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
+                secret: SECRET.to_vec(),
+            },
+        ),
+        "the cluster secret admits a peer that names itself",
+    );
+    id
+}
+
+/// A connection admitted as `node` behind a verified client certificate that names
+/// `node`'s own host — the binding C13 established, and the inbound half of a
+/// verification.
+fn certified_peer_as(r: &mut Registry, node: &NodeId) -> ConnId {
+    let host =
+        crdtsync_server::dial::member_host(node.as_bytes()).expect("the member names a host");
+    let id = r.connect_cert_authenticated(Identity::new(b"peer".to_vec()), vec![host.into_bytes()]);
+    assert!(r.deliver(
+        id,
+        Message::PeerAuth {
+            node: node.as_bytes().to_vec(),
+            secret: SECRET.to_vec(),
+        },
+    ));
+    id
+}
+
+/// The frame a member sends to introduce itself: its own tuple, at its own address.
+/// `verified` is the claim it makes about having reached that member — for a
+/// self-introduction, a claim about itself.
+fn introduces(node: &NodeId, verified: bool) -> Message {
+    Message::Gossip {
+        members: vec![(
+            node.as_bytes().to_vec(),
+            node.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            verified,
+        )],
+    }
+}
+
+/// The wire tuples introducing each of `nodes` at its own address, unverified — the
+/// payload the *reply* half of a gossip round hands over, which introduces freely.
+fn advertisements(nodes: &[&NodeId]) -> Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)> {
+    nodes
+        .iter()
+        .map(|node| {
+            (
+                node.as_bytes().to_vec(),
+                node.as_bytes().to_vec(),
+                0,
+                MemberState::Alive,
+                false,
+            )
+        })
+        .collect()
+}
+
+/// A room this node is the placement primary of — the room an attack from outside
+/// the replica set targets.
+fn room_self_leads(m: &Membership) -> Vec<u8> {
+    (0..1_000_000)
+        .map(|i| format!("room-{i}").into_bytes())
+        .find(|room| m.is_primary_for(room))
+        .expect("a room self leads")
+}
+
+/// An id HRW would place into `room`'s replica set once adopted — what a member
+/// grinds for when it wants to hold a room it was never placed on. All on one host,
+/// which is the mint space peer identity leaves open (C13): a certified member can
+/// mint only on its own host.
+fn minted_for(m: &Membership, room: &[u8]) -> NodeId {
+    (0..1_000_000)
+        .map(|i| NodeId::from(format!("10.9.9.9:{i}")))
+        .find(|node| {
+            let mut grown: Vec<NodeId> = m.adopted_members().to_vec();
+            grown.push(node.clone());
+            Cluster::new(grown).replicas(room, N).contains(node)
+        })
+        .expect("an id the room places on")
+}
+
+/// A replication frame for `room` at `epoch`, carrying one op.
+fn replicate(d: &mut Document, room: &[u8], epoch: u64) -> Message {
+    let ops = d.transact(|tx| tx.register(b"k", Scalar::Int(1)));
+    Message::Replicate {
+        room: room.to_vec(),
+        branch: b"main".to_vec(),
+        epoch,
+        base_seq: 0,
+        ops,
+    }
+}
+
+/// An authenticated client on `r`, handshake drained.
+fn client(r: &mut Registry) -> ConnId {
+    let id = r.connect();
+    r.deliver(
+        id,
+        Message::Hello {
+            client: cid(1),
+            app_id: Vec::new(),
+            schema_version: 0,
+            codecs: Vec::new(),
+        },
+    );
+    r.deliver(
+        id,
+        Message::Auth {
+            credential: b"cred".to_vec(),
+        },
+    );
+    r.take_outbox(id);
+    id
+}
+
+fn sub(room: &[u8]) -> Message {
+    Message::Subscribe {
+        channel: CH,
+        room: room.to_vec(),
+        branch: Vec::new(),
+        zone: Vec::new(),
+        last_seen_seq: 0,
+    }
+}
+
+fn write() -> Vec<Op> {
+    doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30)))
+}
+
+/// Whether `outbox` carries a write-ack `Accepted` on `CH`.
+fn has_accepted(outbox: &[Message]) -> bool {
+    outbox
+        .iter()
+        .any(|m| matches!(m, Message::Accepted { channel, .. } if *channel == CH))
+}
+
+/// Commit `r`'s write on a room this node leads and return the room, the client, and
+/// the room's genuine followers.
+fn led_room_with_a_withheld_write(r: &mut Registry) -> (Vec<u8>, ConnId, Vec<NodeId>) {
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_leads(&m);
+    let me = NodeId::from(SELF_ADDR);
+    let followers: Vec<NodeId> = m
+        .replicas_for(&room)
+        .into_iter()
+        .filter(|n| n != &me)
+        .collect();
+    let c = client(r);
+    r.deliver(c, sub(&room));
+    r.take_outbox(c);
+    r.deliver(
+        c,
+        Message::Ops {
+            channel: CH,
+            ops: write(),
+        },
+    );
+    assert!(
+        r.take_outbox(c).is_empty(),
+        "the Accepted is withheld until a majority holds the write",
+    );
+    (room, c, followers)
+}
+
+/// The liveness tuple `m` advertises for `node`, or `None` if it advertises none.
+fn advertised(m: &Membership, node: &NodeId) -> Option<(Vec<u8>, u64, MemberState, bool)> {
+    m.known_liveness()
+        .into_iter()
+        .find(|(n, ..)| n == node)
+        .map(|(_, addr, inc, state, verified)| (addr, inc, state, verified))
+}
+
+/// Whether `m` advertises `node` as one it has itself verified.
+fn verified_by(m: &Membership, node: &NodeId) -> bool {
+    advertised(m, node).map(|(.., v)| v).unwrap_or(false)
+}
+
+// --- the defect: a minted id reaches no room ---
+
+#[test]
+fn a_member_that_mints_a_node_id_does_not_enter_a_rooms_replica_set() {
+    // The inversion of C13's residual. The id still places — HRW is a pure function of
+    // the member set and grinding one that lands on a chosen room is a few tries — but
+    // introducing itself no longer makes it a member rooms are placed on.
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_leads(&m);
+    let minted = minted_for(&m, &room);
+    let mut r = registry();
+
+    let p = peer_as(&mut r, &minted);
+    assert!(
+        r.deliver(p, introduces(&minted, false)),
+        "the join path still admits an unknown node's self-introduction",
+    );
+
+    let view = r.membership().expect("clustered");
+    assert!(
+        view.is_member(&minted),
+        "the minted node is learned — it has to be dialable to ever be verified",
+    );
+    assert!(
+        !view.is_adopted(&minted),
+        "but the cluster has not adopted it"
+    );
+    assert!(
+        !view.replicas_for(&room).contains(&minted),
+        "so no room places on it",
+    );
+    assert_eq!(
+        view.replicas_for(&room),
+        m.replicas_for(&room),
+        "and the room's replica set is the one it always was",
+    );
+}
+
+#[test]
+fn a_minted_member_cannot_supersede_the_leader_with_a_forged_epoch() {
+    // The leadership gate, reached from outside the replica set. Before adoption the
+    // minted member was inside it and any epoch above this node's stripped it of the
+    // room; now the frame comes from a member that replicates nothing and the link
+    // goes, leaving the epoch where the leader left it.
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_leads(&m);
+    let minted = minted_for(&m, &room);
+    let mut r = registry();
+    let c = client(&mut r);
+    r.deliver(c, sub(&room));
+    r.deliver(
+        c,
+        Message::Ops {
+            channel: CH,
+            ops: write(),
+        },
+    );
+    let epoch = r.highest_epoch(&room);
+
+    let p = peer_as(&mut r, &minted);
+    assert!(r.deliver(p, introduces(&minted, false)));
+    assert!(
+        !r.deliver(p, replicate(&mut doc(9), &room, epoch + 100)),
+        "the forged frame drops the link",
+    );
+    assert_eq!(
+        r.highest_epoch(&room),
+        epoch,
+        "and leaves this node's leadership epoch untouched",
+    );
+}
+
+#[test]
+fn a_minted_member_cannot_release_an_accepted_no_majority_holds() {
+    // The durability gate. A room's majority is counted over its replica set, so a
+    // member that mints its way in acks as one of five and the leader releases the
+    // client's `Accepted` on a write only two nodes hold. Pending, its ack counts for
+    // nothing — and the write still releases the moment a real majority holds it, so
+    // this is a narrower quorum and not a stalled one.
+    let m = membership_for(SELF_ADDR);
+    let mut r = registry();
+    let (room, c, followers) = led_room_with_a_withheld_write(&mut r);
+    let minted = minted_for(&m, &room);
+    let seq = r.hub().seq(&room);
+
+    let p = peer_as(&mut r, &minted);
+    assert!(r.deliver(p, introduces(&minted, false)));
+
+    r.record_replica_ack(minted.clone(), &room, seq);
+    r.record_replica_ack(followers[0].clone(), &room, seq);
+    assert!(
+        !has_accepted(&r.take_outbox(c)),
+        "self plus one genuine follower is not a majority of five, whatever the \
+         minted member acks",
+    );
+
+    r.record_replica_ack(followers[1].clone(), &room, seq);
+    assert!(
+        has_accepted(&r.take_outbox(c)),
+        "a genuine majority still releases the write",
+    );
+}
+
+#[test]
+fn a_pending_member_does_not_enlarge_the_quorum_of_a_room_it_does_not_attack() {
+    // The lesser way in: a minted member landing in the ring raises the majority of
+    // every room it places on, so writes to rooms it never meant to touch wait on acks
+    // it never sends. Pending, it changes no room's replica set at all, so the same
+    // genuine acks release the same write.
+    let m = membership_for(SELF_ADDR);
+    let mut r = registry();
+    let (room, c, followers) = led_room_with_a_withheld_write(&mut r);
+    let seq = r.hub().seq(&room);
+
+    // A member minted for a *different* room — the collateral case.
+    let other = (0..1_000_000)
+        .map(|i| format!("room-{i}").into_bytes())
+        .find(|candidate| candidate != &room && m.is_primary_for(candidate))
+        .expect("a second room self leads");
+    let minted = minted_for(&m, &other);
+    let p = peer_as(&mut r, &minted);
+    assert!(r.deliver(p, introduces(&minted, false)));
+    assert_eq!(
+        r.membership().expect("clustered").replicas_for(&room),
+        m.replicas_for(&room),
+        "the written room's replica set is untouched",
+    );
+
+    r.record_replica_ack(followers[0].clone(), &room, seq);
+    r.record_replica_ack(followers[1].clone(), &room, seq);
+    assert!(
+        has_accepted(&r.take_outbox(c)),
+        "the room's majority is the one it always had",
+    );
+}
+
+// --- a node cannot vouch for itself ---
+
+#[test]
+fn a_member_cannot_verify_itself_into_the_ring() {
+    // The claim is a member's own, so the obvious forgery is to make it about itself.
+    // A tuple naming the sender is dropped: a node's place in the ring is never its own
+    // to assert, which is the whole reason adoption is a cluster decision.
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_leads(&m);
+    let minted = minted_for(&m, &room);
+    let mut r = registry();
+
+    let p = peer_as(&mut r, &minted);
+    assert!(r.deliver(p, introduces(&minted, true)));
+    assert!(!r.membership().expect("clustered").is_adopted(&minted));
+}
+
+#[test]
+fn this_node_never_advertises_itself_as_verified() {
+    // The same rule from the inside: a node holds no verification of itself to
+    // advertise, so it never contributes one to its own adoption anywhere.
+    let mut m = membership_for(SELF_ADDR);
+    let me = NodeId::from(SELF_ADDR);
+    m.note_verified(&me);
+    assert!(!verified_by(&m, &me));
+}
+
+// --- the threshold ---
+
+#[test]
+fn one_members_verification_does_not_place_a_node() {
+    // Adoption takes more than one member, because a single compromised member is
+    // exactly the attacker here: it would otherwise vouch for the id it ground and
+    // place it itself.
+    let mut m = membership_for(SELF_ADDR);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+
+    m.merge_liveness(
+        &NodeId::from("10.0.0.1:9000"),
+        [(
+            joiner.clone(),
+            joiner.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )],
+    );
+    assert!(!m.is_adopted(&joiner));
+}
+
+#[test]
+fn enough_members_verifications_place_a_node() {
+    // The other side: the bar is reachable, and clearing it puts the member in every
+    // room its id places on.
+    let mut m = membership_for(SELF_ADDR);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    for voucher in ["10.0.0.1:9000", "10.0.0.2:9000"] {
+        m.merge_liveness(
+            &NodeId::from(voucher),
+            [(
+                joiner.clone(),
+                joiner.as_bytes().to_vec(),
+                0,
+                MemberState::Alive,
+                true,
+            )],
+        );
+    }
+    assert!(m.is_adopted(&joiner));
+    assert!(m.adopted_members().contains(&joiner));
+    assert!(
+        (0..64)
+            .map(|i| format!("room-{i}").into_bytes())
+            .any(|room| m.replicas_for(&room).contains(&joiner)),
+        "and it now holds rooms",
+    );
+}
+
+#[test]
+fn the_same_members_verification_twice_is_still_one_voucher() {
+    // The evidence is a set of members, not a count of frames, so a member that
+    // re-gossips its own claim every round does not accumulate into a majority of one.
+    let mut m = membership_for(SELF_ADDR);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    for _ in 0..8 {
+        m.merge_liveness(
+            &NodeId::from("10.0.0.1:9000"),
+            [(
+                joiner.clone(),
+                joiner.as_bytes().to_vec(),
+                0,
+                MemberState::Alive,
+                true,
+            )],
+        );
+    }
+    assert!(!m.is_adopted(&joiner));
+}
+
+#[test]
+fn a_pending_members_verification_does_not_count() {
+    // Two nodes minted together would otherwise vouch each other in without a single
+    // established member ever reaching either. Only an adopted member's claim counts.
+    let mut m = membership_for(SELF_ADDR);
+    let first = NodeId::from("10.9.9.9:9000");
+    let second = NodeId::from("10.9.9.9:9001");
+    for node in [&first, &second] {
+        m.add_member((*node).clone(), node.as_bytes().to_vec());
+    }
+    let claim = |about: &NodeId| {
+        [(
+            about.clone(),
+            about.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )]
+    };
+    m.merge_liveness(&second, claim(&first));
+    m.merge_liveness(&first, claim(&second));
+    // One genuine member reaches the first — still one short, because the pending
+    // sibling's word is worth nothing.
+    m.merge_liveness(&NodeId::from("10.0.0.1:9000"), claim(&first));
+    assert!(!m.is_adopted(&first));
+    assert!(!m.is_adopted(&second));
+}
+
+// --- the address a member is verified at is the address its id names ---
+
+#[test]
+fn a_member_advertised_at_another_hosts_address_is_never_adopted() {
+    // The other lesser way in: the reply half of a gossip round adopts a member at
+    // whatever address its tuple carries, so a dialed node can introduce an id pointing
+    // somewhere else entirely. Such a member would be verified at one host and dialed
+    // at another, so no link to either vouches for it and it stays pending however many
+    // members claim it.
+    let mut m = membership_for(SELF_ADDR);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone(), b"10.6.6.6:9000".to_vec());
+    for voucher in ["10.0.0.1:9000", "10.0.0.2:9000", "10.0.0.3:9000"] {
+        m.merge_liveness(
+            &NodeId::from(voucher),
+            [(
+                joiner.clone(),
+                b"10.6.6.6:9000".to_vec(),
+                0,
+                MemberState::Alive,
+                true,
+            )],
+        );
+    }
+    assert!(!m.is_adopted(&joiner));
+    // Nor does this node's own link to it vouch, for the same reason.
+    m.note_verified(&joiner);
+    assert!(!verified_by(&m, &joiner));
+    assert!(!m.is_adopted(&joiner));
+}
+
+#[test]
+fn a_member_this_view_never_learned_is_not_verified_into_existence() {
+    // A link is evidence *about* a member; where this view holds no member there is
+    // nothing to be evidence about, and a link that could add one would restore the
+    // unchecked join this closes. Learning a member stays gossip's job.
+    let mut m = membership_for(SELF_ADDR);
+    let stranger = NodeId::from("10.9.9.9:9000");
+    m.note_verified(&stranger);
+    assert!(!m.is_member(&stranger));
+    assert!(!m.is_adopted(&stranger));
+}
+
+// --- what a link means ---
+
+#[test]
+fn only_the_dialing_side_verifies_the_other() {
+    // A dial authenticates the far end against the address it dialed; being dialed
+    // proves the sender reached here and nothing about who answers at the sender's own
+    // address. So the initiator comes away holding a verification and the peer does not.
+    let mut a = Membership::from_static_config(None, Some("10.0.0.1:9000"), "", N).unwrap();
+    let mut b = Membership::from_static_config(None, Some("10.0.0.2:9000"), "", N).unwrap();
+    let a_id = NodeId::from("10.0.0.1:9000");
+    let b_id = NodeId::from("10.0.0.2:9000");
+
+    crdtsync_server::gossip::exchange(&mut a, &mut b);
+    assert!(verified_by(&a, &b_id), "the dialer verified the peer");
+    assert!(!verified_by(&b, &a_id), "the dialed node verified nobody");
+}
+
+#[test]
+fn an_uncertified_inbound_link_does_not_verify_the_member_it_claims() {
+    // The cluster secret is one deployment-wide value, so an uncertified claim is a
+    // member asserting an id rather than answering at one. Taking it as verification
+    // would let any secret-holder vouch for any id it liked, which is the mint again
+    // one step over.
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_leads(&m);
+    let minted = minted_for(&m, &room);
+    let mut r = registry();
+
+    let p = peer_as(&mut r, &minted);
+    assert!(r.deliver(p, introduces(&minted, false)));
+    // Re-admit on a second link: repetition is not evidence either.
+    let again = peer_as(&mut r, &minted);
+    assert!(r.deliver(again, introduces(&minted, false)));
+    assert!(!verified_by(r.membership().expect("clustered"), &minted));
+}
+
+#[test]
+fn a_certified_inbound_link_verifies_the_member_it_names() {
+    // The other half of the promotion signal: a member dialing in behind a certificate
+    // that names its own host is verified by this node, exactly as this node's own dial
+    // to it would be. One verification is still not adoption in a cluster this size.
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_leads(&m);
+    let minted = minted_for(&m, &room);
+    let mut r = registry();
+
+    let p = peer_as(&mut r, &minted);
+    assert!(r.deliver(p, introduces(&minted, false)));
+    certified_peer_as(&mut r, &minted);
+
+    let view = r.membership().expect("clustered");
+    assert!(verified_by(view, &minted), "the certificate vouches");
+    assert!(
+        !view.is_adopted(&minted),
+        "and one voucher is short of the bar",
+    );
+}
+
+// --- convergence ---
+
+#[test]
+fn adoption_is_independent_of_the_order_the_evidence_arrives() {
+    // Placement must be identical on every node or the ring splits, so adoption has to
+    // be a function of the evidence and not of the order it landed in.
+    let joiner = NodeId::from("10.9.9.9:9000");
+    let vouchers = ["10.0.0.1:9000", "10.0.0.2:9000", "10.0.0.3:9000"];
+    let claim = [(
+        joiner.clone(),
+        joiner.as_bytes().to_vec(),
+        0,
+        MemberState::Alive,
+        true,
+    )];
+
+    let mut forward = membership_for(SELF_ADDR);
+    forward.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    for v in vouchers {
+        forward.merge_liveness(&NodeId::from(v), claim.clone());
+    }
+
+    let mut backward = membership_for(SELF_ADDR);
+    backward.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    for v in vouchers.iter().rev() {
+        backward.merge_liveness(&NodeId::from(*v), claim.clone());
+    }
+
+    assert_eq!(forward.adopted_members(), backward.adopted_members());
+    for i in 0..32 {
+        let room = format!("room-{i}").into_bytes();
+        assert_eq!(forward.replicas_for(&room), backward.replicas_for(&room));
+    }
+}
+
+#[test]
+fn a_configured_member_is_adopted_from_birth() {
+    // The operator's config is the root of trust a cluster starts from — there is no
+    // earlier authority for it to be vouched for by, and a cluster whose own seeds were
+    // pending could never place a room at all.
+    let m = membership_for(SELF_ADDR);
+    assert_eq!(m.members(), m.adopted_members().to_vec());
+    for i in 0..9 {
+        assert!(m.is_adopted(&NodeId::from(format!("10.0.0.{i}:9000"))));
+    }
+}
+
+#[test]
+fn a_reaped_member_loses_its_place_and_its_vouches() {
+    // Reaping removes a durably-gone member from the roster; it must take its adoption
+    // and its word with it, or a departed node would keep vouching for joiners nobody
+    // can reach.
+    let mut m = membership_for(SELF_ADDR);
+    let departing = NodeId::from("10.0.0.1:9000");
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    m.merge_liveness(
+        &departing,
+        [(
+            joiner.clone(),
+            joiner.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )],
+    );
+
+    for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+        m.note_gossip_unreachable(&departing);
+    }
+    for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+        m.reap_dead();
+    }
+    assert!(!m.is_member(&departing));
+    assert!(!m.is_adopted(&departing));
+
+    // Its vouch went with it: one further genuine claim is now the first, not the
+    // second.
+    m.merge_liveness(
+        &NodeId::from("10.0.0.2:9000"),
+        [(
+            joiner.clone(),
+            joiner.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )],
+    );
+    assert!(!m.is_adopted(&joiner));
+}
+
+// --- a pending member is still a member ---
+
+#[test]
+fn a_pending_member_is_dialed_probed_and_gossiped_about() {
+    // Pending is not exile: a member nobody dials can never be verified, so it would
+    // never be adopted and a genuine joiner would never join. It rides the roster, the
+    // gossip advertisement, and the indirect-probe roster exactly as an adopted member
+    // does — it simply holds no room.
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_leads(&m);
+    let minted = minted_for(&m, &room);
+    let mut r = registry();
+
+    let p = peer_as(&mut r, &minted);
+    assert!(r.deliver(p, introduces(&minted, false)));
+
+    assert!(
+        r.known_members().iter().any(|(node, _)| node == &minted),
+        "the roster carries it, so the gossip loop dials it",
+    );
+    let advert = advertised(r.membership().expect("clustered"), &minted);
+    assert_eq!(
+        advert,
+        Some((minted.as_bytes().to_vec(), 0, MemberState::Alive, false)),
+        "and it is advertised, unverified, at its own address",
+    );
+    // The reply this node just queued carries it too, so the joiner's own view converges.
+    let replied = r.take_outbox(p).into_iter().any(|msg| match msg {
+        Message::Gossip { members } => members
+            .iter()
+            .any(|(node, ..)| node.as_slice() == minted.as_bytes()),
+        _ => false,
+    });
+    assert!(replied, "the gossip reply advertises it back");
+}
+
+#[test]
+fn a_plaintext_dial_does_not_verify_where_an_identified_peer_is_required() {
+    // A deployment that requires an identified peer requires the dial to have
+    // authenticated one. A plaintext member is dialed with no certificate to check, so
+    // the round proves only that something answers there — and adopting on that would
+    // give rooms to a member whose every inbound link is refused, stalling their
+    // quorums. A `wss://` member is dialed over a transport that authenticates it, and
+    // is verified.
+    let mut r = registry();
+    r.set_require_peer_identity(true);
+    let plain = NodeId::from("10.9.9.9:9000");
+    let tls = NodeId::from("wss://10.9.9.8:9000");
+    r.merge_gossip(
+        &NodeId::from("10.0.0.1:9000"),
+        advertisements(&[&plain, &tls]),
+    );
+
+    r.note_peer_verified(&plain);
+    r.note_peer_verified(&tls);
+
+    let view = r.membership().expect("clustered");
+    assert!(
+        !verified_by(view, &plain),
+        "a plaintext dial checked nothing"
+    );
+    assert!(
+        verified_by(view, &tls),
+        "a TLS dial authenticated the far end"
+    );
+}
+
+#[test]
+fn a_plaintext_dial_still_verifies_where_no_identity_is_required() {
+    // The honest floor, so the refusal above is the policy and not a blanket one. With
+    // no certificates configured a completed dial vouches for reachability at the
+    // address the id names — which is less than identity, and still more than a member
+    // saying an id exists.
+    let mut r = registry();
+    let plain = NodeId::from("10.9.9.9:9000");
+    r.merge_gossip(&NodeId::from("10.0.0.1:9000"), advertisements(&[&plain]));
+    r.note_peer_verified(&plain);
+    assert!(verified_by(r.membership().expect("clustered"), &plain));
+}

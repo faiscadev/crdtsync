@@ -249,9 +249,13 @@ enum Cmd {
     /// success, `learned` carries the liveness the peer advertised back (the
     /// registry merges it) and the peer is noted reachable; on failure (`learned`
     /// is `None`) the peer is noted unreachable — the gossip-driven failover signal.
+    /// `direct` says the round reached `peer` by *this node's own dial* rather than
+    /// through a relay's second opinion, which is what makes it evidence of the peer's
+    /// identity and not merely of its liveness.
     GossipRound {
         peer: NodeId,
         learned: Option<Vec<GossipWireMember>>,
+        direct: bool,
     },
     /// The blob-fetch plane asks whether `identity` may retrieve blob `blob_id`,
     /// resolved against the live rooms' references (see
@@ -733,14 +737,25 @@ async fn registry_actor(
                     Cmd::GossipSnapshot { reply } => {
                         let _ = reply.send(reg.known_liveness());
                     }
-                    Cmd::GossipRound { peer, learned } => {
+                    Cmd::GossipRound {
+                        peer,
+                        learned,
+                        direct,
+                    } => {
                         // The next client delivery recomputes placement and
                         // effective leadership off the grown set and updated
                         // liveness, so there is nothing to flush here.
                         match learned {
                             Some(members) => {
-                                reg.note_gossip_probe(peer, true);
-                                reg.merge_gossip(members);
+                                reg.note_gossip_probe(peer.clone(), true);
+                                // This node dialed the peer and the transport
+                                // authenticated it before a byte was written, so the
+                                // round is its own first-hand verification of that
+                                // member — the evidence its place in the ring rests on.
+                                if direct {
+                                    reg.note_peer_verified(&peer);
+                                }
+                                reg.merge_gossip(&peer, members);
                             }
                             None => reg.note_gossip_probe(peer, false),
                         }
@@ -1145,11 +1160,19 @@ async fn gossip_loop(
         // A direct success carries the liveness the peer advertised back; an
         // indirect-only success reports the peer reachable but has nothing to merge
         // (an empty learned set); an all-failed round reports it unreachable (`None`).
+        let reached_directly = direct.is_some();
         let learned = match direct {
             Some(members) => Some(members),
             None => reachable.then(Vec::new),
         };
-        if cmds.send(Cmd::GossipRound { peer, learned }).is_err() {
+        if cmds
+            .send(Cmd::GossipRound {
+                peer,
+                learned,
+                direct: reached_directly,
+            })
+            .is_err()
+        {
             return;
         }
     }

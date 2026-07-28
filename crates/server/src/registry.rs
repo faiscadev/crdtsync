@@ -608,12 +608,12 @@ impl Registry {
         if conn.peer.is_some() {
             return false;
         }
-        match conn.cert_hosts.as_deref() {
+        let certified = match conn.cert_hosts.as_deref() {
             // No certificate at all. The claim stands on its own, which is what a
             // deployment that has not issued per-node certificates has; one that has
             // says so and this is refused.
             None if self.require_peer_identity => return false,
-            None => {}
+            None => false,
             // A certificate *was* presented and verified, so it decides — including
             // when it names no host, which binds nothing. Treating that as certless
             // would make a certificate widen what a link may claim.
@@ -624,9 +624,22 @@ impl Registry {
             {
                 return false
             }
-            Some(_) => {}
+            Some(_) => true,
+        };
+        let member = NodeId::from(claimed.to_vec());
+        conn.peer = Some(member.clone());
+        // An inbound link is a verification of the member it names only when a
+        // certificate named it. Admission alone is no evidence: the cluster secret is
+        // deployment-wide, so an uncertified claim is a member asserting an id rather
+        // than answering at one, and taking it as verification would let any
+        // secret-holder place any id it liked. A dial in the other direction still
+        // vouches without certificates — it at least proves the far end answers at the
+        // address the id names.
+        if certified {
+            if let Some(membership) = &mut self.membership {
+                membership.note_verified(&member);
+            }
         }
-        conn.peer = Some(NodeId::from(claimed.to_vec()));
         true
     }
 
@@ -814,11 +827,35 @@ impl Registry {
     /// This node's known cluster members with liveness — the payload it gossips.
     /// Empty in single-node mode (no membership), so a non-cluster node advertises
     /// nothing.
-    pub fn known_liveness(&self) -> Vec<(NodeId, Vec<u8>, u64, MemberState)> {
+    pub fn known_liveness(&self) -> Vec<(NodeId, Vec<u8>, u64, MemberState, bool)> {
         self.membership
             .as_ref()
             .map(Membership::known_liveness)
             .unwrap_or_default()
+    }
+
+    /// Record that this node has itself completed an identity-checked peer link to
+    /// `node` — the promotion signal a room's placement is built from. Driven by the
+    /// gossip loop's *direct* round, which dials the member and (on a TLS member)
+    /// authenticates it before a byte of the cluster secret is written; an
+    /// indirect-only round confirms a relay reached it and vouches for nothing here.
+    /// Inert in single-node mode.
+    ///
+    /// A deployment that *requires* an identified peer requires the dial to have
+    /// authenticated one, so a plaintext member is not verified this way: the dial had
+    /// no certificate to check, and a round that proves only "something answers here"
+    /// would let such a member take rooms in a cluster whose every inbound link from it
+    /// is refused — stalling their quorums. Without that policy the same round is the
+    /// honest floor, and vouches for reachability alone.
+    pub fn note_peer_verified(&mut self, node: &NodeId) {
+        let require_identity = self.require_peer_identity;
+        let Some(membership) = &mut self.membership else {
+            return;
+        };
+        if require_identity && !membership.advertises_tls(node) {
+            return;
+        }
+        membership.note_verified(node);
     }
 
     /// Merge a gossiped liveness payload into this node's membership — the SWIM
@@ -832,12 +869,28 @@ impl Registry {
     /// it is how a joiner learns the cluster in one round. The *inbound* half is the one
     /// an unknown peer can reach, and it filters first — a peer introduces only itself,
     /// at its own address ([`apply_gossip`](Self::apply_gossip)).
-    pub fn merge_gossip(&mut self, members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>) {
+    ///
+    /// What the reply half hands over freely is the *roster*, and a member reaching the
+    /// roster this way is **pending**: dialed, probed and gossiped about, but on no
+    /// room and in no room's quorum until the cluster verifies it. So the freedom costs
+    /// what it always should have — a joiner converges in one round — without letting
+    /// the node this one dialed choose who takes a place in the ring.
+    ///
+    /// `sender` is the member the payload came from, and every `verified` flag in it is
+    /// recorded as that member's own first-hand claim.
+    pub fn merge_gossip(
+        &mut self,
+        sender: &NodeId,
+        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)>,
+    ) {
         if let Some(membership) = &mut self.membership {
             membership.merge_liveness(
+                sender,
                 members
                     .into_iter()
-                    .map(|(node, addr, inc, state)| (NodeId::from(node), addr, inc, state)),
+                    .map(|(node, addr, inc, state, verified)| {
+                        (NodeId::from(node), addr, inc, state, verified)
+                    }),
             );
         }
     }
@@ -892,11 +945,18 @@ impl Registry {
     /// A joining node still converges: it learns the cluster from the seed it *dialed*
     /// (see [`merge_gossip`](Self::merge_gossip), the reply path) and then introduces
     /// itself to each member directly.
+    ///
+    /// **A self-introduction joins the roster, not the ring.** The member is dialed,
+    /// probed and gossiped about, and placed on no room until the cluster has verified
+    /// it — otherwise a member would grind a node id that HRW placed on the room it
+    /// wanted and be inside that room's replica set the moment it said so. Its own
+    /// tuple cannot carry that verification either: a claim naming the sender is
+    /// dropped.
     fn apply_gossip(
         &mut self,
         id: ConnId,
         sender: &NodeId,
-        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>,
+        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)>,
     ) -> bool {
         let Some(membership) = &self.membership else {
             return false;
@@ -910,7 +970,7 @@ impl Registry {
                 membership.is_member(&node) || (&node == sender && addr == node.as_bytes())
             })
             .collect();
-        self.merge_gossip(members);
+        self.merge_gossip(sender, members);
         let reply = crate::gossip::gossip_frame(&self.known_liveness());
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.outbox.push(reply);

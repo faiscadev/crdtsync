@@ -465,6 +465,7 @@ async fn anti_entropy_and_ping_req_round_trip_over_tls() {
                 b"10.0.0.9:9000".to_vec(),
                 1,
                 MemberState::Alive,
+                false,
             )]),
         )
     })

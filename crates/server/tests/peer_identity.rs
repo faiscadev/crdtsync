@@ -25,16 +25,15 @@
 //!
 //! What that closes: a member outside a room's replica set can no longer touch that
 //! room at all, a peer introduces only itself and only at its own address, and a node
-//! reports only its own heads. Two limits are pinned below as passing tests rather
+//! reports only its own heads. One limit is pinned below as a passing test rather
 //! than left implied. Inside a room's replica set the epoch is still the only arbiter
 //! — a genuinely promoted replica must be able to supersede a stale leader, and
 //! nothing here tells it apart from a peer replica forging the bump, which needs a
-//! real election. And placement follows from a node id while the join path lets an
-//! unknown node introduce itself, so a member can *mint* an id that places it into a
-//! room's replica set and reach these gates from inside it; peer identity bounds that
-//! to the member's own certified host, and closing it needs placement over verified
-//! members (C17), which is a cluster-wide change because placement must be identical
-//! on every node.
+//! real election. What was a second limit — that placement follows from a node id
+//! while the join path lets an unknown node introduce itself, so a member could *mint*
+//! an id that placed it into a room's replica set and reach these gates from inside it
+//! — is closed by C25: rooms are placed on *adopted* members, and a node introducing
+//! itself is pending until the cluster has verified it. See `adoption.rs`.
 //!
 //! Most of these drive the registry in process (no sockets), so they are
 //! deterministic and run under Miri; the socket tests at the end stand up a real
@@ -381,53 +380,6 @@ fn a_replica_of_the_room_still_supersedes_a_stale_leader() {
     );
 }
 
-#[test]
-fn a_member_that_mints_a_node_id_places_itself_into_a_rooms_replica_set() {
-    // The second limit, pinned rather than implied — and the reason C17 is a
-    // prerequisite for these gates to hold against a *compromised* member rather than
-    // a follow-on. Placement is HRW over the member set, a pure and publicly
-    // computable function, so which rooms a node replicates follows from its node id;
-    // and the join path lets an unknown node introduce itself. A member can therefore
-    // mint an id, land in a room's replica set, and reach the leadership gate from
-    // inside it. Peer identity bounds the mint space to the member's own certified
-    // host — it cannot mint on anyone else's — but does not close it, because closing
-    // it means placing rooms only on members this node has itself verified, and
-    // placement must be identical on every node or the ring diverges.
-    let m = membership_for(SELF_ADDR);
-    let room = room_self_leads_without(&m, &outsider_of(&m, b"room-0"));
-    let mut r = registry();
-    commit_write(&mut r, &room);
-    let epoch = r.highest_epoch(&room);
-
-    // Grind an id that HRW places on the room, then join under it.
-    let minted = (0..1_000_000)
-        .map(|i| NodeId::from(format!("10.9.9.9:{i}")))
-        .find(|node| {
-            let mut grown = membership_for(SELF_ADDR);
-            grown.add_member(node.clone(), node.as_bytes().to_vec());
-            grown.replicas_for(&room).contains(node)
-        })
-        .expect("an id the room places on");
-    let p = peer_as(&mut r, &minted);
-    assert!(r.deliver(
-        p,
-        Message::Gossip {
-            members: vec![(
-                minted.as_bytes().to_vec(),
-                minted.as_bytes().to_vec(),
-                0,
-                MemberState::Alive,
-            )],
-        },
-    ));
-    assert!(r.deliver(p, replicate(&mut doc(9), &room, epoch + 100)));
-    assert_eq!(
-        r.highest_epoch(&room),
-        epoch + 100,
-        "a minted member reaches the leadership gate from inside the replica set",
-    );
-}
-
 // --- membership: a peer introduces itself and nobody else ---
 
 #[test]
@@ -447,6 +399,7 @@ fn a_member_cannot_introduce_a_foreign_address_into_the_member_set() {
                     b"evil.example:9000".to_vec(),
                     7,
                     MemberState::Alive,
+                    false,
                 )],
             },
         ),
@@ -470,22 +423,24 @@ fn a_member_cannot_hide_a_foreign_address_among_legitimate_tuples() {
     let joiner = NodeId::from("10.9.9.9:9000");
     let mut r = registry();
     let p = peer_as(&mut r, &joiner);
-    let mut members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)> = m
+    let mut members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)> = m
         .known_liveness()
         .into_iter()
-        .map(|(node, addr, inc, state)| (node.as_bytes().to_vec(), addr, inc, state))
+        .map(|(node, addr, inc, state, v)| (node.as_bytes().to_vec(), addr, inc, state, v))
         .collect();
     members.push((
         joiner.as_bytes().to_vec(),
         joiner.as_bytes().to_vec(),
         0,
         MemberState::Alive,
+        false,
     ));
     members.push((
         b"evil.example:9000".to_vec(),
         b"evil.example:9000".to_vec(),
         9,
         MemberState::Alive,
+        false,
     ));
     assert!(r.deliver(p, Message::Gossip { members }));
     assert!(
@@ -518,6 +473,7 @@ fn a_member_cannot_introduce_itself_at_an_address_it_chose() {
                 b"ws://evil.example:9000".to_vec(),
                 0,
                 MemberState::Alive,
+                false,
             )],
         },
     ));
@@ -545,6 +501,7 @@ fn a_liveness_verdict_about_a_known_member_still_disseminates() {
                 subject.as_bytes().to_vec(),
                 5,
                 MemberState::Dead,
+                false,
             )],
         },
     ));
@@ -570,6 +527,7 @@ fn a_joining_node_introduces_itself() {
                 joiner.as_bytes().to_vec(),
                 0,
                 MemberState::Alive,
+                false,
             )],
         },
     ));
@@ -845,7 +803,7 @@ fn an_identified_member_still_sends_every_node_to_node_frame() {
             members: m
                 .known_liveness()
                 .into_iter()
-                .map(|(node, addr, inc, state)| (node.as_bytes().to_vec(), addr, inc, state))
+                .map(|(node, addr, inc, state, v)| (node.as_bytes().to_vec(), addr, inc, state, v))
                 .collect(),
         },
     ));

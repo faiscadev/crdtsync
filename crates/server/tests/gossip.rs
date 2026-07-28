@@ -58,6 +58,23 @@ fn sample_rooms() -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Drive two gossip rounds per ordered pair, so every node has dialed every other
+/// twice — what a real node's randomized peer choice reaches within a handful of
+/// rounds. The roster converges much faster than this; the *ring* waits on it,
+/// because a node adopts a member off links it completed itself. Two passes, not
+/// one: the first completes the links, and the second carries each node's own
+/// verifications to the others, which is the only way they travel.
+fn all_pairs(a: &mut Membership, b: &mut Membership, c: &mut Membership) {
+    for _ in 0..2 {
+        exchange(a, b);
+        exchange(b, a);
+        exchange(a, c);
+        exchange(c, a);
+        exchange(b, c);
+        exchange(c, b);
+    }
+}
+
 /// Assert two memberships place every sample room identically — same ordered
 /// replica set and same primary.
 fn placement_agrees(x: &Membership, y: &Membership) {
@@ -77,10 +94,12 @@ fn placement_agrees(x: &Membership, y: &Membership) {
 
 /// The wire payload a membership advertises — its known members with liveness, as
 /// raw bytes.
-fn payload(m: &Membership) -> Vec<(Vec<u8>, Vec<u8>, u64, MemberState)> {
+fn payload(m: &Membership) -> Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)> {
     m.known_liveness()
         .into_iter()
-        .map(|(node, addr, inc, state)| (node.as_bytes().to_vec(), addr, inc, state))
+        .map(|(node, addr, inc, state, verified)| {
+            (node.as_bytes().to_vec(), addr, inc, state, verified)
+        })
         .collect()
 }
 
@@ -96,8 +115,16 @@ fn tuple(
     addr: &str,
     inc: u64,
     state: MemberState,
-) -> (NodeId, Vec<u8>, u64, MemberState) {
-    (node.clone(), addr.as_bytes().to_vec(), inc, state)
+) -> (NodeId, Vec<u8>, u64, MemberState, bool) {
+    (node.clone(), addr.as_bytes().to_vec(), inc, state, false)
+}
+
+/// The member a directly-merged liveness payload is attributed to. These payloads
+/// carry no verification claims, so the merge does not turn on which member sent
+/// them — but every anti-entropy frame arrives from one, and the merge records its
+/// claims against it.
+fn sender() -> NodeId {
+    NodeId::from_addr(B)
 }
 
 /// The cluster secret these nodes share — what admits a node-to-node link to a
@@ -174,8 +201,13 @@ fn a_seed_only_node_converges_on_the_full_cluster() {
     assert_eq!(member_set(&b), full, "B converged");
     assert_eq!(member_set(&c), full, "C converged");
 
+    // The roster converges in two rounds; the *ring* waits on the cluster having
+    // reached each newcomer, since adoption rests on links a node completed itself.
+    all_pairs(&mut a, &mut b, &mut c);
+
     // Placement converged: all three compute the same replica set and primary for
-    // every sample room.
+    // every sample room, over all three members.
+    assert_eq!(a.adopted_members(), full, "A places on all three");
     placement_agrees(&a, &b);
     placement_agrees(&b, &c);
 }
@@ -192,6 +224,7 @@ fn convergence_holds_whatever_the_gossip_order() {
         exchange(&mut b, &mut a);
         exchange(&mut c, &mut b);
     }
+    all_pairs(&mut a, &mut b, &mut c);
     let full = vec![
         NodeId::from_addr(A),
         NodeId::from_addr(B),
@@ -241,7 +274,7 @@ fn re_gossiping_a_fully_known_set_changes_nothing() {
     // Union the node's own advertisement back into itself — a re-gossip of an
     // already-known set.
     let own = payload(&m);
-    merge_into(&mut m, own);
+    merge_into(&mut m, &sender(), own);
 
     assert_eq!(member_set(&m), members_before, "no member churn");
     assert_eq!(m.known_members(), known_before, "addresses unchanged");
@@ -280,13 +313,15 @@ fn a_member_with_an_empty_node_id_is_dropped() {
     // The same guard holds through the wire merge path.
     merge_into(
         &mut m,
+        &sender(),
         vec![
-            (Vec::new(), Vec::new(), 0, MemberState::Alive),
+            (Vec::new(), Vec::new(), 0, MemberState::Alive, false),
             (
                 C.as_bytes().to_vec(),
                 C.as_bytes().to_vec(),
                 0,
                 MemberState::Alive,
+                false,
             ),
         ],
     );
@@ -331,12 +366,16 @@ fn a_single_node_registry_knows_no_members_and_ignores_gossip() {
     assert!(r.known_members().is_empty(), "no members to advertise");
 
     // Merging a gossip payload is inert with no membership.
-    r.merge_gossip(vec![(
-        A.as_bytes().to_vec(),
-        A.as_bytes().to_vec(),
-        0,
-        MemberState::Alive,
-    )]);
+    r.merge_gossip(
+        &sender(),
+        vec![(
+            A.as_bytes().to_vec(),
+            A.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            false,
+        )],
+    );
     assert!(r.known_members().is_empty());
     assert!(r.membership().is_none());
 
@@ -350,6 +389,7 @@ fn a_single_node_registry_knows_no_members_and_ignores_gossip() {
                 A.as_bytes().to_vec(),
                 0,
                 MemberState::Alive,
+                false,
             )],
         },
     );
@@ -375,6 +415,13 @@ fn a_member_learned_by_gossip_becomes_a_placement_target() {
         .all(|room| m.primary_for(room) == Some(NodeId::from_addr(self_addr))));
 
     m.add_member(newcomer_id.clone(), newcomer.as_bytes().to_vec());
+    // Learned, but pending: it is dialed and gossiped about, and placed nowhere.
+    assert!(sample_rooms()
+        .iter()
+        .all(|room| m.primary_for(room) == Some(NodeId::from_addr(self_addr))));
+    // This node then reaches it over an identity-checked link, which is the whole
+    // cluster's verdict here — there is nobody else to raise.
+    m.note_verified(&newcomer_id);
 
     let room = sample_rooms()
         .into_iter()
@@ -400,12 +447,16 @@ fn a_registry_grows_its_membership_from_a_gossip_frame() {
     r.set_membership(seeded(A, B));
     assert_eq!(r.known_members().len(), 2);
 
-    r.merge_gossip(vec![(
-        C.as_bytes().to_vec(),
-        C.as_bytes().to_vec(),
-        0,
-        MemberState::Alive,
-    )]);
+    r.merge_gossip(
+        &sender(),
+        vec![(
+            C.as_bytes().to_vec(),
+            C.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            false,
+        )],
+    );
     let members: Vec<NodeId> = r
         .known_members()
         .into_iter()
@@ -434,6 +485,7 @@ fn the_gossip_frame_carries_every_known_member_with_its_address_and_liveness() {
             addr.as_bytes().to_vec(),
             0,
             MemberState::Alive,
+            false,
         )));
     }
 }
@@ -552,14 +604,14 @@ fn a_falsely_suspected_node_refutes_and_the_cluster_restores_it() {
     let c_id = NodeId::from_addr(C);
 
     let stale = vec![tuple(&c_id, C, 0, MemberState::Suspect)];
-    a.merge_liveness(stale.clone());
-    b.merge_liveness(stale.clone());
+    a.merge_liveness(&sender(), stale.clone());
+    b.merge_liveness(&sender(), stale.clone());
     assert_eq!(a.gossip_state(&c_id), MemberState::Suspect);
     assert_eq!(b.gossip_state(&c_id), MemberState::Suspect);
 
     // C receives the same suspicion about itself and refutes: incarnation climbs
     // above the received 0, state re-asserted Alive.
-    c.merge_liveness(stale);
+    c.merge_liveness(&sender(), stale);
     assert_eq!(c.gossip_state(&c_id), MemberState::Alive);
     assert!(
         c.incarnation(&c_id) > 0,
@@ -582,11 +634,11 @@ fn refutation_overrides_even_a_dead_verdict() {
     let mut a = full_node(A);
     let mut c = full_node(C);
     let c_id = NodeId::from_addr(C);
-    a.merge_liveness(vec![tuple(&c_id, C, 4, MemberState::Dead)]);
+    a.merge_liveness(&sender(), vec![tuple(&c_id, C, 4, MemberState::Dead)]);
     assert!(!a.is_live(&c_id));
 
     // C hears the Dead@4 about itself, refutes above 4, re-disseminates Alive.
-    c.merge_liveness(vec![tuple(&c_id, C, 4, MemberState::Dead)]);
+    c.merge_liveness(&sender(), vec![tuple(&c_id, C, 4, MemberState::Dead)]);
     assert!(c.incarnation(&c_id) > 4);
     exchange(&mut c, &mut a);
     assert_eq!(a.gossip_state(&c_id), MemberState::Alive);
@@ -599,14 +651,14 @@ fn refutation_overrides_even_a_dead_verdict() {
 fn a_higher_incarnation_always_wins_the_merge() {
     let mut a = full_node(A);
     let c_id = NodeId::from_addr(C);
-    a.merge_liveness(vec![tuple(&c_id, C, 5, MemberState::Dead)]);
+    a.merge_liveness(&sender(), vec![tuple(&c_id, C, 5, MemberState::Dead)]);
     assert_eq!(a.gossip_state(&c_id), MemberState::Dead);
     // A fresher (higher-incarnation) Alive supersedes the older Dead.
-    a.merge_liveness(vec![tuple(&c_id, C, 6, MemberState::Alive)]);
+    a.merge_liveness(&sender(), vec![tuple(&c_id, C, 6, MemberState::Alive)]);
     assert_eq!(a.gossip_state(&c_id), MemberState::Alive);
     assert_eq!(a.incarnation(&c_id), 6);
     // A stale lower-incarnation Dead is ignored.
-    a.merge_liveness(vec![tuple(&c_id, C, 5, MemberState::Dead)]);
+    a.merge_liveness(&sender(), vec![tuple(&c_id, C, 5, MemberState::Dead)]);
     assert_eq!(a.gossip_state(&c_id), MemberState::Alive);
 }
 
@@ -615,12 +667,12 @@ fn at_equal_incarnation_the_more_suspicious_state_wins() {
     let mut a = full_node(A);
     let c_id = NodeId::from_addr(C);
     // Alive -> Suspect -> Dead all at incarnation 3, each more suspicious wins.
-    a.merge_liveness(vec![tuple(&c_id, C, 3, MemberState::Suspect)]);
+    a.merge_liveness(&sender(), vec![tuple(&c_id, C, 3, MemberState::Suspect)]);
     assert_eq!(a.gossip_state(&c_id), MemberState::Suspect);
-    a.merge_liveness(vec![tuple(&c_id, C, 3, MemberState::Dead)]);
+    a.merge_liveness(&sender(), vec![tuple(&c_id, C, 3, MemberState::Dead)]);
     assert_eq!(a.gossip_state(&c_id), MemberState::Dead);
     // A less-suspicious state at the same incarnation does not un-do it.
-    a.merge_liveness(vec![tuple(&c_id, C, 3, MemberState::Alive)]);
+    a.merge_liveness(&sender(), vec![tuple(&c_id, C, 3, MemberState::Alive)]);
     assert_eq!(a.gossip_state(&c_id), MemberState::Dead);
 }
 
@@ -636,11 +688,11 @@ fn liveness_merge_is_order_independent() {
     ];
     let mut fwd = full_node(A);
     for u in updates.iter().cloned() {
-        fwd.merge_liveness(vec![u]);
+        fwd.merge_liveness(&sender(), vec![u]);
     }
     let mut rev = full_node(A);
     for u in updates.iter().rev().cloned() {
-        rev.merge_liveness(vec![u]);
+        rev.merge_liveness(&sender(), vec![u]);
     }
     assert_eq!(fwd.gossip_state(&c_id), rev.gossip_state(&c_id));
     assert_eq!(fwd.incarnation(&c_id), rev.incarnation(&c_id));
@@ -716,7 +768,7 @@ fn a_relay_reconnect_does_not_resurrect_a_gossip_dead_node() {
     a.mark_node_live(&c_id);
     assert!(!a.is_live(&c_id), "gossip-Dead survives a relay reconnect");
     // Only a gossip refutation (higher-incarnation Alive) restores it.
-    a.merge_liveness(vec![tuple(&c_id, C, 99, MemberState::Alive)]);
+    a.merge_liveness(&sender(), vec![tuple(&c_id, C, 99, MemberState::Alive)]);
     assert!(a.is_live(&c_id));
 }
 
@@ -767,6 +819,7 @@ async fn a_gossip_exchange_over_the_socket_merges_and_replies() {
             C.as_bytes().to_vec(),
             0,
             MemberState::Alive,
+            false,
         )],
     };
     let learned = gossip_exchange(&addr, cid(0xEE), &plaintext_dialer_as(C), frame)

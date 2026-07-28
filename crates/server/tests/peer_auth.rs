@@ -309,6 +309,7 @@ fn a_bare_socket_cannot_gossip_membership() {
                 b"10.9.9.9:9000".to_vec(),
                 7,
                 MemberState::Alive,
+                false,
             )],
         },
     );
@@ -550,6 +551,7 @@ fn a_single_node_deployment_refuses_every_node_to_node_frame() {
                 b"10.9.9.9:9000".to_vec(),
                 7,
                 MemberState::Alive,
+                false,
             )],
         },
         Message::FollowerHeads {
@@ -684,6 +686,7 @@ fn an_admitted_peer_may_send_every_node_to_node_frame() {
                 b"10.9.9.9:9000".to_vec(),
                 7,
                 MemberState::Alive,
+                false,
             )],
         },
     ));

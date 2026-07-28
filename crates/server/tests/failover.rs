@@ -203,7 +203,7 @@ fn all_replicas_live_effective_equals_placement() {
         assert_eq!(m.is_effective_primary_for(&room), m.is_primary_for(&room));
         // Every member is live until proven down.
         for member in m.members() {
-            assert!(m.is_live(member));
+            assert!(m.is_live(&member));
         }
     }
 }
