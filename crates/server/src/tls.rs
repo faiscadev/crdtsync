@@ -14,11 +14,13 @@
 //! mTLS (client-cert authentication) is opt-in on top of that: configure a
 //! trust-anchor bundle and [`server_config_from_pem_with_client_ca`] swaps the
 //! `with_no_client_auth` slot for a [`WebPkiClientVerifier`] against those roots.
-//! The names a verified client cert carries (its SANs, falling back to its CN) are
-//! extracted with [`identities_from_client_cert`]: the leading one is bound as the
-//! connection's authenticated actor — the same ACL principal an in-band credential
-//! establishes, reached over the transport instead — and the peer plane weighs all of
-//! them against the member a node-to-node link claims to be.
+//! A verified client cert is read by two rules that are deliberately not the same.
+//! [`actor_from_client_cert`] is its subject as an ACL principal — a DNS, e-mail or
+//! URI SAN, else an IP SAN, else the Common Name — bound as the connection's
+//! authenticated actor, the same principal an in-band credential establishes, reached
+//! over the transport instead. [`host_names_from_client_cert`] is the narrower one the
+//! peer plane binds a *member* to: only the `dNSName` and `iPAddress` SANs, which are
+//! the kinds that name a host a CA vouches for reaching.
 //!
 //! [`ClientAuthMode`] selects how strict the client-cert requirement is:
 //!
@@ -188,7 +190,7 @@ pub fn server_config_from_pem(
 /// fail-closed at the handshake: a client presenting no cert, or one that does not
 /// chain to a configured root, is rejected by rustls before the connection ever
 /// reaches the wire protocol. A verified connection's peer cert is later mapped to
-/// an actor by [`identities_from_client_cert`].
+/// an actor by [`actor_from_client_cert`].
 ///
 /// An empty client-CA bundle is a loud [`NoClientCa`](TlsConfigError::NoClientCa)
 /// error, never a silent fall back to server-auth-only: a deployment that asked
@@ -452,6 +454,8 @@ pub fn actor_from_client_cert(leaf: &CertificateDer<'_>) -> Option<Vec<u8>> {
     if let Some(addr) = ip {
         return Some(addr.into_bytes());
     }
+    // Bound rather than returned directly: the iterator borrows `cert`, which does not
+    // outlive the tail expression.
     let cn = cert
         .subject()
         .iter_common_name()
@@ -492,7 +496,16 @@ pub fn host_names_from_client_cert(leaf: &CertificateDer<'_>) -> Vec<Vec<u8>> {
     if let Ok(Some(san)) = cert.subject_alternative_name() {
         for name in &san.value.general_names {
             let value = match name {
-                GeneralName::DNSName(s) if !s.is_empty() => (*s).to_string(),
+                // A DNS name that is an IP literal is not one: RFC 6125 matches an
+                // address only against an `iPAddress` SAN, and admitting it here would
+                // undo the kind filter one field over — a certificate issued for one
+                // node carrying another node's address in a field that is not an
+                // address.
+                GeneralName::DNSName(s)
+                    if !s.is_empty() && s.parse::<std::net::IpAddr>().is_err() =>
+                {
+                    (*s).to_string()
+                }
                 GeneralName::IPAddress(octets) => match ip_san(octets) {
                     Some(addr) => addr,
                     None => continue,
@@ -575,6 +588,40 @@ mod tests {
             actor_from_client_cert(&der).as_deref(),
             Some(&b"node-b.internal"[..]),
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_uri_san_names_no_host() {
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::URI("node-b.internal".try_into().unwrap())];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "node-a");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = CertificateDer::from(params.self_signed(&key).unwrap().der().to_vec());
+        assert!(host_names_from_client_cert(&der).is_empty());
+        assert_eq!(
+            actor_from_client_cert(&der).as_deref(),
+            Some(&b"node-b.internal"[..]),
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_dns_name_that_is_an_address_names_no_host() {
+        // RFC 6125 matches an address only against an `iPAddress` SAN. Admitting a
+        // `dNSName` that happens to be an IP literal would undo the kind filter one
+        // field over — a certificate for one node carrying another node's address in a
+        // field that is not an address.
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::DnsName("10.0.0.6".try_into().unwrap())];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "node-a");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = CertificateDer::from(params.self_signed(&key).unwrap().der().to_vec());
+        assert!(host_names_from_client_cert(&der).is_empty());
     }
 
     #[test]

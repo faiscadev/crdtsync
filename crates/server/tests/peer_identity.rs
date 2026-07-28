@@ -45,6 +45,7 @@ use std::sync::Arc;
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, MemberState, Message, Op, Scalar};
+use crdtsync_server::auth::Identity;
 use crdtsync_server::membership::Membership;
 use crdtsync_server::placement::NodeId;
 use crdtsync_server::{ConnId, ManualClock, Registry};
@@ -740,6 +741,57 @@ fn peer_identity_is_per_connection() {
 }
 
 #[test]
+fn a_certificate_that_names_no_host_binds_nothing_and_is_refused() {
+    // The difference between "presented no certificate" and "presented one that names
+    // no host". The first is a deployment that has issued none, and its claim stands
+    // on its own until identity is required. The second is a verified certificate
+    // that simply does not bind this member — and a certificate must never *widen*
+    // what a link may claim, so it is refused whatever the policy says.
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_follows(&m);
+    let leader = m.replicas_for(&room)[0].clone();
+    let mut r = registry();
+
+    let id = r.connect_cert_authenticated(Identity::new(b"node-a".to_vec()), Vec::new());
+    assert!(!r.deliver(
+        id,
+        Message::PeerAuth {
+            node: leader.as_bytes().to_vec(),
+            secret: SECRET.to_vec(),
+        },
+    ));
+    let retry = r.connect_cert_authenticated(Identity::new(b"node-a".to_vec()), Vec::new());
+    assert!(!r.deliver(retry, replicate(&mut doc(9), &room, 1)));
+    assert_eq!(r.hub().seq(&room), 0);
+}
+
+#[test]
+fn a_certificate_naming_the_member_binds_the_link() {
+    // The other side of the same gate, so the refusal above is not simply "any
+    // certificate refuses".
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_follows(&m);
+    let leader = m.replicas_for(&room)[0].clone();
+    let host = crdtsync_server::dial::member_host(leader.as_bytes()).unwrap();
+    let mut r = registry();
+    r.set_require_peer_identity(true);
+
+    let id = r.connect_cert_authenticated(
+        Identity::new(host.clone().into_bytes()),
+        vec![host.into_bytes()],
+    );
+    assert!(r.deliver(
+        id,
+        Message::PeerAuth {
+            node: leader.as_bytes().to_vec(),
+            secret: SECRET.to_vec(),
+        },
+    ));
+    assert!(r.deliver(id, replicate(&mut doc(9), &room, 1)));
+    assert_eq!(r.hub().seq(&room), 1);
+}
+
+#[test]
 fn an_uncertified_link_is_refused_where_identity_is_required() {
     // The declared posture. A deployment that has issued per-node certificates says
     // so, and from then on a link presenting none is not admitted at all — the claim
@@ -1377,7 +1429,10 @@ mod live {
             },
         )
         .await;
-        assert!(e.to_string().contains("names no host"), "{e}");
+        assert!(
+            e.to_string().contains("names no host, so no certificate"),
+            "{e}"
+        );
     }
 
     #[tokio::test]
@@ -1403,7 +1458,7 @@ mod live {
             },
         )
         .await;
-        assert!(e.to_string().contains("names no host matching"), "{e}");
+        assert!(e.to_string().contains("names no host binding it"), "{e}");
     }
 
     #[tokio::test]

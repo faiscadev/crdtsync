@@ -52,14 +52,15 @@ struct Conn {
     /// node-to-node handlers. Every gate downstream of admission reads *this*, never
     /// a node id a frame asserts.
     peer: Option<NodeId>,
-    /// Every *host* the verified mTLS client certificate this connection presented
-    /// names — its `dNSName` and `iPAddress` SANs, and nothing else it carries. Empty
-    /// on a plaintext or server-auth-only link, on a connection authenticated by an
-    /// in-band credential, and on a certificate that names no host at all; only a
-    /// certificate the listener's trust anchors verified lands here, so these are the
-    /// only names [`authenticate_peer`](Registry::authenticate_peer) will bind a
-    /// member to.
-    cert_hosts: Vec<Vec<u8>>,
+    /// The hosts the verified mTLS client certificate this connection presented names
+    /// — its `dNSName` and `iPAddress` SANs, and nothing else it carries. `None` is a
+    /// connection that presented no certificate at all: a plaintext or
+    /// server-auth-only link, or one authenticated by an in-band credential.
+    /// `Some(hosts)` is a certificate the listener's trust anchors verified, and those
+    /// hosts are the only names [`authenticate_peer`](Registry::authenticate_peer)
+    /// will bind a member to — `Some(vec![])` therefore binds nothing at all, which is
+    /// not the same as having presented nothing.
+    cert_hosts: Option<Vec<Vec<u8>>>,
 }
 
 /// A client write-ack withheld pending majority replication. The leader owes the
@@ -554,9 +555,10 @@ impl Registry {
     /// verified mTLS client certificate, one of the *hosts* that certificate names must
     /// bind the claim ([`cert_names_member`]) — the trust anchors the listener verifies
     /// client certificates against vouch for the binding, so no member can speak as
-    /// another. A certificate that names an actor but no host binds nothing, so it
-    /// reaches the peer plane exactly as a certless link does. On an uncertified link
-    /// the claim is taken at face value, which still binds the link to one identity but
+    /// another. A certificate that names an actor but no *host* binds nothing and the
+    /// link is refused: a presented certificate decides, and one that named nothing
+    /// relevant must never widen what a link may claim. On an uncertified link the
+    /// claim is taken at face value, which still binds the link to one identity but
     /// vouches for none; a deployment that will not have that sets
     /// [`set_require_peer_identity`](Self::set_require_peer_identity) and every
     /// uncertified link is refused.
@@ -589,17 +591,23 @@ impl Registry {
         if conn.peer.is_some() {
             return false;
         }
-        match conn.cert_hosts.as_slice() {
-            [] if self.require_peer_identity => return false,
-            [] => {}
-            hosts => {
+        match conn.cert_hosts.as_deref() {
+            // No certificate at all. The claim stands on its own, which is what a
+            // deployment that has not issued per-node certificates has; one that has
+            // says so and this is refused.
+            None if self.require_peer_identity => return false,
+            None => {}
+            // A certificate *was* presented and verified, so it decides — including
+            // when it names no host, which binds nothing. Treating that as certless
+            // would make a certificate widen what a link may claim.
+            Some(hosts)
                 if !hosts
                     .iter()
-                    .any(|host| crate::dial::cert_names_member(host, claimed))
-                {
-                    return false;
-                }
+                    .any(|host| crate::dial::cert_names_member(host, claimed)) =>
+            {
+                return false
             }
+            Some(_) => {}
         }
         conn.peer = Some(NodeId::from(claimed.to_vec()));
         true
@@ -1098,7 +1106,7 @@ impl Registry {
     ) -> ConnId {
         let id = self.connect_authenticated(identity);
         if let Some(conn) = self.conns.get_mut(&id) {
-            conn.cert_hosts = hosts;
+            conn.cert_hosts = Some(hosts);
         }
         id
     }
@@ -1112,7 +1120,7 @@ impl Registry {
                 session,
                 outbox: Vec::new(),
                 peer: None,
-                cert_hosts: Vec::new(),
+                cert_hosts: None,
             },
         );
         self.hub.emit(EngineEvent::Connected { conn: id });

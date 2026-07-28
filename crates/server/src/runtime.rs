@@ -889,9 +889,9 @@ fn peer_identity_policy(config: &ServeConfig) -> std::io::Result<()> {
         .any(|host| crate::dial::cert_names_member(host, self_addr))
     {
         return Err(invalid(&format!(
-            "this node's peer certificate names no host matching its own advertise address `{}`, \
-             so every peer running the same policy refuses it: issue a certificate whose SAN is \
-             this node's advertise host",
+            "this node's peer certificate names no host binding it to the node id it dials \
+             under, `{}`, so every peer running the same policy refuses it: issue a certificate \
+             whose dNSName or iPAddress SAN is that id's host",
             String::from_utf8_lossy(self_addr),
         )));
     }
