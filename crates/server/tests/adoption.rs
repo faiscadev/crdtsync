@@ -134,9 +134,10 @@ fn introduces(node: &NodeId, verified: bool) -> Message {
     }
 }
 
-/// The wire tuples introducing each of `nodes` at its own address, unverified — the
-/// payload the *reply* half of a gossip round hands over, which introduces freely.
-fn advertisements(nodes: &[&NodeId]) -> Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)> {
+/// The wire tuples introducing each of `nodes` at its own address, carrying the
+/// sender's `verified` claim about each — the payload the *reply* half of a gossip
+/// round hands over, which introduces freely.
+fn advertisements(nodes: &[&NodeId], verified: bool) -> Vec<crdtsync_core::MemberAdvert> {
     nodes
         .iter()
         .map(|node| {
@@ -145,10 +146,19 @@ fn advertisements(nodes: &[&NodeId]) -> Vec<(Vec<u8>, Vec<u8>, u64, MemberState,
                 node.as_bytes().to_vec(),
                 0,
                 MemberState::Alive,
-                false,
+                verified,
             )
         })
         .collect()
+}
+
+/// Have the cluster verify `node` to the bar, as `ADOPTION_VERIFIERS` members each
+/// reporting their own completed link to it would.
+fn cluster_verifies(r: &mut Registry, node: &NodeId) {
+    for i in 0..ADOPTION_VERIFIERS {
+        let voucher = NodeId::from(format!("10.0.0.{i}:9000"));
+        r.merge_gossip(&voucher, advertisements(&[node], true));
+    }
 }
 
 /// A room this node is the placement primary of — the room an attack from outside
@@ -306,6 +316,16 @@ fn a_member_that_mints_a_node_id_does_not_enter_a_rooms_replica_set() {
         view.replicas_for(&room),
         m.replicas_for(&room),
         "and the room's replica set is the one it always was",
+    );
+
+    // The grind was real, and pending is the whole of what kept it out: verified to the
+    // bar by the cluster, that same id takes its place on that same room.
+    cluster_verifies(&mut r, &minted);
+    let view = r.membership().expect("clustered");
+    assert!(view.is_adopted(&minted));
+    assert!(
+        view.replicas_for(&room).contains(&minted),
+        "the id was one placement puts on the room",
     );
 }
 
@@ -779,7 +799,7 @@ fn a_plaintext_dial_does_not_verify_where_an_identified_peer_is_required() {
     let tls = NodeId::from("wss://10.9.9.8:9000");
     r.merge_gossip(
         &NodeId::from("10.0.0.1:9000"),
-        advertisements(&[&plain, &tls]),
+        advertisements(&[&plain, &tls], false),
     );
 
     r.note_peer_verified(&plain);
@@ -804,7 +824,10 @@ fn a_plaintext_dial_still_verifies_where_no_identity_is_required() {
     // saying an id exists.
     let mut r = registry();
     let plain = NodeId::from("10.9.9.9:9000");
-    r.merge_gossip(&NodeId::from("10.0.0.1:9000"), advertisements(&[&plain]));
+    r.merge_gossip(
+        &NodeId::from("10.0.0.1:9000"),
+        advertisements(&[&plain], false),
+    );
     r.note_peer_verified(&plain);
     assert!(verified_by(r.membership().expect("clustered"), &plain));
 }
