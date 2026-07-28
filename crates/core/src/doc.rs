@@ -3495,13 +3495,26 @@ impl Document {
         };
         // One placement per `(list, stamp)`, for the reason `insert_xml_child` gives.
         // Here the colliding op need not name the same node — a move takes its node
-        // from the payload, so two moves at one stamp into one list name two
-        // unrelated ones — so the whole move is refused rather than only its
-        // placement. Applying it to the move-set while storing no placement would
-        // put the node's parent at the destination with nowhere to render, and
-        // `refold_moves` would suppress every placement it has: the node would
-        // vanish. Which of the two lands is still arrival-order dependent, and that
-        // residual is filed as C24; what this keeps is that neither disappears.
+        // from the payload — so the whole move is refused rather than only its
+        // placement, and refusing is what keeps two separate things from breaking.
+        //
+        // A node vanishing: the collision that matters is a **birth** holding
+        // `(list, stamp)` and a *move* arriving at that same stamp into that list.
+        // The move log has nothing at that stamp (a birth writes none), so
+        // `moves.apply` records, the node's effective parent becomes this list, and
+        // it holds no placement here — `refold_moves` then finds no live placement
+        // and suppresses every placement it has anywhere. (Two *moves* at one stamp
+        // never reached that: `TreeMoves::apply` dedups on the exact stamp, so the
+        // second was already inert.)
+        //
+        // A revealed shell stranding: the old path ran `revealed_pending.remove`
+        // while storing no placement, leaving the node with neither — and both
+        // `ready` and this function gate a move on holding one or the other, so
+        // every later move of that node was refused forever. Returning before that
+        // keeps the shell pending and movable.
+        //
+        // Which of the two lands is still arrival-order dependent; that residual is
+        // filed as C24.
         if !self.placement_index.insert((dest_list, stamp)) {
             return;
         }
@@ -3884,6 +3897,9 @@ impl Document {
             self.commit_atomic()
         } else {
             self.history.close(false);
+            // The replayed intention ends here, so the latch ends with it — the same
+            // rule the other three `history.close` sites follow.
+            self.mint_refused = false;
             ops
         };
         self.history.end_replay(saved);

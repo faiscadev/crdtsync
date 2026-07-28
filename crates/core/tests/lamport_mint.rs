@@ -283,7 +283,7 @@ fn two_ops_at_one_stamp_into_one_list_still_leave_a_loadable_snapshot() {
     let victim = cid(1);
     for tagged in [true, false] {
         let mut doc = Document::new(victim);
-        let mut batch = doc.transact(|tx| {
+        let batch = doc.transact(|tx| {
             tx.xml_fragment(b"f").children().insert_element(0, b"a");
         });
         let insert = batch
@@ -301,8 +301,23 @@ fn two_ops_at_one_stamp_into_one_list_still_leave_a_loadable_snapshot() {
             twin.stamp, batch[insert].stamp,
             "the twin carries one stamp"
         );
-        doc.apply(&twin);
-        let _ = &mut batch;
+        assert!(
+            doc.apply(&twin),
+            "the twin was refused, so nothing is being pinned (tagged={tagged})"
+        );
+
+        // A placement is only *stored* for a node with more than one, or a
+        // tombstoned one — so tombstoning every child is what makes both colliding
+        // placements reach the encoding. Without that the tagless half writes no
+        // placement at all and passes with the guard deleted: its two ops derive
+        // different child ids, so each node holds a single live placement.
+        doc.transact(|tx| {
+            let mut frag = tx.xml_fragment(b"f");
+            let mut children = frag.children();
+            while !children.is_empty() {
+                children.delete(0);
+            }
+        });
 
         Document::decode_state(&doc.encode_state()).unwrap_or_else(|e| {
             panic!("a replica could not load its own snapshot (tagged={tagged}): {e:?}")
