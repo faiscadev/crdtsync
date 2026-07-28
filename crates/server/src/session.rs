@@ -785,6 +785,21 @@ pub fn step(
                         ),
                     }
                 }
+                // The branch owns a base this node cannot decode, so there is no
+                // state and no delta over it. Say so and leave the subscriber
+                // uncaught-up: an empty delta would tell it it is at the head of a
+                // stream it holds none of, and it would then edit from an empty
+                // document.
+                Catchup::Unavailable => {
+                    return Response {
+                        replies: vec![Message::Error {
+                            code: ErrorCode::Internal,
+                            message: "branch state is unreadable".to_string(),
+                            details: Vec::new(),
+                        }],
+                        ..Response::default()
+                    }
+                }
             };
             // After the catch-up, replay the room's current presence so the
             // joiner sees who is already here without waiting for a republish.
@@ -1320,7 +1335,12 @@ fn handle_ops(
     // branch/zone interaction.
     if branch == MAIN_BRANCH {
         if let Some(schema) = schema {
-            let crossings = hub.batch_zone_crossings(&room, &ops, schema);
+            // A room whose state cannot be simulated yields no verdict, and the
+            // gate is a reject boundary: refuse the batch rather than read the
+            // missing verdict as "crosses nothing".
+            let Some(crossings) = hub.batch_zone_crossings(&room, &ops, schema) else {
+                return ops_rejected(channel, &ops, ErrorCode::Internal);
+            };
             if !crossings.is_empty()
                 && !cross_zone_move_authorized(
                     hub,

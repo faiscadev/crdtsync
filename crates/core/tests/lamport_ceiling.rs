@@ -8,34 +8,44 @@
 //! guessing and no forged authorship — overflowed the very next ordinary local
 //! edit: a panic in debug, a wrap to 0 in release.
 //!
-//! The bound lives in the **clock merge**, not in the codec and not in an
-//! acceptance gate:
+//! **Two different questions, two constants.** What a folded op may do to a
+//! *clock* is bounded by [`LAMPORT_WIRE_CEILING`]; where a *stamp* may sit at all
+//! is bounded by [`LAMPORT_STATE_CEILING`]. Both are constants, so each is a pure
+//! function of the input and every replica decides identically — clocks stay
+//! convergent, which a relative bound (`clock + k`) could not promise.
 //!
-//! * The op is still applied. Refusing it would be a *liveness* choice that buys
-//!   nothing: a peer that wants to dominate LWW simply sits one below whatever
-//!   the gate is, so no bound removes that, while a gate at the same value the
-//!   mint tops out at lets one admissible op park a replica's clock exactly
-//!   where its next mint would be refused by everyone else — divergence traded
-//!   for a panic.
-//! * What a folded op may do to the clock *is* bounded: the fold clamps at
-//!   [`LAMPORT_WIRE_CEILING`], and a snapshot declaring a clock above
-//!   [`LAMPORT_STATE_CEILING`] is refused outright. Both are constants, so each
-//!   is a pure function of the input and every replica decides identically —
-//!   clocks stay convergent, which a relative bound (`clock + k`) could not
-//!   promise. The state bound refuses rather than clamps because a stored clock
-//!   is a high-water over ids already published, and lowering one re-issues them.
-//! * Neither clamp sits at `u64::MAX`, and that is the whole point. Saturating
-//!   the clock at the top of the space is what makes a pinned clock re-mint one
-//!   stamp forever — and a sequence node's id *is* its stamp, so that is C4's
-//!   collision reached from the other side. Clamping *below* the top leaves the
-//!   reserved headroom that keeps `clock + 1` both in range and strictly above
-//!   every stamp this replica has minted.
+//! * **The clock bound is a clamp, and the op is still applied.** Refusing an op
+//!   for where it puts a clock buys nothing: a peer that wants to dominate LWW
+//!   simply sits one below whatever the gate is, while a gate at the value the
+//!   mint tops out at lets one admissible op park a replica's clock exactly where
+//!   its next mint would be refused by everyone else — divergence traded for a
+//!   panic. So a stamp anywhere in `(LAMPORT_WIRE_CEILING, LAMPORT_STATE_CEILING]`
+//!   is folded, with the clock clamped under it, and the gap between the two
+//!   constants is the runway a clock-parked replica keeps minting into.
+//! * **The id-space bound is a refusal, and it is where a stamp may exist.** A
+//!   replica stores the highest lamport each client's stamps reach, so a stamp is
+//!   an id and the record of it has to stay inside what a decode admits; clamping
+//!   the record instead hands live ids back to the mint. So a stamp whose
+//!   *reservation* reaches past [`LAMPORT_STATE_CEILING`] names no id and is
+//!   refused — on the wire, on the decode path, and at the local mint alike. One
+//!   constant for all three is what keeps it convergent rather than divergent: a
+//!   replica emits exactly the set its peers admit, so an honest mint is never
+//!   refused by the network. That is a deliberate departure from applying every
+//!   op regardless, and it is bounded to the region no honest replica reaches.
+//! * **Exhaustion is a refused edit**, never a panic, a wrap, or a re-issued id.
+//!   A snapshot may legally declare a clock at the very ceiling, and a replica
+//!   that adopts one has no id left to mint: [`Document::can_mint`] answers false
+//!   and the edit emits nothing.
+//! * Neither bound sits at `u64::MAX`, and that is the whole point. Saturating at
+//!   the top of the space is what makes a pinned clock re-mint one stamp forever —
+//!   and a sequence node's id *is* its stamp, so that is C4's collision reached
+//!   from the other side.
 //!
-//! The reservation, not just the base, is what is clamped: a text run takes one
-//! lamport per codepoint, so bounding `stamp.lamport` alone would let a long run
-//! carry the clock past the ceiling anyway — a point check on a range problem.
-//! And the clamp is per-partition, so a zone clock is bounded by the same
-//! constant as the root's, through the same fold.
+//! The reservation, not just the base, is what both bounds read: a text run takes
+//! one lamport per codepoint, so bounding `stamp.lamport` alone would let a long
+//! run carry the clock past the ceiling anyway — a point check on a range problem.
+//! And the clamp is per-partition, so a zone clock is bounded by the same constant
+//! as the root's, through the same fold.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::Op;
@@ -89,8 +99,8 @@ fn next_zone_lamport(doc: &mut Document) -> u64 {
     .lamport
 }
 
-/// A hostile batch writing into zone 0, every op re-stamped at the top of the
-/// space — the zoned counterpart of [`op_at_lamport`].
+/// A hostile batch writing into zone 0, every op re-stamped at the highest
+/// position a stamp may occupy — the zoned counterpart of [`op_at_lamport`].
 fn zoned_ceiling_ops(client: ClientId, key: &[u8]) -> Vec<Op> {
     let mut peer = Document::new(client);
     peer.set_schema(schema_with_zone());
@@ -99,7 +109,7 @@ fn zoned_ceiling_ops(client: ClientId, key: &[u8]) -> Vec<Op> {
     });
     for op in ops.iter_mut() {
         assert_eq!(op.zone, Some(0), "the whole batch belongs to the zone");
-        op.stamp.lamport = u64::MAX;
+        op.stamp.lamport = LAMPORT_STATE_CEILING;
     }
     ops
 }
@@ -182,10 +192,11 @@ fn schema_with_zone() -> Schema {
 
 #[test]
 fn a_peer_op_at_the_top_of_the_space_does_not_overflow_the_next_local_edit() {
+    // The reported primitive, reached from the highest position an op may still
+    // occupy. Debug builds panicked on `clock + 1`; release wrapped to 0.
     let mut doc = Document::new(cid(1));
-    assert!(doc.apply(&op_at_lamport(cid(2), b"k", u64::MAX)));
+    assert!(doc.apply(&op_at_lamport(cid(2), b"k", LAMPORT_STATE_CEILING)));
 
-    // Debug builds panicked here on `clock + 1`; release wrapped to 0.
     let lamport = next_root_lamport(&mut doc);
     assert_eq!(lamport, LAMPORT_WIRE_CEILING + 1);
 }
@@ -193,8 +204,21 @@ fn a_peer_op_at_the_top_of_the_space_does_not_overflow_the_next_local_edit() {
 #[test]
 fn a_peer_op_at_the_top_of_the_space_does_not_wrap_the_next_local_edit() {
     let mut doc = Document::new(cid(1));
-    doc.apply(&op_at_lamport(cid(2), b"k", u64::MAX));
+    doc.apply(&op_at_lamport(cid(2), b"k", LAMPORT_STATE_CEILING));
     assert_ne!(next_root_lamport(&mut doc), 0);
+}
+
+#[test]
+fn an_op_stamped_past_the_id_space_is_refused_and_moves_nothing() {
+    // Past the end of the id space there is nothing to record: the replica stores
+    // the highest lamport each client's stamps reach, and a record above the
+    // ceiling is one its own decoder would refuse. So the op is refused rather
+    // than folded-and-clamped — the one place the fold's apply-anyway rule stops.
+    let mut doc = Document::new(cid(1));
+    assert!(!doc.apply(&op_at_lamport(cid(2), b"k", u64::MAX)));
+    assert!(doc.get(b"k").is_none(), "nothing of it landed");
+    assert_eq!(doc.zone_clock(None), 0, "it moved no clock either");
+    assert_eq!(next_root_lamport(&mut doc), 1, "the mint is untouched");
 }
 
 #[test]
@@ -272,11 +296,34 @@ fn a_text_run_based_below_the_ceiling_cannot_carry_the_clock_over_it() {
 
 #[test]
 fn a_text_run_at_the_top_of_the_space_does_not_overflow_the_next_local_edit() {
+    // Based so the tenth codepoint lands exactly on the ceiling — the furthest a
+    // run can reach and still name ten ids that exist.
     let mut doc = Document::new(cid(1));
-    for op in &text_run_at_lamport(cid(2), b"t", "abcdefghij", u64::MAX - 4) {
-        doc.apply(op);
+    for op in &text_run_at_lamport(cid(2), b"t", "abcdefghij", LAMPORT_STATE_CEILING - 9) {
+        assert!(doc.apply(op));
     }
     assert_eq!(next_root_lamport(&mut doc), LAMPORT_WIRE_CEILING + 1);
+}
+
+#[test]
+fn a_text_run_reaching_past_the_id_space_is_refused_though_its_base_fits() {
+    // The gate reads the reservation, not the base — the same range-versus-point
+    // distinction the clock clamp reads it on. A base one inside the ceiling with
+    // ten codepoints names nine ids that do not exist, so the run is refused whole
+    // rather than saturated onto the last one.
+    let mut doc = Document::new(cid(1));
+    let ops = text_run_at_lamport(cid(2), b"t", "abcdefghij", LAMPORT_STATE_CEILING - 8);
+    for op in &ops {
+        if matches!(op.kind, OpKind::TextInsert { .. }) {
+            assert!(!doc.apply(op), "a run past the end of the space is refused");
+        } else {
+            assert!(doc.apply(op));
+        }
+    }
+    let Some(Element::Text(t)) = doc.get(b"t") else {
+        panic!("the create still landed");
+    };
+    assert_eq!(t.borrow().len(), 0, "no codepoint of the run landed");
 }
 
 #[test]
@@ -313,12 +360,25 @@ fn a_large_but_legitimate_lamport_is_folded_unclamped() {
 
 #[test]
 fn an_over_ceiling_op_is_still_applied() {
-    let mut doc = Document::new(cid(1));
-    let op = op_at_lamport(cid(2), b"k", u64::MAX);
-    assert!(doc.apply(&op), "the op is folded, not refused");
-    assert!(matches!(doc.get(b"k"), Some(Element::Scalar(_))));
-    // And it is deduped like any other op.
-    assert!(!doc.apply(&op));
+    // Every position between the two constants keeps the original rule: the clock
+    // is clamped, the op itself is folded. This is the range the gate deliberately
+    // does not reach into, and it is where a peer that wants to dominate LWW sits.
+    for lamport in [
+        LAMPORT_WIRE_CEILING + 1,
+        LAMPORT_WIRE_CEILING + (1 << 40),
+        LAMPORT_STATE_CEILING,
+    ] {
+        let mut doc = Document::new(cid(1));
+        let op = op_at_lamport(cid(2), b"k", lamport);
+        assert!(
+            doc.apply(&op),
+            "the op is folded, not refused, at {lamport}"
+        );
+        assert!(matches!(doc.get(b"k"), Some(Element::Scalar(_))));
+        assert_eq!(doc.zone_clock(None), LAMPORT_WIRE_CEILING, "clamped");
+        // And it is deduped like any other op.
+        assert!(!doc.apply(&op));
+    }
 }
 
 #[test]
@@ -328,7 +388,7 @@ fn the_clamp_does_not_lower_a_clock_a_replica_already_reached() {
     // A local mint climbs past the wire ceiling; a later over-ceiling op must
     // not drag the clock back down onto ids this replica already minted.
     let mine = next_root_lamport(&mut doc);
-    doc.apply(&op_at_lamport(cid(3), b"j", u64::MAX));
+    assert!(doc.apply(&op_at_lamport(cid(3), b"j", LAMPORT_STATE_CEILING)));
     assert!(next_root_lamport(&mut doc) > mine);
 }
 
@@ -358,14 +418,15 @@ fn an_op_whose_stamp_names_another_client_is_refused() {
 }
 
 #[test]
-fn a_forged_stamp_cannot_take_ids_out_of_a_victims_space_above_the_clamp() {
-    // Without the authorship check this is a two-op divergence primitive, and the
-    // wire clamp is what arms it: below the ceiling, folding the forged op drags
-    // every clock past the ids it planted, so the victim's next mint clears them.
-    // Above the ceiling the clock stops moving, and a stamp forged in the
-    // victim's space would sit exactly where the victim mints next — its edits
-    // then land on ids the sequence already holds and are dropped as replays, on
-    // the victim and on every peer that folded the forged op.
+fn a_stamp_forged_under_a_different_author_is_refused_before_it_plants_anything() {
+    // The **mismatched-author** shape only, and that is the whole reach of the
+    // authorship check: both fields are attacker-supplied, so an attacker that
+    // authors the batch under the victim's own `ClientId` sets them equal and the
+    // check admits it. What actually keeps the victim's next mint off planted ids
+    // is the id-space high-water — see `lamport_mint.rs`, which models that
+    // attacker. This case is worth refusing anyway: it is malformed, no honest op
+    // is anywhere near it, and refusing raises the bar to impersonating a
+    // `ClientId` rather than merely naming one.
     let victim = cid(1);
     let attacker = cid(9);
 
@@ -407,7 +468,16 @@ fn a_snapshot_declaring_a_root_clock_above_the_ceiling_is_refused() {
     // ceiling is still a legal declaration.
     let at = with_root_clock(src.encode_state(), LAMPORT_STATE_CEILING);
     let mut doc = Document::decode_state(&at).expect("a decodable snapshot");
-    assert_eq!(next_root_lamport(&mut doc), LAMPORT_STATE_CEILING + 1);
+    // Decodable, and spent: the declaration names the top of the id space, so
+    // there is no position left to mint. The edit is refused whole rather than
+    // stepping over the bound the same decoder enforces.
+    assert!(!doc.can_mint(None), "a clock at the ceiling leaves no id");
+    assert!(
+        doc.transact(|tx| tx.set(b"probe", Scalar::Int(1)))
+            .is_empty(),
+        "an exhausted replica emits nothing"
+    );
+    assert!(Document::decode_state(&doc.encode_state()).is_ok());
 }
 
 #[test]
@@ -423,7 +493,29 @@ fn a_snapshot_declaring_a_zone_clock_above_the_ceiling_is_refused() {
     let at = with_only_zone_clock(src.encode_state(), LAMPORT_STATE_CEILING);
     let mut doc = Document::decode_state(&at).expect("a decodable snapshot");
     doc.set_schema(schema_with_zone());
-    assert_eq!(next_zone_lamport(&mut doc), LAMPORT_STATE_CEILING + 1);
+    // The *capacity* is per-partition, exactly as the clock is: zone 0 is spent and
+    // the root is not.
+    assert!(!doc.can_mint(Some(0)));
+    assert!(doc.can_mint(None));
+
+    // The *refusal* is not. A zoned edit is refused, and because the latch is
+    // document-global it takes the rest of that transaction with it — the batch is
+    // empty, not merely free of zoned ops.
+    let zoned = doc.transact(|tx| {
+        tx.map(b"board").set(b"probe", Scalar::Int(1));
+        tx.set(b"root_probe", Scalar::Int(1));
+    });
+    assert!(
+        zoned.is_empty(),
+        "a refused zoned edit let the rest of its transaction through: {zoned:?}"
+    );
+    assert!(doc.get(b"root_probe").is_none());
+
+    // The next transaction starts clean, so the root partition's room is real and
+    // the latch did not outlive the intention that set it.
+    let root = doc.transact(|tx| tx.set(b"root_probe", Scalar::Int(1)));
+    assert_eq!(root.len(), 1, "the root partition had no room after all");
+    assert_eq!(root[0].zone, None);
 }
 
 #[test]
@@ -433,7 +525,7 @@ fn an_honest_replicas_snapshot_round_trips_its_clock_untouched() {
     // and then minted past it, which is the case a clamp on decode would break
     // by re-issuing ids the author already published.
     let mut src = Document::new(cid(1));
-    src.apply(&op_at_lamport(cid(2), b"k", u64::MAX));
+    assert!(src.apply(&op_at_lamport(cid(2), b"k", LAMPORT_STATE_CEILING)));
     let minted = next_root_lamport(&mut src);
     assert!(minted > LAMPORT_WIRE_CEILING);
 
@@ -563,12 +655,12 @@ fn an_op_a_replica_minted_above_the_clamp_is_still_folded_by_its_peers() {
     // a gate would refuse that mint on every peer. The room would then diverge
     // on honest traffic, which is strictly worse than the panic being fixed.
     let mut a = Document::new(cid(1));
-    a.apply(&op_at_lamport(cid(9), b"k", u64::MAX));
+    assert!(a.apply(&op_at_lamport(cid(9), b"k", LAMPORT_STATE_CEILING)));
     let ops = a.transact(|tx| tx.set(b"a", Scalar::Int(1)));
     assert!(ops[0].stamp.lamport > LAMPORT_WIRE_CEILING);
 
     let mut b = Document::new(cid(2));
-    b.apply(&op_at_lamport(cid(9), b"k", u64::MAX));
+    assert!(b.apply(&op_at_lamport(cid(9), b"k", LAMPORT_STATE_CEILING)));
     for op in &ops {
         assert!(b.apply(op), "a peer refused an honestly minted op");
     }
@@ -577,22 +669,31 @@ fn an_op_a_replica_minted_above_the_clamp_is_still_folded_by_its_peers() {
 
 #[test]
 fn no_wire_input_can_put_a_clock_above_the_state_ceiling() {
-    // The wire clamp and the state refusal are the only writers a remote input
-    // reaches, so the space above the state ceiling is entered by local minting
-    // alone — one step per real local edit. That is what makes the emit site's
-    // arithmetic total: reaching the end from there takes 2^63 mints in one
-    // partition, and the replica states it as an invariant rather than handling
-    // it, because every other answer at that point re-issues a stamp.
+    // The wire clamp, the decode refusal and the mint bound are the only writers
+    // of a clock, and all three stop at or below the state ceiling — so nothing
+    // any input can do puts a clock above it. That is what makes the emit site's
+    // arithmetic total: every position it reads is in range, and the one position
+    // past the end is refused rather than handled, because every other answer
+    // there re-issues a stamp.
     let mut src = Document::new(cid(2));
     src.transact(|tx| tx.set(b"k", Scalar::Int(1)));
     let bytes = with_root_clock(src.encode_state(), LAMPORT_STATE_CEILING);
 
     let mut doc = Document::decode_state(&bytes).expect("a decodable snapshot");
-    doc.apply(&op_at_lamport(cid(3), b"j", u64::MAX));
+    assert!(!doc.apply(&op_at_lamport(cid(3), b"j", u64::MAX)));
     for op in &text_run_at_lamport(cid(4), b"t", "abcdefghij", u64::MAX - 4) {
         doc.apply(op);
     }
-    assert_eq!(next_root_lamport(&mut doc), LAMPORT_STATE_CEILING + 1);
+    assert_eq!(doc.zone_clock(None), LAMPORT_STATE_CEILING);
+    assert!(!doc.can_mint(None));
+    assert!(doc
+        .transact(|tx| tx.set(b"probe", Scalar::Int(1)))
+        .is_empty());
+    assert_eq!(
+        doc.zone_clock(None),
+        LAMPORT_STATE_CEILING,
+        "a refused mint moved the clock"
+    );
 }
 
 #[test]
@@ -603,31 +704,22 @@ fn a_save_and_reload_never_lowers_a_replicas_clock() {
     // sequence drops a re-issued id as a replay — the write is lost on the author
     // and on every peer, silently. So a reload either carries the clock forward or
     // refuses the snapshot; it never comes back lower.
-    for start in [
-        0,
-        1 << 20,
-        LAMPORT_WIRE_CEILING,
-        LAMPORT_STATE_CEILING - 4,
-        LAMPORT_STATE_CEILING,
-    ] {
+    // Every start that still leaves the five ids the two edits below reserve: the
+    // create, the two codepoints of "AB", the idempotent re-create a second
+    // `tx.text` emits, and "C". Where the space runs out first, the boundary is
+    // its own case — `a_reload_at_the_top_of_the_space_refuses_rather_than_re_issuing`.
+    for start in [0, 1 << 20, LAMPORT_WIRE_CEILING, LAMPORT_STATE_CEILING - 5] {
         let seed = with_root_clock(Document::new(cid(1)).encode_state(), start);
         let mut doc = Document::decode_state_as(cid(1), 0, &seed).expect("decodes");
         doc.transact(|tx| tx.text(b"t").insert(0, "AB"));
         let live = text_ids(&doc, b"t", 2);
 
-        let reloaded = Document::decode_state(&doc.encode_state());
-        let Ok(mut back) = reloaded else {
-            // Refusing is the honest answer for a clock only a crafted snapshot
-            // could have declared — loud, and a snapshot that will not load
-            // cannot re-issue what it holds. It must not be the answer for a
-            // clock a replica could reach on its own: the runway between the two
-            // ceilings is exactly what keeps this branch off those.
-            assert!(
-                start > LAMPORT_WIRE_CEILING,
-                "an honest replica could not reload its own snapshot at {start}"
-            );
-            continue;
-        };
+        // Every start a snapshot may legally declare — the ceiling included —
+        // reloads. `encode_state` never emits a clock its own decoder refuses, so
+        // no iteration here is excused: excusing one is what hid the edit that
+        // stepped the stored clock over the bound.
+        let mut back = Document::decode_state(&doc.encode_state())
+            .unwrap_or_else(|e| panic!("no reload of a replica's own snapshot at {start}: {e:?}"));
         back.transact(|tx| tx.text(b"t").insert(2, "C"));
         assert_eq!(
             text_of(&back, b"t"),
@@ -640,5 +732,72 @@ fn a_save_and_reload_never_lowers_a_replicas_clock() {
             !live.contains(&after[2]),
             "re-issued a live stamp at {start}"
         );
+    }
+}
+
+#[test]
+fn a_reload_at_the_top_of_the_space_refuses_rather_than_re_issuing() {
+    // Past the last id, the sweep above has no honest answer left, and the whole
+    // point of the bound is which answer is taken there. A clamp would hand the
+    // replica a stamp it already published; walking past the ceiling would leave a
+    // snapshot its own decoder refuses. So the edit is refused: nothing is emitted,
+    // no live id is re-issued, the clock is not lowered, and the snapshot still
+    // reloads.
+    for start in [LAMPORT_STATE_CEILING - 4, LAMPORT_STATE_CEILING] {
+        let seed = with_root_clock(Document::new(cid(1)).encode_state(), start);
+        let mut doc = Document::decode_state_as(cid(1), 0, &seed).expect("decodes");
+        doc.transact(|tx| tx.text(b"t").insert(0, "AB"));
+        let live: Vec<Stamp> = match doc.get(b"t") {
+            Some(Element::Text(t)) => {
+                let t = t.borrow();
+                t.node_ids(0, t.len())
+            }
+            _ => Vec::new(),
+        };
+        let clock = doc.zone_clock(None);
+
+        let bytes = doc.encode_state();
+        let mut back = Document::decode_state(&bytes)
+            .unwrap_or_else(|e| panic!("no reload of a replica's own snapshot at {start}: {e:?}"));
+        assert!(
+            back.zone_clock(None) >= clock,
+            "the reload lowered the clock at {start}"
+        );
+
+        let emitted = back.transact(|tx| tx.text(b"t").insert(live.len(), "C"));
+        let after: Vec<Stamp> = match back.get(b"t") {
+            Some(Element::Text(t)) => {
+                let t = t.borrow();
+                t.node_ids(0, t.len())
+            }
+            _ => Vec::new(),
+        };
+        for stamp in &after {
+            assert_eq!(
+                after.iter().filter(|s| *s == stamp).count(),
+                1,
+                "re-issued a live stamp at {start}"
+            );
+        }
+        assert!(
+            after.len() >= live.len(),
+            "the refusal dropped a codepoint at {start}"
+        );
+        // Whatever was emitted stayed inside the space every peer admits.
+        for op in &emitted {
+            assert!(
+                op.stamp.lamport <= LAMPORT_STATE_CEILING,
+                "minted past the id space at {start}"
+            );
+        }
+        // The write lands exactly when the space allowed it — `can_mint` cannot be
+        // used as the oracle here, since it folds in the refusal latch this very
+        // transaction may have just set.
+        assert_eq!(
+            after.len() > live.len(),
+            start <= LAMPORT_STATE_CEILING - 5,
+            "the space ran out at a different start than {start}"
+        );
+        Document::decode_state(&back.encode_state()).expect("still reloads");
     }
 }

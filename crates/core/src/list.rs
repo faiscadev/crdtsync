@@ -295,6 +295,10 @@ impl List {
         let live_count = cur.u32()?;
         for _ in 0..live_count {
             let node_id = cur.stamp()?;
+            // A live node's id is an id the replica holds, so it floors the id-space
+            // record ([`Cursor::note_stamp_reach`]). The anchor read below is a
+            // *reference* to an id and deliberately does not.
+            cur.note_stamp_reach(node_id.client, node_id.lamport);
             let value = match cur.u8()? {
                 // ElementKind::Scalar tag: an inline scalar.
                 0 => Element::Scalar(cur.scalar()?),
@@ -370,6 +374,12 @@ impl List {
                     tag: 0,
                 });
             }
+            // The run holds every id from its head to `last`, but only the head is a
+            // stamp on the wire — so the tail is reported explicitly, or a snapshot
+            // could under-declare its id-space record by the length of its own
+            // tombstones. Deleting a planted run is what makes that the mainline
+            // path rather than a corner.
+            cur.note_stamp_reach(start.client, last);
             list.add_dead(start, length, anchor.parent, anchor.side);
         }
 

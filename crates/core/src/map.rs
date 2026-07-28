@@ -274,11 +274,19 @@ impl Map {
         for _ in 0..count {
             let key = cur.bytes()?;
             let stamp = cur.stamp()?;
+            // A slot's stamp is the id of the op that wrote it — one this replica
+            // holds, and one LWW resolves strictly-greater against, so a re-issue
+            // loses silently. It floors the id-space record
+            // ([`Cursor::note_stamp_reach`]).
+            cur.note_stamp_reach(stamp.client, stamp.lamport);
             let (tombstone, deleted) = match cur.u8()? {
                 SLOT_LIVE => (false, None),
                 SLOT_LEAF_TOMB => (true, None),
                 SLOT_CONTAINER_TOMB => {
                     let stamp = cur.stamp()?;
+                    // The create-stamp a deleted container retains — the id a
+                    // migration resurrect keys on.
+                    cur.note_stamp_reach(stamp.client, stamp.lamport);
                     let kind = match ElementKind::from_tag(cur.u8()?) {
                         Some(k @ (ElementKind::Map | ElementKind::List | ElementKind::Text)) => k,
                         _ => {

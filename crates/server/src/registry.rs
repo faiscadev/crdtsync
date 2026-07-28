@@ -510,6 +510,11 @@ impl Registry {
                 state,
                 epoch: self.claim_and_persist_epoch(room),
             }),
+            // `catch_up` reads main's log, never a branch base, so it has no
+            // unservable answer. Dialling nothing is the fail-closed reading anyway:
+            // a follower stays behind rather than being handed a frame built over a
+            // stream this node could not read.
+            Catchup::Unavailable => None,
         }
     }
 

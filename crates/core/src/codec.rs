@@ -14,7 +14,8 @@ use crate::list::{Anchor, Side};
 use crate::op::{Op, OpId, OpKind, Tx, TxId, MAX_TX_MEMBERS};
 use crate::ranged::{is_composite_payload_kind, RangeAnchor, RangedInit};
 use crate::scalar::{BlobRef, Scalar};
-use crate::stamp::Stamp;
+use crate::stamp::{Stamp, LAMPORT_STATE_CEILING};
+use std::collections::HashMap;
 
 /// Why a byte string could not be decoded into an op.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -453,11 +454,72 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
 pub(crate) struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// While tracking, the highest lamport reached by each client id — over the
+    /// stamps [`note_stamp_reach`](Self::note_stamp_reach) is explicitly told about,
+    /// not every stamp read. A state stream carries stamps that only *reference* an
+    /// id (an anchor's parent, a range anchor's position), and flooring on those
+    /// would invent entries the encoder never held. A snapshot's own stamps are ids it visibly holds, so reading them
+    /// back as they decode is the **floor** under the high-water the snapshot
+    /// declares — see
+    /// [`Document::read_state`](crate::doc::Document::decode_state). Off by default
+    /// so the op path pays nothing.
+    stamp_high_water: HashMap<ClientId, u64>,
+    tracking_stamps: bool,
 }
 
 impl<'a> Cursor<'a> {
     pub(crate) fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            stamp_high_water: HashMap::new(),
+            tracking_stamps: false,
+        }
+    }
+
+    /// Start recording the stamps read from here on, discarding anything an
+    /// enclosing frame already read.
+    pub(crate) fn track_stamps(&mut self) {
+        self.stamp_high_water.clear();
+        self.tracking_stamps = true;
+    }
+
+    /// Record that `client`'s ids reach at least `lamport` — a **node id** the
+    /// stream carries, which is what the id-space record is a high-water over.
+    ///
+    /// Called explicitly rather than from [`stamp`](Self::stamp), because most
+    /// stamps a state stream carries are not ids the replica holds: an anchor's
+    /// parent and a range anchor's position *reference* ids, and one may name a
+    /// client whose own op has not arrived. Flooring on those would invent record
+    /// entries the encoder never had, so a decoded replica could not reproduce its
+    /// own bytes.
+    ///
+    /// A dead sequence run needs it for the other reason: it encodes as
+    /// `(head, length)`, so only the head is a stamp at all, and the ids behind it
+    /// are exactly the ones a plant leaves once a user deletes it.
+    ///
+    /// A zero reach is skipped: it says nothing, and
+    /// [`Document::record_stamp`](crate::doc::Document) does not store one, so
+    /// reading it back would invent an entry the encoder never wrote.
+    ///
+    /// A reach past [`LAMPORT_STATE_CEILING`] is **clamped to it, not skipped** —
+    /// the same thing `record_stamp` does, and the two writers of one record have to
+    /// agree. Skipping looks safe for a point stamp (the mint cannot reach past the
+    /// ceiling, so it could not collide) but is wrong for a *range*: a dead run
+    /// reports `head + length - 1`, so a run straddling the ceiling would be dropped
+    /// whole — including the mintable ids below it that the run genuinely holds.
+    /// Lengthening a plant would then defeat the floor that a shorter one trips.
+    pub(crate) fn note_stamp_reach(&mut self, client: ClientId, lamport: u64) {
+        if self.tracking_stamps && lamport != 0 {
+            let slot = self.stamp_high_water.entry(client).or_insert(0);
+            *slot = (*slot).max(lamport.min(LAMPORT_STATE_CEILING));
+        }
+    }
+
+    /// Stop recording and take what was read.
+    pub(crate) fn take_stamp_high_water(&mut self) -> HashMap<ClientId, u64> {
+        self.tracking_stamps = false;
+        std::mem::take(&mut self.stamp_high_water)
     }
 
     /// Whether every byte has been consumed — the total-decode check.

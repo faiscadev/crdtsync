@@ -22,9 +22,10 @@ use crate::clientid::ClientId;
 /// ordering, since a peer wanting to dominate LWW sits one below whatever the
 /// gate is.
 ///
-/// A clock this high is not reachable by honest means. A clock advances by one
-/// per op and one per inserted codepoint, so reaching it takes 2^62 real edits
-/// in a single partition.
+/// A clock this high is not reachable by honest means. A clock advances by one per
+/// op and one per inserted codepoint, so reaching it takes 2^62 real edits — and
+/// since the mint counts on from the replica's whole id-space position rather than
+/// one partition's, that is 2^62 edits across the document, not within a zone.
 pub const LAMPORT_WIRE_CEILING: u64 = u64::MAX >> 2;
 
 /// The highest clock a *decoded snapshot* may declare, for the root partition
@@ -42,9 +43,14 @@ pub const LAMPORT_WIRE_CEILING: u64 = u64::MAX >> 2;
 /// replica unable to reload its own snapshot.
 pub const LAMPORT_STATE_CEILING: u64 = u64::MAX >> 1;
 
-// Both gaps are what make the arithmetic downstream of a clock total: the runway
-// below the state ceiling keeps it off an honest replica's own snapshot, and the
-// half above it is entered one local mint at a time.
+// The runway between the two is what makes the arithmetic downstream of a clock
+// total: a replica whose clock a fold parked at the wire ceiling still has 2^62
+// positions to mint into before it is spent.
+//
+// Nothing ever enters the half **above** the state ceiling. A mint refuses past it,
+// a fold clamps lower still, `apply` refuses a stamp reaching past it, and a decode
+// refuses a clock or an id-space record above it — so that half is headroom the
+// arithmetic never uses, not space a replica climbs into.
 const _: () = assert!(LAMPORT_WIRE_CEILING < LAMPORT_STATE_CEILING);
 const _: () = assert!(LAMPORT_STATE_CEILING - LAMPORT_WIRE_CEILING == 1 << 62);
 const _: () = assert!(u64::MAX - LAMPORT_STATE_CEILING == 1 << 63);

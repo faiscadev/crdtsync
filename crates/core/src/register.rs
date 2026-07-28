@@ -41,6 +41,9 @@ impl Register {
         let id = cur.element_id()?;
         let value = cur.scalar()?;
         let stamp = cur.stamp()?;
+        // The register's LWW stamp is an id this replica holds, and `set` is
+        // strictly-greater, so a re-issue would lose silently.
+        cur.note_stamp_reach(stamp.client, stamp.lamport);
         Ok(Register {
             id,
             value,

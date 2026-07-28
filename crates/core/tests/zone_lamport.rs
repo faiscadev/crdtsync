@@ -94,39 +94,50 @@ fn an_op_targeting_a_zoned_subtree_stamps_from_that_zones_clock() {
 
     assert_eq!(doc.zone_clock(None), 0, "the root partition is untouched");
     assert_eq!(doc.zone_clock(Some(0)), 2);
+    // The zone owns the whole first write, so the replica has minted nothing
+    // outside it and the numbering is still the zone's own count.
 }
 
 #[test]
 fn an_op_in_one_zone_does_not_advance_another_zones_clock() {
-    let mut doc = Document::new(cid(1));
-    doc.set_schema(schema_with_zones(r#"{ "a": "/a", "b": "/b" }"#));
-
-    // Materialise both zone roots. Each seed write is a create (zone a / zone b) then
-    // a set in the same zone, so zone a and zone b each reach clock 2.
-    path::register_int(&mut doc, &p(&[b"a", b"seed"]), 0);
-    path::register_int(&mut doc, &p(&[b"b", b"seed"]), 0);
-
-    // Five more edits inside zone a — the container already lives, so each is just a
-    // set (the redundant create is elided). Zone a: 2 (seed create+set) + 5 = 7.
+    // The invariant is about the **fold**: a replica that folds an op advances that
+    // op's partition and no other, so two zones stay causally independent and each
+    // replicates as its own stream. A local *mint* is a different matter — it counts
+    // on from the replica's whole stamp position, because a stamp is a
+    // document-global id and no per-partition floor can keep one unique (see
+    // `lamport_mint.rs`). So the numbering is not compact and is not asserted here;
+    // what a zone's clock must never do is move because another zone's op arrived.
+    let mut author = Document::new(cid(1));
+    author.set_schema(schema_with_zones(r#"{ "a": "/a", "b": "/b" }"#));
+    let mut zone_a = path::register_int(&mut author, &p(&[b"a", b"seed"]), 0);
+    path::register_int(&mut author, &p(&[b"b", b"seed"]), 0);
     for i in 0..5 {
-        path::register_int(&mut doc, &p(&[b"a", b"x"]), i);
+        zone_a.extend(path::register_int(&mut author, &p(&[b"a", b"x"]), i));
     }
-    assert_eq!(
-        doc.zone_clock(Some(0)),
-        7,
-        "seed create+set, then five edits"
-    );
+    assert!(zone_a.iter().all(|o| o.zone == Some(0)), "all zone a");
 
-    // One edit inside zone b — its stamp reflects zone b's own clock, never the ops
-    // zone a has accrued.
-    let ops = path::register_int(&mut doc, &p(&[b"b", b"x"]), 9);
-    let set = ops.iter().find(|o| o.zone == Some(1)).expect("a zone b op");
-    assert_eq!(set.stamp.lamport, 3, "zone b: seed create=1, set=2, this=3");
-    assert_eq!(doc.zone_clock(Some(1)), 3);
+    let mut doc = Document::new(cid(2));
+    doc.set_schema(schema_with_zones(r#"{ "a": "/a", "b": "/b" }"#));
+    path::register_int(&mut doc, &p(&[b"b", b"seed"]), 0);
+    let b_before = doc.zone_clock(Some(1));
+    let root_before = doc.zone_clock(None);
+
+    for op in &zone_a {
+        doc.apply(op);
+    }
+    assert!(
+        doc.zone_clock(Some(0)) > 0,
+        "zone a's own clock took the ops"
+    );
     assert_eq!(
-        doc.zone_clock(Some(0)),
-        7,
-        "zone a untouched by a zone b edit"
+        doc.zone_clock(Some(1)),
+        b_before,
+        "zone b moved on a zone a fold"
+    );
+    assert_eq!(
+        doc.zone_clock(None),
+        root_before,
+        "the root partition moved on a zone a fold"
     );
 }
 
