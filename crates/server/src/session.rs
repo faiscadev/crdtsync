@@ -1001,22 +1001,73 @@ pub fn step(
             else {
                 return version_denied(session, channel);
             };
+            // `version_room` resolved the room only for an authenticated session.
+            let Some(identity) = session.identity() else {
+                return version_denied(session, channel);
+            };
             match hub.version_state(&room, &name) {
                 Some(state) => {
                     // A version's captured state is served — an auditable history
                     // read, distinct from the live subscribe stream. Record it
                     // through the audit seam (the read was already authorized by
                     // `version_room` above, so the verdict is granted).
-                    if let Some(identity) = session.identity() {
-                        authorizer.observe(
-                            identity,
-                            Action::VersionRead,
-                            &Resource::Room(&room),
-                            true,
-                        );
-                    }
+                    authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     let seq = hub.version_seq(&room, &name).unwrap_or(0);
                     let state = state.to_vec();
+                    // A version is the room's own state at an earlier sequence, so it
+                    // carries every partition the room carried — the zones this
+                    // channel withholds and the subtrees this reader's doc-ACL denies
+                    // included. Narrow it with the same two projections, in the same
+                    // order, that a catch-up snapshot runs, so a version read serves
+                    // exactly the partitions the live stream does.
+                    let records = hub.acl_records(&room);
+                    let creator = hub.room_creator(&room);
+                    // Element-scoped grants resolve against the *version's* tree: an
+                    // element's redaction path is where it stood when the version was
+                    // captured, not where it stands in the live room.
+                    let index = if records.is_empty() {
+                        HashMap::new()
+                    } else {
+                        Document::decode_state(&state)
+                            .map(|doc| crate::index::element_paths(&doc))
+                            .unwrap_or_default()
+                    };
+                    // The replica identity this channel authors under — the one author
+                    // whose ids a projection keeps in the frontier it otherwise scrubs,
+                    // so a reader that adopts this version does not re-mint into ids
+                    // the room's log already holds.
+                    let recipient = session.client.map(|c| c.for_channel(channel.0));
+                    let reads_all = records.is_empty()
+                        || reads_whole_document(
+                            authorizer,
+                            &records,
+                            creator.as_deref(),
+                            &index,
+                            schema,
+                            identity,
+                            &room,
+                        );
+                    let state = if reads_all {
+                        state
+                    } else {
+                        project_snapshot_reads(
+                            state,
+                            authorizer,
+                            &records,
+                            creator.as_deref(),
+                            schema,
+                            identity,
+                            &room,
+                            recipient,
+                        )
+                    };
+                    // The channel's zone scope, resolved when it subscribed — the same
+                    // set the live fan-out filters this channel's ops by.
+                    let zones = session
+                        .channels
+                        .get(&channel)
+                        .and_then(|sub| sub.zones.clone());
+                    let state = project_snapshot_zones(state, schema, &zones, recipient);
                     Response {
                         replies: vec![Message::VersionState {
                             channel,
