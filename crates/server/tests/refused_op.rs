@@ -31,7 +31,8 @@ use crdtsync_core::{
     ClientId, ErrorCode, Message, Op, OpId, OpKind, Scalar, Stamp, Tx, TxId, LAMPORT_STATE_CEILING,
 };
 use crdtsync_server::auth::AllowAll;
-use crdtsync_server::store::Store;
+use crdtsync_server::replay::{head_seq, reconstruct_at};
+use crdtsync_server::store::{RoomLog, Store, StoredOp};
 use crdtsync_server::{step, Hub, PermitAll, SchemaRegistry, Session};
 
 const ROOM: &[u8] = b"room-1";
@@ -326,6 +327,51 @@ fn a_buffered_op_is_still_logged_broadcast_and_acked() {
     assert!(
         h.get(ROOM, b"nested").is_some(),
         "the held write applied once its container arrived"
+    );
+}
+
+/// The read-only replay tooling numbers a room's sequences from the same tail the
+/// hub commits, so it must apply the same filter. It reads bytes this node did not
+/// necessarily write — a store handed over, or one a crash left mid-write — where a
+/// record the ingest seam would have dropped can appear. Reading such a record as
+/// sequence-advancing would slide every later op's sequence by one against the live
+/// hub, and point-in-time reconstruction would answer for the wrong ops.
+#[test]
+fn replay_numbers_sequences_past_a_refused_record() {
+    let good_one = honest_op(cid(1));
+    let mut refused = offset_stamp_op(cid(1));
+    refused.id.seq = 1;
+    let mut good_two = honest_op(cid(1));
+    good_two.id.seq = 2;
+    good_two.stamp.lamport += 1;
+
+    // The order matters: the refused record sits between the two admissible ones, so
+    // an unfiltered tail would number `good_two` at 3 rather than 2.
+    let log = RoomLog {
+        ops: vec![&good_one, &refused, &good_two]
+            .into_iter()
+            .map(|op| StoredOp::new(op.clone(), None))
+            .collect(),
+        ..RoomLog::default()
+    };
+    assert_eq!(head_seq(&log), 2, "the refused record advances nothing");
+
+    // And the sequences agree with a live hub fed the identical batch.
+    let mut h = Hub::new(cid(0xFF));
+    h.ingest(
+        ROOM,
+        vec![good_one.clone(), refused, good_two.clone()],
+        None,
+    )
+    .expect("a store-less ingest never fails");
+    assert_eq!(h.seq(ROOM), head_seq(&log));
+
+    let at_head =
+        reconstruct_at(&log, ROOM, head_seq(&log), cid(0xFF)).expect("the head is reconstructable");
+    assert_eq!(
+        at_head.state,
+        h.export_room(ROOM).expect("the room exists"),
+        "reconstruction matches the live replica byte for byte"
     );
 }
 
