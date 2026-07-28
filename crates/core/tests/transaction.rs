@@ -1366,12 +1366,111 @@ fn a_duplicate_of_an_applied_member_changes_nothing() {
         );
     }
 
-    // And the last member of the evicted group is where eviction left it, whether
-    // or not those duplicates arrived.
+    // And the last member of the evicted group lands the same way whether or not
+    // those duplicates arrived — the eviction spent its key, not the duplicates.
     let mut c = Document::decode_state(&settled).expect("decode");
-    assert!(!b.apply(&ops[2]));
-    assert!(!c.apply(&ops[2]));
+    assert!(b.apply(&ops[2]));
+    assert!(c.apply(&ops[2]));
     assert_eq!(b.encode_state(), c.encode_state());
+}
+
+#[test]
+fn many_resolved_keys_encode_in_one_order() {
+    // The record is a set, so its iteration order is per-instance. Two replicas that
+    // resolved the same groups in opposite orders have to encode identical bytes, or
+    // the record itself is the divergence it exists to prevent.
+    let mut a = doc(1);
+    let groups: Vec<Vec<Op>> = (0..12)
+        .map(|i| {
+            a.atomic_transact(|tx| {
+                tx.register(format!("k{i}a").as_bytes(), Scalar::Int(i));
+                tx.register(format!("k{i}b").as_bytes(), Scalar::Int(i));
+            })
+        })
+        .collect();
+
+    let mut forward = doc(9);
+    for op in groups.iter().flatten() {
+        forward.apply(op);
+    }
+    let mut backward = doc(9);
+    for op in groups.iter().rev().flatten() {
+        backward.apply(op);
+    }
+    assert_eq!(
+        forward.encode_state(),
+        backward.encode_state(),
+        "the record's encoding follows its set iteration order"
+    );
+}
+
+#[test]
+fn a_projection_serves_no_record_of_the_groups_it_withholds() {
+    // A key names an author and a group, never a partition, so a projection that kept
+    // one would count the groups a withheld partition resolved. It goes whole, and the
+    // recipient buckets a later stray as a group it has never seen resolve.
+    let (mut a, group) = pair();
+    let stray = a.transact(|tx| {
+        tx.register(b"loose", Scalar::Int(7));
+    });
+    let forged = retagged(&stray[0], tx_id(&group[0]), 2);
+
+    let mut room = doc(9);
+    for op in &group {
+        room.apply(op);
+    }
+    let served = room.encode_state();
+
+    let mut whole = Document::decode_state(&served).expect("decode");
+    assert!(
+        whole.apply(&forged),
+        "the unprojected replica holds the record and merges the stray"
+    );
+
+    let mut projected = Document::decode_state(&served).expect("decode");
+    projected.project_read_paths(|path| path != [b"x".to_vec()], None);
+    let mut reader = Document::decode_state(&projected.encode_state()).expect("decode");
+    assert!(
+        !reader.apply(&forged),
+        "the projection served its record of the withheld groups"
+    );
+}
+
+#[test]
+fn a_decoded_member_of_a_spent_key_does_not_wait_on_it() {
+    // A snapshot can present both at once — a spent key and a member still tagged
+    // under it — which an honest encoder never holds together. Whatever the bytes
+    // carry, the member merges rather than waiting on a bucket the record has closed.
+    let (a, ops) = triple();
+    let id = tx_id(&ops[0]);
+    let shrunk: Vec<Op> = ops.iter().map(|op| retagged(op, id, 2)).collect();
+
+    // A replica holding the record, and one holding the stray still tagged.
+    let mut resolved = doc(9);
+    resolved.apply(&shrunk[0]);
+    resolved.apply(&shrunk[1]);
+    let with_record = resolved.encode_state();
+
+    // The committed bucket leaves the buffer empty, so the snapshot's last four bytes
+    // are its length; replacing them frames the stray as still held under the key.
+    assert_eq!(
+        with_record[with_record.len() - 4..],
+        [0, 0, 0, 0],
+        "the committed group left the buffer empty"
+    );
+    let framed = crdtsync_core::encode_ops(&[shrunk[2].clone()]);
+    let mut forged = with_record[..with_record.len() - 4].to_vec();
+    forged.extend_from_slice(&(framed.len() as u32).to_le_bytes());
+    forged.extend_from_slice(&framed);
+
+    let restored = Document::decode_state(&forged).expect("decode");
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(
+            reg(&restored, key),
+            reg(&a, key),
+            "member {key:?} waited on a bucket the record had closed"
+        );
+    }
 }
 
 #[test]
@@ -1477,12 +1576,45 @@ fn evicting_a_partial_transaction_lands_its_members() {
         "an evicted member merges standalone"
     );
 
-    // A member arriving after its group was evicted is a group of its own again:
-    // it holds until the next eviction, which is why eviction is a policy the
-    // caller repeats rather than a one-off.
-    assert!(!b.apply(&ops[1]));
-    assert_eq!(b.evict_partial_transactions(), 1);
+    // Giving up on a group spends its bucket key, so a member arriving afterwards is
+    // a stray of a group this replica has already released rather than the first
+    // member of a fresh one — it merges standalone, without a second eviction. Two
+    // replicas on one policy would otherwise disagree over nothing but which of them
+    // had already ticked when the last member landed.
+    assert!(b.apply(&ops[1]), "the late member merges standalone");
+    assert_eq!(b.evict_partial_transactions(), 0, "nothing is left waiting");
     assert_eq!(reg(&b, b"y"), reg(&a, b"y"));
+}
+
+#[test]
+fn evicting_replicas_agree_whichever_of_them_had_ticked() {
+    // The record covers eviction because eviction resolves a bucket: one replica
+    // evicts between two members and the other after both, and they hold the same
+    // state — down to which keys each has spent, so a later stray lands at both.
+    let (mut a, ops) = pair();
+    let stray = a.transact(|tx| {
+        tx.register(b"late", Scalar::Int(9));
+    });
+    let forged = retagged(&stray[0], tx_id(&ops[0]), 2);
+
+    let mut early = doc(9);
+    early.apply(&ops[0]);
+    early.evict_partial_transactions();
+    early.apply(&ops[1]);
+    early.evict_partial_transactions();
+
+    let mut late = doc(9);
+    late.apply(&ops[0]);
+    late.apply(&ops[1]);
+    late.evict_partial_transactions();
+
+    assert_eq!(
+        early.encode_state(),
+        late.encode_state(),
+        "when each replica ticked decided its state"
+    );
+    assert_eq!(early.apply(&forged), late.apply(&forged));
+    assert_eq!(reg(&early, b"late"), reg(&late, b"late"));
 }
 
 #[test]

@@ -255,20 +255,23 @@ pub struct Document {
     /// malformed on any member's own terms. Recording the key is what makes a stray's
     /// fate a function of the op set rather than of when it arrived.
     ///
-    /// A key resolves at three points, one per way a bucket is spent. A bucket that
-    /// commits spends it. A local mint spends it too — the author applies its own
-    /// edits as it makes them and buckets nothing, so a group it tags is resolved
-    /// where a receiver's is on commit, or an author would hold a stray every
-    /// receiver merged. And a member arriving under a group other than the one the
-    /// buffer holds it under spends *both*: only one of the two can ever hold this
-    /// id, and which one is the arrival order's.
+    /// A key is spent at each of the four points a bucket resolves. A bucket that
+    /// **commits** spends it. A local **mint** spends it too — the author applies its
+    /// own edits as it makes them and buckets nothing, so a group it tags is resolved
+    /// where a receiver's is on commit, or an author would hold a stray every receiver
+    /// merged. **Eviction** spends the keys it gives up on, or a member arriving after
+    /// one would wait on a group this replica has already released. And a member
+    /// arriving under a group other than the one the buffer holds it under spends
+    /// *both*: only one of the two can ever hold this id, and which one is the arrival
+    /// order's.
     ///
     /// Carried in the state encoding: a group resolved before a restart is one whose
-    /// stray still has to land after it. Each entry needs a group this replica
-    /// bucketed, committed or minted, so the set is bounded by the ops it holds —
-    /// and a conflicting envelope adds at most one key per bucketed group, since
-    /// resolving untags that bucket and the next envelope for the same id then finds
-    /// nothing held under a group.
+    /// stray still has to land after it. Every entry is charged to a bucket this
+    /// replica held, committed, evicted or minted — the foreign key a conflicting
+    /// envelope names is charged to the bucket it was caught against, and there is at
+    /// most one, since spending untags that bucket and the next envelope for the same
+    /// id then finds nothing held under a group. So the set is bounded by the ops the
+    /// replica holds, not by what arrives.
     resolved_tx: HashSet<(ClientId, TxId)>,
     /// Movable nodes revealed by an [`XmlReveal`](crate::op::OpKind::XmlReveal) shell
     /// but not yet placed — a node materialized (identity + tag) with no placement,
@@ -1514,8 +1517,8 @@ impl Document {
         });
         // Once anything is dropped, scrub the causal frontier, the buffer and the
         // resolved-group record of the hidden state so none leaks another replica's op
-        // or group count, and rebuild the tree-move
-        // fold so the derived parents and `moved_away` overlay match the filtered log a
+        // or group count, and rebuild the tree-move fold so the derived parents and
+        // `moved_away` overlay match the filtered log a
         // reload replays — a node kept at its readable origin renders there, not at the
         // denied destination it was folded to, so the projected snapshot is byte-stable
         // through a round-trip. A pure identity projection (a whole-document reader)
@@ -2555,6 +2558,9 @@ impl Document {
         };
         let id = TxId::derive(ops.iter().map(|op| op.id.seq));
         self.resolve_tx((self.client, id));
+        // Spending a key releases what it held, and a released member applies on the
+        // drain — never on whenever the next unrelated arrival happens to run one.
+        self.drain_buffer();
         ops.into_iter()
             .map(|mut op| {
                 op.tx = Some(Tx { id, count });
@@ -2599,19 +2605,24 @@ impl Document {
     /// either way — an evicted member is applied or still buffered, never free for
     /// the sequence counter to mint again.
     ///
-    /// A member arriving after its group was evicted rejoins that group's bucket
-    /// still carrying the size the group declared, which the remainder can no
-    /// longer reach: the eviction left no record, so nothing distinguishes it from
-    /// the first member of a fresh group. It waits until the next call, which is
-    /// why this is a policy the caller repeats rather than a one-shot repair.
+    /// Giving up on a group **spends its bucket key**, as completing it does: a
+    /// member arriving afterwards carries a size the remainder can no longer reach,
+    /// so untagging the buffer while keeping the key would leave that member waiting
+    /// on a group this replica has already released. Two replicas running one
+    /// eviction policy would then disagree over nothing but when each ticked — which
+    /// of them had already evicted when the last member landed — so the record has
+    /// to cover this way of resolving a bucket alongside the others.
     pub fn evict_partial_transactions(&mut self) -> usize {
         let groups = self.tx_buckets();
         if groups.is_empty() {
             return 0;
         }
         let evicted = groups.len();
-        for i in groups.into_values().flatten() {
-            self.buffer[i].tx = None;
+        for (key, idxs) in groups {
+            for i in idxs {
+                self.buffer[i].tx = None;
+            }
+            self.resolved_tx.insert(key);
         }
         self.drain_buffer();
         evicted
@@ -2641,8 +2652,11 @@ impl Document {
             // so both keys resolve and every order lands the same set. A plain
             // resend names the group already held and decides nothing, which is
             // what leaves an honest group waiting whole for the member it lacks.
-            if let (Some(tx), Some(held)) = (op.tx, self.buffered_tx(op.id)) {
-                if held != tx {
+            // Only a member the buffer is *holding* is evidence of a group, so the
+            // buffer is searched only for an id it can hold. A resend of an applied
+            // op — ordinary traffic on any transport that retries — costs nothing.
+            if let Some(tx) = op.tx.filter(|_| self.buffered.contains(&op.id)) {
+                if let Some(held) = self.buffered_tx(op.id).filter(|held| *held != tx) {
                     self.resolve_tx((op.id.client, held.id));
                     self.resolve_tx((op.id.client, tx.id));
                     self.drain_buffer();
