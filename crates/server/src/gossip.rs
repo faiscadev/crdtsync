@@ -227,6 +227,39 @@ pub fn probe_outcome(direct_reachable: bool, indirect: &[Option<bool>]) -> bool 
     direct_reachable || indirect_reachable(indirect)
 }
 
+/// How one SWIM probe round reached its target — the whole verdict a round carries
+/// back, since liveness and identity are different questions and a round answers them
+/// differently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GossipRoundOutcome {
+    /// This node dialed the member and it answered. On a TLS member the transport
+    /// authenticated the far end against the address dialed before a byte was
+    /// written, so this is the only outcome that is evidence about *who* is there.
+    Direct,
+    /// The direct probe failed but a relay reported the target reachable. Evidence
+    /// that the member is alive, and about nobody's identity: it says a *relay*
+    /// reaches the target, which this node did not observe and cannot attribute.
+    Relayed,
+    /// Neither the direct probe nor any relay reached the member.
+    Unreachable,
+}
+
+impl GossipRoundOutcome {
+    /// Fold a round's direct and indirect results into its outcome.
+    pub fn of(direct_reachable: bool, indirect: &[Option<bool>]) -> Self {
+        match (direct_reachable, indirect_reachable(indirect)) {
+            (true, _) => GossipRoundOutcome::Direct,
+            (false, true) => GossipRoundOutcome::Relayed,
+            (false, false) => GossipRoundOutcome::Unreachable,
+        }
+    }
+
+    /// Whether the round found the member alive, by either path.
+    pub fn reachable(self) -> bool {
+        self != GossipRoundOutcome::Unreachable
+    }
+}
+
 /// Ask the relay at `relay_addr` to report whether it can reach `target_addr` on
 /// this node's behalf: dial it, send a [`Message::PingReq`], and read back the
 /// [`Message::PingAck`]'s verdict. `Some(reachable)` is the relay's answer — its

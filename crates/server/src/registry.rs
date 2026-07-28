@@ -23,6 +23,7 @@ use crate::auto_version::{
     AutoVersionState,
 };
 use crate::clock::{Clock, SystemClock};
+use crate::gossip::GossipRoundOutcome;
 use crate::leadership::LeadershipEpochs;
 use crate::membership::Membership;
 use crate::placement::NodeId;
@@ -608,12 +609,12 @@ impl Registry {
         if conn.peer.is_some() {
             return false;
         }
-        let certified = match conn.cert_hosts.as_deref() {
+        match conn.cert_hosts.as_deref() {
             // No certificate at all. The claim stands on its own, which is what a
             // deployment that has not issued per-node certificates has; one that has
             // says so and this is refused.
             None if self.require_peer_identity => return false,
-            None => false,
+            None => {}
             // A certificate *was* presented and verified, so it decides — including
             // when it names no host, which binds nothing. Treating that as certless
             // would make a certificate widen what a link may claim.
@@ -624,22 +625,17 @@ impl Registry {
             {
                 return false
             }
-            Some(_) => true,
-        };
-        let member = NodeId::from(claimed.to_vec());
-        conn.peer = Some(member.clone());
-        // An inbound link is a verification of the member it names only when a
-        // certificate named it. Admission alone is no evidence: the cluster secret is
-        // deployment-wide, so an uncertified claim is a member asserting an id rather
-        // than answering at one, and taking it as verification would let any
-        // secret-holder place any id it liked. A dial in the other direction still
-        // vouches without certificates — it at least proves the far end answers at the
-        // address the id names.
-        if certified {
-            if let Some(membership) = &mut self.membership {
-                membership.note_verified(&member);
-            }
+            Some(_) => {}
         }
+        conn.peer = Some(NodeId::from(claimed.to_vec()));
+        // Admitting a link is **not** a verification of the member it names, however
+        // well the certificate names it. A member chooses when to dial in and how
+        // often, so a vouch earned that way is one the member caused rather than one
+        // this node independently made — and a certificate names a *host*, which mints
+        // as many node ids as it likes, so a member could dial in under each ground id
+        // in turn and have this node vouch for every one of them. Verification is this
+        // node's own dial and nothing else (see
+        // [`note_peer_verified`](Self::note_peer_verified)).
         true
     }
 
@@ -848,14 +844,12 @@ impl Registry {
     /// is refused — stalling their quorums. Without that policy the same round is the
     /// honest floor, and vouches for reachability alone.
     pub fn note_peer_verified(&mut self, node: &NodeId) {
-        let require_identity = self.require_peer_identity;
-        let Some(membership) = &mut self.membership else {
-            return;
-        };
-        if require_identity && !membership.advertises_tls(node) {
+        if !self.dial_establishes_identity(node) {
             return;
         }
-        membership.note_verified(node);
+        if let Some(membership) = &mut self.membership {
+            membership.note_verified(node);
+        }
     }
 
     /// Merge a gossiped liveness payload into this node's membership — the SWIM
@@ -877,11 +871,30 @@ impl Registry {
     /// the node this one dialed choose who takes a place in the ring.
     ///
     /// `sender` is the member the payload came from, and every `verified` flag in it is
-    /// recorded as that member's own first-hand claim.
+    /// recorded as that member's own first-hand claim — but only where `sender`'s
+    /// identity was established. This is the *reply* half of a round this node drove,
+    /// so what establishes it is the dial: a deployment that requires an identified
+    /// peer gets one from a `wss://` member's certificate and nothing at all from a
+    /// plaintext one, and an unattributable claim must not become an adopted member's
+    /// vouch. The liveness in the payload still merges either way — a member's
+    /// reachability is not a claim about anyone's identity.
     pub fn merge_gossip(
         &mut self,
         sender: &NodeId,
         members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)>,
+    ) {
+        let attributable = self.dial_establishes_identity(sender);
+        self.merge_gossip_attributed(sender, members, attributable);
+    }
+
+    /// Merge a gossip payload from `sender`, saying explicitly whether its `verified`
+    /// flags may be attributed to it — the seam both halves of a round share, each
+    /// deciding attribution from the link it actually holds.
+    fn merge_gossip_attributed(
+        &mut self,
+        sender: &NodeId,
+        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)>,
+        attributable: bool,
     ) {
         if let Some(membership) = &mut self.membership {
             membership.merge_liveness(
@@ -889,10 +902,31 @@ impl Registry {
                 members
                     .into_iter()
                     .map(|(node, addr, inc, state, verified)| {
-                        (NodeId::from(node), addr, inc, state, verified)
+                        (
+                            NodeId::from(node),
+                            addr,
+                            inc,
+                            state,
+                            verified && attributable,
+                        )
                     }),
             );
         }
+    }
+
+    /// Whether a dial to `member` establishes who answered — a TLS member's
+    /// certificate does, a plaintext member's transport does not, and a deployment
+    /// that has not declared identity required takes the dial at face value. The
+    /// member's *advertised* transport is the right thing to read here and the wrong
+    /// thing to read of an inbound link: an outbound dial runs over exactly the
+    /// transport that address declares, while an inbound link is one the member dialed
+    /// and its own listener's scheme describes nothing about it.
+    fn dial_establishes_identity(&self, member: &NodeId) -> bool {
+        !self.require_peer_identity
+            || self
+                .membership
+                .as_ref()
+                .is_some_and(|m| m.advertises_tls(member))
     }
 
     /// Run one reap check over the cluster membership: remove members that have
@@ -918,6 +952,24 @@ impl Registry {
             } else {
                 membership.note_gossip_unreachable(&node);
             }
+        }
+    }
+
+    /// Record how one SWIM probe round reached `node` — the whole of what a round
+    /// means to this view, in one place rather than split across the caller.
+    ///
+    /// Liveness and *identity* are different questions and a round answers them
+    /// differently. Every reachable outcome is proof the member is alive, whichever
+    /// path found it. Only [`Direct`](GossipRoundOutcome::Direct) is proof about the
+    /// member itself: this node dialed the address the id names and the transport
+    /// authenticated the far end before a byte was written, which is what a
+    /// verification claims. A relay's second opinion says a *relay* reaches the target,
+    /// which vouches for nobody here — if it did, one member confirming a target would
+    /// place it, and the mint would be open one step over.
+    pub fn note_gossip_round(&mut self, node: NodeId, outcome: GossipRoundOutcome) {
+        self.note_gossip_probe(node.clone(), outcome.reachable());
+        if outcome == GossipRoundOutcome::Direct {
+            self.note_peer_verified(&node);
         }
     }
 
@@ -970,7 +1022,10 @@ impl Registry {
                 membership.is_member(&node) || (&node == sender && addr == node.as_bytes())
             })
             .collect();
-        self.merge_gossip(sender, members);
+        // The link this arrived on is bound to `sender` (C13), and under a deployment
+        // that requires an identified peer it is bound by a certificate that names it,
+        // so the claims it carries are attributable to that member.
+        self.merge_gossip_attributed(sender, members, true);
         let reply = crate::gossip::gossip_frame(&self.known_liveness());
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.outbox.push(reply);

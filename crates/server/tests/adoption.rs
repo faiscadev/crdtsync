@@ -18,12 +18,27 @@
 //! member is **pending** — dialed, probed and gossiped about, but in no room's replica
 //! set and no room's quorum — until the cluster adopts it. Adoption cannot be a local
 //! predicate, because placement must be identical on every node or the ring splits, so
-//! a node records only what it knows first-hand (it completed an identity-checked peer
-//! link to the member), that claim rides the same anti-entropy liveness does attributed
-//! to the node that made it, and a member is placed once `ADOPTION_VERIFIERS`
-//! already-adopted members have verified it. A member never verifies itself, so no node
-//! can place itself; configured members are adopted from birth, the operator's config
-//! being the root of trust.
+//! a node records only what it knows first-hand — its **own dial** completed and the
+//! transport authenticated the far end — and that claim rides the same anti-entropy
+//! liveness does, attributed to the member the receiving link is bound to. A member is
+//! placed once `ADOPTION_VERIFIERS` already-adopted **trust units** have verified it.
+//!
+//! Four rules make that hold. The adopted set is *derived* from the configured members
+//! plus the evidence, never accumulated, so the ring is a function of state and not of
+//! the order a node saw things in. A verifier is a **host**, because a certificate
+//! names a host and a host mints unlimited node ids — and a member's own host is
+//! excluded from its own count. An **inbound** link never verifies, however certified:
+//! the member chooses when to dial in, so the vouch would be one it caused. And a
+//! member is dialed at its **own id**, so no peer can decide where a later dial goes by
+//! being the first to advertise an address.
+//!
+//! Two limits are pinned below as passing tests rather than left implied. With no
+//! certificates configured a secret-holder binds a link to any member id it likes
+//! (C13's own residual), so the bar is not a bar and what remains is reachability. And
+//! under peer mTLS a member that owns a host owns every id under it — it answers at
+//! each ground id and honest nodes verify one truthfully — so adoption bounds the mint
+//! to the member's own host and no further; closing that needs the ring to weigh trust
+//! units rather than ids (C27).
 //!
 //! These drive the registry and the membership in process (no sockets), so they are
 //! deterministic and run under Miri.
@@ -33,6 +48,7 @@ use std::sync::Arc;
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, MemberState, Message, Op, Scalar};
 use crdtsync_server::auth::Identity;
+use crdtsync_server::gossip::GossipRoundOutcome;
 use crdtsync_server::membership::{Membership, ADOPTION_VERIFIERS};
 use crdtsync_server::placement::{Cluster, NodeId};
 use crdtsync_server::{ConnId, ManualClock, Registry};
@@ -405,19 +421,22 @@ fn a_pending_member_does_not_enlarge_the_quorum_of_a_room_it_does_not_attack() {
     let (room, c, followers) = led_room_with_a_withheld_write(&mut r);
     let seq = r.hub().seq(&room);
 
-    // A member minted for a *different* room — the collateral case.
-    let other = (0..1_000_000)
-        .map(|i| format!("room-{i}").into_bytes())
-        .find(|candidate| candidate != &room && m.is_primary_for(candidate))
-        .expect("a second room self leads");
-    let minted = minted_for(&m, &other);
+    // The member is minted for *this* room, so it would have entered its replica set —
+    // and therefore raised its majority — had it been adopted. Pending, no room's
+    // replica set moves at all, so the rooms it never meant to touch keep the quorum
+    // they always had.
+    let minted = minted_for(&m, &room);
     let p = peer_as(&mut r, &minted);
     assert!(r.deliver(p, introduces(&minted, false)));
-    assert_eq!(
-        r.membership().expect("clustered").replicas_for(&room),
-        m.replicas_for(&room),
-        "the written room's replica set is untouched",
-    );
+    let view = r.membership().expect("clustered");
+    for i in 0..32 {
+        let sample = format!("room-{i}").into_bytes();
+        assert_eq!(
+            view.replicas_for(&sample),
+            m.replicas_for(&sample),
+            "no room's replica set moves",
+        );
+    }
 
     r.record_replica_ack(followers[0].clone(), &room, seq);
     r.record_replica_ack(followers[1].clone(), &room, seq);
@@ -441,7 +460,38 @@ fn a_member_cannot_verify_itself_into_the_ring() {
 
     let p = peer_as(&mut r, &minted);
     assert!(r.deliver(p, introduces(&minted, true)));
-    assert!(!r.membership().expect("clustered").is_adopted(&minted));
+    let view = r.membership().expect("clustered");
+    assert!(
+        !view.has_verified(&minted, &minted),
+        "the claim never enters the evidence",
+    );
+    assert!(!view.is_adopted(&minted));
+}
+
+#[test]
+fn a_claim_is_recorded_against_the_member_whose_link_carried_it() {
+    // The claim is worth exactly the link it arrived on, so it is attributed to that
+    // member and to nobody the payload names. Were it recorded against the named node
+    // instead, every member would be its own voucher and the bar would be no bar.
+    let mut m = membership_for(SELF_ADDR);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    let voucher = NodeId::from("10.0.0.1:9000");
+    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+    m.merge_liveness(
+        &voucher,
+        [(
+            joiner.clone(),
+            joiner.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )],
+    );
+    assert!(m.has_verified(&voucher, &joiner), "the sender vouched");
+    assert!(
+        !m.has_verified(&joiner, &joiner),
+        "and the member the payload named did not",
+    );
 }
 
 #[test]
@@ -560,44 +610,66 @@ fn a_pending_members_verification_does_not_count() {
 // --- the address a member is verified at is the address its id names ---
 
 #[test]
-fn a_member_advertised_at_another_hosts_address_is_never_adopted() {
-    // The other lesser way in: the reply half of a gossip round adopts a member at
-    // whatever address its tuple carries, so a dialed node can introduce an id pointing
-    // somewhere else entirely. Such a member would be verified at one host and dialed
-    // at another, so no link to either vouches for it and it stays pending however many
-    // members claim it.
-    let mut m = membership_for(SELF_ADDR);
+fn a_member_is_dialed_at_its_own_id_whatever_address_a_tuple_carries() {
+    // The other lesser way in: the reply half of a gossip round hands over members at
+    // whatever address their tuples carry, and a member's recorded address decided
+    // where every later dial went — so whoever advertised a member *first* decided
+    // what every node afterwards verified. Two nodes that saw it in a different order
+    // then verified different endpoints and placed rooms differently, forever. A node
+    // id is an advertise address, so the second name is dropped and the dial address is
+    // a function of the id alone.
+    let mut poisoned = membership_for(SELF_ADDR);
     let joiner = NodeId::from("10.9.9.9:9000");
-    m.add_member(joiner.clone(), b"10.6.6.6:9000".to_vec());
-    for voucher in ["10.0.0.1:9000", "10.0.0.2:9000", "10.0.0.3:9000"] {
-        m.merge_liveness(
-            &NodeId::from(voucher),
-            [(
-                joiner.clone(),
-                b"10.6.6.6:9000".to_vec(),
-                0,
-                MemberState::Alive,
-                true,
-            )],
-        );
+    poisoned.add_member(joiner.clone(), b"10.6.6.6:9000".to_vec());
+    let mut clean = membership_for(SELF_ADDR);
+    clean.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+
+    let dial_of = |m: &Membership| {
+        m.known_members()
+            .into_iter()
+            .find(|(node, _)| node == &joiner)
+            .map(|(_, addr)| addr)
+    };
+    assert_eq!(dial_of(&poisoned), Some(joiner.as_bytes().to_vec()));
+    assert_eq!(dial_of(&poisoned), dial_of(&clean));
+
+    // So the same evidence places the same rooms on both, whichever address was
+    // advertised first.
+    for m in [&mut poisoned, &mut clean] {
+        for voucher in ["10.0.0.1:9000", "10.0.0.2:9000"] {
+            m.merge_liveness(
+                &NodeId::from(voucher),
+                [(
+                    joiner.clone(),
+                    joiner.as_bytes().to_vec(),
+                    0,
+                    MemberState::Alive,
+                    true,
+                )],
+            );
+        }
     }
-    assert!(!m.is_adopted(&joiner));
-    // Nor does this node's own link to it vouch, for the same reason.
-    m.note_verified(&joiner);
-    assert!(!verified_by(&m, &joiner));
-    assert!(!m.is_adopted(&joiner));
+    assert!(poisoned.is_adopted(&joiner));
+    assert_eq!(poisoned.adopted_members(), clean.adopted_members());
 }
 
 #[test]
 fn a_member_this_view_never_learned_is_not_verified_into_existence() {
     // A link is evidence *about* a member; where this view holds no member there is
     // nothing to be evidence about, and a link that could add one would restore the
-    // unchecked join this closes. Learning a member stays gossip's job.
+    // unchecked join this closes. Learning a member stays gossip's job. Nothing is
+    // *stored* either, which is what keeps the evidence bounded by the roster: peer
+    // admission takes the id a link claims, so a certified member could otherwise open
+    // a link per port on its own host and grow the map without limit.
     let mut m = membership_for(SELF_ADDR);
     let stranger = NodeId::from("10.9.9.9:9000");
     m.note_verified(&stranger);
     assert!(!m.is_member(&stranger));
     assert!(!m.is_adopted(&stranger));
+    assert!(
+        !m.has_verified(&NodeId::from(SELF_ADDR), &stranger),
+        "no evidence is kept about a node that is no member",
+    );
 }
 
 // --- what a link means ---
@@ -637,10 +709,13 @@ fn an_uncertified_inbound_link_does_not_verify_the_member_it_claims() {
 }
 
 #[test]
-fn a_certified_inbound_link_verifies_the_member_it_names() {
-    // The other half of the promotion signal: a member dialing in behind a certificate
-    // that names its own host is verified by this node, exactly as this node's own dial
-    // to it would be. One verification is still not adoption in a cluster this size.
+fn no_inbound_link_verifies_the_member_it_names_however_it_is_certified() {
+    // Admitting a link is not a verification, however well the certificate names the
+    // member. A member chooses when to dial in and how often, so a vouch earned that
+    // way is one the member *caused* rather than one this node independently made — and
+    // a certificate names a host, which mints as many node ids as it likes, so a member
+    // could dial in under each ground id in turn and have this node vouch for every
+    // one. Verification is this node's own dial and nothing else.
     let m = membership_for(SELF_ADDR);
     let room = room_self_leads(&m);
     let minted = minted_for(&m, &room);
@@ -649,13 +724,17 @@ fn a_certified_inbound_link_verifies_the_member_it_names() {
     let p = peer_as(&mut r, &minted);
     assert!(r.deliver(p, introduces(&minted, false)));
     certified_peer_as(&mut r, &minted);
+    certified_peer_as(&mut r, &minted);
 
     let view = r.membership().expect("clustered");
-    assert!(verified_by(view, &minted), "the certificate vouches");
-    assert!(
-        !view.is_adopted(&minted),
-        "and one voucher is short of the bar",
-    );
+    assert!(!verified_by(view, &minted), "no inbound link vouches");
+    assert!(!view.is_adopted(&minted));
+
+    // This node's own dial is what does, and one voucher is still short of the bar.
+    r.note_peer_verified(&minted);
+    let view = r.membership().expect("clustered");
+    assert!(verified_by(view, &minted));
+    assert!(!view.is_adopted(&minted));
 }
 
 // --- convergence ---
@@ -733,6 +812,10 @@ fn a_reaped_member_loses_its_place_and_its_vouches() {
     }
     assert!(!m.is_member(&departing));
     assert!(!m.is_adopted(&departing));
+    assert!(
+        !m.has_verified(&departing, &joiner),
+        "a departed member vouches for nobody, and its entries go with it",
+    );
 
     // Its vouch went with it: one further genuine claim is now the first, not the
     // second.
@@ -830,4 +913,174 @@ fn a_plaintext_dial_still_verifies_where_no_identity_is_required() {
     );
     r.note_peer_verified(&plain);
     assert!(verified_by(r.membership().expect("clustered"), &plain));
+}
+
+// --- a trust unit is a host, not a node id ---
+
+/// A membership whose configured set puts two members on one host and one on another
+/// — the shape that tells "distinct verifiers" from "distinct trust units" apart.
+fn shared_host_membership() -> Membership {
+    Membership::from_static_config(
+        None,
+        Some(SELF_ADDR),
+        "10.0.0.1:9000,10.0.0.1:9001,10.0.0.2:9000",
+        N,
+    )
+    .unwrap()
+}
+
+/// `voucher`'s claim to have verified `node`, merged into `m`.
+fn vouch(m: &mut Membership, voucher: &str, node: &NodeId) {
+    m.merge_liveness(
+        &NodeId::from(voucher),
+        [(
+            node.clone(),
+            node.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )],
+    );
+}
+
+#[test]
+fn two_ids_on_one_host_are_one_voucher() {
+    // A certificate names a *host* (C13), and a host mints as many node ids as it
+    // likes — so counting distinct ids would let one machine raise the whole bar by
+    // itself, which is the mint one level up. Two adopted members on one host vouch
+    // once between them; a member on a second host is what carries it.
+    let mut m = shared_host_membership();
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone(), joiner.as_bytes().to_vec());
+
+    vouch(&mut m, "10.0.0.1:9000", &joiner);
+    vouch(&mut m, "10.0.0.1:9001", &joiner);
+    assert!(
+        !m.is_adopted(&joiner),
+        "both vouchers are the same machine, so they are one",
+    );
+
+    vouch(&mut m, "10.0.0.2:9000", &joiner);
+    assert!(m.is_adopted(&joiner), "a second host carries it");
+}
+
+#[test]
+fn a_sibling_on_a_members_own_host_does_not_vouch_for_it() {
+    // A member vouching for a sibling on its own host is vouching for itself: they are
+    // one trust unit, and the whole bar is that a member cannot place a node by itself.
+    let mut m = shared_host_membership();
+    let sibling = NodeId::from("10.0.0.1:9002");
+    m.add_member(sibling.clone(), sibling.as_bytes().to_vec());
+
+    vouch(&mut m, "10.0.0.1:9000", &sibling);
+    vouch(&mut m, "10.0.0.1:9001", &sibling);
+    assert!(
+        !m.is_adopted(&sibling),
+        "its own host does not vouch for it"
+    );
+
+    vouch(&mut m, "10.0.0.2:9000", &sibling);
+    m.note_verified(&sibling);
+    assert!(m.is_adopted(&sibling), "two other hosts do");
+}
+
+#[test]
+fn a_certified_member_still_mints_ids_on_its_own_host() {
+    // The limit, pinned rather than implied. Placement keys on node ids and a
+    // certificate names a host, so a member that owns a host owns every id under it:
+    // it answers at each ground id, and the honest nodes that dial it are telling the
+    // truth when they verify one. Adoption bounds the mint to the member's own host and
+    // to ids the cluster can actually reach — it cannot bound it further, because every
+    // verification here is genuine. Closing it needs the ring to weigh trust units
+    // rather than ids, which is a placement change, not an evidence one.
+    let mut m = membership_for(SELF_ADDR);
+    let minted = NodeId::from("10.0.0.1:9999");
+    m.add_member(minted.clone(), minted.as_bytes().to_vec());
+    vouch(&mut m, "10.0.0.2:9000", &minted);
+    vouch(&mut m, "10.0.0.3:9000", &minted);
+    assert!(
+        m.is_adopted(&minted),
+        "honest nodes that reached it vouched truthfully, and it is placed",
+    );
+}
+
+// --- what a round means, and whose word counts ---
+
+#[test]
+fn only_a_direct_round_verifies_the_member_it_reached() {
+    // A relay's second opinion says a *relay* reaches the target, which this node did
+    // not observe and cannot attribute — so it is evidence of life and of nobody's
+    // identity. Were it otherwise, one member confirming a target would place it.
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_leads(&m);
+    let minted = minted_for(&m, &room);
+    let mut r = registry();
+    let p = peer_as(&mut r, &minted);
+    assert!(r.deliver(p, introduces(&minted, false)));
+
+    r.note_gossip_round(minted.clone(), GossipRoundOutcome::Relayed);
+    assert!(!verified_by(r.membership().expect("clustered"), &minted));
+    r.note_gossip_round(minted.clone(), GossipRoundOutcome::Unreachable);
+    assert!(!verified_by(r.membership().expect("clustered"), &minted));
+
+    r.note_gossip_round(minted.clone(), GossipRoundOutcome::Direct);
+    assert!(verified_by(r.membership().expect("clustered"), &minted));
+}
+
+#[test]
+fn a_plaintext_peers_vouches_do_not_count_where_identity_is_required() {
+    // The reply half comes from a node this one dialed, so what establishes the
+    // sender's identity is that dial. A deployment that requires an identified peer
+    // gets one from a `wss://` member's certificate and nothing at all from a plaintext
+    // one — and an unattributable claim must not become an adopted member's vouch. The
+    // liveness in the same payload still merges: reachability is nobody's identity.
+    let mut r = registry();
+    r.set_require_peer_identity(true);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    let plaintext_member = NodeId::from("10.0.0.1:9000");
+
+    r.merge_gossip(&plaintext_member, advertisements(&[&joiner], true));
+    let view = r.membership().expect("clustered");
+    assert!(view.is_member(&joiner), "the liveness still merged");
+    assert!(
+        !view.has_verified(&plaintext_member, &joiner),
+        "but the claim is attributable to nobody",
+    );
+}
+
+// --- bootstrap ---
+
+#[test]
+fn a_node_that_knows_only_itself_places_on_what_it_has_reached() {
+    // The bar is a constant on every node, so two nodes never disagree about what the
+    // evidence must show — except for a node configured with no peers at all, which has
+    // no cluster to be outvoted by and would otherwise freeze forever: a second voucher
+    // can only ever come from a member it has already adopted. That is the single-node
+    // deployment, and the cluster it places on is what it has itself reached.
+    let mut alone = Membership::from_static_config(None, Some(SELF_ADDR), "", N).unwrap();
+    let first = NodeId::from("10.9.9.9:9000");
+    let second = NodeId::from("10.9.9.8:9000");
+    for node in [&first, &second] {
+        alone.add_member((*node).clone(), node.as_bytes().to_vec());
+    }
+
+    alone.note_verified(&first);
+    alone.note_verified(&second);
+    assert!(
+        alone.is_adopted(&first),
+        "its own link is the whole verdict"
+    );
+    assert!(alone.is_adopted(&second));
+
+    // The exception keys on configuration, not on the running set, so a node given a
+    // single seed peer is held to the constant from its first round — the seed is
+    // adopted from birth and there is a cluster to agree with.
+    let mut seeded =
+        Membership::from_static_config(None, Some(SELF_ADDR), "10.0.0.1:9000", N).unwrap();
+    seeded.add_member(first.clone(), first.as_bytes().to_vec());
+    seeded.note_verified(&first);
+    assert!(
+        !seeded.is_adopted(&first),
+        "one voucher is short of the bar"
+    );
 }
