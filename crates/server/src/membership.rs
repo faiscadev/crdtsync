@@ -154,9 +154,13 @@ pub struct Membership {
     /// reaching `Dead` is excluded from effective leadership cluster-wide.
     liveness: HashMap<NodeId, MemberLiveness>,
     /// Each member's advertise (dial) address, keyed by node id — what a node
-    /// gossips so a peer can dial a member it just learned. A member derived from
-    /// its address (every seed peer) maps to that address verbatim; `self` maps to
-    /// its configured advertise address when one was given, else its node-id bytes.
+    /// gossips so a peer can dial a member it just learned. Every *configured* member,
+    /// `self` included, maps to its own node-id bytes: a seed peer's id is derived from
+    /// its address, and `self`'s is its advertise address unless an explicit node id
+    /// overrode it. Only a member learned by gossip can hold an address distinct from
+    /// its id, and never one it advertised for itself — the peer plane admits a
+    /// self-introduction only at its own id (see
+    /// [`Registry::apply_gossip`](crate::Registry)).
     addrs: HashMap<NodeId, Vec<u8>>,
     /// Reaped members — a tombstone that makes reaping convergent and fail-safe,
     /// mapped to the count of reap checks it has been retained through (its prune

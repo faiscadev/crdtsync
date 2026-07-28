@@ -136,12 +136,24 @@ fn commit_writes(leader: &mut Registry, room: &[u8], count: usize) {
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
 /// A connection admitted to `r`'s peer plane, as a member's dialed link is.
-fn peer_conn(r: &mut Registry) -> ConnId {
+fn peer_conn(r: &mut Registry, room: &[u8]) -> ConnId {
+    let node = r
+        .membership()
+        .and_then(|m| m.replicas_for(room).into_iter().find(|n| !m.is_self(n)))
+        .unwrap_or_else(|| NodeId::from("10.0.0.1:9000"));
+    peer_conn_as(r, &node)
+}
+
+/// A connection admitted to the peer plane as the member `node` — peer admission
+/// binds the link to a member, and every node-to-node frame on it is decided
+/// against that identity rather than anything the frame itself names.
+fn peer_conn_as(r: &mut Registry, node: &NodeId) -> ConnId {
     let id = r.connect();
     assert!(
         r.deliver(
             id,
             Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
                 secret: CLUSTER_SECRET.to_vec(),
             },
         ),
@@ -182,7 +194,7 @@ fn a_late_follower_catches_up_to_the_full_state() {
 
     // Applied to a fresh follower, it converges to the leader's state and sequence.
     let mut follower = node(Some(B));
-    let peer = peer_conn(&mut follower);
+    let peer = peer_conn(&mut follower, &room);
     for (n, frame) in frames {
         if n == b {
             assert!(follower.deliver(peer, frame));
@@ -275,7 +287,7 @@ fn commit_follower_state(r: &mut Registry, room: &[u8]) {
     // Seed some state on the node via a replicated frame so the room exists.
     let mut w = doc(7);
     let ops = w.transact(|tx| tx.register(b"x", Scalar::Int(1)));
-    let peer = peer_conn(r);
+    let peer = peer_conn(r, room);
     let frame = Message::Replicate {
         room: room.to_vec(),
         branch: b"main".to_vec(),

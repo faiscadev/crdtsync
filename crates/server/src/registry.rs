@@ -45,12 +45,19 @@ pub struct ConnId(u64);
 struct Conn {
     session: Session,
     outbox: Vec<Message>,
-    /// Whether this connection has presented the cluster secret, admitting it to
-    /// the peer plane. False for every connection until a
-    /// [`Message::PeerAuth`] carrying the configured secret arrives, so an
-    /// ordinary client — and any socket that has said nothing at all — reaches
-    /// none of the node-to-node handlers.
-    peer: bool,
+    /// The cluster member this connection speaks as, once it has presented the
+    /// cluster secret in a [`Message::PeerAuth`] — the peer plane's admission and
+    /// its identity in one. `None` for every connection until then, so an ordinary
+    /// client — and any socket that has said nothing at all — reaches none of the
+    /// node-to-node handlers. Every gate downstream of admission reads *this*, never
+    /// a node id a frame asserts.
+    peer: Option<NodeId>,
+    /// Every name the verified mTLS client certificate this connection presented
+    /// carries. Empty on a plaintext or server-auth-only link, and on a connection
+    /// authenticated by an in-band credential — only a certificate the listener's
+    /// trust anchors verified lands here, so these are the only names
+    /// [`authenticate_peer`](Registry::authenticate_peer) will bind a member to.
+    cert_names: Vec<Vec<u8>>,
 }
 
 /// A client write-ack withheld pending majority replication. The leader owes the
@@ -125,6 +132,12 @@ pub struct Registry {
     /// [`LeadershipEpochs`]). Empty (inert) in single-node mode and until a room's
     /// leadership first changes.
     epochs: LeadershipEpochs,
+    /// Refuse the peer plane to a link that carries no verified certificate — how a
+    /// deployment declares that every member is identified, not merely
+    /// secret-holding. `false` (the default) admits an uncertified link at the
+    /// identity it claims, which separates one member's link from another's but
+    /// vouches for neither.
+    require_peer_identity: bool,
     /// Client write-acks withheld pending majority replication: for each write
     /// the leader has committed but not yet confirmed durable, the `Accepted` owed
     /// to its author and the server sequence a majority of the replica set must
@@ -147,6 +160,18 @@ enum ReplicaGate {
     /// Committed to apply — the fence has been advanced and persisted, so the caller
     /// folds the frame's payload into the replica.
     Apply,
+}
+
+/// The addressing a node-to-node replication frame carries, apart from its payload:
+/// the member whose link it arrived on, the room and stream it names, and the
+/// leadership epoch it is stamped with. This is exactly what
+/// [`gate_replica_frame`](Registry::gate_replica_frame) decides on, so `Replicate`
+/// and `ReplicateSnapshot` hand it over whole.
+struct ReplicaFrame<'a> {
+    sender: &'a NodeId,
+    room: RoomId,
+    branch: Vec<u8>,
+    epoch: u64,
 }
 
 impl Registry {
@@ -191,6 +216,7 @@ impl Registry {
             schedule_fires: HashMap::new(),
             membership: None,
             cluster_secret: None,
+            require_peer_identity: false,
             replication: Replication::default(),
             epochs,
             pending_acks: Vec::new(),
@@ -270,6 +296,18 @@ impl Registry {
     /// policy, enforced before a deployment starts.
     pub fn set_cluster_secret(&mut self, secret: Vec<u8>) {
         self.cluster_secret = (!secret.is_empty()).then_some(secret);
+    }
+
+    /// Refuse the peer plane to any link that presents no verified client
+    /// certificate naming a member — the deployment's declaration that peer identity
+    /// is established rather than claimed. Off by default, which admits an
+    /// uncertified link at the node id it asserts. This is the mechanism; that a
+    /// deployment turning it on must also terminate client-certificate verification
+    /// and issue this node an identity of its own is
+    /// [`ServeConfig`](crate::runtime::ServeConfig)'s policy, enforced before it
+    /// starts.
+    pub fn set_require_peer_identity(&mut self, require: bool) {
+        self.require_peer_identity = require;
     }
 
     /// Record a peer's reachability, the failover liveness signal (Unit 6a): its
@@ -504,55 +542,125 @@ impl Registry {
         epoch
     }
 
-    /// Admit connection `id` to the peer plane if `presented` is this deployment's
-    /// cluster secret. This is the whole of a node's peer authentication: the frames
-    /// a member sends carry no identity a stranger could not also assert — every node
-    /// dials under the same reserved replica id, and a `FollowerHeads` simply names
-    /// whichever node it likes — so possession of the secret is what separates a
-    /// member from anyone else who can reach the port.
+    /// Admit connection `id` to the peer plane as the member `claimed`, if
+    /// `presented` is this deployment's cluster secret. The secret is what separates
+    /// a member from anyone else who can reach the port; `claimed` is what separates
+    /// one member from another, and every gate downstream of this reads the bound
+    /// identity rather than a node id a later frame asserts.
+    ///
+    /// The claim is only as strong as what establishes it. On a link carrying a
+    /// verified mTLS client certificate, one of the names that certificate carries
+    /// must bind the claim ([`cert_names_member`]) — the cluster's CA vouches for the
+    /// binding, so no member can speak as another. On an uncertified link the claim is
+    /// taken at face value, which still binds the link to one identity but vouches for
+    /// none; a deployment that will not have that sets
+    /// [`set_require_peer_identity`](Self::set_require_peer_identity) and every
+    /// uncertified link is refused.
     ///
     /// Fail-closed and silent. A node with no configured secret has no peer plane to
-    /// open, so it refuses; so does any mismatch. Either way the connection is dropped
-    /// with no reply — which is what hides whether a secret is configured at all, since
-    /// the unconfigured case returns before comparing anything. Where a secret *is*
-    /// configured the comparison is constant-time over the content, so a rejection
-    /// leaks no prefix of it. Returns whether the connection stays open.
-    fn authenticate_peer(&mut self, id: ConnId, presented: &[u8]) -> bool {
+    /// open, so it refuses; so does any mismatch, an unnamed claim, a claim its
+    /// certificate contradicts, an uncertified link under a deployment that requires
+    /// identity, and a second `PeerAuth` on a link already admitted — an identity is
+    /// bound once and holds for the connection, so a re-bind is a link speaking as two
+    /// members. Either way the connection is dropped with no reply — which is what
+    /// hides whether a secret is configured at all, since the unconfigured case
+    /// returns before comparing anything. Where a secret *is* configured the
+    /// comparison is constant-time over the content, so a rejection leaks no prefix
+    /// of it. Returns whether the connection stays open.
+    fn authenticate_peer(&mut self, id: ConnId, claimed: &[u8], presented: &[u8]) -> bool {
         let Some(expected) = &self.cluster_secret else {
             return false;
         };
         if !bool::from(expected.as_slice().ct_eq(presented)) {
             return false;
         }
+        // A link that names no member has no identity to gate on, so there is nothing
+        // to admit it as.
+        if claimed.is_empty() {
+            return false;
+        }
         let Some(conn) = self.conns.get_mut(&id) else {
             return false;
         };
-        conn.peer = true;
+        if conn.peer.is_some() {
+            return false;
+        }
+        match conn.cert_names.as_slice() {
+            [] if self.require_peer_identity => return false,
+            [] => {}
+            names => {
+                if !names
+                    .iter()
+                    .any(|name| crate::dial::cert_names_member(name, claimed))
+                {
+                    return false;
+                }
+            }
+        }
+        conn.peer = Some(NodeId::from(claimed.to_vec()));
         true
     }
 
-    /// Whether connection `id` has presented the cluster secret — the gate every
-    /// node-to-node frame passes before it reaches a peer handler.
-    fn is_peer(&self, id: ConnId) -> bool {
-        self.conns.get(&id).is_some_and(|conn| conn.peer)
+    /// The cluster member connection `id` was admitted as, or `None` when it has
+    /// presented no cluster secret — the gate every node-to-node frame passes before
+    /// it reaches a peer handler, and the identity each of them is decided against.
+    fn peer_identity(&self, id: ConnId) -> Option<NodeId> {
+        self.conns.get(&id).and_then(|conn| conn.peer.clone())
     }
 
     /// The shared membership + leadership-epoch fence for a node-to-node replication
     /// frame (`Replicate` and `ReplicateSnapshot`) for `room` on `branch` stamped
-    /// `epoch`. A frame is applied only while this node merely *follows* `room`: it
-    /// must hold the room (placement) and not itself lead it, unless a strictly higher
-    /// `epoch` supersedes that leadership (the recovered-stale-leader reconciliation),
-    /// and it must name the `main` stream (a leader replicates only `main`). A frame
-    /// below the highest epoch this node has seen is fenced — it comes from a demoted
-    /// leader that missed the promotion, and applying it would resurrect its writes.
+    /// `epoch`, arriving from the member `sender` its link was admitted as. A frame is
+    /// applied only while this node merely *follows* `room`: it must hold the room
+    /// (placement) and not itself lead it, unless a strictly higher `epoch` supersedes
+    /// that leadership (the recovered-stale-leader reconciliation), and it must name
+    /// the `main` stream (a leader replicates only `main`). A frame below the highest
+    /// epoch this node has seen is fenced — it comes from a demoted leader that missed
+    /// the promotion, and applying it would resurrect its writes.
+    ///
+    /// **`sender` must itself hold `room`.** Placement says which members may ever
+    /// lead a room, and a member outside its replica set can hold no copy of it and so
+    /// can never be its leader — so a frame from one is applied under no epoch at all.
+    /// Without that check every admitted member could push ops into any room this node
+    /// replicates and supersede its leadership of any room at will. Inside the replica
+    /// set the epoch is still the only arbiter: a genuinely promoted replica must be
+    /// able to supersede a stale leader, and nothing here distinguishes it from a peer
+    /// replica forging the bump — that needs a real election, not a stronger identity.
+    ///
+    /// The rejection **drops the link** rather than fencing the frame, and that is the
+    /// repair path rather than a cost. Placement is a pure function of the member set,
+    /// so two nodes disagree about who replicates a room for the propagation window of
+    /// every join and every reap, and a legitimate leader is transiently outside a
+    /// room's replica set as this node sees it. Its frames must not be *silently*
+    /// discarded: the steady path mirrors only fresh commits, so the ops fenced during
+    /// that window would never be re-sent and the follower would carry a permanent gap
+    /// that later frames stack on top of. Dropping the link makes the leader redial,
+    /// which re-runs the late-joiner catch-up from the follower's watermark and closes
+    /// the window's gap. The cost is a few redials while gossip converges; the
+    /// alternative is silent divergence.
+    ///
     /// On [`Apply`](ReplicaGate::Apply) the fence is advanced (stepping down if
     /// superseded) and persisted, so a restart reloads it and a later lower-epoch frame
     /// is fenced; the step-down is deferred to here so a rejected frame never churns
     /// this node's leadership epoch.
-    fn gate_replica_frame(&mut self, room: &[u8], branch: &[u8], epoch: u64) -> ReplicaGate {
+    fn gate_replica_frame(&mut self, frame: &ReplicaFrame<'_>) -> ReplicaGate {
+        let ReplicaFrame {
+            sender,
+            room,
+            branch,
+            epoch,
+        } = frame;
+        let (room, branch, epoch) = (room.as_slice(), branch.as_slice(), *epoch);
         let Some(membership) = &self.membership else {
             return ReplicaGate::Reject;
         };
+        // A link claiming to be this node speaks for a leader that is not on the other
+        // end of it; one claiming a node this view has never learned speaks for no
+        // leader at all; and a member that does not replicate the room could never be
+        // its leader.
+        if membership.is_self(sender) || !membership.replicas_for(room).contains(sender) {
+            return ReplicaGate::Reject;
+        }
         let owns = membership.owns(room);
         let leads = membership.is_effective_primary_for(room);
         if epoch < self.epochs.highest_seen(room) {
@@ -574,25 +682,13 @@ impl Registry {
     /// the sequence the replica has reached. Gated by [`gate_replica_frame`](Registry::gate_replica_frame):
     /// a stray frame drops the connection, a stale-epoch one is fenced. Returns
     /// whether the connection stays open.
-    fn apply_replicate(
-        &mut self,
-        id: ConnId,
-        room: RoomId,
-        branch: Vec<u8>,
-        ops: Vec<Op>,
-        base_seq: u64,
-        epoch: u64,
-    ) -> bool {
-        match self.gate_replica_frame(&room, &branch, epoch) {
+    fn apply_replicate(&mut self, id: ConnId, frame: ReplicaFrame<'_>, ops: Vec<Op>) -> bool {
+        match self.gate_replica_frame(&frame) {
             ReplicaGate::Reject => return false,
             ReplicaGate::Fenced => return true,
             ReplicaGate::Apply => {}
         }
-        // `base_seq` is the leader's compaction floor. Unit 4 replicates the whole log
-        // from the first op, so a follower on the ops path already tracks the leader's
-        // sequence space (a below-floor follower takes the snapshot path instead), and
-        // the ack needs no adjustment.
-        let _ = base_seq;
+        let room = frame.room;
         // Ingest through the same path a client `Ops` write uses. A replicated write
         // carries no schema version — the leader logs its writers' ops untagged on the
         // relay seam, and the follower mirrors them verbatim.
@@ -618,17 +714,16 @@ impl Registry {
     fn apply_replicate_snapshot(
         &mut self,
         id: ConnId,
-        room: RoomId,
-        branch: Vec<u8>,
+        frame: ReplicaFrame<'_>,
         seq: u64,
         state: Vec<u8>,
-        epoch: u64,
     ) -> bool {
-        match self.gate_replica_frame(&room, &branch, epoch) {
+        match self.gate_replica_frame(&frame) {
             ReplicaGate::Reject => return false,
             ReplicaGate::Fenced => return true,
             ReplicaGate::Apply => {}
         }
+        let room = frame.room;
         if self.hub.install_snapshot(&room, &state, seq).is_err() {
             return false;
         }
@@ -673,6 +768,14 @@ impl Registry {
     /// Merge a gossiped liveness payload into this node's membership — the SWIM
     /// anti-entropy merge that both grows the member set and converges its liveness
     /// toward a cluster-wide view. Inert in single-node mode (no membership).
+    ///
+    /// The payload is merged as given, so a caller hands over only what it is willing
+    /// to have introduced. The *reply* half of a push-pull round hands over everything:
+    /// it came from a node this one chose to dial, the set a node dials is its own
+    /// member set rooted in static configuration, and growing it from a node already in
+    /// it is how a joiner learns the cluster in one round. The *inbound* half is the one
+    /// an unknown peer can reach, and it filters first — a peer introduces only itself,
+    /// at its own address ([`apply_gossip`](Self::apply_gossip)).
     pub fn merge_gossip(&mut self, members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>) {
         if let Some(membership) = &mut self.membership {
             membership.merge_liveness(
@@ -709,20 +812,48 @@ impl Registry {
         }
     }
 
-    /// Apply an inbound [`Message::Gossip`] on peer connection `id`: merge the
-    /// advertised liveness into this node's view, then answer with this node's own
-    /// so the exchange syncs both directions (push-pull anti-entropy). Honored only
-    /// in cluster mode — a Gossip on a single-node deployment (no membership) is a
-    /// stray frame and the connection is dropped. Returns whether the connection
-    /// stays open.
+    /// Apply an inbound [`Message::Gossip`] from the member `sender` on peer
+    /// connection `id`: merge the advertised liveness into this node's view, then
+    /// answer with this node's own so the exchange syncs both directions (push-pull
+    /// anti-entropy). Honored only in cluster mode — a Gossip on a single-node
+    /// deployment (no membership) is a stray frame and the connection is dropped.
+    /// Returns whether the connection stays open.
+    ///
+    /// **A member reached this way introduces only itself, at its own address.** A
+    /// tuple naming a node this view already knows is merged whole (that is SWIM
+    /// dissemination — a `Dead` verdict has to travel, and a known member's dial
+    /// address is never re-learned anyway), but a tuple naming an *unknown* node is
+    /// adopted only when it is the sender's own **and** the dial address it carries is
+    /// that same id. Both halves are needed: without the first, any admitted peer
+    /// plants an arbitrary member in every node's set; without the second it plants
+    /// its own id pointing at an address it chose, which every node then dials and
+    /// hands the cluster secret to just the same. A node id *is* its advertise
+    /// address, so the constraint costs a legitimate joiner nothing. It holds for this
+    /// path only: the reply half ([`merge_gossip`](Self::merge_gossip)) adopts a member
+    /// at whatever address its tuple carries, because the node whose reply it is was
+    /// chosen from this node's own member set.
+    ///
+    /// A joining node still converges: it learns the cluster from the seed it *dialed*
+    /// (see [`merge_gossip`](Self::merge_gossip), the reply path) and then introduces
+    /// itself to each member directly.
     fn apply_gossip(
         &mut self,
         id: ConnId,
+        sender: &NodeId,
         members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>,
     ) -> bool {
-        if self.membership.is_none() {
+        let Some(membership) = &self.membership else {
             return false;
-        }
+        };
+        let members = members
+            .into_iter()
+            .filter(|(node, addr, ..)| {
+                // `is_member` holds for self too — a node is a member of its own view
+                // from construction and is never reaped out of it.
+                let node = NodeId::from(node.clone());
+                membership.is_member(&node) || (&node == sender && addr == node.as_bytes())
+            })
+            .collect();
         self.merge_gossip(members);
         let reply = crate::gossip::gossip_frame(&self.known_liveness());
         if let Some(conn) = self.conns.get_mut(&id) {
@@ -731,20 +862,36 @@ impl Registry {
         true
     }
 
-    /// Apply an inbound [`Message::FollowerHeads`]: catch the reporting follower up
-    /// from the durable heads it named, honoring them over any remembered ack (the
-    /// wiped-follower self-heal). Self-describing — the follower's id rides the frame
-    /// — so this needs no connection→node mapping, exactly like a Gossip. Honored only
-    /// in cluster mode; a report on a single-node deployment is a stray frame and the
-    /// connection is dropped. The catch-up frames are queued for the follower and the
-    /// transport routes them over its peer connection. Returns whether the connection
-    /// stays open.
-    fn apply_follower_heads(&mut self, reporter: Vec<u8>, heads: Vec<(RoomId, u64)>) -> bool {
+    /// Apply an inbound [`Message::FollowerHeads`] from the member `sender` its link
+    /// was admitted as: catch the reporting follower up from the durable heads it
+    /// named, honoring them over any remembered ack (the wiped-follower self-heal).
+    /// Honored only in cluster mode; a report on a single-node deployment is a stray
+    /// frame and the connection is dropped. The catch-up frames are queued for the
+    /// follower and the transport routes them over its peer connection. Returns whether
+    /// the connection stays open.
+    ///
+    /// **A node reports only its own heads.** The frame names its reporter, but the
+    /// name is a claim checked against the link's established identity, not an
+    /// instruction: a report is authoritative because a node is the only authority on
+    /// what it durably holds, and the moment one member can name another it can credit
+    /// a third node with data that node does not have — which raises that node's
+    /// watermark and makes majority-ack release a client `Accepted` for a write no
+    /// majority ever held. A mismatch is a member speaking for someone else, or a node
+    /// whose configured id disagrees with the one its link claimed, and the connection
+    /// is dropped either way.
+    fn apply_follower_heads(
+        &mut self,
+        sender: &NodeId,
+        reporter: Vec<u8>,
+        heads: Vec<(RoomId, u64)>,
+    ) -> bool {
         if self.membership.is_none() {
             return false;
         }
-        let follower = NodeId::from(reporter);
-        self.catch_up_follower_reporting(&follower, &heads);
+        if NodeId::from(reporter) != *sender {
+            return false;
+        }
+        self.catch_up_follower_reporting(sender, &heads);
         true
     }
 
@@ -932,6 +1079,25 @@ impl Registry {
         self.insert_conn(Session::authenticated(identity))
     }
 
+    /// Open a connection already authenticated as `identity` by a verified mTLS
+    /// client certificate — [`connect_authenticated`](Self::connect_authenticated)
+    /// plus every name that certificate carries. Those names are what lets the peer
+    /// plane bind the link to a member: an in-band credential names an actor the
+    /// deployment's verifier chose to trust, which says nothing about which node is on
+    /// the other end of the socket. The session's own actor stays the leading name, so
+    /// a certificate authenticates one actor however many ways it spells its host.
+    pub fn connect_cert_authenticated(
+        &mut self,
+        identity: Identity,
+        names: Vec<Vec<u8>>,
+    ) -> ConnId {
+        let id = self.connect_authenticated(identity);
+        if let Some(conn) = self.conns.get_mut(&id) {
+            conn.cert_names = names;
+        }
+        id
+    }
+
     fn insert_conn(&mut self, session: Session) -> ConnId {
         let id = ConnId(self.next);
         self.next += 1;
@@ -940,7 +1106,8 @@ impl Registry {
             Conn {
                 session,
                 outbox: Vec::new(),
-                peer: false,
+                peer: None,
+                cert_names: Vec::new(),
             },
         );
         self.hub.emit(EngineEvent::Connected { conn: id });
@@ -1640,8 +1807,8 @@ impl Registry {
         // ahead of everything else and never answered: a wrong or unconfigured
         // secret drops the connection with no reply, so a guess costs a fresh
         // connection and learns nothing from what comes back.
-        if let Message::PeerAuth { secret } = &msg {
-            return self.authenticate_peer(id, secret);
+        if let Message::PeerAuth { node, secret } = &msg {
+            return self.authenticate_peer(id, node, secret);
         }
         // A Replicate or a Gossip arrives node-to-node on a peer connection, not
         // from a client on its data plane — intercept each before the client
@@ -1649,7 +1816,7 @@ impl Registry {
         // presented the cluster secret. On any other connection they fall through
         // to the session step, which answers each with the protocol violation it
         // is: the node-to-node handlers are unreachable from the client plane.
-        let msg = if self.is_peer(id) {
+        let msg = if let Some(sender) = self.peer_identity(id) {
             match msg {
                 Message::Replicate {
                     room,
@@ -1657,21 +1824,43 @@ impl Registry {
                     ops,
                     base_seq,
                     epoch,
-                } => return self.apply_replicate(id, room, branch, ops, base_seq, epoch),
+                } => {
+                    // `base_seq` is the leader's compaction floor. Unit 4 replicates
+                    // the whole log from the first op, so a follower on the ops path
+                    // already tracks the leader's sequence space (a below-floor
+                    // follower takes the snapshot path instead), and the ack needs no
+                    // adjustment.
+                    let _ = base_seq;
+                    let frame = ReplicaFrame {
+                        sender: &sender,
+                        room,
+                        branch,
+                        epoch,
+                    };
+                    return self.apply_replicate(id, frame, ops);
+                }
                 Message::ReplicateSnapshot {
                     room,
                     branch,
                     seq,
                     state,
                     epoch,
-                } => return self.apply_replicate_snapshot(id, room, branch, seq, state, epoch),
-                Message::Gossip { members } => return self.apply_gossip(id, members),
+                } => {
+                    let frame = ReplicaFrame {
+                        sender: &sender,
+                        room,
+                        branch,
+                        epoch,
+                    };
+                    return self.apply_replicate_snapshot(id, frame, seq, state);
+                }
+                Message::Gossip { members } => return self.apply_gossip(id, &sender, members),
                 // A follower's durable-head report arrives node-to-node on a peer
                 // connection; catch it up from the reported heads off the client session
-                // path. Self-describing (it names the reporting node), so no connection
-                // identity beyond peer admission is needed — handled exactly as a Gossip.
+                // path. The reporter it names must be the member the link was admitted
+                // as — a node is authoritative for its own durable state and no other's.
                 Message::FollowerHeads { reporter, heads } => {
-                    return self.apply_follower_heads(reporter, heads)
+                    return self.apply_follower_heads(&sender, reporter, heads)
                 }
                 // A ping-req arrives node-to-node on a peer connection asking this relay
                 // for its liveness view of a third member; answer it off the client

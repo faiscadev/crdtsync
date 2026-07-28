@@ -60,6 +60,10 @@ const CONVERGE: Duration = Duration::from_secs(60);
 /// nobody else does.
 const SECRET: &[u8] = b"cluster-secret-of-at-least-32-bytes";
 
+/// The node id a bare probe dial claims. These tests drive the transport, not the
+/// identity binding, so the claim only has to be a well-formed member id.
+const PROBE_NODE: &[u8] = b"127.0.0.1:0";
+
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
     b[0] = first;
@@ -446,6 +450,7 @@ async fn anti_entropy_and_ping_req_round_trip_over_tls() {
     ));
 
     let dialer = PeerDialer::new(
+        PROBE_NODE.into(),
         Arc::from(SECRET),
         Some(client_config_from_pem(&ca.ca_path).unwrap()),
         false,
@@ -498,7 +503,7 @@ async fn a_plaintext_dial_to_a_tls_listener_reaches_nothing() {
         },
     ));
 
-    let plain = PeerDialer::new(Arc::from(SECRET), None, false);
+    let plain = PeerDialer::new(PROBE_NODE.into(), Arc::from(SECRET), None, false);
     assert!(
         gossip_exchange(&tls_addr, cid(0), &plain, gossip_frame(&[]))
             .await
@@ -540,6 +545,7 @@ async fn a_squatter_at_a_members_address_never_receives_the_cluster_secret() {
     });
 
     let dialer = PeerDialer::new(
+        PROBE_NODE.into(),
         Arc::from(SECRET),
         Some(client_config_from_pem(&ca.ca_path).unwrap()),
         false,
@@ -581,6 +587,7 @@ async fn a_certificate_from_another_authority_is_not_a_member() {
     ));
 
     let dialer = PeerDialer::new(
+        PROBE_NODE.into(),
         Arc::from(SECRET),
         Some(client_config_from_pem(&cluster_ca.ca_path).unwrap()),
         false,
@@ -617,6 +624,7 @@ async fn a_cluster_certificate_for_another_address_is_not_this_member() {
     ));
 
     let dialer = PeerDialer::new(
+        PROBE_NODE.into(),
         Arc::from(SECRET),
         Some(client_config_from_pem(&ca.ca_path).unwrap()),
         false,
@@ -806,6 +814,7 @@ async fn a_dialer_with_no_identity_is_refused_by_a_mutual_peer_listener() {
     ));
 
     let certless = PeerDialer::new(
+        PROBE_NODE.into(),
         Arc::from(SECRET),
         Some(client_config_from_pem(&ca.ca_path).unwrap()),
         false,
@@ -1001,6 +1010,7 @@ async fn a_dial_to_a_far_end_that_never_speaks_gives_up() {
     });
 
     let dialer = PeerDialer::new(
+        PROBE_NODE.into(),
         Arc::from(SECRET),
         Some(client_config_from_pem(&ca.ca_path).unwrap()),
         false,

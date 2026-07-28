@@ -64,7 +64,7 @@ pub use schema_registry::{RegisterError, Registered, Resolution, SchemaRegistry}
 pub use session::{negotiate, step, AwarenessBroadcast, Response, Session};
 pub use store::{Branch, RoomLog, RoomMeta, Snapshot, Store, StoredOp};
 pub use tls::{
-    actor_from_client_cert, client_config_from_pem, client_config_from_pem_with_identity,
+    client_config_from_pem, client_config_from_pem_with_identity, identities_from_client_cert,
     server_config_from_pem, server_config_from_pem_with_client_ca,
     server_config_from_pem_with_client_ca_mode, ClientAuthMode, TlsConfigError,
 };

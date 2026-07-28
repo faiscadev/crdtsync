@@ -22,6 +22,7 @@ use std::sync::Arc;
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Scalar};
 use crdtsync_server::membership::Membership;
+use crdtsync_server::placement::NodeId;
 use crdtsync_server::store::Store;
 use crdtsync_server::{ConnId, ManualClock, Registry};
 
@@ -135,12 +136,24 @@ fn sub(room: &[u8]) -> Message {
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
 /// A connection admitted to `r`'s peer plane, as a member's dialed link is.
-fn peer_conn(r: &mut Registry) -> ConnId {
+fn peer_conn(r: &mut Registry, room: &[u8]) -> ConnId {
+    let node = r
+        .membership()
+        .and_then(|m| m.replicas_for(room).into_iter().find(|n| !m.is_self(n)))
+        .unwrap_or_else(|| NodeId::from("10.0.0.1:9000"));
+    peer_conn_as(r, &node)
+}
+
+/// A connection admitted to the peer plane as the member `node` — peer admission
+/// binds the link to a member, and every node-to-node frame on it is decided
+/// against that identity rather than anything the frame itself names.
+fn peer_conn_as(r: &mut Registry, node: &NodeId) -> ConnId {
     let id = r.connect();
     assert!(
         r.deliver(
             id,
             Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
                 secret: CLUSTER_SECRET.to_vec(),
             },
         ),
@@ -160,7 +173,7 @@ fn an_observed_epoch_survives_a_restart() {
 
     {
         let mut r = node(Store::open(tmp.path()).unwrap());
-        let peer = peer_conn(&mut r);
+        let peer = peer_conn(&mut r, &room);
         // The room advances to epoch 5 under a leader — the follower observes it.
         assert!(r.deliver(peer, replicate(&mut w, &room, 5, b"a", 1)));
         assert_eq!(r.highest_epoch(&room), 5, "the follower observed epoch 5");
@@ -178,7 +191,7 @@ fn an_observed_epoch_survives_a_restart() {
     // reloaded node still remembers epoch 5. Without persistence it would have
     // re-accepted this.
     let seq_before = r.hub().seq(&room);
-    let stale = peer_conn(&mut r);
+    let stale = peer_conn(&mut r, &room);
     let kept = r.deliver(stale, replicate(&mut w, &room, 3, b"resurrected", 999));
     assert!(kept, "a fenced frame is dropped, not a violation");
     assert_eq!(
@@ -199,14 +212,14 @@ fn a_fresh_higher_epoch_still_applies_after_a_restart() {
 
     {
         let mut r = node(Store::open(tmp.path()).unwrap());
-        let peer = peer_conn(&mut r);
+        let peer = peer_conn(&mut r, &room);
         assert!(r.deliver(peer, replicate(&mut w, &room, 5, b"a", 1)));
     }
 
     let mut r = node(Store::open(tmp.path()).unwrap());
     assert_eq!(r.highest_epoch(&room), 5);
     // A genuine promotion past the reloaded fence is applied and acked.
-    let peer = peer_conn(&mut r);
+    let peer = peer_conn(&mut r, &room);
     let seq_before = r.hub().seq(&room);
     assert!(r.deliver(peer, replicate(&mut w, &room, 6, b"b", 2)));
     assert_eq!(

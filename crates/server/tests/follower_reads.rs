@@ -151,7 +151,7 @@ fn caught_up_follower(leader: &mut Registry, room: &[u8], writes: usize) -> Regi
     commit_writes(leader, room, writes);
     let frames = leader.take_replication();
     let mut follower = node(Some(B));
-    let peer = peer_conn(&mut follower);
+    let peer = peer_conn(&mut follower, room);
     for (nodeid, frame) in frames {
         if nodeid == b {
             assert!(follower.deliver(peer, frame), "follower applies the frame");
@@ -171,12 +171,24 @@ fn caught_up_follower(leader: &mut Registry, room: &[u8], writes: usize) -> Regi
 const CLUSTER_SECRET: &[u8] = b"peer-plane-cluster-secret-for-tests";
 
 /// A connection admitted to `r`'s peer plane, as a member's dialed link is.
-fn peer_conn(r: &mut Registry) -> ConnId {
+fn peer_conn(r: &mut Registry, room: &[u8]) -> ConnId {
+    let node = r
+        .membership()
+        .and_then(|m| m.replicas_for(room).into_iter().find(|n| !m.is_self(n)))
+        .unwrap_or_else(|| NodeId::from("10.0.0.1:9000"));
+    peer_conn_as(r, &node)
+}
+
+/// A connection admitted to the peer plane as the member `node` — peer admission
+/// binds the link to a member, and every node-to-node frame on it is decided
+/// against that identity rather than anything the frame itself names.
+fn peer_conn_as(r: &mut Registry, node: &NodeId) -> ConnId {
     let id = r.connect();
     assert!(
         r.deliver(
             id,
             Message::PeerAuth {
+                node: node.as_bytes().to_vec(),
                 secret: CLUSTER_SECRET.to_vec(),
             },
         ),

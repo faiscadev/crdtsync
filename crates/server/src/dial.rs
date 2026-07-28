@@ -107,6 +107,74 @@ impl PeerEndpoint {
     }
 }
 
+/// The host an advertise address names, with its scheme, port and path stripped —
+/// the part of a member's identity a certificate can carry. A bracketed IPv6
+/// literal keeps its brackets off but its colons intact, so `[::1]:9000` is `::1`
+/// rather than everything up to the last colon. `None` when the address resolves to
+/// no endpoint, or names no host at all.
+///
+/// This is the whole of the node-id↔certificate-subject mapping: a member's
+/// advertise address already agrees cluster-wide and already rides gossip, and its
+/// host is exactly what a TLS certificate legitimately names — the same fact the
+/// dialer verifies in the other direction when it authenticates the acceptor.
+pub fn member_host(addr: &[u8]) -> Option<String> {
+    let addr = std::str::from_utf8(addr).ok()?;
+    let endpoint = PeerEndpoint::parse(addr).ok()?;
+    let authority = endpoint
+        .url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&endpoint.url);
+    let authority = authority.split('/').next().unwrap_or(authority);
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next()?,
+        None => authority.split(':').next()?,
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether a verified peer certificate's subject `name` establishes the connection
+/// as the member at advertise address `addr` — the binding from a certificate the
+/// cluster's CA issued to a place in the placement set.
+///
+/// The rule is one comparison: the certificate names the member's *host*, matched
+/// without regard to case as DNS names are. The port is deliberately not part of it
+/// — no certificate can carry one — so nodes sharing a host are one trust unit and
+/// may speak for each other.
+///
+/// An IP literal is compared as an *address*, not as a string, since one address has
+/// many spellings: a certificate's IP SAN arrives canonicalized from its octets while
+/// an advertise address holds whatever the operator wrote, and `[2001:0db8::0:1]` and
+/// `2001:db8::1` are the same member. A DNS name is compared without its root label,
+/// for the same reason.
+pub fn cert_names_member(name: &[u8], addr: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    let Some(host) = member_host(addr) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    match (
+        host.parse::<std::net::IpAddr>(),
+        name.parse::<std::net::IpAddr>(),
+    ) {
+        (Ok(host), Ok(name)) => host == name,
+        _ => strip_root_dot(&host) == strip_root_dot(&name),
+    }
+}
+
+/// A DNS name without its root label — `node-a.internal.` and `node-a.internal` name
+/// one host, and a certificate and an advertise address need not spell it the same
+/// way.
+fn strip_root_dot(name: &str) -> &str {
+    name.strip_suffix('.').unwrap_or(name)
+}
+
 /// An advertise address no dial can be built from — a configuration error,
 /// surfaced at startup for a configured member and per dial for a gossiped one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,29 +254,44 @@ impl DialError {
 
 impl std::error::Error for DialError {}
 
-/// Everything an outbound node-to-node link needs: the cluster secret it presents
-/// once open, the trust anchors (and optional client identity) that authenticate
-/// the acceptor first, and whether a plaintext member may be dialed at all.
+/// Everything an outbound node-to-node link needs: the node id it claims and the
+/// cluster secret it presents once open, the trust anchors (and optional client
+/// identity) that authenticate the acceptor first, and whether a plaintext member
+/// may be dialed at all.
 ///
 /// One dialer is shared by every peer link a node opens, so the transport policy
 /// is decided in exactly one place.
 #[derive(Clone)]
 pub struct PeerDialer {
+    node: Arc<[u8]>,
     secret: Arc<[u8]>,
     tls: Option<Arc<ClientConfig>>,
     require_tls: bool,
 }
 
 impl PeerDialer {
-    /// A dialer presenting `secret` on every link it opens, authenticating a TLS
-    /// member against `tls` when one is configured, and refusing plaintext members
-    /// outright when `require_tls`.
-    pub fn new(secret: Arc<[u8]>, tls: Option<Arc<ClientConfig>>, require_tls: bool) -> Self {
+    /// A dialer claiming `node` and presenting `secret` on every link it opens,
+    /// authenticating a TLS member against `tls` when one is configured, and
+    /// refusing plaintext members outright when `require_tls`.
+    pub fn new(
+        node: Arc<[u8]>,
+        secret: Arc<[u8]>,
+        tls: Option<Arc<ClientConfig>>,
+        require_tls: bool,
+    ) -> Self {
         Self {
+            node,
             secret,
             tls,
             require_tls,
         }
+    }
+
+    /// The node id a link claims in its `PeerAuth` — this node's own advertise
+    /// address, which the acceptor binds the connection to (and, under peer mTLS,
+    /// checks against the certificate this dial presented).
+    pub fn node(&self) -> &[u8] {
+        &self.node
     }
 
     /// The cluster secret a link presents in its `PeerAuth` once open.
@@ -260,7 +343,12 @@ mod tests {
     use super::*;
 
     fn plain_dialer() -> PeerDialer {
-        PeerDialer::new(Arc::from(&b"secret"[..]), None, false)
+        PeerDialer::new(
+            Arc::from(&b"10.0.0.1:9000"[..]),
+            Arc::from(&b"secret"[..]),
+            None,
+            false,
+        )
     }
 
     #[test]
@@ -342,7 +430,12 @@ mod tests {
     fn a_dialer_that_requires_tls_refuses_a_plaintext_member() {
         // The end of a rollout: a member still advertising plaintext is not dialed
         // at all rather than handed the secret in the clear.
-        let dialer = PeerDialer::new(Arc::from(&b"secret"[..]), None, true);
+        let dialer = PeerDialer::new(
+            Arc::from(&b"10.0.0.1:9000"[..]),
+            Arc::from(&b"secret"[..]),
+            None,
+            true,
+        );
         assert!(matches!(
             dialer.endpoint("10.0.0.1:9000"),
             Err(DialError::PlaintextRefused)
@@ -375,5 +468,124 @@ mod tests {
     #[test]
     fn a_dialer_carries_the_cluster_secret_the_link_presents() {
         assert_eq!(plain_dialer().secret(), b"secret");
+    }
+
+    #[test]
+    fn a_dialer_carries_the_node_id_the_link_claims() {
+        assert_eq!(plain_dialer().node(), b"10.0.0.1:9000");
+    }
+
+    // --- the node-id to certificate-subject binding ---
+
+    #[test]
+    fn a_members_host_is_read_out_of_its_advertise_address() {
+        assert_eq!(
+            member_host(b"node-a.internal:9000").as_deref(),
+            Some("node-a.internal")
+        );
+        assert_eq!(
+            member_host(b"wss://node-a.internal:9000").as_deref(),
+            Some("node-a.internal")
+        );
+        assert_eq!(
+            member_host(b"ws://node-a.internal:9000/sync").as_deref(),
+            Some("node-a.internal")
+        );
+        assert_eq!(member_host(b"10.0.0.1:9000").as_deref(), Some("10.0.0.1"));
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_literal_keeps_its_colons() {
+        // Splitting on the last colon would make `[::1]:9000` the host `[:`.
+        assert_eq!(member_host(b"wss://[::1]:9000").as_deref(), Some("::1"));
+        assert_eq!(
+            member_host(b"[2001:db8::1]:9000").as_deref(),
+            Some("2001:db8::1")
+        );
+    }
+
+    #[test]
+    fn an_address_that_resolves_to_no_endpoint_names_no_host() {
+        assert_eq!(member_host(b""), None);
+        assert_eq!(member_host(b"http://node-a:9000"), None);
+        assert_eq!(member_host(&[0xff, 0xfe]), None);
+    }
+
+    #[test]
+    fn a_certificate_naming_a_members_host_establishes_that_member() {
+        assert!(cert_names_member(
+            b"node-a.internal",
+            b"wss://node-a.internal:9000"
+        ));
+        // The port is no part of the binding — no certificate can carry one — so a
+        // member keeps its identity across a port change.
+        assert!(cert_names_member(
+            b"node-a.internal",
+            b"wss://node-a.internal:9443"
+        ));
+    }
+
+    #[test]
+    fn an_ip_literal_is_matched_as_an_address_rather_than_as_a_string() {
+        // A certificate's IP SAN arrives canonicalized from its octets; an advertise
+        // address holds whatever the operator wrote. Both spell one member.
+        assert!(cert_names_member(
+            b"2001:db8::1",
+            b"wss://[2001:0db8:0000:0000:0000:0000:0000:0001]:9000"
+        ));
+        assert!(cert_names_member(b"127.0.0.1", b"wss://127.0.0.1:9000"));
+        assert!(!cert_names_member(
+            b"2001:db8::2",
+            b"wss://[2001:db8::1]:9000"
+        ));
+    }
+
+    #[test]
+    fn an_address_and_a_name_never_bind_each_other() {
+        assert!(!cert_names_member(
+            b"node-a.internal",
+            b"wss://10.0.0.1:9000"
+        ));
+        assert!(!cert_names_member(
+            b"10.0.0.1",
+            b"wss://node-a.internal:9000"
+        ));
+    }
+
+    #[test]
+    fn a_certificate_subject_is_matched_without_regard_to_case() {
+        assert!(cert_names_member(
+            b"Node-A.Internal",
+            b"wss://node-a.INTERNAL:9000"
+        ));
+    }
+
+    #[test]
+    fn a_certificate_naming_another_host_establishes_nothing() {
+        assert!(!cert_names_member(
+            b"node-b.internal",
+            b"wss://node-a.internal:9000"
+        ));
+        // Nor does a prefix or suffix of the host, which a substring rule would admit.
+        assert!(!cert_names_member(b"node-a", b"wss://node-a.internal:9000"));
+        assert!(!cert_names_member(
+            b"internal",
+            b"wss://node-a.internal:9000"
+        ));
+    }
+
+    #[test]
+    fn an_empty_or_unusable_certificate_subject_establishes_nothing() {
+        assert!(!cert_names_member(b"", b"wss://node-a.internal:9000"));
+        assert!(!cert_names_member(b"   ", b"wss://node-a.internal:9000"));
+        assert!(!cert_names_member(
+            &[0xff, 0xfe],
+            b"wss://node-a.internal:9000"
+        ));
+        // Nor does any subject establish a member whose address names no host.
+        assert!(!cert_names_member(
+            b"node-a.internal",
+            b"http://node-a.internal:9000"
+        ));
     }
 }

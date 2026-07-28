@@ -14,10 +14,11 @@
 //! mTLS (client-cert authentication) is opt-in on top of that: configure a
 //! trust-anchor bundle and [`server_config_from_pem_with_client_ca`] swaps the
 //! `with_no_client_auth` slot for a [`WebPkiClientVerifier`] against those roots.
-//! A verified client cert's identity (its SAN, falling back to CN) is extracted
-//! with [`actor_from_client_cert`] and bound as the connection's authenticated
-//! actor — the same ACL principal an in-band credential establishes, reached over
-//! the transport instead.
+//! The names a verified client cert carries (its SANs, falling back to its CN) are
+//! extracted with [`identities_from_client_cert`]: the leading one is bound as the
+//! connection's authenticated actor — the same ACL principal an in-band credential
+//! establishes, reached over the transport instead — and the peer plane weighs all of
+//! them against the member a node-to-node link claims to be.
 //!
 //! [`ClientAuthMode`] selects how strict the client-cert requirement is:
 //!
@@ -187,7 +188,7 @@ pub fn server_config_from_pem(
 /// fail-closed at the handshake: a client presenting no cert, or one that does not
 /// chain to a configured root, is rejected by rustls before the connection ever
 /// reaches the wire protocol. A verified connection's peer cert is later mapped to
-/// an actor by [`actor_from_client_cert`].
+/// an actor by [`identities_from_client_cert`].
 ///
 /// An empty client-CA bundle is a loud [`NoClientCa`](TlsConfigError::NoClientCa)
 /// error, never a silent fall back to server-auth-only: a deployment that asked
@@ -401,32 +402,137 @@ fn load_roots(
     Ok(roots)
 }
 
-/// The actor identity a verified client certificate authenticates as: the leaf
-/// cert's Subject Alternative Name (the first DNS, email, or URI entry), falling
-/// back to its Subject Common Name. `None` when the cert parses but carries
-/// neither — the caller treats that as a rejection, never as an anonymous or
-/// default actor, so an identity-less cert cannot slip past authentication.
+/// The textual form of an IP-address SAN's octets — dotted-quad for a v4 entry and
+/// the canonical compressed form for a v6 one, matching how an advertise address
+/// spells a host. `None` for any other length, which is not an IP address at all.
+fn ip_san(octets: &[u8]) -> Option<String> {
+    match octets.len() {
+        4 => {
+            let v4: [u8; 4] = octets.try_into().ok()?;
+            Some(std::net::Ipv4Addr::from(v4).to_string())
+        }
+        16 => {
+            let v6: [u8; 16] = octets.try_into().ok()?;
+            Some(std::net::Ipv6Addr::from(v6).to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Every identity a verified client certificate carries, in certificate order: each
+/// Subject Alternative Name entry that names something (DNS, email, URI, or IP
+/// address), falling back to the Subject Common Name when the SAN names nothing this
+/// understands — a certificate with no SAN at all, or one carrying only general-name
+/// kinds no identity can be read from. Empty when the cert parses but names nothing — the caller treats that
+/// as a rejection, never as an anonymous or default actor, so an identity-less cert
+/// cannot slip past authentication.
 ///
-/// The returned bytes are the UTF-8 of the name, fed into the same
+/// All of them, not just the first, because a node certificate conventionally names
+/// its host several ways at once — `DNS:node-a.internal` alongside `IP:10.0.0.6` —
+/// and a cluster member is addressed by whichever of those its advertise address
+/// happens to spell. Peer identity admits a link when *any* name binds it to the
+/// member, the same way a TLS client verifies an acceptor against the name it dialed.
+///
+/// An IP-address SAN yields the address in its textual form, which is what a cluster
+/// member's advertise address holds.
+///
+/// The returned bytes are the UTF-8 of each name, fed into the same
 /// authenticated-actor plumbing an in-band credential's actor uses.
-pub fn actor_from_client_cert(leaf: &CertificateDer<'_>) -> Option<Vec<u8>> {
-    let (_, cert) = X509Certificate::from_der(leaf.as_ref()).ok()?;
+pub fn identities_from_client_cert(leaf: &CertificateDer<'_>) -> Vec<Vec<u8>> {
+    let Ok((_, cert)) = X509Certificate::from_der(leaf.as_ref()) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
     if let Ok(Some(san)) = cert.subject_alternative_name() {
         for name in &san.value.general_names {
             let value = match name {
-                GeneralName::DNSName(s) | GeneralName::RFC822Name(s) | GeneralName::URI(s) => *s,
+                GeneralName::DNSName(s) | GeneralName::RFC822Name(s) | GeneralName::URI(s) => {
+                    (*s).to_string()
+                }
+                GeneralName::IPAddress(octets) => match ip_san(octets) {
+                    Some(addr) => addr,
+                    None => continue,
+                },
                 _ => continue,
             };
             if !value.is_empty() {
-                return Some(value.as_bytes().to_vec());
+                names.push(value.into_bytes());
             }
         }
     }
-    let cn = cert
-        .subject()
-        .iter_common_name()
-        .filter_map(|cn| cn.as_str().ok())
-        .find(|cn| !cn.is_empty())
-        .map(|cn| cn.as_bytes().to_vec());
-    cn
+    if names.is_empty() {
+        names.extend(
+            cert.subject()
+                .iter_common_name()
+                .filter_map(|cn| cn.as_str().ok())
+                .filter(|cn| !cn.is_empty())
+                .map(|cn| cn.as_bytes().to_vec()),
+        );
+    }
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{identities_from_client_cert, ip_san};
+    use tokio_rustls::rustls::pki_types::CertificateDer;
+
+    /// A self-signed leaf naming `sans` (rcgen reads an IP literal as an IP SAN and
+    /// anything else as a DNS name) with Common Name `cn`, as DER.
+    fn leaf(cn: &str, sans: &[&str]) -> CertificateDer<'static> {
+        let mut params =
+            rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        CertificateDer::from(cert.der().to_vec())
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn every_name_a_certificate_carries_is_read_in_certificate_order() {
+        // A node cert conventionally spells its host both ways at once, and the
+        // member is addressed by whichever one its advertise address uses — so the
+        // peer binding needs all of them, not the leading one.
+        let der = leaf("node-a", &["node-a.internal", "10.0.0.6"]);
+        assert_eq!(
+            identities_from_client_cert(&der),
+            vec![b"node-a.internal".to_vec(), b"10.0.0.6".to_vec()],
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_certificate_with_no_san_falls_back_to_its_common_name() {
+        let der = leaf("node-a", &[]);
+        assert_eq!(identities_from_client_cert(&der), vec![b"node-a".to_vec()]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_certificate_naming_nothing_authenticates_as_nothing() {
+        // Fail-closed: the caller rejects such a link rather than admitting it
+        // anonymously.
+        let der = leaf("", &[]);
+        assert!(identities_from_client_cert(&der).is_empty());
+    }
+
+    #[test]
+    fn an_ip_address_san_reads_as_the_address_a_member_advertises() {
+        assert_eq!(ip_san(&[127, 0, 0, 1]).as_deref(), Some("127.0.0.1"));
+        assert_eq!(ip_san(&[10, 0, 0, 6]).as_deref(), Some("10.0.0.6"));
+        let mut v6 = [0u8; 16];
+        v6[15] = 1;
+        assert_eq!(ip_san(&v6).as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn octets_of_no_address_length_read_as_nothing() {
+        assert_eq!(ip_san(&[]), None);
+        assert_eq!(ip_san(&[127, 0, 0]), None);
+        assert_eq!(ip_san(&[0u8; 17]), None);
+    }
 }
