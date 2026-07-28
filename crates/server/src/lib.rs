@@ -454,6 +454,11 @@ pub enum Catchup {
     /// The subscriber fell below the floor: load this whole-replica state, then
     /// treat `seq` as the sequence it has now caught up to.
     Snapshot { seq: u64, state: Vec<u8> },
+    /// The stream cannot be served: the branch owns a base this node cannot decode,
+    /// so neither the state nor a delta over it is known. Distinct from an empty
+    /// delta on purpose — reading "unknown" as "nothing to send" is what let a
+    /// publish freeze an empty document over a live branch.
+    Unavailable,
 }
 
 /// A named version: a whole-replica snapshot captured at the server sequence it
@@ -1361,9 +1366,8 @@ impl Hub {
                 .map(|log| log.ops.as_slice())
                 .unwrap_or(&[]);
             if last_seen_seq < fork_point {
-                let mut doc = match Document::decode_state(base) {
-                    Ok(doc) => doc,
-                    Err(_) => return Catchup::Ops(Vec::new()),
+                let Ok(mut doc) = Document::decode_state(base) else {
+                    return Catchup::Unavailable;
                 };
                 for rec in tail {
                     doc.apply(&rec.op);
@@ -1747,17 +1751,19 @@ impl Hub {
     /// moved nodes whose zone the batch changes, each with the zone ids it moves
     /// between. The redemption gate reads these to check a cross-zone-move token's
     /// binding against the batch's actual crossing. Empty for an unknown room, a
-    /// batch that moves nothing, or a schema with no zones.
+    /// batch that moves nothing, or a schema with no zones; `None` when the room's
+    /// state could not be simulated, which the gate treats as a refusal rather than
+    /// as an absence of crossings.
     pub fn batch_zone_crossings(
         &self,
         room: &[u8],
         ops: &[Op],
         schema: &Schema,
-    ) -> Vec<index::ZoneCrossing> {
-        self.rooms
-            .get(room)
-            .map(|r| index::batch_zone_crossings(&r.doc, ops, schema))
-            .unwrap_or_default()
+    ) -> Option<Vec<index::ZoneCrossing>> {
+        match self.rooms.get(room) {
+            Some(r) => index::batch_zone_crossings(&r.doc, ops, schema),
+            None => Some(Vec::new()),
+        }
     }
 
     /// Install the server's zone-master key, enabling cross-zone-move token
@@ -2515,6 +2521,12 @@ impl Hub {
                 }
                 Some(doc.encode_state())
             }
+            // No state to freeze. Folding an unservable stream into a fresh
+            // document would materialize an *empty* replica, and the publish path
+            // writes what it is handed straight over the target branch's base and
+            // its captured version — so answering `None` is what keeps a stream
+            // this node cannot read from destroying the branch it names.
+            Catchup::Unavailable => None,
         }
     }
 

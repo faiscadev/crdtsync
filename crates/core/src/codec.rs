@@ -15,6 +15,7 @@ use crate::op::{Op, OpId, OpKind, Tx, TxId, MAX_TX_MEMBERS};
 use crate::ranged::{is_composite_payload_kind, RangeAnchor, RangedInit};
 use crate::scalar::{BlobRef, Scalar};
 use crate::stamp::Stamp;
+use std::collections::HashMap;
 
 /// Why a byte string could not be decoded into an op.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -453,11 +454,36 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
 pub(crate) struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// While tracking, the highest `(lamport, offset)` reached by any stamp read
+    /// under each client id. A snapshot's stamps *are* the ids the replica holds,
+    /// so reading them back as they decode is what recovers a replica's id-space
+    /// high-water without storing it beside them — see
+    /// [`Document::read_state`](crate::doc::Document::decode_state).
+    stamp_high_water: HashMap<ClientId, (u64, u64)>,
+    tracking_stamps: bool,
 }
 
 impl<'a> Cursor<'a> {
     pub(crate) fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            stamp_high_water: HashMap::new(),
+            tracking_stamps: false,
+        }
+    }
+
+    /// Start recording the stamps read from here on, discarding anything an
+    /// enclosing frame already read. Off by default so the op path pays nothing.
+    pub(crate) fn track_stamps(&mut self) {
+        self.stamp_high_water.clear();
+        self.tracking_stamps = true;
+    }
+
+    /// Stop recording and take what was read.
+    pub(crate) fn take_stamp_high_water(&mut self) -> HashMap<ClientId, (u64, u64)> {
+        self.tracking_stamps = false;
+        std::mem::take(&mut self.stamp_high_water)
     }
 
     /// Whether every byte has been consumed — the total-decode check.
@@ -554,6 +580,10 @@ impl<'a> Cursor<'a> {
             0 => 0,
             _ => self.u64()?,
         };
+        if self.tracking_stamps {
+            let slot = self.stamp_high_water.entry(client).or_insert((0, 0));
+            *slot = (*slot).max((lamport, offset));
+        }
         Ok(Stamp {
             lamport,
             client,

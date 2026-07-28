@@ -358,14 +358,15 @@ fn an_op_whose_stamp_names_another_client_is_refused() {
 }
 
 #[test]
-fn a_forged_stamp_cannot_take_ids_out_of_a_victims_space_above_the_clamp() {
-    // Without the authorship check this is a two-op divergence primitive, and the
-    // wire clamp is what arms it: below the ceiling, folding the forged op drags
-    // every clock past the ids it planted, so the victim's next mint clears them.
-    // Above the ceiling the clock stops moving, and a stamp forged in the
-    // victim's space would sit exactly where the victim mints next — its edits
-    // then land on ids the sequence already holds and are dropped as replays, on
-    // the victim and on every peer that folded the forged op.
+fn a_stamp_forged_under_a_different_author_is_refused_before_it_plants_anything() {
+    // The **mismatched-author** shape only, and that is the whole reach of the
+    // authorship check: both fields are attacker-supplied, so an attacker that
+    // authors the batch under the victim's own `ClientId` sets them equal and the
+    // check admits it. What actually keeps the victim's next mint off planted ids
+    // is the id-space high-water — see `lamport_mint.rs`, which models that
+    // attacker. This case is worth refusing anyway: it is malformed, no honest op
+    // is anywhere near it, and refusing raises the bar to impersonating a
+    // `ClientId` rather than merely naming one.
     let victim = cid(1);
     let attacker = cid(9);
 
@@ -615,19 +616,12 @@ fn a_save_and_reload_never_lowers_a_replicas_clock() {
         doc.transact(|tx| tx.text(b"t").insert(0, "AB"));
         let live = text_ids(&doc, b"t", 2);
 
-        let reloaded = Document::decode_state(&doc.encode_state());
-        let Ok(mut back) = reloaded else {
-            // Refusing is the honest answer for a clock only a crafted snapshot
-            // could have declared — loud, and a snapshot that will not load
-            // cannot re-issue what it holds. It must not be the answer for a
-            // clock a replica could reach on its own: the runway between the two
-            // ceilings is exactly what keeps this branch off those.
-            assert!(
-                start > LAMPORT_WIRE_CEILING,
-                "an honest replica could not reload its own snapshot at {start}"
-            );
-            continue;
-        };
+        // Every start a snapshot may legally declare — the ceiling included —
+        // reloads. `encode_state` never emits a clock its own decoder refuses, so
+        // no iteration here is excused: excusing one is what hid the edit that
+        // stepped the stored clock over the bound.
+        let mut back = Document::decode_state(&doc.encode_state())
+            .unwrap_or_else(|e| panic!("no reload of a replica's own snapshot at {start}: {e:?}"));
         back.transact(|tx| tx.text(b"t").insert(2, "C"));
         assert_eq!(
             text_of(&back, b"t"),

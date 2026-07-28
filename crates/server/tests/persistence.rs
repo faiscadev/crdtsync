@@ -36,7 +36,7 @@ fn doc(first: u8) -> Document {
 fn ops(c: Catchup) -> Vec<Op> {
     match c {
         Catchup::Ops(v) => v.into_iter().map(|rec| rec.op).collect(),
-        Catchup::Snapshot { .. } => panic!("expected an op delta, got a snapshot"),
+        _ => panic!("expected an op delta"),
     }
 }
 

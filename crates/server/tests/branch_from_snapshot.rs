@@ -47,7 +47,7 @@ fn int_in(state: &[u8], key: &[u8]) -> i64 {
 fn snapshot(c: Catchup) -> Vec<u8> {
     match c {
         Catchup::Snapshot { state, .. } => state,
-        Catchup::Ops(_) => panic!("expected a materialized snapshot, got an op delta"),
+        _ => panic!("expected a materialized snapshot, got an op delta"),
     }
 }
 
@@ -55,7 +55,7 @@ fn snapshot(c: Catchup) -> Vec<u8> {
 fn delta(c: Catchup) -> Vec<Op> {
     match c {
         Catchup::Ops(v) => v.into_iter().map(|rec| rec.op).collect(),
-        Catchup::Snapshot { .. } => panic!("expected an op delta, got a snapshot"),
+        _ => panic!("expected an op delta"),
     }
 }
 
@@ -95,7 +95,7 @@ fn main_is_unaffected_by_a_snapshot_fork() {
     // Main still resolves its own live head (age 30), unchanged by the fork.
     match hub.catch_up(ROOM, 0) {
         Catchup::Ops(ops) => assert_eq!(ops.len(), 3),
-        Catchup::Snapshot { .. } => panic!("main was not compacted"),
+        _ => panic!("main was not compacted"),
     }
     assert_eq!(hub.seq(ROOM), 3);
 }
@@ -261,7 +261,7 @@ mod durable {
         hub.fork_branch(ROOM, RESTORED, b"main", fork_at).unwrap();
         match hub.catch_up_branch(ROOM, RESTORED, 0) {
             Catchup::Ops(ops) => assert_eq!(ops.len(), 2),
-            Catchup::Snapshot { .. } => panic!("an orphan base shadowed the live-log fork"),
+            _ => panic!("an orphan base shadowed the live-log fork"),
         }
     }
 

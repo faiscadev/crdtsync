@@ -372,7 +372,7 @@ fn kv(d: &mut Document, key: &[u8], value: i64) -> Vec<Op> {
 fn delta(c: Catchup) -> Vec<Op> {
     match c {
         Catchup::Ops(v) => v.into_iter().map(|rec| rec.op).collect(),
-        Catchup::Snapshot { .. } => panic!("expected an op delta, got a snapshot"),
+        _ => panic!("expected an op delta"),
     }
 }
 
@@ -469,7 +469,7 @@ mod durable {
         // It still serves the published state.
         let state = match hub.catch_up_branch(ROOM, PUBLISHED_BRANCH, 0) {
             Catchup::Snapshot { state, .. } => state,
-            Catchup::Ops(_) => panic!("expected the published branch's snapshot"),
+            _ => panic!("expected the published branch's snapshot"),
         };
         assert_eq!(int_in(&state, b"age"), 10);
     }
@@ -501,7 +501,7 @@ mod durable {
         assert!(hub.is_published(ROOM, PUBLISHED_BRANCH));
         let state = match hub.catch_up_branch(ROOM, PUBLISHED_BRANCH, 0) {
             Catchup::Snapshot { state, .. } => state,
-            Catchup::Ops(_) => panic!("expected the published branch's snapshot"),
+            _ => panic!("expected the published branch's snapshot"),
         };
         assert_eq!(int_in(&state, b"age"), 10);
     }

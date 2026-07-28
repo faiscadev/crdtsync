@@ -52,7 +52,7 @@ fn counter(e: Option<Element>) -> i64 {
 fn ops(c: Catchup) -> Vec<Op> {
     match c {
         Catchup::Ops(v) => v.into_iter().map(|rec| rec.op).collect(),
-        Catchup::Snapshot { .. } => panic!("expected an op delta, got a snapshot"),
+        _ => panic!("expected an op delta"),
     }
 }
 
@@ -60,7 +60,7 @@ fn ops(c: Catchup) -> Vec<Op> {
 fn snapshot(c: Catchup) -> (u64, Document) {
     match c {
         Catchup::Snapshot { seq, state } => (seq, Document::decode_state(&state).unwrap()),
-        Catchup::Ops(_) => panic!("expected a snapshot, got an op delta"),
+        _ => panic!("expected a snapshot, got an op delta"),
     }
 }
 

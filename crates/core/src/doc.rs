@@ -184,6 +184,22 @@ pub struct Document {
     /// above, not an entry here; an empty map is a document behaving exactly as one
     /// with no zones.
     zone_clocks: HashMap<u32, u64>,
+    /// The id-space high-water of every client whose stamps this replica holds:
+    /// the highest `(lamport, offset)` reached by any stamp under that id, run
+    /// reservations included. A partition clock is bounded, so it is not an upper
+    /// bound over the stamps present in the document — this is, and it is what
+    /// [`emit_stamped`](Self::emit_stamped) mints above, so a local mint clears its
+    /// own id space instead of trusting the clock. Keyed by client because a stamp
+    /// names its author: those are the only stamps a local mint can collide with,
+    /// and a replica that adopts a snapshot under a different identity
+    /// ([`adopt_as`](Self::adopt_as)) must read that identity's high-water, not the
+    /// encoder's.
+    ///
+    /// Derived from the ids the replica holds — recorded as stamps are applied and
+    /// read back off a snapshot as it decodes — never stored beside them, on the
+    /// same reasoning as [`free_seq`](Self::free_seq): a position handed to a
+    /// replica by anyone else is a position it can be made to re-issue from.
+    stamp_high_water: HashMap<ClientId, (u64, u64)>,
     seq: u64,
     /// When recording an atomic transaction (between `begin_atomic` and
     /// `commit_atomic`), the ops emitted so far accumulate here instead of being
@@ -262,6 +278,7 @@ impl Document {
             acl: HashMap::new(),
             lamport: 0,
             zone_clocks: HashMap::new(),
+            stamp_high_water: HashMap::new(),
             seq: 0,
             atomic: None,
             seen: HashSet::new(),
@@ -1719,6 +1736,11 @@ impl Document {
     }
 
     fn read_state(cur: &mut Cursor) -> Result<Document, DecodeError> {
+        // A snapshot's stamps are the ids the replica holds, so recording them as
+        // they decode is what restores `stamp_high_water` — including under a client
+        // id the stored clock does not cover, which is the whole point of keeping
+        // the mint off the clock.
+        cur.track_stamps();
         let version = cur.u8()?;
         if version != STATE_VERSION {
             return Err(DecodeError::BadTag {
@@ -2025,6 +2047,15 @@ impl Document {
                     tag: 0,
                 });
             }
+            // The drain replays these straight through `apply_now`, so an op the
+            // live `apply` seam would refuse must not reach state through the
+            // snapshot seam instead.
+            if !stamp_names_its_author(op) {
+                return Err(DecodeError::BadTag {
+                    what: "document: buffered op stamped under another client",
+                    tag: 0,
+                });
+            }
         }
 
         let root = maps.get(&root_id).cloned().ok_or(DecodeError::BadTag {
@@ -2045,6 +2076,7 @@ impl Document {
             root_id,
         );
 
+        let stamp_high_water = cur.take_stamp_high_water();
         let mut doc = Document {
             client,
             root,
@@ -2065,6 +2097,10 @@ impl Document {
             acl,
             lamport,
             zone_clocks,
+            // Every stamp the snapshot carries was read back as it decoded, so the
+            // id-space high-water comes off the state itself — including of a client
+            // the encoder's own clamped clock never covered.
+            stamp_high_water,
             seq,
             atomic: None,
             seen,
@@ -2337,15 +2373,18 @@ impl Document {
             return false;
         }
         // A node's id is its op's stamp, so an op whose stamp names a client other
-        // than its author mints ids inside *that* client's id space — and the
-        // clock, bounded above [`LAMPORT_WIRE_CEILING`], no longer moves past them
-        // to keep their owner's next mint clear. Every op this codebase emits
-        // stamps under its author, including the server's reveal shells, so this
-        // refuses only a malformed op. It is a categorical check, not a threshold
-        // one: no honest op sits near its boundary, so nothing is one op away from
-        // it, and being a pure function of the op it refuses the same set on every
-        // replica.
-        if op.stamp.client != op.id.client {
+        // than its author mints ids inside *that* client's id space. Every op this
+        // codebase emits stamps under its author, including the server's reveal
+        // shells, so this refuses only a malformed op; being a pure function of the
+        // op, it refuses the same set on every replica.
+        //
+        // What it does **not** do is protect that id space: both fields come off the
+        // same op, so a peer authoring under the victim's `ClientId` satisfies it.
+        // Keeping the victim's next mint off ids planted under its own id is
+        // [`mint_floor`](Self::mint_floor)'s job, on this path and on the buffer a
+        // decode drains alike. This raises the bar to impersonating an identity
+        // rather than merely naming one, which is a transport-authenticated claim.
+        if !stamp_names_its_author(op) {
             return false;
         }
         // A member declaring a group size outside the representable range is
@@ -2405,6 +2444,47 @@ impl Document {
             .min(LAMPORT_WIRE_CEILING);
         self.advance_clock(op.zone, last);
         self.apply_kind(op.target, &op.kind, op.stamp, op.id.client);
+    }
+
+    /// The highest stamp position a local mint in `zone` must clear: the partition
+    /// clock, or this replica's own id-space high-water when a stamp under its
+    /// client id sits past what *any* clock covers.
+    ///
+    /// The high-water carries no partition — a snapshot's stamps decode long before
+    /// a schema resolves their zones — so reading it unconditionally would drag
+    /// every zone up to whatever the busiest partition reached and cost the per-zone
+    /// causal independence the replication streams are built on. It is read exactly
+    /// when no clock in the document covers it, which is when it is telling the mint
+    /// something no clock can: a stamp the clamp stopped a clock under, or one a
+    /// snapshot declared a clock below. In every ordinary document some partition's
+    /// clock covers every stamp it holds, so this reads the clock alone and each
+    /// partition keeps counting from its own. Where it does fire, it is deliberately
+    /// read across every partition: no honest replica is there, and clearing a
+    /// planted id in the wrong partition too costs nothing real.
+    fn mint_floor(&self, zone: Option<u32>) -> (u64, u64) {
+        let clock = (self.clock(zone), 0);
+        match self.stamp_high_water.get(&self.client) {
+            Some(own) if own.0 > self.covered_clock() && *own > clock => *own,
+            _ => clock,
+        }
+    }
+
+    /// The highest lamport any partition clock in this document reaches — the
+    /// frontier below which a clock vouches for every stamp the replica holds.
+    fn covered_clock(&self) -> u64 {
+        self.zone_clocks
+            .values()
+            .copied()
+            .fold(self.lamport, u64::max)
+    }
+
+    /// Record `stamp`'s whole reservation against its author's id-space high-water.
+    /// Every stamp this replica applies passes here, so the high-water covers ops
+    /// folded off the wire, ops drained out of the buffer, and local mints alike.
+    fn record_stamp(&mut self, stamp: Stamp, span: u64) {
+        let last = stamp.run_member(span - 1);
+        let slot = self.stamp_high_water.entry(stamp.client).or_insert((0, 0));
+        *slot = (*slot).max((last.lamport, last.offset));
     }
 
     /// The current lamport high-water of a partition: the root clock for `None`,
@@ -2717,24 +2797,25 @@ impl Document {
         // container), so its zone — the created child's, for a container-create —
         // resolves now.
         let zone = self.zone_of_op(target, &kind);
-        // Only local minting enters the space above [`LAMPORT_STATE_CEILING`],
-        // one step per real edit, so the end of it is 2^63 mints away in this
-        // partition. At that end there is no unused stamp left, so the invariant
-        // is stated rather than handled: every other answer re-issues one.
-        let base = self
-            .clock(zone)
-            .checked_add(1)
-            .expect("a partition's lamport space outlives the replica");
-        let stamp = Stamp {
-            lamport: base,
-            client: self.client,
-            offset: 0,
-        };
-        // Reserve the rest of a run's char_ids so the next op sorts after it.
-        let last = base
-            .checked_add(span(&kind) - 1)
-            .expect("a local run fits its partition's lamport space");
-        self.advance_clock(zone, last);
+        // The mint starts above the replica's **own id space**, not just above the
+        // partition clock. A bounded clock is no longer an upper bound over the
+        // stamps the document holds: an op stamped under this replica's client id
+        // and based above the clamp plants ids the clock does not move past, and a
+        // mint that read the clock alone would land straight on them — the write
+        // then vanishes as a replay, here and on every peer holding those ids. A
+        // stamp names its author, so those planted ids are the only ones a local
+        // mint can collide with, and clearing them is exactly the discipline
+        // [`free_seq`](Self::free_seq) already applies to the op-seq position.
+        let stamp = next_stamp(self.mint_floor(zone), self.client);
+        // Reserve the rest of a run's char_ids so the next op sorts after it. The
+        // carry into `offset` keeps every codepoint distinct at the top of the space.
+        let last = stamp.run_member(span(&kind) - 1);
+        // The clock the snapshot stores is bounded on the way out by the same
+        // constant [`read_state`](Self::read_state) enforces on the way in, so
+        // `encode_state` can never emit a clock its own decoder refuses. Clamping it
+        // costs nothing the mint needs, precisely because the mint reads the id-space
+        // high-water above rather than this slot.
+        self.advance_clock(zone, last.lamport.min(LAMPORT_STATE_CEILING));
         let id = self.mint_op_id();
         let author = self.client;
         // The record-seam: the inverse is read off the state this op is about to
@@ -2829,6 +2910,10 @@ impl Document {
     /// Route a mutation to its target, recording any displaced composite and
     /// registering any container it creates.
     fn apply_kind(&mut self, target: ElementId, kind: &OpKind, stamp: Stamp, author: ClientId) {
+        // The single seam every stamp this replica installs passes through, so it is
+        // where the id-space high-water is kept — one place covers `apply`, the
+        // buffer drain a decode performs, and the local mint.
+        self.record_stamp(stamp, span(kind));
         match kind {
             // Sequence and text ops address a list or text directly.
             OpKind::ListInsert { value, anchor } => {
@@ -4582,8 +4667,6 @@ fn acl_id(stamp: Stamp) -> ElementId {
     ElementId::derive(ns, &stamp_key(stamp), ElementKind::Scalar)
 }
 
-/// How many consecutive char_ids an op consumes from its stamp. A text run
-/// takes one per codepoint; every other op takes one.
 /// A declared partition clock, refused rather than clamped when it sits above
 /// [`LAMPORT_STATE_CEILING`]. See [`Document::read_state`]'s use — the bound has
 /// to be a refusal, because a clock is a high-water over ids already published.
@@ -4594,6 +4677,43 @@ fn clock_within_ceiling(lamport: u64, what: &'static str) -> Result<u64, DecodeE
     Ok(lamport)
 }
 
+/// The stamp `client` mints to sit strictly past the `(lamport, offset)` position
+/// `from` — the next free position in that client's id space.
+///
+/// The lamport carries the position while there is room, so an op stamp keeps
+/// `offset == 0` as every other seam expects. At the very top of the lamport space
+/// the offset carries it instead, the same second dimension
+/// [`Stamp::run_member`](crate::stamp::Stamp::run_member) uses to keep a ceiling
+/// run's codepoints distinct: a stamp space is two-dimensional, so exhausting it
+/// takes 2^128 ids and only a crafted snapshot could declare a position with
+/// neither left.
+fn next_stamp(from: (u64, u64), client: ClientId) -> Stamp {
+    match from.0.checked_add(1) {
+        Some(lamport) => Stamp {
+            lamport,
+            client,
+            offset: 0,
+        },
+        None => Stamp {
+            lamport: u64::MAX,
+            client,
+            offset: from
+                .1
+                .checked_add(1)
+                .expect("a client's stamp space outlives the replica"),
+        },
+    }
+}
+
+/// Whether an op's stamp names the client that authored it. A node's id is its
+/// op's stamp, so a mismatch mints ids inside another client's id space; nothing
+/// this codebase emits carries one.
+fn stamp_names_its_author(op: &Op) -> bool {
+    op.stamp.client == op.id.client
+}
+
+/// How many consecutive char_ids an op consumes from its stamp. A text run
+/// takes one per codepoint; every other op takes one.
 fn span(kind: &OpKind) -> u64 {
     match kind {
         OpKind::TextInsert { s, .. } => s.chars().count().max(1) as u64,

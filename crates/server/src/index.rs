@@ -148,7 +148,7 @@ pub struct ZoneCrossing {
 /// detectable from the post-move tree (the moved node simply renders under its
 /// new parent). Thin wrapper over [`batch_zone_crossings`].
 pub fn batch_crosses_zone(doc: &Document, ops: &[Op], schema: &Schema) -> bool {
-    !batch_zone_crossings(doc, ops, schema).is_empty()
+    batch_zone_crossings(doc, ops, schema).is_none_or(|c| !c.is_empty())
 }
 
 /// The cross-zone relocations applying `ops` to `doc` performs — one
@@ -165,23 +165,30 @@ pub fn batch_crosses_zone(doc: &Document, ops: &[Op], schema: &Schema) -> bool {
 /// fold (readiness buffering, Kleppmann move refold, slot LWW) decides the
 /// outcome — the check reflects exactly what the document will hold, never a
 /// divergent re-derivation. Empty when the batch moves nothing or the schema
-/// declares no zones (every path resolving unzoned).
-pub fn batch_zone_crossings(doc: &Document, ops: &[Op], schema: &Schema) -> Vec<ZoneCrossing> {
+/// declares no zones (every path resolving unzoned); `None` when the state does not
+/// decode, which the gate reads as a refusal and never as an absence of crossings.
+pub fn batch_zone_crossings(
+    doc: &Document,
+    ops: &[Op],
+    schema: &Schema,
+) -> Option<Vec<ZoneCrossing>> {
+    zone_crossings_over(&doc.encode_state(), ops, schema)
+}
+
+/// [`batch_zone_crossings`] as a pure function of the room's encoded state — the
+/// form the unreadable-state case is decided in, and tested in.
+fn zone_crossings_over(state: &[u8], ops: &[Op], schema: &Schema) -> Option<Vec<ZoneCrossing>> {
     let movers: Vec<ElementId> = ops.iter().filter_map(move_node).collect();
     if movers.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    let before = element_paths(doc);
-    // An independent copy: decode fresh bytes rather than share the live tree's
-    // handles, so the simulation never touches the committed document.
-    let Ok(mut simulated) = Document::decode_state(&doc.encode_state()) else {
-        return Vec::new();
-    };
+    let mut simulated = decoded(state)?;
+    let before = element_paths(&simulated);
     for op in ops {
         simulated.apply(op);
     }
     let after = element_paths(&simulated);
-    movers
+    let crossings = movers
         .iter()
         .filter_map(|node| {
             // Compare zones only for a mover that lives on both sides — a node
@@ -195,7 +202,21 @@ pub fn batch_zone_crossings(doc: &Document, ops: &[Op], schema: &Schema) -> Vec<
                 to,
             })
         })
-        .collect()
+        .collect();
+    Some(crossings)
+}
+
+/// An independent copy of `state` for a gate to fold a batch into — decoded bytes
+/// rather than the live tree's handles, so a simulation never touches the committed
+/// document.
+///
+/// `None` when the state does not decode. Every caller is a **reject boundary**, so
+/// the missing answer has to stay distinguishable from a clean one: read as "no
+/// crossings" or "no violation" it admits exactly the batch the gate exists to
+/// refuse. The core makes `encode_state ∘ decode_state` total, so this is the belt
+/// on top of that brace — not a case a live room reaches.
+fn decoded(state: &[u8]) -> Option<Document> {
+    Document::decode_state(state).ok()
 }
 
 /// The node a tree move relocates, or `None` for any other op.
@@ -224,19 +245,25 @@ fn move_node(op: &Op) -> Option<ElementId> {
 /// planting a fresh one elsewhere — a count would net to zero and admit it. The
 /// location key resolves each sequence index to its stable Fugue node stamp, so an
 /// unrelated insert/delete that only renumbers a pre-existing mismatch's index does
-/// not read as a new one. `false` for a batch that plants no fresh mismatch, or one
-/// that fails to decode.
+/// not read as a new one. `false` for a batch that plants no fresh mismatch; `true`
+/// for a state that does not decode, since the gate is a reject boundary and an
+/// answer it cannot compute must not read as a clean one.
 pub fn batch_introduces_schema_violation(doc: &Document, ops: &[Op], schema: &Schema) -> bool {
+    introduces_violation_over(&doc.encode_state(), ops, schema)
+}
+
+/// [`batch_introduces_schema_violation`] as a pure function of the room's encoded
+/// state — the form the unreadable-state case is decided in, and tested in.
+fn introduces_violation_over(bytes: &[u8], ops: &[Op], schema: &Schema) -> bool {
     // An empty batch changes nothing, so it cannot plant a mismatch — skip the
     // whole simulate/validate round trip.
     if ops.is_empty() {
         return false;
     }
-    // An independent copy: decode fresh bytes rather than share the live tree's
-    // handles, so the simulation never touches the committed document.
-    let bytes = doc.encode_state();
-    let Ok(mut simulated) = Document::decode_state(&bytes) else {
-        return false;
+    // A state that will not decode leaves the answer unknown. The enforcing tier is
+    // a reject boundary, so unknown reads as "refuse", never as "conforming".
+    let Some(mut simulated) = decoded(bytes) else {
+        return true;
     };
     for op in ops {
         simulated.apply(op);
@@ -247,8 +274,8 @@ pub fn batch_introduces_schema_violation(doc: &Document, ops: &[Op], schema: &Sc
     if after.is_empty() {
         return false;
     }
-    let Ok(base) = Document::decode_state(&bytes) else {
-        return false;
+    let Some(base) = decoded(bytes) else {
+        return true;
     };
     let before = mismatch_keys(&base, schema);
     after.iter().any(|k| !before.contains(k))
@@ -314,4 +341,69 @@ fn stable_key(doc: &Document, path: &[Step]) -> Option<Vec<KeyPart>> {
         };
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crdtsync_core::list::{Anchor, Side};
+    use crdtsync_core::{ClientId, ElementId, OpKind, Scalar};
+
+    fn zoned_schema() -> Schema {
+        Schema::parse(
+            r#"{ "schema": "s", "version": 1, "root": "R",
+                 "types": { "R": { "kind": "map" } },
+                 "zones": { "board": "/board" } }"#,
+        )
+        .expect("schema parses")
+    }
+
+    /// A batch carrying a move, so neither gate short-circuits before the
+    /// simulation it needs.
+    fn a_move() -> Vec<Op> {
+        let mut doc = Document::new(ClientId::from_bytes([1; 16]));
+        let mut ops = doc.transact(|tx| tx.set(b"k", Scalar::Int(1)));
+        ops[0].kind = OpKind::XmlMove {
+            node: ElementId::from_bytes([9; 16]),
+            anchor: Anchor {
+                parent: None,
+                side: Side::Right,
+            },
+        };
+        ops
+    }
+
+    /// Both gates are reject boundaries, so a state neither can read must not come
+    /// back as a clean verdict — that reading admits exactly the batch the gate is
+    /// there to refuse.
+    #[test]
+    fn an_unreadable_state_refuses_at_the_zone_gate() {
+        assert!(
+            zone_crossings_over(b"not a snapshot", &a_move(), &zoned_schema()).is_none(),
+            "an unreadable state reported its crossings"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_state_refuses_at_the_schema_gate() {
+        assert!(
+            introduces_violation_over(b"not a snapshot", &a_move(), &zoned_schema()),
+            "an unreadable state was admitted as conforming"
+        );
+    }
+
+    #[test]
+    fn a_readable_state_still_answers_both_gates() {
+        let state = Document::new(ClientId::from_bytes([2; 16])).encode_state();
+        assert_eq!(
+            zone_crossings_over(&state, &a_move(), &zoned_schema()),
+            Some(Vec::new()),
+            "a move of a node the document does not hold crosses nothing"
+        );
+        assert!(!introduces_violation_over(
+            &state,
+            &a_move(),
+            &zoned_schema()
+        ));
+    }
 }

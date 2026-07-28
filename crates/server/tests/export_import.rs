@@ -94,7 +94,7 @@ fn export_matches_the_state_a_below_floor_subscriber_is_served() {
     h.compact(ROOM).unwrap();
     match h.catch_up(ROOM, 0) {
         Catchup::Snapshot { state, .. } => assert_eq!(state, exported),
-        Catchup::Ops(_) => panic!("a below-floor subscriber expects a snapshot"),
+        _ => panic!("a below-floor subscriber expects a snapshot"),
     }
 }
 
@@ -126,7 +126,7 @@ fn a_fresh_subscriber_to_an_imported_room_gets_a_snapshot() {
             assert_eq!(caught, state);
             assert_eq!(seq, dst.seq(DEST));
         }
-        Catchup::Ops(_) => panic!("an imported room serves a snapshot to a fresh subscriber"),
+        _ => panic!("an imported room serves a snapshot to a fresh subscriber"),
     }
 }
 
@@ -288,7 +288,7 @@ fn a_clone_takes_and_dedups_like_any_room() {
     assert_eq!(h.seq(DEST), seq_before);
     match h.catch_up(DEST, 0) {
         Catchup::Snapshot { seq, .. } => assert_eq!(seq, h.seq(DEST)),
-        Catchup::Ops(_) => panic!("a fresh subscriber to a clone expects a snapshot"),
+        _ => panic!("a fresh subscriber to a clone expects a snapshot"),
     }
 }
 
