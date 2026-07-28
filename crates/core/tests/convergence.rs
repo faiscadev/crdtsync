@@ -738,8 +738,9 @@ fn rewritten_group_counts_converge_under_every_order() {
 
         // A rewrite consistent across every member of a group is one no receiver
         // can tell from an honest group of that size, so it *does* commit — at
-        // that size, over whichever members the order delivered first. Eviction is
-        // what converges it, and it has to converge it from every order.
+        // that size, over whichever members the order delivered first. The members
+        // left over are strays of a key that has resolved, so they land on the ops
+        // alone, and every order lands the same ones.
         let shrunk: Vec<Op> = pool
             .iter()
             .map(|op| {
@@ -755,12 +756,22 @@ fn rewritten_group_counts_converge_under_every_order() {
                 op
             })
             .collect();
+        let held = converge_shuffled(&shrunk, 100, 1, &mut Rng::new(seed));
         let reference = converge_evicting(&shrunk, 100, &mut Rng::new(seed));
+        assert_eq!(
+            held, reference,
+            "seed {seed}: a group rewritten smaller left something for eviction"
+        );
         for round in 0..shuffles {
+            assert_eq!(
+                converge_shuffled(&shrunk, 160 + round as u8, 1, &mut rng),
+                held,
+                "seed {seed}: shuffle {round} diverged on a group rewritten smaller"
+            );
             assert_eq!(
                 converge_evicting(&shrunk, 160 + round as u8, &mut rng),
                 reference,
-                "seed {seed}: shuffle {round} diverged on a group rewritten smaller"
+                "seed {seed}: shuffle {round} diverged after eviction"
             );
         }
     }

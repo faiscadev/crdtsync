@@ -57,7 +57,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 12;
+const STATE_VERSION: u8 = 13;
 
 /// A composite that a mutation displaced from its slot and left unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -242,6 +242,25 @@ pub struct Document {
     /// Ops whose target isn't reachable yet, held until a create makes it so.
     buffer: Vec<Op>,
     buffered: HashSet<OpId>,
+    /// The `(author, group id)` keys whose bucket has already resolved — committed
+    /// as a whole group, or settled by a member this replica holds under another
+    /// envelope. A member arriving under a resolved key is untagged and merges
+    /// standalone.
+    ///
+    /// Committing a bucket *spends* its key: the members leave the buffer, and a
+    /// later member of that key would otherwise start a fresh bucket at an arrival
+    /// count the group has already met and no further arrival can meet again. Which
+    /// members commit and which are left holding is then the arrival order's, so two
+    /// replicas fold one op set to two states — a rewritten `count` consistent across
+    /// every member, an unrelated op of the same author carrying a live group's id,
+    /// and one op id delivered under two envelopes all reach that shape, and none is
+    /// malformed on any member's own terms. Recording the key is what makes the
+    /// stray's fate a function of the op set rather than of when it arrived.
+    ///
+    /// Carried in the state encoding: a group resolved before a restart is one whose
+    /// stray still has to land after it. Bounded by the groups the replica has
+    /// resolved, so smaller than the `seen` set it already keeps per op.
+    resolved_tx: HashSet<(ClientId, TxId)>,
     /// Movable nodes revealed by an [`XmlReveal`](crate::op::OpKind::XmlReveal) shell
     /// but not yet placed — a node materialized (identity + tag) with no placement,
     /// awaiting the [`XmlMove`](crate::op::OpKind::XmlMove) that will position it. A
@@ -318,6 +337,7 @@ impl Document {
             seen: HashSet::new(),
             buffer: Vec::new(),
             buffered: HashSet::new(),
+            resolved_tx: HashSet::new(),
             revealed_pending: HashSet::new(),
             orphans: Vec::new(),
             pending: Vec::new(),
@@ -1103,6 +1123,17 @@ impl Document {
             put_u64(&mut out, op.seq);
         }
 
+        // The group keys whose bucket has resolved, key-sorted for a deterministic
+        // encoding. A stray of a group resolved before a restart has to land at the
+        // restored replica too, so the record is as durable as the buffer it rules.
+        let mut resolved: Vec<&(ClientId, TxId)> = self.resolved_tx.iter().collect();
+        resolved.sort_by_key(|(client, tx)| (client.as_bytes(), tx.0));
+        put_u32(&mut out, len_u32(resolved.len()));
+        for (client, tx) in resolved {
+            out.extend_from_slice(&client.as_bytes());
+            put_u64(&mut out, tx.0);
+        }
+
         // The buffer is a framed op log, itself length-prefixed so the reader
         // knows where it ends inside the document stream.
         let framed = encode_ops(&self.buffer);
@@ -1238,7 +1269,9 @@ impl Document {
         // state-side face of the rule every per-op delivery filter applies, since a
         // group missing a member here can never complete at the recipient either. A
         // group wholly inside the authorized partitions keeps its tag and its
-        // all-or-nothing commit.
+        // all-or-nothing commit. The resolved-group record goes whole: a key names
+        // an author and a group, never a partition, so a kept one counts the groups
+        // the withheld partition resolved — the inference the frontier scrub closes.
         let published = self.published_by(recipient);
         let split = crate::op::split_groups(
             self.buffer
@@ -1249,6 +1282,7 @@ impl Document {
             .retain(|op| op.zone.is_none_or(|zone| authorized.contains(&zone)));
         crate::op::destrand_split(self.buffer.iter_mut(), &split);
         self.buffered = self.buffer.iter().map(|op| op.id).collect();
+        self.resolved_tx.clear();
         self.scrub_frontier_to(published);
         self.scrub_high_water_to(recipient);
     }
@@ -1469,8 +1503,9 @@ impl Document {
                 && !purge.contains(&parent)
                 && !list_denied(&XmlElement::children_id(parent))
         });
-        // Once anything is dropped, scrub the causal frontier and buffer of the hidden
-        // state so neither leaks another replica's op count, and rebuild the tree-move
+        // Once anything is dropped, scrub the causal frontier, the buffer and the
+        // resolved-group record of the hidden state so none leaks another replica's op
+        // or group count, and rebuild the tree-move
         // fold so the derived parents and `moved_away` overlay match the filtered log a
         // reload replays — a node kept at its readable origin renders there, not at the
         // denied destination it was folded to, so the projected snapshot is byte-stable
@@ -1481,6 +1516,7 @@ impl Document {
             self.refold_projected_moves();
             self.buffer.clear();
             self.buffered.clear();
+            self.resolved_tx.clear();
             self.scrub_frontier_to(published);
             self.scrub_high_water_to(recipient);
         }
@@ -2155,6 +2191,18 @@ impl Document {
             }
         }
 
+        let resolved_count = cur.u32()?;
+        let mut resolved_tx = HashSet::with_capacity((resolved_count as usize).min(1024));
+        for _ in 0..resolved_count {
+            let key = (cur.client()?, TxId(cur.u64()?));
+            if !resolved_tx.insert(key) {
+                return Err(DecodeError::BadTag {
+                    what: "document: duplicate resolved group key",
+                    tag: 0,
+                });
+            }
+        }
+
         let buf_len = cur.u32()? as usize;
         let framed = cur.take(buf_len)?;
         let buffer = decode_ops(framed)?;
@@ -2271,6 +2319,7 @@ impl Document {
             seen,
             buffer,
             buffered,
+            resolved_tx,
             revealed_pending: HashSet::new(),
             orphans: Vec::new(),
             pending: Vec::new(),
@@ -2288,7 +2337,9 @@ impl Document {
         // The buffer holds only ops still waiting on their target; a well-formed
         // snapshot already satisfies that, so this is a no-op there. Draining
         // restores the invariant for any op decoded as already reachable rather
-        // than leaving it stuck until an unrelated mutation.
+        // than leaving it stuck until an unrelated mutation, and the untag ahead of
+        // it the invariant that no member waits under a key the record has spent.
+        doc.untag_resolved();
         doc.drain_buffer();
         Ok(doc)
     }
@@ -2563,11 +2614,41 @@ impl Document {
     /// alone and never of this document's state.
     pub fn apply(&mut self, op: &Op) -> bool {
         if self.seen.contains(&op.id) || self.buffered.contains(&op.id) {
+            // A second envelope for an id this replica already holds. The copy it
+            // kept is the one its buckets see, so a group naming this id under the
+            // *other* envelope will never hold it and can never reach its size —
+            // and which copy the dedup kept is the arrival order's. Resolving that
+            // group's key releases what it holds, so the same ops land the same set
+            // whichever envelope won. A plain resend carries the envelope already
+            // held and decides nothing: an honest group stays whole.
+            if let Some(tx) = op.tx {
+                let held = self.buffer.iter().find(|held| held.id == op.id);
+                if held.is_none_or(|held| held.tx != Some(tx)) {
+                    self.resolve_tx((op.id.client, tx.id));
+                    self.drain_buffer();
+                }
+            }
             return false;
         }
         if !op.is_admissible() {
             return false;
         }
+        // A member of a group whose bucket has already resolved is a stray of a
+        // spent key: it joins no bucket and merges standalone, so it is untagged
+        // here and takes the ordinary path below.
+        let stray;
+        let op = if op
+            .tx
+            .is_some_and(|tx| self.resolved_tx.contains(&(op.id.client, tx.id)))
+        {
+            stray = Op {
+                tx: None,
+                ..op.clone()
+            };
+            &stray
+        } else {
+            op
+        };
         // An atomic-transaction member is always held first; its group commits
         // together once every member is present. A lone (single-member) tx
         // completes immediately. A member whose own dependencies are unmet at
@@ -2805,6 +2886,15 @@ impl Document {
             // so a member that targets a container an earlier member creates
             // lands after it.
             if let Some(mut members) = self.take_complete_tx() {
+                // The bucket's key is spent by this commit — its members are leaving
+                // the buffer and the count they met cannot be met a second time — so
+                // record it before anything else can arrive under it.
+                if let Some(key) = members
+                    .first()
+                    .and_then(|op| op.tx.map(|tx| (op.id.client, tx.id)))
+                {
+                    self.resolve_tx(key);
+                }
                 members.sort_by_key(|op| op.id.seq);
                 for mut op in members {
                     // Every applied op still passes the ordinary readiness gate:
@@ -2928,6 +3018,29 @@ impl Document {
         let mut idxs = complete;
         idxs.sort_unstable_by(|a, b| b.cmp(a));
         Some(idxs.into_iter().map(|i| self.buffer.remove(i)).collect())
+    }
+
+    /// Record `key`'s bucket as resolved and release every member still held under
+    /// it, so a group id decides a member's fate once and the same way for every
+    /// arrival order.
+    fn resolve_tx(&mut self, key: (ClientId, TxId)) {
+        if self.resolved_tx.insert(key) {
+            self.untag_resolved();
+        }
+    }
+
+    /// Untag every buffered member whose bucket key has resolved, so it merges
+    /// standalone rather than waiting on an arrival count its bucket has spent.
+    fn untag_resolved(&mut self) {
+        let resolved = &self.resolved_tx;
+        for op in self.buffer.iter_mut() {
+            if op
+                .tx
+                .is_some_and(|tx| resolved.contains(&(op.id.client, tx.id)))
+            {
+                op.tx = None;
+            }
+        }
     }
 
     /// The buffer positions of every held transaction member, bucketed by the

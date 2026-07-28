@@ -880,6 +880,57 @@ fn pair() -> (Document, Vec<Op>) {
     (a, ops)
 }
 
+/// A three-member atomic group over `x`, `y` and `z`, and its author.
+fn triple() -> (Document, Vec<Op>) {
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.register(b"y", Scalar::Int(2));
+        tx.register(b"z", Scalar::Int(3));
+    });
+    (a, ops)
+}
+
+/// Every ordering of `0..n`, so a fold is checked against the whole arrival space
+/// rather than the two orders that happen to disagree.
+fn orderings(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for rest in orderings(n - 1) {
+        for at in 0..n {
+            let mut order = rest.clone();
+            order.insert(at, n - 1);
+            out.push(order);
+        }
+    }
+    out
+}
+
+/// Fold `ops` in every arrival order and assert every fold reads one state,
+/// returning it. The comparison is over the canonical snapshot bytes, so nothing
+/// the replica holds — buffer and resolved group keys included — is left out of
+/// it, and every fold runs under one client id so the bytes are comparable.
+fn one_state_in_every_order(ops: &[Op]) -> Document {
+    let mut folded: Option<(Vec<usize>, Vec<u8>, Document)> = None;
+    for order in orderings(ops.len()) {
+        let mut d = doc(9);
+        for &i in &order {
+            d.apply(&ops[i]);
+        }
+        let bytes = d.encode_state();
+        match &folded {
+            None => folded = Some((order, bytes, d)),
+            Some((first, first_bytes, _)) => assert_eq!(
+                &bytes, first_bytes,
+                "order {order:?} folded to a different state than {first:?}"
+            ),
+        }
+    }
+    folded.expect("an op set has at least one order").2
+}
+
 #[test]
 fn the_codec_refuses_a_group_that_declares_no_members() {
     let (_, ops) = pair();
@@ -1086,83 +1137,126 @@ fn a_rewritten_count_holds_the_same_set_whatever_order_it_arrives_in() {
     }
 }
 
+// --- a resolved group key ---
+//
+// A bucket key is spent when its group commits, so a member that arrives after it
+// re-enters an arrival count the bucket already met — a count no further arrival
+// can satisfy. Which members commit and which are left holding is the arrival
+// order's, so the same ops fold to two states. Recording that a key has resolved
+// is what closes it: a later member of a resolved key is untagged and merges
+// standalone, so every order lands the same set. Three rewrites reach the shape,
+// and none is malformed on any member's own terms.
+
 #[test]
-fn a_group_rewritten_smaller_on_every_member_commits_a_subset_the_order_picks() {
-    // The shape no count rule reaches, pinned as what it is rather than claimed
-    // fixed: a rewrite consistent across every member is, to a receiver, an honest
-    // group of the smaller size followed by a stray. It commits at the size it was
-    // told, and *which* members that is belongs to the arrival order — so two
-    // replicas disagree until each evicts. Closing it needs a record that a group
-    // id has been resolved, which is state of its own (KANBAN C18).
-    let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
-    });
+fn a_group_rewritten_smaller_on_every_member_folds_one_state_in_every_order() {
+    // A rewrite consistent across every member is, to a receiver, an honest group
+    // of the smaller size followed by a stray, so it commits at the size it was
+    // told. Whichever two members that is, the third is a stray of a key that has
+    // resolved, and lands.
+    let (a, ops) = triple();
     let id = tx_id(&ops[0]);
     let shrunk: Vec<Op> = ops.iter().map(|op| retagged(op, id, 2)).collect();
 
-    let mut first = doc(2);
-    for op in &shrunk {
-        first.apply(op);
-    }
-    let mut last = doc(3);
-    for op in shrunk.iter().rev() {
-        last.apply(op);
-    }
-    assert_ne!(
-        reg(&first, b"x").is_some(),
-        reg(&last, b"x").is_some(),
-        "the arrival order decides which members the rewritten size commits"
-    );
-
-    // Eviction is what closes it, and it closes it the same way on both.
-    assert_eq!(first.evict_partial_transactions(), 1);
-    assert_eq!(last.evict_partial_transactions(), 1);
+    let b = one_state_in_every_order(&shrunk);
     for key in [&b"x"[..], b"y", b"z"] {
-        assert_eq!(reg(&first, key), reg(&a, key));
-        assert_eq!(reg(&last, key), reg(&a, key));
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
 }
 
 #[test]
-fn two_envelopes_of_one_member_leave_the_bucket_reading_whichever_landed_first() {
-    // `apply` dedups on op id before it looks at the tag, so when one member
-    // arrives twice under different envelopes the bucket keeps whichever won the
-    // race — a hostile duplicate, or a destranded copy racing the tagged one
-    // across two delivery seams. The size the bucket then reads is the arrival
-    // order's. Pinned as what it is: the record that would settle it is the one
-    // a resolved bucket key does not keep (KANBAN C18).
+fn an_unrelated_op_retagged_into_a_group_folds_one_state_in_every_order() {
+    // The same shape built the other way round: an honest two-member group plus a
+    // fourth op of the same author re-tagged with its id. Whichever two of the
+    // three the order commits, the remaining one is a stray of a resolved key.
     let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
+    let group = a.atomic_transact(|tx| {
+        tx.register(b"m1", Scalar::Int(1));
+        tx.register(b"m2", Scalar::Int(2));
     });
+    let stray = a.transact(|tx| {
+        tx.register(b"m4", Scalar::Int(4));
+    });
+    let ops = [
+        group[0].clone(),
+        group[1].clone(),
+        retagged(&stray[0], tx_id(&group[0]), 2),
+    ];
+
+    let b = one_state_in_every_order(&ops);
+    for key in [&b"m1"[..], b"m2", b"m4"] {
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
+    }
+}
+
+#[test]
+fn one_member_under_two_envelopes_folds_one_state_in_every_order() {
+    // `apply` dedups on op id before it looks at the tag, so one member arriving
+    // twice under different envelopes leaves the bucket reading whichever copy the
+    // dedup kept — a hostile duplicate, or a destranded copy racing the tagged one
+    // across two delivery seams. The copy that lost the dedup is a member the
+    // bucket will never hold under that envelope, so its key resolves and the rest
+    // of the group merges standalone.
+    let (a, ops) = triple();
     let dup = retagged(&ops[2], tx_id(&ops[0]), 2);
+    let set = [ops[0].clone(), ops[1].clone(), ops[2].clone(), dup];
 
-    let mut honest_first = doc(2);
-    for op in [&ops[0], &ops[1], &ops[2], &dup] {
-        honest_first.apply(op);
-    }
-    let mut dup_first = doc(3);
-    for op in [&ops[0], &ops[1], &dup, &ops[2]] {
-        dup_first.apply(op);
-    }
-    assert_ne!(
-        reg(&honest_first, b"x").is_some(),
-        reg(&dup_first, b"x").is_some(),
-        "the envelope that won the dedup decides the bucket's size"
-    );
-
-    // Eviction closes it, and closes it the same way on both.
-    honest_first.evict_partial_transactions();
-    dup_first.evict_partial_transactions();
+    let b = one_state_in_every_order(&set);
     for key in [&b"x"[..], b"y", b"z"] {
-        assert_eq!(reg(&honest_first, key), reg(&a, key));
-        assert_eq!(reg(&dup_first, key), reg(&a, key));
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
+}
+
+#[test]
+fn a_resent_member_of_a_waiting_group_leaves_it_atomic() {
+    // The resolved key is read off a *disagreeing* envelope. A plain resend of a
+    // member already held carries the envelope the bucket holds, so it decides
+    // nothing: the group is still waiting, whole, on the member that has not come.
+    let (_, ops) = triple();
+    let mut b = doc(9);
+    assert!(!b.apply(&ops[0]));
+    assert!(!b.apply(&ops[0]), "a resend is a duplicate");
+    assert!(!b.apply(&ops[1]));
+    assert!(!b.apply(&ops[1]));
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), None, "a resend released the group early");
+    }
+    assert!(b.apply(&ops[2]), "the group commits on its own last member");
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert!(reg(&b, key).is_some(), "member {key:?} did not commit");
+    }
+}
+
+#[test]
+fn a_resolved_group_key_survives_a_snapshot_restore() {
+    // The record rides `encode_state`: a stray of a key resolved before a restart
+    // has to land at the restored replica too, or a restore re-opens the hole the
+    // record closes.
+    let (a, ops) = triple();
+    let id = tx_id(&ops[0]);
+    let shrunk: Vec<Op> = ops.iter().map(|op| retagged(op, id, 2)).collect();
+
+    let mut b = doc(9);
+    b.apply(&shrunk[0]);
+    b.apply(&shrunk[1]);
+    let mut restored = Document::decode_state(&b.encode_state()).expect("decode");
+    assert!(
+        restored.apply(&shrunk[2]),
+        "the stray of a resolved key was held across the restore"
+    );
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&restored, key), reg(&a, key));
+    }
+
+    // And the restored replica re-encodes to the bytes it decoded from, the record
+    // included.
+    let settled = restored.encode_state();
+    assert_eq!(
+        Document::decode_state(&settled)
+            .expect("decode")
+            .encode_state(),
+        settled,
+        "the record is not byte-stable through a round-trip"
+    );
 }
 
 #[test]
