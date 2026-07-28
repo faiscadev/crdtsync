@@ -172,6 +172,12 @@ pub fn batch_zone_crossings(
     ops: &[Op],
     schema: &Schema,
 ) -> Option<Vec<ZoneCrossing>> {
+    // The short-circuit is the wrapper's, not the inner form's: a batch that moves
+    // nothing must not pay a whole-document encode, and every ordinary keystroke
+    // batch on a schema'd room reaches here.
+    if !ops.iter().any(|op| move_node(op).is_some()) {
+        return Some(Vec::new());
+    }
     zone_crossings_over(&doc.encode_state(), ops, schema)
 }
 
@@ -249,6 +255,11 @@ fn move_node(op: &Op) -> Option<ElementId> {
 /// for a state that does not decode, since the gate is a reject boundary and an
 /// answer it cannot compute must not read as a clean one.
 pub fn batch_introduces_schema_violation(doc: &Document, ops: &[Op], schema: &Schema) -> bool {
+    // As above: an empty batch changes nothing, and finding that out must not cost
+    // an encode of the room.
+    if ops.is_empty() {
+        return false;
+    }
     introduces_violation_over(&doc.encode_state(), ops, schema)
 }
 

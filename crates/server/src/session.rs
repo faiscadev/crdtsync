@@ -1339,7 +1339,7 @@ fn handle_ops(
             // gate is a reject boundary: refuse the batch rather than read the
             // missing verdict as "crosses nothing".
             let Some(crossings) = hub.batch_zone_crossings(&room, &ops, schema) else {
-                return ops_rejected(channel, &ops, ErrorCode::Forbidden);
+                return ops_rejected(channel, &ops, ErrorCode::Internal);
             };
             if !crossings.is_empty()
                 && !cross_zone_move_authorized(
