@@ -1227,6 +1227,154 @@ fn a_resent_member_of_a_waiting_group_leaves_it_atomic() {
 }
 
 #[test]
+fn two_envelopes_naming_different_groups_spend_both_keys() {
+    // When the copies name different *groups* rather than two sizes of one, only
+    // the group the dedup kept the copy under can ever hold this id, and that is
+    // the arrival order's — so a genuine member of the other would be left holding.
+    // Both keys are spent, and each group's own member lands whichever copy won.
+    let (mut a, first) = pair();
+    let second = a.atomic_transact(|tx| {
+        tx.register(b"p", Scalar::Int(3));
+        tx.register(b"q", Scalar::Int(4));
+    });
+    let (t1, t2) = (tx_id(&first[0]), tx_id(&second[0]));
+
+    for order in [[0, 1], [1, 0]] {
+        let both = [retagged(&first[0], t1, 2), retagged(&first[0], t2, 2)];
+        let mut b = doc(9);
+        assert!(!b.apply(&both[order[0]]), "the first copy is held");
+        assert!(!b.apply(&both[order[1]]), "the second copy is a duplicate");
+        assert_eq!(reg(&b, b"x"), reg(&a, b"x"), "the held copy was released");
+        assert!(b.apply(&first[1]), "the first group's own member lands");
+        assert!(b.apply(&second[1]), "the second group's own member lands");
+        assert_eq!(reg(&b, b"y"), reg(&a, b"y"));
+        assert_eq!(reg(&b, b"q"), reg(&a, b"q"));
+    }
+}
+
+/// The residue the record does not reach, and does not claim to. A second copy is
+/// a duplicate only where the first is still *held*, so a copy whose forged tag
+/// carried it into another group's bucket — completing that bucket, and applying
+/// the id — has left the buffer before the honest copy arrives, and the honest
+/// group's own member is left holding. Eviction is what lands it, as for every
+/// group nobody will complete. This is a *fourth* shape, not one of the three the
+/// record closes: it needs the two copies to name different groups, it is
+/// order-dependent on `main` before the record exists, and the record narrows it
+/// from a split in what a replica reads to a split in which keys it has spent.
+/// Filed as its own unit (KANBAN C27).
+#[test]
+fn a_copy_absorbed_by_another_groups_bucket_strands_its_own_group_until_eviction() {
+    let (mut a, first) = pair();
+    let second = a.atomic_transact(|tx| {
+        tx.register(b"p", Scalar::Int(3));
+        tx.register(b"q", Scalar::Int(4));
+    });
+    let ops = [
+        retagged(&first[0], tx_id(&first[0]), 2),
+        retagged(&first[0], tx_id(&second[0]), 2),
+        first[1].clone(),
+        second[1].clone(),
+    ];
+
+    // The forged copy completes the second group's bucket, so the first group's
+    // own member waits on an id that has already applied elsewhere.
+    let mut b = doc(9);
+    for i in [3, 1, 0, 2] {
+        b.apply(&ops[i]);
+    }
+    assert_eq!(reg(&b, b"y"), None, "the stranded member");
+
+    // What every order does agree on, once evicted, is the state a reader sees.
+    for order in orderings(ops.len()) {
+        let mut d = doc(9);
+        for &i in &order {
+            d.apply(&ops[i]);
+        }
+        d.evict_partial_transactions();
+        for key in [&b"x"[..], b"y", b"q"] {
+            assert_eq!(
+                reg(&d, key),
+                reg(&a, key),
+                "order {order:?} left {key:?} stranded past eviction"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stray_of_the_authors_own_group_lands_at_the_author_too() {
+    // The author applies its own edits as it makes them and buckets nothing, so a
+    // group it tags leaves no bucket to commit. Resolved at the mint instead, or a
+    // stray under that id would be held at the author while every receiver merged
+    // it — one op set, two states.
+    let mut a = doc(1);
+    let group = a.atomic_transact(|tx| {
+        tx.register(b"m1", Scalar::Int(1));
+        tx.register(b"m2", Scalar::Int(2));
+    });
+    // An op of the author's own id space that the author has not published — what a
+    // relay forges when it re-tags a stray into a live group.
+    let mut relay = doc(1);
+    relay.transact(|tx| tx.register(b"burn1", Scalar::Int(0)));
+    relay.transact(|tx| tx.register(b"burn2", Scalar::Int(0)));
+    let stray = relay.transact(|tx| {
+        tx.register(b"m4", Scalar::Int(4));
+    });
+    let forged = retagged(&stray[0], tx_id(&group[0]), 2);
+
+    let mut b = doc(9);
+    for op in [&group[0], &group[1], &forged] {
+        b.apply(op);
+    }
+    assert_eq!(
+        reg(&b, b"m4"),
+        Some(Scalar::Int(4)),
+        "the receiver merged it"
+    );
+
+    assert!(a.apply(&forged), "the author merged it too");
+    assert_eq!(reg(&a, b"m4"), reg(&b, b"m4"));
+}
+
+#[test]
+fn a_duplicate_of_an_applied_member_changes_nothing() {
+    // A redelivered op is state a replica already holds, so it may not move any:
+    // the resend seams replay more than a peer kept, and a delivery that decided
+    // something would make state a function of how often an op arrived. Only a
+    // member the buffer is *holding* under another group is evidence of anything.
+    let (_, ops) = triple();
+    let id = tx_id(&ops[0]);
+
+    let mut b = doc(9);
+    b.apply(&ops[0]);
+    b.apply(&ops[1]);
+    b.evict_partial_transactions();
+    let settled = b.encode_state();
+
+    // Every envelope of an already-applied member: the honest one, one naming a
+    // size the group never had, one naming a group that never existed.
+    for forged in [
+        ops[0].clone(),
+        retagged(&ops[0], id, 2),
+        retagged(&ops[0], crdtsync_core::TxId(0xfeed), 2),
+    ] {
+        assert!(!b.apply(&forged));
+        assert_eq!(
+            b.encode_state(),
+            settled,
+            "a duplicate moved the replica's state"
+        );
+    }
+
+    // And the last member of the evicted group is where eviction left it, whether
+    // or not those duplicates arrived.
+    let mut c = Document::decode_state(&settled).expect("decode");
+    assert!(!b.apply(&ops[2]));
+    assert!(!c.apply(&ops[2]));
+    assert_eq!(b.encode_state(), c.encode_state());
+}
+
+#[test]
 fn a_resolved_group_key_survives_a_snapshot_restore() {
     // The record rides `encode_state`: a stray of a key resolved before a restart
     // has to land at the restored replica too, or a restore re-opens the hole the

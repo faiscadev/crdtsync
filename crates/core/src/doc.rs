@@ -242,10 +242,8 @@ pub struct Document {
     /// Ops whose target isn't reachable yet, held until a create makes it so.
     buffer: Vec<Op>,
     buffered: HashSet<OpId>,
-    /// The `(author, group id)` keys whose bucket has already resolved — committed
-    /// as a whole group, or settled by a member this replica holds under another
-    /// envelope. A member arriving under a resolved key is untagged and merges
-    /// standalone.
+    /// The `(author, group id)` keys whose bucket has resolved. A member arriving
+    /// under one is untagged and merges standalone.
     ///
     /// Committing a bucket *spends* its key: the members leave the buffer, and a
     /// later member of that key would otherwise start a fresh bucket at an arrival
@@ -254,12 +252,23 @@ pub struct Document {
     /// replicas fold one op set to two states — a rewritten `count` consistent across
     /// every member, an unrelated op of the same author carrying a live group's id,
     /// and one op id delivered under two envelopes all reach that shape, and none is
-    /// malformed on any member's own terms. Recording the key is what makes the
-    /// stray's fate a function of the op set rather than of when it arrived.
+    /// malformed on any member's own terms. Recording the key is what makes a stray's
+    /// fate a function of the op set rather than of when it arrived.
+    ///
+    /// A key resolves at three points, one per way a bucket is spent. A bucket that
+    /// commits spends it. A local mint spends it too — the author applies its own
+    /// edits as it makes them and buckets nothing, so a group it tags is resolved
+    /// where a receiver's is on commit, or an author would hold a stray every
+    /// receiver merged. And a member arriving under a group other than the one the
+    /// buffer holds it under spends *both*: only one of the two can ever hold this
+    /// id, and which one is the arrival order's.
     ///
     /// Carried in the state encoding: a group resolved before a restart is one whose
-    /// stray still has to land after it. Bounded by the groups the replica has
-    /// resolved, so smaller than the `seen` set it already keeps per op.
+    /// stray still has to land after it. Each entry needs a group this replica
+    /// bucketed, committed or minted, so the set is bounded by the ops it holds —
+    /// and a conflicting envelope adds at most one key per bucketed group, since
+    /// resolving untags that bucket and the next envelope for the same id then finds
+    /// nothing held under a group.
     resolved_tx: HashSet<(ClientId, TxId)>,
     /// Movable nodes revealed by an [`XmlReveal`](crate::op::OpKind::XmlReveal) shell
     /// but not yet placed — a node materialized (identity + tag) with no placement,
@@ -2337,8 +2346,9 @@ impl Document {
         // The buffer holds only ops still waiting on their target; a well-formed
         // snapshot already satisfies that, so this is a no-op there. Draining
         // restores the invariant for any op decoded as already reachable rather
-        // than leaving it stuck until an unrelated mutation, and the untag ahead of
-        // it the invariant that no member waits under a key the record has spent.
+        // than leaving it stuck until an unrelated mutation. The untag ahead of it
+        // restores the other invariant the drain assumes: no member waits under a
+        // key the record has already spent.
         doc.untag_resolved();
         doc.drain_buffer();
         Ok(doc)
@@ -2533,12 +2543,18 @@ impl Document {
     ///
     /// The id is [derived](TxId::derive) from the members' own sequences, so it is
     /// as durable as the op ids it sits beside and needs no state of its own.
-    fn tag_atomic(&self, ops: Vec<Op>) -> Vec<Op> {
+    ///
+    /// Tagging resolves the group's key here, as a receiver's commit resolves it
+    /// there: the author applied these edits as it made them and never buckets
+    /// them, so without this a stray arriving under the group's id would be held
+    /// at the author while every receiver merged it — one op set, two states.
+    fn tag_atomic(&mut self, ops: Vec<Op>) -> Vec<Op> {
         let count = match u32::try_from(ops.len()) {
             Ok(count) if (1..=MAX_TX_MEMBERS).contains(&count) => count,
             _ => return ops,
         };
         let id = TxId::derive(ops.iter().map(|op| op.id.seq));
+        self.resolve_tx((self.client, id));
         ops.into_iter()
             .map(|mut op| {
                 op.tx = Some(Tx { id, count });
@@ -2613,24 +2629,25 @@ impl Document {
     /// and acknowledge — asks the op, since the refusal is a function of the op
     /// alone and never of this document's state.
     pub fn apply(&mut self, op: &Op) -> bool {
+        // Judged before the dedup, so an envelope no replica may hold decides
+        // nothing about the groups this one is holding.
+        if !op.is_admissible() {
+            return false;
+        }
         if self.seen.contains(&op.id) || self.buffered.contains(&op.id) {
-            // A second envelope for an id this replica already holds. The copy it
-            // kept is the one its buckets see, so a group naming this id under the
-            // *other* envelope will never hold it and can never reach its size —
-            // and which copy the dedup kept is the arrival order's. Resolving that
-            // group's key releases what it holds, so the same ops land the same set
-            // whichever envelope won. A plain resend carries the envelope already
-            // held and decides nothing: an honest group stays whole.
-            if let Some(tx) = op.tx {
-                let held = self.buffer.iter().find(|held| held.id == op.id);
-                if held.is_none_or(|held| held.tx != Some(tx)) {
+            // A second envelope for a member this replica is holding. The copy it
+            // kept is the one its buckets see, so exactly one of the two groups
+            // named will ever hold this id, and which one is the arrival order's —
+            // so both keys resolve and every order lands the same set. A plain
+            // resend names the group already held and decides nothing, which is
+            // what leaves an honest group waiting whole for the member it lacks.
+            if let (Some(tx), Some(held)) = (op.tx, self.buffered_tx(op.id)) {
+                if held != tx {
+                    self.resolve_tx((op.id.client, held.id));
                     self.resolve_tx((op.id.client, tx.id));
                     self.drain_buffer();
                 }
             }
-            return false;
-        }
-        if !op.is_admissible() {
             return false;
         }
         // A member of a group whose bucket has already resolved is a stray of a
@@ -3018,6 +3035,12 @@ impl Document {
         let mut idxs = complete;
         idxs.sort_unstable_by(|a, b| b.cmp(a));
         Some(idxs.into_iter().map(|i| self.buffer.remove(i)).collect())
+    }
+
+    /// The group a buffered member is held under, or `None` if the buffer holds no
+    /// member at `id` or holds it untagged.
+    fn buffered_tx(&self, id: OpId) -> Option<Tx> {
+        self.buffer.iter().find(|op| op.id == id)?.tx
     }
 
     /// Record `key`'s bucket as resolved and release every member still held under
