@@ -1597,11 +1597,13 @@ impl Document {
     /// snapshot-served one, which materializes the identical nodes.
     ///
     /// Each shell carries only the node's current identity and `tag` — never an op of its
-    /// private origin — and is stamped from the node's birth stamp (so the reader's clock
-    /// reaches what the origin advanced) under an id derived from the node (unique, and
-    /// never a real authored op, which the reader could not have seen anyway since its
-    /// origin was denied). The server injects these into a partial reader's catch-up
-    /// delta and live fan-out; they are never authored, logged, or persisted.
+    /// private origin — and is stamped at **lamport 0** under an id derived from the node
+    /// (unique, and never a real authored op, which the reader could not have seen anyway
+    /// since its origin was denied). Lamport 0 is deliberate: a shell must move no clock
+    /// and leave no id-space record, or a synthetic op would speak for the origin's
+    /// position. `record_stamp`'s zero-reach skip is what keeps it out of the record.
+    /// The server injects these into a partial reader's catch-up delta and live
+    /// fan-out; they are never authored, logged, or persisted.
     pub fn reveal_ops(&self, reads: impl Fn(&[Vec<u8>]) -> bool) -> Vec<Op> {
         let paths = self.element_paths();
         let root = self.root_id();
@@ -2407,6 +2409,11 @@ impl Document {
         // closes the intention itself.
         if self.atomic.is_none() && !self.history.grouped() {
             self.history.close(false);
+            // The intention is over, so the refusal latch goes with it. Clearing at
+            // both ends is what makes [`can_mint`](Self::can_mint) a reading of the
+            // id space *between* operations rather than a report on the last one:
+            // held while the intention runs, gone once it has.
+            self.mint_refused = false;
         }
         // While recording an atomic transaction, edits accumulate into the group
         // rather than returning per call; the group ships on `commit_atomic`.
@@ -2452,8 +2459,10 @@ impl Document {
         let Some(ops) = self.atomic.take() else {
             return Vec::new();
         };
-        // The group is one intention, undone and redone as one transaction.
+        // The group is one intention, undone and redone as one transaction — and it
+        // is over, so the refusal latch clears with it.
         self.history.close(true);
+        self.mint_refused = false;
         self.tag_atomic(ops)
     }
 
@@ -3430,13 +3439,14 @@ impl Document {
         self.parents.insert(child_id, list_id);
         list.borrow_mut().insert_at(stamp, element, anchor);
         // Record the birth placement so a later move can pick the live one of the
-        // node's placements — but only once per `(list, stamp)`. `insert_at` is
-        // idempotent on the id, and two ops may legitimately carry one stamp into
-        // one list: they share a `ClientId`, so they derive the same `child_id` and
-        // both pass every gate, and dedup is on `OpId`. Pushing unconditionally
-        // stored the placement twice, which `read_state` refuses as a duplicate —
-        // an `encode_state` its own decoder rejects, and a room snapshot no restart
-        // can load. The index is the seam that already knows, so it decides.
+        // node's placements — but only once per `(list, stamp)`. Two ops can carry
+        // one stamp into one list and both pass every gate, since dedup is on `OpId`
+        // and an id-space record only bounds an *honest* mint. They need not name the
+        // same child: `xml_child_id` mixes the kind in, so a tagged and a tagless
+        // insert at one stamp derive *different* ids. Pushing unconditionally stored
+        // the placement twice, which `read_state` refuses as a duplicate — an
+        // `encode_state` its own decoder rejects, and a room snapshot no restart can
+        // load. The index is the seam that already knows, so it decides.
         if self.placement_index.insert((list_id, stamp)) {
             self.placements
                 .entry(child_id)
@@ -3483,16 +3493,23 @@ impl Document {
         let Some(element) = self.node_element(node) else {
             return;
         };
-        list.borrow_mut().insert_at(stamp, element, anchor);
-        // One placement per `(list, stamp)`, for the reason `insert_xml_child` gives:
-        // a second op at the same stamp into the same list would otherwise store a
-        // duplicate placement that `read_state` refuses.
-        if self.placement_index.insert((dest_list, stamp)) {
-            self.placements.entry(node).or_default().push(Placement {
-                list: dest_list,
-                stamp,
-            });
+        // One placement per `(list, stamp)`, for the reason `insert_xml_child` gives.
+        // Here the colliding op need not name the same node — a move takes its node
+        // from the payload, so two moves at one stamp into one list name two
+        // unrelated ones — so the whole move is refused rather than only its
+        // placement. Applying it to the move-set while storing no placement would
+        // put the node's parent at the destination with nowhere to render, and
+        // `refold_moves` would suppress every placement it has: the node would
+        // vanish. Which of the two lands is still arrival-order dependent, and that
+        // residual is filed as C24; what this keeps is that neither disappears.
+        if !self.placement_index.insert((dest_list, stamp)) {
+            return;
         }
+        list.borrow_mut().insert_at(stamp, element, anchor);
+        self.placements.entry(node).or_default().push(Placement {
+            list: dest_list,
+            stamp,
+        });
         self.moves.apply(stamp, node, owner);
         // The shell is now placed — an ordinary moved node from here on.
         self.revealed_pending.remove(&node);
@@ -3764,6 +3781,7 @@ impl Document {
     pub fn end_intention(&mut self) {
         if self.history.close_group() && self.atomic.is_none() {
             self.history.close(false);
+            self.mint_refused = false;
         }
     }
 

@@ -268,6 +268,74 @@ fn a_projection_keeps_the_recipients_own_high_water() {
 }
 
 #[test]
+fn two_ops_at_one_stamp_into_one_list_still_leave_a_loadable_snapshot() {
+    // `encode_state` must never emit bytes `decode_state` refuses — the invariant
+    // C18 is about — and a placement was the last way it could. `List::insert_at` is
+    // idempotent on the id, but the placement push was not: two ops carrying one
+    // stamp into one children list stored the placement twice, and `read_state`
+    // refuses a duplicate. Durable, because the room replica folds both, compaction
+    // writes the snapshot, and no restart can load it.
+    //
+    // Two ops can carry one stamp and both pass every gate: dedup is on `OpId`, and
+    // the id-space record only bounds an *honest* mint. They need not even name the
+    // same child — `xml_child_id` mixes the kind in, so a tagged and a tagless insert
+    // at one stamp derive different ids, which is why the tagless variant is run too.
+    let victim = cid(1);
+    for tagged in [true, false] {
+        let mut doc = Document::new(victim);
+        let mut batch = doc.transact(|tx| {
+            tx.xml_fragment(b"f").children().insert_element(0, b"a");
+        });
+        let insert = batch
+            .iter()
+            .position(|op| matches!(op.kind, OpKind::XmlInsertChild { .. }))
+            .expect("the child insert");
+        let mut twin = batch[insert].clone();
+        twin.id.seq = 9_000;
+        if !tagged {
+            if let OpKind::XmlInsertChild { tag, .. } = &mut twin.kind {
+                *tag = None;
+            }
+        }
+        assert_eq!(
+            twin.stamp, batch[insert].stamp,
+            "the twin carries one stamp"
+        );
+        doc.apply(&twin);
+        let _ = &mut batch;
+
+        Document::decode_state(&doc.encode_state()).unwrap_or_else(|e| {
+            panic!("a replica could not load its own snapshot (tagged={tagged}): {e:?}")
+        });
+    }
+}
+
+#[test]
+fn a_buffered_op_at_lamport_zero_leaves_the_snapshot_byte_stable() {
+    // `record_stamp` stores no entry for a zero reach, so the decode-side buffer
+    // floor must not create one either — otherwise a decoded replica declares a
+    // record the encoder never wrote, and `encode_state`'s byte-stability contract
+    // breaks on a re-encode. A projection's re-floor would then carry the invented
+    // entry into a live document.
+    let victim = cid(1);
+    let mut plant = impersonated_run(victim, b"t", "M", 1);
+    let run = plant.pop().expect("the run op");
+    let mut zero = run;
+    zero.stamp.lamport = 0;
+    zero.id.seq = 7_000;
+
+    let mut doc = Document::new(victim);
+    assert!(!doc.apply(&zero), "the run waits on its container");
+    let bytes = doc.encode_state();
+    let back = Document::decode_state(&bytes).expect("its own snapshot decodes");
+    assert_eq!(
+        back.encode_state(),
+        bytes,
+        "the decode invented a zero record entry the encoder never wrote"
+    );
+}
+
+#[test]
 fn a_projection_withholds_every_other_clients_entry_and_re_floors() {
     // The two halves of the scrub, each pinned on its own. The *withholding* half is
     // a privacy rule: another client's entry counts what that replica minted inside
