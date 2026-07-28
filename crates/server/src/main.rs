@@ -50,13 +50,20 @@
 //! CA, or any certificate it issues naming a member's host can speak as that member.
 //! Once every node has an identity, set `CRDTSYNC_CLUSTER_REQUIRE_PEER_IDENTITY=1` to
 //! refuse any peer link that presents none; a node that requires it while verifying no
-//! client certificate, while presenting no identity of its own or one that does not
-//! name its own advertise host, or while holding a member whose advertise address
-//! names no host, refuses to start. A member that advertises plaintext still
-//! identifies itself — the link carrying its identity here is the one it dials — so
-//! this requires no TLS rollout of its own. A certificate that *is* presented is
-//! decisive either way, so a cluster already running peer mTLS wants each node's
-//! certificate naming that node's advertise host before the upgrade. Set `CRDTSYNC_BLOB_ADDR` to
+//! client certificate, while presenting no identity of its own, or while holding a
+//! member whose advertise address names no host, refuses to start. Two refusals do not
+//! wait for that policy: an advertise address that names no host at all is refused
+//! outright (no peer could dial it), and a node that sets `CRDTSYNC_TLS_CLIENT_CA`
+//! while presenting a peer certificate that names no host matching the id it dials
+//! under refuses to start too, since every peer applying the same binding refuses its
+//! links. A node holding such a certificate *without* `CRDTSYNC_TLS_CLIENT_CA` cannot
+//! tell whether its peers ask for one, so it warns and starts — **keep the client-CA
+//! and peer-certificate settings uniform across the cluster**, or a node may run on
+//! only that warning while its peers refuse every link it opens. A member that
+//! advertises plaintext still identifies itself — the link carrying its identity here
+//! is the one it dials — so this requires no TLS rollout of its own. A certificate
+//! that *is* presented is decisive either way, so a cluster already running peer mTLS
+//! wants each node's certificate naming that node's advertise host before the upgrade. Set `CRDTSYNC_BLOB_ADDR` to
 //! serve the out-of-band blob upload/fetch HTTP plane there — a client stores a
 //! large blob and fetches it by handle; its store root is `CRDTSYNC_BLOB_ROOT` or
 //! a `blobs/` subdirectory of `CRDTSYNC_DATA_DIR`, and requests authenticate

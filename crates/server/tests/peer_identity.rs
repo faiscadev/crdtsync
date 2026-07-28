@@ -1066,6 +1066,46 @@ mod live {
         ws
     }
 
+    /// Open a client on a *plaintext* listener and subscribe it to a room, so a test
+    /// can tell "the node is serving" from "the node refused to start".
+    async fn open_plain_client(addr: &str, client: ClientId) -> Ws {
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        ws.send(WsMessage::Binary(encode_header(PROTOCOL_VERSION).to_vec()))
+            .await
+            .unwrap();
+        send_frame(
+            &mut ws,
+            &Message::Hello {
+                client,
+                app_id: Vec::new(),
+                schema_version: 0,
+                codecs: Vec::new(),
+            },
+        )
+        .await;
+        send_frame(
+            &mut ws,
+            &Message::Auth {
+                credential: b"cred".to_vec(),
+            },
+        )
+        .await;
+        send_frame(
+            &mut ws,
+            &Message::Subscribe {
+                channel: CH,
+                room: b"any-room".to_vec(),
+                branch: Vec::new(),
+                zone: Vec::new(),
+                last_seen_seq: 0,
+            },
+        )
+        .await;
+        ws
+    }
+
     /// Open a certless client on a `wss://` listener running in request mode — the
     /// ordinary application connection a peer-identity deployment must keep serving.
     async fn open_client(url: &str, ca: &Ca, client: ClientId) -> Ws {
@@ -1409,6 +1449,29 @@ mod live {
 
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // binds a loopback listener
+    async fn an_advertise_address_that_names_no_host_refuses_to_start() {
+        // No peer can dial it and no certificate could ever be bound to it, so it is
+        // the address that is wrong — refused however the deployment is configured,
+        // with the message for the problem it actually is rather than as a certificate
+        // naming the wrong host.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let e = startup_error(
+            listener,
+            ServeConfig {
+                membership: Some(two_node_membership("::1:9000", "10.0.0.2:9000")),
+                cluster_secret: Some(SECRET.to_vec()),
+                ..ServeConfig::default()
+            },
+        )
+        .await;
+        assert!(
+            e.to_string().contains("names no host, so no peer can dial"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // binds a loopback listener
     async fn requiring_peer_identity_of_a_member_that_names_no_host_refuses_to_start() {
         // The binding is the member's host, so a member whose advertise address yields
         // none — an unbracketed IPv6 literal is the way to get there — could never be
@@ -1488,36 +1551,41 @@ mod live {
 
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // binds and dials a loopback listener
-    async fn a_certificate_for_another_host_still_starts_where_no_peer_asks_for_one() {
-        // The other side of that refusal, and the reason it is conditioned rather than
+    async fn a_certificate_for_another_host_still_serves_where_no_peer_asks_for_one() {
+        // The other side of that refusal, and why it is conditioned rather than
         // absolute. A client certificate is only sent when the acceptor asks for one,
-        // so in a cluster where no listener verifies client certificates the binding
-        // never runs and a certificate naming something else — a URI-SAN service
-        // identity, a CN-only one, a wildcard — is inert. Refusing to start there would
-        // break a working deployment to warn about a failure that cannot happen.
+        // so where no listener verifies client certificates the binding never runs and
+        // a certificate naming something else — a URI-SAN service identity, a CN-only
+        // one, a wildcard — is inert. Refusing to start there would break a working
+        // deployment to report a failure that cannot happen; the node says so on stderr
+        // instead, since it cannot see whether its peers ask.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let served = tokio::time::timeout(
-            Duration::from_secs(2),
-            serve_with(
-                listener,
-                cid(0xFF),
-                None,
-                ServeConfig {
-                    membership: Some(two_node_membership(&addr, "10.0.0.2:9000")),
-                    cluster_secret: Some(SECRET.to_vec()),
-                    require_peer_identity: false,
-                    client_cert_verification: false,
-                    peer_client_identity: Some(vec![b"elsewhere.example".to_vec()]),
-                    ..ServeConfig::default()
-                },
-            ),
-        )
-        .await;
+        let node = tokio::spawn(serve_with(
+            listener,
+            cid(0xFF),
+            None,
+            ServeConfig {
+                membership: Some(two_node_membership(&addr, "10.0.0.2:9000")),
+                cluster_secret: Some(SECRET.to_vec()),
+                require_peer_identity: false,
+                client_cert_verification: false,
+                peer_client_identity: Some(vec![b"elsewhere.example".to_vec()]),
+                ..ServeConfig::default()
+            },
+        ));
+        // It started *and serves*: an ordinary client completes the handshake.
+        let mut ws = open_plain_client(&addr, cid(1)).await;
         assert!(
-            served.is_err(),
-            "the node refused to start over a certificate no peer will ever ask it for: {served:?}",
+            next_matching(&mut ws, CONVERGE, |m| matches!(
+                m,
+                Message::Ops { .. } | Message::Snapshot { .. } | Message::Redirect { .. }
+            ))
+            .await
+            .is_some(),
+            "the node did not serve, so the certificate refusal fired where no peer asks",
         );
+        node.abort();
     }
 
     #[tokio::test]

@@ -838,9 +838,11 @@ fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
 /// to it, and that binding refuses a presented certificate which binds nothing — so a
 /// node with a certificate for the wrong host has every link refused, silently, whether
 /// or not *this* deployment requires identity. It is decidable here, so it is decided
-/// here — but only where this node verifies client certificates, which mirrors whether
-/// its peers request one at all: where none does, the certificate is never presented,
-/// the binding never runs, and one naming something else is inert rather than fatal.
+/// here — but *fatally* only where this node verifies client certificates, which is a
+/// proxy for whether its peers request one: exact in a homogeneous deployment, wrong in
+/// both directions during a rolling change. Where this node's own evidence says no
+/// certificate is asked for it warns instead, since the deployment may be perfectly
+/// inert and breaking it to report a failure that may not exist is the worse error.
 ///
 /// The rest apply only where identity is *required*, since requiring it means refusing
 /// every peer link that carries no verified certificate naming a member, which needs
@@ -870,33 +872,44 @@ fn peer_identity_policy(config: &ServeConfig) -> std::io::Result<()> {
         |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string());
     // The peers apply this node's own rule to this node's own certificate, so that half
     // of their decision is decidable here — and it binds whether or not this deployment
-    // requires identity *of them*. It is conditioned on this node verifying client
-    // certificates, because that mirrors whether the peers request one at all: where no
-    // listener does, no certificate is ever presented, the binding never runs, and a
-    // certificate that names something else — a URI-SAN service identity, a CN-only
-    // one, a wildcard — is simply inert rather than a link nobody will accept.
+    // requires identity *of them*.
     //
-    // A self address that names no host is left to `peer_dialer`, which refuses it with
-    // the message for the problem it actually is; reporting it here as a certificate
-    // that names the wrong host would send the operator to the wrong file.
-    if let (Some(own_hosts), Some(membership), true) = (
-        &config.peer_client_identity,
-        &config.membership,
-        config.client_cert_verification,
-    ) {
+    // Whether it is *fatal* turns on whether a peer will ever ask for the certificate,
+    // which this node cannot see. Its own listener is the only evidence available, and
+    // it is a proxy: exact in the homogeneous deployment the docs prescribe, and wrong
+    // in both directions during a rolling change, when the two settings land on a node
+    // one at a time. So the node refuses where its own evidence says a certificate is
+    // asked for, and says so out loud otherwise — rather than breaking a deployment
+    // that may be perfectly inert, or starting silently into a cluster that will refuse
+    // every link it opens.
+    //
+    // A self address that names no host is `peer_dialer`'s refusal, which reports the
+    // problem it actually is; repeating it here as a certificate naming the wrong host
+    // would send the operator to the wrong file.
+    if let (Some(own_hosts), Some(membership)) = (&config.peer_client_identity, &config.membership)
+    {
         let self_addr = membership.self_id().as_bytes();
-        if crate::dial::member_host(self_addr).is_some()
+        let unbound = crate::dial::member_host(self_addr).is_some()
             && !own_hosts
                 .iter()
-                .any(|host| crate::dial::cert_names_member(host, self_addr))
-        {
-            return Err(invalid(&format!(
+                .any(|host| crate::dial::cert_names_member(host, self_addr));
+        if unbound {
+            let addr = String::from_utf8_lossy(self_addr);
+            let advice = format!(
                 "this node's peer certificate names no host binding it to the node id it dials \
-                 under, `{}`, so every peer that verifies client certificates refuses its links \
-                 — whether or not identity is required anywhere: give the certificate an \
-                 iPAddress SAN for that address, or a dNSName SAN for that host name",
-                String::from_utf8_lossy(self_addr),
-            )));
+                 under, `{addr}`: give the certificate an iPAddress SAN for that address, or a \
+                 dNSName SAN for that host name"
+            );
+            if config.client_cert_verification {
+                return Err(invalid(&format!(
+                    "{advice} — every peer that verifies client certificates refuses its links"
+                )));
+            }
+            eprintln!(
+                "crdtsync: {advice}. This node verifies no client certificate itself, so it \
+                 cannot tell whether its peers request one; where any of them does, it will \
+                 refuse every link this node opens."
+            );
         }
     }
     if !config.require_peer_identity {
@@ -986,6 +999,17 @@ fn peer_dialer(
             // it must match the transport this node terminates.
             let endpoint = crate::dial::PeerEndpoint::parse(&addr)
                 .map_err(|e| invalid(format!("this node's advertise address `{addr}`: {e}")))?;
+            // An address that parses but names no host — an IPv6 literal left
+            // unbracketed, or one opening with its port separator — is dialable by
+            // nobody, and it is also the one shape no certificate could ever be bound
+            // to. Refused here rather than by the identity policy, because it is the
+            // address that is wrong however the deployment is configured.
+            if crate::dial::member_host(addr.as_bytes()).is_none() {
+                return Err(invalid(format!(
+                    "this node's advertise address `{addr}` names no host, so no peer can dial \
+                     it: address this node as `host:port`, bracketing an IPv6 literal"
+                )));
+            }
             if endpoint.is_tls() != config.tls.is_some() {
                 return Err(invalid(match endpoint.is_tls() {
                     true => format!(
