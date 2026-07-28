@@ -29,6 +29,7 @@ use crdtsync_core::{
     ClientId, ErrorCode, Message, Op, OpId, OpKind, Scalar, Stamp, Tx, TxId, LAMPORT_STATE_CEILING,
 };
 use crdtsync_server::auth::AllowAll;
+use crdtsync_server::store::Store;
 use crdtsync_server::{step, Hub, PermitAll, SchemaRegistry, Session};
 
 const ROOM: &[u8] = b"room-1";
@@ -331,6 +332,62 @@ fn the_ingest_seam_drops_a_refused_op() {
         vec![resend],
         "the refused id was never entered in the dedup set"
     );
+}
+
+/// A branch tail is folded into a document only when the branch is materialized, so
+/// a refused op admitted there would sit durable and undetected until the fold and
+/// then be dropped — the same land-nowhere write, deferred.
+#[test]
+fn a_branch_tail_never_holds_a_refused_op() {
+    let mut h = Hub::new(cid(0xFF));
+    h.ingest(ROOM, vec![honest_op(cid(1))], None)
+        .expect("a store-less ingest never fails");
+    assert!(h
+        .fork_branch(ROOM, b"feature", b"main", 1)
+        .expect("a store-less fork never fails"));
+
+    let mut bad = offset_stamp_op(cid(2));
+    bad.id.seq = 5;
+    let applied = h
+        .ingest_branch(ROOM, b"feature", vec![bad], None)
+        .expect("a store-less ingest never fails");
+
+    assert!(applied.is_empty(), "the refused op is not appended");
+    assert_eq!(
+        h.branch(ROOM, b"feature").map(|b| b.head),
+        Some(1),
+        "and does not advance the branch head"
+    );
+}
+
+/// The durable half: a refused op never reaches the store, so a reload does not
+/// replay it back into the log it was kept out of.
+#[test]
+#[cfg_attr(miri, ignore = "real filesystem I/O, which Miri does not model")]
+fn a_refused_op_never_reaches_the_store() {
+    let dir = std::env::temp_dir().join(format!("crdtsync-refused-op-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the temp dir is creatable");
+
+    let good = honest_op(cid(1));
+    let mut bad = offset_stamp_op(cid(1));
+    bad.id.seq = good.id.seq + 1;
+    {
+        let mut h = Hub::new(cid(0xFF));
+        h.attach_store(Store::open(&dir).expect("the store opens"));
+        h.ingest(ROOM, vec![bad.clone(), good.clone()], None)
+            .expect("the ingest persists");
+    }
+
+    let h = Hub::from_rooms(
+        cid(0xFF),
+        Store::open(&dir).expect("the store opens").load().unwrap(),
+    )
+    .expect("the reload succeeds");
+    assert_eq!(h.seq(ROOM), 1, "only the admissible op was persisted");
+    assert!(h.get(ROOM, b"title").is_some(), "and it replays into state");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A refusal is a pure function of the op, so the predicate the server gates on is
