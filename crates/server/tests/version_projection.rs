@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
 use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::Channel;
-use crdtsync_core::{AclEffect, ClientId, Document, Element, Message, Op, OpId, Scalar, Schema};
+use crdtsync_core::{
+    AclEffect, ClientId, Document, Element, ElementId, Message, Op, OpId, Scalar, Schema,
+};
 use crdtsync_server::acl::{actor_key, Acl, ResourceMatch, Subject};
 use crdtsync_server::{
     Action, ConnId, Identity, ManualClock, Registry, Resource, SchemaRegistry, StaticTokens,
@@ -68,11 +70,11 @@ fn auth(r: &mut Registry, client: u8, credential: &str, app: &[u8], version: u32
     id
 }
 
-fn subscribe(r: &mut Registry, id: ConnId, zone: &[u8]) -> Vec<Message> {
+fn subscribe_on(r: &mut Registry, id: ConnId, channel: Channel, zone: &[u8]) -> Vec<Message> {
     assert!(r.deliver(
         id,
         Message::Subscribe {
-            channel: CH,
+            channel,
             room: ROOM.to_vec(),
             branch: Vec::new(),
             zone: zone.to_vec(),
@@ -82,9 +84,17 @@ fn subscribe(r: &mut Registry, id: ConnId, zone: &[u8]) -> Vec<Message> {
     r.take_outbox(id)
 }
 
-fn submit(r: &mut Registry, id: ConnId, ops: Vec<Op>) {
-    assert!(r.deliver(id, Message::Ops { channel: CH, ops }));
+fn subscribe(r: &mut Registry, id: ConnId, zone: &[u8]) -> Vec<Message> {
+    subscribe_on(r, id, CH, zone)
+}
+
+fn submit_on(r: &mut Registry, id: ConnId, channel: Channel, ops: Vec<Op>) {
+    assert!(r.deliver(id, Message::Ops { channel, ops }));
     r.take_outbox(id);
+}
+
+fn submit(r: &mut Registry, id: ConnId, ops: Vec<Op>) {
+    submit_on(r, id, CH, ops);
 }
 
 /// Take a named version of the channel's room, through the wire sub-protocol.
@@ -107,12 +117,12 @@ fn create_version(r: &mut Registry, id: ConnId, name: &[u8]) {
     assert!(names.contains(&name.to_vec()));
 }
 
-/// The state `id` is served for the named version — the bytes under test.
-fn fetch_version(r: &mut Registry, id: ConnId, name: &[u8]) -> Vec<u8> {
+/// The state `id` is served for the named version on `channel` — the bytes under test.
+fn fetch_version_on(r: &mut Registry, id: ConnId, channel: Channel, name: &[u8]) -> Vec<u8> {
     assert!(r.deliver(
         id,
         Message::VersionFetch {
-            channel: CH,
+            channel,
             name: name.to_vec(),
         }
     ));
@@ -123,6 +133,10 @@ fn fetch_version(r: &mut Registry, id: ConnId, name: &[u8]) -> Vec<u8> {
             _ => None,
         })
         .expect("the fetch replies with the version's state")
+}
+
+fn fetch_version(r: &mut Registry, id: ConnId, name: &[u8]) -> Vec<u8> {
+    fetch_version_on(r, id, CH, name)
 }
 
 /// The ops in a batch of reply frames, flattened.
@@ -376,11 +390,34 @@ fn alice_tuple(
     })
 }
 
+/// Which shape of read-deny alice installs on `/b` before bob joins.
+#[derive(Clone, Copy, PartialEq)]
+enum Deny {
+    /// None yet — the room reads whole until a test installs one.
+    Absent,
+    /// A fixed-path tuple on `/b`.
+    Path,
+    /// A stable-element tuple on the container `/b` currently holds, so the deny
+    /// resolves through whichever tree it is evaluated against.
+    Element,
+}
+
+/// The container id `/b` holds in `doc`.
+fn slot_id(doc: &Document, key: &[u8]) -> ElementId {
+    match doc.get(key) {
+        Some(Element::Map(m)) => {
+            let id = m.borrow().id();
+            id
+        }
+        _ => panic!("slot {key:?} is not a map"),
+    }
+}
+
 /// A room alice created with `/a` and `/b` seeded, where bob reads the room through
-/// the schema tier, writes through a doc-ACL root grant, and is denied read on `/b`.
-/// Bob has joined and caught up. Returns the registry, alice's doc + conn, bob's doc
-/// + conn.
-fn partial_room() -> (Registry, Document, ConnId, Document, ConnId) {
+/// the schema tier, writes through a doc-ACL root grant, and is denied read on `/b`
+/// in the shape `deny` names. Bob has joined and caught up. Returns the registry,
+/// alice's doc + conn, bob's doc + conn.
+fn partial_room(deny: Deny) -> (Registry, Document, ConnId, Document, ConnId) {
     let mut sr = SchemaRegistry::new();
     sr.register(PARTIAL_APP, 1, PARTIAL.as_bytes(), b"")
         .unwrap();
@@ -417,14 +454,33 @@ fn partial_room() -> (Registry, Document, ConnId, Document, ConnId) {
             AclEffect::Allow,
             &encode_path(&[]),
         ),
-        alice_tuple(
-            &mut alice_doc,
-            Capability::Read,
-            AclEffect::Deny,
-            &encode_path(&[b"b"]),
-        ),
     ] {
         submit(&mut r, alice, ops);
+    }
+    match deny {
+        Deny::Absent => {}
+        Deny::Path => {
+            let ops = alice_tuple(
+                &mut alice_doc,
+                Capability::Read,
+                AclEffect::Deny,
+                &encode_path(&[b"b"]),
+            );
+            submit(&mut r, alice, ops);
+        }
+        Deny::Element => {
+            let target = slot_id(&alice_doc, b"b");
+            let ops = alice_doc.transact(|tx| {
+                tx.acl().grant_element(
+                    AclSubject::Actor(actor_key(b"bob")),
+                    AclGrant::Capability(Capability::Read),
+                    AclEffect::Deny,
+                    target,
+                    actor_key(b"alice"),
+                );
+            });
+            submit(&mut r, alice, ops);
+        }
     }
 
     let bob = auth(&mut r, 2, "t-bob", PARTIAL_APP, 1);
@@ -438,7 +494,7 @@ fn partial_room() -> (Registry, Document, ConnId, Document, ConnId) {
 
 #[test]
 fn a_partial_readers_version_withholds_the_denied_subtree() {
-    let (mut r, _alice_doc, alice, _bob_doc, bob) = partial_room();
+    let (mut r, _alice_doc, alice, _bob_doc, bob) = partial_room(Deny::Path);
     create_version(&mut r, alice, V1);
 
     let served = Document::decode_state(&fetch_version(&mut r, bob, V1))
@@ -456,7 +512,7 @@ fn a_partial_readers_version_withholds_the_denied_subtree() {
 
 #[test]
 fn a_whole_document_readers_version_is_served_unnarrowed() {
-    let (mut r, _alice_doc, alice, _bob_doc, _bob) = partial_room();
+    let (mut r, _alice_doc, alice, _bob_doc, _bob) = partial_room(Deny::Path);
     create_version(&mut r, alice, V1);
 
     let served = Document::decode_state(&fetch_version(&mut r, alice, V1))
@@ -467,7 +523,7 @@ fn a_whole_document_readers_version_is_served_unnarrowed() {
 
 #[test]
 fn a_partial_readers_version_names_no_other_replicas_ids() {
-    let (mut r, _alice_doc, alice, mut bob_doc, bob) = partial_room();
+    let (mut r, _alice_doc, alice, mut bob_doc, bob) = partial_room(Deny::Path);
     let ops = bob_doc.transact(|tx| {
         tx.map(b"a").register(b"b0", Scalar::Int(0));
     });
@@ -483,7 +539,7 @@ fn a_partial_readers_version_names_no_other_replicas_ids() {
 
 #[test]
 fn a_restarted_partial_reader_does_not_re_mint_across_a_fetched_version() {
-    let (mut r, _alice_doc, alice, mut bob_doc, bob) = partial_room();
+    let (mut r, _alice_doc, alice, mut bob_doc, bob) = partial_room(Deny::Path);
     let mut durable: HashSet<OpId> = HashSet::new();
     for i in 0..3 {
         let key = format!("b{i}").into_bytes();
@@ -520,5 +576,179 @@ fn a_restarted_partial_reader_does_not_re_mint_across_a_fetched_version() {
         nested(&room_doc(&r), b"a", b"after"),
         Some(9),
         "the post-adoption write was deduped away",
+    );
+}
+
+#[test]
+fn an_element_scoped_deny_resolves_against_the_versions_own_tree() {
+    // An element grant resolves to the element's *current* path, and "current" for a
+    // version read is the version's tree. Resolving against the live room instead
+    // leaves the deny inert the moment the element leaves that tree — and an inert
+    // deny is not a narrower read, it is the whole version served unredacted.
+    let (mut r, mut alice_doc, alice, _bob_doc, bob) = partial_room(Deny::Element);
+    create_version(&mut r, alice, V1);
+
+    // `/b` leaves the live room, so its element resolves to no live path at all.
+    let ops = alice_doc.transact(|tx| tx.delete(b"b"));
+    submit(&mut r, alice, ops);
+    assert!(
+        room_doc(&r).get(b"b").is_none(),
+        "the live room still holds the denied element",
+    );
+
+    let served = Document::decode_state(&fetch_version(&mut r, bob, V1))
+        .expect("the served version state decodes");
+    assert_eq!(nested(&served, b"a", b"aseed"), Some(0));
+    assert!(
+        served.get(b"b").is_none(),
+        "the version served an element the reader is denied",
+    );
+}
+
+#[test]
+fn the_live_acl_governs_a_version_captured_before_the_deny() {
+    // Authorization is a decision about now, not about the moment of capture: the
+    // version's own captured tuples would resurrect the access the deployment has
+    // since taken away.
+    let (mut r, mut alice_doc, alice, _bob_doc, bob) = partial_room(Deny::Absent);
+    create_version(&mut r, alice, V1);
+    assert_eq!(
+        nested(
+            &Document::decode_state(&fetch_version(&mut r, bob, V1)).expect("decodes"),
+            b"b",
+            b"bseed",
+        ),
+        Some(0),
+        "the reader was narrowed before anything denied it",
+    );
+
+    let ops = alice_tuple(
+        &mut alice_doc,
+        Capability::Read,
+        AclEffect::Deny,
+        &encode_path(&[b"b"]),
+    );
+    submit(&mut r, alice, ops);
+
+    let served = Document::decode_state(&fetch_version(&mut r, bob, V1))
+        .expect("the served version state decodes");
+    assert!(
+        served.get(b"b").is_none(),
+        "a version captured before the deny served the denied subtree",
+    );
+}
+
+#[test]
+fn a_version_fetched_on_a_second_channel_keeps_that_channels_own_ids() {
+    // A channel authors under `for_channel` of the id declared at Hello, so the
+    // frontier the fetch keeps has to be cut to *that* identity — the connection's own
+    // id answers only for channel 0. A session's second subscription is where a
+    // mistake here hides.
+    let (mut r, _author_doc, author, _reader_doc, reader) = zoned_room();
+    let second = Channel(1);
+    subscribe_on(&mut r, reader, second, b"za");
+
+    let authoring = cid(2).for_channel(second.0);
+    assert_ne!(authoring, cid(2), "the second channel derives its identity");
+    let mut second_doc = Document::new(authoring);
+    second_doc.set_schema(zoned_schema());
+    let ops = second_doc.transact(|tx| {
+        tx.map(b"board").register(b"s0", Scalar::Int(0));
+    });
+    submit_on(&mut r, reader, second, ops);
+    create_version(&mut r, author, V1);
+
+    assert_eq!(
+        frontier_authors(&fetch_version_on(&mut r, reader, second, V1)),
+        HashSet::from([authoring]),
+        "the version's frontier is not the fetching channel's own identity",
+    );
+}
+
+// --- both projections at once ---
+
+/// Zoned like `ZONED`, and readable room-wide through the schema tier — so a reader
+/// can be zone-limited *and* doc-ACL-partial in the same room.
+const COMPOSED: &str = r#"{
+    "schema": "c", "version": 1, "root": "Doc",
+    "types": {
+        "Doc": { "kind": "map", "children": {
+            "board": "Sect", "notes": "Sect", "loose": "Sect" } },
+        "Sect": { "kind": "map" }
+    },
+    "zones": { "za": "/board", "zb": "/notes" },
+    "auth": { "grants": [ { "allow": "read", "to": "authenticated", "on": "/" } ] }
+}"#;
+
+const COMPOSED_APP: &[u8] = b"c";
+
+#[test]
+fn a_version_is_narrowed_by_both_projections_at_once() {
+    let mut sr = SchemaRegistry::new();
+    sr.register(COMPOSED_APP, 1, COMPOSED.as_bytes(), b"")
+        .unwrap();
+    let mut r = Registry::new(cid(0xFF));
+    r.set_schema_registry(Arc::new(Mutex::new(sr)));
+    r.set_verifier(Box::new(tokens(&[("t-alice", "alice"), ("t-bob", "bob")])));
+    // alice reaches everything; bob's room read is the schema tier's, and the
+    // deployment carves the `zb` partition out of it.
+    r.set_authorizer(Box::new(
+        Acl::new()
+            .allow(
+                Subject::Actor(b"alice".to_vec()),
+                None,
+                ResourceMatch::Room(ROOM.to_vec()),
+            )
+            .deny(
+                Subject::Actor(b"bob".to_vec()),
+                Some(Action::Read),
+                ResourceMatch::Zone {
+                    room: ROOM.to_vec(),
+                    zone: b"zb".to_vec(),
+                },
+            ),
+    ));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+
+    let alice = auth(&mut r, 1, "t-alice", COMPOSED_APP, 1);
+    subscribe(&mut r, alice, b"");
+    let mut alice_doc = Document::new(cid(1));
+    alice_doc.set_schema(Schema::parse(COMPOSED).expect("the composed schema parses"));
+    for ops in [
+        alice_doc.transact(|tx| {
+            tx.map(b"board").register(b"bseed", Scalar::Int(0));
+            tx.map(b"notes").register(b"nseed", Scalar::Int(0));
+            tx.map(b"loose").register(b"lseed", Scalar::Int(0));
+        }),
+        // A doc-ACL deny on the unzoned subtree, so the read projection bites on a
+        // partition the zone projection does not touch.
+        alice_tuple(
+            &mut alice_doc,
+            Capability::Read,
+            AclEffect::Deny,
+            &encode_path(&[b"loose"]),
+        ),
+    ] {
+        submit(&mut r, alice, ops);
+    }
+
+    let bob = auth(&mut r, 2, "t-bob", COMPOSED_APP, 1);
+    subscribe(&mut r, bob, b"");
+    create_version(&mut r, alice, V1);
+
+    let served = Document::decode_state(&fetch_version(&mut r, bob, V1))
+        .expect("the served version state decodes");
+    assert_eq!(
+        nested(&served, b"board", b"bseed"),
+        Some(0),
+        "the version withheld the partition both tiers admit",
+    );
+    assert!(
+        served.get(b"notes").is_none(),
+        "the version served a zone the reader may not read",
+    );
+    assert!(
+        served.get(b"loose").is_none(),
+        "the version served a subtree the reader is denied",
     );
 }

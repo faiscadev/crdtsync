@@ -1022,15 +1022,29 @@ pub fn step(
                     // exactly the partitions the live stream does.
                     let records = hub.acl_records(&room);
                     let creator = hub.room_creator(&room);
+                    // The channel's zone scope, resolved when it subscribed — the same
+                    // set the live fan-out filters this channel's ops by.
+                    let zones = session
+                        .channels
+                        .get(&channel)
+                        .and_then(|sub| sub.zones.clone());
                     // Element-scoped grants resolve against the *version's* tree: an
                     // element's redaction path is where it stood when the version was
                     // captured, not where it stands in the live room.
-                    let index = if records.is_empty() {
-                        HashMap::new()
-                    } else {
-                        Document::decode_state(&state)
-                            .map(|doc| crate::index::element_paths(&doc))
-                            .unwrap_or_default()
+                    let decoded = Document::decode_state(&state);
+                    // A version's bytes come back off durable storage, so unlike a
+                    // snapshot materialized this instant they can fail to decode here.
+                    // Undecodable is unprojectable, and the unnarrowed bytes still carry
+                    // whatever a redaction would have cut, so a reader that any
+                    // redaction could apply to is refused rather than served them.
+                    if decoded.is_err()
+                        && (!records.is_empty() || zone_narrowing(schema, &zones).is_some())
+                    {
+                        return internal("version state is unreadable");
+                    }
+                    let index = match &decoded {
+                        Ok(doc) if !records.is_empty() => crate::index::element_paths(doc),
+                        _ => HashMap::new(),
                     };
                     // The replica identity this channel authors under — the one author
                     // whose ids a projection keeps in the frontier it otherwise scrubs,
@@ -1061,12 +1075,6 @@ pub fn step(
                             recipient,
                         )
                     };
-                    // The channel's zone scope, resolved when it subscribed — the same
-                    // set the live fan-out filters this channel's ops by.
-                    let zones = session
-                        .channels
-                        .get(&channel)
-                        .and_then(|sub| sub.zones.clone());
                     let state = project_snapshot_zones(state, schema, &zones, recipient);
                     Response {
                         replies: vec![Message::VersionState {
@@ -1741,23 +1749,32 @@ fn zone_readable(
     }
 }
 
+/// The `(schema, authorized set)` a zone projection would genuinely narrow by, or
+/// `None` when it would be a no-op — a whole-zone subscriber (its set covers every
+/// declared zone), a no-zones room, or a relay, each of which takes a state verbatim,
+/// byte-identical to a zoneless one. The single home of that rule, so
+/// [`project_snapshot_zones`] and a caller that must know whether narrowing is even
+/// possible cannot drift apart.
+fn zone_narrowing<'a>(
+    schema: Option<&'a Schema>,
+    zones: &'a Option<HashSet<u32>>,
+) -> Option<(&'a Schema, &'a HashSet<u32>)> {
+    let (schema, set) = (schema?, zones.as_ref()?);
+    (!schema.zones().is_empty() && set.len() != schema.zones().len()).then_some((schema, set))
+}
+
 /// Narrow a catch-up snapshot to a zone-limited subscriber's authorized partitions,
-/// dropping every hidden zone's state so the snapshot carries no trace of it. A
-/// whole-zone subscriber (its set covers every declared zone), a no-zones room, or a
-/// relay takes the snapshot verbatim — byte-identical to a zoneless snapshot — so
-/// only a genuinely zone-limited subscriber pays the projection.
+/// dropping every hidden zone's state so the snapshot carries no trace of it. Only a
+/// genuinely zone-limited subscriber pays the projection ([`zone_narrowing`]).
 fn project_snapshot_zones(
     state: Vec<u8>,
     schema: Option<&Schema>,
     zones: &Option<HashSet<u32>>,
     recipient: Option<ClientId>,
 ) -> Vec<u8> {
-    let (Some(schema), Some(set)) = (schema, zones) else {
+    let Some((schema, set)) = zone_narrowing(schema, zones) else {
         return state;
     };
-    if schema.zones().is_empty() || set.len() == schema.zones().len() {
-        return state;
-    }
     match Document::decode_state(&state) {
         Ok(mut doc) => {
             doc.project_zones(schema, set, recipient);
