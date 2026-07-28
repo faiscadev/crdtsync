@@ -1461,6 +1461,33 @@ mod live {
 
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // binds a loopback listener
+    async fn a_certificate_for_another_host_refuses_to_start_even_mid_rollout() {
+        // The runtime rule is unconditional — a presented certificate that binds no
+        // member refuses the link whether or not identity is required — so the startup
+        // check that predicts it must be too. A node partway through a rollout, with a
+        // certificate but not yet the policy, would otherwise have every peer link
+        // refused silently by every peer that verifies client certificates.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let e = startup_error(
+            listener,
+            ServeConfig {
+                membership: Some(two_node_membership(
+                    "wss://10.0.0.1:9000",
+                    "wss://10.0.0.2:9000",
+                )),
+                cluster_secret: Some(SECRET.to_vec()),
+                require_peer_identity: false,
+                client_cert_verification: true,
+                peer_client_identity: Some(vec![b"elsewhere.example".to_vec()]),
+                ..ServeConfig::default()
+            },
+        )
+        .await;
+        assert!(e.to_string().contains("names no host binding it"), "{e}");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // binds a loopback listener
     async fn requiring_peer_identity_without_an_identity_of_its_own_refuses_to_start() {
         // The symmetry `CRDTSYNC_CLUSTER_REQUIRE_TLS` already has: a node that demands
         // an identity of its peers must present one itself, or every peer running the
