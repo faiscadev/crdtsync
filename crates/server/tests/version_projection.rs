@@ -292,14 +292,21 @@ fn a_zone_limited_readers_version_withholds_the_zone_it_may_not_read() {
 #[test]
 fn a_whole_room_readers_version_is_served_unnarrowed() {
     // The projection is targeted, not blanket: a subscriber that reaches every zone
-    // still gets the version whole.
-    let (mut r, _author_doc, author, _reader_doc, _reader) = zoned_room();
+    // still gets the version whole — content *and* the frontier every author put in
+    // it, which a reader entitled to the room needs to dedup against.
+    let (mut r, _author_doc, author, mut reader_doc, reader) = zoned_room();
+    reader_writes(&mut r, reader, &mut reader_doc);
     create_version(&mut r, author, V1);
 
-    let served = Document::decode_state(&fetch_version(&mut r, author, V1))
-        .expect("the served version state decodes");
+    let state = fetch_version(&mut r, author, V1);
+    let served = Document::decode_state(&state).expect("the served version state decodes");
     assert_eq!(nested(&served, b"board", b"bseed"), Some(0));
     assert_eq!(nested(&served, b"notes", b"nseed"), Some(0));
+    assert_eq!(
+        frontier_authors(&state),
+        HashSet::from([cid(1), cid(2)]),
+        "a whole-zone reader's frontier was scrubbed",
+    );
 }
 
 #[test]
@@ -512,13 +519,22 @@ fn a_partial_readers_version_withholds_the_denied_subtree() {
 
 #[test]
 fn a_whole_document_readers_version_is_served_unnarrowed() {
-    let (mut r, _alice_doc, alice, _bob_doc, _bob) = partial_room(Deny::Path);
+    let (mut r, _alice_doc, alice, mut bob_doc, bob) = partial_room(Deny::Path);
+    let ops = bob_doc.transact(|tx| {
+        tx.map(b"a").register(b"b0", Scalar::Int(0));
+    });
+    submit(&mut r, bob, ops);
     create_version(&mut r, alice, V1);
 
-    let served = Document::decode_state(&fetch_version(&mut r, alice, V1))
-        .expect("the served version state decodes");
+    let state = fetch_version(&mut r, alice, V1);
+    let served = Document::decode_state(&state).expect("the served version state decodes");
     assert_eq!(nested(&served, b"a", b"aseed"), Some(0));
     assert_eq!(nested(&served, b"b", b"bseed"), Some(0));
+    assert_eq!(
+        frontier_authors(&state),
+        HashSet::from([cid(1), cid(2)]),
+        "a whole-document reader's frontier was scrubbed",
+    );
 }
 
 #[test]
@@ -632,6 +648,7 @@ fn the_live_acl_governs_a_version_captured_before_the_deny() {
 
     let served = Document::decode_state(&fetch_version(&mut r, bob, V1))
         .expect("the served version state decodes");
+    assert_eq!(nested(&served, b"a", b"aseed"), Some(0));
     assert!(
         served.get(b"b").is_none(),
         "a version captured before the deny served the denied subtree",
