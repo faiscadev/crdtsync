@@ -7,7 +7,7 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
-## 2026-07-28 · C19 refused-op ack (#PRNUM) · `Document::apply`'s `false` is split into "not yet" and "never", and only "never" may be dropped, logged by nobody and acked by nobody
+## 2026-07-28 · C19 refused-op ack (#367) · `Document::apply`'s `false` is split into "not yet" and "never", and only "never" may be dropped, logged by nobody and acked by nobody
 
 **Changed:** ARCHITECTURE's op-ingress description gains the refusal boundary — a server refuses at ingress an op no replica can hold, on the same terms as the schema-violation reject it already documents, and the retained log's contract becomes *only ops the replica applied or is holding*.
 
