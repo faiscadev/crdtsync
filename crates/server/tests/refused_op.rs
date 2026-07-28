@@ -283,6 +283,46 @@ fn a_buffered_op_is_still_logged_broadcast_and_acked() {
     assert_eq!(h.seq(ROOM), 1, "and is retained for catch-up");
 }
 
+/// The other waiting case: a transaction member whose group is incomplete. It is
+/// held rather than applied, so `apply` answers `false` for it too — but the group
+/// commits the moment its last member arrives, so every member must be logged and
+/// acked as it lands. Refusing a member because it does not apply yet would strand
+/// its whole group forever.
+#[test]
+fn an_incomplete_transaction_member_is_still_logged_broadcast_and_acked() {
+    let (mut h, mut s) = joined(cid(1));
+    let mut d = Document::new(cid(1));
+    let mut members = d.atomic_transact(|tx| {
+        tx.register(b"a", Scalar::Int(1));
+        tx.register(b"b", Scalar::Int(2));
+    });
+    assert_eq!(members.len(), 2, "a two-member group");
+    assert!(
+        members.iter().all(|op| op.tx.is_some_and(|t| t.count == 2)),
+        "both members declare the group's size"
+    );
+
+    let second = members.pop().expect("two members");
+    let first = members.pop().expect("two members");
+
+    // The first member alone: held, because its partner has not arrived.
+    let r = submit(&mut h, &mut s, vec![first.clone()]);
+    assert!(is_accepted(&r), "a held member is acked");
+    assert_eq!(r.broadcast, vec![first], "and fans out to peers");
+    assert_eq!(h.seq(ROOM), 1, "and is retained for catch-up");
+    assert!(
+        h.get(ROOM, b"a").is_none(),
+        "but the group has not committed"
+    );
+
+    // The partner completes the group, and both writes land at once.
+    let r = submit(&mut h, &mut s, vec![second]);
+    assert!(is_accepted(&r));
+    assert_eq!(h.seq(ROOM), 2);
+    assert!(h.get(ROOM, b"a").is_some(), "the group committed");
+    assert!(h.get(ROOM, b"b").is_some(), "both members, together");
+}
+
 /// A duplicate also answers `false`, and is acked so the author can prune its
 /// outbox — the case the `through`-over-the-whole-batch rule exists for.
 #[test]
