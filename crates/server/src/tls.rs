@@ -20,7 +20,8 @@
 //! authenticated actor, the same principal an in-band credential establishes, reached
 //! over the transport instead. [`host_names_from_client_cert`] is the narrower one the
 //! peer plane binds a *member* to: only the `dNSName` and `iPAddress` SANs, which are
-//! the kinds that name a host a CA vouches for reaching.
+//! the kinds that name a host a CA vouches for reaching, and only where a `dNSName` is
+//! not itself an address.
 //!
 //! [`ClientAuthMode`] selects how strict the client-cert requirement is:
 //!
@@ -454,19 +455,18 @@ pub fn actor_from_client_cert(leaf: &CertificateDer<'_>) -> Option<Vec<u8>> {
     if let Some(addr) = ip {
         return Some(addr.into_bytes());
     }
-    // Bound rather than returned directly: the iterator borrows `cert`, which does not
-    // outlive the tail expression.
-    let cn = cert
+    return cert
         .subject()
         .iter_common_name()
         .filter_map(|cn| cn.as_str().ok())
         .find(|cn| !cn.is_empty())
         .map(|cn| cn.as_bytes().to_vec());
-    cn
 }
 
 /// Every *host* a verified client certificate names: its `dNSName` and `iPAddress`
-/// Subject Alternative Names, in certificate order. Empty when it names no host.
+/// Subject Alternative Names, in certificate order, less any `dNSName` that is really
+/// an IP literal — an address is matched only against an `iPAddress` SAN, or the kind
+/// filter below would be undone one field over. Empty when it names no host.
 ///
 /// This is deliberately a narrower reading than [`actor_from_client_cert`], and the
 /// difference is the whole of what makes a peer binding mean anything. A member's
@@ -500,10 +500,9 @@ pub fn host_names_from_client_cert(leaf: &CertificateDer<'_>) -> Vec<Vec<u8>> {
                 // address only against an `iPAddress` SAN, and admitting it here would
                 // undo the kind filter one field over — a certificate issued for one
                 // node carrying another node's address in a field that is not an
-                // address.
-                GeneralName::DNSName(s)
-                    if !s.is_empty() && s.parse::<std::net::IpAddr>().is_err() =>
-                {
+                // address. Judged by the binding's own normalization, so a spelling it
+                // would fold into an address (`10.0.0.6.`) cannot pass here as a name.
+                GeneralName::DNSName(s) if !s.is_empty() && !crate::dial::is_ip_literal(s) => {
                     (*s).to_string()
                 }
                 GeneralName::IPAddress(octets) => match ip_san(octets) {
@@ -616,6 +615,21 @@ mod tests {
         // field that is not an address.
         let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
         params.subject_alt_names = vec![rcgen::SanType::DnsName("10.0.0.6".try_into().unwrap())];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "node-a");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = CertificateDer::from(params.self_signed(&key).unwrap().der().to_vec());
+        assert!(host_names_from_client_cert(&der).is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // generates a key pair, which reads system entropy
+    fn a_dns_name_that_is_an_address_with_a_root_label_names_no_host() {
+        // The skip is judged by the binding's own normalization, so a spelling the
+        // comparison would fold into an address cannot pass here as a name.
+        let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::DnsName("10.0.0.6.".try_into().unwrap())];
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "node-a");

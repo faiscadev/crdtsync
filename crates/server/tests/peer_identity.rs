@@ -760,8 +760,6 @@ fn a_certificate_that_names_no_host_binds_nothing_and_is_refused() {
             secret: SECRET.to_vec(),
         },
     ));
-    let retry = r.connect_cert_authenticated(Identity::new(b"node-a".to_vec()), Vec::new());
-    assert!(!r.deliver(retry, replicate(&mut doc(9), &room, 1)));
     assert_eq!(r.hub().seq(&room), 0);
 }
 

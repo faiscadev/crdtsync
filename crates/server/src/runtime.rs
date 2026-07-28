@@ -830,19 +830,26 @@ fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
     }
 }
 
-/// Refuse a deployment whose peer-identity policy cannot be honored. Requiring
-/// identity means refusing every peer link that carries no verified certificate
-/// naming a member, so it needs the whole posture in place:
+/// Refuse a deployment whose peer-identity policy cannot be honored.
+///
+/// One refusal stands on its own, whatever the policy says: **a certificate this node
+/// presents on its dials must name the host of the id it dials under.** A peer applies
+/// its own binding to it, and that binding refuses a presented certificate which binds
+/// nothing — so a node with a certificate for the wrong host has every link refused by
+/// every peer that verifies client certificates, silently, whether or not *this*
+/// deployment requires identity. It is decidable here, so it is decided here.
+///
+/// The rest apply only where identity is *required*, since requiring it means refusing
+/// every peer link that carries no verified certificate naming a member, which needs
+/// the whole posture in place:
 ///
 ///  - a cluster at all — a single-node deployment has no peer plane to identify;
 ///  - **a listener that verifies client certificates**, or no inbound link ever
 ///    carries one and every peer is refused;
-///  - **a client identity of this node's own on its outbound dials, naming this
-///    node's own advertise host**, or every peer running the same policy refuses this
-///    node — the same symmetry `CRDTSYNC_CLUSTER_REQUIRE_TLS` has, where a node that
-///    requires TLS of its peers must terminate it itself. The peers apply this node's
-///    own rule to this node's own certificate, so that half of their decision is
-///    decidable here;
+///  - **a client identity of this node's own on its outbound dials**, or every peer
+///    running the same policy refuses this node — the same symmetry
+///    `CRDTSYNC_CLUSTER_REQUIRE_TLS` has, where a node that requires TLS of its peers
+///    must terminate it itself;
 ///  - **a member set whose every advertise address names a host**, since the host is
 ///    what a certificate binds to and a member whose address yields none could never
 ///    be identified.
@@ -853,11 +860,30 @@ fn cluster_secret(config: &ServeConfig) -> std::io::Result<Option<Arc<[u8]>>> {
 /// its certificate whatever it advertises for itself. Refusing the secret to a
 /// plaintext member is `CRDTSYNC_CLUSTER_REQUIRE_TLS`'s separate declaration.
 ///
-/// Each is the cluster-wide non-convergence an operator would otherwise meet as
-/// links that open and immediately close.
+/// Each is the cluster-wide non-convergence an operator would otherwise meet as links
+/// that open and immediately close.
 fn peer_identity_policy(config: &ServeConfig) -> std::io::Result<()> {
     let invalid =
         |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.to_string());
+    // The peers apply this node's own rule to this node's own certificate, so that half
+    // of their decision is decidable here — and it binds whether or not this deployment
+    // requires identity of them.
+    if let (Some(own_hosts), Some(membership)) = (&config.peer_client_identity, &config.membership)
+    {
+        let self_addr = membership.self_id().as_bytes();
+        if !own_hosts
+            .iter()
+            .any(|host| crate::dial::cert_names_member(host, self_addr))
+        {
+            return Err(invalid(&format!(
+                "this node's peer certificate names no host binding it to the node id it dials \
+                 under, `{}`, so every peer that verifies client certificates refuses its links \
+                 — whether or not identity is required anywhere: give the certificate an \
+                 iPAddress SAN for that address, or a dNSName SAN for that host name",
+                String::from_utf8_lossy(self_addr),
+            )));
+        }
+    }
     if !config.require_peer_identity {
         return Ok(());
     }
@@ -874,30 +900,16 @@ fn peer_identity_policy(config: &ServeConfig) -> std::io::Result<()> {
              refused",
         ));
     }
-    let Some(own_hosts) = &config.peer_client_identity else {
+    if config.peer_client_identity.is_none() {
         return Err(invalid(
             "this node requires an identified peer but presents no identity of its own: set \
              CRDTSYNC_CLUSTER_CLIENT_CERT and CRDTSYNC_CLUSTER_CLIENT_KEY, or every peer running \
              the same policy refuses it",
         ));
-    };
-    // The peers apply this node's own rule to this node's own certificate, so the one
-    // half of their decision that is knowable here is checked here.
-    let self_addr = membership.self_id().as_bytes();
-    if !own_hosts
-        .iter()
-        .any(|host| crate::dial::cert_names_member(host, self_addr))
-    {
-        return Err(invalid(&format!(
-            "this node's peer certificate names no host binding it to the node id it dials \
-             under, `{}`, so every peer running the same policy refuses it: issue a certificate \
-             whose dNSName or iPAddress SAN is that id's host",
-            String::from_utf8_lossy(self_addr),
-        )));
     }
     for (node, _) in membership.known_members() {
-        let addr = String::from_utf8_lossy(node.as_bytes()).into_owned();
         if crate::dial::member_host(node.as_bytes()).is_none() {
+            let addr = String::from_utf8_lossy(node.as_bytes());
             return Err(invalid(&format!(
                 "cluster member `{addr}` names no host, so no certificate could identify it: an \
                  identified cluster addresses each member as `host:port` (bracket an IPv6 literal)"

@@ -145,34 +145,43 @@ pub fn member_host(addr: &[u8]) -> Option<String> {
 /// An IP literal is compared as an *address*, not as a string, since one address has
 /// many spellings: a certificate's IP SAN arrives canonicalized from its octets while
 /// an advertise address holds whatever the operator wrote, and `[2001:0db8::0:1]` and
-/// `2001:db8::1` are the same member. A DNS name is compared without its root label,
-/// for the same reason.
+/// `2001:db8::1` are the same member.
 pub fn cert_names_member(name: &[u8], addr: &[u8]) -> bool {
     let Ok(name) = std::str::from_utf8(name) else {
         return false;
     };
-    let name = name.trim();
+    let name = normalized(name);
     if name.is_empty() {
         return false;
     }
     let Some(host) = member_host(addr) else {
         return false;
     };
-    let name = name.to_ascii_lowercase();
+    let host = normalized(&host);
     match (
         host.parse::<std::net::IpAddr>(),
         name.parse::<std::net::IpAddr>(),
     ) {
         (Ok(host), Ok(name)) => host == name,
-        _ => strip_root_dot(&host) == strip_root_dot(&name),
+        _ => host == name,
     }
 }
 
-/// A DNS name without its root label — `node-a.internal.` and `node-a.internal` name
-/// one host, and a certificate and an advertise address need not spell it the same
-/// way.
-fn strip_root_dot(name: &str) -> &str {
-    name.strip_suffix('.').unwrap_or(name)
+/// A certificate name or advertise host reduced to the one form the binding compares:
+/// trimmed, lowercased as DNS names are, and without its root label — `node-a.` and
+/// `node-a` name one host, and a certificate and an advertise address need not agree on
+/// which spelling to use.
+fn normalized(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Whether `name` is an IP address rather than a host name, judged after the same
+/// normalization the binding applies. The reader that decides which certificate SANs
+/// name a host consults this, so it and [`cert_names_member`] can never disagree about
+/// what an address is: a `dNSName` of `10.0.0.6.` must not pass the reader as a name
+/// and then match an IP-advertised member as an address.
+pub fn is_ip_literal(name: &str) -> bool {
+    normalized(name).parse::<std::net::IpAddr>().is_ok()
 }
 
 /// An advertise address no dial can be built from — a configuration error,
@@ -587,6 +596,18 @@ mod tests {
             b"node-a.internal",
             b"wss://node-a.internal.:9000"
         ));
+    }
+
+    #[test]
+    fn an_address_with_a_root_label_is_still_an_address() {
+        // The reader that decides which SANs name a host and this comparison must agree
+        // on what an address is, or a `dNSName` of `10.0.0.6.` passes the reader as a
+        // name and then matches an IP-advertised member here as an address.
+        assert!(is_ip_literal("10.0.0.6."));
+        assert!(is_ip_literal(" 10.0.0.6 "));
+        assert!(is_ip_literal("::1."));
+        assert!(!is_ip_literal("node-a.internal."));
+        assert!(cert_names_member(b"10.0.0.6.", b"wss://10.0.0.6:9000"));
     }
 
     #[test]
