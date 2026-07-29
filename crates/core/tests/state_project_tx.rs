@@ -252,6 +252,21 @@ fn a_zone_projection_serves_no_record_of_the_withheld_partitions_groups() {
         !restored.apply(&forged),
         "the projection served its record of the withheld zone's groups"
     );
+    assert_eq!(
+        zoned_int(&restored, b"loose", b"lk"),
+        None,
+        "the stray is held, not applied"
+    );
+    // Held as a *bucket* rather than refused: a second member under that id commits
+    // the pair, which is what tells the two apart.
+    let mut second = stray[0].clone();
+    second.id.seq += 1000;
+    second.tx = group[0].tx;
+    assert!(
+        restored.apply(&second),
+        "the bucket completed on its second member"
+    );
+    assert_eq!(zoned_int(&restored, b"loose", b"lk"), Some(9));
 }
 
 #[test]

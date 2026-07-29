@@ -1192,10 +1192,11 @@ fn an_unrelated_op_retagged_into_a_group_folds_one_state_in_every_order() {
 fn one_member_under_two_envelopes_folds_one_state_in_every_order() {
     // `apply` dedups on op id before it looks at the tag, so one member arriving
     // twice under different envelopes leaves the bucket reading whichever copy the
-    // dedup kept — a hostile duplicate, or a destranded copy racing the tagged one
-    // across two delivery seams. The copy that lost the dedup is a member the
-    // bucket will never hold under that envelope, so its key resolves and the rest
-    // of the group merges standalone.
+    // dedup kept. The copy that lost the dedup is a member the bucket will never
+    // hold under that envelope, so its key resolves and the rest of the group merges
+    // standalone. Both copies name a group here: a copy carrying *no* tag — what a
+    // filtering seam's destranding produces — leaves the buffer holding nothing to
+    // contradict, and is C27's shape rather than this one.
     let (a, ops) = triple();
     let dup = retagged(&ops[2], tx_id(&ops[0]), 2);
     let set = [ops[0].clone(), ops[1].clone(), ops[2].clone(), dup];
@@ -1409,6 +1410,38 @@ fn many_resolved_keys_encode_in_one_order() {
             ),
         }
     }
+
+    // And the order is a named one, not merely a stable one: every group committed,
+    // so the buffer is empty and the record is the section just before its length.
+    let bytes = folded.expect("a fold");
+    let count = groups.len();
+    assert_eq!(
+        bytes[bytes.len() - 4..],
+        [0, 0, 0, 0],
+        "every group committed, so the buffer is empty"
+    );
+    let keys_end = bytes.len() - 4;
+    let keys_at = keys_end - count * 24;
+    assert_eq!(
+        u32::from_le_bytes(bytes[keys_at - 4..keys_at].try_into().expect("a length")),
+        count as u32,
+        "the record section is where its length says"
+    );
+    let encoded: Vec<(&[u8], u64)> = (0..count)
+        .map(|i| {
+            let at = keys_at + i * 24;
+            (
+                &bytes[at..at + 16],
+                u64::from_le_bytes(bytes[at + 16..at + 24].try_into().expect("a key")),
+            )
+        })
+        .collect();
+    let mut ascending = encoded.clone();
+    ascending.sort();
+    assert_eq!(
+        encoded, ascending,
+        "the record is not encoded key-ascending"
+    );
 }
 
 #[test]

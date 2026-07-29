@@ -270,10 +270,12 @@ pub struct Document {
     /// replica held, committed, evicted or minted — the foreign key a conflicting
     /// envelope names is charged to the bucket it was caught against, and there is at
     /// most one, since spending untags that bucket and the next envelope for the same
-    /// id then finds nothing held under a group. A key outlives the ops that made its
-    /// bucket, so the bound is the ids the replica has *ever* held — strictly smaller
-    /// than the dedup set it already carries per op, and never a function of what
-    /// arrives.
+    /// id then finds nothing held under a group. So the count is at most one key per
+    /// group minted or committed, plus at most two per op id ever buffered under a
+    /// group — the same order as the dedup set the replica already carries per op,
+    /// and never more than a constant times what it has held. A key is not released
+    /// when its bucket's ops leave the buffer, so what caps the adversarial case is
+    /// the same buffer cap C20 owes the eviction seam.
     resolved_tx: HashSet<(ClientId, TxId)>,
     /// Movable nodes revealed by an [`XmlReveal`](crate::op::OpKind::XmlReveal) shell
     /// but not yet placed — a node materialized (identity + tag) with no placement,
