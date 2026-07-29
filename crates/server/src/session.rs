@@ -1250,13 +1250,21 @@ pub fn step(
                 DiffKind::Branches => hub.diff_branches(&room, &a, &b, narrow),
             };
             match diff {
-                Ok(changes) => Response {
-                    replies: vec![Message::DiffResult {
-                        room,
-                        changes: encode_changes(&changes),
-                    }],
-                    ..Response::default()
-                },
+                Ok(changes) => {
+                    // A change list is captured room content leaving the server — the
+                    // same auditable history read a version fetch records, in a
+                    // different shape, so it goes through the same audit seam and once
+                    // it is actually going out. The read was authorized by
+                    // `channel_room` above, so the verdict is granted.
+                    authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
+                    Response {
+                        replies: vec![Message::DiffResult {
+                            room,
+                            changes: encode_changes(&changes),
+                        }],
+                        ..Response::default()
+                    }
+                }
                 Err(e) => diff_error(e),
             }
         }
@@ -2125,19 +2133,23 @@ fn request_denied(session: &Session, what: &str) -> Response {
 
 /// Map a [`DiffError`] to the client failure it surfaces. An absent version or
 /// branch is a recoverable `NotFound` — a well-formed query naming something the
-/// room does not have, the connection stays open. A snapshot that fails to decode
-/// is a server-side fault, so it closes like any [`internal`] error.
+/// room does not have. A state that fails to decode is an `Internal` fault, since
+/// nothing the client sent caused it. Neither closes: a diff's two sides come off
+/// durable storage, so one of them being unreadable says nothing about the live
+/// stream the channel carries — the same reading the version fetch takes of the
+/// same bytes.
 fn diff_error(e: DiffError) -> Response {
-    match e {
-        DiffError::UnknownVersion(_) | DiffError::UnknownBranch(_) => Response {
-            replies: vec![Message::Error {
-                code: ErrorCode::NotFound,
-                message: e.to_string(),
-                details: Vec::new(),
-            }],
-            ..Response::default()
-        },
-        DiffError::Decode => internal("a snapshot failed to decode for diff"),
+    let code = match e {
+        DiffError::UnknownVersion(_) | DiffError::UnknownBranch(_) => ErrorCode::NotFound,
+        DiffError::Decode => ErrorCode::Internal,
+    };
+    Response {
+        replies: vec![Message::Error {
+            code,
+            message: e.to_string(),
+            details: Vec::new(),
+        }],
+        ..Response::default()
     }
 }
 

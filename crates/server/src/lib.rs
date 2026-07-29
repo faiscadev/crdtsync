@@ -2103,8 +2103,9 @@ impl Hub {
     /// a room's paths and its scalar values, so it is a content read: the hub holds
     /// no notion of who is asking, so the caller supplies one, and a caller that
     /// serves a reader passes the same projection every other state-serving seam
-    /// runs. [`Ok`] leaves a side unnarrowed — the honest answer only where there is
-    /// no reader to narrow for.
+    /// runs. An identity closure leaves a side unnarrowed — the honest answer only
+    /// where there is no reader to narrow for, which is why the suites that pin the
+    /// engine pass one under a name that says so.
     pub fn diff_versions(
         &self,
         room: &[u8],

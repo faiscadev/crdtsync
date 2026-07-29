@@ -9,6 +9,10 @@
 //! Undecodable is unprojectable, and unprojected bytes still carry everything a
 //! redaction would have cut, so a reader any redaction could apply to is refused.
 //! A reader entitled to the room whole is served them, exactly as before.
+//!
+//! The diff seam (C27) reaches the same bytes and answers the same way: a side that
+//! cannot be decoded cannot be narrowed, so the query fails — recoverably, since the
+//! archive being unreadable says nothing about the live stream the channel carries.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
 use crdtsync_core::path::encode_path;
-use crdtsync_core::protocol::Channel;
+use crdtsync_core::protocol::{Channel, DiffKind};
 use crdtsync_core::{AclEffect, ClientId, Document, ErrorCode, Message, Op, Scalar, Schema};
 use crdtsync_server::acl::actor_key;
 use crdtsync_server::{
@@ -277,6 +281,62 @@ fn the_creator_is_refused_too_once_the_room_holds_doc_acl_state() {
     );
 
     match &fetch(&mut r, creator)[..] {
+        [Message::Error { code, .. }] => assert_eq!(*code, ErrorCode::Internal),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// Whether the connection survived, and the replies, for a diff of the damaged
+/// version against itself.
+fn diff_self(r: &mut Registry, id: ConnId) -> (bool, Vec<Message>) {
+    let keep_open = r.deliver(
+        id,
+        Message::DiffQuery {
+            channel: CH,
+            kind: DiffKind::Versions,
+            a: V1.to_vec(),
+            b: V1.to_vec(),
+        },
+    );
+    (keep_open, r.take_outbox(id))
+}
+
+#[test]
+fn a_diff_over_an_undecodable_version_fails_without_closing() {
+    // The diff engine decodes both sides, so an unreadable one has always failed the
+    // query. What it must not do is take the connection with it: one archived state
+    // stopped decoding, the live stream on this channel did not — the same reading
+    // the fetch takes of these very bytes.
+    let dir = tempdir();
+    let mut r = damaged_room(dir.path(), ZONE_APP, ZONED, false);
+    let reader = joined(&mut r, 2, "c-reader", ZONE_APP, b"za");
+
+    let (keep_open, replies) = diff_self(&mut r, reader);
+    assert!(
+        keep_open,
+        "an unreadable archived state closed the connection"
+    );
+    match &replies[..] {
+        [Message::Error { code, .. }] => assert_eq!(*code, ErrorCode::Internal),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_undecodable_side_refuses_a_whole_room_readers_diff_too() {
+    // Unlike the fetch, which serves a reader no redaction could narrow, the diff
+    // cannot: the engine has to decode both sides to compare them, so an unreadable
+    // one is refused whoever asks.
+    let dir = tempdir();
+    let mut r = damaged_room(dir.path(), TUPLE_APP, TUPLED, false);
+    let author = joined(&mut r, 1, "c-author", TUPLE_APP, b"");
+
+    let (keep_open, replies) = diff_self(&mut r, author);
+    assert!(
+        keep_open,
+        "an unreadable archived state closed the connection"
+    );
+    match &replies[..] {
         [Message::Error { code, .. }] => assert_eq!(*code, ErrorCode::Internal),
         other => panic!("expected a refusal, got {other:?}"),
     }

@@ -26,7 +26,7 @@ use crdtsync_core::diff::{decode_changes, Change};
 use crdtsync_core::path::{encode_path, parse_path};
 use crdtsync_core::protocol::{Channel, DiffKind};
 use crdtsync_core::{
-    AclEffect, ClientId, Document, Element, ElementId, Message, Op, Scalar, Schema,
+    AclEffect, ClientId, Document, Element, ElementId, Message, Op, Scalar, Schema, Side,
 };
 use crdtsync_server::acl::{actor_key, Acl, ResourceMatch, Subject};
 use crdtsync_server::{
@@ -167,6 +167,12 @@ fn diff_on(
 
 fn diff(r: &mut Registry, id: ConnId, kind: DiffKind, a: &[u8], b: &[u8]) -> Vec<Change> {
     diff_on(r, id, CH, kind, a, b)
+}
+
+/// The room's materialized replica, decoded — the oracle for what the live tree holds.
+fn room_doc(r: &Registry) -> Document {
+    Document::decode_state(&r.hub().export_room(ROOM).expect("the room exists"))
+        .expect("the room's state decodes")
 }
 
 /// The ops in a batch of reply frames, flattened.
@@ -364,6 +370,13 @@ fn a_zone_limited_readers_branch_diff_withholds_the_zone_it_may_not_read() {
     assert!(r.hub_mut().fork_branch(ROOM, DRAFT, b"main", fork).unwrap());
     write_into(&mut r, author, &mut author_doc, b"notes", b"nseed", 4242);
 
+    // The positive control, so an empty answer cannot come from the two branches
+    // having nothing between them: the author sees exactly the change the reader
+    // does not.
+    let seen = diff(&mut r, author, DiffKind::Branches, DRAFT, b"main");
+    assert_eq!(touched(&seen), vec![Some(b"notes".to_vec())]);
+    assert!(reports_value(&seen, 4242));
+
     let changes = diff(&mut r, reader, DiffKind::Branches, DRAFT, b"main");
     assert!(
         changes.is_empty(),
@@ -372,6 +385,64 @@ fn a_zone_limited_readers_branch_diff_withholds_the_zone_it_may_not_read() {
     assert!(
         !reports_value(&changes, 4242),
         "the branch diff carried the hidden partition's scalar",
+    );
+}
+
+#[test]
+fn a_zone_limited_readers_diff_withholds_a_structural_add_in_the_hidden_zone() {
+    // The hidden change everywhere else in this suite is a `Value`, which carries the
+    // state itself. A fresh key is the other shape: nothing but a path and a kind,
+    // which a redaction that only scrubbed values would still let through.
+    let (mut r, mut author_doc, author, reader) = zoned_room();
+    create_version(&mut r, author, VA);
+    write_into(&mut r, author, &mut author_doc, b"notes", b"fresh", 1);
+    create_version(&mut r, author, VB);
+
+    let seen = diff(&mut r, author, DiffKind::Versions, VA, VB);
+    assert_eq!(touched(&seen), vec![Some(b"notes".to_vec())]);
+
+    let changes = diff(&mut r, reader, DiffKind::Versions, VA, VB);
+    assert!(
+        changes.is_empty(),
+        "the diff reported a structural add in a zone the reader may not read: {changes:?}",
+    );
+}
+
+#[test]
+fn a_zone_limited_readers_diff_withholds_a_mark_anchored_in_the_hidden_zone() {
+    // A mark change carries no path at all — it is addressed by its own id and its
+    // target sequence — which is why the redaction runs over the two *states* rather
+    // than over the change list a path predicate could filter.
+    let (mut r, mut author_doc, author, reader) = zoned_room();
+    let body = author_doc.transact(|tx| {
+        tx.map(b"notes").text(b"body").insert(0, "secret");
+    });
+    submit(&mut r, author, body);
+    create_version(&mut r, author, VA);
+    let (ops, id) = crdtsync_core::path::mark(
+        &mut author_doc,
+        &encode_path(&[b"notes", b"body"]),
+        0,
+        Side::Left,
+        6,
+        Side::Right,
+        b"bold",
+        Scalar::Bool(true),
+    );
+    assert!(id.is_some(), "the mark anchored on a live sequence");
+    submit(&mut r, author, ops);
+    create_version(&mut r, author, VB);
+
+    let seen = diff(&mut r, author, DiffKind::Versions, VA, VB);
+    assert!(
+        seen.iter().any(|c| matches!(c, Change::MarkAdded { .. })),
+        "the author's own diff reported no mark: {seen:?}",
+    );
+
+    let changes = diff(&mut r, reader, DiffKind::Versions, VA, VB);
+    assert!(
+        changes.is_empty(),
+        "the diff reported a mark anchored in a zone the reader may not read: {changes:?}",
     );
 }
 
@@ -551,6 +622,12 @@ fn a_partial_readers_branch_diff_withholds_the_denied_subtree() {
     assert!(r.hub_mut().fork_branch(ROOM, DRAFT, b"main", fork).unwrap());
     write_into(&mut r, alice, &mut alice_doc, b"b", b"bseed", 4242);
 
+    // The positive control: the same two branches, read by the reader the deny does
+    // not reach, so an empty answer above cannot come from the branches agreeing.
+    let seen = diff(&mut r, alice, DiffKind::Branches, DRAFT, b"main");
+    assert_eq!(touched(&seen), vec![Some(b"b".to_vec())]);
+    assert!(reports_value(&seen, 4242));
+
     let changes = diff(&mut r, bob, DiffKind::Branches, DRAFT, b"main");
     assert!(
         changes.is_empty(),
@@ -559,14 +636,27 @@ fn a_partial_readers_branch_diff_withholds_the_denied_subtree() {
 }
 
 #[test]
-fn an_element_scoped_deny_narrows_each_side_of_a_diff() {
-    // An element-scoped grant resolves to where the element stood in the tree it is
-    // evaluated against, and the two sides of a diff are two different trees — so
-    // each side derives its own index rather than sharing one, or the live room's.
+fn an_element_scoped_deny_resolves_against_the_diffed_tree_not_the_live_room() {
+    // An element-scoped grant resolves to where the element stands in the tree it is
+    // evaluated against, so a deny whose target has since left the live room is
+    // inert there — and an inert deny is no deny, which is a gate that serves the
+    // state whole (the shape C32 names). The two sides of a diff are two archived
+    // trees, and the deny still governs both.
     let (mut r, mut alice_doc, alice, bob) = partial_room(Deny::Element);
     create_version(&mut r, alice, VA);
     write_into(&mut r, alice, &mut alice_doc, b"b", b"bseed", 4242);
     create_version(&mut r, alice, VB);
+    // The denied container leaves the live room. Both versions still hold it, so a
+    // gate resolving the deny against live main would find no path for it.
+    let drop_b = alice_doc.transact(|tx| tx.delete(b"b"));
+    submit(&mut r, alice, drop_b);
+    assert!(
+        room_doc(&r).get(b"b").is_none(),
+        "the denied container is still in the live room",
+    );
+
+    let seen = diff(&mut r, alice, DiffKind::Versions, VA, VB);
+    assert_eq!(touched(&seen), vec![Some(b"b".to_vec())]);
 
     let changes = diff(&mut r, bob, DiffKind::Versions, VA, VB);
     assert!(

@@ -12,7 +12,7 @@
 
 use crdtsync_core::diff::{decode_changes, Change};
 use crdtsync_core::path::encode_path;
-use crdtsync_core::protocol::DiffKind;
+use crdtsync_core::protocol::{Channel, DiffKind};
 use crdtsync_core::{ClientId, Document, ErrorCode, Message, Scalar};
 use crdtsync_server::{Action, ConnId, DiffError, Identity, Registry, Resource};
 
@@ -31,7 +31,7 @@ fn registry() -> Registry {
 }
 
 const ROOM: &[u8] = b"room-a";
-const CH: crdtsync_core::protocol::Channel = crdtsync_core::protocol::Channel(0);
+const CH: Channel = Channel(0);
 
 /// Drive a connection through Hello + Auth, subscribing `ROOM` on `CH`.
 fn joined(r: &mut Registry, client: u8) -> ConnId {
@@ -267,7 +267,7 @@ fn a_diff_on_an_unbound_channel_is_a_violation() {
     let keep_open = r.deliver(
         id,
         Message::DiffQuery {
-            channel: crdtsync_core::protocol::Channel(7),
+            channel: Channel(7),
             kind: DiffKind::Versions,
             a: b"v1".to_vec(),
             b: b"v2".to_vec(),

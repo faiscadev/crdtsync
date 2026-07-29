@@ -1940,7 +1940,7 @@ impl Registry {
             | Message::VersionFetch { channel, .. }
             // A diff query is channel-keyed for exactly this: the change list it
             // answers with is narrowed by the room's zone declarations, and those
-            // live in the acting schema this resolution is what finds.
+            // live in the acting schema, which is what this resolution finds.
             | Message::DiffQuery { channel, .. } => self
                 .conns
                 .get(&id)
