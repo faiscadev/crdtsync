@@ -1748,14 +1748,13 @@ fn zone_readable(
 /// the named-version fetch — so a redaction added to it cannot reach one seam and miss
 /// the other, which is the failure this composition exists to answer.
 ///
-/// The read projection runs first because its reveal rule reads the tree: a movable
-/// node dragged from a readable subtree into a denied one is kept at its readable
-/// origin, and that decision is taken against the whole document rather than one
-/// already trimmed to a partition — the same order the op fan-out resolves in, which
-/// is what the op-join ≡ snapshot-join convergence rests on. Running the zone
-/// projection first would be *more* redactive, not less (a zone-purged node has no
-/// placement left for the reveal rule to find), so the order is a convergence
-/// property, not a containment one.
+/// Read-then-zone is the order the catch-up seam has always used, preserved verbatim
+/// by the extraction rather than re-derived. It is not a containment property: running
+/// the zone projection first is *more* redactive, not less, since a zone-purged node
+/// leaves no placement for the read projection's reveal rule to un-purge. The rationale
+/// for keeping it is that the reveal rule's decision belongs against the whole document,
+/// as the op fan-out resolves it — but no test today distinguishes the two orders, so
+/// treat that as the reason it was chosen, not as an invariant something enforces.
 ///
 /// `index` resolves element-scoped grants to paths for the *gate* — the whole-document
 /// verdict that decides whether the read projection runs at all. The projection itself
@@ -1833,8 +1832,10 @@ fn project_snapshot_zones(
             doc.project_zones(schema, set, recipient);
             doc.encode_state()
         }
-        // An undecodable snapshot is left as-is: it fails downstream on the same
-        // footing it would have without zones, never silently served narrowed-wrong.
+        // An undecodable state is left as-is: it fails downstream on the same footing
+        // it would have without zones. The version fetch refuses such bytes before it
+        // gets here, but only the bytes it was *handed* — this input can also be the
+        // read projection's re-encode, which nothing re-checks.
         Err(_) => state,
     }
 }
