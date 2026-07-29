@@ -54,8 +54,8 @@ def test_edits_converge_across_documents():
     with Document(cid(1)) as a, Document(cid(2)) as b:
         ops_elem = a.xml_element([b"doc"], b"section")
         ops_child = a.xml_insert_element([b"doc"], 0, b"p")
-        assert b.apply(ops_elem) >= 0
-        assert b.apply(ops_child) >= 0
+        assert b.apply(ops_elem).applied >= 0
+        assert b.apply(ops_child).applied >= 0
         assert b.xml_tag([b"doc"]) == b"section"
         assert b.xml_children_len([b"doc"]) == 1
 

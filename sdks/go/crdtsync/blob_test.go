@@ -82,7 +82,7 @@ func TestBlobConvergesOnAPeer(t *testing.T) {
 	defer b.Close()
 
 	ops, _ := a.SetBlob(path("pic"), "image/png", []byte("tiny-png"))
-	if b.Apply(ops) < 1 {
+	if n, _ := b.Apply(ops); n < 1 {
 		t.Fatal("peer should apply the blob op")
 	}
 	blob, ok := b.GetBlob(path("pic"))

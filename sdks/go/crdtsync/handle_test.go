@@ -391,7 +391,7 @@ func TestOnUpdateFiresRemote(t *testing.T) {
 			remote++
 		}
 	})
-	if n := b.ApplyUpdate(localOps); n <= 0 {
+	if n, _ := b.ApplyUpdate(localOps); n <= 0 {
 		t.Fatalf("apply: %d", n)
 	}
 	if remote != 1 {

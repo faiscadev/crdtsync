@@ -28,10 +28,10 @@ def test_decoded_document_dedups_and_converges():
         back = Document.decode_state(a.encode_state())
         try:
             # A replay of the covered op is a no-op; a later peer op still lands.
-            assert back.apply(reg) == 0
+            assert back.apply(reg).applied == 0
             b.apply(reg)
             hit = b.inc([b"hits"], 4)
-            assert back.apply(hit) == 1
+            assert back.apply(hit).applied == 1
             assert back.get_counter([b"hits"]) == 4
         finally:
             back.close()

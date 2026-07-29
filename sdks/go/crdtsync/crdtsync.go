@@ -552,10 +552,15 @@ func (d *Document) ResolvePosition(path [][]byte, pos []byte) (uint, bool) {
 
 // --- sync ---
 
-// Apply folds a peer's encoded ops in. Returns the number applied, -1 on error.
-func (d *Document) Apply(ops []byte) int {
+// Apply folds a peer's encoded ops in. It returns how many ops applied as they
+// arrived (-1 on a malformed batch) beside how many no replica will ever hold. An
+// op a later op in the same batch releases from the buffer applies without being
+// counted.
+func (d *Document) Apply(ops []byte) (applied, refused int) {
 	pp, pl := bytesArg(ops)
-	return int(C.crdtsync_doc_apply(d.h, pp, pl))
+	var r C.uint32_t
+	applied = int(C.crdtsync_doc_apply(d.h, pp, pl, &r))
+	return applied, int(r)
 }
 
 // BeginAtomic starts recording an atomic transaction; edits accumulate until

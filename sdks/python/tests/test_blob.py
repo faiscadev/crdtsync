@@ -50,7 +50,7 @@ def test_inline_and_ref_are_distinct_at_two_paths():
 def test_blob_converges_on_a_peer():
     with Document(cid(1)) as a, Document(cid(2)) as b:
         ops = a.set_blob([b"pic"], "image/png", b"tiny-png")
-        assert b.apply(ops) >= 1
+        assert b.apply(ops).applied >= 1
         assert b.get_blob([b"pic"]) == a.get_blob([b"pic"])
 
 

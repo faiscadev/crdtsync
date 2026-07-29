@@ -4,6 +4,7 @@
 
 export { Doc } from "./doc.js";
 export type {
+  ApplyOutcome,
   Change,
   ChangeEvent,
   ChangeListener,

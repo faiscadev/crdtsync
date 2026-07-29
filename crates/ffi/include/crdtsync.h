@@ -521,13 +521,33 @@ int32_t crdtsync_doc_resolve_position(const CrdtDoc *doc,
                                       uintptr_t *out);
 
 // Fold an encoded op log (as returned by an edit) from a peer into the
-// document. Returns the number of ops applied now (a duplicate or one buffered
-// pending its target counts as not-applied), or -1 on a bad handle or
-// malformed bytes.
+// document. Returns the number of ops the fold took as they arrived — a
+// duplicate and one buffered pending its target both count as not-applied, and
+// so does a buffered op that a *later op in the same batch* releases — or -1 on
+// a bad handle or malformed bytes.
+//
+// **`out_refused` is what separates "not yet" from "never"**, and the two want
+// opposite responses. It receives the count of ops in the batch that no replica
+// will ever hold: the stamp conditions [`Op::is_admissible`] names — a stamp
+// naming a client other than the op's author, or one outside the position an id
+// may occupy — since the codec refuses its third, a transaction size no group
+// can have, at the frame. A buffered op is *waiting*, so the fold keeps it and a
+// later arrival commits it; a refused op is a bug in whoever wrote it, and there
+// is no server between this fold and a peer it reaches offline, directly, or
+// over a byte pipe the app carries itself, to answer `MalformedOp` on the app's
+// behalf. A refused op does not hold back the rest of the batch — unlike at the
+// server's ingress, which refuses the whole frame because its ack frontier is a
+// max over it. Zero is the honest-peer reading, and the count is written on
+// every outcome, `-1` included, so a caller may reuse the variable across
+// batches. A null pointer skips the write.
 //
 // # Safety
-// `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`].
-int32_t crdtsync_doc_apply(CrdtDoc *doc, const uint8_t *bytes, uintptr_t len);
+// `doc` is a live handle or null; `bytes`/`len` follow [`as_slice`];
+// `out_refused` is null or points to a writable `u32`.
+int32_t crdtsync_doc_apply(CrdtDoc *doc,
+                           const uint8_t *bytes,
+                           uintptr_t len,
+                           uint32_t *out_refused);
 
 // Begin recording an atomic transaction: until [`crdtsync_doc_commit_atomic`],
 // edits accumulate into one group and each returns an empty ops buffer.

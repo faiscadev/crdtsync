@@ -68,7 +68,15 @@ export interface Backend {
   takeRepairs(): Uint8Array[];
 
   /** Fold a peer's ops in (local only); a client backend syncs through its provider. */
-  apply(ops: Uint8Array): number;
+  apply(ops: Uint8Array): ApplyOutcome;
+}
+
+/** What one fold of a peer's ops did — see `Doc.applyUpdate`. */
+export interface ApplyOutcome {
+  /** How many ops the fold took as they arrived; `-1` when the batch was malformed. */
+  readonly applied: number;
+  /** How many ops no replica will ever hold. */
+  readonly refused: number;
 }
 
 /** `WasmDocument` already implements the `Backend` shape 1:1. */
@@ -214,7 +222,7 @@ export class ClientBackend implements Backend {
     return this.client.takeRepairs(this.channel) as Uint8Array[];
   }
 
-  apply(_ops: Uint8Array): number {
+  apply(_ops: Uint8Array): ApplyOutcome {
     throw new Error("crdtsync: a networked document syncs through its provider, not applyUpdate");
   }
 }

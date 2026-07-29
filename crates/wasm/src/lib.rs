@@ -676,12 +676,30 @@ impl WasmDocument {
         Ok(changes.iter().map(change_to_js).collect())
     }
 
-    /// Fold a peer's encoded ops in. Returns the number applied, -1 on error.
-    pub fn apply(&mut self, ops: &[u8]) -> i32 {
-        match decode_ops(ops) {
-            Ok(ops) => ops.iter().filter(|op| self.inner.apply(op)).count() as i32,
-            Err(_) => -1,
-        }
+    /// Fold a peer's encoded ops in, as `{ applied, refused }`: `applied` the
+    /// number the fold took as they arrived (`-1` on a malformed batch), `refused`
+    /// the number no replica will ever hold.
+    ///
+    /// **The two zeros mean opposite things.** An op that did not apply may be a
+    /// duplicate, or be *waiting* — buffered until a create makes its target
+    /// reachable or its transaction group completes, which a later arrival does,
+    /// including one later in this same batch, which `applied` does not count —
+    /// while a refused op is a bug in whoever wrote it, and no arrival lifts it.
+    /// The refusal is the stamp conditions [`Op::is_admissible`] names, the codec
+    /// having refused its third (a transaction size no group can have) at the
+    /// frame. A peer reached offline, directly, or over a byte pipe the app carries
+    /// itself has no server between it and this fold to answer `MalformedOp`, so
+    /// the count is the app's only signal; a refused op does not hold back the rest
+    /// of the batch, unlike at the server's ingress, which refuses the whole frame
+    /// because its ack frontier is a max over it. A malformed batch decodes nothing
+    /// to judge, so it reports `refused: 0`.
+    pub fn apply(&mut self, ops: &[u8]) -> JsValue {
+        let Ok(decoded) = decode_ops(ops) else {
+            return apply_outcome_to_js(-1, 0);
+        };
+        let refused = decoded.iter().filter(|op| !op.is_admissible()).count() as i32;
+        let applied = decoded.iter().filter(|op| self.inner.apply(op)).count() as i32;
+        apply_outcome_to_js(applied, refused)
     }
 
     /// Begin recording an atomic transaction; edits accumulate until commit.
@@ -1975,6 +1993,14 @@ fn resolved_mark_to_js(mark: &ResolvedMark) -> JsValue {
             set(&obj, "value", &arr.into());
         }
     }
+    obj.into()
+}
+
+/// One fold's outcome as a plain JS object: `{ applied, refused }`.
+fn apply_outcome_to_js(applied: i32, refused: i32) -> JsValue {
+    let obj = js_sys::Object::new();
+    set(&obj, "applied", &JsValue::from_f64(applied as f64));
+    set(&obj, "refused", &JsValue::from_f64(refused as f64));
     obj.into()
 }
 

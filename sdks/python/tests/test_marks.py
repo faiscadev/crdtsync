@@ -73,8 +73,8 @@ def test_marks_converge_across_documents():
     with Document(cid(1)) as a, Document(cid(2)) as b:
         text_ops = a.text_insert([b"body"], 0, "hello world")
         _, mark_ops = bold(a, [b"body"])
-        assert b.apply(text_ops) >= 0
-        assert b.apply(mark_ops) >= 0
+        assert b.apply(text_ops).applied >= 0
+        assert b.apply(mark_ops).applied >= 0
         marks = b.marks_at([b"body"], 2)
         assert any(m["name"] == b"bold" for m in marks)
 

@@ -44,7 +44,7 @@ func TestRegisterReadsBackAndConverges(t *testing.T) {
 	if v, ok := a.GetInt(path("age")); !ok || v != 30 {
 		t.Fatalf("local read: got %d ok=%v", v, ok)
 	}
-	if n := b.Apply(ops); n != 1 {
+	if n, _ := b.Apply(ops); n != 1 {
 		t.Fatalf("apply: got %d", n)
 	}
 	if v, ok := b.GetInt(path("age")); !ok || v != 30 {
@@ -167,7 +167,7 @@ func TestTextConvergesAndDeletes(t *testing.T) {
 func TestApplyRejectsGarbage(t *testing.T) {
 	a := newDoc(t, 1)
 	defer a.Close()
-	if rc := a.Apply([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}); rc != -1 {
+	if rc, _ := a.Apply([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}); rc != -1 {
 		t.Fatalf("garbage apply: got %d", rc)
 	}
 }
@@ -211,14 +211,14 @@ func TestDecodedDocumentDedupsAndConverges(t *testing.T) {
 	defer back.Close()
 
 	// A replay of the covered op is a no-op; a later peer op still lands.
-	if n := back.Apply(reg); n != 0 {
+	if n, _ := back.Apply(reg); n != 0 {
 		t.Fatalf("replay applied %d ops, want 0", n)
 	}
 	b := newDoc(t, 2)
 	defer b.Close()
 	b.Apply(reg)
 	hit := b.Inc(path("hits"), 4)
-	if n := back.Apply(hit); n != 1 {
+	if n, _ := back.Apply(hit); n != 1 {
 		t.Fatalf("later op applied %d ops, want 1", n)
 	}
 	if v, ok := back.GetCounter(path("hits")); !ok || v != 4 {
@@ -1165,7 +1165,7 @@ func TestXmlElementReadsBackChildrenAndConverges(t *testing.T) {
 	}
 
 	for _, ops := range [][]byte{root, e, txt} {
-		if n := b.Apply(ops); n < 1 {
+		if n, _ := b.Apply(ops); n < 1 {
 			t.Fatalf("apply: got %d", n)
 		}
 	}

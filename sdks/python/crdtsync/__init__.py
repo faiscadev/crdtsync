@@ -28,6 +28,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, 
 from . import _websocket
 
 __all__ = [
+    "ApplyOutcome",
     "BlobRef",
     "Branch",
     "Capability",
@@ -171,6 +172,15 @@ class Rejected(NamedTuple):
     ops: List[bytes]
 
 
+class ApplyOutcome(NamedTuple):
+    """What one fold of a peer's ops did, returned by :meth:`Doc.apply_update`.
+    ``applied`` is how many ops the fold took as they arrived (``-1`` for a
+    malformed batch), ``refused`` how many no replica will ever hold."""
+
+    applied: int
+    refused: int
+
+
 class Branch(NamedTuple):
     """One branch of a room as the client observes it, returned by
     :meth:`Client.branches`. ``name`` is the branch name, ``fork_point`` the
@@ -272,7 +282,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         [doc, cbytes, size, cbytes, size, c.POINTER(size)],
         c.c_int32,
     )
-    sig(lib.crdtsync_doc_apply, [doc, cbytes, size], c.c_int32)
+    sig(lib.crdtsync_doc_apply, [doc, cbytes, size, c.POINTER(c.c_uint32)], c.c_int32)
     sig(lib.crdtsync_doc_encode_state, [doc], buf)
     sig(lib.crdtsync_doc_decode_state, [cbytes, size], doc)
     sig(lib.crdtsync_doc_begin_atomic, [doc], None)
@@ -1269,9 +1279,14 @@ class Document:
 
     # --- sync ---
 
-    def apply(self, ops: bytes) -> int:
-        """Fold a peer's encoded ops in. Returns the number applied, -1 on error."""
-        return _LIB.crdtsync_doc_apply(self._handle, ops, len(ops))
+    def apply(self, ops: bytes) -> ApplyOutcome:
+        """Fold a peer's encoded ops in. Returns how many applied as they arrived
+        (``-1`` on a malformed batch) beside how many no replica will ever hold. An
+        op a later op in the same batch releases from the buffer applies without
+        being counted."""
+        refused = ctypes.c_uint32(0)
+        applied = _LIB.crdtsync_doc_apply(self._handle, ops, len(ops), ctypes.byref(refused))
+        return ApplyOutcome(applied=applied, refused=refused.value)
 
     def begin_atomic(self) -> None:
         """Start recording an atomic transaction; edits accumulate until commit."""
@@ -3047,15 +3062,28 @@ class Doc:
         the :meth:`on_repair` signal."""
         return self._backend.set_schema(schema)
 
-    def apply_update(self, ops: bytes) -> int:
-        """Fold a peer's update ops into this replica; returns the count applied.
-        Local docs only — a networked doc syncs through its provider."""
+    def apply_update(self, ops: bytes) -> ApplyOutcome:
+        """Fold a peer's update ops into this replica. Local docs only — a networked
+        doc syncs through its provider, and raises here rather than answering an
+        outcome.
+
+        The outcome separates an op that did not apply *yet* from one that never
+        will. ``applied`` counts what the fold took as the ops arrived; one it did
+        not take may be a duplicate, or be waiting — buffered until a create makes
+        its target reachable or its transaction group completes, which a later
+        update does, including one later in this same batch (released that way, it
+        is not counted). ``refused`` counts what no replica will ever hold, which
+        is a bug in whoever wrote it: a peer reached offline, directly, or over a
+        byte pipe the app carries itself has no server between it and this fold to
+        reject such an op first, so a non-zero ``refused`` is the only signal the
+        app gets that a peer's edits are dropped for good. A refused op does not
+        hold back the rest of the batch."""
         before = self._backend.encode_state() if self._observing() else None
-        applied = self._backend.apply(ops)
-        if applied > 0:
+        outcome = self._backend.apply(ops)
+        if outcome.applied > 0:
             self._dispatch("remote", ops, before)
             self._emit_repairs()
-        return applied
+        return outcome
 
     def encode_state(self) -> bytes:
         """Serialize the whole replica to a canonical snapshot."""
@@ -3243,9 +3271,9 @@ class LocalProvider:
         else:
             self._outbox.append(event.ops)
 
-    def receive(self, ops: bytes) -> int:
+    def receive(self, ops: bytes) -> ApplyOutcome:
         """Fold a peer's ops into the bound doc (firing ``remote`` reactivity);
-        returns the count applied."""
+        returns what the fold applied beside what it refused forever."""
         return self.doc.apply_update(ops)
 
     @property
@@ -3521,7 +3549,7 @@ class _ClientBackend:
         with self._lock:
             return self._framed(self._client.commit_atomic(self._channel))
 
-    def apply(self, ops: bytes) -> int:
+    def apply(self, ops: bytes) -> ApplyOutcome:
         raise RuntimeError(
             "crdtsync: a networked document syncs through its provider, not apply_update"
         )

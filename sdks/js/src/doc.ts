@@ -9,13 +9,14 @@
 // after states is re-marshaled into ergonomic change events. The snapshot/diff
 // only runs when something is listening, so an unobserved document pays nothing.
 
-import { type Backend, localBackend } from "./backend.js";
+import { type ApplyOutcome, type Backend, localBackend } from "./backend.js";
 import { type Change, remarshalChange } from "./changes.js";
 import { CrdtList, CrdtMap, CrdtText, CrdtXml } from "./handles.js";
 import type { ChangeEvent, ChangeListener, HandleContext } from "./internal.js";
 import { type Key, type RepairStep, decodeRepairPath, pathStartsWith } from "./path.js";
 import { WasmDocument } from "./wasm/crdtsync_wasm.js";
 
+export type { ApplyOutcome } from "./backend.js";
 export type { Change } from "./changes.js";
 export type { ChangeEvent, ChangeListener } from "./internal.js";
 export type { RepairStep } from "./path.js";
@@ -114,16 +115,29 @@ export class Doc {
     return new CrdtXml(this.ctx, [key]);
   }
 
-  /** Fold a peer's update ops into this replica; returns the count applied.
-   * Local documents only — a networked document syncs through its provider. */
-  applyUpdate(ops: Uint8Array): number {
+  /** Fold a peer's update ops into this replica. Local documents only — a
+   * networked document syncs through its provider, and throws here rather than
+   * answering an outcome.
+   *
+   * The outcome separates an op that did not apply *yet* from one that never
+   * will. `applied` counts what the fold took as the ops arrived; one it did not
+   * take may be a duplicate, or be waiting — buffered until a create makes its
+   * target reachable or its transaction group completes, which a later update
+   * does, including one later in this same batch (released that way, it is not
+   * counted). `refused` counts what no replica will ever hold, which is a bug in
+   * whoever wrote it: a peer reached offline, directly, or over a byte pipe the
+   * app carries itself has no server between it and this fold to reject such an
+   * op first, so a non-zero `refused` is the only signal the app gets that a
+   * peer's edits are dropped for good. A refused op does not hold back the rest
+   * of the batch. */
+  applyUpdate(ops: Uint8Array): ApplyOutcome {
     const before = this.observing() ? this.backend.encodeState() : undefined;
-    const applied = this.backend.apply(ops);
-    if (applied > 0) {
+    const outcome = this.backend.apply(ops);
+    if (outcome.applied > 0) {
       this.dispatch("remote", ops, before);
       this.emitRepairs();
     }
-    return applied;
+    return outcome;
   }
 
   /** @internal Bracket a provider-driven inbound receive with reactivity. */

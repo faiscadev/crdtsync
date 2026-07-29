@@ -33,7 +33,7 @@ def test_grant_to_an_actor_key_converges():
             capability=Capability.OWN,
         )
         assert len(tuple_id) == 16
-        assert b.apply(ops) >= 1
+        assert b.apply(ops).applied >= 1
 
 
 def test_grant_returns_a_tuple_id_and_converges():
@@ -48,7 +48,7 @@ def test_grant_returns_a_tuple_id_and_converges():
         assert len(tuple_id) == 16
         assert ops, "a grant emits ops"
         # The grant tuple materialises on a second replica.
-        assert b.apply(ops) >= 1
+        assert b.apply(ops).applied >= 1
 
 
 def test_revoke_by_the_returned_id():
@@ -63,7 +63,7 @@ def test_revoke_by_the_returned_id():
         b.apply(ops)
         revoke_ops = a.acl_revoke(tuple_id)
         assert revoke_ops, "revoking a held tuple emits ops"
-        assert b.apply(revoke_ops) >= 1
+        assert b.apply(revoke_ops).applied >= 1
 
 
 def test_grant_needs_exactly_one_of_capability_or_role():
@@ -110,7 +110,7 @@ def test_class_and_authenticated_subjects_marshal():
             capability=Capability.WRITE,
             effect=Effect.ALLOW,
         )
-        assert b.apply(ops) >= 1
+        assert b.apply(ops).applied >= 1
 
 
 def test_client_acl_grant_and_revoke_route_through_the_outbox():
