@@ -217,6 +217,20 @@ pub fn canonical_member_addr(addr: &str) -> Option<String> {
         Some("") => None,
         Some(digits) => Some(digits.parse::<u16>().ok()?),
     };
+    // An absent port *is* the scheme's default port — that is how the dial resolves it
+    // — so the two spellings name one socket and must reduce to one id. Leaving them
+    // apart is the whole doppelgänger: a member advertised portlessly, or at `:443`
+    // under `wss`, has a second id that resolves to its own listener and is answered by
+    // its own certificate, so every honest node that dials the second spelling
+    // verifies it *truthfully* and adopts it. That id is then placed on rooms while the
+    // member itself only ever speaks as the first — it holds replicas that never ack,
+    // it is the effective primary of rooms no node believes it leads, and it cannot
+    // even refute a suspicion of itself, because `is_self` is false for it.
+    let default_port = match endpoint.transport {
+        PeerTransport::Tls => 443,
+        PeerTransport::Plain => 80,
+    };
+    let port = port.filter(|port| *port != default_port);
     let host = normalized(host);
     let host = match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
@@ -712,6 +726,13 @@ mod tests {
                 "[2001:db8::6]:9000",
             ),
             ("  wss://Node-A.Example:9000  ", "wss://node-a.example:9000"),
+            // An absent port is the scheme's default port, because that is how the
+            // dial resolves it — so the two spellings are one socket and one id.
+            ("wss://node-a.example", "wss://node-a.example:443"),
+            ("node-a.example", "node-a.example:80"),
+            ("ws://node-a.example:80", "node-a.example"),
+            ("wss://10.0.0.1", "wss://10.0.0.1:443"),
+            ("[2001:db8::6]", "[2001:db8::6]:80"),
         ] {
             assert_eq!(
                 canonical_member_addr(a),

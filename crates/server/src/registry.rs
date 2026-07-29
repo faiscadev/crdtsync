@@ -1024,10 +1024,17 @@ impl Registry {
                 membership.is_member(&node) || (&node == sender && addr == node.as_bytes())
             })
             .collect();
-        // The link this arrived on is bound to `sender` (C13), and under a deployment
-        // that requires an identified peer it is bound by a certificate that names it,
-        // so the claims it carries are attributable to that member.
-        self.merge_gossip_attributed(sender, members, true);
+        // Whether a claim is attributable is asked the same way on both halves of a
+        // round, because `verifiers` has to converge and this is what decides what
+        // enters it. Reading the link here (bound to `sender`, C13) while the reply
+        // half reads the member's advertised transport made the two halves disagree
+        // about the same member: a plaintext member under `require_peer_identity` had
+        // its claims kept by every node it dialed and dropped by every node that dialed
+        // it, so nodes holding identical evidence built different rings and placed
+        // rooms differently — permanently. `dial_establishes_identity` is a function of
+        // configuration and the member's own address, so every node computes it alike.
+        let attributable = self.dial_establishes_identity(sender);
+        self.merge_gossip_attributed(sender, members, attributable);
         let reply = crate::gossip::gossip_frame(&self.known_liveness());
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.outbox.push(reply);

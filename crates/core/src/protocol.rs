@@ -1304,7 +1304,18 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 let addr = cur.bytes()?;
                 let incarnation = cur.u64()?;
                 let state = member_state(cur.u8()?)?;
-                let verified = cur.u8()? != 0;
+                // One byte string per message: the encoder writes 0 or 1, so anything
+                // else is not a frame this cluster produced.
+                let verified = match cur.u8()? {
+                    0 => false,
+                    1 => true,
+                    tag => {
+                        return Err(ProtocolError::BadTag {
+                            what: "gossip member verification",
+                            tag,
+                        })
+                    }
+                };
                 members.push((node, addr, incarnation, state, verified));
             }
             Message::Gossip { members }
