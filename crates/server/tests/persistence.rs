@@ -13,7 +13,7 @@ use std::fs;
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, Message, Op, Scalar};
-use crdtsync_server::store::{Store, StoredOp};
+use crdtsync_server::store::{RoomMeta, Store, StoredOp};
 use crdtsync_server::{Catchup, Hub, Registry, RoomId, RoomLog};
 
 /// Tag a batch of ops as relay records (no schema) — the store's unit.
@@ -167,6 +167,41 @@ fn a_rooms_doc_acl_creator_survives_a_restart() {
         hub.room_creator(ROOM),
         Some(b"alice".to_vec()),
         "the persisted creator comes back on reload",
+    );
+}
+
+#[test]
+fn a_stored_creator_that_could_never_re_present_roots_nothing() {
+    // The store's bytes are supplied by whoever hands it over, so a root read off disk
+    // is judged like one off a frame: an anonymous id is ephemeral per-connection, and
+    // the root is set-once, so admitting it would wedge the room's authority for good.
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![(
+            ROOM.to_vec(),
+            RoomLog {
+                snapshot: None,
+                ops: relay(doc(1).transact(|tx| tx.register(b"a", Scalar::Int(1)))),
+                versions: Vec::new(),
+                meta: Some(RoomMeta {
+                    governing: None,
+                    max_op_version: None,
+                    creator: Some(b"anon:ephemeral".to_vec()),
+                }),
+                branches: Vec::new(),
+                branch_ops: Vec::new(),
+                branch_bases: Vec::new(),
+                active_branch: None,
+                epoch: None,
+            },
+        )],
+    )
+    .unwrap();
+    assert_eq!(hub.seq(ROOM), 1, "the room itself loaded");
+    assert_eq!(
+        hub.room_creator(ROOM),
+        None,
+        "an anonymous id off the store is not an authority root",
     );
 }
 

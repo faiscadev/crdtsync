@@ -714,9 +714,10 @@ impl Registry {
     ///
     /// `creator` is the room's doc-ACL authority root as the leader holds it, adopted
     /// set-once here so this replica decides its replicated ACL tuples under the same
-    /// authority the leader does. The ops path establishes no root of its own:
-    /// [`ensure_creator`](crate::Hub::ensure_creator) fires on a *client* write, and a
-    /// follower serves none.
+    /// authority the leader does. The frame is where it comes from: a replica that took
+    /// only the ops would hold the room's ACL tuples and not the authority they are
+    /// decided under, since it serves the client writes that establish one only once a
+    /// failover has made it a leader — by which time the tuples are long folded in.
     fn apply_replicate(
         &mut self,
         id: ConnId,

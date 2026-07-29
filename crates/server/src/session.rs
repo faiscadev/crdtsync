@@ -1541,7 +1541,6 @@ fn handle_ops(
     // head, never main's. A hub that cannot durably record the ops rejects the write
     // rather than advertising an unpersisted one.
     let applied = if branch == MAIN_BRANCH {
-        let actor = identity.actor().to_vec();
         let applied = hub.ingest(&room, ops, write_version);
         // The first authenticated actor to write a room establishes it, so it becomes
         // the room's creator — the doc-ACL authority root that owns `/`. Set-once and
@@ -1549,7 +1548,7 @@ fn handle_ops(
         // a replication frame is judged by the same rule. A branch write presupposes
         // an already-established (forked) room, so it never bootstraps a creator.
         if applied.is_ok() {
-            hub.ensure_creator(&room, &actor);
+            hub.ensure_creator(&room, identity.actor());
         }
         applied
     } else {

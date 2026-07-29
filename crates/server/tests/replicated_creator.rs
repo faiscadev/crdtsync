@@ -403,7 +403,8 @@ fn a_room_born_in_one_commit_carries_its_creator_on_that_commit() {
 #[test]
 fn a_dialed_ops_catch_up_carries_the_creator() {
     // The late-joiner dial, the wiped-follower self-heal and the redial after a
-    // dropped link all converge a follower through this frame and no other, so a
+    // dropped link converge a follower through the dialed frame rather than a steady
+    // commit — an ops delta here, its sibling arm's snapshot below the floor — so a
     // follower that never saw a steady commit must still come up rooted.
     let room = room_led_by_a_with_b_next();
     let b = NodeId::from_addr(B);
@@ -526,7 +527,6 @@ fn a_promoted_replica_keeps_the_rooms_creator() {
         mallory,
         Document::new(cid(4)).transact(|tx| tx.register(b"mine", Scalar::Int(9))),
     );
-    let head = follower.hub().seq(&room);
     let out = follower.take_outbox(mallory);
     assert!(
         !out.iter()
@@ -537,7 +537,6 @@ fn a_promoted_replica_keeps_the_rooms_creator() {
         follower.hub().get(&room, b"mine").is_some(),
         "mallory's op landed in the replica, so the creator seam ran on it",
     );
-    assert!(head > 0, "the write advanced the replica's sequence");
     assert_eq!(
         follower.hub().room_creator(&room).as_deref(),
         Some(b"alice".as_slice()),
@@ -617,6 +616,10 @@ fn a_second_frame_naming_another_root_does_not_displace_the_first() {
             creator: Some(b"mallory".to_vec()),
         },
     ));
+    assert!(
+        follower.hub().get(&room, b"planted").is_some(),
+        "the frame applied, so the root it named was judged and refused",
+    );
     assert!(follower.deliver(
         peer,
         Message::ReplicateSnapshot {
@@ -628,6 +631,11 @@ fn a_second_frame_naming_another_root_does_not_displace_the_first() {
             creator: Some(b"mallory".to_vec()),
         },
     ));
+    assert_eq!(
+        follower.hub().seq(&room),
+        9,
+        "the snapshot installed, so the root it named was judged and refused",
+    );
     assert_eq!(
         follower.hub().room_creator(&room).as_deref(),
         Some(b"alice".as_slice()),
@@ -717,6 +725,32 @@ fn a_rootless_frame_leaves_the_replica_rootless() {
         follower.hub().room_creator(&room),
         None,
         "a frame naming no root establishes none",
+    );
+}
+
+#[test]
+fn an_authenticated_actor_roots_a_room_whatever_its_id_looks_like() {
+    // The rule is exactly "not anonymous". Refusing to root is not fail-closed — a
+    // room with no authority root reads every deny in it as inert — so a seam that
+    // second-guesses what the verifier produced strips authority rather than
+    // protecting it. An empty actor is the sharpest case: every other tier already
+    // counts it as authenticated.
+    let room = room_led_by_a_with_b_next();
+    let mut leader = seeded_leader(&room);
+    let other = b"other-room".to_vec();
+    leader
+        .hub_mut()
+        .ingest(
+            &other,
+            Document::new(cid(8)).transact(|tx| tx.register(OPEN, Scalar::Int(1))),
+            None,
+        )
+        .expect("the room ingests");
+    leader.hub_mut().ensure_creator(&other, b"");
+    assert_eq!(
+        leader.hub().room_creator(&other),
+        Some(Vec::new()),
+        "an empty actor is a credentialed one, so it roots the room",
     );
 }
 
