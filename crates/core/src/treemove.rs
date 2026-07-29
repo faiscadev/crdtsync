@@ -82,6 +82,38 @@ impl TreeMoves {
         true
     }
 
+    /// Withdraw the logged move `(stamp, child, parent)`, leaving the relation as
+    /// if it had never been recorded. Absorbed the same way a late arrival is —
+    /// undo every later move, drop this one, redo the rest — so the result is the
+    /// fold of the remaining log alone.
+    ///
+    /// The seam a children-list placement collision resolves through: a move that
+    /// loses `(list, stamp)` — to a birth, or to a smaller node id — keeps no
+    /// placement, so it must keep no edge either. `child` and `parent` are matched
+    /// as well as `stamp`, because a second move can hold that stamp in a different
+    /// list — one op set may reach here naming an edge this log does not hold, and
+    /// withdrawing someone else's would be a divergence of its own. Returns whether
+    /// the log held it.
+    pub fn remove(&mut self, stamp: Stamp, child: ElementId, parent: ElementId) -> bool {
+        let at = self.log.partition_point(|op| op.stamp < stamp);
+        let held = self
+            .log
+            .get(at)
+            .is_some_and(|op| op.stamp == stamp && op.child == child && op.parent == parent);
+        if !held {
+            return false;
+        }
+        let later: Vec<LogOp> = self.log.split_off(at);
+        for op in later.iter().rev() {
+            self.undo(op);
+        }
+        for op in later.into_iter().skip(1) {
+            let recorded = self.redo(op.stamp, op.child, op.parent);
+            self.log.push(recorded);
+        }
+        true
+    }
+
     /// The current effective parent of `child`: its move-overriding parent if one
     /// governs it, else the parent it was created under, else `None` (a root).
     pub fn parent_of(&self, child: ElementId) -> Option<ElementId> {

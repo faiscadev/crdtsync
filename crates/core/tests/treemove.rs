@@ -250,3 +250,69 @@ fn a_random_move_stream_converges_across_orderings_and_stays_acyclic() {
         assert_acyclic(&r2);
     }
 }
+
+// --- withdrawing a logged move ---
+
+#[test]
+fn a_withdrawn_move_leaves_the_fold_of_the_remaining_log() {
+    // The seam a children-list placement collision resolves through: a move that
+    // loses its `(list, stamp)` key — to a birth, or to a smaller node id — keeps
+    // no placement, so it must keep no edge. What is left has to be the fold of the surviving log
+    // alone, not the fold minus one step — a later move whose result depended on
+    // the withdrawn one is re-derived against the tree without it.
+    // The last move closes a loop only while the withdrawn one stands — 3 is under
+    // 2 is under 1 — so it is inert in the full log and has to apply once the middle
+    // move goes. Splicing the entry out and dropping its edge would leave it inert.
+    let seed = |t: &mut TreeMoves| {
+        t.set_base(node(1), node(9));
+        t.set_base(node(2), node(9));
+        t.set_base(node(3), node(9));
+    };
+    let mut with = TreeMoves::new();
+    seed(&mut with);
+    for (s, c, p) in [
+        (stamp(1, 1), node(2), node(1)),
+        (stamp(2, 1), node(3), node(2)),
+        (stamp(3, 1), node(1), node(3)),
+    ] {
+        with.apply(s, c, p);
+    }
+    assert_eq!(
+        with.parent_of(node(1)),
+        Some(node(9)),
+        "the cycle move should be inert while the middle move stands"
+    );
+    assert!(with.remove(stamp(2, 1), node(3), node(2)));
+    assert_eq!(with.len(), 2, "the log kept the withdrawn move");
+    assert_eq!(
+        with.parent_of(node(1)),
+        Some(node(3)),
+        "the cycle move was not re-derived against the surviving log"
+    );
+
+    let mut without = TreeMoves::new();
+    seed(&mut without);
+    without.apply(stamp(1, 1), node(2), node(1));
+    without.apply(stamp(3, 1), node(1), node(3));
+
+    assert_eq!(
+        edges(&with),
+        edges(&without),
+        "the withdrawal left a residue"
+    );
+}
+
+#[test]
+fn a_withdrawal_that_names_a_different_edge_leaves_the_log_alone() {
+    // A stamp is not enough to name a move: a second op can carry it into a
+    // different list, so a replica may reach the withdrawal naming an edge this
+    // log does not hold. Dropping someone else's on a stamp match would be a
+    // divergence of its own.
+    let mut t = TreeMoves::new();
+    t.apply(stamp(1, 1), node(1), node(2));
+    assert!(!t.remove(stamp(1, 1), node(5), node(2)), "wrong child");
+    assert!(!t.remove(stamp(1, 1), node(1), node(7)), "wrong parent");
+    assert!(!t.remove(stamp(9, 1), node(1), node(2)), "wrong stamp");
+    assert_eq!(t.len(), 1);
+    assert_eq!(edges(&t), vec![(node(1), node(2))]);
+}
