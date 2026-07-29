@@ -105,11 +105,30 @@ impl PeerEndpoint {
         // being *retried forever* — a control character or a space builds a URL the
         // dialer rejects at send time, which reads as "unreachable" and is redialed on
         // the fast cadence rather than classified a permanent address error.
-        if !authority
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':' | b'[' | b']'))
-        {
+        if !authority.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':' | b'[' | b']' | b'_')
+        }) {
             return Err(BadPeerAddress::NotAnAuthority);
+        }
+        // A bracketed host must be followed by its port and nothing else. Trailing junk
+        // after `]` is read as part of the authority by the dialer and dropped by the
+        // canonical form, so the two would disagree about which endpoint the string
+        // names — and a *wrong* canonical form is worse than none, because it is
+        // accepted.
+        if let Some(after) = authority.strip_prefix('[') {
+            match after.split_once(']') {
+                Some((_, rest)) if rest.is_empty() || rest.starts_with(':') => {}
+                _ => return Err(BadPeerAddress::NotAnAuthority),
+            }
+        }
+        // A host with an empty label — `a..example`, `.example`, a bare `..` — is no
+        // host any resolver accepts, and it is the shape that survives a one-dot
+        // reduction as a second spelling of a real one.
+        if let Some(host) = host_of(authority) {
+            let host = host.trim_end_matches('.');
+            if !host.starts_with('[') && (host.is_empty() || host.split('.').any(str::is_empty)) {
+                return Err(BadPeerAddress::NotAnAuthority);
+            }
         }
         // An authority that names no host — an IPv6 literal left unbracketed, or one
         // opening with its port separator — is dialable by nobody and bindable to no
@@ -246,6 +265,15 @@ pub fn cert_names_member(name: &[u8], addr: &[u8]) -> bool {
     let Ok(name) = std::str::from_utf8(name) else {
         return false;
     };
+    // A name carries at most one root label. A run of them, or any other empty label,
+    // is not a name a resolver accepts, so it binds nothing — checked before the fold
+    // rather than by folding one dot, because folding one is not a fixpoint and a
+    // reduction that is not a fixpoint hands one endpoint a second identity.
+    let trimmed = name.trim();
+    let without_root = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    if without_root.split('.').any(str::is_empty) {
+        return false;
+    }
     let name = normalized(name);
     if name.is_empty() {
         return false;
@@ -267,9 +295,14 @@ pub fn cert_names_member(name: &[u8], addr: &[u8]) -> bool {
 /// trimmed, lowercased as DNS names are, and without its root label — `node-a.` and
 /// `node-a` name one host, and a certificate and an advertise address need not agree on
 /// which spelling to use.
+///
+/// **Every** trailing dot goes, not one. Stripping a single dot is not a fixpoint, and a
+/// reduction that is not a fixpoint is not a reduction: `a.example..` would reduce to
+/// `a.example.`, a *different* node id that DNS resolves to the same host and that TLS
+/// accepts against the same certificate — so one honest endpoint would hold a second
+/// ring position that it never speaks as.
 fn normalized(name: &str) -> String {
-    let name = name.trim();
-    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Whether `name` is an IP address rather than a host name, judged after the same
@@ -548,6 +581,62 @@ mod tests {
                 "{addr}",
             );
         }
+    }
+
+    #[test]
+    fn the_canonical_form_is_a_fixpoint() {
+        // A reduction that is not a fixpoint is not a reduction: if `canonical(x)` can
+        // still be reduced, then a peer sends the un-reduced spelling, one door reduces
+        // it once, and the roster holds a *second* id for an endpoint it already has —
+        // one that resolves to the same host and that TLS accepts against the same
+        // certificate, so every honest node verifies it truthfully.
+        for addr in [
+            "a.example:9000",
+            "a.example.:9000",
+            "a.example..:9000",
+            "a.example...:9000",
+            "wss://A.Example..:09000",
+            "10.0.0.1..:9000",
+            "[2001:db8::6]:9000",
+            "node_a.internal:9000",
+            "node-a",
+        ] {
+            let once = canonical_member_addr(addr);
+            if let Some(once) = &once {
+                assert_eq!(
+                    canonical_member_addr(once).as_ref(),
+                    Some(once),
+                    "{addr} -> {once} is not a fixpoint",
+                );
+            }
+        }
+        // And every spelling of one host reduces to the *same* id, not to a chain of
+        // distinct ones.
+        let canonical = canonical_member_addr("a.example:9000");
+        for addr in ["a.example.:9000", "a.example..:9000", "A.EXAMPLE...:9000"] {
+            assert_eq!(canonical_member_addr(addr), canonical, "{addr}");
+        }
+    }
+
+    #[test]
+    fn an_authority_with_no_single_reading_is_refused() {
+        // Each of these is read one way by the dialer and another by the canonical
+        // form, or is no host at all. A *wrong* canonical form is worse than none,
+        // because it is accepted.
+        for addr in [
+            "[::1]junk:9000",
+            "[2001:db8::1]xy:8080",
+            "a..example:9000",
+            ".example:9000",
+            "..:9000",
+            "[::1",
+        ] {
+            assert!(PeerEndpoint::parse(addr).is_err(), "{addr}");
+            assert_eq!(canonical_member_addr(addr), None, "{addr}");
+        }
+        // An underscore is legal in the names container runtimes hand out, and carries
+        // no second reading, so it is not swept up by the refusal.
+        assert!(canonical_member_addr("node_a.internal:9000").is_some());
     }
 
     #[test]

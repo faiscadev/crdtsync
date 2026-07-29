@@ -1457,3 +1457,83 @@ fn a_link_bound_to_this_nodes_own_id_makes_it_vouch_for_nobody() {
     );
     assert!(!m.is_adopted(&joiner));
 }
+
+#[test]
+fn a_node_advertises_only_the_verifications_it_made_itself() {
+    // The flag is *first-hand*. Relaying what this node merely heard would make one
+    // member's word enough to place any id it liked: a compromised member's claim
+    // would be re-asserted by every honest node that received it, and the bar would be
+    // met by one attacker and one echo.
+    let mut m = membership_for(SELF_ADDR);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone());
+    vouch(&mut m, "10.0.0.1:9000", &joiner);
+    assert!(
+        m.has_verified(&NodeId::from("10.0.0.1:9000"), &joiner),
+        "the claim was recorded",
+    );
+    assert!(
+        !verified_by(&m, &joiner),
+        "and this node advertises nothing it did not do itself",
+    );
+
+    // Its own link is what puts the flag on the wire.
+    m.note_verified(&joiner);
+    assert!(verified_by(&m, &joiner));
+}
+
+#[test]
+fn a_peer_entry_no_peer_could_dial_is_refused_where_it_is_written() {
+    // The peer-list door, not just the node-id door. A configured member is adopted
+    // from birth, so an undialable id seeded here would be placed on rooms it can never
+    // answer for — the write-stall, reached with no attacker at all.
+    for peers in [
+        "10.0.0.1:9000/sync",
+        "10.0.0.1:9000,::1:9000",
+        "wss://a.example:1@b.example:9000",
+        "10.0.0.1:99999",
+        "a..example:9000",
+    ] {
+        let e = Membership::from_static_config(None, Some(SELF_ADDR), peers, N)
+            .expect_err("an undialable peer is refused");
+        assert!(
+            e.to_string().contains("is not an address a peer can dial"),
+            "{peers}"
+        );
+    }
+}
+
+#[test]
+fn a_second_spelling_of_an_honest_member_is_not_a_second_member() {
+    // The shape a compromised member reaches for once it cannot mint on another host:
+    // a spelling of an *honest* member's address that reduces to a different id. It
+    // would resolve to the honest host, answer with the honest certificate, and be
+    // verified truthfully by everyone — a ring position the honest node never speaks
+    // as, and a room whose quorum can never be met. Every such spelling either reduces
+    // to the same id or is no address at all.
+    let honest = NodeId::from("wss://a.example:9000");
+    let mut m = Membership::from_static_config(
+        None,
+        Some("wss://victim.example:9000"),
+        "wss://a.example:9000,wss://b.example:9000",
+        N,
+    )
+    .unwrap();
+    let before = m.members().len();
+    for spelling in [
+        "wss://a.example.:9000",
+        "wss://a.example..:9000",
+        "wss://a.example...:9000",
+        "wss://A.Example.:09000",
+    ] {
+        m.add_member(NodeId::from(spelling));
+        assert!(
+            matches!(
+                crdtsync_server::dial::canonical_member_addr(spelling),
+                None | Some(_)
+            ) && NodeId::canonical(spelling.as_bytes()).is_none_or(|id| id == honest),
+            "{spelling} is either no address or the honest member",
+        );
+    }
+    assert_eq!(m.members().len(), before, "no ghost joined the roster");
+}
