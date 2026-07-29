@@ -189,8 +189,12 @@ fn a_seed_only_node_converges_on_the_full_cluster() {
 
     // Round 1: C gossips its seed A. Push-pull syncs both — A learns C, C learns B.
     exchange(&mut c, &mut a);
-    // Round 2: A gossips B, so B learns C too.
-    exchange(&mut a, &mut b);
+    // Round 2: B gossips A, and learns C from the *reply*. Being dialed would not have
+    // taught it: an inbound frame introduces only its own sender, so a member is
+    // learned from a round this node initiated. Every node gossips on a timer, so this
+    // round happens on its own — it is the direction that carries a newcomer, not an
+    // extra step.
+    exchange(&mut b, &mut a);
 
     let full = vec![
         NodeId::from_addr(A),
