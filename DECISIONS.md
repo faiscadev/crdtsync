@@ -7,7 +7,7 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
-## 2026-07-29 · C27 diff-query redaction (#PR) · a change list is content, so a diff is a redacted read — and the scope it is redacted to is a channel's, which is why the query now names one
+## 2026-07-29 · C27 diff-query redaction (#375) · a change list is content, so a diff is a redacted read — and the scope it is redacted to is a channel's, which is why the query now names one
 
 **Changed:** ARCHITECTURE §Schema-Aware Diff gains the read contract — both sides of a served diff go through the state-serving composition before the engine sees them — and the surface rule the diff and version seams share: a request that serves a room's *content* is channel-keyed, one that serves only *names* or performs a room-management mutation may ride a room off the frame.
 
