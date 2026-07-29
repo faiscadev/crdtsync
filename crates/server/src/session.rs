@@ -752,31 +752,18 @@ pub fn step(
                     // the recipient authors under, and so the one author whose ids the
                     // projections keep in the frontier they otherwise scrub.
                     let recipient = session.client.map(|c| c.for_channel(channel.0));
-                    let reads_all = records.is_empty()
-                        || reads_whole_document(
-                            authorizer,
-                            &records,
-                            creator.as_deref(),
-                            &index,
-                            schema,
-                            identity,
-                            &room,
-                        );
-                    let state = if reads_all {
-                        state
-                    } else {
-                        project_snapshot_reads(
-                            state,
-                            authorizer,
-                            &records,
-                            creator.as_deref(),
-                            schema,
-                            identity,
-                            &room,
-                            recipient,
-                        )
-                    };
-                    let state = project_snapshot_zones(state, schema, &zones, recipient);
+                    let state = project_served_state(
+                        state,
+                        authorizer,
+                        &records,
+                        creator.as_deref(),
+                        &index,
+                        schema,
+                        identity,
+                        &room,
+                        &zones,
+                        recipient,
+                    );
                     Message::Snapshot {
                         channel,
                         seq,
@@ -997,26 +984,91 @@ pub fn step(
             versions_list(hub, channel, &room)
         }
         Message::VersionFetch { channel, name } => {
+            // The reader is resolved before the room, so the redaction below has the
+            // identity it narrows for without a second, unreachable lookup.
+            let Some(identity) = session.identity() else {
+                return version_denied(session, channel);
+            };
             let Some(room) = version_room(session, channel, authorizer, schema, Action::Read)
             else {
                 return version_denied(session, channel);
             };
             match hub.version_state(&room, &name) {
                 Some(state) => {
-                    // A version's captured state is served — an auditable history
-                    // read, distinct from the live subscribe stream. Record it
-                    // through the audit seam (the read was already authorized by
-                    // `version_room` above, so the verdict is granted).
-                    if let Some(identity) = session.identity() {
-                        authorizer.observe(
-                            identity,
-                            Action::VersionRead,
-                            &Resource::Room(&room),
-                            true,
-                        );
-                    }
                     let seq = hub.version_seq(&room, &name).unwrap_or(0);
                     let state = state.to_vec();
+                    // A version is the room's own state at an earlier sequence, so it
+                    // carries every partition the room carried — the zones this
+                    // channel withholds and the subtrees this reader's doc-ACL denies
+                    // included. Narrow it with the same two projections, in the same
+                    // order, that a catch-up snapshot runs, so a version read serves
+                    // exactly the partitions the live stream does.
+                    let records = hub.acl_records(&room);
+                    let creator = hub.room_creator(&room);
+                    // The channel's zone scope, resolved when it subscribed — the same
+                    // set the live fan-out filters this channel's ops by.
+                    let zones = session
+                        .channels
+                        .get(&channel)
+                        .and_then(|sub| sub.zones.clone());
+                    // Whether either redaction is configured over these bytes on this
+                    // channel at all. A room with no doc-ACL state, read by a channel that
+                    // is not zone-limited, is served the captured bytes as it always was,
+                    // without paying a decode. This asks what is *configured* — a room
+                    // holding any tuple, a channel holding a partial zone set — not what
+                    // would actually have been cut: that answer needs the element index,
+                    // the index needs the decode, and the decode is what can fail here.
+                    let narrowable =
+                        !records.is_empty() || zone_narrowing(schema, &zones).is_some();
+                    // Element-scoped grants resolve against the *version's* tree: an
+                    // element's redaction path is where it stood when the version was
+                    // captured, not where it stands in the live room.
+                    let index = if narrowable {
+                        match Document::decode_state(&state) {
+                            Ok(doc) if !records.is_empty() => crate::index::element_paths(&doc),
+                            Ok(_) => HashMap::new(),
+                            // A version's bytes come back off durable storage, so unlike a
+                            // snapshot materialized this instant they can fail to decode.
+                            // Undecodable is unprojectable, and the unnarrowed bytes still
+                            // carry whatever a redaction would have cut — so say so, without
+                            // closing: one archived state is unreadable, the live stream
+                            // this channel carries is not.
+                            Err(_) => {
+                                return Response {
+                                    replies: vec![Message::Error {
+                                        code: ErrorCode::Internal,
+                                        message: "version state is unreadable".to_string(),
+                                        details: Vec::new(),
+                                    }],
+                                    ..Response::default()
+                                }
+                            }
+                        }
+                    } else {
+                        HashMap::new()
+                    };
+                    // The version's state is being served — an auditable history read,
+                    // distinct from the live subscribe stream. Record it through the audit
+                    // seam once it is actually going out (the read was authorized by
+                    // `version_room` above, so the verdict is granted).
+                    authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
+                    // The replica identity this channel authors under — the one author
+                    // whose ids a projection keeps in the frontier it otherwise scrubs,
+                    // so a reader that adopts this version does not re-mint into ids
+                    // the room's log already holds.
+                    let recipient = session.client.map(|c| c.for_channel(channel.0));
+                    let state = project_served_state(
+                        state,
+                        authorizer,
+                        &records,
+                        creator.as_deref(),
+                        &index,
+                        schema,
+                        identity,
+                        &room,
+                        &zones,
+                        recipient,
+                    );
                     Response {
                         replies: vec![Message::VersionState {
                             channel,
@@ -1690,30 +1742,100 @@ fn zone_readable(
     }
 }
 
+/// Narrow a whole-replica state to what one recipient may read: the doc-ACL path
+/// projection, then the zone projection, in that order. **The one composition every
+/// seam that hands a client a state blob runs** — the subscribe catch-up snapshot and
+/// the named-version fetch — so a redaction added to it cannot reach one seam and miss
+/// the other, which is the failure this composition exists to answer.
+///
+/// Read-then-zone is the order the catch-up seam has always used, preserved verbatim
+/// by the extraction rather than re-derived. It is not a containment property: running
+/// the zone projection first is *more* redactive, not less, since a zone-purged node
+/// leaves no placement for the read projection's reveal rule to un-purge. The rationale
+/// for keeping it is that the reveal rule's decision belongs against the whole document,
+/// as the op fan-out resolves it — but no test today distinguishes the two orders, so
+/// treat that as the reason it was chosen, not as an invariant something enforces.
+///
+/// `index` resolves element-scoped grants to paths for the *gate* — the whole-document
+/// verdict that decides whether the read projection runs at all. The projection itself
+/// always derives its own index from the state it is about to narrow, so only the gate
+/// can be fed an index from a different tree than the bytes. It must not be: an element
+/// scope that resolves to no path is inert, an inert deny is no deny, and a gate that
+/// finds none serves the state whole. The version fetch passes the version's own tree;
+/// the catch-up snapshot passes the live room's, which is the same tree for a `main`
+/// snapshot and **not** for a branch whose base was forked from a version (C32).
+/// `records.is_empty()` (a room with no doc-ACL state) or a whole-document verdict
+/// skips the read projection; [`zone_narrowing`] decides the zone one.
+#[allow(clippy::too_many_arguments)]
+fn project_served_state(
+    state: Vec<u8>,
+    authorizer: &dyn Authorizer,
+    records: &[crdtsync_core::acl::AclRecord],
+    creator: Option<&[u8]>,
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
+    schema: Option<&Schema>,
+    identity: &Identity,
+    room: &[u8],
+    zones: &Option<HashSet<u32>>,
+    recipient: Option<ClientId>,
+) -> Vec<u8> {
+    let reads_all = records.is_empty()
+        || reads_whole_document(authorizer, records, creator, index, schema, identity, room);
+    let state = if reads_all {
+        state
+    } else {
+        project_snapshot_reads(
+            state, authorizer, records, creator, schema, identity, room, recipient,
+        )
+    };
+    project_snapshot_zones(state, schema, zones, recipient)
+}
+
+/// The `(schema, authorized set)` a zone projection would narrow by, or `None` when it
+/// is not to run at all — a whole-zone subscriber (its set is exactly the declared id
+/// range), a no-zones room, or a relay, each of which takes a state verbatim. Skipping
+/// it is not merely an optimization: the projection also scrubs the causal frontier,
+/// and a reader entitled to every partition is owed the whole frontier to dedup
+/// against. The single home of that rule, so [`project_snapshot_zones`] and a caller
+/// that must know whether narrowing is even possible cannot drift apart.
+///
+/// "Whole-zone" means the set is *exactly* the declared id range, rather than merely
+/// having as many members. A set is resolved once, when a channel subscribes, and the
+/// room's governing schema can lift underneath it, so a set can both miss a declared
+/// partition and name ids no longer declared — and a member count says nothing about
+/// which of the two it is. Anything short of the exact range projects, which is the
+/// only reading that is never wider than either a count or a containment test alone.
+fn zone_narrowing<'a>(
+    schema: Option<&'a Schema>,
+    zones: &'a Option<HashSet<u32>>,
+) -> Option<(&'a Schema, &'a HashSet<u32>)> {
+    let (schema, set) = (schema?, zones.as_ref()?);
+    let declared = schema.zones().len() as u32;
+    let whole = set.len() as u32 == declared && (0..declared).all(|id| set.contains(&id));
+    (declared > 0 && !whole).then_some((schema, set))
+}
+
 /// Narrow a catch-up snapshot to a zone-limited subscriber's authorized partitions,
-/// dropping every hidden zone's state so the snapshot carries no trace of it. A
-/// whole-zone subscriber (its set covers every declared zone), a no-zones room, or a
-/// relay takes the snapshot verbatim — byte-identical to a zoneless snapshot — so
-/// only a genuinely zone-limited subscriber pays the projection.
+/// dropping every hidden zone's state so the snapshot carries no trace of it. Only a
+/// genuinely zone-limited subscriber pays the projection ([`zone_narrowing`]).
 fn project_snapshot_zones(
     state: Vec<u8>,
     schema: Option<&Schema>,
     zones: &Option<HashSet<u32>>,
     recipient: Option<ClientId>,
 ) -> Vec<u8> {
-    let (Some(schema), Some(set)) = (schema, zones) else {
+    let Some((schema, set)) = zone_narrowing(schema, zones) else {
         return state;
     };
-    if schema.zones().is_empty() || set.len() == schema.zones().len() {
-        return state;
-    }
     match Document::decode_state(&state) {
         Ok(mut doc) => {
             doc.project_zones(schema, set, recipient);
             doc.encode_state()
         }
-        // An undecodable snapshot is left as-is: it fails downstream on the same
-        // footing it would have without zones, never silently served narrowed-wrong.
+        // An undecodable state is left as-is: it fails downstream on the same footing
+        // it would have without zones. The version fetch refuses such bytes before it
+        // gets here, but only the bytes it was *handed* — this input can also be the
+        // read projection's re-encode, which nothing re-checks.
         Err(_) => state,
     }
 }

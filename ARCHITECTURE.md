@@ -625,6 +625,10 @@ Snapshots are the storage primitive. Versioning is the user-facing layer on top.
 
 Snapshot + entry in a versions index. List, paginate, rename, delete are first-class.
 
+A version *read* is a redacted read. The captured bytes are the room's own state at an earlier sequence, so they carry every partition the room carried; the **state and its causal frontier** are therefore subject to the same per-recipient redactions the live catch-up applies — the doc-ACL path projection, then the zone projection — narrowed to the requesting channel's zone scope, and — wherever a projection actually runs — carrying only the requesting replica's own frontier. Both seams that hand a client a state blob run that one composition, so a redaction added to it cannot reach one and miss the other.
+
+**Current** policy governs a version read; the version's own captured ACL state does not, or a revoked grant would be reachable by fetching a version taken before the revocation. That holds for every tier resolved at request time — deployment, schema, and the doc-ACL tuples. It does *not* yet hold for the zone scope, which a channel resolves once when it subscribes and then carries: a zone verdict revoked afterwards narrows nothing on that bound channel, at a fetch or at the live fan-out. An element-scoped grant resolves against the *version's* tree — an element's redaction path is where it stood at capture — since a grant that resolves to no live path is inert, and an inert deny over a version's bytes is the whole version. A path-scoped grant is unchanged by this: it names a position, and governs whatever occupies that position in the tree it is evaluated against. A *version* state that cannot be decoded, and so cannot be projected, is refused rather than served unnarrowed wherever a redaction is configured over it — the archive is read back off durable storage, unlike a snapshot this build materialized in the same instant.
+
 ## Auto-Version Triggers
 
 Versions can be created declaratively in response to engine events (`before-publish`, `after-restore`, `before-migration`, ...) or schedules.
