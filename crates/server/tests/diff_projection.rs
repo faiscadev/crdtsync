@@ -14,7 +14,8 @@
 //! been served. (The states are not byte-identical to a fetch's: the two seams scrub
 //! the causal frontier differently. The change list is, because it carries no
 //! frontier.) A partition the reader may not read therefore contributes no change at
-//! all, rather than a redacted one. The scope that makes it possible is the channel: the
+//! all, rather than a redacted one — as far as the projections themselves reach, which
+//! for an annotation whose anchor has left the tree is not yet far enough (C37). The scope that makes it possible is the channel: the
 //! query is channel-keyed like a version fetch, so the subscription's zone set is
 //! what a diff narrows by.
 //!
@@ -451,11 +452,12 @@ fn a_zone_limited_readers_diff_withholds_a_mark_anchored_in_the_hidden_zone() {
 }
 
 #[test]
-fn a_diff_narrows_on_a_channel_bound_to_a_branch_other_than_main() {
-    // Every other fixture here queries from a channel on `main`, so nothing pinned
-    // that the zone scope a subscription carries is a claim about the room's
-    // partitions rather than about the branch it followed. A branch is a different
-    // tree; the zone ids it is narrowed by are the schema's, so they are the same.
+fn a_diff_from_a_channel_subscribed_to_a_branch_still_narrows() {
+    // Every other fixture here queries from a channel on `main`. This one queries from
+    // a channel that named `draft` at Subscribe, which nothing in the arm reads — only
+    // the channel's room and its zone set — so what it pins is that the seam works
+    // from such a channel at all, not that the branch selects the partitioning. It
+    // cannot: zone ids are the schema's, so they mean the same thing in every tree.
     let (mut r, mut author_doc, author, _reader) = zoned_room();
     let fork = r.hub().seq(ROOM);
     assert!(r.hub_mut().fork_branch(ROOM, DRAFT, b"main", fork).unwrap());
@@ -660,6 +662,40 @@ fn a_partial_readers_version_diff_still_reports_the_subtree_it_may_read() {
             old: Scalar::Int(0),
             new: Scalar::Int(7),
         }],
+    );
+}
+
+#[test]
+fn a_partial_readers_diff_is_the_diff_of_the_versions_it_is_served() {
+    // The doc-ACL half of the fetch-oracle equality. The read projection is the more
+    // intricate of the two — it re-opens a moved-in node, cuts leaf slots, and retains
+    // ACL tuples and annotations by their own rules — so agreeing with the fetch is a
+    // stronger claim here than for the zone prune.
+    let (mut r, mut alice_doc, alice, bob) = partial_room(Deny::Path);
+    create_version(&mut r, alice, VA);
+    write_into(&mut r, alice, &mut alice_doc, b"a", b"aseed", 7);
+    write_into(&mut r, alice, &mut alice_doc, b"b", b"bseed", 4242);
+    create_version(&mut r, alice, VB);
+
+    assert_eq!(
+        diff(&mut r, bob, DiffKind::Versions, VA, VB),
+        served_version_diff(&mut r, bob, VA, VB),
+    );
+}
+
+#[test]
+fn an_element_denied_readers_diff_is_the_diff_of_the_versions_it_is_served() {
+    // The same equality where the deny is element-scoped, so each side's gate resolves
+    // it through that side's own tree.
+    let (mut r, mut alice_doc, alice, bob) = partial_room(Deny::Element);
+    create_version(&mut r, alice, VA);
+    write_into(&mut r, alice, &mut alice_doc, b"a", b"aseed", 7);
+    write_into(&mut r, alice, &mut alice_doc, b"b", b"bseed", 4242);
+    create_version(&mut r, alice, VB);
+
+    assert_eq!(
+        diff(&mut r, bob, DiffKind::Versions, VA, VB),
+        served_version_diff(&mut r, bob, VA, VB),
     );
 }
 
