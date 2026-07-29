@@ -207,6 +207,7 @@ fn replicate(writer: &mut Document, room: &[u8], epoch: u64) -> Message {
         ops,
         base_seq: 0,
         epoch,
+        creator: None,
     }
 }
 
@@ -221,6 +222,7 @@ fn replicate_snapshot(room: &[u8], epoch: u64) -> Message {
         seq: 1,
         state: writer.encode_state(),
         epoch,
+        creator: None,
     }
 }
 

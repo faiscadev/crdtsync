@@ -1499,6 +1499,11 @@ impl Hub {
     /// live state needs an explicit delete first. Malformed bytes are an
     /// `InvalidData` error. With a store attached the snapshot is persisted
     /// before the room commits, so the import survives a restart.
+    ///
+    /// A portable snapshot is a `Document` encoding and carries no server-side room
+    /// metadata, so an imported room has no creator until its first authenticated
+    /// write establishes one. Until then it holds no doc-ACL authority root, and the
+    /// tuples that rode the snapshot decide nothing.
     pub fn import_room(&mut self, room: &[u8], state: &[u8]) -> io::Result<bool> {
         if self.rooms.contains_key(room) {
             return Ok(false);
@@ -1507,7 +1512,7 @@ impl Hub {
         // the op count (`None`) — a fresh subscriber lands below it and is served the
         // state rather than an empty delta. Sequences renumber from here; they are
         // server-local, so a move never collides with the origin's.
-        self.install_room_state(room, state, None)?;
+        self.install_room_state(room, state, None, None)?;
         Ok(true)
     }
 
@@ -1520,11 +1525,19 @@ impl Hub {
     /// set come back, so a client resending its ops is deduped exactly as against the
     /// origin. Malformed bytes are an `InvalidData` error; with a store attached the
     /// snapshot is persisted before the room commits, so the install survives a restart.
+    ///
+    /// `creator` is the room's doc-ACL authority root, which the state bytes do not
+    /// carry: the caller supplies it from wherever it holds the room's metadata. It
+    /// composes with any root already installed under `room` the way `creator` is
+    /// defined everywhere else — set-once, never displaced — so a re-sent snapshot
+    /// that names none leaves the standing root alone rather than dropping the
+    /// authority every deny in the state is decided under.
     fn install_room_state(
         &mut self,
         room: &[u8],
         state: &[u8],
         floor: Option<u64>,
+        creator: Option<Vec<u8>>,
     ) -> io::Result<()> {
         let doc = Document::decode_state(state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
@@ -1533,6 +1546,13 @@ impl Hub {
         if let Some(store) = self.store.as_mut() {
             store.compact(room, base_seq, state)?;
         }
+        let standing = self.rooms.get(room);
+        let root = standing.and_then(|r| r.creator.clone());
+        // The op-version high-water is the all-time worst case a joiner must down-reach,
+        // so it survives the replace as it survives compaction: the installed state is
+        // this same room's history, and the frame carries no high-water of its own to
+        // raise it with.
+        let max_op_version = standing.and_then(|r| r.max_op_version);
         self.rooms.insert(
             room.to_vec(),
             Room {
@@ -1540,10 +1560,14 @@ impl Hub {
                 log: Vec::new(),
                 seen,
                 base_seq,
-                max_op_version: None,
-                creator: None,
+                max_op_version,
+                creator: root.or(creator),
             },
         );
+        // Best-effort, matching the governing metadata: the room is installed either
+        // way, and a failed write leaves the in-memory root to re-persist rather than
+        // failing the install.
+        let _ = self.persist_meta(room);
         Ok(())
     }
 
@@ -1562,8 +1586,19 @@ impl Hub {
     /// the leader's and later replicated ops — carried in the leader's sequence space
     /// — place correctly above it. Malformed bytes are an `InvalidData` error; with a
     /// store attached the snapshot is persisted before the room commits.
-    pub fn install_snapshot(&mut self, room: &[u8], state: &[u8], seq: u64) -> io::Result<()> {
-        self.install_room_state(room, state, Some(seq))
+    ///
+    /// `creator` is the room's doc-ACL authority root as the sending leader holds it,
+    /// installed set-once beside the state: the snapshot bytes carry the room's ACL
+    /// tuples but not the authority they are decided under, so a replica that took
+    /// only the bytes would read every deny in them as inert.
+    pub fn install_snapshot(
+        &mut self,
+        room: &[u8],
+        state: &[u8],
+        seq: u64,
+        creator: Option<Vec<u8>>,
+    ) -> io::Result<()> {
+        self.install_room_state(room, state, Some(seq), creator)
     }
 
     /// Clone `src`'s live state into a fresh room `dst` — "duplicate this doc as a

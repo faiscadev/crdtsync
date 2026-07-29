@@ -356,6 +356,11 @@ impl Registry {
             return;
         }
         let base_seq = self.hub.base_seq(room);
+        // The room's doc-ACL authority root rides the frame, so a follower holds the
+        // authority its replicated ACL tuples are decided under rather than only the
+        // tuples. Read per fan-out: the first write to a fresh room establishes it,
+        // and that same write is the frame that carries it.
+        let creator = self.hub.room_creator(room);
         // Stamp the frames with this node's leadership epoch for the room. A
         // promotion opens a fresh (higher) epoch — persist the advance so the fence
         // survives a restart and this node never re-leads at a stale epoch.
@@ -371,6 +376,7 @@ impl Registry {
                     ops: ops.to_vec(),
                     base_seq,
                     epoch,
+                    creator: creator.clone(),
                 },
             );
         }
@@ -484,6 +490,10 @@ impl Registry {
     /// it divergent; one at or above it keeps the ops-tail path. The frame is stamped
     /// with this node's leadership epoch, fenced exactly as a steady replication frame.
     fn catch_up_room_frame(&mut self, room: &[u8], floor: u64) -> Option<Message> {
+        // The room's doc-ACL authority root, carried by a dialed catch-up exactly as
+        // by a steady commit — a follower converged either way holds the authority its
+        // replicated ACL tuples are decided under.
+        let creator = self.hub.room_creator(room);
         match self.hub.catch_up(room, floor) {
             Catchup::Ops(records) => {
                 let ops: Vec<Op> = records.into_iter().map(|rec| rec.op).collect();
@@ -497,6 +507,7 @@ impl Registry {
                     ops,
                     base_seq,
                     epoch: self.claim_and_persist_epoch(room),
+                    creator,
                 })
             }
             // Below the floor: send the whole-replica snapshot the ops path cannot
@@ -509,6 +520,7 @@ impl Registry {
                 seq,
                 state,
                 epoch: self.claim_and_persist_epoch(room),
+                creator,
             }),
             // `catch_up` reads main's log, never a branch base, so it has no
             // unservable answer. Dialling nothing is the fail-closed reading anyway:
@@ -699,7 +711,19 @@ impl Registry {
     /// the sequence the replica has reached. Gated by [`gate_replica_frame`](Registry::gate_replica_frame):
     /// a stray frame drops the connection, a stale-epoch one is fenced. Returns
     /// whether the connection stays open.
-    fn apply_replicate(&mut self, id: ConnId, frame: ReplicaFrame<'_>, ops: Vec<Op>) -> bool {
+    ///
+    /// `creator` is the room's doc-ACL authority root as the leader holds it, adopted
+    /// set-once here so this replica decides its replicated ACL tuples under the same
+    /// authority the leader does. Nothing on the ops path would otherwise establish
+    /// one: [`ensure_creator`](crate::Hub::ensure_creator) fires on a *client* write,
+    /// and a follower serves none.
+    fn apply_replicate(
+        &mut self,
+        id: ConnId,
+        frame: ReplicaFrame<'_>,
+        ops: Vec<Op>,
+        creator: Option<Vec<u8>>,
+    ) -> bool {
         match self.gate_replica_frame(&frame) {
             ReplicaGate::Reject => return false,
             ReplicaGate::Fenced => return true,
@@ -711,6 +735,11 @@ impl Registry {
         // relay seam, and the follower mirrors them verbatim.
         if self.hub.ingest(&room, ops, None).is_err() {
             return false;
+        }
+        // After the ingest: the room must exist for the root to land on it, and the
+        // frame that first creates it is the one that names it.
+        if let Some(creator) = &creator {
+            self.hub.ensure_creator(&room, creator);
         }
         let through_seq = self.hub.seq(&room);
         if let Some(conn) = self.conns.get_mut(&id) {
@@ -728,12 +757,18 @@ impl Registry {
     /// re-sent snapshot is idempotent. Gated by [`gate_replica_frame`](Registry::gate_replica_frame),
     /// exactly as [`apply_replicate`](Registry::apply_replicate). Returns whether the
     /// connection stays open.
+    ///
+    /// `creator` rides beside the state because the state does not hold it: the
+    /// snapshot is a `Document` encoding, so it carries the room's ACL tuples but not
+    /// the authority root they are decided under. It installs set-once, so replacing
+    /// the replica never drops a root already standing here.
     fn apply_replicate_snapshot(
         &mut self,
         id: ConnId,
         frame: ReplicaFrame<'_>,
         seq: u64,
         state: Vec<u8>,
+        creator: Option<Vec<u8>>,
     ) -> bool {
         match self.gate_replica_frame(&frame) {
             ReplicaGate::Reject => return false,
@@ -741,7 +776,11 @@ impl Registry {
             ReplicaGate::Apply => {}
         }
         let room = frame.room;
-        if self.hub.install_snapshot(&room, &state, seq).is_err() {
+        if self
+            .hub
+            .install_snapshot(&room, &state, seq, creator)
+            .is_err()
+        {
             return false;
         }
         let through_seq = self.hub.seq(&room);
@@ -1843,6 +1882,7 @@ impl Registry {
                     ops,
                     base_seq,
                     epoch,
+                    creator,
                 } => {
                     // `base_seq` is the leader's compaction floor. Unit 4 replicates
                     // the whole log from the first op, so a follower on the ops path
@@ -1856,7 +1896,7 @@ impl Registry {
                         branch,
                         epoch,
                     };
-                    return self.apply_replicate(id, frame, ops);
+                    return self.apply_replicate(id, frame, ops, creator);
                 }
                 Message::ReplicateSnapshot {
                     room,
@@ -1864,6 +1904,7 @@ impl Registry {
                     seq,
                     state,
                     epoch,
+                    creator,
                 } => {
                     let frame = ReplicaFrame {
                         sender: &sender,
@@ -1871,7 +1912,7 @@ impl Registry {
                         branch,
                         epoch,
                     };
-                    return self.apply_replicate_snapshot(id, frame, seq, state);
+                    return self.apply_replicate_snapshot(id, frame, seq, state, creator);
                 }
                 Message::Gossip { members } => return self.apply_gossip(id, &sender, members),
                 // A follower's durable-head report arrives node-to-node on a peer

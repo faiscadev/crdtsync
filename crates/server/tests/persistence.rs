@@ -171,6 +171,42 @@ fn a_rooms_doc_acl_creator_survives_a_restart() {
 }
 
 #[test]
+fn a_creator_installed_with_a_snapshot_survives_a_restart() {
+    // A follower converged by a state transfer holds the room's authority root, and
+    // it is durable there on the same footing a written one is — otherwise a restart
+    // would re-open the redaction gap the transfer closed.
+    let tmp = tempdir();
+    let state = {
+        let mut origin = Hub::new(cid(SERVER));
+        origin
+            .ingest(
+                ROOM,
+                doc(1).transact(|tx| tx.register(b"a", Scalar::Int(1))),
+                None,
+            )
+            .unwrap();
+        origin.export_room(ROOM).unwrap()
+    };
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        hub.install_snapshot(ROOM, &state, 1, Some(b"alice".to_vec()))
+            .unwrap();
+        assert_eq!(hub.room_creator(ROOM), Some(b"alice".to_vec()));
+    }
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        hub.room_creator(ROOM),
+        Some(b"alice".to_vec()),
+        "the installed creator comes back on reload",
+    );
+}
+
+#[test]
 fn from_rooms_replays_independent_rooms() {
     let a = doc(1).transact(|tx| tx.register(b"k", Scalar::Int(1)));
     let b = doc(2).transact(|tx| tx.register(b"k", Scalar::Int(2)));

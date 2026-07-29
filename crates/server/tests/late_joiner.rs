@@ -294,6 +294,7 @@ fn commit_follower_state(r: &mut Registry, room: &[u8]) {
         ops,
         base_seq: 0,
         epoch: 1,
+        creator: None,
     };
     r.deliver(peer, frame);
     r.take_outbox(peer);

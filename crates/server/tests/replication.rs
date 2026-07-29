@@ -181,6 +181,7 @@ fn a_leader_replicates_a_commit_to_its_follower() {
             ops: ops.clone(),
             base_seq: 0,
             epoch: 1,
+            creator: None,
         },
         "the frame carries the fresh ops on main from an uncompacted base at the \
          leader's first epoch",
@@ -290,6 +291,7 @@ fn a_follower_drops_a_branch_replicate() {
             ops,
             base_seq: 0,
             epoch: 1,
+            creator: None,
         },
     );
     assert!(!kept, "a non-main Replicate drops the connection");
@@ -357,6 +359,7 @@ fn a_follower_ignores_a_replicate_for_a_room_it_leads() {
             ops,
             base_seq: 0,
             epoch: 1,
+            creator: None,
         },
     );
     assert!(
@@ -408,6 +411,7 @@ fn single_node_rejects_a_replicate() {
             ops,
             base_seq: 0,
             epoch: 1,
+            creator: None,
         },
     );
     assert!(!kept);
@@ -526,6 +530,7 @@ async fn a_follower_applies_a_replicate_over_the_socket_and_acks() {
             ops: ops.clone(),
             base_seq: 0,
             epoch: 1,
+            creator: None,
         },
     )
     .await;

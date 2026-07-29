@@ -20,7 +20,7 @@ use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Scalar};
 use crdtsync_server::membership::Membership;
 use crdtsync_server::placement::NodeId;
-use crdtsync_server::{ConnId, ManualClock, Registry};
+use crdtsync_server::{ConnId, Hub, ManualClock, Registry};
 
 const CH: Channel = Channel(0);
 const N: usize = 3;
@@ -439,6 +439,7 @@ fn a_stale_epoch_snapshot_is_fenced() {
             ops,
             base_seq: 0,
             epoch: 5,
+            creator: None,
         },
     ));
     let seq_before = follower.hub().seq(&room);
@@ -454,6 +455,7 @@ fn a_stale_epoch_snapshot_is_fenced() {
             seq: 99,
             state,
             epoch: 4,
+            creator: None,
         },
     ));
     assert_eq!(
@@ -470,4 +472,30 @@ fn single_node_snapshot_catch_up_is_inert() {
     let mut r = node(None);
     r.catch_up_follower(&NodeId::from_addr(B));
     assert!(r.take_replication().is_empty());
+}
+
+// --- what the install carries over from the replica it replaces ---
+
+#[test]
+fn an_installed_snapshot_keeps_the_rooms_op_version_high_water() {
+    // The high-water is the worst-case op version a joiner must down-reach, taken
+    // over the room's whole history — a state transfer replaces the bytes of that
+    // same room and carries no high-water of its own, so dropping it would let a
+    // joiner that cannot reach the room's versions past the handshake range-check.
+    let mut hub = Hub::new(cid(0xFF));
+    hub.ingest(
+        b"room-1",
+        doc(1).transact(|tx| tx.register(b"age", Scalar::Int(30))),
+        Some(4),
+    )
+    .unwrap();
+    assert_eq!(hub.max_op_version(b"room-1"), Some(4));
+
+    let state = hub.export_room(b"room-1").unwrap();
+    hub.install_snapshot(b"room-1", &state, 1, None).unwrap();
+    assert_eq!(
+        hub.max_op_version(b"room-1"),
+        Some(4),
+        "the replaced replica's high-water stands",
+    );
 }
