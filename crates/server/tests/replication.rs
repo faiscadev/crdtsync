@@ -181,10 +181,13 @@ fn a_leader_replicates_a_commit_to_its_follower() {
             ops: ops.clone(),
             base_seq: 0,
             epoch: 1,
-            creator: None,
+            // The authenticated writer of this first commit is the room's creator, and
+            // the same frame that carries the commit carries the authority root under
+            // which the follower will decide the room's ACL tuples.
+            creator: Some(b"cred".to_vec()),
         },
         "the frame carries the fresh ops on main from an uncompacted base at the \
-         leader's first epoch",
+         leader's first epoch, under the room's creator",
     );
 }
 
