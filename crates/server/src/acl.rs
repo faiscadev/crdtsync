@@ -818,8 +818,8 @@ pub fn op_read_path(
         | OpKind::XmlInsertChild { .. }
         | OpKind::XmlMove { .. } => resolve_read_path(index, op.target),
         // A RangedElement op is governed by the set of its anchor-sequence paths, which
-        // `op_read_paths` resolves; the single-path form folds it to root (the whole-
-        // document reader always carries it) and is never taken by the redaction filters.
+        // `op_read_paths` resolves; the single-path form folds it to root (whatever the
+        // root verdict admits carries it) and is never taken by the redaction filters.
         OpKind::RangedCreate { .. }
         | OpKind::RangedSetPayload { .. }
         | OpKind::RangedDelete { .. } => root(),
@@ -830,8 +830,8 @@ pub fn op_read_path(
         // An ACL grant is gated by the path its scope governs: a fixed path directly,
         // an element scope resolved to its element's current path through `index` (so
         // the grant op reaches exactly the readers of the element's live location). An
-        // unresolvable element scope falls back to the root, reaching only a
-        // whole-document reader.
+        // unresolvable element scope falls back to the root, reaching whatever the root
+        // verdict admits — wider than the whole-document reader (C37).
         OpKind::AclGrant { scope, .. } => {
             scope_path(index, scope).unwrap_or_else(|| encode_path(&[]))
         }

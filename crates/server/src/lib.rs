@@ -1643,8 +1643,9 @@ impl Hub {
     /// inherit that container's own path, since read authority governs a whole
     /// subtree. An op whose target is still unindexed (a since-deleted container, a
     /// composite annotation payload) resolves to the root by
-    /// [`op_read_path`](crate::acl::op_read_path), so only a whole-document reader
-    /// carries it. Empty for an unknown room.
+    /// [`op_read_path`](crate::acl::op_read_path), so whatever the root verdict admits
+    /// carries it — wider than the whole-document reader (C37). Empty for an unknown
+    /// room.
     pub fn element_paths(&self, room: &[u8]) -> ElementPaths {
         self.rooms
             .get(room)

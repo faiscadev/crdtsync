@@ -14,10 +14,10 @@
 //! been served. (The states are not byte-identical to a fetch's: the two seams scrub
 //! the causal frontier differently. The change list is, because it carries no
 //! frontier.) A partition the reader may not read therefore contributes no change at
-//! all, rather than a redacted one — as far as the projections themselves reach, which
-//! for an element the live walk does not reach is not yet far enough (C37). The scope that makes it possible is the channel: the
-//! query is channel-keyed like a version fetch, so the subscription's zone set is
-//! what a diff narrows by.
+//! all, rather than a redacted one — as far as the projections themselves reach,
+//! which for an element the live walk does not reach is not yet far enough (C37).
+//! The scope that makes it possible is the channel: the query is channel-keyed like
+//! a version fetch, so the subscription's zone set is what a diff narrows by.
 //!
 //! Everything runs in-process through the [`Registry`] (no socket, no fs), so the
 //! suite runs under Miri.
@@ -572,8 +572,8 @@ fn slot_id(doc: &Document, key: &[u8]) -> ElementId {
 }
 
 /// A room alice created with `/a` and `/b` seeded, where bob reads the room through
-/// the schema tier, writes through a doc-ACL root grant, and is denied read on `/b`
-/// in the shape `deny` names. Bob has joined and caught up.
+/// the schema tier and is denied read on `/b` in the shape `deny` names. Bob never
+/// writes here, so it needs no write grant. Bob has joined and caught up.
 fn partial_room(deny: Deny) -> (Registry, Document, ConnId, ConnId) {
     let mut sr = SchemaRegistry::new();
     sr.register(PARTIAL_APP, 1, PARTIAL.as_bytes(), b"")
