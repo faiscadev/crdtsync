@@ -752,31 +752,18 @@ pub fn step(
                     // the recipient authors under, and so the one author whose ids the
                     // projections keep in the frontier they otherwise scrub.
                     let recipient = session.client.map(|c| c.for_channel(channel.0));
-                    let reads_all = records.is_empty()
-                        || reads_whole_document(
-                            authorizer,
-                            &records,
-                            creator.as_deref(),
-                            &index,
-                            schema,
-                            identity,
-                            &room,
-                        );
-                    let state = if reads_all {
-                        state
-                    } else {
-                        project_snapshot_reads(
-                            state,
-                            authorizer,
-                            &records,
-                            creator.as_deref(),
-                            schema,
-                            identity,
-                            &room,
-                            recipient,
-                        )
-                    };
-                    let state = project_snapshot_zones(state, schema, &zones, recipient);
+                    let state = project_served_state(
+                        state,
+                        authorizer,
+                        &records,
+                        creator.as_deref(),
+                        &index,
+                        schema,
+                        identity,
+                        &room,
+                        &zones,
+                        recipient,
+                    );
                     Message::Snapshot {
                         channel,
                         seq,
@@ -1024,13 +1011,13 @@ pub fn step(
                         .channels
                         .get(&channel)
                         .and_then(|sub| sub.zones.clone());
-                    // Whether either redaction is configured over these bytes at all. A
-                    // room with no doc-ACL state and a channel that is not zone-limited is
-                    // served the captured bytes as it always was, without paying a decode.
-                    // This asks what could apply to the *room*, not what would apply to
-                    // *this reader* — the per-reader answer needs the element index, which
-                    // needs the decode, so a state that fails to decode can only be judged
-                    // by the coarser question.
+                    // Whether either redaction is configured over these bytes on this
+                    // channel at all. A room with no doc-ACL state, read by a channel that
+                    // is not zone-limited, is served the captured bytes as it always was,
+                    // without paying a decode. This asks what is *configured* — a room
+                    // holding any tuple, a channel holding a partial zone set — not what
+                    // would actually have been cut: that answer needs the element index,
+                    // the index needs the decode, and the decode is what can fail here.
                     let narrowable =
                         !records.is_empty() || zone_narrowing(schema, &zones).is_some();
                     // Element-scoped grants resolve against the *version's* tree: an
@@ -1070,31 +1057,18 @@ pub fn step(
                     // so a reader that adopts this version does not re-mint into ids
                     // the room's log already holds.
                     let recipient = session.client.map(|c| c.for_channel(channel.0));
-                    let reads_all = records.is_empty()
-                        || reads_whole_document(
-                            authorizer,
-                            &records,
-                            creator.as_deref(),
-                            &index,
-                            schema,
-                            identity,
-                            &room,
-                        );
-                    let state = if reads_all {
-                        state
-                    } else {
-                        project_snapshot_reads(
-                            state,
-                            authorizer,
-                            &records,
-                            creator.as_deref(),
-                            schema,
-                            identity,
-                            &room,
-                            recipient,
-                        )
-                    };
-                    let state = project_snapshot_zones(state, schema, &zones, recipient);
+                    let state = project_served_state(
+                        state,
+                        authorizer,
+                        &records,
+                        creator.as_deref(),
+                        &index,
+                        schema,
+                        identity,
+                        &room,
+                        &zones,
+                        recipient,
+                    );
                     Response {
                         replies: vec![Message::VersionState {
                             channel,
@@ -1766,6 +1740,47 @@ fn zone_readable(
         Decision::Deny => false,
         Decision::Abstain => room_read,
     }
+}
+
+/// Narrow a whole-replica state to what one recipient may read: the doc-ACL path
+/// projection, then the zone projection, in that order. **The one composition every
+/// seam that hands a client a state blob runs** — the subscribe catch-up snapshot and
+/// the named-version fetch — so a redaction added to it cannot reach one seam and miss
+/// the other, which is the failure this composition exists to answer.
+///
+/// The order is load-bearing. `project_read_paths` keeps a movable node that was
+/// dragged from a readable subtree into a denied one, at its readable origin; running
+/// the zone projection afterwards still purges that node by its current partition.
+/// Reversed, the un-purge would resurrect it into a partition the recipient cannot
+/// read.
+///
+/// `index` resolves element-scoped grants to paths, and belongs to the tree being
+/// narrowed: the live room's for a catch-up snapshot, the version's own for a version
+/// fetch. `records.is_empty()` (a room with no doc-ACL state) or a whole-document
+/// verdict skips the read projection; [`zone_narrowing`] decides the zone one.
+#[allow(clippy::too_many_arguments)]
+fn project_served_state(
+    state: Vec<u8>,
+    authorizer: &dyn Authorizer,
+    records: &[crdtsync_core::acl::AclRecord],
+    creator: Option<&[u8]>,
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
+    schema: Option<&Schema>,
+    identity: &Identity,
+    room: &[u8],
+    zones: &Option<HashSet<u32>>,
+    recipient: Option<ClientId>,
+) -> Vec<u8> {
+    let reads_all = records.is_empty()
+        || reads_whole_document(authorizer, records, creator, index, schema, identity, room);
+    let state = if reads_all {
+        state
+    } else {
+        project_snapshot_reads(
+            state, authorizer, records, creator, schema, identity, room, recipient,
+        )
+    };
+    project_snapshot_zones(state, schema, zones, recipient)
 }
 
 /// The `(schema, authorized set)` a zone projection would genuinely narrow by, or

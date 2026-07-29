@@ -364,6 +364,29 @@ fn a_restarted_zone_limited_reader_does_not_re_mint_across_a_fetched_version() {
     );
 }
 
+#[test]
+fn a_version_follows_the_channels_zone_scope_not_the_actors_entitlement() {
+    // The set the fetch narrows by is the *channel's*, stored when it subscribed — the
+    // same field the live fan-out filters this channel's ops by. Re-deriving a
+    // whole-room scope at fetch time would serve a partition the subscription
+    // deliberately left out, and the fetch and the fan-out on one channel would
+    // disagree about what that channel carries.
+    let (mut r, _author_doc, author, _reader_doc, _reader) = zoned_room();
+    create_version(&mut r, author, V1);
+
+    // `author` reaches both zones, and subscribes a second channel to za alone.
+    let narrow = Channel(1);
+    subscribe_on(&mut r, author, narrow, b"za");
+
+    let served = Document::decode_state(&fetch_version_on(&mut r, author, narrow, V1))
+        .expect("the served version state decodes");
+    assert_eq!(nested(&served, b"board", b"bseed"), Some(0));
+    assert!(
+        served.get(b"notes").is_none(),
+        "the version served a zone this channel did not subscribe to",
+    );
+}
+
 // --- a doc-ACL partial reader ---
 
 /// Room read is granted by the schema tier to every authenticated actor, so a reader
