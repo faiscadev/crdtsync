@@ -455,12 +455,18 @@ fn a_promoted_replica_keeps_the_rooms_creator() {
         mallory,
         Document::new(cid(4)).transact(|tx| tx.register(b"mine", Scalar::Int(9))),
     );
+    let head = follower.hub().seq(&room);
     let out = follower.take_outbox(mallory);
     assert!(
         !out.iter()
             .any(|m| matches!(m, Message::OpsRejected { .. } | Message::Redirect { .. })),
-        "the promoted replica took the write, so the creator seam ran: {out:?}",
+        "the promoted replica took the write rather than refusing or redirecting: {out:?}",
     );
+    assert!(
+        follower.hub().get(&room, b"mine").is_some(),
+        "mallory's op landed in the replica, so the creator seam ran on it",
+    );
+    assert!(head > 0, "the write advanced the replica's sequence");
     assert_eq!(
         follower.hub().room_creator(&room).as_deref(),
         Some(b"alice".as_slice()),
@@ -515,6 +521,119 @@ fn a_creatorless_snapshot_never_drops_a_standing_creator() {
         follower.hub().room_creator(&room).as_deref(),
         Some(b"alice".as_slice()),
         "a snapshot naming no root leaves the standing one alone",
+    );
+}
+
+#[test]
+fn a_second_frame_naming_another_root_does_not_displace_the_first() {
+    // Set-once over the wire, on both paths — the composition above is reached through
+    // the frames a peer actually sends, not only through the hub call they make.
+    let room = room_led_by_a_with_b_next();
+    let mut leader = seeded_leader(&room);
+    let mut follower = follower_by_ops(&mut leader, &room);
+    let peer = peer_conn(&mut follower, &room);
+    let state = leader.hub().export_room(&room).expect("the room exports");
+    let ops = Document::new(cid(7)).transact(|tx| tx.register(b"planted", Scalar::Int(1)));
+
+    assert!(follower.deliver(
+        peer,
+        Message::Replicate {
+            room: room.clone(),
+            branch: b"main".to_vec(),
+            ops,
+            base_seq: 0,
+            epoch: 1,
+            creator: Some(b"mallory".to_vec()),
+        },
+    ));
+    assert!(follower.deliver(
+        peer,
+        Message::ReplicateSnapshot {
+            room: room.clone(),
+            branch: b"main".to_vec(),
+            seq: 9,
+            state,
+            epoch: 1,
+            creator: Some(b"mallory".to_vec()),
+        },
+    ));
+    assert_eq!(
+        follower.hub().room_creator(&room).as_deref(),
+        Some(b"alice".as_slice()),
+        "neither frame re-roots a replica that already holds an authority root",
+    );
+}
+
+#[test]
+fn a_frame_naming_a_root_that_could_never_re_present_roots_nothing() {
+    // The root is set-once, so one that can never come back to exercise its ownership
+    // would wedge the room's authority for good — the same rule the write path applies
+    // to an anonymous writer, applied to what a peer asserts.
+    let room = room_led_by_a_with_b_next();
+    let mut follower = node(B);
+    let peer = peer_conn(&mut follower, &room);
+    let ops = Document::new(cid(7)).transact(|tx| tx.register(b"planted", Scalar::Int(1)));
+    assert!(follower.deliver(
+        peer,
+        Message::Replicate {
+            room: room.clone(),
+            branch: b"main".to_vec(),
+            ops,
+            base_seq: 0,
+            epoch: 1,
+            creator: Some(b"anon:ephemeral".to_vec()),
+        },
+    ));
+    assert_eq!(
+        follower.hub().room_creator(&room),
+        None,
+        "an anonymous id is not an authority root",
+    );
+
+    let state = follower.hub().export_room(&room).expect("the room exports");
+    assert!(follower.deliver(
+        peer,
+        Message::ReplicateSnapshot {
+            room: room.clone(),
+            branch: b"main".to_vec(),
+            seq: 9,
+            state,
+            epoch: 1,
+            creator: Some(Vec::new()),
+        },
+    ));
+    assert_eq!(
+        follower.hub().room_creator(&room),
+        None,
+        "an empty actor names no principal, so it roots nothing",
+    );
+}
+
+#[test]
+fn a_rootless_frame_leaves_the_replica_rootless() {
+    // What is still not carried, pinned rather than left to prose: a leader with no
+    // root of its own hands over none, and the replica reads the room's denies as
+    // inert exactly as the leader does. A root derived from the state bytes would
+    // break this — which is the point of pinning it.
+    let room = room_led_by_a_with_b_next();
+    let mut follower = node(B);
+    let peer = peer_conn(&mut follower, &room);
+    let ops = Document::new(cid(7)).transact(|tx| tx.register(b"planted", Scalar::Int(1)));
+    assert!(follower.deliver(
+        peer,
+        Message::Replicate {
+            room: room.clone(),
+            branch: b"main".to_vec(),
+            ops,
+            base_seq: 0,
+            epoch: 1,
+            creator: None,
+        },
+    ));
+    assert_eq!(
+        follower.hub().room_creator(&room),
+        None,
+        "a frame naming no root establishes none",
     );
 }
 

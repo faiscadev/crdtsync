@@ -490,11 +490,14 @@ impl Registry {
     /// it divergent; one at or above it keeps the ops-tail path. The frame is stamped
     /// with this node's leadership epoch, fenced exactly as a steady replication frame.
     fn catch_up_room_frame(&mut self, room: &[u8], floor: u64) -> Option<Message> {
+        let catchup = self.hub.catch_up(room, floor);
         // The room's doc-ACL authority root, carried by a dialed catch-up exactly as
         // by a steady commit — a follower converged either way holds the authority its
-        // replicated ACL tuples are decided under.
+        // replicated ACL tuples are decided under. Read after the catch-up, as the
+        // steady path reads it after the write, so the frame never predates the root
+        // the state it carries was decided under.
         let creator = self.hub.room_creator(room);
-        match self.hub.catch_up(room, floor) {
+        match catchup {
             Catchup::Ops(records) => {
                 let ops: Vec<Op> = records.into_iter().map(|rec| rec.op).collect();
                 if ops.is_empty() {

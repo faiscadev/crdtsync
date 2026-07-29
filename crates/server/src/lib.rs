@@ -408,6 +408,16 @@ pub(crate) fn index_blob_refs(
     }
 }
 
+/// Whether `actor` can stand as a room's doc-ACL authority root: a non-empty,
+/// credentialed id. An anonymous id is ephemeral per-connection, so it could never
+/// re-present to exercise the ownership; an empty one names no principal at all.
+/// The root is set-once, so one that cannot re-present wedges the room's authority
+/// for good — the rule holds wherever a root arrives, a client's write and a peer's
+/// replication frame alike.
+fn can_root(actor: &[u8]) -> bool {
+    !actor.is_empty() && crate::acl::is_authenticated(actor)
+}
+
 struct Room {
     doc: Document,
     log: Vec<StoredOp>,
@@ -1529,9 +1539,10 @@ impl Hub {
     /// `creator` is the room's doc-ACL authority root, which the state bytes do not
     /// carry: the caller supplies it from wherever it holds the room's metadata. It
     /// composes with any root already installed under `room` the way `creator` is
-    /// defined everywhere else — set-once, never displaced — so a re-sent snapshot
-    /// that names none leaves the standing root alone rather than dropping the
-    /// authority every deny in the state is decided under.
+    /// defined everywhere else — set-once, never displaced, and only an actor that
+    /// [`can_root`] — so a re-sent snapshot that names none leaves the standing root
+    /// alone rather than dropping the authority every deny in the state is decided
+    /// under.
     fn install_room_state(
         &mut self,
         room: &[u8],
@@ -1561,12 +1572,11 @@ impl Hub {
                 seen,
                 base_seq,
                 max_op_version,
-                creator: root.or(creator),
+                creator: root.or_else(|| creator.filter(|a| can_root(a))),
             },
         );
         // Best-effort, matching the governing metadata: the room is installed either
-        // way, and a failed write leaves the in-memory root to re-persist rather than
-        // failing the install.
+        // way, and a failed write does not fail the install.
         let _ = self.persist_meta(room);
         Ok(())
     }
@@ -1892,10 +1902,15 @@ impl Hub {
 
     /// Record `actor` as `room`'s creator if it has none yet, persisting the durable
     /// metadata. Set-once: a room keeps its first writer as creator, so a later
-    /// caller never displaces it. A no-op for an unknown room. Best-effort persist,
-    /// matching the governing metadata: a write failure leaves the in-memory creator
-    /// to re-persist rather than failing the write.
+    /// caller never displaces it. A no-op for an unknown room, and for an actor that
+    /// cannot stand as an authority root ([`can_root`]). Persisting is best-effort,
+    /// matching the governing metadata: a failed write does not fail the caller's
+    /// write. Set-once means nothing retries it either — the room comes back
+    /// creatorless from that store, and its next writer establishes it afresh.
     pub fn ensure_creator(&mut self, room: &[u8], actor: &[u8]) {
+        if !can_root(actor) {
+            return;
+        }
         let established = match self.rooms.get_mut(room) {
             Some(r) if r.creator.is_none() => {
                 r.creator = Some(actor.to_vec());
