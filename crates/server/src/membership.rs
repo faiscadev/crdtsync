@@ -51,11 +51,24 @@
 //! shared member set. A node records only what it knows first-hand — that it has
 //! completed an identity-checked peer link to a member ([`note_verified`]) — and
 //! that claim rides gossip attributed to the node that made it. A member is adopted
-//! once [`ADOPTION_VERIFIERS`] *already-adopted* members have verified it, so the
-//! evidence is a grow-only set that merges the same way liveness does and converges
-//! on the same anti-entropy. A member never verifies itself, so no node can place
-//! itself; the members a node was *configured* with are adopted from birth, since
-//! the operator's config is the root of trust the cluster starts from.
+//! once [`ADOPTION_VERIFIERS`] *already-adopted* members have verified it. A member
+//! never verifies itself, so no node can place itself; the members a node was
+//! *configured* with are adopted from birth, since the operator's config is the root
+//! of trust the cluster starts from.
+//!
+//! **What converges, and what a Byzantine member can still do.** A claim is
+//! first-hand and is never relayed: this node tells its peers what *it* verified, and
+//! passes on nobody else's word, because with no signature on the wire "A and B
+//! verified X" is free for any node to write. So among honest members the evidence is
+//! grow-only and converges — every node dials every member it knows and eventually
+//! tells every other node — but a *compromised* member's claim reaches exactly the
+//! nodes it chooses to send it to. It can set the flag toward some peers and clear it
+//! toward others, and no honest node can carry the claim past them or contradict it.
+//! Where such a member is the swing vote — a candidate that exactly one other trust
+//! unit has reached — honest nodes then disagree about the ring, and if the candidate
+//! stays unreachable to the rest, that disagreement does not heal. Closing it needs
+//! evidence a receiver can attribute without trusting the relay, i.e. a claim signed
+//! by the verifier's peer key; see KANBAN C39.
 //!
 //! [`note_verified`]: Membership::note_verified
 
@@ -264,9 +277,14 @@ pub struct Membership {
     /// (attributed to the member its link is bound to), so every entry is a
     /// first-hand claim by the node named — a member can vouch for itself only, and
     /// never *for* itself ([`note_verified`](Self::note_verified) refuses that).
-    /// Grow-only per member, so it merges by union and converges however gossip
-    /// interleaves. Claims by members that are not (yet) adopted are retained but do
-    /// not count, so a pending member cannot vouch another pending member in.
+    /// Grow-only per member, so it merges by union: within one node the order claims
+    /// arrive in cannot change the result. Between nodes it converges only as far as
+    /// the claims travel, and a claim travels only from the member that made it —
+    /// nothing here relays another node's word, so a member that sends different
+    /// claims to different peers leaves them holding different evidence permanently
+    /// (see the module docs, and KANBAN C39). Claims by members that are not (yet)
+    /// adopted are retained but do not count, so a pending member cannot vouch
+    /// another pending member in.
     verifiers: HashMap<NodeId, HashSet<NodeId>>,
 }
 
@@ -489,10 +507,16 @@ impl Membership {
     /// direction, where a member's advertised scheme describes its own listener and
     /// says nothing about the link carrying its identity here, an outbound dial runs
     /// over exactly the transport that address declares.
+    /// Read off the **id**, not off the roster. A node id is an advertise address, so
+    /// the transport is a property of the id itself and needs no state to decide —
+    /// which is what makes this answer the same on every node. A roster lookup would
+    /// answer `false` for a member this node has not learned yet, so the frame that
+    /// *introduces* a member would be judged differently from every later one, and the
+    /// claims it carries would be kept on the nodes that already knew the sender and
+    /// dropped on the nodes meeting it — one delivery, two states.
     pub fn advertises_tls(&self, node: &NodeId) -> bool {
-        self.addrs
-            .get(node)
-            .and_then(|addr| std::str::from_utf8(addr).ok())
+        std::str::from_utf8(node.as_bytes())
+            .ok()
             .and_then(|addr| crate::dial::PeerEndpoint::parse(addr).ok())
             .is_some_and(|endpoint| endpoint.is_tls())
     }

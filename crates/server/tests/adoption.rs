@@ -469,6 +469,43 @@ fn a_member_cannot_verify_itself_into_the_ring() {
 }
 
 #[test]
+fn whether_a_dial_establishes_identity_is_read_off_the_id_alone() {
+    // Whether a member's claims are attributable decides what enters `verifiers`, and
+    // `verifiers` is what the ring is derived from — so it has to be the same answer on
+    // every node, including one meeting that member for the first time. A node id *is*
+    // an advertise address, so the transport is a property of the id. Were this a
+    // roster lookup it would answer `false` for a member not yet learned, and the frame
+    // that *introduces* a sender would be judged differently from every later one: the
+    // claims it carries kept by the nodes that already knew it and dropped by the nodes
+    // meeting it, from one delivery.
+    let known = membership_for(SELF_ADDR);
+    let stranger =
+        Membership::from_static_config(None, Some(SELF_ADDR), "10.7.7.7:9000", N).unwrap();
+    for addr in [
+        "wss://node-a.example:9000",
+        "node-a.example:9000",
+        "wss://10.0.0.1:9000",
+        "10.0.0.1:9000",
+    ] {
+        let node = NodeId::from(addr);
+        assert!(
+            known.is_member(&node) || !stranger.is_member(&node),
+            "{addr}: the two views hold different rosters",
+        );
+        assert_eq!(
+            known.advertises_tls(&node),
+            stranger.advertises_tls(&node),
+            "{addr}: a view that has never seen the member answers the same",
+        );
+        assert_eq!(
+            stranger.advertises_tls(&node),
+            addr.starts_with("wss://"),
+            "{addr}: and the answer is the id's own transport",
+        );
+    }
+}
+
+#[test]
 fn a_claim_is_recorded_against_the_member_whose_link_carried_it() {
     // The claim is worth exactly the link it arrived on, so it is attributed to that
     // member and to nobody the payload names. Were it recorded against the named node
@@ -1647,4 +1684,75 @@ fn a_second_spelling_of_an_honest_member_is_not_a_second_member() {
         );
     }
     assert_eq!(m.members().len(), before, "no ghost joined the roster");
+}
+
+#[test]
+fn a_compromised_member_that_speaks_selectively_splits_the_ring() {
+    // The accepted residual, pinned so it is a decision and not a surprise (KANBAN
+    // C39). A claim is first-hand and never relayed — with no signature on the wire,
+    // "A and B verified X" is free for any node to write — so a claim reaches exactly
+    // the nodes its maker chooses to send it to, and no honest node can carry it
+    // further or contradict it. A compromised member is therefore a swing vote for any
+    // candidate that exactly one other trust unit has reached: it sets the flag toward
+    // some peers and clears it toward others, and the two groups place rooms
+    // differently. Where the candidate stays unreachable to the rest, no later gossip
+    // repairs it, because there is no path by which the claim could arrive.
+    let candidate = NodeId::from("wss://joiner.example:9000");
+    // Both are configured members, so both are adopted and their word counts.
+    let honest = "10.0.0.1:9000";
+    let attacker = "10.0.0.2:9000";
+
+    let mut told = membership_for(SELF_ADDR);
+    let mut untold = membership_for(SELF_ADDR);
+    for m in [&mut told, &mut untold] {
+        m.add_member(candidate.clone());
+        // The one honest unit that reached the candidate says so to both.
+        vouch(m, honest, &candidate);
+    }
+    assert!(!told.is_adopted(&candidate), "one unit is not the bar");
+    assert!(!untold.is_adopted(&candidate));
+
+    // The compromised member sets the flag toward one node and clears it toward the
+    // other. Both frames are well-formed and each is attributed to the member whose
+    // link carried it, which is exactly what the rules require.
+    vouch(&mut told, attacker, &candidate);
+    untold.merge_liveness(
+        &NodeId::from(attacker),
+        [(
+            candidate.clone(),
+            candidate.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            false,
+        )],
+    );
+
+    assert!(
+        told.is_adopted(&candidate),
+        "two units, on the node it told"
+    );
+    assert!(
+        !untold.is_adopted(&candidate),
+        "and one unit on the node it did not",
+    );
+
+    // The rings differ, and they differ about rooms: the two nodes disagree on who
+    // holds and who leads.
+    let differing = (0..256u32)
+        .map(|i| format!("room-{i}"))
+        .filter(|room| told.replicas_for(room.as_bytes()) != untold.replicas_for(room.as_bytes()))
+        .count();
+    assert!(differing > 0, "a ring split is what the disagreement costs",);
+
+    // And it does not heal: every honest exchange between the two carries only what
+    // each verified itself, so neither can learn what the attacker told the other.
+    for _ in 0..8 {
+        crdtsync_server::gossip::exchange(&mut told, &mut untold);
+        crdtsync_server::gossip::exchange(&mut untold, &mut told);
+    }
+    assert!(told.is_adopted(&candidate));
+    assert!(
+        !untold.is_adopted(&candidate),
+        "no anti-entropy carries a claim its maker withheld",
+    );
 }
