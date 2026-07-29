@@ -238,6 +238,12 @@ fn a_zone_projection_serves_no_record_of_the_withheld_partitions_groups() {
     // the cut leaves it applicable at the recipient — only the record decides.
     let mut forged = stray[0].clone();
     forged.tx = group[0].tx;
+    // The group's other member, on its own key, so the reading proves both landed.
+    let mut partner = author.transact(|tx| {
+        tx.map(b"loose").register(b"lk2", Scalar::Int(8));
+    })[0]
+        .clone();
+    partner.tx = group[0].tx;
 
     let mut whole = room(&setup, &group);
     assert!(
@@ -259,14 +265,16 @@ fn a_zone_projection_serves_no_record_of_the_withheld_partitions_groups() {
     );
     // Held as a *bucket* rather than refused: a second member under that id commits
     // the pair, which is what tells the two apart.
-    let mut second = stray[0].clone();
-    second.id.seq += 1000;
-    second.tx = group[0].tx;
     assert!(
-        restored.apply(&second),
+        restored.apply(&partner),
         "the bucket completed on its second member"
     );
     assert_eq!(zoned_int(&restored, b"loose", b"lk"), Some(9));
+    assert_eq!(
+        zoned_int(&restored, b"loose", b"lk2"),
+        Some(8),
+        "only one of the pair landed"
+    );
 }
 
 #[test]

@@ -2921,9 +2921,11 @@ impl Document {
                 self.apply_now(&op);
                 progressed = true;
             }
-            // One complete atomic transaction: apply every member in seq order,
-            // so a member that targets a container an earlier member creates
-            // lands after it.
+            // One complete atomic transaction: apply every member in seq order, so a
+            // member that targets a container an earlier member creates reaches it on
+            // the first pass. Order is a shortcut, not the mechanism — a member that
+            // is not ready is re-buffered untagged and lands on the drain's fixpoint
+            // either way.
             if let Some(mut members) = self.take_complete_tx() {
                 // The bucket's key is spent by this commit — its members are leaving
                 // the buffer and the count they met cannot be met a second time — so

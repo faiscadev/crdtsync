@@ -1208,6 +1208,43 @@ fn one_member_under_two_envelopes_folds_one_state_in_every_order() {
 }
 
 #[test]
+fn an_inadmissible_envelope_decides_nothing_about_the_held_groups() {
+    // Admissibility is judged before the dedup, so an envelope no replica may hold
+    // never reaches the conflict rule. Otherwise a forged tag on a *held* member's id
+    // would spend both keys and release the honest group waiting under one of them —
+    // an op every replica refuses deciding what this one shows.
+    let (a, ops) = triple();
+    let mut b = doc(9);
+    assert!(!b.apply(&ops[0]));
+    assert!(!b.apply(&ops[1]));
+    let settled = b.encode_state();
+
+    // A size no group can have, on an id the buffer is holding under a live group.
+    for count in [0, crdtsync_core::MAX_TX_MEMBERS + 1, u32::MAX] {
+        let forged = retagged(&ops[0], crdtsync_core::TxId(0xbeef), count);
+        assert!(!b.apply(&forged), "a size of {count} is refused");
+        assert_eq!(
+            b.encode_state(),
+            settled,
+            "a size of {count} moved the replica's state"
+        );
+    }
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(
+            reg(&b, key),
+            None,
+            "the group was released by a refused envelope"
+        );
+    }
+
+    // And the group still commits on its own last member.
+    assert!(b.apply(&ops[2]));
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), reg(&a, key));
+    }
+}
+
+#[test]
 fn a_resent_member_of_a_waiting_group_leaves_it_atomic() {
     // The resolved key is read off a *disagreeing* envelope. A plain resend of a
     // member already held carries the envelope the bucket holds, so it decides
@@ -1381,10 +1418,16 @@ fn many_resolved_keys_encode_in_one_order() {
     // about what a replica folded. Replicas that resolved the same groups in
     // different orders have to encode identical bytes, or the record is itself the
     // divergence it exists to prevent.
+    // Two authors, so the key's client component is exercised and not just its id —
+    // `TxId::derive` hashes member sequences alone, so two clients collide on a group
+    // id readily, and a sort that ignored the client would leave those pairs in set
+    // order.
     let mut a = doc(1);
+    let mut second = doc(2);
     let groups: Vec<Vec<Op>> = (0..12)
         .map(|i| {
-            a.atomic_transact(|tx| {
+            let author = if i % 2 == 0 { &mut a } else { &mut second };
+            author.atomic_transact(|tx| {
                 tx.register(format!("k{i}a").as_bytes(), Scalar::Int(i));
                 tx.register(format!("k{i}b").as_bytes(), Scalar::Int(i));
             })
@@ -1487,6 +1530,15 @@ fn a_projection_serves_no_record_of_the_groups_it_withholds() {
         tx.register(b"loose", Scalar::Int(7));
     });
     let forged = retagged(&stray[0], tx_id(&group[0]), 2);
+    // The group's other member, writing its own key so the reading below proves both
+    // members landed rather than just one.
+    let partner = retagged(
+        &a.transact(|tx| {
+            tx.register(b"looser", Scalar::Int(8));
+        })[0],
+        tx_id(&group[0]),
+        2,
+    );
 
     let mut room = doc(9);
     for op in &group {
@@ -1507,6 +1559,19 @@ fn a_projection_serves_no_record_of_the_groups_it_withholds() {
         !reader.apply(&forged),
         "the projection served its record of the withheld groups"
     );
+    assert_eq!(
+        reg(&reader, b"loose"),
+        None,
+        "the stray is held, not applied"
+    );
+    // Held as a *bucket* rather than refused: a second member under that id completes
+    // the pair, which is what tells the two apart.
+    assert!(
+        reader.apply(&partner),
+        "the bucket completed on its second member"
+    );
+    assert_eq!(reg(&reader, b"loose"), Some(Scalar::Int(7)));
+    assert_eq!(reg(&reader, b"looser"), Some(Scalar::Int(8)));
 }
 
 #[test]
