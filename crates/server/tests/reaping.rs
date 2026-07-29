@@ -284,7 +284,9 @@ fn a_returned_member_with_a_higher_incarnation_is_resurrected() {
         !m.is_adopted(&d),
         "a returned member is pending until verified"
     );
-    for voucher in [A, B] {
+    // Two members other than this node: a claim carried on a link bound to this node's
+    // own id is not this node vouching, so `A` (self here) is not one of them.
+    for voucher in [B, C] {
         m.merge_liveness(
             &nid(voucher),
             [(

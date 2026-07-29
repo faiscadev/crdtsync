@@ -152,6 +152,16 @@ pub enum MembershipConfigError {
     /// Peers were configured but the node has no advertise address or node id, so
     /// it cannot place itself in its own cluster.
     MissingSelfId,
+    /// A configured address is not one a peer could dial — it carries more than a
+    /// host and a port, names no host, or names a port that is no port. Refused
+    /// rather than joined under, because an id nobody can reach is a member the
+    /// cluster can never verify and this node can never be recognised as.
+    NotAnAddress(String),
+    /// A peer list was configured but named nobody except this node. Such a node has
+    /// a peer plane and a cluster secret and yet no cluster to be outvoted by, so its
+    /// adoption bar would fall to a single vouch — it would place a member on rooms
+    /// on its own word while every peer it met still held the cluster's bar.
+    NoPeerButSelf,
 }
 
 impl std::fmt::Display for MembershipConfigError {
@@ -163,6 +173,16 @@ impl std::fmt::Display for MembershipConfigError {
             MembershipConfigError::MissingSelfId => write!(
                 f,
                 "cluster peers configured but no node id or advertise address for self"
+            ),
+            MembershipConfigError::NotAnAddress(addr) => write!(
+                f,
+                "`{addr}` is not an address a peer can dial — use `host:port`, with no \
+                 user, path, query or fragment, and bracket an IPv6 literal"
+            ),
+            MembershipConfigError::NoPeerButSelf => write!(
+                f,
+                "the cluster peer list names nobody but this node: list this node's \
+                 seed peers, or unset it for single-node mode"
             ),
         }
     }
@@ -258,6 +278,14 @@ impl Membership {
         peers: impl IntoIterator<Item = NodeId>,
         replication_factor: usize,
     ) -> Self {
+        let peers: Vec<NodeId> = peers.into_iter().collect();
+        // Whether the configuration named a peer *other than this node* — not how many
+        // distinct members it collapsed to. A peer list whose every entry canonicalizes
+        // to this node's own id de-duplicates down to one member, and a bar read off
+        // that count would fall to the single-node rule on a node that has a peer plane
+        // and a cluster secret. That is the shape the startup refusal exists to catch,
+        // reached without the variable being empty.
+        let solitary = !peers.iter().any(|peer| peer != &self_id);
         let members: Vec<NodeId> = std::iter::once(self_id.clone()).chain(peers).collect();
         // Every seeded member dials at its node id — the identity each is derived
         // from (`NodeId::from_addr`), so the id and the dial address are the same
@@ -277,7 +305,6 @@ impl Membership {
         // root of trust a cluster starts from, and there is no earlier authority for
         // it to be vouched for by.
         let configured: HashSet<NodeId> = members.iter().cloned().collect();
-        let solitary = configured.len() <= 1;
         Self {
             self_id,
             cluster: Cluster::new(members),
@@ -311,12 +338,26 @@ impl Membership {
         // derives the same id every peer's trimmed `from_addr` does.
         let node_id = node_id.map(str::trim).filter(|s| !s.is_empty());
         let advertise_addr = advertise_addr.map(str::trim).filter(|s| !s.is_empty());
-        let self_id = match (node_id, advertise_addr) {
-            (Some(id), _) => NodeId::from(id),
-            (None, Some(addr)) => NodeId::from_addr(addr),
+        let written = match (node_id, advertise_addr) {
+            (Some(id), _) => id,
+            (None, Some(addr)) => addr,
             (None, None) => return Err(MembershipConfigError::MissingSelfId),
         };
+        // The explicit id goes through the same canonicalization every other door
+        // applies. Left verbatim it would name a member the cluster spells differently:
+        // this node's peers would learn its canonical id, this node would not recognise
+        // that id as itself, and it would carry a *doppelgänger* of itself in its own
+        // roster — adopted on two honest vouchers, placed on rooms it never answers
+        // for, unable to refute a suspicion of itself, and dropping every follower-head
+        // report because the link is bound to the other spelling.
+        let self_id = NodeId::from_addr(written);
+        if crate::dial::canonical_member_addr(written).is_none() {
+            return Err(MembershipConfigError::NotAnAddress(written.to_string()));
+        }
         let peers = parse_peers(peers)?;
+        if !peers.is_empty() && !peers.iter().any(|peer| peer != &self_id) {
+            return Err(MembershipConfigError::NoPeerButSelf);
+        }
         Ok(Self::new(self_id, peers, replication_factor))
     }
 
@@ -838,7 +879,9 @@ impl Membership {
             let Some(node) = NodeId::canonical(node.as_bytes()) else {
                 continue;
             };
-            if verified && &node != sender && !self.is_self(&node) {
+            // A claim is the *sender's*, so a frame that arrives on a link bound to this
+            // node's own id cannot make this node vouch for a member it never dialed.
+            if verified && &node != sender && !self.is_self(&node) && !self.is_self(sender) {
                 claimed.push(node.clone());
             }
             if self.is_self(&node) {
@@ -949,9 +992,14 @@ fn parse_peers(list: &str) -> Result<Vec<NodeId>, MembershipConfigError> {
         .map(|entry| {
             let entry = entry.trim();
             if entry.is_empty() {
-                Err(MembershipConfigError::EmptyPeer)
-            } else {
-                Ok(NodeId::from_addr(entry))
+                return Err(MembershipConfigError::EmptyPeer);
+            }
+            // A peer with no canonical form is one no member of this cluster could
+            // dial or agree with, so it is refused where it is written rather than
+            // seeded verbatim into a ring nobody else computes the same way.
+            match crate::dial::canonical_member_addr(entry) {
+                Some(_) => Ok(NodeId::from_addr(entry)),
+                None => Err(MembershipConfigError::NotAnAddress(entry.to_string())),
             }
         })
         .collect()

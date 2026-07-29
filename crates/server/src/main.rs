@@ -215,10 +215,14 @@ fn membership() -> std::io::Result<Option<Membership>> {
     let m =
         Membership::from_static_config(node_id.as_deref(), advertise.as_deref(), &peers, factor)
             .map_err(|e| {
+                // Every membership config error is the same class of operator mistake
+                // and every one of them refuses the start. The match stays exhaustive
+                // with no catch-all, so a new one has to be classified here.
                 let kind = match e {
-                    MembershipConfigError::EmptyPeer | MembershipConfigError::MissingSelfId => {
-                        std::io::ErrorKind::InvalidInput
-                    }
+                    MembershipConfigError::EmptyPeer
+                    | MembershipConfigError::MissingSelfId
+                    | MembershipConfigError::NotAnAddress(_)
+                    | MembershipConfigError::NoPeerButSelf => std::io::ErrorKind::InvalidInput,
                 };
                 std::io::Error::new(kind, e)
             })?;

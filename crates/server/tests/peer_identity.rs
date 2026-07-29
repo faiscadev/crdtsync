@@ -956,6 +956,14 @@ mod live {
         Membership::from_static_config(Some(me), None, other, 2).unwrap()
     }
 
+    /// The same two-member view, built **without** the config validation. C25 refuses an
+    /// address with no canonical form where it is written, so the startup refusals below
+    /// — which are about a member that reaches the *serve* path naming no host — need a
+    /// membership that did not go through that door to still have something to refuse.
+    fn unvalidated_two_node_membership(me: &str, other: &str) -> Membership {
+        Membership::new(NodeId::from(me), [NodeId::from(other)], 2)
+    }
+
     /// A node that terminates mTLS, dials its peers with an identity of its own, and
     /// refuses any peer link carrying none — the whole declared posture.
     ///
@@ -1413,12 +1421,23 @@ mod live {
         // No peer can dial it and no certificate could ever be bound to it, so it is
         // the address that is wrong — refused however the deployment is configured,
         // with the message for the problem it actually is rather than as a certificate
-        // naming the wrong host.
+        // naming the wrong host. The refusal is now at the membership config itself
+        // (C25): an id with no canonical form names a member the cluster could never
+        // verify and this node could never be recognised as, so it never reaches a
+        // listener at all.
+        let e = Membership::from_static_config(Some("::1:9000"), None, "10.0.0.2:9000", 2)
+            .expect_err("an unbracketed IPv6 literal names no host");
+        assert!(
+            e.to_string().contains("is not an address a peer can dial"),
+            "{e}"
+        );
+        // And a member *learned* at such an address is still refused where it is read,
+        // which is what keeps it a permanent dial failure rather than a forever-retry.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let e = startup_error(
             listener,
             ServeConfig {
-                membership: Some(two_node_membership("::1:9000", "10.0.0.2:9000")),
+                membership: Some(unvalidated_two_node_membership("10.0.0.1:9000", "::1:9000")),
                 cluster_secret: Some(SECRET.to_vec()),
                 ..ServeConfig::default()
             },
@@ -1441,7 +1460,10 @@ mod live {
         let e = startup_error(
             listener,
             ServeConfig {
-                membership: Some(two_node_membership("wss://10.0.0.1:9000", "wss://::1:9000")),
+                membership: Some(unvalidated_two_node_membership(
+                    "wss://10.0.0.1:9000",
+                    "wss://::1:9000",
+                )),
                 cluster_secret: Some(SECRET.to_vec()),
                 require_peer_identity: true,
                 client_cert_verification: true,

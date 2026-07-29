@@ -1137,26 +1137,24 @@ fn two_spellings_of_one_host_are_one_voucher() {
 }
 
 #[test]
-fn a_machine_holding_two_spellings_still_vouches_once() {
-    // The consequence, end to end: a member that grinds a second id under an alias of
-    // its own host holds two node ids and one trust unit, so it cannot carry a joiner
-    // into the ring on its own word.
-    let mut m = Membership::from_static_config(
+fn a_machine_holding_two_spellings_holds_one_member() {
+    // Canonicalization is what makes the trust unit hard to game: two spellings of one
+    // machine are not two vouchers because they are not two *members*. The reduction in
+    // the unit count is the second line of the same defence, for an id that ever
+    // reached the roster unreduced.
+    let m = Membership::from_static_config(
         None,
         Some(SELF_ADDR),
-        "evil.example:9000,evil.example.:9001,10.0.0.1:9000",
+        "evil.example:9000,EVIL.example.:9000,ws://evil.example:09000",
         N,
     )
     .unwrap();
-    let joiner = NodeId::from("10.9.9.9:9000");
-    m.add_member(joiner.clone());
-
-    vouch(&mut m, "evil.example:9000", &joiner);
-    vouch(&mut m, "evil.example.:9001", &joiner);
-    assert!(!m.is_adopted(&joiner), "one machine, one voucher");
-
-    vouch(&mut m, "10.0.0.1:9000", &joiner);
-    assert!(m.is_adopted(&joiner), "a second machine carries it");
+    let members: Vec<_> = m
+        .members()
+        .into_iter()
+        .filter(|node| node != &NodeId::from(SELF_ADDR))
+        .collect();
+    assert_eq!(members, vec![NodeId::from("evil.example:9000")]);
 }
 
 // --- the ring is a fixpoint, and the bar does not move under it ---
@@ -1294,6 +1292,9 @@ fn one_endpoint_holds_one_node_id() {
         "ws://10.9.9.9:9000",
         "WS://10.9.9.9:9000",
         "  10.9.9.9:9000  ",
+        // A port is a number, not text: one listener, however it is written.
+        "10.9.9.9:09000",
+        "10.9.9.9:009000",
     ];
     for spelling in spellings {
         assert_eq!(NodeId::from_addr(spelling), canonical, "{spelling}");
@@ -1359,4 +1360,100 @@ fn an_adopted_member_is_un_adopted_when_a_voucher_is_reaped() {
     // one-way door.
     vouch(&mut m, "10.0.0.3:9000", &joiner);
     assert!(m.is_adopted(&joiner));
+}
+
+// --- the id a node is configured with is the id the cluster spells ---
+
+#[test]
+fn a_peer_list_naming_nobody_but_this_node_is_refused() {
+    // Such a node has a peer plane, a cluster secret and gossip, and yet no cluster to
+    // be outvoted by — its bar would fall to a single vouch and it would place a member
+    // on rooms on its own word while every peer it met still held the cluster's bar.
+    // The refusal reads the list, not the member count it collapses to: every spelling
+    // below canonicalizes to this node's own id and de-duplicates away.
+    for peers in [
+        SELF_ADDR,
+        "WS://10.0.0.6:9000",
+        "  10.0.0.6:09000  ",
+        "10.0.0.6:9000,ws://10.0.0.6:9000",
+    ] {
+        let e = Membership::from_static_config(None, Some(SELF_ADDR), peers, N)
+            .expect_err("a peer list of only self is refused");
+        assert!(
+            e.to_string().contains("names nobody but this node"),
+            "{peers}"
+        );
+    }
+    // A list that names one real peer is a cluster, and is accepted.
+    assert!(Membership::from_static_config(None, Some(SELF_ADDR), "10.0.0.1:9000", N).is_ok());
+}
+
+#[test]
+fn an_explicit_node_id_is_the_id_the_cluster_spells() {
+    // The explicit-id door canonicalizes like every other. Left verbatim, a node would
+    // carry a *doppelgänger* of itself: its peers learn its canonical id, it does not
+    // recognise that id as itself, two honest members vouch for it truthfully, and it
+    // is adopted — rooms placed on a member that never answers, a suspicion of itself
+    // it can never refute, and every follower-head report dropped because the link is
+    // bound to the other spelling.
+    let written = "WSS://Node-A.Example.:09000";
+    let m = Membership::from_static_config(Some(written), None, "wss://node-b.example:9000", N)
+        .unwrap();
+    assert_eq!(m.self_id(), &NodeId::from("wss://node-a.example:9000"));
+    assert_eq!(m.self_id(), &NodeId::from_addr(written));
+
+    // So the canonical id arriving by gossip is recognised as itself and never learned
+    // as a second member.
+    let mut m = m;
+    let before = m.members().len();
+    m.add_member(NodeId::from_addr(written));
+    m.add_member(NodeId::from("wss://node-a.example:9000"));
+    assert_eq!(m.members().len(), before, "no doppelgänger");
+}
+
+#[test]
+fn a_configured_address_no_peer_could_dial_is_refused() {
+    // An id with no canonical form names a member the cluster could never verify and
+    // this node could never be recognised as, so it is refused where it is written
+    // rather than joined under.
+    for id in [
+        "::1:9000",
+        "wss://a.example:1@b.example:9000",
+        "10.0.0.1:9000/sync",
+        "10.0.0.1:99999",
+        "10.0.0.1:nine",
+        "10.0.0.1:+9000",
+        "10.0.0.1 :9000",
+    ] {
+        assert!(
+            Membership::from_static_config(Some(id), None, "10.0.0.1:9000", N).is_err(),
+            "{id}",
+        );
+    }
+}
+
+#[test]
+fn a_link_bound_to_this_nodes_own_id_makes_it_vouch_for_nobody() {
+    // A claim is the sender's. A frame arriving on a link that names *this* node would
+    // otherwise insert this node into a member's verifier set — a whole trust unit,
+    // for a member this node never dialed.
+    let mut m = membership_for(SELF_ADDR);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone());
+    let me = NodeId::from(SELF_ADDR);
+    m.merge_liveness(
+        &me,
+        [(
+            joiner.clone(),
+            joiner.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )],
+    );
+    assert!(
+        !m.has_verified(&me, &joiner),
+        "this node vouched for nobody"
+    );
+    assert!(!m.is_adopted(&joiner));
 }

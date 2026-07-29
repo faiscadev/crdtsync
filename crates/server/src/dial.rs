@@ -99,7 +99,16 @@ impl PeerEndpoint {
         // A path is refused for the second half of the same reason — it is a free
         // alias, so one endpoint would answer under unboundedly many node ids, each
         // separately placed and none of which ever speaks.
-        if authority.contains(['@', '?', '#', '/']) {
+        // Only the characters a host and a port are written with. `@`, `/`, `?` and
+        // `#` are the ones that change where a dial lands or hand one endpoint a
+        // second id; the rest of the refusal is what keeps an unreachable address from
+        // being *retried forever* — a control character or a space builds a URL the
+        // dialer rejects at send time, which reads as "unreachable" and is redialed on
+        // the fast cadence rather than classified a permanent address error.
+        if !authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':' | b'[' | b']'))
+        {
             return Err(BadPeerAddress::NotAnAuthority);
         }
         // An authority that names no host — an IPv6 literal left unbracketed, or one
@@ -159,9 +168,19 @@ pub fn canonical_member_addr(addr: &str) -> Option<String> {
     let authority = endpoint.url.split_once("://")?.1.trim_end_matches('/');
     let host = host_of(authority)?;
     // Whatever follows the host — its port separator and port, or nothing.
-    let port = match authority.strip_prefix('[') {
+    let after_host = match authority.strip_prefix('[') {
         Some(after) => after.split_once(']').map(|(_, rest)| rest)?,
         None => authority.find(':').map_or("", |at| &authority[at..]),
+    };
+    // The port is a *number*, so it is canonicalized as one: `:9000`, `:09000` and
+    // `:+9000` are one port on one listener, and leaving them as text would give one
+    // endpoint unboundedly many node ids — separately placed, and only one of them
+    // ever answering. An absent port and an empty one are the same absence. A port
+    // that is no port has no canonical form and the address is refused.
+    let port = match after_host.strip_prefix(':') {
+        None => None,
+        Some("") => None,
+        Some(digits) => Some(digits.parse::<u16>().ok()?),
     };
     let host = normalized(host);
     let host = match host.parse::<std::net::IpAddr>() {
@@ -173,7 +192,10 @@ pub fn canonical_member_addr(addr: &str) -> Option<String> {
         PeerTransport::Tls => "wss://",
         PeerTransport::Plain => "",
     };
-    Some(format!("{scheme}{host}{port}"))
+    Some(match port {
+        Some(port) => format!("{scheme}{host}:{port}"),
+        None => format!("{scheme}{host}"),
+    })
 }
 
 /// The **trust unit** an advertise address belongs to: its host reduced to the one
