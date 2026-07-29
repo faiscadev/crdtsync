@@ -14,7 +14,7 @@ use crdtsync_core::diff::{decode_changes, Change};
 use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::{Channel, DiffKind};
 use crdtsync_core::{ClientId, Document, ErrorCode, Message, Scalar};
-use crdtsync_server::{Action, ConnId, DiffError, Identity, Registry, Resource};
+use crdtsync_server::{Action, ConnId, Identity, Registry, Resource};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -86,8 +86,8 @@ fn result_changes(m: &Message) -> Vec<Change> {
 /// The identity redaction, for the hub-side oracle: this suite's rooms declare no
 /// zones and hold no doc-ACL state, so the served diff and the unnarrowed one agree
 /// (`diff_projection` is where they are made to differ).
-fn unnarrowed(state: Vec<u8>) -> Result<Vec<u8>, DiffError> {
-    Ok(state)
+fn unnarrowed(state: Vec<u8>) -> Vec<u8> {
+    state
 }
 
 fn query(r: &mut Registry, id: ConnId, kind: DiffKind, a: &[u8], b: &[u8]) -> Vec<Message> {

@@ -588,10 +588,12 @@ fn a_client_diff_query_round_trips() {
 
     let mut c = wasm_client(1);
     let room = b"room-1";
-    // Both kinds frame a request; a bad kind is an error.
-    assert!(!c.diff_query(room, 0, b"a", b"b").unwrap().is_empty());
-    assert!(!c.diff_query(room, 1, b"main", b"draft").unwrap().is_empty());
-    assert!(c.diff_query(room, 9, b"a", b"b").is_err());
+    // Both kinds frame a request; a bad kind is an error. Channel-keyed: the server
+    // resolves the room, and the scope the change list is narrowed to, from the
+    // subscription — while the reply, and so the view, stays keyed by that room.
+    assert!(!c.diff_query(0, 0, b"a", b"b").unwrap().is_empty());
+    assert!(!c.diff_query(0, 1, b"main", b"draft").unwrap().is_empty());
+    assert!(c.diff_query(0, 9, b"a", b"b").is_err());
     // No result until one is answered.
     assert!(c.diff(room).is_null());
 

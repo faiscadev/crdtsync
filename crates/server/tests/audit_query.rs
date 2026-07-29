@@ -404,14 +404,31 @@ fn a_diff_query_is_audited_as_a_version_read() {
         }
     ));
 
+    // Both kinds record it: a branch diff needs no version at all, which is the
+    // cheaper way to the same captured content and so the one that must not be the
+    // untraced way.
+    assert!(r.deliver(
+        id,
+        Message::DiffQuery {
+            channel: CH,
+            kind: DiffKind::Branches,
+            a: b"main".to_vec(),
+            b: b"main".to_vec(),
+        }
+    ));
+
     let records = log.read_all().unwrap();
-    assert!(
-        records.iter().any(|rec| {
+    let reads = records
+        .iter()
+        .filter(|rec| {
             rec.action == Action::VersionRead
                 && rec.actor == b"actor-1"
                 && rec.resource.room() == Some(ROOM)
-        }),
-        "a diff query records a VersionRead: {records:?}"
+        })
+        .count();
+    assert_eq!(
+        reads, 2,
+        "each diff query records a VersionRead: {records:?}"
     );
 }
 

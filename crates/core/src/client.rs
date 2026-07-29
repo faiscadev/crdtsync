@@ -121,7 +121,11 @@ pub struct ClientSession {
     /// [`Message::DiffResult`] reply carried, decoded. Room-keyed like the branch
     /// view even though the query is channel-keyed: a change list is a fact about a
     /// room. A fresh query replaces the room's entry, so two channels diffing one
-    /// room share it. Empty until a diff query is answered.
+    /// room share it — and since the reply carries no channel, a result **cannot be
+    /// attributed to the query that asked for it**. Two channels on one room with
+    /// different zone scopes are now served genuinely different change lists, so this
+    /// view can hand one channel's answer to the other's reader (C35). Empty until a
+    /// diff query is answered.
     diffs: HashMap<Vec<u8>, Vec<Change>>,
     /// The outcome of each clone-room request, keyed by the destination room — the
     /// `created` flag a [`Message::CloneRoomResult`] reply carried. Keyed by `dst`
@@ -613,7 +617,9 @@ impl ClientSession {
     }
 
     /// The change list from the last diff query answered for `room`, or `None` if
-    /// none has been. An empty diff is an empty slice, not `None`.
+    /// none has been. An empty diff is an empty slice, not `None`. Keyed by room, so
+    /// two channels of this session diffing one room overwrite each other's answer
+    /// and neither can tell whose it is reading (C35).
     pub fn diff(&self, room: &[u8]) -> Option<&[Change]> {
         self.diffs.get(room).map(Vec::as_slice)
     }

@@ -10,9 +10,11 @@
 //! redaction would have cut, so a reader any redaction could apply to is refused.
 //! A reader entitled to the room whole is served them, exactly as before.
 //!
-//! The diff seam (C27) reaches the same bytes and answers the same way: a side that
-//! cannot be decoded cannot be narrowed, so the query fails — recoverably, since the
-//! archive being unreadable says nothing about the live stream the channel carries.
+//! The diff seam (C27) reaches the same bytes and answers with the same code, and
+//! like the fetch does not close — the archive being unreadable says nothing about the
+//! live stream the channel carries. It refuses for a different reason, though: the
+//! engine has to decode both sides to compare them, so a diff cannot serve a side it
+//! cannot read whoever asks, where a fetch serves a reader nothing would narrow for.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -304,9 +306,9 @@ fn diff_self(r: &mut Registry, id: ConnId) -> (bool, Vec<Message>) {
 #[test]
 fn a_diff_over_an_undecodable_version_fails_without_closing() {
     // The diff engine decodes both sides, so an unreadable one has always failed the
-    // query. What it must not do is take the connection with it: one archived state
-    // stopped decoding, the live stream on this channel did not — the same reading
-    // the fetch takes of these very bytes.
+    // query — this seam adds no guard of its own. What it must not do is take the
+    // connection with it: one archived state stopped decoding, the live stream on this
+    // channel did not — the same reading the fetch takes of these very bytes.
     let dir = tempdir();
     let mut r = damaged_room(dir.path(), ZONE_APP, ZONED, false);
     let reader = joined(&mut r, 2, "c-reader", ZONE_APP, b"za");

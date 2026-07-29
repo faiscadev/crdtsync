@@ -38,8 +38,8 @@ fn p(keys: &[&[u8]]) -> Vec<u8> {
 
 /// The identity redaction — no reader to narrow for, so each side reaches the diff
 /// engine as the hub stored it.
-fn unnarrowed(state: Vec<u8>) -> Result<Vec<u8>, DiffError> {
-    Ok(state)
+fn unnarrowed(state: Vec<u8>) -> Vec<u8> {
+    state
 }
 
 #[test]

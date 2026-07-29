@@ -11,8 +11,10 @@
 //! The fix is C15's composition run per side, before the engine: each state goes
 //! through `project_served_state` — the read projection then the zone projection —
 //! and the change list is the diff of the two states this reader would itself have
-//! been served. A partition it may not read therefore contributes no change at all,
-//! rather than a redacted one. The scope that makes it possible is the channel: the
+//! been served. (The states are not byte-identical to a fetch's: the two seams scrub
+//! the causal frontier differently. The change list is, because it carries no
+//! frontier.) A partition the reader may not read therefore contributes no change at
+//! all, rather than a redacted one. The scope that makes it possible is the channel: the
 //! query is channel-keyed like a version fetch, so the subscription's zone set is
 //! what a diff narrows by.
 //!
@@ -347,7 +349,9 @@ fn a_zone_limited_readers_version_diff_still_reports_the_zone_it_may_read() {
 fn a_zone_limited_readers_diff_is_the_diff_of_the_versions_it_is_served() {
     // The invariant the fix expresses: a change list is the diff of the two states
     // this reader would itself have been handed, so the diff seam and the fetch seam
-    // cannot disagree about what it may see.
+    // cannot disagree about what it may see. It holds over the change list rather
+    // than over the bytes — the two seams scrub the frontier differently — which is
+    // exactly the reach a diff has.
     let (mut r, mut author_doc, author, reader) = zoned_room();
     create_version(&mut r, author, VA);
     write_into(&mut r, author, &mut author_doc, b"board", b"bseed", 7);
@@ -684,8 +688,8 @@ fn a_whole_document_readers_diff_reports_the_denied_subtree() {
 #[test]
 fn a_room_no_redaction_applies_to_diffs_exactly_as_before() {
     // A room with no doc-ACL state, queried by a channel that is not zone-limited,
-    // is diffed from the stored bytes without paying a decode per side — the
-    // narrowing is targeted, and its absence is the common case.
+    // is diffed from the stored bytes: the narrowing is targeted, and its absence is
+    // the common case.
     let mut r = Registry::new(cid(0xFF));
     r.set_clock(Arc::new(ManualClock::new(0)));
     let id = r.connect();

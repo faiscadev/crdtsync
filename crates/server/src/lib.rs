@@ -2111,7 +2111,7 @@ impl Hub {
         room: &[u8],
         a: &[u8],
         b: &[u8],
-        narrow: impl Fn(Vec<u8>) -> Result<Vec<u8>, DiffError>,
+        narrow: impl Fn(Vec<u8>) -> Vec<u8>,
     ) -> Result<Vec<Change>, DiffError> {
         let old = self
             .version_state(room, a)
@@ -2121,7 +2121,7 @@ impl Hub {
             .version_state(room, b)
             .ok_or_else(|| DiffError::UnknownVersion(b.to_vec()))?
             .to_vec();
-        diff_states(&narrow(old)?, &narrow(new)?)
+        diff_states(&narrow(old), &narrow(new))
     }
 
     /// The structural diff turning branch `a`'s current state into branch `b`'s —
@@ -2136,7 +2136,7 @@ impl Hub {
         room: &[u8],
         a: &[u8],
         b: &[u8],
-        narrow: impl Fn(Vec<u8>) -> Result<Vec<u8>, DiffError>,
+        narrow: impl Fn(Vec<u8>) -> Vec<u8>,
     ) -> Result<Vec<Change>, DiffError> {
         let old = self
             .materialize_branch(room, a)
@@ -2144,7 +2144,7 @@ impl Hub {
         let new = self
             .materialize_branch(room, b)
             .ok_or_else(|| DiffError::UnknownBranch(b.to_vec()))?;
-        diff_states(&narrow(old)?, &narrow(new)?)
+        diff_states(&narrow(old), &narrow(new))
     }
 
     /// The names of a room's versions, sorted, for listing and pagination.

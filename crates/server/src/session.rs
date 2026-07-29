@@ -1217,20 +1217,20 @@ pub fn step(
             // other's index, nor the live room's (C32). Only the read projection's
             // whole-document gate reads the index, so a room holding no doc-ACL state
             // pays no decode to build one.
-            let narrow = |state: Vec<u8>| -> Result<Vec<u8>, DiffError> {
+            let narrow = |state: Vec<u8>| -> Vec<u8> {
                 let index = if records.is_empty() {
                     HashMap::new()
                 } else {
-                    match Document::decode_state(&state) {
-                        Ok(doc) => crate::index::element_paths(&doc),
-                        // Unprojectable bytes still carry what a redaction would cut, so
-                        // the query fails rather than diffing one side unnarrowed. The
-                        // engine's own decode below would refuse the same bytes with the
-                        // same error; refusing here just does it where it is known.
-                        Err(_) => return Err(DiffError::Decode),
-                    }
+                    // An empty index where the state does not decode, and no guard for
+                    // that case — unlike the version fetch. The projections would hand
+                    // such bytes on unnarrowed, but the engine below decodes them again
+                    // and refuses the whole query: a diff has no way to serve a side it
+                    // cannot read, where a fetch would have served it.
+                    Document::decode_state(&state)
+                        .map(|doc| crate::index::element_paths(&doc))
+                        .unwrap_or_default()
                 };
-                Ok(project_served_state(
+                project_served_state(
                     state,
                     authorizer,
                     &records,
@@ -1245,7 +1245,7 @@ pub fn step(
                     // diff is never adopted as state, and the change list carries no
                     // frontier at all, so the scrub goes whole.
                     None,
-                ))
+                )
             };
             let diff = match kind {
                 DiffKind::Versions => hub.diff_versions(&room, &a, &b, narrow),
@@ -1255,9 +1255,11 @@ pub fn step(
                 Ok(changes) => {
                     // A change list is captured room content leaving the server — the
                     // same auditable history read a version fetch records, in another
-                    // shape — so it goes through the same audit seam, and like the
-                    // fetch only once the content is actually going out. The read was
-                    // authorized by `channel_room` above, so the verdict is granted.
+                    // shape — so it goes through the same audit seam, once the content
+                    // is actually going out. (Later than the fetch's, which fires
+                    // before its projections and so can record a read it then narrows
+                    // to nothing; both are on the reply path.) The read was authorized
+                    // by `channel_room` above, so the verdict is granted.
                     authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     Response {
                         replies: vec![Message::DiffResult {
