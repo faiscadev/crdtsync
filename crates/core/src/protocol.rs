@@ -475,8 +475,13 @@ pub enum Message {
     /// so it is served through the same redactions the live stream is, and the
     /// channel is what carries the reader's zone scope. The reply is a
     /// [`DiffResult`](Message::DiffResult) carrying the encoded change list, or an
-    /// [`Error`](Message::Error) with [`ErrorCode::NotFound`] when a named version
-    /// or branch is absent.
+    /// [`Error`](Message::Error): [`NotFound`](ErrorCode::NotFound) for a version or
+    /// branch the room cannot produce, [`Forbidden`](ErrorCode::Forbidden) for a
+    /// denied reader, [`Internal`](ErrorCode::Internal) for a state that does not
+    /// decode — none of which closes the connection. A query on a channel this
+    /// connection never bound is a [`ProtocolViolation`](ErrorCode::ProtocolViolation)
+    /// and does close: the channel is what names the room and carries the scope, so
+    /// there is nothing to answer.
     DiffQuery {
         channel: Channel,
         kind: DiffKind,

@@ -1181,12 +1181,15 @@ pub fn step(
         // request uses (the doc-ACL tier abstains, deployment and schema decide), then
         // each side is put through `project_served_state` *before* the diff engine
         // sees it — so a change list is the diff of the two states this reader would
-        // itself have been served, and a partition it may not read contributes no
-        // change at all rather than a redacted one. Served locally from the replicated
-        // state, so no leader redirect. An absent version/branch answers `NotFound`, a
-        // side that fails to decode `Internal`; neither closes, since a diff's two
-        // sides come off durable storage and one being unreadable says nothing about
-        // the live stream this channel carries.
+        // itself have been served (the causal frontier aside, which the two seams
+        // scrub differently and a change list does not carry), and a partition it may
+        // not read contributes no change at all rather than a redacted one. Served locally from the replicated
+        // state, so no leader redirect. A version or branch that does not materialize
+        // answers `NotFound`, a materialized side that fails to decode `Internal`;
+        // neither closes. A side is archived or reconstructed state — a version's
+        // captured bytes, a branch's folded stream, the live replica for `main` — and
+        // one of them failing to decode is a server-side fault this channel's live
+        // stream survives, which is the reading the version fetch already takes.
         Message::DiffQuery {
             channel,
             kind,
@@ -2135,13 +2138,14 @@ fn request_denied(session: &Session, what: &str) -> Response {
     }
 }
 
-/// Map a [`DiffError`] to the client failure it surfaces. An absent version or
-/// branch is a recoverable `NotFound` — a well-formed query naming something the
-/// room does not have. A state that fails to decode is an `Internal` fault, since
-/// nothing the client sent caused it. Neither closes: a diff's two sides come off
-/// durable storage, so one of them being unreadable says nothing about the live
-/// stream the channel carries — the same reading the version fetch takes of the
-/// same bytes.
+/// Map a [`DiffError`] to the client failure it surfaces. A version or branch that
+/// does not materialize is a recoverable `NotFound` — usually a name the room does
+/// not have, though a branch whose durable base this node cannot read reaches it too
+/// (C36). A materialized state that fails to decode is an `Internal` fault, since
+/// nothing the client sent caused it. Neither closes: a diff's sides are archived or
+/// reconstructed state, so one of them being unreadable is a server-side fault the
+/// channel's live stream survives — the reading the version fetch takes of the
+/// version bytes, generalized.
 fn diff_error(e: DiffError) -> Response {
     let code = match e {
         DiffError::UnknownVersion(_) | DiffError::UnknownBranch(_) => ErrorCode::NotFound,

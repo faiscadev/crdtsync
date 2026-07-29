@@ -403,6 +403,7 @@ fn a_diff_query_is_audited_as_a_version_read() {
             b: b"v2".to_vec(),
         }
     ));
+    assert!(matches!(r.take_outbox(id)[0], Message::DiffResult { .. }));
 
     // Both kinds record it: a branch diff needs no version at all, which is the
     // cheaper way to the same captured content and so the one that must not be the
@@ -416,6 +417,7 @@ fn a_diff_query_is_audited_as_a_version_read() {
             b: b"main".to_vec(),
         }
     ));
+    assert!(matches!(r.take_outbox(id)[0], Message::DiffResult { .. }));
 
     let records = log.read_all().unwrap();
     let reads = records

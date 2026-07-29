@@ -2128,9 +2128,13 @@ impl Hub {
     /// each branch materialized (shared base plus divergent tail, or its owned
     /// snapshot base), narrowed by `narrow`, then fed to the core engine, so a
     /// branch against its fork source yields only the divergence. Diffing a branch
-    /// against itself is empty. An unknown branch is [`DiffError::UnknownBranch`]; a
-    /// state that does not decode is [`DiffError::Decode`]. `narrow` is the reader's
-    /// redaction, as in [`Hub::diff_versions`].
+    /// against itself is empty. A branch that does not materialize is
+    /// [`DiffError::UnknownBranch`] — which today covers more than an unknown name,
+    /// since [`materialize_branch`](Hub::materialize_branch) also answers `None` for a
+    /// branch whose durable base this node cannot read, and for `main` on a room it
+    /// holds no state for (C36). A *materialized* state that does not decode is
+    /// [`DiffError::Decode`]. `narrow` is the reader's redaction, as in
+    /// [`Hub::diff_versions`].
     pub fn diff_branches(
         &mut self,
         room: &[u8],

@@ -451,6 +451,46 @@ fn a_zone_limited_readers_diff_withholds_a_mark_anchored_in_the_hidden_zone() {
 }
 
 #[test]
+fn a_diff_narrows_on_a_channel_bound_to_a_branch_other_than_main() {
+    // Every other fixture here queries from a channel on `main`, so nothing pinned
+    // that the zone scope a subscription carries is a claim about the room's
+    // partitions rather than about the branch it followed. A branch is a different
+    // tree; the zone ids it is narrowed by are the schema's, so they are the same.
+    let (mut r, mut author_doc, author, _reader) = zoned_room();
+    let fork = r.hub().seq(ROOM);
+    assert!(r.hub_mut().fork_branch(ROOM, DRAFT, b"main", fork).unwrap());
+    write_into(&mut r, author, &mut author_doc, b"notes", b"nseed", 4242);
+    write_into(&mut r, author, &mut author_doc, b"board", b"bseed", 7);
+
+    // A za-scoped reader whose subscription follows `draft`, not `main`.
+    let reader = auth(&mut r, 3, "c-reader", ZONE_APP, 1);
+    assert!(r.deliver(
+        reader,
+        Message::Subscribe {
+            channel: CH,
+            room: ROOM.to_vec(),
+            branch: DRAFT.to_vec(),
+            zone: b"za".to_vec(),
+            last_seen_seq: 0,
+        },
+    ));
+    r.take_outbox(reader);
+
+    assert_eq!(
+        touched(&diff(&mut r, author, DiffKind::Branches, DRAFT, b"main")),
+        vec![Some(b"board".to_vec()), Some(b"notes".to_vec())],
+        "the control: both partitions changed between the branches",
+    );
+    let changes = diff(&mut r, reader, DiffKind::Branches, DRAFT, b"main");
+    assert_eq!(
+        touched(&changes),
+        vec![Some(b"board".to_vec())],
+        "a channel bound to a branch narrowed by the wrong partitions: {changes:?}",
+    );
+    assert!(!reports_value(&changes, 4242));
+}
+
+#[test]
 fn a_whole_zone_readers_diff_reports_every_partition() {
     let (mut r, mut author_doc, author, _reader) = zoned_room();
     create_version(&mut r, author, VA);
@@ -476,6 +516,10 @@ fn a_diff_follows_the_channels_zone_scope_not_the_actors_entitlement() {
     create_version(&mut r, author, VA);
     write_into(&mut r, author, &mut author_doc, b"notes", b"nseed", 4242);
     create_version(&mut r, author, VB);
+
+    // The control, on this very fixture: the author's whole-room channel does report
+    // the change, so an empty answer below is the scope's doing and not the room's.
+    assert!(!diff(&mut r, author, DiffKind::Versions, VA, VB).is_empty());
 
     // `author` reaches both zones, and subscribes a second channel to za alone.
     let narrow = Channel(1);
