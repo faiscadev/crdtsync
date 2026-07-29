@@ -15,7 +15,7 @@
 //! the causal frontier differently. The change list is, because it carries no
 //! frontier.) A partition the reader may not read therefore contributes no change at
 //! all, rather than a redacted one — as far as the projections themselves reach, which
-//! for an annotation whose anchor has left the tree is not yet far enough (C37). The scope that makes it possible is the channel: the
+//! for an element the live walk does not reach is not yet far enough (C37). The scope that makes it possible is the channel: the
 //! query is channel-keyed like a version fetch, so the subscription's zone set is
 //! what a diff narrows by.
 //!

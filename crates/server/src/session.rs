@@ -1184,8 +1184,8 @@ pub fn step(
         // itself have been served (the causal frontier aside, which the two seams
         // scrub differently and a change list does not carry), and a partition it may
         // not read contributes no change at all rather than a redacted one — with the
-        // one exception the projections themselves carry, an annotation whose anchor
-        // has left the tree (C37). Served locally from the replicated
+        // one exception the projections themselves carry, an element the live walk does
+        // not reach, whose diff-visible face is an orphaned annotation (C37). Served locally from the replicated
         // state, so no leader redirect. A version or branch that does not materialize
         // answers `NotFound`, a materialized side that fails to decode `Internal`;
         // neither closes. A side is archived or reconstructed state — a version's
