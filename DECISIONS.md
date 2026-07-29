@@ -29,7 +29,7 @@ The entries below (2026-07-02) are a backfill: design changes made during the v0
 
 **C32 does not reach this seam.** Each side of the diff derives its gate index from its own decoded tree, so the case C15 left open — a gate resolving element grants against a different tree than the bytes being narrowed — cannot arise here by construction.
 
-## 2026-07-29 · C29 replicated room creator (#PR) · the creator is room metadata that rides the replication frames, because a replica holding a room's ACL tuples without its authority root reads every one of them as inert
+## 2026-07-29 · C29 replicated room creator (#374) · the creator is room metadata that rides the replication frames, because a replica holding a room's ACL tuples without its authority root reads every one of them as inert
 
 **Changed:** ARCHITECTURE's Owner bullet now says where the creator binding lives — server-side room metadata, replicated with the room and durable beside it, not CRDT state — and that every replica therefore resolves the same authority root.
 
