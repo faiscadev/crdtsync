@@ -439,6 +439,75 @@ fn a_reader_denied_every_zone_is_served_only_the_root_partition() {
     assert!(served.get(b"notes").is_none(), "zb survived an empty set");
 }
 
+#[test]
+fn a_zone_set_wider_than_the_schema_still_projects() {
+    // The other side of the drift, and the conservative half of the rule. A set that
+    // covers every *currently* declared zone but also names one the schema has since
+    // dropped is not "exactly the declared range", so the projection runs. It purges
+    // no content — a de-zoned subtree belongs to the root partition — but it does
+    // scrub the frontier, and being narrower than `main` was here is the deliberate
+    // choice: whole-zone is a claim about which partitions a set names, and a set
+    // resolved against a schema that no longer exists cannot make it.
+    let mut sr = SchemaRegistry::new();
+    sr.register(DRIFT_APP, 1, DRIFT_V1.as_bytes(), b"").unwrap();
+    sr.register(
+        DRIFT_APP,
+        2,
+        DRIFT_V2.as_bytes(),
+        br#"{ "from": 1, "to": 2, "steps": [ { "kind": "addField", "type": "Sect", "field": "note", "fieldType": "int" } ] }"#,
+    )
+    .unwrap();
+    let mut r = Registry::new(cid(0xFF));
+    r.set_schema_registry(Arc::new(Mutex::new(sr)));
+    r.set_verifier(Box::new(tokens(&[
+        ("c-author", "author"),
+        ("c-reader", "reader"),
+    ])));
+    // Nobody is denied any zone, so the reader's set is every id v1 declares.
+    r.set_authorizer(Box::new(|_: &Identity, _: Action, _: &Resource| true));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+
+    let author = auth(&mut r, 1, "c-author", DRIFT_APP, 1);
+    subscribe(&mut r, author, b"");
+    let mut author_doc = Document::new(cid(1));
+    author_doc.set_schema(Schema::parse(DRIFT_V1).expect("v1 parses"));
+    submit(
+        &mut r,
+        author,
+        author_doc.transact(|tx| {
+            tx.map(b"board").register(b"bseed", Scalar::Int(0));
+        }),
+    );
+
+    let reader = auth(&mut r, 2, "c-reader", DRIFT_APP, 1);
+    let mut reader_doc = Document::new(cid(2));
+    reader_doc.set_schema(Schema::parse(DRIFT_V1).expect("v1 parses"));
+    for op in ops_in(subscribe(&mut r, reader, b"")) {
+        reader_doc.apply(&op);
+    }
+    submit(
+        &mut r,
+        reader,
+        reader_doc.transact(|tx| {
+            tx.map(b"board").register(b"r0", Scalar::Int(0));
+        }),
+    );
+    create_version(&mut r, author, V1);
+
+    // The lift drops a zone, leaving the bound set wider than the schema.
+    let newer = auth(&mut r, 3, "c-author", DRIFT_APP, 2);
+    subscribe(&mut r, newer, b"");
+
+    let state = fetch_version(&mut r, reader, V1);
+    let served = Document::decode_state(&state).expect("the served version state decodes");
+    assert_eq!(nested(&served, b"board", b"bseed"), Some(0));
+    assert_eq!(
+        frontier_authors(&state),
+        HashSet::from([cid(2)]),
+        "a set wider than the schema was mistaken for a whole-zone one",
+    );
+}
+
 // --- a doc-ACL partial reader ---
 
 /// Room read is granted by the schema tier to every authenticated actor, so a reader
