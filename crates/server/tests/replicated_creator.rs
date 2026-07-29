@@ -377,6 +377,77 @@ fn a_room_replicated_by_ops_carries_its_creator() {
 }
 
 #[test]
+fn a_room_born_in_one_commit_carries_its_creator_on_that_commit() {
+    // The root is established by the write the frame carries, so the frame must be
+    // built after it — a room whose whole history is one commit has no second frame
+    // to make up for reading the root too early.
+    let room = room_led_by_a_with_b_next();
+    let mut leader = node(A);
+    let alice = hello_auth(&mut leader, 1, "t-alice");
+    assert!(leader.deliver(alice, sub(&room)));
+    leader.take_outbox(alice);
+    submit(
+        &mut leader,
+        alice,
+        Document::new(cid(1)).transact(|tx| tx.register(OPEN, Scalar::Int(1))),
+    );
+
+    let follower = follower_by_ops(&mut leader, &room);
+    assert_eq!(
+        follower.hub().room_creator(&room).as_deref(),
+        Some(b"alice".as_slice()),
+        "the room's only commit carries the root it established",
+    );
+}
+
+#[test]
+fn a_dialed_ops_catch_up_carries_the_creator() {
+    // The late-joiner dial, the wiped-follower self-heal and the redial after a
+    // dropped link all converge a follower through this frame and no other, so a
+    // follower that never saw a steady commit must still come up rooted.
+    let room = room_led_by_a_with_b_next();
+    let b = NodeId::from_addr(B);
+    let mut leader = seeded_leader(&room);
+    // Drop the steady-path frames: the follower acked nothing, so the dial below is
+    // what converges it — from the retained log, uncompacted, so an ops delta.
+    leader.take_replication();
+    leader.catch_up_follower(&b);
+    let mut frames: Vec<Message> = leader
+        .take_replication()
+        .into_iter()
+        .filter(|(target, _)| *target == b)
+        .map(|(_, frame)| frame)
+        .collect();
+    assert_eq!(frames.len(), 1, "exactly one catch-up frame: {frames:?}");
+    let frame = frames.pop().expect("one frame");
+    assert!(
+        matches!(frame, Message::Replicate { .. }),
+        "an uncompacted room is dialed an ops delta: {frame:?}",
+    );
+
+    let mut follower = node(B);
+    let peer = peer_conn(&mut follower, &room);
+    assert!(follower.deliver(peer, frame), "the follower applies it");
+    assert_eq!(
+        follower.hub().export_room(&room),
+        leader.hub().export_room(&room),
+        "the dial converged the follower",
+    );
+    assert_eq!(
+        follower.hub().room_creator(&room).as_deref(),
+        Some(b"alice".as_slice()),
+        "the dialed ops delta carries the room's authority root",
+    );
+
+    let (_, view) = bob_reads(&mut follower, &room);
+    assert_eq!(
+        reads(&view),
+        (false, true),
+        "so a read it serves is redacted like the leader's",
+    );
+}
+
+#[test]
 fn a_room_installed_by_snapshot_carries_its_creator() {
     let room = room_led_by_a_with_b_next();
     let mut leader = seeded_leader(&room);
@@ -565,10 +636,10 @@ fn a_second_frame_naming_another_root_does_not_displace_the_first() {
 }
 
 #[test]
-fn a_frame_naming_a_root_that_could_never_re_present_roots_nothing() {
+fn a_frame_naming_an_anonymous_root_roots_nothing() {
     // The root is set-once, so one that can never come back to exercise its ownership
     // would wedge the room's authority for good — the same rule the write path applies
-    // to an anonymous writer, applied to what a peer asserts.
+    // to an anonymous writer, applied to what a peer asserts, on both frames.
     let room = room_led_by_a_with_b_next();
     let mut follower = node(B);
     let peer = peer_conn(&mut follower, &room);
@@ -584,6 +655,10 @@ fn a_frame_naming_a_root_that_could_never_re_present_roots_nothing() {
             creator: Some(b"anon:ephemeral".to_vec()),
         },
     ));
+    assert!(
+        follower.hub().get(&room, b"planted").is_some(),
+        "the frame applied, so the root it named was judged and refused",
+    );
     assert_eq!(
         follower.hub().room_creator(&room),
         None,
@@ -599,22 +674,26 @@ fn a_frame_naming_a_root_that_could_never_re_present_roots_nothing() {
             seq: 9,
             state,
             epoch: 1,
-            creator: Some(Vec::new()),
+            creator: Some(b"anon:ephemeral".to_vec()),
         },
     ));
     assert_eq!(
+        follower.hub().seq(&room),
+        9,
+        "the snapshot installed, so the root it named was judged and refused",
+    );
+    assert_eq!(
         follower.hub().room_creator(&room),
         None,
-        "an empty actor names no principal, so it roots nothing",
+        "nor does it become one by riding a state transfer",
     );
 }
 
 #[test]
 fn a_rootless_frame_leaves_the_replica_rootless() {
     // What is still not carried, pinned rather than left to prose: a leader with no
-    // root of its own hands over none, and the replica reads the room's denies as
-    // inert exactly as the leader does. A root derived from the state bytes would
-    // break this — which is the point of pinning it.
+    // root of its own hands over none. A root derived from the state bytes would break
+    // this — which is the point of pinning it.
     let room = room_led_by_a_with_b_next();
     let mut follower = node(B);
     let peer = peer_conn(&mut follower, &room);
@@ -630,6 +709,10 @@ fn a_rootless_frame_leaves_the_replica_rootless() {
             creator: None,
         },
     ));
+    assert!(
+        follower.hub().get(&room, b"planted").is_some(),
+        "the frame applied rather than being fenced, so the absence below is its answer",
+    );
     assert_eq!(
         follower.hub().room_creator(&room),
         None,
@@ -639,9 +722,10 @@ fn a_rootless_frame_leaves_the_replica_rootless() {
 
 #[test]
 fn a_version_captured_on_a_replica_withholds_the_denied_key() {
-    // A version is captured wherever the room is led — and leadership moves to a
-    // replica on failover, so the fetch seam reads the same authority root the
-    // subscribe seam does.
+    // The fetch seam is not leader-gated, so it answers from any node holding the
+    // version — and it reads the same authority root the subscribe seam does. The
+    // version is captured through the hub directly, as `VersionCreate` does once a
+    // failover has made this replica the room's leader.
     let room = room_led_by_a_with_b_next();
     let mut leader = seeded_leader(&room);
     let mut follower = follower_by_ops(&mut leader, &room);

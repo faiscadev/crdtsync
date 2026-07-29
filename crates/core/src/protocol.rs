@@ -365,9 +365,9 @@ pub enum Message {
     /// authority root — the authenticated actor that established it — carried on
     /// every frame so a replica that holds the room holds the root its redactions
     /// resolve against; `None` for a room no authenticated actor has yet written.
-    /// It is set-once and immutable, so re-sending it costs an actor id per frame
-    /// and can never conflict. Node-to-node — never a client frame; a client that
-    /// sends one commits a protocol violation.
+    /// It is set-once and immutable, so every frame for a room names the same root.
+    /// Node-to-node — never a client frame; a client that sends one commits a
+    /// protocol violation.
     Replicate {
         room: Vec<u8>,
         branch: Vec<u8>,

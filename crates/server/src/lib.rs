@@ -408,16 +408,6 @@ pub(crate) fn index_blob_refs(
     }
 }
 
-/// Whether `actor` can stand as a room's doc-ACL authority root: a non-empty,
-/// credentialed id. An anonymous id is ephemeral per-connection, so it could never
-/// re-present to exercise the ownership; an empty one names no principal at all.
-/// The root is set-once, so one that cannot re-present wedges the room's authority
-/// for good — the rule holds wherever a root arrives, a client's write and a peer's
-/// replication frame alike.
-fn can_root(actor: &[u8]) -> bool {
-    !actor.is_empty() && crate::acl::is_authenticated(actor)
-}
-
 struct Room {
     doc: Document,
     log: Vec<StoredOp>,
@@ -1027,7 +1017,10 @@ impl Hub {
                     r.max_op_version = r.max_op_version.max(Some(persisted));
                 }
             }
-            if let Some(creator) = meta.creator {
+            // The stored bytes are supplied by whoever hands the store over, so the
+            // root they name is checked here as one off a frame is: an anonymous id
+            // could never re-present to exercise the ownership it would be handed.
+            if let Some(creator) = meta.creator.filter(|a| crate::acl::is_authenticated(a)) {
                 if let Some(r) = self.rooms.get_mut(&room) {
                     r.creator = Some(creator);
                 }
@@ -1539,10 +1532,9 @@ impl Hub {
     /// `creator` is the room's doc-ACL authority root, which the state bytes do not
     /// carry: the caller supplies it from wherever it holds the room's metadata. It
     /// composes with any root already installed under `room` the way `creator` is
-    /// defined everywhere else — set-once, never displaced, and only an actor that
-    /// [`can_root`] — so a re-sent snapshot that names none leaves the standing root
-    /// alone rather than dropping the authority every deny in the state is decided
-    /// under.
+    /// defined everywhere else — set-once, never displaced, and never an anonymous
+    /// actor — so a re-sent snapshot that names none leaves the standing root alone
+    /// rather than dropping the authority every deny in the state is decided under.
     fn install_room_state(
         &mut self,
         room: &[u8],
@@ -1572,7 +1564,7 @@ impl Hub {
                 seen,
                 base_seq,
                 max_op_version,
-                creator: root.or_else(|| creator.filter(|a| can_root(a))),
+                creator: root.or_else(|| creator.filter(|a| crate::acl::is_authenticated(a))),
             },
         );
         // Best-effort, matching the governing metadata: the room is installed either
@@ -1902,13 +1894,20 @@ impl Hub {
 
     /// Record `actor` as `room`'s creator if it has none yet, persisting the durable
     /// metadata. Set-once: a room keeps its first writer as creator, so a later
-    /// caller never displaces it. A no-op for an unknown room, and for an actor that
-    /// cannot stand as an authority root ([`can_root`]). Persisting is best-effort,
-    /// matching the governing metadata: a failed write does not fail the caller's
-    /// write. Set-once means nothing retries it either — the room comes back
-    /// creatorless from that store, and its next writer establishes it afresh.
+    /// caller never displaces it. A no-op for an unknown room, and for an
+    /// [anonymous](crate::acl::is_authenticated) actor — an anonymous id is ephemeral
+    /// per-connection, so set-once would wedge the room's authority on a principal
+    /// that can never re-present to exercise it. The same two rules decide a root
+    /// arriving with an installed snapshot ([`install_room_state`]), so a root is
+    /// judged the same whether a client's write or a peer's frame carries it.
+    ///
+    /// Persisting is best-effort, matching the governing metadata: a failed write does
+    /// not fail the caller's write. Set-once means nothing retries it either. On a
+    /// leader that costs nothing lasting — the room comes back creatorless and its
+    /// next writer establishes it afresh — but a replica serves no client write, so
+    /// its root returns only with the room's next replicated commit.
     pub fn ensure_creator(&mut self, room: &[u8], actor: &[u8]) {
-        if !can_root(actor) {
+        if !crate::acl::is_authenticated(actor) {
             return;
         }
         let established = match self.rooms.get_mut(room) {
