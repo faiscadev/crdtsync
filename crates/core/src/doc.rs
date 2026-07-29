@@ -273,9 +273,12 @@ pub struct Document {
     /// id then finds nothing held under a group. So the count is at most one key per
     /// group minted or committed, plus at most two per op id ever buffered under a
     /// group — the same order as the dedup set the replica already carries per op,
-    /// and never more than a constant times what it has held. A key is not released
-    /// when its bucket's ops leave the buffer, so what caps the adversarial case is
-    /// the same buffer cap C20 owes the eviction seam.
+    /// and never more than a constant times what it has held. What bounds it is that
+    /// dedup set and not the buffer: a key outlives the ops that earned it exactly as
+    /// a `seen` entry does, so an eviction policy empties the buffer and keeps the
+    /// key. A group id colliding with one this replica has already spent — the
+    /// 64-bit birthday bound on [`TxId::derive`], which hashes member sequences alone
+    /// — costs the later group its atomic view at receivers rather than its members.
     resolved_tx: HashSet<(ClientId, TxId)>,
     /// Movable nodes revealed by an [`XmlReveal`](crate::op::OpKind::XmlReveal) shell
     /// but not yet placed — a node materialized (identity + tag) with no placement,
@@ -1526,7 +1529,7 @@ impl Document {
         // reload replays — a node kept at its readable origin renders there, not at the
         // denied destination it was folded to, so the projected snapshot is byte-stable
         // through a round-trip. A pure identity projection (a whole-document reader)
-        // leaves both untouched, staying byte-identical on re-encode.
+        // leaves them untouched, staying byte-identical on re-encode.
         if !purge.is_empty() || cut_leaf || acl_cut || ranged_cut || !root_reads {
             let published = self.published_by(recipient);
             self.refold_projected_moves();
@@ -2660,9 +2663,11 @@ impl Document {
             // so both keys resolve and every order lands the same set. A plain
             // resend names the group already held and decides nothing, which is
             // what leaves an honest group waiting whole for the member it lacks.
-            // Only a member the buffer is *holding* is evidence of a group, so the
-            // buffer is searched only for an id it can hold. A resend of an applied
-            // op — ordinary traffic on any transport that retries — costs nothing.
+            // Only a member the buffer is *holding* is evidence of a group; that gate
+            // is `buffered_tx`, which answers `None` for every id the buffer does not
+            // hold under a group. The `buffered` check ahead of it decides nothing —
+            // it just spares a resend of an applied op the scan, which is ordinary
+            // traffic on any transport that retries.
             if let Some(tx) = op.tx.filter(|_| self.buffered.contains(&op.id)) {
                 if let Some(held) = self.buffered_tx(op.id).filter(|held| *held != tx) {
                     self.resolve_tx((op.id.client, held.id));
