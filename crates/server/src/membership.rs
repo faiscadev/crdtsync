@@ -879,9 +879,10 @@ impl Membership {
             let Some(node) = NodeId::canonical(node.as_bytes()) else {
                 continue;
             };
-            // A claim is the *sender's*, so a frame that arrives on a link bound to this
-            // node's own id cannot make this node vouch for a member it never dialed.
-            if verified && &node != sender && !self.is_self(&node) && !self.is_self(sender) {
+            // A claim is the *sender's*, and a member does not vouch for itself. Both
+            // ends being something other than this node is decided once, by
+            // `can_be_verified`, where the claim is actually recorded.
+            if verified && &node != sender {
                 claimed.push(node.clone());
             }
             if self.is_self(&node) {

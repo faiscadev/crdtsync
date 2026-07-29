@@ -217,6 +217,45 @@ fn a_seed_only_node_converges_on_the_full_cluster() {
 }
 
 #[test]
+fn being_dialed_introduces_only_the_dialer() {
+    // An inbound frame carries whatever its sender chose to put in it, and admitting a
+    // *third* member from it is a join with no dial behind it — the unchecked join the
+    // adoption rules exist to close, reached one level down at the roster. Production
+    // (`Registry::apply_gossip`) admits only members the receiver already holds plus
+    // the sender's own tuple, so a newcomer is learned from a round this node
+    // initiated, never from being dialed.
+    let mut a = seeded(A, B);
+    let mut b = seeded(B, A);
+    let mut c = seeded(C, A);
+
+    // A learns C the legitimate way: C dials A.
+    exchange(&mut c, &mut a);
+    assert!(
+        member_set(&a).contains(&NodeId::from_addr(C)),
+        "A learned C"
+    );
+
+    // Now A dials B and pushes a view that names C. B takes the dialer and nothing
+    // else.
+    exchange(&mut a, &mut b);
+    assert!(
+        !member_set(&b).contains(&NodeId::from_addr(C)),
+        "an inbound push introduces only its own sender",
+    );
+    assert!(
+        member_set(&b).contains(&NodeId::from_addr(A)),
+        "B still holds A"
+    );
+
+    // B reaches C by gossiping *outward*, where the reply is a view it asked for.
+    exchange(&mut b, &mut a);
+    assert!(
+        member_set(&b).contains(&NodeId::from_addr(C)),
+        "and a round B initiated does carry the newcomer",
+    );
+}
+
+#[test]
 fn convergence_holds_whatever_the_gossip_order() {
     // Drive several rounds of a fixed all-pairs schedule; the set must converge to
     // the union regardless of which exchanges ran when.
