@@ -466,16 +466,19 @@ pub enum Message {
     /// Deletes branch `name` of `room`. The default `main` is never deletable.
     /// Replies with the fresh branch list.
     BranchDelete { room: Vec<u8>, name: Vec<u8> },
-    /// Requests the structural diff turning state `a` into state `b` in `room` —
-    /// `kind` selects whether `a`/`b` name two saved versions or two branches.
-    /// The app-facing query a client runs to review what changed between two
-    /// points of a room, room-keyed like branch management so it is runnable
-    /// before any subscription. The reply is a
+    /// Requests the structural diff turning state `a` into state `b` in the room
+    /// `channel` is subscribed to — `kind` selects whether `a`/`b` name two saved
+    /// versions or two branches. The app-facing query a client runs to review what
+    /// changed between two points of a room. **Channel-keyed like
+    /// [`VersionFetch`](Message::VersionFetch)**, not room-keyed like branch
+    /// management: a diff reports a room's own content — paths and scalar values —
+    /// so it is served through the same redactions the live stream is, and the
+    /// channel is what carries the reader's zone scope. The reply is a
     /// [`DiffResult`](Message::DiffResult) carrying the encoded change list, or an
     /// [`Error`](Message::Error) with [`ErrorCode::NotFound`] when a named version
     /// or branch is absent.
     DiffQuery {
-        room: Vec<u8>,
+        channel: Channel,
         kind: DiffKind,
         a: Vec<u8>,
         b: Vec<u8>,
@@ -483,7 +486,9 @@ pub enum Message {
     /// The structural diff `a`→`b` a [`DiffQuery`](Message::DiffQuery) asked for:
     /// `changes` is the encoded [`Change`](crate::diff::Change) list — the
     /// `encode_changes` codec the diff SDK bindings already decode. An empty diff
-    /// is an empty change list, not an error.
+    /// is an empty change list, not an error. Keyed by the `room` the query's
+    /// channel resolved to: a change list is a fact about a room, and the channel
+    /// only supplied the scope it was narrowed to.
     DiffResult { room: Vec<u8>, changes: Vec<u8> },
     /// Duplicates the live state of room `src` into a fresh room `dst` — the wire
     /// form of the "duplicate this doc as a template" server primitive. Room-keyed
@@ -913,9 +918,14 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, room);
             put_bytes(&mut out, name);
         }
-        Message::DiffQuery { room, kind, a, b } => {
+        Message::DiffQuery {
+            channel,
+            kind,
+            a,
+            b,
+        } => {
             put_u8(&mut out, 40);
-            put_bytes(&mut out, room);
+            put_u32(&mut out, channel.0);
             put_u8(&mut out, diff_kind_tag(*kind));
             put_bytes(&mut out, a);
             put_bytes(&mut out, b);
@@ -1316,11 +1326,16 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             Message::BranchDelete { room, name }
         }
         40 => {
-            let room = cur.bytes()?;
+            let channel = Channel(cur.u32()?);
             let kind = diff_kind(cur.u8()?)?;
             let a = cur.bytes()?;
             let b = cur.bytes()?;
-            Message::DiffQuery { room, kind, a, b }
+            Message::DiffQuery {
+                channel,
+                kind,
+                a,
+                b,
+            }
         }
         41 => {
             let room = cur.bytes()?;

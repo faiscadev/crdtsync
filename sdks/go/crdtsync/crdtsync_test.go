@@ -529,9 +529,10 @@ func TestClientDiffQueryRoundTrips(t *testing.T) {
 	defer c.Close()
 
 	room := key("room-1")
-	// Both kinds frame a request; room-keyed, no subscription needed.
+	// Both kinds frame a request; channel-keyed, so the server resolves the room
+	// and the scope the change list is narrowed to.
 	for _, kind := range []DiffKind{DiffVersions, DiffBranches} {
-		if f := c.DiffQuery(room, kind, key("a"), key("b")); len(f) == 0 {
+		if f := c.DiffQuery(0, kind, key("a"), key("b")); len(f) == 0 {
 			t.Fatalf("diff query (kind %d) should yield a frame", kind)
 		}
 	}

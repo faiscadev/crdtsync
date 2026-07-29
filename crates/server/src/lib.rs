@@ -2093,30 +2093,49 @@ impl Hub {
 
     /// The structural diff turning version `a`'s snapshot into version `b`'s: the
     /// [`Change`] list [`path::diff`](crdtsync_core::path::diff) computes over the
-    /// two decoded whole-replica states. Diffing a version against itself is empty.
-    /// An absent version is [`DiffError::UnknownVersion`]; a snapshot that does not
-    /// decode is [`DiffError::Decode`] — never a panic.
-    pub fn diff_versions(&self, room: &[u8], a: &[u8], b: &[u8]) -> Result<Vec<Change>, DiffError> {
+    /// two decoded whole-replica states, each first put through `narrow`. Diffing a
+    /// version against itself is empty. An absent version is
+    /// [`DiffError::UnknownVersion`]; a snapshot that does not decode is
+    /// [`DiffError::Decode`] — never a panic.
+    ///
+    /// `narrow` is the reader's redaction, applied per side before the engine ever
+    /// sees the bytes ([`Hub::diff_branches`] takes the same). A change list carries
+    /// a room's paths and its scalar values, so it is a content read: the hub holds
+    /// no notion of who is asking, so the caller supplies one, and a caller that
+    /// serves a reader passes the same projection every other state-serving seam
+    /// runs. [`Ok`] leaves a side unnarrowed — the honest answer only where there is
+    /// no reader to narrow for.
+    pub fn diff_versions(
+        &self,
+        room: &[u8],
+        a: &[u8],
+        b: &[u8],
+        narrow: impl Fn(Vec<u8>) -> Result<Vec<u8>, DiffError>,
+    ) -> Result<Vec<Change>, DiffError> {
         let old = self
             .version_state(room, a)
-            .ok_or_else(|| DiffError::UnknownVersion(a.to_vec()))?;
+            .ok_or_else(|| DiffError::UnknownVersion(a.to_vec()))?
+            .to_vec();
         let new = self
             .version_state(room, b)
-            .ok_or_else(|| DiffError::UnknownVersion(b.to_vec()))?;
-        diff_states(old, new)
+            .ok_or_else(|| DiffError::UnknownVersion(b.to_vec()))?
+            .to_vec();
+        diff_states(&narrow(old)?, &narrow(new)?)
     }
 
     /// The structural diff turning branch `a`'s current state into branch `b`'s —
     /// each branch materialized (shared base plus divergent tail, or its owned
-    /// snapshot base) then fed to the core engine, so a branch against its fork
-    /// source yields only the divergence. Diffing a branch against itself is empty.
-    /// An unknown branch is [`DiffError::UnknownBranch`]; a state that does not
-    /// decode is [`DiffError::Decode`].
+    /// snapshot base), narrowed by `narrow`, then fed to the core engine, so a
+    /// branch against its fork source yields only the divergence. Diffing a branch
+    /// against itself is empty. An unknown branch is [`DiffError::UnknownBranch`]; a
+    /// state that does not decode is [`DiffError::Decode`]. `narrow` is the reader's
+    /// redaction, as in [`Hub::diff_versions`].
     pub fn diff_branches(
         &mut self,
         room: &[u8],
         a: &[u8],
         b: &[u8],
+        narrow: impl Fn(Vec<u8>) -> Result<Vec<u8>, DiffError>,
     ) -> Result<Vec<Change>, DiffError> {
         let old = self
             .materialize_branch(room, a)
@@ -2124,7 +2143,7 @@ impl Hub {
         let new = self
             .materialize_branch(room, b)
             .ok_or_else(|| DiffError::UnknownBranch(b.to_vec()))?;
-        diff_states(&old, &new)
+        diff_states(&narrow(old)?, &narrow(new)?)
     }
 
     /// The names of a room's versions, sorted, for listing and pagination.

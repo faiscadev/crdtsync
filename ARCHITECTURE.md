@@ -671,6 +671,8 @@ Same primitive supports per-user forks. Useful when each user customizes a base 
 
 Documents are structured Element trees with declared schema (not opaque blobs). Diff between any two snapshots is computable as structural change lists. Text values produce char-level diffs; XmlElement subtrees produce structural diffs; attrs / marks / Map / Register / Counter show value diffs. Engine ships sensible default renderers; apps can override.
 
+A change list is the room's own content in a different shape — every change carries a path, and a value change carries the scalar at it — so **a diff served to a client is a redacted read**, on the same terms as a version read. Both of a diff's sides go through the one state-serving composition *before* the engine sees them, so a served change list is by construction the diff of the two states that reader would itself have been served: a partition it may not read contributes no change at all, rather than a change it may not see. That is why a client's diff query names a **channel** rather than a room. The general rule the two seams share: a request that serves a room's *content* is channel-keyed, because the channel is what carries the reader's zone scope; a request that serves only *names*, or performs a room-management mutation, may ride a room off the frame.
+
 ## Branch Merging
 
 Out of scope for v0.x. The primitive (fork point + HEAD pointers) is there; merge tooling can land later.

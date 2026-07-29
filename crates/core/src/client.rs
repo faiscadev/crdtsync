@@ -119,8 +119,9 @@ pub struct ClientSession {
     branches: HashMap<Vec<u8>, Vec<BranchInfo>>,
     /// The last diff result the server returned per room — the change list a
     /// [`Message::DiffResult`] reply carried, decoded. Room-keyed like the branch
-    /// view; a fresh query replaces the room's entry. Empty until a diff query is
-    /// answered.
+    /// view even though the query is channel-keyed: a change list is a fact about a
+    /// room. A fresh query replaces the room's entry, so two channels diffing one
+    /// room share it. Empty until a diff query is answered.
     diffs: HashMap<Vec<u8>, Vec<Change>>,
     /// The outcome of each clone-room request, keyed by the destination room — the
     /// `created` flag a [`Message::CloneRoomResult`] reply carried. Keyed by `dst`
@@ -596,14 +597,15 @@ impl ClientSession {
         self.branches.get(room).map(Vec::as_slice)
     }
 
-    /// Request the structural diff turning state `a` into state `b` in `room`,
-    /// returning the request frame. `kind` selects whether `a`/`b` name two saved
-    /// versions or two branches. The reply updates the [`diff`](Self::diff) view.
-    /// Room-keyed like branch management: a client may diff a room before it
-    /// subscribes any of its branches.
-    pub fn diff_query(&self, room: &[u8], kind: DiffKind, a: &[u8], b: &[u8]) -> Message {
+    /// Request the structural diff turning state `a` into state `b` in the room
+    /// `channel` is subscribed to, returning the request frame. `kind` selects
+    /// whether `a`/`b` name two saved versions or two branches. The reply updates
+    /// the [`diff`](Self::diff) view, keyed by the room the server resolved.
+    /// Channel-keyed like a version fetch: a diff reports a room's own paths and
+    /// values, so the server narrows it to what this channel may read.
+    pub fn diff_query(&self, channel: Channel, kind: DiffKind, a: &[u8], b: &[u8]) -> Message {
         Message::DiffQuery {
-            room: room.to_vec(),
+            channel,
             kind,
             a: a.to_vec(),
             b: b.to_vec(),

@@ -173,9 +173,10 @@ def test_diff_query_round_trips():
 
     with Client(cid(1)) as a:
         room = b"room-1"
-        # Both kinds frame a request; room-keyed, no subscription needed.
-        assert len(a.diff_query(room, DiffKind.VERSIONS, b"a", b"b")) > 0
-        assert len(a.diff_query(room, DiffKind.BRANCHES, b"main", b"draft")) > 0
+        # Both kinds frame a request; channel-keyed, so the server resolves the
+        # room and the scope the change list is narrowed to.
+        assert len(a.diff_query(0, DiffKind.VERSIONS, b"a", b"b")) > 0
+        assert len(a.diff_query(0, DiffKind.BRANCHES, b"main", b"draft")) > 0
         # No result until one is answered.
         assert a.diff(room) is None
 

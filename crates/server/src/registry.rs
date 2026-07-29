@@ -1937,7 +1937,11 @@ impl Registry {
             | Message::VersionRename { channel, .. }
             | Message::VersionDelete { channel, .. }
             | Message::VersionList { channel, .. }
-            | Message::VersionFetch { channel, .. } => self
+            | Message::VersionFetch { channel, .. }
+            // A diff query is channel-keyed for exactly this: the change list it
+            // answers with is narrowed by the room's zone declarations, and those
+            // live in the acting schema this resolution is what finds.
+            | Message::DiffQuery { channel, .. } => self
                 .conns
                 .get(&id)
                 .and_then(|c| c.session.room_for_channel(*channel).cloned()),

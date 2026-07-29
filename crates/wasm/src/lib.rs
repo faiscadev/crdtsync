@@ -1788,15 +1788,16 @@ impl WasmClient {
             .into()
     }
 
-    /// Frame a diff query over `room`: the structural diff turning state `a` into
-    /// state `b`. `kind` selects the state space — 0 diffs two saved versions, 1
-    /// diffs two branches' HEADs; any other value is an error. Room-keyed: a
-    /// client may diff a room before it subscribes any of its branches. The reply
-    /// updates the diff view.
+    /// Frame a diff query on `channel`: the structural diff turning state `a` into
+    /// state `b` in the room that channel is subscribed to. `kind` selects the
+    /// state space — 0 diffs two saved versions, 1 diffs two branches' HEADs; any
+    /// other value is an error. Channel-keyed: a change list carries the room's
+    /// paths and values, so the server narrows it to what this channel may read.
+    /// The reply updates the diff view, keyed by the room the server resolved.
     #[wasm_bindgen(js_name = diffQuery)]
     pub fn diff_query(
         &self,
-        room: &[u8],
+        channel: u32,
         kind: u32,
         a: &[u8],
         b: &[u8],
@@ -1810,7 +1811,9 @@ impl WasmClient {
                 ))
             }
         };
-        Ok(encode_message(&self.inner.diff_query(room, kind, a, b)))
+        Ok(encode_message(
+            &self.inner.diff_query(Channel(channel), kind, a, b),
+        ))
     }
 
     /// The change list from the last diff query answered for `room`, as an array

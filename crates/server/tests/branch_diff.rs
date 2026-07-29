@@ -5,6 +5,10 @@
 //! list — a value change, a text edit, a structural add/remove — the same
 //! `Change` set the engine renders. Diffing a snapshot against itself is empty;
 //! an unknown version or branch is a clean error, never a panic.
+//!
+//! The engine is what this suite pins, so every diff here runs [`unnarrowed`]: the
+//! hub holds no notion of a reader, and the per-reader redaction each side goes
+//! through in service is the session's (see `diff_projection`).
 
 use crdtsync_core::diff::{Change, SeqItem};
 use crdtsync_core::element::ElementKind;
@@ -32,6 +36,12 @@ fn p(keys: &[&[u8]]) -> Vec<u8> {
     encode_path(keys)
 }
 
+/// The identity redaction — no reader to narrow for, so each side reaches the diff
+/// engine as the hub stored it.
+fn unnarrowed(state: Vec<u8>) -> Result<Vec<u8>, DiffError> {
+    Ok(state)
+}
+
 #[test]
 fn diff_versions_reports_a_value_change() {
     let mut hub = Hub::new(cid(0xFF));
@@ -42,7 +52,7 @@ fn diff_versions_reports_a_value_change() {
     hub.ingest(ROOM, reg(&mut main, b"age", 40), None).unwrap();
     assert!(hub.create_version(ROOM, b"v2").unwrap());
 
-    let changes = hub.diff_versions(ROOM, b"v1", b"v2").unwrap();
+    let changes = hub.diff_versions(ROOM, b"v1", b"v2", unnarrowed).unwrap();
     assert_eq!(
         changes,
         vec![Change::Value {
@@ -65,7 +75,7 @@ fn diff_versions_reports_a_text_edit() {
     hub.ingest(ROOM, edit, None).unwrap();
     assert!(hub.create_version(ROOM, b"v2").unwrap());
 
-    let changes = hub.diff_versions(ROOM, b"v1", b"v2").unwrap();
+    let changes = hub.diff_versions(ROOM, b"v1", b"v2", unnarrowed).unwrap();
     assert_eq!(
         changes,
         vec![Change::TextInsert {
@@ -89,7 +99,7 @@ fn diff_versions_reports_a_structural_add() {
     hub.ingest(ROOM, add, None).unwrap();
     assert!(hub.create_version(ROOM, b"v2").unwrap());
 
-    let changes = hub.diff_versions(ROOM, b"v1", b"v2").unwrap();
+    let changes = hub.diff_versions(ROOM, b"v1", b"v2", unnarrowed).unwrap();
     assert!(
         changes.contains(&Change::Added {
             path: p(&[b"meta"]),
@@ -107,7 +117,10 @@ fn diffing_a_version_against_itself_is_empty() {
     hub.ingest(ROOM, reg(&mut main, b"age", 30), None).unwrap();
     assert!(hub.create_version(ROOM, b"v1").unwrap());
 
-    assert_eq!(hub.diff_versions(ROOM, b"v1", b"v1").unwrap(), Vec::new());
+    assert_eq!(
+        hub.diff_versions(ROOM, b"v1", b"v1", unnarrowed).unwrap(),
+        Vec::new()
+    );
 }
 
 #[test]
@@ -119,11 +132,11 @@ fn an_unknown_version_is_a_clean_error() {
     assert!(hub.create_version(ROOM, b"v1").unwrap());
 
     assert_eq!(
-        hub.diff_versions(ROOM, b"v1", b"nope"),
+        hub.diff_versions(ROOM, b"v1", b"nope", unnarrowed),
         Err(DiffError::UnknownVersion(b"nope".to_vec()))
     );
     assert_eq!(
-        hub.diff_versions(ROOM, b"gone", b"v1"),
+        hub.diff_versions(ROOM, b"gone", b"v1", unnarrowed),
         Err(DiffError::UnknownVersion(b"gone".to_vec()))
     );
 }
@@ -141,7 +154,9 @@ fn diff_branches_reports_only_the_divergence_from_the_fork_source() {
     hub.ingest_branch(ROOM, b"draft", reg(&mut draft, b"age", 99), None)
         .unwrap();
 
-    let changes = hub.diff_branches(ROOM, b"main", b"draft").unwrap();
+    let changes = hub
+        .diff_branches(ROOM, b"main", b"draft", unnarrowed)
+        .unwrap();
     assert_eq!(
         changes,
         vec![Change::Value {
@@ -162,7 +177,8 @@ fn a_branch_against_itself_is_empty() {
     assert!(hub.fork_branch(ROOM, b"draft", b"main", fork).unwrap());
 
     assert_eq!(
-        hub.diff_branches(ROOM, b"draft", b"draft").unwrap(),
+        hub.diff_branches(ROOM, b"draft", b"draft", unnarrowed)
+            .unwrap(),
         Vec::new()
     );
 }
@@ -175,7 +191,7 @@ fn an_unknown_branch_is_a_clean_error() {
     hub.ingest(ROOM, reg(&mut main, b"age", 30), None).unwrap();
 
     assert_eq!(
-        hub.diff_branches(ROOM, b"main", b"ghost"),
+        hub.diff_branches(ROOM, b"main", b"ghost", unnarrowed),
         Err(DiffError::UnknownBranch(b"ghost".to_vec()))
     );
 }
@@ -199,7 +215,7 @@ fn diff_versions_reports_a_list_insert_into_an_existing_list() {
     hub.ingest(ROOM, push, None).unwrap();
     assert!(hub.create_version(ROOM, b"v2").unwrap());
 
-    let changes = hub.diff_versions(ROOM, b"v1", b"v2").unwrap();
+    let changes = hub.diff_versions(ROOM, b"v1", b"v2", unnarrowed).unwrap();
     assert!(
         changes.contains(&Change::ListInsert {
             path: p(&[b"xs"]),

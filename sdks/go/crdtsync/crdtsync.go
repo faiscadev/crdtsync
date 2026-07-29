@@ -1332,14 +1332,14 @@ const (
 )
 
 // DiffQuery frames a request for the structural diff turning state a into state b
-// in room. kind selects whether a/b name two saved versions or two branches.
-// Room-keyed: a client may diff a room before it subscribes any of its branches.
-// The reply updates the diff view, read with DiffResult.
-func (c *Client) DiffQuery(room []byte, kind DiffKind, a, b []byte) []byte {
-	rp, rl := bytesArg(room)
+// in the room channel is subscribed to. kind selects whether a/b name two saved
+// versions or two branches. Channel-keyed: a change list carries the room's paths
+// and values, so the server narrows it to what this channel may read. The reply
+// updates the diff view, read with DiffResult under the room the server resolved.
+func (c *Client) DiffQuery(channel uint32, kind DiffKind, a, b []byte) []byte {
 	ap, al := bytesArg(a)
 	bp, bl := bytesArg(b)
-	return takeBuf(C.crdtsync_client_diff_query(c.h, rp, rl, C.uint32_t(kind), ap, al, bp, bl))
+	return takeBuf(C.crdtsync_client_diff_query(c.h, C.uint32_t(channel), C.uint32_t(kind), ap, al, bp, bl))
 }
 
 // DiffResult returns the change list from the last diff query answered for room,

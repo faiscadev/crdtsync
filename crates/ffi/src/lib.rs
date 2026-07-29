@@ -4222,20 +4222,20 @@ pub unsafe extern "C" fn crdtsync_client_branch_at(
 
 // --- client diff query ---
 
-/// Frame a diff query over `room`: the structural diff turning state `a` into
-/// state `b`, where `kind` selects the state space — 0 diffs two saved versions,
-/// 1 diffs two branches' HEADs. Returns the frame to send; empty on a bad handle,
-/// a bad `kind`, or a bad input. Room-keyed: a client may diff a room before it
-/// subscribes any of its branches. The reply updates the diff view.
+/// Frame a diff query on `channel`: the structural diff turning state `a` into
+/// state `b` in the room that channel is subscribed to, where `kind` selects the
+/// state space — 0 diffs two saved versions, 1 diffs two branches' HEADs. Returns
+/// the frame to send; empty on a bad handle, a bad `kind`, or a bad input.
+/// Channel-keyed: a change list carries the room's paths and values, so the server
+/// narrows it to what this channel may read. The reply updates the diff view, keyed
+/// by the room the server resolved.
 ///
 /// # Safety
-/// `client` is a live handle; `room`/`room_len`, `a`/`a_len`, and `b`/`b_len`
-/// follow [`as_slice`].
+/// `client` is a live handle; `a`/`a_len` and `b`/`b_len` follow [`as_slice`].
 #[no_mangle]
 pub unsafe extern "C" fn crdtsync_client_diff_query(
     client: *const CrdtClient,
-    room: *const u8,
-    room_len: usize,
+    channel: u32,
     kind: u32,
     a: *const u8,
     a_len: usize,
@@ -4248,12 +4248,8 @@ pub unsafe extern "C" fn crdtsync_client_diff_query(
             1 => DiffKind::Branches,
             _ => return None,
         };
-        match (
-            as_slice(room, room_len),
-            as_slice(a, a_len),
-            as_slice(b, b_len),
-        ) {
-            (Some(r), Some(a), Some(b)) => Some(s.diff_query(r, kind, a, b)),
+        match (as_slice(a, a_len), as_slice(b, b_len)) {
+            (Some(a), Some(b)) => Some(s.diff_query(Channel(channel), kind, a, b)),
             _ => None,
         }
     })

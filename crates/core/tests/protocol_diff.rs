@@ -2,15 +2,19 @@
 //!
 //! A client asks for the structural diff between two of a room's saved versions
 //! or two of its branches; the server replies with the encoded change list. The
-//! query is room-keyed like branch management — runnable before any subscription
-//! — and the change payload rides the same `encode_changes` codec the diff SDK
-//! bindings decode. Rooms, versions, and branch names are opaque byte strings the
-//! core does not parse. Decoding stays total.
+//! query is channel-keyed like a version fetch — a change list carries the room's
+//! own paths and values, so the server resolves the room and the scope it narrows
+//! to from the channel — while the reply is keyed by that resolved room. The change
+//! payload rides the same `encode_changes` codec the diff SDK bindings decode.
+//! Rooms, versions, and branch names are opaque byte strings the core does not
+//! parse. Decoding stays total.
 
 use crdtsync_core::diff::{encode_changes, Change};
 use crdtsync_core::element::ElementKind;
 use crdtsync_core::path::encode_path;
-use crdtsync_core::protocol::{decode_message, encode_message, DiffKind, Message, ProtocolError};
+use crdtsync_core::protocol::{
+    decode_message, encode_message, Channel, DiffKind, Message, ProtocolError,
+};
 use crdtsync_core::Scalar;
 
 fn round_trip(m: Message) {
@@ -34,13 +38,13 @@ fn sample_changes() -> Vec<u8> {
 #[test]
 fn diff_query_frames_round_trip() {
     round_trip(Message::DiffQuery {
-        room: b"room".to_vec(),
+        channel: Channel(0),
         kind: DiffKind::Versions,
         a: b"v1".to_vec(),
         b: b"v2".to_vec(),
     });
     round_trip(Message::DiffQuery {
-        room: b"room".to_vec(),
+        channel: Channel(u32::MAX),
         kind: DiffKind::Branches,
         a: b"main".to_vec(),
         b: b"draft".to_vec(),
@@ -64,7 +68,7 @@ fn diff_result_round_trips_an_empty_and_a_many_change_diff() {
 #[test]
 fn empty_names_round_trip() {
     round_trip(Message::DiffQuery {
-        room: Vec::new(),
+        channel: Channel(0),
         kind: DiffKind::Versions,
         a: Vec::new(),
         b: Vec::new(),
@@ -81,7 +85,7 @@ fn empty_names_round_trip() {
 fn a_truncated_diff_message_is_an_error_not_a_panic() {
     for m in [
         Message::DiffQuery {
-            room: b"room".to_vec(),
+            channel: Channel(7),
             kind: DiffKind::Branches,
             a: b"main".to_vec(),
             b: b"draft".to_vec(),
@@ -105,14 +109,13 @@ fn a_truncated_diff_message_is_an_error_not_a_panic() {
 #[test]
 fn a_bad_diff_kind_tag_is_an_error_not_a_panic() {
     let mut bytes = encode_message(&Message::DiffQuery {
-        room: b"r".to_vec(),
+        channel: Channel(3),
         kind: DiffKind::Versions,
         a: b"a".to_vec(),
         b: b"b".to_vec(),
     });
-    // The kind tag sits right after the 1-byte message tag and the length-framed
-    // room (4-byte length + 1 byte "r").
-    bytes[6] = 9;
+    // The kind tag sits right after the 1-byte message tag and the 4-byte channel.
+    bytes[5] = 9;
     assert!(matches!(
         decode_message(&bytes),
         Err(ProtocolError::BadTag {
@@ -125,7 +128,7 @@ fn a_bad_diff_kind_tag_is_an_error_not_a_panic() {
 #[test]
 fn trailing_bytes_after_a_diff_message_are_rejected() {
     let mut bytes = encode_message(&Message::DiffQuery {
-        room: b"room".to_vec(),
+        channel: Channel(0),
         kind: DiffKind::Versions,
         a: b"v1".to_vec(),
         b: b"v2".to_vec(),
@@ -138,7 +141,7 @@ fn trailing_bytes_after_a_diff_message_are_rejected() {
 fn diff_tags_are_distinct_from_each_other_and_the_branch_frames() {
     let tags: Vec<u8> = [
         Message::DiffQuery {
-            room: Vec::new(),
+            channel: Channel(0),
             kind: DiffKind::Versions,
             a: Vec::new(),
             b: Vec::new(),
