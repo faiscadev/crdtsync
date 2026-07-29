@@ -207,3 +207,66 @@ fn a_straddling_groups_survivor_is_applied_not_held() {
         "the survivor is still waiting on a member that will never arrive"
     );
 }
+
+/// A group of `n` two-member atomic transactions inside the withheld zone, folded by
+/// a room replica so each one commits and spends its bucket key there.
+fn zb_groups(author: &mut Document, n: usize) -> Vec<Op> {
+    (0..n)
+        .flat_map(|i| {
+            author.atomic_transact(|tx| {
+                tx.map(b"notes")
+                    .register(format!("n{i}a").as_bytes(), Scalar::Int(1));
+                tx.map(b"notes")
+                    .register(format!("n{i}b").as_bytes(), Scalar::Int(2));
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn a_zone_projection_serves_no_record_of_the_withheld_partitions_groups() {
+    // A resolved-group key names an author and a group, never a partition, so a key
+    // kept through the cut would tell a za-only subscriber that the author resolved a
+    // group it cannot see. The record goes whole, and the recipient buckets a member
+    // arriving under one of those ids as a group it has never seen resolve.
+    let (mut author, setup) = seeded();
+    let group = zb_groups(&mut author, 1);
+    let stray = author.transact(|tx| {
+        tx.map(b"loose").register(b"lk", Scalar::Int(9));
+    });
+    // Re-tagged into the withheld zone's group, but targeting the root partition, so
+    // the cut leaves it applicable at the recipient — only the record decides.
+    let mut forged = stray[0].clone();
+    forged.tx = group[0].tx;
+
+    let mut whole = room(&setup, &group);
+    assert!(
+        whole.apply(&forged),
+        "the unprojected room holds the record and merges the stray"
+    );
+
+    let mut projected = room(&setup, &group);
+    projected.project_zones(&zoned(), &za_only(), None);
+    let mut restored = round_trip(&projected);
+    assert!(
+        !restored.apply(&forged),
+        "the projection served its record of the withheld zone's groups"
+    );
+}
+
+#[test]
+fn a_zone_projection_does_not_grow_with_the_withheld_partitions_group_count() {
+    // The size of what is served must not count the groups behind the cut.
+    let served = |n: usize| {
+        let (mut author, setup) = seeded();
+        let groups = zb_groups(&mut author, n);
+        let mut projected = room(&setup, &groups);
+        projected.project_zones(&zoned(), &za_only(), None);
+        projected.encode_state().len()
+    };
+    assert_eq!(
+        served(1),
+        served(9),
+        "the snapshot counts the groups the withheld zone resolved"
+    );
+}

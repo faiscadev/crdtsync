@@ -1376,9 +1376,10 @@ fn a_duplicate_of_an_applied_member_changes_nothing() {
 
 #[test]
 fn many_resolved_keys_encode_in_one_order() {
-    // The record is a set, so its iteration order is per-instance. Two replicas that
-    // resolved the same groups in opposite orders have to encode identical bytes, or
-    // the record itself is the divergence it exists to prevent.
+    // The record is a set, so its iteration order is per-instance and says nothing
+    // about what a replica folded. Replicas that resolved the same groups in
+    // different orders have to encode identical bytes, or the record is itself the
+    // divergence it exists to prevent.
     let mut a = doc(1);
     let groups: Vec<Vec<Op>> = (0..12)
         .map(|i| {
@@ -1389,18 +1390,57 @@ fn many_resolved_keys_encode_in_one_order() {
         })
         .collect();
 
-    let mut forward = doc(9);
-    for op in groups.iter().flatten() {
-        forward.apply(op);
+    // Several rotations of the fold order, so the answer does not rest on two hash
+    // sets happening to disagree.
+    let mut folded: Option<Vec<u8>> = None;
+    for rotation in 0..groups.len() {
+        let mut d = doc(9);
+        for i in 0..groups.len() {
+            for op in &groups[(i + rotation) % groups.len()] {
+                d.apply(op);
+            }
+        }
+        let bytes = d.encode_state();
+        match &folded {
+            None => folded = Some(bytes),
+            Some(first) => assert_eq!(
+                &bytes, first,
+                "rotation {rotation} encoded the record in its own order"
+            ),
+        }
     }
-    let mut backward = doc(9);
-    for op in groups.iter().rev().flatten() {
-        backward.apply(op);
-    }
+}
+
+#[test]
+fn the_mint_drains_what_spending_its_own_key_releases() {
+    // The author's group is complete the moment it is tagged, so spending its key
+    // releases whatever the buffer held under that id — and a released member applies
+    // on the drain, not on whenever the next unrelated arrival happens to run one.
+    let id = crdtsync_core::TxId::derive([0, 1]);
+
+    // A foreign op under the author's own client id, tagged into the group the next
+    // local transaction derives, at a sequence the mint will not take.
+    let mut elsewhere = doc(7);
+    let mut stray = elsewhere.transact(|tx| {
+        tx.register(b"stray", Scalar::Int(3));
+    })[0]
+        .clone();
+    stray.id.seq = 100;
+    stray.tx = Some(Tx { id, count: 2 });
+
+    let mut a = doc(7);
+    assert!(!a.apply(&stray), "held under the group it names");
+    assert_eq!(reg(&a, b"stray"), None);
+
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"m1", Scalar::Int(1));
+        tx.register(b"m2", Scalar::Int(2));
+    });
+    assert_eq!(tx_id(&ops[0]), id, "the group the stray named");
     assert_eq!(
-        forward.encode_state(),
-        backward.encode_state(),
-        "the record's encoding follows its set iteration order"
+        reg(&a, b"stray"),
+        Some(Scalar::Int(3)),
+        "the mint spent its key and left what it released in the buffer"
     );
 }
 
