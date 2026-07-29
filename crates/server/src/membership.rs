@@ -278,7 +278,10 @@ pub struct Membership {
     /// first-hand claim by the node named — a member can vouch for itself only, and
     /// never *for* itself ([`note_verified`](Self::note_verified) refuses that).
     /// Grow-only per member, so it merges by union: within one node the order claims
-    /// arrive in cannot change the result. Between nodes it converges only as far as
+    /// arrive in cannot change the result — which is why a claim about a member this
+    /// view has not met is *held* rather than dropped (see
+    /// [`claim_may_be_retained`](Self::claim_may_be_retained)), since dropping it made
+    /// the union, and so the ring, a function of arrival order. Between nodes it converges only as far as
     /// the claims travel, and a claim travels only from the member that made it —
     /// nothing here relays another node's word, so a member that sends different
     /// claims to different peers leaves them holding different evidence permanently
@@ -661,11 +664,57 @@ impl Membership {
         }
     }
 
+    /// Record `sender`'s claims about members this view has not learned, for the seam
+    /// that admits a tuple's evidence without admitting the member it names. Same bars
+    /// as the claims carried on an admitted tuple: the sender is on the roster, and the
+    /// member it names is neither this node nor tombstoned.
+    pub fn note_claims(&mut self, sender: &NodeId, nodes: impl IntoIterator<Item = NodeId>) {
+        if !self.can_be_verified(sender) {
+            return;
+        }
+        let mut rebuilt = false;
+        for node in nodes {
+            if self.claim_may_be_retained(&node) {
+                rebuilt |= self
+                    .verifiers
+                    .entry(node)
+                    .or_default()
+                    .insert(sender.clone());
+            }
+        }
+        if rebuilt {
+            self.rebuild_placement();
+        }
+    }
+
     /// Whether a verification of `node` is admissible evidence at all — the bar every
     /// verifier claim clears, this node's own and a peer's alike. See
     /// [`note_verified`](Self::note_verified) for what each clause refuses.
     fn can_be_verified(&self, node: &NodeId) -> bool {
         !self.is_self(node) && self.addrs.contains_key(node)
+    }
+
+    /// Whether a *peer's* claim about `node` may be retained. Weaker than
+    /// [`can_be_verified`](Self::can_be_verified) in one place, deliberately: the claim
+    /// does not require `node` to be on the roster **yet**.
+    ///
+    /// The frame that carries a claim about a member and the frame that introduces
+    /// that member are two frames, and which arrives first is ordinary network
+    /// ordering. Requiring the member first made retention a function of arrival order,
+    /// and `adopted` is derived from `verifiers`, so the *ring* became a function of
+    /// arrival order one level down — two nodes given the identical frames in different
+    /// orders placed different rooms until the vouchers happened to gossip again. A
+    /// claim about a member this view has not met is held rather than dropped; it
+    /// counts for nothing until that member exists, because [`rebuild_placement`] only
+    /// ever scans the roster.
+    ///
+    /// A tombstoned node is still refused. It is not a member of this view, and banking
+    /// claims against it would let it return pre-adopted on evidence collected while
+    /// nobody could reach it.
+    ///
+    /// [`rebuild_placement`]: Self::rebuild_placement
+    fn claim_may_be_retained(&self, node: &NodeId) -> bool {
+        !self.is_self(node) && !self.reaped.contains_key(node)
     }
 
     /// How many **trust units** have vouched for `node`: the distinct hosts of the
@@ -963,7 +1012,7 @@ impl Membership {
         // roster is what keeps it bounded at all.
         if self.can_be_verified(sender) {
             for node in claimed {
-                if self.can_be_verified(&node) {
+                if self.claim_may_be_retained(&node) {
                     rebuilt |= self
                         .verifiers
                         .entry(node)

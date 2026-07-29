@@ -1015,15 +1015,30 @@ impl Registry {
         let Some(membership) = &self.membership else {
             return false;
         };
-        let members = members
-            .into_iter()
-            .filter(|(node, addr, ..)| {
+        // An inbound frame introduces only its own sender: admitting a *third* member
+        // from it would be a join with no dial behind it. But refusing to admit the
+        // member is not a reason to discard the *claim* the same tuple carries — the
+        // frame naming a member and the frame introducing it are two frames, and which
+        // arrives first is ordinary network ordering. Dropping the claim made the ring
+        // a function of that order: the same three frames delivered as
+        // `[joiner, s1, s2]` adopted the joiner and as `[s1, s2, joiner]` left it
+        // pending, placing 959 of 2000 sample rooms differently until a voucher
+        // happened to gossip again. The claim is carried over separately, where it is
+        // held against a member this view does not have yet and counts for nothing
+        // until it does.
+        let (admitted, deferred): (Vec<_>, Vec<_>) =
+            members.into_iter().partition(|(node, addr, ..)| {
                 // `is_member` holds for self too — a node is a member of its own view
                 // from construction and is never reaped out of it.
                 let node = NodeId::from(node.clone());
                 membership.is_member(&node) || (&node == sender && addr == node.as_bytes())
-            })
+            });
+        let deferred: Vec<NodeId> = deferred
+            .into_iter()
+            .filter(|(_, _, _, _, verified)| *verified)
+            .filter_map(|(node, ..)| NodeId::canonical(&node))
             .collect();
+        let members = admitted;
         // Whether a claim is attributable is asked the same way on both halves of a
         // round, because `verifiers` has to converge and this is what decides what
         // enters it. Reading the link here (bound to `sender`, C13) while the reply
@@ -1035,6 +1050,11 @@ impl Registry {
         // configuration and the member's own address, so every node computes it alike.
         let attributable = self.dial_establishes_identity(sender);
         self.merge_gossip_attributed(sender, members, attributable);
+        if attributable && !deferred.is_empty() {
+            if let Some(membership) = &mut self.membership {
+                membership.note_claims(sender, deferred);
+            }
+        }
         let reply = crate::gossip::gossip_frame(&self.known_liveness());
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.outbox.push(reply);
