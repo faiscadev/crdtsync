@@ -1748,11 +1748,14 @@ fn zone_readable(
 /// the named-version fetch — so a redaction added to it cannot reach one seam and miss
 /// the other, which is the failure this composition exists to answer.
 ///
-/// The order is load-bearing. `project_read_paths` keeps a movable node that was
-/// dragged from a readable subtree into a denied one, at its readable origin; running
-/// the zone projection afterwards still purges that node by its current partition.
-/// Reversed, the un-purge would resurrect it into a partition the recipient cannot
-/// read.
+/// The read projection runs first because its reveal rule reads the tree: a movable
+/// node dragged from a readable subtree into a denied one is kept at its readable
+/// origin, and that decision is taken against the whole document rather than one
+/// already trimmed to a partition — the same order the op fan-out resolves in, which
+/// is what the op-join ≡ snapshot-join convergence rests on. Running the zone
+/// projection first would be *more* redactive, not less (a zone-purged node has no
+/// placement left for the reveal rule to find), so the order is a convergence
+/// property, not a containment one.
 ///
 /// `index` resolves element-scoped grants to paths, and belongs to the tree being
 /// narrowed: the live room's for a catch-up snapshot, the version's own for a version
@@ -1790,17 +1793,20 @@ fn project_served_state(
 /// [`project_snapshot_zones`] and a caller that must know whether narrowing is even
 /// possible cannot drift apart.
 ///
-/// "Whole-zone" is decided by containment over the declared ids rather than by
-/// cardinality: a set resolved against one schema version can outlive it on a bound
-/// channel, and a count that happens to match a later schema's zone count says
-/// nothing about *which* partitions it names.
+/// "Whole-zone" means the set is *exactly* the declared id range, rather than merely
+/// having as many members. A set is resolved once, when a channel subscribes, and the
+/// room's governing schema can lift underneath it, so a set can both miss a declared
+/// partition and name ids no longer declared — and a member count says nothing about
+/// which of the two it is. Anything short of the exact range projects, which is the
+/// only reading that is never wider than either a count or a containment test alone.
 fn zone_narrowing<'a>(
     schema: Option<&'a Schema>,
     zones: &'a Option<HashSet<u32>>,
 ) -> Option<(&'a Schema, &'a HashSet<u32>)> {
     let (schema, set) = (schema?, zones.as_ref()?);
     let declared = schema.zones().len() as u32;
-    (declared > 0 && !(0..declared).all(|id| set.contains(&id))).then_some((schema, set))
+    let whole = set.len() as u32 == declared && (0..declared).all(|id| set.contains(&id));
+    (declared > 0 && !whole).then_some((schema, set))
 }
 
 /// Narrow a catch-up snapshot to a zone-limited subscriber's authorized partitions,
