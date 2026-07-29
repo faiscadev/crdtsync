@@ -1183,8 +1183,10 @@ pub fn step(
         // sees it — so a change list is the diff of the two states this reader would
         // itself have been served, and a partition it may not read contributes no
         // change at all rather than a redacted one. Served locally from the replicated
-        // state, so no leader redirect. An absent version/branch maps to a recoverable
-        // NotFound; a state that fails to decode is an internal fault.
+        // state, so no leader redirect. An absent version/branch answers `NotFound`, a
+        // side that fails to decode `Internal`; neither closes, since a diff's two
+        // sides come off durable storage and one being unreadable says nothing about
+        // the live stream this channel carries.
         Message::DiffQuery {
             channel,
             kind,
@@ -1252,10 +1254,10 @@ pub fn step(
             match diff {
                 Ok(changes) => {
                     // A change list is captured room content leaving the server — the
-                    // same auditable history read a version fetch records, in a
-                    // different shape, so it goes through the same audit seam and once
-                    // it is actually going out. The read was authorized by
-                    // `channel_room` above, so the verdict is granted.
+                    // same auditable history read a version fetch records, in another
+                    // shape — so it goes through the same audit seam, and like the
+                    // fetch only once the content is actually going out. The read was
+                    // authorized by `channel_room` above, so the verdict is granted.
                     authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     Response {
                         replies: vec![Message::DiffResult {
@@ -1272,8 +1274,8 @@ pub fn step(
         Message::DiffResult { .. } => violation("client sent a diff result"),
         // Cloning duplicates the live state of `src` into a fresh room `dst` — a
         // read of the whole source composed with a room create. Two gates compose:
-        // the actor must be able to read `src` (the same read tier a branch list or
-        // diff uses — the doc-ACL tier abstains, deployment and schema decide), and
+        // the actor must be able to read `src` (the same read tier a branch list
+        // uses — the doc-ACL tier abstains, deployment and schema decide), and
         // the create is a room-management mutation on `dst`, gated by the write tier
         // a branch mutation uses. A create persists a new room, so like a branch
         // mutation it is served only by `dst`'s leader; on a non-leader it is
@@ -2121,7 +2123,7 @@ fn branch_authorized(
 
 /// The refusal for a room-keyed `what` request [`branch_authorized`] rejected: a
 /// violation if the connection is unauthenticated, otherwise a non-closing
-/// forbidden. `what` names the request kind (`"branch"`, `"diff"`) in the
+/// forbidden. `what` names the request kind (`"branch"`, `"clone"`) in the
 /// diagnostic so the message points at the surface the client actually used.
 fn request_denied(session: &Session, what: &str) -> Response {
     if session.actor().is_none() {
