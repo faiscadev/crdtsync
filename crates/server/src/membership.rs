@@ -928,13 +928,23 @@ impl Membership {
         // above — a claim about a node that was dropped as malformed, or that is
         // tombstoned, is a claim about no member of this view — and only where the
         // member is coherently addressed, the same bar this node's own links clear.
-        for node in claimed {
-            if self.can_be_verified(&node) {
-                rebuilt |= self
-                    .verifiers
-                    .entry(node)
-                    .or_default()
-                    .insert(sender.clone());
+        //
+        // The *sender* clears that same bar, because it is what the entry stores. A
+        // verifier off the roster can never count — `verifier_units` reads only adopted
+        // ones — but it would still be retained, and peer admission takes the id a link
+        // claims: one certified host opens a link per port, claims a distinct id on
+        // each, and banks an entry per link against every member, keyed on ids no reap
+        // will ever strike because they are on no roster. Bounding the evidence by the
+        // roster is what keeps it bounded at all.
+        if self.can_be_verified(sender) {
+            for node in claimed {
+                if self.can_be_verified(&node) {
+                    rebuilt |= self
+                        .verifiers
+                        .entry(node)
+                        .or_default()
+                        .insert(sender.clone());
+                }
             }
         }
         if rebuilt {

@@ -115,9 +115,25 @@ impl PeerEndpoint {
         // canonical form, so the two would disagree about which endpoint the string
         // names — and a *wrong* canonical form is worse than none, because it is
         // accepted.
+        // Brackets mean one thing: an IPv6 literal. A bracketed anything-else is read
+        // here as a host whose own text contains colons, and the canonical form then
+        // emits that host verbatim with the port appended — `[10.0.0.1:9000]:9443`
+        // becomes the id `10.0.0.1:9000:9443`, which names no endpoint any dialer
+        // accepts. That id is worse than a refusal: it is *accepted*, so it is
+        // configured and adopted from birth, placed on every room HRW gives it, and
+        // never acks — the rooms it holds a replica of can reach no quorum. Written as
+        // this node's own id it is worse still, because it has no canonical form at
+        // all, so peers drop it from gossip and refuse its `PeerAuth`, and the node
+        // joins nothing while believing it has.
         if let Some(after) = authority.strip_prefix('[') {
             match after.split_once(']') {
-                Some((_, rest)) if rest.is_empty() || rest.starts_with(':') => {}
+                // Empty brackets name no host at all, which the check below classifies
+                // more precisely.
+                Some((host, rest)) if rest.is_empty() || rest.starts_with(':') => {
+                    if !host.is_empty() && host.parse::<std::net::Ipv6Addr>().is_err() {
+                        return Err(BadPeerAddress::NotAnAuthority);
+                    }
+                }
                 _ => return Err(BadPeerAddress::NotAnAuthority),
             }
         }
@@ -569,6 +585,40 @@ mod tests {
     }
 
     #[test]
+    fn a_bracketed_host_that_is_no_ipv6_literal_is_refused() {
+        // Brackets are the IPv6 literal's syntax and nothing else. Bracketing a
+        // `host:port` pair — the operator typo `[10.0.0.1:9000]:9443` — otherwise reads
+        // as a host whose own text carries colons, and every reader downstream agrees
+        // on an id (`10.0.0.1:9000:9443`) that no dialer will build a URL for. It would
+        // be accepted at the config door, adopted from birth, and placed on rooms that
+        // could then reach no quorum, because the member holding their replicas is one
+        // nobody can reach.
+        for addr in [
+            "[a.example:9000]:9443",
+            "[10.0.0.1:9000]:9443",
+            "[node-a.example:9000]:9443",
+            "wss://[a.example:9000]:9443",
+            "[a.example:]",
+            "[a:]",
+            "[[a]:9000",
+            "[a.example]",
+            "[10.0.0.1]:9000",
+        ] {
+            assert_eq!(
+                PeerEndpoint::parse(addr),
+                Err(BadPeerAddress::NotAnAuthority),
+                "{addr}"
+            );
+            assert_eq!(canonical_member_addr(addr), None, "{addr}");
+        }
+        // The literal itself still resolves, in either spelling of its own text.
+        for addr in ["[::1]:9000", "[2001:db8::6]:9000", "[2001:0db8::0:6]:9000"] {
+            assert!(PeerEndpoint::parse(addr).is_ok(), "{addr}");
+            assert!(canonical_member_addr(addr).is_some(), "{addr}");
+        }
+    }
+
+    #[test]
     fn a_dialed_url_names_the_same_host_the_binding_reads() {
         // The one invariant the refusal above exists for: whatever a reader takes out
         // of an address, the dialer connects to the same host.
@@ -600,6 +650,17 @@ mod tests {
             "[2001:db8::6]:9000",
             "node_a.internal:9000",
             "node-a",
+            // Brackets around something that is not an IPv6 literal: the shape that
+            // used to hand back a host with colons still in it.
+            "[a.example:9000]:9443",
+            "[10.0.0.1:9000]:9443",
+            "[node-a.example:9000]:9443",
+            "wss://[a.example:9000]:9443",
+            "[a.example:]",
+            "[a:]",
+            "[[a]:9000",
+            "[a.example]",
+            "[10.0.0.1]:9000",
         ] {
             let once = canonical_member_addr(addr);
             if let Some(once) = &once {

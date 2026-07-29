@@ -856,6 +856,118 @@ fn a_reaped_member_loses_its_place_and_its_vouches() {
     assert!(!m.is_adopted(&joiner));
 }
 
+#[test]
+fn vouches_banked_while_a_member_is_tombstoned_do_not_survive_its_return() {
+    // Evidence is about a member of *this* view, and a tombstoned node is not one. If
+    // claims about it were banked while it was gone, a member could be reaped and then
+    // return pre-adopted — placed on rooms on the strength of vouches collected while
+    // nobody could reach it, which is the unverified join the unit exists to close. The
+    // vouches must arrive after it does.
+    let mut m = membership_for(SELF_ADDR);
+    let departing = NodeId::from("10.9.9.9:9000");
+    m.add_member(departing.clone());
+    for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+        m.note_gossip_unreachable(&departing);
+    }
+    for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+        m.reap_dead();
+    }
+    assert!(!m.is_member(&departing));
+
+    // Every configured member vouches for it while it is tombstoned — far past the bar.
+    // The claims ride tuples that do not themselves lift the tombstone, which is the
+    // whole point: SWIM's own resurrection rule is not being invoked, only the evidence
+    // is being banked ahead of it.
+    for i in 0..6 {
+        let voucher = NodeId::from(format!("10.0.0.{i}:9000").as_str());
+        m.merge_liveness(
+            &voucher,
+            [(
+                departing.clone(),
+                departing.as_bytes().to_vec(),
+                0,
+                MemberState::Suspect,
+                true,
+            )],
+        );
+        assert!(
+            !m.has_verified(&voucher, &departing),
+            "a claim about a node this view does not hold is about no member",
+        );
+    }
+    assert!(
+        !m.is_member(&departing),
+        "and it did not slip back onto the roster",
+    );
+    assert!(!m.is_adopted(&departing));
+
+    // It returns under SWIM's own rule, at a higher incarnation. It is a member again —
+    // and pending, because none of those claims were kept.
+    m.merge_liveness(
+        &NodeId::from("10.0.0.1:9000"),
+        [(
+            departing.clone(),
+            departing.as_bytes().to_vec(),
+            1,
+            MemberState::Alive,
+            false,
+        )],
+    );
+    assert!(m.is_member(&departing), "it rejoined");
+    assert!(
+        !m.is_adopted(&departing),
+        "it returns pending: the vouches banked while it was gone are gone with it",
+    );
+}
+
+#[test]
+fn a_claim_from_a_sender_off_the_roster_is_not_retained() {
+    // Peer admission takes the id a link claims, so one certified host can present as
+    // many ids as it has ports. A claim is stored under its *sender*, so a sender that
+    // is on no roster would bank an entry per link against every member — keyed on ids
+    // no reap will ever strike, because reaping only strikes members. The evidence is
+    // bounded by the roster or it is not bounded at all.
+    let mut m = membership_for(SELF_ADDR);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    m.add_member(joiner.clone());
+    let before = m.members().len();
+
+    for port in 9100..9200 {
+        let stranger = NodeId::from(format!("evil.example:{port}").as_str());
+        m.merge_liveness(
+            &stranger,
+            [(
+                joiner.clone(),
+                joiner.as_bytes().to_vec(),
+                0,
+                MemberState::Alive,
+                true,
+            )],
+        );
+        assert!(
+            !m.has_verified(&stranger, &joiner),
+            "a sender off the roster leaves nothing behind",
+        );
+    }
+    assert_eq!(m.members().len(), before, "and joins nothing either");
+    assert!(!m.is_adopted(&joiner));
+
+    // A sender that *is* a member is still recorded — the bar is roster membership,
+    // not distrust of gossip.
+    let member = NodeId::from("10.0.0.1:9000");
+    m.merge_liveness(
+        &member,
+        [(
+            joiner.clone(),
+            joiner.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )],
+    );
+    assert!(m.has_verified(&member, &joiner));
+}
+
 // --- a pending member is still a member ---
 
 #[test]
@@ -1525,13 +1637,12 @@ fn a_second_spelling_of_an_honest_member_is_not_a_second_member() {
         "wss://a.example..:9000",
         "wss://a.example...:9000",
         "wss://A.Example.:09000",
+        "wss://[a.example:9000]:9000",
+        "[a.example:]",
     ] {
         m.add_member(NodeId::from(spelling));
         assert!(
-            matches!(
-                crdtsync_server::dial::canonical_member_addr(spelling),
-                None | Some(_)
-            ) && NodeId::canonical(spelling.as_bytes()).is_none_or(|id| id == honest),
+            NodeId::canonical(spelling.as_bytes()).is_none_or(|id| id == honest),
             "{spelling} is either no address or the honest member",
         );
     }

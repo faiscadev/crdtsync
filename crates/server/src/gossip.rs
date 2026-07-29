@@ -148,7 +148,19 @@ pub fn merge_into(membership: &mut Membership, sender: &NodeId, payload: Vec<Gos
 pub fn exchange(initiator: &mut Membership, peer: &mut Membership) {
     let peer_id = peer.self_id().clone();
     let initiator_id = initiator.self_id().clone();
-    peer.merge_liveness(&initiator_id, initiator.known_liveness());
+    // The inbound half admits exactly what production's ([`Registry::apply_gossip`])
+    // does: liveness about members the receiver already holds, plus the sender's own
+    // tuple at its own address. An inbound frame introducing a *third* member is
+    // refused there, so accepting one here would model a join the cluster has no path
+    // for — and convergence measured over a push production rejects is not convergence.
+    let pushed: Vec<GossipMember> = initiator
+        .known_liveness()
+        .into_iter()
+        .filter(|(node, addr, ..)| {
+            peer.is_member(node) || (node == &initiator_id && addr.as_slice() == node.as_bytes())
+        })
+        .collect();
+    peer.merge_liveness(&initiator_id, pushed);
     initiator.merge_liveness(&peer_id, peer.known_liveness());
     initiator.note_gossip_reachable(&peer_id);
     initiator.note_verified(&peer_id);
