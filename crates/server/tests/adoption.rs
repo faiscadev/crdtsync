@@ -1223,3 +1223,140 @@ fn reaping_a_seed_does_not_lower_the_bar() {
         "and this node still holds the constant bar",
     );
 }
+
+// --- an advertise address names one endpoint, and one endpoint has one id ---
+
+#[test]
+fn an_address_that_carries_more_than_an_authority_is_no_address() {
+    // The host a reader takes out of the string and the host a dialer connects to must
+    // be the same one. A URL's userinfo splits them: `a.example:1@b.example:9000` reads
+    // as `a.example` and connects to `b.example`, so a certificate for `a.example`
+    // would bind an id that every honest peer verifies by dialing *`b`* — and the
+    // attacker then speaks as a member of `b`'s rooms. A path splits nothing but is a
+    // free alias, which is the other half of the same defect.
+    for addr in [
+        "wss://evil.example:1@10.0.0.1:9000",
+        "evil.example@10.0.0.1:9000",
+        "10.0.0.1:9000/x",
+        "ws://10.0.0.1:9000/a/b",
+        "10.0.0.1:9000?x=1",
+        "10.0.0.1:9000#f",
+    ] {
+        assert!(
+            crdtsync_server::dial::PeerEndpoint::parse(addr).is_err(),
+            "{addr} is not an advertise address",
+        );
+        assert!(
+            crdtsync_server::dial::canonical_member_addr(addr).is_none(),
+            "{addr} has no canonical form",
+        );
+    }
+}
+
+#[test]
+fn an_id_that_embeds_another_host_reaches_no_roster_and_no_link() {
+    // End to end: the ground id is refused at every door. Gossip does not learn it, so
+    // no node ever dials the honest host it embeds and verifies it; and no link can
+    // bind to it, so it speaks as nobody even if some peer had.
+    let minted = NodeId::from("wss://evil.example:1@10.0.0.1:9000");
+    let mut r = registry();
+    r.merge_gossip(
+        &NodeId::from("10.0.0.1:9000"),
+        advertisements(&[&minted], false),
+    );
+    let view = r.membership().expect("clustered");
+    assert!(!view.is_member(&minted), "it is no member");
+    assert!(!view.is_adopted(&minted));
+
+    let id = r.connect();
+    assert!(
+        !r.deliver(
+            id,
+            Message::PeerAuth {
+                node: minted.as_bytes().to_vec(),
+                secret: SECRET.to_vec(),
+            },
+        ),
+        "and no link binds to it",
+    );
+}
+
+#[test]
+fn one_endpoint_holds_one_node_id() {
+    // A node id *is* an advertise address and placement hashes it, so two spellings of
+    // one endpoint would be two positions in the ring that one node answers for. Every
+    // peer that dialed either would verify it truthfully and both would be adopted —
+    // and only one of them ever speaks, so a room that placed on the other waits on an
+    // ack that never comes. The spellings collapse before the roster sees them.
+    let canonical = NodeId::from("10.9.9.9:9000");
+    let spellings = [
+        "10.9.9.9:9000",
+        "ws://10.9.9.9:9000",
+        "WS://10.9.9.9:9000",
+        "  10.9.9.9:9000  ",
+    ];
+    for spelling in spellings {
+        assert_eq!(NodeId::from_addr(spelling), canonical, "{spelling}");
+    }
+
+    let mut m = membership_for(SELF_ADDR);
+    let before = m.members().len();
+    m.add_members(spellings.iter().map(|s| NodeId::from(*s)));
+    assert_eq!(
+        m.members().len(),
+        before + 1,
+        "every spelling is the same one member",
+    );
+    assert!(m.is_member(&canonical));
+}
+
+#[test]
+fn a_tls_member_keeps_its_scheme_and_a_plain_one_drops_it() {
+    // The canonical form is not "strip the scheme": a member's transport is part of its
+    // identity (§Peer Transport), and dropping `wss://` would make a TLS member and a
+    // plaintext one on the same authority one id.
+    assert_eq!(
+        NodeId::from_addr("WSS://Node-A.Example.:9000"),
+        NodeId::from("wss://node-a.example:9000"),
+    );
+    assert_ne!(
+        NodeId::from_addr("wss://node-a.example:9000"),
+        NodeId::from_addr("ws://node-a.example:9000"),
+    );
+    assert_eq!(
+        NodeId::from_addr("[2001:0DB8:0000:0000:0000:0000:0000:0006]:9000"),
+        NodeId::from_addr("[2001:db8::6]:9000"),
+    );
+}
+
+#[test]
+fn an_adopted_member_is_un_adopted_when_a_voucher_is_reaped() {
+    // The ring is *derived* from the evidence, not accumulated as it goes past. So
+    // evidence that goes away takes the placement with it — which is the whole point:
+    // a node that kept the member placed because it happened to see the vouches before
+    // the reap would disagree, permanently, with one that saw them after.
+    let mut m = membership_for(SELF_ADDR);
+    let joiner = NodeId::from("10.9.9.9:9000");
+    let voucher = NodeId::from("10.0.0.1:9000");
+    m.add_member(joiner.clone());
+    vouch(&mut m, "10.0.0.1:9000", &joiner);
+    vouch(&mut m, "10.0.0.2:9000", &joiner);
+    assert!(m.is_adopted(&joiner));
+
+    for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+        m.note_gossip_unreachable(&voucher);
+    }
+    for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+        m.reap_dead();
+    }
+    assert!(!m.is_member(&voucher), "the voucher departed");
+    assert!(
+        !m.is_adopted(&joiner),
+        "and the member it carried leaves the ring with it",
+    );
+
+    // A replacement voucher puts it back, so this is the evidence speaking and not a
+    // one-way door.
+    vouch(&mut m, "10.0.0.3:9000", &joiner);
+    assert!(m.is_adopted(&joiner));
+}

@@ -400,28 +400,40 @@ fn a_single_node_registry_knows_no_members_and_ignores_gossip() {
 
 #[test]
 fn a_member_learned_by_gossip_becomes_a_placement_target() {
-    // Start knowing only self, which leads every room. Learn a peer by gossip, then
-    // some rooms place on — and are led by — the newcomer, so it is a live redirect
-    // and replica target (effective_primary_for elects it; the redirect uses that
-    // leader's address).
+    // Learn a peer by gossip and have the cluster verify it; then some rooms place on
+    // — and are led by — the newcomer, so it is a live redirect and replica target
+    // (effective_primary_for elects it; the redirect uses that leader's address).
     let self_addr = "10.0.0.9:9000";
-    let mut m = alone(self_addr);
+    // Seeded with peers, so the newcomer clears the cluster's bar rather than the
+    // single-node exception: two adopted trust units have to have reached it.
+    let mut m = seeded(self_addr, &format!("{A},{B}"));
     let newcomer = "10.0.0.7:9000";
     let newcomer_id = NodeId::from_addr(newcomer);
+    let places_on_newcomer = |m: &Membership| {
+        sample_rooms()
+            .iter()
+            .any(|room| m.replicas_for(room).contains(&newcomer_id))
+    };
 
-    // Before learning it, the newcomer leads nothing here.
-    assert!(sample_rooms()
-        .iter()
-        .all(|room| m.primary_for(room) == Some(NodeId::from_addr(self_addr))));
-
+    assert!(!places_on_newcomer(&m), "unknown, so it holds nothing");
     m.add_member(newcomer_id.clone());
-    // Learned, but pending: it is dialed and gossiped about, and placed nowhere.
-    assert!(sample_rooms()
-        .iter()
-        .all(|room| m.primary_for(room) == Some(NodeId::from_addr(self_addr))));
-    // This node then reaches it over an identity-checked link, which is the whole
-    // cluster's verdict here — there is nobody else to raise.
+    assert!(
+        !places_on_newcomer(&m),
+        "learned but pending: dialed and gossiped about, placed nowhere",
+    );
+    // This node reaches it over an identity-checked link, and one of its peers reports
+    // having done the same — two trust units, which is the cluster's bar.
     m.note_verified(&newcomer_id);
+    m.merge_liveness(
+        &NodeId::from_addr(A),
+        [(
+            newcomer_id.clone(),
+            newcomer.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            true,
+        )],
+    );
 
     let room = sample_rooms()
         .into_iter()

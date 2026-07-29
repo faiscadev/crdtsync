@@ -367,14 +367,17 @@ impl Membership {
     pub fn add_members(&mut self, members: impl IntoIterator<Item = NodeId>) {
         let mut added = false;
         for node in members {
+            // An address is taken in its one canonical spelling, or not at all: a
+            // second spelling of one endpoint would be a second member, separately
+            // placed, that the same node answers for and never speaks as.
+            let Some(node) = NodeId::canonical(node.as_bytes()) else {
+                continue;
+            };
             // A reaped member is never re-added by a plain re-advertise: only a live
             // return (an `Alive` tuple through `merge_liveness`) escapes the
             // tombstone, so a bare gossip of the member's address — which carries no
             // liveness — cannot resurrect it.
-            if node.as_bytes().is_empty()
-                || self.addrs.contains_key(&node)
-                || self.reaped.contains_key(&node)
-            {
+            if self.addrs.contains_key(&node) || self.reaped.contains_key(&node) {
                 continue;
             }
             self.liveness
@@ -829,9 +832,12 @@ impl Membership {
         let mut rebuilt = false;
         let mut claimed = Vec::new();
         for (node, addr, incarnation, state, verified) in payload {
-            if node.as_bytes().is_empty() {
+            // One spelling per endpoint, or the tuple names no member at all — the
+            // same bar the additive path applies, and the reason a malformed id is
+            // dropped rather than placed.
+            let Some(node) = NodeId::canonical(node.as_bytes()) else {
                 continue;
-            }
+            };
             if verified && &node != sender && !self.is_self(&node) {
                 claimed.push(node.clone());
             }

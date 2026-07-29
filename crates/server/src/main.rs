@@ -186,6 +186,18 @@ fn membership() -> std::io::Result<Option<Membership>> {
     let Some(peers) = path_var("CRDTSYNC_CLUSTER_PEERS")? else {
         return Ok(None);
     };
+    // Present but empty is refused rather than read as either shape. It is neither
+    // single-node mode (which is the variable being *unset*) nor a cluster, and taking
+    // it as a cluster of one gives the node a peer plane while leaving it with nobody
+    // to be outvoted by — so it would adopt a member into the ring on its own word
+    // while every peer it later meets still holds the cluster's bar (§Member Adoption).
+    if peers.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CRDTSYNC_CLUSTER_PEERS is set but empty: list this node's seed peers, or \
+             unset it for single-node mode",
+        ));
+    }
     let node_id = path_var("CRDTSYNC_NODE_ID")?;
     let advertise = path_var("CRDTSYNC_ADVERTISE_ADDR")?;
     let factor = match path_var("CRDTSYNC_REPLICATION_FACTOR")? {

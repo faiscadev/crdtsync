@@ -91,6 +91,17 @@ impl PeerEndpoint {
         if authority.is_empty() {
             return Err(BadPeerAddress::Empty);
         }
+        // An advertise address is an authority and nothing else. A `@`, a path, a query
+        // or a fragment would make the URL the dialer builds resolve somewhere other
+        // than the host read out of the same string: `wss://a.example:1@b.example:9000`
+        // reads as host `a.example` here and connects to `b.example`, so a certificate
+        // for `a.example` would bind an id that every peer verifies by dialing *`b`*.
+        // A path is refused for the second half of the same reason — it is a free
+        // alias, so one endpoint would answer under unboundedly many node ids, each
+        // separately placed and none of which ever speaks.
+        if authority.contains(['@', '?', '#', '/']) {
+            return Err(BadPeerAddress::NotAnAuthority);
+        }
         // An authority that names no host — an IPv6 literal left unbracketed, or one
         // opening with its port separator — is dialable by nobody and bindable to no
         // certificate. Refused here so every consumer inherits it: a configured member
@@ -101,12 +112,8 @@ impl PeerEndpoint {
             return Err(BadPeerAddress::NoHost);
         }
         let scheme = transport.scheme();
-        // A bare authority is dialed at the root path, as every advertise address
-        // in a cluster is; one that already carries a path keeps it verbatim.
-        let url = match authority.contains('/') {
-            true => format!("{scheme}://{authority}"),
-            false => format!("{scheme}://{authority}/"),
-        };
+        // Every advertise address is dialed at the root path.
+        let url = format!("{scheme}://{authority}/");
         Ok(Self { url, transport })
     }
 
@@ -135,6 +142,38 @@ pub fn member_host(addr: &[u8]) -> Option<String> {
         .map(|(_, rest)| rest)
         .unwrap_or(&endpoint.url);
     host_of(authority).map(|host| host.to_ascii_lowercase())
+}
+
+/// The one spelling of a member's advertise address: no redundant `ws://`, the host
+/// lowercased with its root label dropped, and an IP literal reserialized in its
+/// canonical form. `None` when the address is not one a peer can dial.
+///
+/// A node id **is** an advertise address and placement hashes it, so two spellings of
+/// one endpoint are two positions in the ring that one node answers for — each
+/// verified *truthfully* by every peer that dials it, each adopted, and none of which
+/// ever speaks or acks. A room whose replica set filled up with them would wait on
+/// acks that never come. One spelling per endpoint is what keeps the ring's positions
+/// and the cluster's members the same set.
+pub fn canonical_member_addr(addr: &str) -> Option<String> {
+    let endpoint = PeerEndpoint::parse(addr).ok()?;
+    let authority = endpoint.url.split_once("://")?.1.trim_end_matches('/');
+    let host = host_of(authority)?;
+    // Whatever follows the host — its port separator and port, or nothing.
+    let port = match authority.strip_prefix('[') {
+        Some(after) => after.split_once(']').map(|(_, rest)| rest)?,
+        None => authority.find(':').map_or("", |at| &authority[at..]),
+    };
+    let host = normalized(host);
+    let host = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
+        Ok(ip) => ip.to_string(),
+        Err(_) => host,
+    };
+    let scheme = match endpoint.transport {
+        PeerTransport::Tls => "wss://",
+        PeerTransport::Plain => "",
+    };
+    Some(format!("{scheme}{host}{port}"))
 }
 
 /// The **trust unit** an advertise address belongs to: its host reduced to the one
@@ -229,6 +268,11 @@ pub enum BadPeerAddress {
     /// The authority names no host — an unbracketed IPv6 literal, or an address
     /// opening with its port separator.
     NoHost,
+    /// The address carries more than an authority — userinfo, a path, a query or a
+    /// fragment. Each is a way for the host a reader takes from the string to differ
+    /// from the host a dialer connects to, or for one endpoint to answer under many
+    /// node ids.
+    NotAnAuthority,
     /// The address carries a scheme that is not `ws` or `wss`.
     UnknownScheme(String),
 }
@@ -241,6 +285,11 @@ impl std::fmt::Display for BadPeerAddress {
                 f,
                 "the address names no host, so no peer can dial it — use `host:port`, \
                  bracketing an IPv6 literal"
+            ),
+            BadPeerAddress::NotAnAuthority => write!(
+                f,
+                "the address carries more than a host and port — use `host:port`, with \
+                 no user, path, query or fragment"
             ),
             BadPeerAddress::UnknownScheme(scheme) => write!(
                 f,
@@ -442,10 +491,67 @@ mod tests {
     }
 
     #[test]
-    fn an_address_that_carries_a_path_keeps_it() {
-        assert_eq!(
-            PeerEndpoint::parse("wss://10.0.0.1:9000/sync").unwrap().url,
-            "wss://10.0.0.1:9000/sync"
+    fn an_address_that_carries_more_than_an_authority_is_refused() {
+        // An advertise address is a host and a port. Userinfo would make the host read
+        // out of the string differ from the host the dial connects to; a path, a query
+        // and a fragment are free aliases, so one endpoint would answer under
+        // unboundedly many node ids.
+        for addr in [
+            "wss://10.0.0.1:9000/sync",
+            "wss://a.example:1@b.example:9000",
+            "a.example@b.example:9000",
+            "10.0.0.1:9000?x=1",
+            "10.0.0.1:9000#f",
+        ] {
+            assert_eq!(
+                PeerEndpoint::parse(addr),
+                Err(BadPeerAddress::NotAnAuthority),
+                "{addr}"
+            );
+            assert_eq!(member_host(addr.as_bytes()), None, "{addr}");
+            assert_eq!(canonical_member_addr(addr), None, "{addr}");
+        }
+    }
+
+    #[test]
+    fn a_dialed_url_names_the_same_host_the_binding_reads() {
+        // The one invariant the refusal above exists for: whatever a reader takes out
+        // of an address, the dialer connects to the same host.
+        for addr in ["10.0.0.1:9000", "wss://node-a.example:9000", "[::1]:9000"] {
+            let url = PeerEndpoint::parse(addr).unwrap().url;
+            let authority = url.split_once("://").unwrap().1.trim_end_matches('/');
+            assert_eq!(
+                host_of(authority).map(str::to_ascii_lowercase),
+                member_host(addr.as_bytes()),
+                "{addr}",
+            );
+        }
+    }
+
+    #[test]
+    fn one_endpoint_has_one_canonical_address() {
+        // Two spellings of one endpoint would be two node ids, so two positions in the
+        // ring that one node answers for and only one of which ever speaks.
+        for (a, b) in [
+            ("10.0.0.1:9000", "ws://10.0.0.1:9000"),
+            ("WS://Node-A.Example.:9000", "node-a.example:9000"),
+            (
+                "[2001:0db8:0000:0000:0000:0000:0000:0006]:9000",
+                "[2001:db8::6]:9000",
+            ),
+            ("  wss://Node-A.Example:9000  ", "wss://node-a.example:9000"),
+        ] {
+            assert_eq!(
+                canonical_member_addr(a),
+                canonical_member_addr(b),
+                "{a}/{b}"
+            );
+            assert!(canonical_member_addr(a).is_some(), "{a}");
+        }
+        // A member's transport is part of its identity, so it is not folded away.
+        assert_ne!(
+            canonical_member_addr("wss://node-a.example:9000"),
+            canonical_member_addr("node-a.example:9000"),
         );
     }
 
@@ -462,7 +568,7 @@ mod tests {
         // Dialable by nobody and bindable to no certificate, so it fails at the parse
         // every consumer shares: a configured member at startup, a gossiped one as a
         // *permanent* dial failure rather than one redialed forever.
-        for addr in ["::1:9000", ":9000", "[]:9000", "ws:///path", "wss://:9000"] {
+        for addr in ["::1:9000", ":9000", "[]:9000", "wss://:9000"] {
             assert_eq!(
                 PeerEndpoint::parse(addr),
                 Err(BadPeerAddress::NoHost),
@@ -476,12 +582,7 @@ mod tests {
     #[test]
     fn a_bracketed_literal_and_a_bare_host_still_parse() {
         // The refusal must not catch a legitimate address on its way past.
-        for addr in [
-            "[::1]:9000",
-            "wss://[2001:db8::1]:9000",
-            "node-a",
-            "node-a:9000/x",
-        ] {
+        for addr in ["[::1]:9000", "wss://[2001:db8::1]:9000", "node-a"] {
             assert!(PeerEndpoint::parse(addr).is_ok(), "{addr}");
             assert!(member_host(addr.as_bytes()).is_some(), "{addr}");
         }
@@ -568,10 +669,6 @@ mod tests {
         );
         assert_eq!(
             member_host(b"wss://node-a.internal:9000").as_deref(),
-            Some("node-a.internal")
-        );
-        assert_eq!(
-            member_host(b"ws://node-a.internal:9000/sync").as_deref(),
             Some("node-a.internal")
         );
         assert_eq!(member_host(b"10.0.0.1:9000").as_deref(), Some("10.0.0.1"));

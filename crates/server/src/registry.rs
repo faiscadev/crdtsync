@@ -599,10 +599,12 @@ impl Registry {
             return false;
         }
         // A link that names no member has no identity to gate on, so there is nothing
-        // to admit it as.
-        if claimed.is_empty() {
+        // to admit it as — and it must name it in the one spelling the roster and the
+        // ring use, or the identity every gate decides against would be a member of
+        // neither.
+        let Some(member) = NodeId::canonical(claimed) else {
             return false;
-        }
+        };
         let Some(conn) = self.conns.get_mut(&id) else {
             return false;
         };
@@ -627,7 +629,7 @@ impl Registry {
             }
             Some(_) => {}
         }
-        conn.peer = Some(NodeId::from(claimed.to_vec()));
+        conn.peer = Some(member);
         // Admitting a link is **not** a verification of the member it names, however
         // well the certificate names it. A member chooses when to dial in and how
         // often, so a vouch earned that way is one the member caused rather than one
