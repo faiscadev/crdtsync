@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// long-lived document must be able to load its own snapshot back.
 const MAX_TOMBSTONE_RUN: u32 = 1 << 20;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Side {
     Left,
     Right,
@@ -107,7 +107,12 @@ fn put_node_ref(out: &mut Vec<u8>, kind: ElementKind, id: ElementId) {
 /// Where a new node attaches in the Fugue tree: a parent node (or the root
 /// when `None`) and the side it hangs on. Computed once at insert time so the
 /// placement is replica-independent.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Ordered so two ops carrying one id into one list can be separated by the
+/// positions they name once everything else about them agrees. The order is
+/// arbitrary — nothing about a document reads it as near or far — but it is
+/// total and intrinsic, which is all a tiebreak has to be.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Anchor {
     pub parent: Option<Stamp>,
     pub side: Side,
@@ -517,6 +522,105 @@ impl List {
                 moved_away: false,
             },
         );
+    }
+
+    /// Hand the id `id` to `value` at `anchor`, whatever it currently holds. The
+    /// seam a children-list placement collision resolves through: two ops can carry
+    /// one id into one list, and which position it ends at is decided by the ops
+    /// alone, not by which arrived first — so the id has to be re-seated when the
+    /// deciding op lands second, where `insert_at` is idempotent on it.
+    ///
+    /// A delete stays terminal. An id already tombstoned keeps its tombstone and
+    /// takes only the new position, so the run remembers where the deciding op put
+    /// it rather than where the other one did.
+    pub(crate) fn reseat(&mut self, id: Stamp, value: Element, anchor: Anchor) {
+        let dead = self.take_dead(id);
+        self.nodes.insert(
+            seq_key(&id),
+            Node {
+                id,
+                value,
+                parent: anchor.parent,
+                side: anchor.side,
+                moved_away: false,
+            },
+        );
+        if dead {
+            self.delete_id(id);
+        }
+    }
+
+    /// Re-seat `id` at the lesser of where it already sits and `anchor`, under
+    /// `value`. Two ops can carry one id into one list naming the same node and
+    /// differ in nothing but the position — neither is the other's loser, so the
+    /// position is the meet of the two, which is the same wherever it is computed
+    /// and whichever arrived first.
+    pub(crate) fn rejoin(&mut self, id: Stamp, value: Element, anchor: Anchor) {
+        let anchor = self.anchor_of(id).map_or(anchor, |held| anchor.min(held));
+        self.reseat(id, value, anchor);
+    }
+
+    /// Where `id` currently sits, or `None` if the list does not hold it — read
+    /// back off the sequence rather than remembered, so a reloaded replica joins a
+    /// later claim exactly as the one that never restarted.
+    ///
+    /// A tombstoned id answers as faithfully as a live one. It heads the run the
+    /// delete built, which keeps the anchor it was buried with; and an interior id
+    /// only ever welds into a run by hanging to the right of its predecessor, so
+    /// that is the anchor it was buried with too.
+    fn anchor_of(&self, id: Stamp) -> Option<Anchor> {
+        if let Some(node) = self.nodes.get(&seq_key(&id)) {
+            return Some(Anchor {
+                parent: node.parent,
+                side: node.side,
+            });
+        }
+        let (head, run) = self.dead_run(id)?;
+        if head == id {
+            return Some(Anchor {
+                parent: run.parent,
+                side: run.side,
+            });
+        }
+        Some(Anchor {
+            parent: Some(run_id(head, id.lamport - head.lamport - 1)),
+            side: Side::Right,
+        })
+    }
+
+    /// Lift `id` out of the dead runs, splitting the record that covers it into
+    /// the stretch before it and the stretch after. A run's ids chain — every id
+    /// but the head hangs to the right of its predecessor — so the trailing piece
+    /// re-heads on `id` itself, which is where the chain already had it hanging.
+    /// Re-deleting `id` welds back whichever pieces its anchor chains onto, always
+    /// the trailing one and the leading one only when the anchor is where the chain
+    /// wants it; the same predicate a list that never split applies, so the two
+    /// leave the same record. Returns whether `id` was deleted.
+    fn take_dead(&mut self, id: Stamp) -> bool {
+        let Some((head, run)) = self.dead_run(id) else {
+            return false;
+        };
+        let (len, parent, side) = (run.len, run.parent, run.side);
+        self.dead.remove(&seq_key(&head));
+        let before = id.lamport - head.lamport;
+        self.put_dead(head, before, parent, side);
+        // The stretch after `id` re-heads on `id` itself, which is where the chain
+        // already had it hanging.
+        let after = len - before - 1;
+        if after > 0 {
+            self.put_dead(run_id(head, before + 1), after, Some(id), Side::Right);
+        }
+        true
+    }
+
+    /// Store one piece of a split run. A record covers at least one id, so an empty
+    /// piece is no record.
+    fn put_dead(&mut self, head: Stamp, len: u64, parent: Option<Stamp>, side: Side) {
+        if len == 0 {
+            return;
+        }
+        self.dead
+            .insert(seq_key(&head), DeadRun { len, parent, side });
     }
 
     /// Suppress or re-instate a node's placement under a tree move. Idempotent and

@@ -51,6 +51,25 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
+/// The answer to a node asking for a `(list, stamp)` placement key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Claim {
+    /// Nothing held the key. A claim owns the key, not the sequence id: a plain
+    /// `ListInsert` reaches a children list without passing through the placement
+    /// index, so the id may already be taken, in which case this answer's insert
+    /// does not land and the eviction and join below overwrite what is there.
+    Fresh,
+    /// The claimant's own node already held it, so nothing changes hands — the
+    /// sequence slot takes the meet of the two positions and the placement record
+    /// is already there.
+    Joined,
+    /// A node this one outranks held it and now holds nothing at it, so the
+    /// sequence slot is re-seated rather than inserted into.
+    Evicted,
+    /// A node this one does not outrank holds the key.
+    Refused,
+}
+
 /// The well-known root slot every replica shares, so children derive under the
 /// same parent.
 const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
@@ -158,10 +177,13 @@ pub struct Document {
     /// element id: `(list, node stamp)` pairs. A node has one per list it was ever
     /// inserted or moved into; the move-log fold picks which is live.
     placements: HashMap<ElementId, Vec<Placement>>,
-    /// The `(list, stamp)` of every placement, so a delete can tell in O(1)
-    /// whether it tombstoned a movable node — and re-fold only then, not on every
-    /// plain-list delete.
-    placement_index: HashSet<(ElementId, Stamp)>,
+    /// Which node owns each `(list, stamp)` placement. A delete reads it to tell
+    /// in O(1) whether it tombstoned a movable node — and re-folds only then, not
+    /// on every plain-list delete — and a write reads it to resolve a collision:
+    /// a document holds at most one placement per key, so two ops carrying one
+    /// stamp into one children list contend for it, and
+    /// [`claim_placement`](Self::claim_placement) ranks them by the ops alone.
+    placement_index: HashMap<(ElementId, Stamp), ElementId>,
     /// The document-level annotation set: every `RangedElement` keyed by its id.
     /// Endpoints are fixed at create; the payload is LWW-by-stamp; a tombstoned
     /// entry is retained so delete wins over a concurrent payload change and
@@ -280,13 +302,19 @@ pub struct Document {
     /// 64-bit birthday bound on [`TxId::derive`], which hashes member sequences alone
     /// — costs the later group its atomic view at receivers rather than its members.
     resolved_tx: HashSet<(ClientId, TxId)>,
-    /// Movable nodes revealed by an [`XmlReveal`](crate::op::OpKind::XmlReveal) shell
-    /// but not yet placed — a node materialized (identity + tag) with no placement,
-    /// awaiting the [`XmlMove`](crate::op::OpKind::XmlMove) that will position it. A
-    /// move of such a node lands its first placement (the reveal-on-move-in seam),
-    /// where a move of any other placement-less node (a keyed root) is a no-op. Cleared
-    /// once the node is placed; never persisted (a placed node is an ordinary moved
-    /// node, so a snapshot holds no pending reveal).
+    /// Movable nodes that hold no placement and are awaiting their first — a node
+    /// materialized (identity + tag) with no position, which the next
+    /// [`XmlMove`](crate::op::OpKind::XmlMove) places, where a move of any other
+    /// placement-less node (a keyed root) is a no-op. Two things land here: an
+    /// [`XmlReveal`](crate::op::OpKind::XmlReveal) shell, and a birth that lost its
+    /// `(list, stamp)` key, which is left in the same placeless state. Cleared once
+    /// the node is placed.
+    ///
+    /// Not itself persisted. A decode re-derives the entry for any unplaced node the
+    /// snapshot holds under a children list
+    /// ([`restore_unplaced`](Self::restore_unplaced)) — which recovers a losing birth,
+    /// since it keeps its birth list as its parent link, but not a shell, which has no
+    /// such link to key on.
     revealed_pending: HashSet<ElementId>,
     orphans: Vec<OrphanEvent>,
     /// Ops emitted by the transact currently in progress.
@@ -344,7 +372,7 @@ impl Document {
             parents: HashMap::new(),
             moves: TreeMoves::new(),
             placements: HashMap::new(),
-            placement_index: HashSet::new(),
+            placement_index: HashMap::new(),
             ranged: HashMap::new(),
             acl: HashMap::new(),
             lamport: 0,
@@ -1075,6 +1103,12 @@ impl Document {
         for (node, places) in placed {
             out.extend_from_slice(&node.as_bytes());
             put_u32(&mut out, len_u32(places.len()));
+            // Key-sorted, because a node's record is grown in arrival order while
+            // nothing reads it positionally — the fold takes a max and the birth
+            // test a find. Writing it as stored would make two replicas that saw
+            // one node's moves in different orders encode different bytes.
+            let mut places: Vec<&Placement> = places.iter().collect();
+            places.sort_by_key(|p| (p.list.as_bytes(), p.stamp));
             for p in places {
                 out.extend_from_slice(&p.list.as_bytes());
                 put_stamp(&mut out, &p.stamp);
@@ -1275,8 +1309,8 @@ impl Document {
         });
         self.placement_index = self
             .placements
-            .values()
-            .flat_map(|places| places.iter().map(|p| (p.list, p.stamp)))
+            .iter()
+            .flat_map(|(node, places)| places.iter().map(|p| ((p.list, p.stamp), *node)))
             .collect();
         self.moves
             .retain(|child, parent| !purge.contains(&child) && !purge.contains(&parent));
@@ -1385,7 +1419,7 @@ impl Document {
             let Some(kind) = self.node_kind(*node) else {
                 continue;
             };
-            let Some(birth) = birth_placement(*node, places, kind) else {
+            let Some(birth) = birth_placement(*node, places) else {
                 continue;
             };
             // Birth readable, current position denied — a move into a denied subtree.
@@ -1514,8 +1548,8 @@ impl Document {
         });
         self.placement_index = self
             .placements
-            .values()
-            .flat_map(|places| places.iter().map(|p| (p.list, p.stamp)))
+            .iter()
+            .flat_map(|(node, places)| places.iter().map(|p| ((p.list, p.stamp), *node)))
             .collect();
         self.moves.retain(|child, parent| {
             !purge.contains(&child)
@@ -1674,7 +1708,7 @@ impl Document {
             let Some(kind) = self.node_kind(*node) else {
                 continue;
             };
-            let Some(birth) = birth_placement(*node, places, kind) else {
+            let Some(birth) = birth_placement(*node, places) else {
                 continue;
             };
             // Born readable → an ordinary create carries it; no reveal.
@@ -1754,6 +1788,12 @@ impl Document {
     /// whose move into a denied subtree was filtered out re-folds back under its readable
     /// origin here, so the live copy renders it where a decoded joiner will. Sound only
     /// as the final transform before [`encode_state`](Self::encode_state).
+    ///
+    /// The created-under relation is re-seeded from every source a decode reads it from,
+    /// not from the birth placements alone: this replays a log against a tree it just
+    /// emptied, so a source left out is an edge the replay's cycle check cannot see, and
+    /// a move the live replica refused folds here into the cyclic `parents` the encode
+    /// then writes out.
     fn refold_projected_moves(&mut self) {
         // A document with no placements is a document with no tree moves, so its fold is
         // already trivial — skip the rebuild rather than pay it on every non-XML snapshot.
@@ -1761,19 +1801,8 @@ impl Document {
             return;
         }
         let log: Vec<(Stamp, ElementId, ElementId)> = self.moves.log().collect();
-        let bases: Vec<(ElementId, ElementId)> = self
-            .placements
-            .iter()
-            .filter_map(|(node, places)| {
-                let kind = self.node_kind(*node)?;
-                let birth = birth_placement(*node, places, kind)?;
-                Some((*node, *self.parents.get(&birth.list)?))
-            })
-            .collect();
         self.moves = TreeMoves::new();
-        for (node, owner) in bases {
-            self.moves.set_base(node, owner);
-        }
+        self.reseed_bases();
         for (stamp, node, parent) in log {
             self.moves.apply(stamp, node, parent);
         }
@@ -1986,7 +2015,7 @@ impl Document {
         let placed_count = cur.u32()?;
         let mut placements: HashMap<ElementId, Vec<Placement>> =
             HashMap::with_capacity((placed_count as usize).min(1024));
-        let mut placement_index: HashSet<(ElementId, Stamp)> = HashSet::new();
+        let mut placement_index: HashMap<(ElementId, Stamp), ElementId> = HashMap::new();
         for _ in 0..placed_count {
             let node = cur.element_id()?;
             let n = cur.u32()?;
@@ -1994,7 +2023,7 @@ impl Document {
             for _ in 0..n {
                 let list = cur.element_id()?;
                 let stamp = cur.stamp()?;
-                if !placement_index.insert((list, stamp)) {
+                if placement_index.insert((list, stamp), node).is_some() {
                     return Err(DecodeError::BadTag {
                         what: "document: duplicate placement",
                         tag: 0,
@@ -2366,33 +2395,79 @@ impl Document {
 
     /// Restore the tree-move overlay from a decoded snapshot: reconstruct the
     /// birth placement of every never-moved node from its live children-list
-    /// node (only moved nodes are stored explicitly), re-derive each placed
-    /// node's base (created-under) parent from its birth placement — the one
-    /// whose `(list, stamp)` re-derives the node's own id — then replay the move
-    /// log and re-fold. Finally re-check the parent relation for a cycle: replay
+    /// node (only moved nodes are stored explicitly), re-seed the created-under
+    /// relation ([`reseed_bases`](Self::reseed_bases)) and the record of which
+    /// nodes hold no placement, then replay the move log and re-fold. Both
+    /// re-seedings run *before* the replay, because they are the tree the replay's
+    /// cycle check reads. Finally re-check the parent relation for a cycle: replay
     /// and re-fold mutate `parents` after decode's first check, so a crafted
     /// snapshot whose moves fold into a cycle is rejected here rather than
     /// hanging a later `resolvable` walk.
     fn restore_moves(&mut self, log: &[(Stamp, ElementId, ElementId)]) -> Result<(), DecodeError> {
         self.reconstruct_births();
-        let bases: Vec<(ElementId, ElementId)> = self
-            .placements
-            .iter()
-            .filter_map(|(node, places)| {
-                let kind = self.node_kind(*node)?;
-                let birth = birth_placement(*node, places, kind)?;
-                let owner = self.parents.get(&birth.list)?;
-                Some((*node, *owner))
-            })
-            .collect();
-        for (node, owner) in bases {
-            self.moves.set_base(node, owner);
-        }
+        self.reseed_bases();
+        self.restore_unplaced();
         for &(stamp, node, parent) in log {
             self.moves.apply(stamp, node, parent);
         }
         self.refold_moves();
         reject_parent_cycles(&self.parents, ElementId::from_bytes(ROOT_ID))
+    }
+
+    /// Re-seed the created-under relation — the half of the move log's tree that
+    /// the log itself does not carry, a create being permanent and so never
+    /// recorded as a move. It is what the cycle check walks, so a rebuild that
+    /// leaves any of it out replays the log against a shorter tree and admits a
+    /// move the replica that wrote these bytes refused as a loop.
+    ///
+    /// A movable node's edge skips the children list and names the element that
+    /// owns it, which is the parent [`refold_moves`](Self::refold_moves) derives a
+    /// live placement from. It comes from the node's birth placement — the
+    /// `(list, stamp)` that re-derives the node's own id — or, for a birth that
+    /// lost that key and so left no placement to read it back from, from the parent
+    /// link the snapshot still carries. Every other container's edge is one hop up
+    /// `parents`: a chain of them is as long as the nesting, so the walk reaches a
+    /// map inside an attrs map inside an element, where a single hop over the map
+    /// half spans only the first of those.
+    ///
+    /// The three do not cover every movable node. One born at a key it then lost
+    /// while holding a move placement has no birth placement to read, is not
+    /// placeless, and carries a parent link naming where it moved to rather than
+    /// where it was created — nothing in a snapshot still names its birth owner, so
+    /// it comes back edgeless.
+    fn reseed_bases(&mut self) {
+        let born: Vec<(ElementId, ElementId)> = self
+            .placements
+            .iter()
+            .filter_map(|(node, places)| {
+                let birth = birth_placement(*node, places)?;
+                Some((*node, *self.parents.get(&birth.list)?))
+            })
+            .collect();
+        let unplaced: Vec<(ElementId, ElementId)> = self
+            .xml_elements
+            .keys()
+            .chain(self.texts.keys())
+            .copied()
+            .filter(|node| !self.placements.contains_key(node))
+            .filter_map(|node| {
+                let list = *self.parents.get(&node)?;
+                self.lists.contains_key(&list).then_some(())?;
+                Some((node, *self.parents.get(&list)?))
+            })
+            .collect();
+        // A node parented to a children list is a movable one, and its entry is the
+        // list it *renders* in rather than the one it was created in, so it is not
+        // an edge — the two sources above are those nodes'.
+        let nested: Vec<(ElementId, ElementId)> = self
+            .parents
+            .iter()
+            .filter(|(_, parent)| !self.lists.contains_key(*parent))
+            .map(|(&child, &parent)| (child, parent))
+            .collect();
+        for (node, owner) in born.into_iter().chain(unplaced).chain(nested) {
+            self.moves.set_base(node, owner);
+        }
     }
 
     /// Rebuild the birth placement of each movable node the snapshot did not
@@ -2430,15 +2505,50 @@ impl Document {
             }
         }
         for (node, list, stamp) in births {
-            if self.placements.contains_key(&node) {
+            // The node has to be unplaced *and* the key free. A snapshot is bytes
+            // someone hands over: an explicit record may already name this key for
+            // another node while the list holds this one, and reconstructing over
+            // that would leave the document holding two placements at one key —
+            // accepted here and refused by the next `read_state`, which is a
+            // durable room no restart can load. The stored record wins; this node
+            // comes back unplaced, which is the state a birth that lost a key is
+            // left in anyway.
+            if self.placements.contains_key(&node)
+                || self.placement_index.contains_key(&(list, stamp))
+            {
                 continue;
             }
             self.placements
                 .entry(node)
                 .or_default()
                 .push(Placement { list, stamp });
-            self.placement_index.insert((list, stamp));
+            self.placement_index.insert((list, stamp), node);
         }
+    }
+
+    /// Record every movable node the snapshot holds under a children list but
+    /// gives no placement as awaiting its first — the state a birth that lost its
+    /// `(list, stamp)` key is left in, so a move naming it lands after a reload
+    /// exactly as it does on the replica that never restarted.
+    ///
+    /// The parent link is what separates such a node from a document root, which
+    /// sits in a map slot: a root is keyed rather than positioned, so a move of it
+    /// is a no-op and it must not become movable here.
+    fn restore_unplaced(&mut self) {
+        let unplaced: Vec<ElementId> = self
+            .xml_elements
+            .keys()
+            .chain(self.texts.keys())
+            .copied()
+            .filter(|node| {
+                !self.placements.contains_key(node)
+                    && self
+                        .parents
+                        .get(node)
+                        .is_some_and(|parent| self.lists.contains_key(parent))
+            })
+            .collect();
+        self.revealed_pending.extend(unplaced);
     }
 
     /// The kind of a materialised movable node — `XmlElement` or `Text`.
@@ -3325,7 +3435,7 @@ impl Document {
                 // concurrent move, so re-fold to hide every placement of that
                 // node. Only a delete that tombstoned a real placement can change
                 // the fold, so a plain-list delete skips the O(placements) work.
-                if self.placement_index.contains(&(target, *id)) {
+                if self.placement_index.contains_key(&(target, *id)) {
                     self.refold_moves();
                 }
                 return;
@@ -3541,6 +3651,15 @@ impl Document {
             element.displace();
         }
         self.parents.insert(child_id, map_id);
+        // The move log's cycle check walks the created-under relation, so a
+        // container keyed into a map has to be in it: without this edge the walk
+        // stops at the map half of the tree and a move under a node reachable
+        // *through* one of these — an element in the moved node's own attrs, say —
+        // reads as acyclic, closes a loop in `parents`, and leaves the replica
+        // holding a snapshot `read_state` refuses. One hop, to the map itself: the
+        // map carries its own edge onward, and a chain of them is as long as the
+        // nesting, where a single hop over the map spans only the first.
+        self.moves.set_base(child_id, map_id);
         if let Some(o) = orphan {
             self.orphans.push(o);
         }
@@ -3574,29 +3693,187 @@ impl Document {
         let child_id = xml_child_id(list_id, stamp, kind);
         let element = self.registered_handle(child_id, container);
         self.parents.insert(child_id, list_id);
-        list.borrow_mut().insert_at(stamp, element, anchor);
         // Record the birth placement so a later move can pick the live one of the
-        // node's placements — but only once per `(list, stamp)`. Two ops can carry
-        // one stamp into one list and both pass every gate, since dedup is on `OpId`
-        // and an id-space record only bounds an *honest* mint. They need not name the
-        // same child: `xml_child_id` mixes the kind in, so a tagged and a tagless
-        // insert at one stamp derive *different* ids. Pushing unconditionally stored
-        // the placement twice, which `read_state` refuses as a duplicate — an
-        // `encode_state` its own decoder rejects, and a room snapshot no restart can
-        // load. The index is the seam that already knows, so it decides.
-        if self.placement_index.insert((list_id, stamp)) {
-            self.placements
-                .entry(child_id)
-                .or_default()
-                .push(Placement {
-                    list: list_id,
-                    stamp,
-                });
+        // node's placements — but a document holds one placement per `(list, stamp)`,
+        // so the child has to win the key. Two ops can carry one stamp into one list
+        // and both pass every gate, since dedup is on `OpId` and an id-space record
+        // only bounds an *honest* mint; they need not even name the same child, as
+        // `xml_child_id` mixes the kind in, so a tagged and a tagless insert at one
+        // stamp derive *different* ids. A losing child is materialised and parented
+        // all the same, and holds no position — the placeless state a reveal shell
+        // sits in, so it is recorded as one: a move naming it is admissible, which
+        // is what makes the loser's later moves land wherever the refusal falls in
+        // the arrival order.
+        let claim = self.claim_placement(list_id, stamp, child_id);
+        match claim {
+            Claim::Fresh => list.borrow_mut().insert_at(stamp, element, anchor),
+            Claim::Joined => list.borrow_mut().rejoin(stamp, element, anchor),
+            Claim::Evicted => list.borrow_mut().reseat(stamp, element, anchor),
+            Claim::Refused => {}
+        }
+        match claim {
+            // Awaiting a first placement is what "materialised and unplaced" is
+            // recorded as, so a child that already holds one is left placed: this
+            // key went to a twin, and a move of the child since then gave it a
+            // position elsewhere.
+            Claim::Refused => {
+                if !self.placements.contains_key(&child_id) {
+                    self.revealed_pending.insert(child_id);
+                }
+            }
+            // A join changes hands with no one, so the record the child already
+            // holds at this key is the record: a second one would be the duplicate
+            // placement `read_state` refuses.
+            Claim::Joined => {}
+            Claim::Fresh | Claim::Evicted => {
+                self.placements
+                    .entry(child_id)
+                    .or_default()
+                    .push(Placement {
+                        list: list_id,
+                        stamp,
+                    });
+                self.revealed_pending.remove(&child_id);
+            }
         }
         // The created-under parent anchors cycle detection and is the fallback
         // parent (via the move log's base map) when no move governs this node.
         if let Some(&owner) = self.parents.get(&list_id) {
             self.moves.set_base(child_id, owner);
+        }
+        // Re-seating clears the suppression the fold wrote, and an eviction also
+        // withdraws the incumbent's move edge — both leave the fold stale in the
+        // node this birth names.
+        if matches!(claim, Claim::Joined | Claim::Evicted) {
+            self.refold_moves();
+        }
+    }
+
+    /// Decide who owns the `(list, stamp)` placement key when `node` asks for it,
+    /// and record the answer.
+    ///
+    /// A document holds at most one placement per key — `read_state` refuses a
+    /// duplicate — while two ops can carry one stamp into one children list and
+    /// both pass every gate, since dedup is on `OpId` and an id-space record only
+    /// bounds an *honest* mint. So the key is contended, and which op takes it is a
+    /// function of the ops alone, never of which arrived first.
+    ///
+    /// The rank is **a birth over a move, then the smaller element id**. A birth
+    /// outranks because the key is where the born node's id comes from: a birth
+    /// that lost would leave a node whose id names a position it does not hold and
+    /// which nothing can re-derive, while a move brings an id of its own and
+    /// survives losing. Between two of a kind, the id decides — total, and held by
+    /// every replica that has either op. Only a claim naming a child this key derives
+    /// can take a birth's, and only two ever do: `xml_child_id` mixes the kind in, so
+    /// the tagged and the tagless child of a stamp are the whole field — either of
+    /// which a move may name, and it is ranked as the child, not as a move.
+    ///
+    /// The rank orders the *nodes* two claims name, which is the whole question
+    /// only while they name two. A move can name exactly the child a birth at the
+    /// key derives, and two inserts carrying one tag derive one child between them
+    /// — there the key is already the claimant's own, nothing changes hands, and
+    /// what is left to settle is the position, which the sequence takes as the meet
+    /// of the two ([`List::rejoin`]). A meet is the same whichever arrived first,
+    /// where a contest between two claims on one node would have needed to know
+    /// what put the incumbent there, and nothing answers that: the move log dedups
+    /// on the stamp alone, so a move can hold the key having recorded no edge.
+    ///
+    /// A claimant that outranks the incumbent evicts it, leaving it exactly as the
+    /// opposite arrival order does: holding nothing at this key and its move edge
+    /// withdrawn, and — if that was its last placement — awaiting its first, which
+    /// is where a refusal leaves a claimant too.
+    fn claim_placement(&mut self, list: ElementId, stamp: Stamp, node: ElementId) -> Claim {
+        let Some(&held) = self.placement_index.get(&(list, stamp)) else {
+            self.placement_index.insert((list, stamp), node);
+            return Claim::Fresh;
+        };
+        if held == node {
+            return Claim::Joined;
+        }
+        // Both sides are ranked by the same question — is this node the child
+        // this key derives — so the answer is the same whichever arrives
+        // second. Asking it of the *claimant's op kind* instead is not: a move
+        // naming a derivable id would be ranked a move on the way in and a
+        // birth once it held the key, and the pair would refuse in both
+        // directions, leaving the key to whoever arrived first.
+        let outranks = match (
+            self.born_at(list, stamp, node),
+            self.born_at(list, stamp, held),
+        ) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => node.as_bytes() < held.as_bytes(),
+        };
+        if !outranks {
+            return Claim::Refused;
+        }
+        self.evict_placement(list, stamp, held);
+        self.placement_index.insert((list, stamp), node);
+        Claim::Evicted
+    }
+
+    /// Whether `node` is a child a birth at `(list, stamp)` derives — the test that
+    /// tells a birth placement from the ones a move gave it.
+    ///
+    /// Pure in the key: a stamp derives exactly two children, the tagged and the
+    /// tagless, so both are tried rather than the one the registry happens to hold.
+    /// Reading the registry would let an `XmlReveal` naming a derivable id register
+    /// it under the other kind and make an honest birth answer `false` here, which
+    /// hands its key to a move.
+    fn born_at(&self, list: ElementId, stamp: Stamp, node: ElementId) -> bool {
+        [ElementKind::XmlElement, ElementKind::Text]
+            .into_iter()
+            .any(|kind| xml_child_id(list, stamp, kind) == node)
+    }
+
+    /// Take the `(list, stamp)` placement away from `held`, so a node that lost the
+    /// key keeps nothing that depended on holding it: the placement record and the
+    /// move edge it carried. The sequence slot is the caller's — the winner re-seats
+    /// it — and so is the reachability edge of a node that keeps other placements,
+    /// which the caller's re-fold derives; only a node left with none has it settled
+    /// here, since the fold reads no node it holds no placement for.
+    fn evict_placement(&mut self, list: ElementId, stamp: Stamp, held: ElementId) {
+        // The move edge goes first, so what remains of the log is what the
+        // reachability edge is re-derived from. A birth wrote no edge, and the
+        // `(child, parent)` match leaves a second move at this stamp in another
+        // list alone.
+        if let Some(&owner) = self.parents.get(&list) {
+            self.moves.remove(stamp, held, owner);
+        }
+        // The index names the holder of a record, so the record is there: every
+        // writer of one writes the other, and every rebuild derives the index from
+        // the records. Returning here would leave the node with neither a placement
+        // nor the pending mark below — the state that refuses every later move of it.
+        debug_assert!(
+            self.placements.contains_key(&held),
+            "a placement key names a node holding no placement"
+        );
+        let Some(places) = self.placements.get_mut(&held) else {
+            return;
+        };
+        places.retain(|p| !(p.list == list && p.stamp == stamp));
+        if !places.is_empty() {
+            return;
+        }
+        self.placements.remove(&held);
+        // A move is gated on the node holding a placement or awaiting its first, so
+        // a node left with none goes back to awaiting one rather than being
+        // stranded with neither, which would refuse every later move of it forever.
+        // That is the state the opposite arrival order leaves it in either way — a
+        // shell whose move is refused stays pending, and a birth whose key is
+        // refused is recorded pending by `insert_xml_child`.
+        self.revealed_pending.insert(held);
+        // Reachability follows the move log, exactly as `refold_moves` derives it
+        // for a placed node: a node created under a parent keeps that parent's
+        // children list whether or not its birth took this key, and one with no
+        // edge at all — a shell — reaches nothing.
+        match self.moves.parent_of(held) {
+            Some(owner) => {
+                self.parents.insert(held, XmlElement::children_id(owner));
+            }
+            None => {
+                self.parents.remove(&held);
+            }
         }
     }
 
@@ -3632,34 +3909,35 @@ impl Document {
         };
         // One placement per `(list, stamp)`, for the reason `insert_xml_child` gives.
         // Here the colliding op need not name the same node — a move takes its node
-        // from the payload — so the whole move is refused rather than only its
-        // placement, and refusing is what keeps two separate things from breaking.
+        // from the payload — so a move that loses the key is refused **whole**,
+        // before any mutation. Two things ride on refusing that early.
         //
-        // A node vanishing: the collision that matters is a **birth** holding
-        // `(list, stamp)` and a *move* arriving at that same stamp into that list.
-        // The move log has nothing at that stamp (a birth writes none), so
-        // `moves.apply` records, the node's effective parent becomes this list, and
-        // it holds no placement here — `refold_moves` then finds no live placement
-        // and suppresses every placement it has anywhere. (Two *moves* at one stamp
-        // never reached that: `TreeMoves::apply` dedups on the exact stamp, so the
-        // second was already inert.)
+        // The node must not vanish. A move whose edge is logged while its placement
+        // is not makes this list the node's effective parent with nothing of the
+        // node in it, and `refold_moves` then finds no live placement and suppresses
+        // every placement it has anywhere. So the edge is recorded only once the key
+        // is held.
         //
-        // A revealed shell stranding: the old path ran `revealed_pending.remove`
-        // while storing no placement, leaving the node with neither — and both
-        // `ready` and this function gate a move on holding one or the other, so
-        // every later move of that node was refused forever. Returning before that
-        // keeps the shell pending and movable.
-        //
-        // Which of the two lands is still arrival-order dependent; that residual is
-        // filed as C24.
-        if !self.placement_index.insert((dest_list, stamp)) {
-            return;
+        // And a shell must stay movable. Both `ready` and this function gate a move
+        // on the node holding a placement or awaiting its first, so clearing the
+        // pending mark without storing a placement would leave it with neither and
+        // refuse every later move of it. The mark is cleared below, once the
+        // placement is stored; an eviction restores it for the same reason.
+        let claim = self.claim_placement(dest_list, stamp, node);
+        match claim {
+            Claim::Fresh => list.borrow_mut().insert_at(stamp, element, anchor),
+            Claim::Joined => list.borrow_mut().rejoin(stamp, element, anchor),
+            Claim::Evicted => list.borrow_mut().reseat(stamp, element, anchor),
+            Claim::Refused => return,
         }
-        list.borrow_mut().insert_at(stamp, element, anchor);
-        self.placements.entry(node).or_default().push(Placement {
-            list: dest_list,
-            stamp,
-        });
+        // A join is the node's own key, already recorded — a second record would be
+        // the duplicate placement `read_state` refuses.
+        if claim != Claim::Joined {
+            self.placements.entry(node).or_default().push(Placement {
+                list: dest_list,
+                stamp,
+            });
+        }
         self.moves.apply(stamp, node, owner);
         // The shell is now placed — an ordinary moved node from here on.
         self.revealed_pending.remove(&node);
@@ -3693,7 +3971,10 @@ impl Document {
     /// re-pointed at the live placement's list so a moved subtree resolves through
     /// its new parent. A node whose placement was tombstoned by a `ListDelete` is
     /// deleted — every placement is hidden, so a concurrent delete wins over a
-    /// concurrent move rather than resurrecting the node under the new parent.
+    /// concurrent move rather than resurrecting the node under the new parent. It
+    /// is re-pointed all the same: rendering nowhere is not the same as belonging
+    /// nowhere, and leaving the edge at whatever the last fold happened to write
+    /// would make it a function of arrival order rather than of the move log.
     ///
     /// This re-folds every placement on each move. Correct but not minimal: one
     /// move's undo-and-replay can shift several nodes' effective parents, so a
@@ -3722,9 +4003,7 @@ impl Document {
                 let away = deleted || !(p.list == eff_list && Some(p.stamp) == live);
                 suppress.push((p.list, p.stamp, away));
             }
-            if !deleted {
-                reparent.push((*node, eff_list));
-            }
+            reparent.push((*node, eff_list));
         }
         for (list, stamp, away) in suppress {
             if let Some(list) = self.lists.get(&list) {
@@ -3831,6 +4110,7 @@ impl Document {
         let pid = payload_id(ranged, kind);
         self.registered_handle(pid, container);
         self.parents.insert(pid, ranged);
+        self.moves.set_base(pid, ranged);
     }
 
     /// The registered container handle for `id`, wrapped as an Element,
@@ -3871,6 +4151,11 @@ impl Document {
                 self.lists.entry(children_id).or_insert(children);
                 self.parents.insert(attrs_id, id);
                 self.parents.insert(children_id, id);
+                // Both are also where the created-under relation runs on through
+                // the node, so the cycle check reaches whatever is keyed into the
+                // attrs map from the node that owns it.
+                self.moves.set_base(attrs_id, id);
+                self.moves.set_base(children_id, id);
                 Element::XmlElement(handle)
             }
             Container::XmlFragment => {
@@ -3883,6 +4168,7 @@ impl Document {
                 let children_id = XmlFragment::children_id(id);
                 self.lists.entry(children_id).or_insert(children);
                 self.parents.insert(children_id, id);
+                self.moves.set_base(children_id, id);
                 Element::XmlFragment(handle)
             }
         }
@@ -5065,10 +5351,17 @@ fn xml_child_id(list_id: ElementId, stamp: Stamp, kind: ElementKind) -> ElementI
 /// The placement a movable node was born at — the one whose `(list, stamp)` re-derives
 /// the node's own id. A move keeps the node's birth id, so a move placement never does,
 /// which tells the birth placement (the created-under list) from the move placements.
-fn birth_placement(node: ElementId, places: &[Placement], kind: ElementKind) -> Option<&Placement> {
-    places
-        .iter()
-        .find(|p| xml_child_id(p.list, p.stamp, kind) == node)
+///
+/// Pure in the key, for the reason [`Document::born_at`] is: a stamp derives exactly two
+/// children, so both are tried rather than the one the registry happens to hold — an
+/// `XmlReveal` naming a derivable id can register it under the other kind, and a birth
+/// answering "born nowhere" here loses the created-under edge the cycle check walks.
+fn birth_placement(node: ElementId, places: &[Placement]) -> Option<&Placement> {
+    places.iter().find(|p| {
+        [ElementKind::XmlElement, ElementKind::Text]
+            .into_iter()
+            .any(|kind| xml_child_id(p.list, p.stamp, kind) == node)
+    })
 }
 
 /// The id of the RangedElement a create at `stamp` mints. Derived under a fixed
