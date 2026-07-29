@@ -1757,10 +1757,16 @@ fn zone_readable(
 /// placement left for the reveal rule to find), so the order is a convergence
 /// property, not a containment one.
 ///
-/// `index` resolves element-scoped grants to paths, and belongs to the tree being
-/// narrowed: the live room's for a catch-up snapshot, the version's own for a version
-/// fetch. `records.is_empty()` (a room with no doc-ACL state) or a whole-document
-/// verdict skips the read projection; [`zone_narrowing`] decides the zone one.
+/// `index` resolves element-scoped grants to paths for the *gate* — the whole-document
+/// verdict that decides whether the read projection runs at all. The projection itself
+/// always derives its own index from the state it is about to narrow, so only the gate
+/// can be fed an index from a different tree than the bytes. It must not be: an element
+/// scope that resolves to no path is inert, an inert deny is no deny, and a gate that
+/// finds none serves the state whole. The version fetch passes the version's own tree;
+/// the catch-up snapshot passes the live room's, which is the same tree for a `main`
+/// snapshot and **not** for a branch whose base was forked from a version (C32).
+/// `records.is_empty()` (a room with no doc-ACL state) or a whole-document verdict
+/// skips the read projection; [`zone_narrowing`] decides the zone one.
 #[allow(clippy::too_many_arguments)]
 fn project_served_state(
     state: Vec<u8>,
@@ -1786,12 +1792,13 @@ fn project_served_state(
     project_snapshot_zones(state, schema, zones, recipient)
 }
 
-/// The `(schema, authorized set)` a zone projection would genuinely narrow by, or
-/// `None` when it would be a no-op — a whole-zone subscriber (its set holds every
-/// declared zone id), a no-zones room, or a relay, each of which takes a state
-/// verbatim, byte-identical to a zoneless one. The single home of that rule, so
-/// [`project_snapshot_zones`] and a caller that must know whether narrowing is even
-/// possible cannot drift apart.
+/// The `(schema, authorized set)` a zone projection would narrow by, or `None` when it
+/// is not to run at all — a whole-zone subscriber (its set is exactly the declared id
+/// range), a no-zones room, or a relay, each of which takes a state verbatim. Skipping
+/// it is not merely an optimization: the projection also scrubs the causal frontier,
+/// and a reader entitled to every partition is owed the whole frontier to dedup
+/// against. The single home of that rule, so [`project_snapshot_zones`] and a caller
+/// that must know whether narrowing is even possible cannot drift apart.
 ///
 /// "Whole-zone" means the set is *exactly* the declared id range, rather than merely
 /// having as many members. A set is resolved once, when a channel subscribes, and the

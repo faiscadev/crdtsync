@@ -387,6 +387,58 @@ fn a_version_follows_the_channels_zone_scope_not_the_actors_entitlement() {
     );
 }
 
+/// `reader` is denied every declared zone, so its authorized set is empty.
+fn no_zones_authorizer(id: &Identity, _action: Action, res: &Resource) -> bool {
+    match res {
+        Resource::Zone { .. } => id.actor() != b"reader",
+        _ => true,
+    }
+}
+
+#[test]
+fn a_reader_denied_every_zone_is_served_only_the_root_partition() {
+    // The far end of the zone scale: an empty authorized set is not "nothing to
+    // narrow by", it is "narrow everything zoned away". Only the unzoned partition
+    // survives.
+    let mut sr = SchemaRegistry::new();
+    sr.register(ZONE_APP, 1, ZONED.as_bytes(), b"").unwrap();
+    let mut r = Registry::new(cid(0xFF));
+    r.set_schema_registry(Arc::new(Mutex::new(sr)));
+    r.set_verifier(Box::new(tokens(&[
+        ("c-author", "author"),
+        ("c-reader", "reader"),
+    ])));
+    r.set_authorizer(Box::new(no_zones_authorizer));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+
+    let author = auth(&mut r, 1, "c-author", ZONE_APP, 1);
+    subscribe(&mut r, author, b"");
+    let mut author_doc = Document::new(cid(1));
+    author_doc.set_schema(zoned_schema());
+    submit(
+        &mut r,
+        author,
+        author_doc.transact(|tx| {
+            tx.map(b"board").register(b"bseed", Scalar::Int(0));
+            tx.map(b"notes").register(b"nseed", Scalar::Int(0));
+            tx.map(b"loose").register(b"lseed", Scalar::Int(0));
+        }),
+    );
+    let reader = auth(&mut r, 2, "c-reader", ZONE_APP, 1);
+    subscribe(&mut r, reader, b"");
+    create_version(&mut r, author, V1);
+
+    let served = Document::decode_state(&fetch_version(&mut r, reader, V1))
+        .expect("the served version state decodes");
+    assert_eq!(
+        nested(&served, b"loose", b"lseed"),
+        Some(0),
+        "the unzoned partition is nobody's zone to deny",
+    );
+    assert!(served.get(b"board").is_none(), "za survived an empty set");
+    assert!(served.get(b"notes").is_none(), "zb survived an empty set");
+}
+
 // --- a doc-ACL partial reader ---
 
 /// Room read is granted by the schema tier to every authenticated actor, so a reader
@@ -866,6 +918,7 @@ fn a_zone_set_that_outlived_its_schema_still_narrows() {
         author_doc.transact(|tx| {
             tx.map(b"secret").register(b"sseed", Scalar::Int(0));
             tx.map(b"board").register(b"bseed", Scalar::Int(0));
+            tx.map(b"notes").register(b"nseed", Scalar::Int(0));
         }),
     );
 
@@ -886,5 +939,14 @@ fn a_zone_set_that_outlived_its_schema_still_narrows() {
     assert!(
         served.get(b"secret").is_none(),
         "a stale zone set was mistaken for a whole-zone one",
+    );
+    // And the consequence of the lift itself, stated rather than left implicit: a
+    // subtree v2 stopped declaring as a zone falls into the root partition, which no
+    // zone verdict governs, so it is served to everyone the room admits. Narrowing a
+    // stale set cannot recover what the schema no longer partitions.
+    assert_eq!(
+        nested(&served, b"notes", b"nseed"),
+        Some(0),
+        "a de-zoned subtree is the root partition's, not a withheld zone's",
     );
 }

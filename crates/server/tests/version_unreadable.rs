@@ -270,6 +270,11 @@ fn the_creator_is_refused_too_once_the_room_holds_doc_acl_state() {
     let dir = tempdir();
     let mut r = damaged_room(dir.path(), TUPLE_APP, TUPLED, true);
     let creator = joined(&mut r, 1, "c-author", TUPLE_APP, b"");
+    assert_eq!(
+        r.hub().room_creator(ROOM).as_deref(),
+        Some(b"author".as_slice()),
+        "the actor under test is not the room's creator",
+    );
 
     match &fetch(&mut r, creator)[..] {
         [Message::Error { code, .. }] => assert_eq!(*code, ErrorCode::Internal),
