@@ -1758,84 +1758,34 @@ fn a_compromised_member_that_speaks_selectively_splits_the_ring() {
 }
 
 #[test]
-fn the_same_frames_in_any_order_build_the_same_ring() {
-    // `adopted` is derived from `verifiers`, so if retention depends on the order
-    // frames arrive in, the ring does too — one level down, and invisibly. The frame
-    // that vouches for a member and the frame that introduces it are two frames, and
-    // which lands first is ordinary network ordering, not evidence.
+fn a_claim_that_outruns_its_subject_is_re_sent_within_one_round() {
+    // An inbound frame introduces only its own sender, so a claim naming a member this
+    // view has not met is dropped with the tuple that carried it. Holding it instead
+    // would be unbounded — those ids are on no roster, so no reap could ever strike
+    // them. What makes dropping safe is that the claim is not lost, only late: a
+    // verifier re-advertises what it verified on every round, so the very next round
+    // this node initiates carries the member and the claim about it together.
     let joiner = NodeId::from("10.9.9.9:9000");
-    let vouchers = ["10.0.0.1:9000", "10.0.0.2:9000"];
+    let mut voucher = membership_for("10.0.0.1:9000");
+    let mut late = membership_for(SELF_ADDR);
+    voucher.add_member(joiner.clone());
+    voucher.note_verified(&joiner);
+    assert!(voucher.has_verified(voucher.self_id(), &joiner));
 
-    let introduce = |m: &mut Membership| m.add_member(joiner.clone());
-    let vouch_from = |m: &mut Membership, who: &str| vouch(m, who, &joiner);
-
-    // Member first, then the vouches.
-    let mut forward = membership_for(SELF_ADDR);
-    introduce(&mut forward);
-    for v in vouchers {
-        vouch_from(&mut forward, v);
-    }
-
-    // The vouches first, then the member they are about.
-    let mut backward = membership_for(SELF_ADDR);
-    for v in vouchers {
-        vouch_from(&mut backward, v);
-    }
-    introduce(&mut backward);
-
-    assert!(forward.is_adopted(&joiner), "vouched then placed");
+    // Being dialed teaches `late` nothing about the joiner, so the claim rides a frame
+    // whose subject it cannot admit, and goes with it.
+    crdtsync_server::gossip::exchange(&mut voucher, &mut late);
     assert!(
-        backward.is_adopted(&joiner),
-        "a claim about a member this view has not met yet is held, not dropped",
+        !late.is_member(&joiner),
+        "an inbound frame introduces only its own sender",
     );
-    assert_eq!(
-        forward.adopted_members(),
-        backward.adopted_members(),
-        "the ring is a function of the evidence, not of its arrival order",
-    );
-    let differing = (0..512u32)
-        .map(|i| format!("room-{i}"))
-        .filter(|r| forward.replicas_for(r.as_bytes()) != backward.replicas_for(r.as_bytes()))
-        .count();
-    assert_eq!(differing, 0, "and so is every room's replica set");
-}
+    assert!(!late.has_verified(voucher.self_id(), &joiner));
 
-#[test]
-fn a_claim_held_for_an_unmet_member_still_respects_the_tombstone() {
-    // Holding a claim about a member this view has not met must not become a way to
-    // bank evidence against one it has *reaped*: that member is not absent, it is
-    // refused, and it must be re-verified after it returns.
-    let mut m = membership_for(SELF_ADDR);
-    let departed = NodeId::from("10.9.9.9:9000");
-    m.add_member(departed.clone());
-    for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
-        m.note_gossip_unreachable(&departed);
-    }
-    for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
-        m.reap_dead();
-    }
-    assert!(!m.is_member(&departed));
-
-    m.note_claims(
-        &NodeId::from("10.0.0.1:9000"),
-        [departed.clone(), departed.clone()],
-    );
-    m.note_claims(&NodeId::from("10.0.0.2:9000"), [departed.clone()]);
+    // One round `late` initiates, and the reply carries both.
+    crdtsync_server::gossip::exchange(&mut late, &mut voucher);
+    assert!(late.is_member(&joiner), "the member arrived");
     assert!(
-        !m.has_verified(&NodeId::from("10.0.0.1:9000"), &departed),
-        "a tombstone refuses a held claim exactly as it refuses a carried one",
+        late.has_verified(voucher.self_id(), &joiner),
+        "and the claim about it arrived in the same frame, one round later",
     );
-
-    m.merge_liveness(
-        &NodeId::from("10.0.0.1:9000"),
-        [(
-            departed.clone(),
-            departed.as_bytes().to_vec(),
-            1,
-            MemberState::Alive,
-            false,
-        )],
-    );
-    assert!(m.is_member(&departed), "it rejoined");
-    assert!(!m.is_adopted(&departed), "and it rejoined pending");
 }
