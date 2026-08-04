@@ -2217,14 +2217,16 @@ class Client:
         self, channel: int, kind: DiffKind, a: bytes, b: bytes
     ) -> bytes:
         """Frame a request for the structural diff turning state ``a`` into state
-        ``b`` in the room ``channel`` is subscribed to. ``kind`` selects whether
+        ``b`` in the room that ``channel`` is subscribed to. ``kind`` selects whether
         ``a``/``b`` name two saved versions or two branches. Channel-keyed: a change
         list carries the room's paths and values, so the server narrows it to what
         this channel may read. The reply updates the diff view, read with
-        :meth:`diff` under the room the server resolved."""
+        :meth:`diff` under the room the server resolved. Empty if the channel is not
+        held."""
+        _u32("channel", channel)
         return _take_buf(
             _LIB.crdtsync_client_diff_query(
-                self._handle, int(channel), int(kind), a, len(a), b, len(b)
+                self._handle, channel, int(kind), a, len(a), b, len(b)
             )
         )
 

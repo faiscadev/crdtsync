@@ -601,19 +601,28 @@ impl ClientSession {
         self.branches.get(room).map(Vec::as_slice)
     }
 
-    /// Request the structural diff turning state `a` into state `b` in the room
-    /// `channel` is subscribed to, returning the request frame. `kind` selects
-    /// whether `a`/`b` name two saved versions or two branches. The reply updates
-    /// the [`diff`](Self::diff) view, keyed by the room the server resolved.
-    /// Channel-keyed like a version fetch: a diff reports a room's own paths and
-    /// values, so the server narrows it to what this channel may read.
-    pub fn diff_query(&self, channel: Channel, kind: DiffKind, a: &[u8], b: &[u8]) -> Message {
-        Message::DiffQuery {
+    /// Request the structural diff turning state `a` into state `b` in the room that
+    /// `channel` is subscribed to, returning the request frame, or `None` if the
+    /// channel isn't held. `kind` selects whether `a`/`b` name two saved versions or
+    /// two branches. The reply updates the [`diff`](Self::diff) view, keyed by the
+    /// room the server resolved. Channel-keyed like a version fetch: a diff reports
+    /// a room's own paths and values, so the server narrows it to what this channel
+    /// may read — and framing one on a channel this session never subscribed is a
+    /// protocol violation at the server, so it is refused here instead.
+    pub fn diff_query(
+        &self,
+        channel: Channel,
+        kind: DiffKind,
+        a: &[u8],
+        b: &[u8],
+    ) -> Option<Message> {
+        self.rooms.get(&channel)?;
+        Some(Message::DiffQuery {
             channel,
             kind,
             a: a.to_vec(),
             b: b.to_vec(),
-        }
+        })
     }
 
     /// The change list from the last diff query answered for `room`, or `None` if

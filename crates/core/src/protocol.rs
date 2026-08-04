@@ -467,7 +467,7 @@ pub enum Message {
     /// Replies with the fresh branch list.
     BranchDelete { room: Vec<u8>, name: Vec<u8> },
     /// Requests the structural diff turning state `a` into state `b` in the room
-    /// `channel` is subscribed to — `kind` selects whether `a`/`b` name two saved
+    /// that `channel` is subscribed to — `kind` selects whether `a`/`b` name two saved
     /// versions or two branches. The app-facing query a client runs to review what
     /// changed between two points of a room. **Channel-keyed like
     /// [`VersionFetch`](Message::VersionFetch)**, not room-keyed like branch

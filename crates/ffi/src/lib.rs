@@ -4225,7 +4225,8 @@ pub unsafe extern "C" fn crdtsync_client_branch_at(
 /// Frame a diff query on `channel`: the structural diff turning state `a` into
 /// state `b` in the room that channel is subscribed to, where `kind` selects the
 /// state space — 0 diffs two saved versions, 1 diffs two branches' HEADs. Returns
-/// the frame to send; empty on a bad handle, a bad `kind`, or a bad input.
+/// the frame to send; empty on a bad handle, a bad `kind`, a bad input, or a channel
+/// this client does not hold.
 /// Channel-keyed: a change list carries the room's paths and values, so the server
 /// narrows it to what this channel may read. The reply updates the diff view, keyed
 /// by the room the server resolved.
@@ -4249,7 +4250,7 @@ pub unsafe extern "C" fn crdtsync_client_diff_query(
             _ => return None,
         };
         match (as_slice(a, a_len), as_slice(b, b_len)) {
-            (Some(a), Some(b)) => Some(s.diff_query(Channel(channel), kind, a, b)),
+            (Some(a), Some(b)) => s.diff_query(Channel(channel), kind, a, b),
             _ => None,
         }
     })

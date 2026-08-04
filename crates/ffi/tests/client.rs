@@ -706,18 +706,23 @@ fn branch_management_round_trips_over_the_client() {
 fn a_diff_query_round_trips_over_the_client() {
     unsafe {
         let c = crdtsync_client_new(client_id(1).as_ptr());
+        let (ch, sub) = subscribe(c, b"room-1");
+        crdtsync_buf_free(sub);
 
         // A diff query frames a non-empty request — channel-keyed, so the server
         // resolves the room and the scope it narrows to. Both kinds frame; a bad
-        // kind frames nothing.
+        // kind frames nothing, and neither does a channel this client does not hold.
         for kind in [0u32, 1u32] {
-            let frame = crdtsync_client_diff_query(c, 0, kind, b"a".as_ptr(), 1, b"b".as_ptr(), 1);
+            let frame = crdtsync_client_diff_query(c, ch, kind, b"a".as_ptr(), 1, b"b".as_ptr(), 1);
             assert!(frame.len > 0, "a diff query frames bytes to send");
             crdtsync_buf_free(frame);
         }
-        let bad = crdtsync_client_diff_query(c, 0, 9, b"a".as_ptr(), 1, b"b".as_ptr(), 1);
+        let bad = crdtsync_client_diff_query(c, ch, 9, b"a".as_ptr(), 1, b"b".as_ptr(), 1);
         assert_eq!(bad.len, 0, "a bad kind frames nothing");
         crdtsync_buf_free(bad);
+        let unheld = crdtsync_client_diff_query(c, ch + 1, 0, b"a".as_ptr(), 1, b"b".as_ptr(), 1);
+        assert_eq!(unheld.len, 0, "an unheld channel frames nothing");
+        crdtsync_buf_free(unheld);
 
         // No result until one is answered.
         let mut none = out_buf();

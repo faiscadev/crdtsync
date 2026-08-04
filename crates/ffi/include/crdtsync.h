@@ -1734,7 +1734,8 @@ int32_t crdtsync_client_branch_at(const CrdtClient *client,
 // Frame a diff query on `channel`: the structural diff turning state `a` into
 // state `b` in the room that channel is subscribed to, where `kind` selects the
 // state space — 0 diffs two saved versions, 1 diffs two branches' HEADs. Returns
-// the frame to send; empty on a bad handle, a bad `kind`, or a bad input.
+// the frame to send; empty on a bad handle, a bad `kind`, a bad input, or a channel
+// this client does not hold.
 // Channel-keyed: a change list carries the room's paths and values, so the server
 // narrows it to what this channel may read. The reply updates the diff view, keyed
 // by the room the server resolved.

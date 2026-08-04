@@ -1332,10 +1332,11 @@ const (
 )
 
 // DiffQuery frames a request for the structural diff turning state a into state b
-// in the room channel is subscribed to. kind selects whether a/b name two saved
-// versions or two branches. Channel-keyed: a change list carries the room's paths
-// and values, so the server narrows it to what this channel may read. The reply
-// updates the diff view, read with DiffResult under the room the server resolved.
+// in the room that channel is subscribed to. kind selects whether a/b name two
+// saved versions or two branches. Channel-keyed: a change list carries the room's
+// paths and values, so the server narrows it to what this channel may read. The
+// reply updates the diff view, read with DiffResult under the room the server
+// resolved. Empty if the channel is not held.
 func (c *Client) DiffQuery(channel uint32, kind DiffKind, a, b []byte) []byte {
 	ap, al := bytesArg(a)
 	bp, bl := bytesArg(b)

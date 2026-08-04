@@ -173,10 +173,13 @@ def test_diff_query_round_trips():
 
     with Client(cid(1)) as a:
         room = b"room-1"
+        ch, _ = a.subscribe(room)
         # Both kinds frame a request; channel-keyed, so the server resolves the
-        # room and the scope the change list is narrowed to.
-        assert len(a.diff_query(0, DiffKind.VERSIONS, b"a", b"b")) > 0
-        assert len(a.diff_query(0, DiffKind.BRANCHES, b"main", b"draft")) > 0
+        # room and the scope the change list is narrowed to. A channel this client
+        # does not hold frames nothing.
+        assert len(a.diff_query(ch, DiffKind.VERSIONS, b"a", b"b")) > 0
+        assert len(a.diff_query(ch, DiffKind.BRANCHES, b"main", b"draft")) > 0
+        assert a.diff_query(ch + 1, DiffKind.VERSIONS, b"a", b"b") == b""
         # No result until one is answered.
         assert a.diff(room) is None
 

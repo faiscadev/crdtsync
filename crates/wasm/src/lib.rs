@@ -1794,6 +1794,7 @@ impl WasmClient {
     /// other value is an error. Channel-keyed: a change list carries the room's
     /// paths and values, so the server narrows it to what this channel may read.
     /// The reply updates the diff view, keyed by the room the server resolved.
+    /// `null` if the channel isn't held, as a version fetch answers.
     #[wasm_bindgen(js_name = diffQuery)]
     pub fn diff_query(
         &self,
@@ -1801,7 +1802,7 @@ impl WasmClient {
         kind: u32,
         a: &[u8],
         b: &[u8],
-    ) -> Result<Vec<u8>, JsError> {
+    ) -> Result<Option<Vec<u8>>, JsError> {
         let kind = match kind {
             0 => DiffKind::Versions,
             1 => DiffKind::Branches,
@@ -1811,9 +1812,11 @@ impl WasmClient {
                 ))
             }
         };
-        Ok(encode_message(
-            &self.inner.diff_query(Channel(channel), kind, a, b),
-        ))
+        Ok(self
+            .inner
+            .diff_query(Channel(channel), kind, a, b)
+            .as_ref()
+            .map(encode_message))
     }
 
     /// The change list from the last diff query answered for `room`, as an array

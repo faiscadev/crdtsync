@@ -31,17 +31,30 @@ fn value_change() -> Change {
 
 #[test]
 fn diff_query_frames_a_channel_keyed_request() {
-    let s = ClientSession::new(cid(1));
+    let mut s = ClientSession::new(cid(1));
+    let (ch, _) = s.subscribe(ROOM);
     assert!(matches!(
-        s.diff_query(Channel(0), DiffKind::Versions, b"v1", b"v2"),
-        Message::DiffQuery { channel, kind: DiffKind::Versions, a, b }
-            if channel == Channel(0) && a == b"v1" && b == b"v2"
+        s.diff_query(ch, DiffKind::Versions, b"v1", b"v2"),
+        Some(Message::DiffQuery { channel, kind: DiffKind::Versions, a, b })
+            if channel == ch && a == b"v1" && b == b"v2"
     ));
     assert!(matches!(
-        s.diff_query(Channel(4), DiffKind::Branches, b"main", b"draft"),
-        Message::DiffQuery { channel, kind: DiffKind::Branches, a, b }
-            if channel == Channel(4) && a == b"main" && b == b"draft"
+        s.diff_query(ch, DiffKind::Branches, b"main", b"draft"),
+        Some(Message::DiffQuery { channel, kind: DiffKind::Branches, a, b })
+            if channel == ch && a == b"main" && b == b"draft"
     ));
+}
+
+#[test]
+fn a_diff_query_on_an_unheld_channel_frames_nothing() {
+    // The server answers a query on a channel this connection never bound with a
+    // protocol violation, which closes the session — so the frame is refused here,
+    // exactly as a version fetch on an unheld channel is.
+    let mut s = ClientSession::new(cid(1));
+    let (ch, _) = s.subscribe(ROOM);
+    assert!(s
+        .diff_query(Channel(ch.0 + 1), DiffKind::Versions, b"v1", b"v2")
+        .is_none());
 }
 
 #[test]
