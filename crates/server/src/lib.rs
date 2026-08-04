@@ -1644,7 +1644,7 @@ impl Hub {
     /// subtree. An op whose target is still unindexed (a since-deleted container, a
     /// composite annotation payload) resolves to the root by
     /// [`op_read_path`](crate::acl::op_read_path), so whatever the root verdict admits
-    /// carries it — wider than the whole-document reader (C37). Empty for an unknown
+    /// carries it — wider than the whole-document reader (C52). Empty for an unknown
     /// room.
     pub fn element_paths(&self, room: &[u8]) -> ElementPaths {
         self.rooms
@@ -2133,7 +2133,7 @@ impl Hub {
     /// [`DiffError::UnknownBranch`] — which today covers more than an unknown name,
     /// since [`materialize_branch`](Hub::materialize_branch) also answers `None` for a
     /// branch whose durable base this node cannot read, and for `main` on a room it
-    /// holds no state for (C36). A *materialized* state that does not decode is
+    /// holds no state for (C51). A *materialized* state that does not decode is
     /// [`DiffError::Decode`]. `narrow` is the reader's redaction, as in
     /// [`Hub::diff_versions`].
     pub fn diff_branches(

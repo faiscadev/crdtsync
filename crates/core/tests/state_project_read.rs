@@ -782,7 +782,7 @@ fn a_range_whose_anchor_seq_is_deleted_falls_back_to_root_gating() {
     // root, so it drops the orphaned range — which is what this pins. It is not the
     // general rule: a reader the *root verdict admits* keeps the range, and a root
     // grant carved by a subtree deny is such a reader, so the fallback is not
-    // fail-closed for it (C37). This is the same fallback op_read_paths applies on the
+    // fail-closed for it (C52). This is the same fallback op_read_paths applies on the
     // op seam, so a fresh op-served and a fresh snapshot-served reader agree either
     // way.
     let build = || {

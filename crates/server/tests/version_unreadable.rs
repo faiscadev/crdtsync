@@ -17,7 +17,7 @@
 //! cannot read whoever asks, where a fetch serves a reader nothing would narrow for.
 //! These two cases are a `DiffKind::Versions` query; a *branch* whose durable base
 //! does not decode reaches the seam as an unmaterializable branch instead, which is
-//! answered `NotFound` rather than `Internal` (C36).
+//! answered `NotFound` rather than `Internal` (C51).
 
 use std::fs;
 use std::path::{Path, PathBuf};

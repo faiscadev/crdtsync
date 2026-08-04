@@ -1563,7 +1563,7 @@ impl Registry {
     /// drop ops and would otherwise desync the path lookup. An op whose target the
     /// index cannot resolve reads at the root ([`op_read_path`](crate::acl::op_read_path)),
     /// so whatever the root verdict admits carries it — which includes a root grant
-    /// carved by a subtree deny, not the whole-document reader alone (C37).
+    /// carved by a subtree deny, not the whole-document reader alone (C52).
     fn fan_out_ops_redacted(
         &mut self,
         writer: ConnId,

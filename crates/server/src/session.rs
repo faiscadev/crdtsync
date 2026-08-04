@@ -1185,7 +1185,7 @@ pub fn step(
         // scrub differently and a change list does not carry), and a partition it may
         // not read contributes no change at all rather than a redacted one — with the
         // one exception the projections themselves carry, an element the live walk
-        // does not reach, whose diff-visible face is an orphaned annotation (C37).
+        // does not reach, whose diff-visible face is an orphaned annotation (C52).
         // Served locally from the replicated state, so no leader redirect. A version
         // or branch that does not materialize answers `NotFound`, and a materialized
         // side that fails to decode `Internal`;
@@ -2144,7 +2144,7 @@ fn request_denied(session: &Session, what: &str) -> Response {
 /// Map a [`DiffError`] to the client failure it surfaces. A version or branch that
 /// does not materialize is a recoverable `NotFound` — usually a name the room does
 /// not have, though a branch whose durable base this node cannot read reaches it too
-/// (C36). A materialized state that fails to decode is an `Internal` fault, since
+/// (C51). A materialized state that fails to decode is an `Internal` fault, since
 /// nothing the client sent caused it. Neither closes: a diff's sides are archived or
 /// reconstructed state, so one of them being unreadable is a server-side fault the
 /// channel's live stream survives — the reading the version fetch takes of the
