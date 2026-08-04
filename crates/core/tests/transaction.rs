@@ -1196,7 +1196,7 @@ fn one_member_under_two_envelopes_folds_one_state_in_every_order() {
     // hold under that envelope, so its key resolves and the rest of the group merges
     // standalone. Both copies name a group here: a copy carrying *no* tag — what a
     // filtering seam's destranding produces — leaves the buffer holding nothing to
-    // contradict, and is C44's shape rather than this one.
+    // contradict, and is C46's shape rather than this one.
     let (a, ops) = triple();
     let dup = retagged(&ops[2], tx_id(&ops[0]), 2);
     let set = [ops[0].clone(), ops[1].clone(), ops[2].clone(), dup];
@@ -1299,7 +1299,7 @@ fn two_envelopes_naming_different_groups_spend_both_keys() {
 /// record closes: it needs the two copies to name different groups, it is
 /// order-dependent on `main` before the record exists, and the record narrows it
 /// from a split in what a replica reads to a split in which keys it has spent.
-/// Filed as its own unit (KANBAN C44).
+/// Filed as its own unit (KANBAN C46).
 #[test]
 fn a_copy_absorbed_by_another_groups_bucket_strands_its_own_group_until_eviction() {
     let (mut a, first) = pair();
