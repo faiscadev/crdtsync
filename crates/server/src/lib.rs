@@ -420,9 +420,11 @@ struct Room {
     max_op_version: Option<u32>,
     /// The authenticated actor that established the room — its first writer. The
     /// doc-ACL authority root: it auto-owns `/`, so it may always read and write and
-    /// its grants confer authority. Set once, on the first write, and never
-    /// displaced; durable across a restart. `None` for a room reconstructed from a
-    /// snapshot with no persisted creator, or one never written through the ops path.
+    /// its grants confer authority. Set once and never displaced; durable across a
+    /// restart. It arrives from whichever seam first names one — a client's write, a
+    /// peer's replication frame, or the store — so a replica holds it without ever
+    /// having served a write. `None` for a room no authenticated actor has established
+    /// and no frame has named.
     creator: Option<Vec<u8>>,
 }
 
@@ -1590,9 +1592,7 @@ impl Hub {
     /// store attached the snapshot is persisted before the room commits.
     ///
     /// `creator` is the room's doc-ACL authority root as the sending leader holds it,
-    /// installed set-once beside the state: the snapshot bytes carry the room's ACL
-    /// tuples but not the authority they are decided under, so a replica that took
-    /// only the bytes would read every deny in them as inert.
+    /// installed set-once beside the state, which does not carry one.
     pub fn install_snapshot(
         &mut self,
         room: &[u8],
@@ -1898,7 +1898,7 @@ impl Hub {
     /// [anonymous](crate::acl::is_authenticated) actor — an anonymous id is ephemeral
     /// per-connection, so set-once would wedge the room's authority on a principal
     /// that can never re-present to exercise it. The same two rules decide a root
-    /// arriving with an installed snapshot ([`install_room_state`]), so a root is
+    /// arriving with an installed snapshot, so a root is
     /// judged the same whether a client's write or a peer's frame carries it.
     ///
     /// Persisting is best-effort, matching the governing metadata: a failed write does

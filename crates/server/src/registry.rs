@@ -759,10 +759,9 @@ impl Registry {
     /// exactly as [`apply_replicate`](Registry::apply_replicate). Returns whether the
     /// connection stays open.
     ///
-    /// `creator` rides beside the state because the state does not hold it: the
-    /// snapshot is a `Document` encoding, so it carries the room's ACL tuples but not
-    /// the authority root they are decided under. It installs set-once, so replacing
-    /// the replica never drops a root already standing here.
+    /// `creator` — the room's authority root, which the state bytes do not carry (see
+    /// [`Message::ReplicateSnapshot`]) — installs set-once, so replacing the replica
+    /// never drops a root already standing here.
     fn apply_replicate_snapshot(
         &mut self,
         id: ConnId,

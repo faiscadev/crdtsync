@@ -1,13 +1,14 @@
 //! A room's creator is replicated metadata — a replica that holds a room holds its
 //! doc-ACL authority root (C29).
 //!
-//! `ensure_creator` runs on the leader's ops-write path, so a node that holds a room
-//! only through replication held no creator at all. A creatorless room has no
-//! authority root: `reads_whole_document` short-circuits `true` and `doc_acl_read_at`
-//! abstains, so every doc-ACL deny that rode the log is inert. Follower reads let a
-//! caught-up follower serve a read from its own replica, so a partial reader landing
-//! there was served the WHOLE document out of every seam that serves a state blob —
-//! the op catch-up, the snapshot catch-up, and the version fetch alike.
+//! A creatorless room has no authority root: `reads_whole_document` short-circuits
+//! `true` and `doc_acl_read_at` abstains, so every doc-ACL deny that rode the log
+//! decides nothing — while `acl_records` is non-empty, because ACL ops ride the log
+//! like any other. Follower reads let a caught-up follower serve a read from its own
+//! replica, so what a replica holds decides what a partial reader landing there is
+//! served, out of every seam that serves a state blob: the op catch-up, the snapshot
+//! catch-up, and the version fetch alike. These pin that a replicated room carries
+//! its root, and that each of those three seams narrows by it.
 //!
 //! The schema tier is what makes the gap observable. It grants root read to any
 //! authenticated actor, so bob passes the room gate on both nodes, while alice's
@@ -735,8 +736,7 @@ fn an_authenticated_actor_roots_a_room_whatever_its_id_looks_like() {
     // second-guesses what the verifier produced strips authority rather than
     // protecting it. An empty actor is the sharpest case: every other tier already
     // counts it as authenticated.
-    let room = room_led_by_a_with_b_next();
-    let mut leader = seeded_leader(&room);
+    let mut leader = node(A);
     let other = b"other-room".to_vec();
     leader
         .hub_mut()
