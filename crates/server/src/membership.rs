@@ -12,10 +12,13 @@
 //! The member set is *dynamic*: gossip membership discovery (Unit 7) grows it by
 //! anti-entropy — a node need only know one seed peer at boot, then learns the
 //! rest by [`add_member`](Membership::add_member) unioning in the members a peer
-//! advertises. Placement stays deterministic and order-independent: the member
-//! set is canonicalized (sorted, de-duplicated) before the [`Cluster`] is built,
-//! so two nodes that have learned the same set place every room identically no
-//! matter the order they learned it in.
+//! advertises. Placement is deterministic *in the adopted set*: that set is
+//! canonicalized (sorted, de-duplicated) before the [`Cluster`] is built, so two
+//! nodes that have adopted the same members place every room identically. Which
+//! members are adopted is not itself order-independent — it is derived from
+//! `verifiers`, and a claim is dropped when it names a member this view has not met
+//! yet, so a node can hold the same evidence rounds later than a peer does. See the
+//! adoption section below for the window and what bounds it.
 //!
 //! A node also tracks each member's *liveness* from two independent signals,
 //! unioned so any evidence of death excludes a member from room leadership:
@@ -282,8 +285,11 @@ pub struct Membership {
     /// claim naming a member this view has not met is dropped with the tuple carrying
     /// it, because retaining claims about ids that are on no roster is unbounded and
     /// no reap could ever strike them. The claim is late rather than lost: a verifier
-    /// re-advertises what it verified every round, so the next round this node
-    /// initiates carries the member and the claim together. Between nodes it converges only as far as
+    /// re-advertises what it verified on every round it sends, so the next round *with
+    /// that verifier* carries it again. That is O(cluster size) intervals, not one — a
+    /// node gossips to one uniformly-random peer per interval and claims are never
+    /// relayed, so they spread by coupon-collector from two fixed sources rather than
+    /// epidemically. C35's roster growth is what makes the wait unbounded. Between nodes it converges only as far as
     /// the claims travel, and a claim travels only from the member that made it —
     /// nothing here relays another node's word, so a member that sends different
     /// claims to different peers leaves them holding different evidence permanently

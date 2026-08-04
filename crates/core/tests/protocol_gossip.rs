@@ -233,3 +233,31 @@ fn member_state_orders_by_suspicion() {
     assert!(MemberState::Dead > MemberState::Suspect);
     assert!(MemberState::Suspect > MemberState::Alive);
 }
+
+#[test]
+fn a_verification_flag_outside_zero_or_one_is_an_error() {
+    // One byte string per message. A decoder that read any non-zero byte as `true`
+    // would give a frame two spellings — the same members, the same claims, different
+    // bytes — so a peer could produce a frame no honest node emits and be understood
+    // anyway. The flag is a tag, and an unknown tag is refused like every other.
+    let mut bytes = encode_message(&Message::Gossip {
+        members: vec![verified_member(
+            b"node-a",
+            b"10.0.0.1:9000",
+            0,
+            MemberState::Alive,
+        )],
+    });
+    for tag in [2u8, 3, 0x80, 0xff] {
+        *bytes.last_mut().unwrap() = tag;
+        assert!(
+            decode_message(&bytes).is_err(),
+            "a verification tag of {tag} decodes as no message",
+        );
+    }
+    // And the two it does define still round-trip.
+    *bytes.last_mut().unwrap() = 1;
+    assert!(decode_message(&bytes).is_ok());
+    *bytes.last_mut().unwrap() = 0;
+    assert!(decode_message(&bytes).is_ok());
+}

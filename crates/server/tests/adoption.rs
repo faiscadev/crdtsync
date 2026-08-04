@@ -1758,34 +1758,115 @@ fn a_compromised_member_that_speaks_selectively_splits_the_ring() {
 }
 
 #[test]
-fn a_claim_that_outruns_its_subject_is_re_sent_within_one_round() {
-    // An inbound frame introduces only its own sender, so a claim naming a member this
-    // view has not met is dropped with the tuple that carried it. Holding it instead
-    // would be unbounded — those ids are on no roster, so no reap could ever strike
-    // them. What makes dropping safe is that the claim is not lost, only late: a
-    // verifier re-advertises what it verified on every round, so the very next round
-    // this node initiates carries the member and the claim about it together.
-    let joiner = NodeId::from("10.9.9.9:9000");
-    let mut voucher = membership_for("10.0.0.1:9000");
-    let mut late = membership_for(SELF_ADDR);
-    voucher.add_member(joiner.clone());
-    voucher.note_verified(&joiner);
-    assert!(voucher.has_verified(voucher.self_id(), &joiner));
+fn an_inbound_frame_drops_the_claim_it_carries_about_an_unmet_member() {
+    // The seam the rule actually lives at. `Registry::apply_gossip` admits only members
+    // this view already holds plus the sender's own tuple, and a tuple that fails that
+    // test is dropped whole — claim included. Retaining the claim instead would key
+    // `verifiers` on ids that are on no roster, which no reap can ever strike and
+    // `rebuild_placement` never scans, so one frame of attacker-chosen ids banks
+    // entries nothing reclaims.
+    //
+    // This must be driven through `Registry`, not through `Membership::merge_liveness`:
+    // that path admits the unmet member from the same tuple, so the claim is retained
+    // either way and a test written there cannot tell the two designs apart.
+    let mut r = registry();
+    let voucher = NodeId::from("10.0.0.1:9000");
+    let unmet = NodeId::from("10.9.9.9:9000");
+    let conn = certified_peer_as(&mut r, &voucher);
 
-    // Being dialed teaches `late` nothing about the joiner, so the claim rides a frame
-    // whose subject it cannot admit, and goes with it.
-    crdtsync_server::gossip::exchange(&mut voucher, &mut late);
+    assert!(!r.membership().unwrap().is_member(&unmet), "not met yet");
+    assert!(r.deliver(
+        conn,
+        Message::Gossip {
+            members: advertisements(&[&unmet], true),
+        },
+    ));
+
+    let m = r.membership().unwrap();
     assert!(
-        !late.is_member(&joiner),
+        !m.is_member(&unmet),
         "an inbound frame introduces only its own sender",
     );
-    assert!(!late.has_verified(voucher.self_id(), &joiner));
-
-    // One round `late` initiates, and the reply carries both.
-    crdtsync_server::gossip::exchange(&mut late, &mut voucher);
-    assert!(late.is_member(&joiner), "the member arrived");
     assert!(
-        late.has_verified(voucher.self_id(), &joiner),
-        "and the claim about it arrived in the same frame, one round later",
+        !m.has_verified(&voucher, &unmet),
+        "and the claim it carried about that member goes with it",
+    );
+    assert!(!m.is_adopted(&unmet));
+}
+
+#[test]
+fn a_dropped_claim_is_re_sent_once_the_member_is_known() {
+    // Why dropping is affordable: the claim is late, not lost. A verifier re-emits
+    // `verified` for every member it has verified on every round it sends, so once this
+    // view holds the member, a later frame from that verifier carries the claim again.
+    let mut r = registry();
+    let voucher = NodeId::from("10.0.0.1:9000");
+    let joiner = NodeId::from("10.9.9.9:9000");
+    let conn = certified_peer_as(&mut r, &voucher);
+
+    // Arrives too early: dropped.
+    assert!(r.deliver(
+        conn,
+        Message::Gossip {
+            members: advertisements(&[&joiner], true),
+        },
+    ));
+    assert!(!r.membership().unwrap().has_verified(&voucher, &joiner));
+
+    // The member becomes known the way it actually does: it dials in and introduces
+    // itself, which is the one thing an inbound frame may do.
+    let own = certified_peer_as(&mut r, &joiner);
+    assert!(r.deliver(own, introduces(&joiner, false)));
+    assert!(r.membership().unwrap().is_member(&joiner));
+
+    // The verifier's next round carries the same claim, and now it lands.
+    assert!(r.deliver(
+        conn,
+        Message::Gossip {
+            members: advertisements(&[&joiner], true),
+        },
+    ));
+    assert!(
+        r.membership().unwrap().has_verified(&voucher, &joiner),
+        "the claim is re-sent, so dropping it costs a round rather than the evidence",
+    );
+}
+
+#[test]
+fn a_member_reaped_after_it_was_adopted_returns_pending() {
+    // `reap_dead` strikes the departed member's own verifier set as well as its entries
+    // in everyone else's. Without the first, a member reaped *after* it was adopted
+    // keeps the claims that adopted it and returns pre-adopted on evidence nobody
+    // re-established — placed on rooms without a single contemporaneous dial.
+    let mut m = membership_for(SELF_ADDR);
+    let returning = NodeId::from("10.9.9.9:9000");
+    m.add_member(returning.clone());
+    for who in ["10.0.0.1:9000", "10.0.0.2:9000"] {
+        vouch(&mut m, who, &returning);
+    }
+    assert!(m.is_adopted(&returning), "adopted before it departs");
+
+    for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+        m.note_gossip_unreachable(&returning);
+    }
+    for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+        m.reap_dead();
+    }
+    assert!(!m.is_member(&returning));
+
+    m.merge_liveness(
+        &NodeId::from("10.0.0.1:9000"),
+        [(
+            returning.clone(),
+            returning.as_bytes().to_vec(),
+            1,
+            MemberState::Alive,
+            false,
+        )],
+    );
+    assert!(m.is_member(&returning), "it returned");
+    assert!(
+        !m.is_adopted(&returning),
+        "and it returned pending: reaping took its vouches with it",
     );
 }

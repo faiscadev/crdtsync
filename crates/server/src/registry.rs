@@ -1022,9 +1022,12 @@ impl Registry {
         // are on no roster, so no reap can ever strike them, and one frame of
         // attacker-chosen ids banks entries that nothing reclaims. Measured, one 24.9 MB
         // frame retained 376.5 MB, a 15x amplification of the wire. Dropping costs a
-        // *bounded* window instead: the maker re-advertises `verified` for every member
-        // it has verified on every round, so a claim that arrives before its subject is
-        // re-sent within one gossip interval and the view converges then.
+        // window instead: the maker re-advertises `verified` for every member it has
+        // verified on every round it sends, so a claim arriving before its subject is
+        // re-sent on the next round *with that maker* — O(cluster size) intervals,
+        // since a node gossips to one random peer per interval and claims are never
+        // relayed. Bounded in bytes, unbounded in time only as far as C35's roster
+        // growth allows.
         let members = members
             .into_iter()
             .filter(|(node, addr, ..)| {
