@@ -12,10 +12,13 @@
 //! The member set is *dynamic*: gossip membership discovery (Unit 7) grows it by
 //! anti-entropy — a node need only know one seed peer at boot, then learns the
 //! rest by [`add_member`](Membership::add_member) unioning in the members a peer
-//! advertises. Placement stays deterministic and order-independent: the member
-//! set is canonicalized (sorted, de-duplicated) before the [`Cluster`] is built,
-//! so two nodes that have learned the same set place every room identically no
-//! matter the order they learned it in.
+//! advertises. Placement is deterministic *in the adopted set*: that set is
+//! canonicalized (sorted, de-duplicated) before the [`Cluster`] is built, so two
+//! nodes that have adopted the same members place every room identically. Which
+//! members are adopted is not itself order-independent — it is derived from
+//! `verifiers`, and a claim is dropped when it names a member this view has not met
+//! yet, so a node can hold the same evidence rounds later than a peer does. See the
+//! adoption section below for the window and what bounds it.
 //!
 //! A node also tracks each member's *liveness* from two independent signals,
 //! unioned so any evidence of death excludes a member from room leadership:
@@ -35,11 +38,48 @@
 //! first live replica in HRW order, so a dead placement primary's rooms promote to
 //! the next live replica rather than stranding, and a refuted or recovered node
 //! reclaims them.
+//!
+//! Learning a member and *placing* rooms on it are two different admissions. The
+//! roster above is what a node dials, probes and gossips; the [`Cluster`] placement
+//! is built from the **adopted** members only, and a member learned by gossip is
+//! held *pending* until the cluster has vouched for it. Placement is HRW over the
+//! member set — a pure and publicly computable function — so which rooms a node
+//! replicates follows from its node id, and an unchecked join path would let a node
+//! mint an id that places it into any room's replica set. Pending keeps such a node
+//! dialable and gossipable (so it converges, and so a genuine joiner is reached)
+//! while it holds no room and counts toward no room's quorum.
+//!
+//! Adoption is a decision the *cluster* makes, never one node: placement must be
+//! identical everywhere or the ring splits, so it cannot be a local predicate over a
+//! shared member set. A node records only what it knows first-hand — that it has
+//! completed an identity-checked peer link to a member ([`note_verified`]) — and
+//! that claim rides gossip attributed to the node that made it. A member is adopted
+//! once [`ADOPTION_VERIFIERS`] *already-adopted* members have verified it. A member
+//! never verifies itself, so no node can place itself; the members a node was
+//! *configured* with are adopted from birth, since the operator's config is the root
+//! of trust the cluster starts from.
+//!
+//! **What converges, and what a Byzantine member can still do.** A claim is
+//! first-hand and is never relayed: this node tells its peers what *it* verified, and
+//! passes on nobody else's word, because with no signature on the wire "A and B
+//! verified X" is free for any node to write. So among honest members the evidence is
+//! grow-only and converges — every node dials every member it knows and eventually
+//! tells every other node — but a *compromised* member's claim reaches exactly the
+//! nodes it chooses to send it to. It can set the flag toward some peers and clear it
+//! toward others, and no honest node can carry the claim past them or contradict it.
+//! Where such a member is the swing vote — a candidate that exactly one other trust
+//! unit has reached — honest nodes then disagree about the ring, and if the candidate
+//! stays unreachable to the rest, that disagreement does not heal. Closing it needs
+//! evidence a receiver can attribute without trusting the relay, i.e. a claim signed
+//! by the verifier's peer key; see KANBAN C39.
+//!
+//! [`note_verified`]: Membership::note_verified
 
 use std::collections::{HashMap, HashSet};
 
 use crdtsync_core::MemberState;
 
+use crate::dial::member_trust_unit;
 use crate::placement::{Cluster, NodeId};
 
 /// Consecutive failed direct gossip probes to a member before this node escalates
@@ -105,6 +145,19 @@ impl MemberLiveness {
 /// room, primary first. Clamps to the member count, so a small cluster resolves.
 pub const DEFAULT_REPLICATION_FACTOR: usize = 3;
 
+/// How many adopted members must have completed an identity-checked peer link to a
+/// gossip-learned member before it is adopted — placed on rooms and counted toward
+/// their quorums. More than one, because the whole point is that no *single* member
+/// can put a node of its choosing into the placement ring: one compromised member
+/// grinding a node id needs an honest member to have independently reached that id
+/// too. Small, because every honest member probes every member it knows on its own
+/// gossip cadence, so a genuine joiner clears the bar within a few rounds. Clamped
+/// Not clamped to the cluster's size: the bar is the same constant on every node, so
+/// two nodes never disagree about what the evidence has to show. A cluster with fewer
+/// than this many adopted members therefore grows by *configuration* rather than by
+/// gossip — which is where a cluster that small gets its members anyway.
+pub const ADOPTION_VERIFIERS: usize = 2;
+
 /// A malformed static membership configuration, surfaced at startup instead of a
 /// panic or a silently wrong member set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +168,16 @@ pub enum MembershipConfigError {
     /// Peers were configured but the node has no advertise address or node id, so
     /// it cannot place itself in its own cluster.
     MissingSelfId,
+    /// A configured address is not one a peer could dial — it carries more than a
+    /// host and a port, names no host, or names a port that is no port. Refused
+    /// rather than joined under, because an id nobody can reach is a member the
+    /// cluster can never verify and this node can never be recognised as.
+    NotAnAddress(String),
+    /// A peer list was configured but named nobody except this node. Such a node has
+    /// a peer plane and a cluster secret and yet no cluster to be outvoted by, so its
+    /// adoption bar would fall to a single vouch — it would place a member on rooms
+    /// on its own word while every peer it met still held the cluster's bar.
+    NoPeerButSelf,
 }
 
 impl std::fmt::Display for MembershipConfigError {
@@ -126,6 +189,16 @@ impl std::fmt::Display for MembershipConfigError {
             MembershipConfigError::MissingSelfId => write!(
                 f,
                 "cluster peers configured but no node id or advertise address for self"
+            ),
+            MembershipConfigError::NotAnAddress(addr) => write!(
+                f,
+                "`{addr}` is not an address a peer can dial — use `host:port`, with no \
+                 user, path, query or fragment, and bracket an IPv6 literal"
+            ),
+            MembershipConfigError::NoPeerButSelf => write!(
+                f,
+                "the cluster peer list names nobody but this node: list this node's \
+                 seed peers, or unset it for single-node mode"
             ),
         }
     }
@@ -181,6 +254,57 @@ pub struct Membership {
     /// retention outlives any in-flight gossip that could reference the member, so the
     /// prune never resurrects it.
     reaped: HashMap<NodeId, u32>,
+    /// The members this node was *configured* with — `self` and the seed peers. The
+    /// root of trust a cluster starts from, adopted from birth because there is no
+    /// earlier authority for them to be vouched for by. Reaping removes a member from
+    /// it: a configured node that departed durably is gone, and the ring is derived
+    /// from this set.
+    configured: HashSet<NodeId>,
+    /// Whether this node was configured with **no peers at all** — the single-node
+    /// deployment, which uses the bootstrap bar ([`adoption_bar`](Self::adoption_bar)).
+    /// Fixed at construction rather than read off `configured`, which shrinks: a bar
+    /// that followed the live set would collapse to one the moment a node's last seed
+    /// was reaped, and that node would then place on a single vouch while every peer
+    /// still held the constant — a ring split off an ordinary retirement.
+    solitary: bool,
+    /// The members rooms are actually placed on — the subset of the roster the
+    /// [`Cluster`] above is built from: the configured members plus every
+    /// gossip-learned member the evidence now carries. **Derived, never accumulated**
+    /// — [`rebuild_placement`](Self::rebuild_placement) recomputes it from
+    /// `configured` + `verifiers` — so it is a pure function of state and two nodes
+    /// holding the same evidence *and the same roster* hold the same ring, however
+    /// they came by it — the fixpoint scans the roster, so a member two units have
+    /// vouched for is not adopted by a node that has not met it yet.
+    adopted: HashSet<NodeId>,
+    /// Whether this node's adopted set spans too few trust units to ever clear its own
+    /// adoption bar again — see [`rebuild_placement`](Self::rebuild_placement). An
+    /// empty ring alone cannot express this: a node with no membership at all also has
+    /// no replicas, and that one *should* serve every room. The write path has to tell
+    /// the two apart, so it is stored rather than inferred.
+    stranded: bool,
+    /// Who has verified each member: for every member, the nodes that reported
+    /// completing an identity-checked peer link to it. A node inserts itself here
+    /// from its own links, and inserts a peer only from that peer's own gossip
+    /// (attributed to the member its link is bound to), so every entry is a
+    /// first-hand claim by the node named — a member can vouch for itself only, and
+    /// never *for* itself ([`note_verified`](Self::note_verified) refuses that).
+    /// Grow-only per member, so it merges by union: within one node the order claims
+    /// arrive in cannot change the *set*. It can change when the set is complete — a
+    /// claim naming a member this view has not met is dropped with the tuple carrying
+    /// it, because retaining claims about ids that are on no roster is unbounded and
+    /// no reap could ever strike them. The claim is late rather than lost: a verifier
+    /// re-advertises what it verified on every round it sends, so the next round *with
+    /// that verifier* carries it again. That is O(cluster size) intervals, not one — a
+    /// node gossips to one uniformly-random peer per interval and claims are never
+    /// relayed, so they spread by coupon-collector from two fixed sources rather than
+    /// epidemically. C35's roster growth is what makes the wait unbounded. Between nodes it converges only as far as
+    /// the claims travel, and a claim travels only from the member that made it —
+    /// nothing here relays another node's word, so a member that sends different
+    /// claims to different peers leaves them holding different evidence permanently
+    /// (see the module docs, and KANBAN C39). Claims by members that are not (yet)
+    /// adopted are retained but do not count, so a pending member cannot vouch
+    /// another pending member in.
+    verifiers: HashMap<NodeId, HashSet<NodeId>>,
 }
 
 impl Membership {
@@ -191,6 +315,20 @@ impl Membership {
         peers: impl IntoIterator<Item = NodeId>,
         replication_factor: usize,
     ) -> Self {
+        let peers: Vec<NodeId> = peers.into_iter().collect();
+        // Whether the configuration named a peer *other than this node* — not how many
+        // distinct members it collapsed to. A peer list whose every entry canonicalizes
+        // to this node's own id de-duplicates down to one member, and a bar read off
+        // that count would fall to the single-node rule on a node that has a peer plane
+        // and a cluster secret. That is the shape the startup refusal exists to catch,
+        // reached without the variable being empty.
+        // "No peer other than this node", read off the *list*: a de-duplicated count
+        // would move as the cluster shrinks, which once let a reap lower the bar. Note
+        // that a list naming only this node is refused at the configuration door
+        // (`NoPeerButSelf`), so the only lists that reach here name a real peer or name
+        // none; between those two this predicate and `peers.is_empty()` agree, and
+        // where they differ this one is the stricter.
+        let solitary = !peers.iter().any(|peer| peer != &self_id);
         let members: Vec<NodeId> = std::iter::once(self_id.clone()).chain(peers).collect();
         // Every seeded member dials at its node id — the identity each is derived
         // from (`NodeId::from_addr`), so the id and the dial address are the same
@@ -206,6 +344,10 @@ impl Membership {
             .iter()
             .map(|node| (node.clone(), MemberLiveness::new(0, MemberState::Alive)))
             .collect();
+        // A configured member is adopted from birth: the operator's config is the
+        // root of trust a cluster starts from, and there is no earlier authority for
+        // it to be vouched for by.
+        let configured: HashSet<NodeId> = members.iter().cloned().collect();
         Self {
             self_id,
             cluster: Cluster::new(members),
@@ -214,6 +356,13 @@ impl Membership {
             liveness,
             addrs,
             reaped: HashMap::new(),
+            adopted: configured.clone(),
+            configured,
+            solitary,
+            // Set by the first `rebuild_placement`; a freshly-configured node is not
+            // stranded, since its configured members are adopted from birth.
+            stranded: false,
+            verifiers: HashMap::new(),
         }
     }
 
@@ -235,12 +384,26 @@ impl Membership {
         // derives the same id every peer's trimmed `from_addr` does.
         let node_id = node_id.map(str::trim).filter(|s| !s.is_empty());
         let advertise_addr = advertise_addr.map(str::trim).filter(|s| !s.is_empty());
-        let self_id = match (node_id, advertise_addr) {
-            (Some(id), _) => NodeId::from(id),
-            (None, Some(addr)) => NodeId::from_addr(addr),
+        let written = match (node_id, advertise_addr) {
+            (Some(id), _) => id,
+            (None, Some(addr)) => addr,
             (None, None) => return Err(MembershipConfigError::MissingSelfId),
         };
+        // The explicit id goes through the same canonicalization every other door
+        // applies. Left verbatim it would name a member the cluster spells differently:
+        // this node's peers would learn its canonical id, this node would not recognise
+        // that id as itself, and it would carry a *doppelgänger* of itself in its own
+        // roster — adopted on two honest vouchers, placed on rooms it never answers
+        // for, unable to refute a suspicion of itself, and dropping every follower-head
+        // report because the link is bound to the other spelling.
+        let self_id = NodeId::from_addr(written);
+        if crate::dial::canonical_member_addr(written).is_none() {
+            return Err(MembershipConfigError::NotAnAddress(written.to_string()));
+        }
         let peers = parse_peers(peers)?;
+        if !peers.is_empty() && !peers.iter().any(|peer| peer != &self_id) {
+            return Err(MembershipConfigError::NoPeerButSelf);
+        }
         Ok(Self::new(self_id, peers, replication_factor))
     }
 
@@ -249,64 +412,97 @@ impl Membership {
         &self.self_id
     }
 
-    /// The canonical (sorted, de-duplicated) member set, self included.
-    pub fn members(&self) -> &[NodeId] {
+    /// The canonical (sorted, de-duplicated) roster, self included — every member
+    /// this node knows, whether or not the cluster has adopted it. What a node
+    /// dials, probes and gossips; [`adopted_members`](Self::adopted_members) is the
+    /// narrower set rooms are placed on.
+    pub fn members(&self) -> Vec<NodeId> {
+        self.roster()
+    }
+
+    /// The canonical (sorted, de-duplicated) *adopted* member set — the members
+    /// rooms are placed on and counted toward quorum. Equal to the roster in a
+    /// cluster with no pending joiners.
+    pub fn adopted_members(&self) -> &[NodeId] {
         self.cluster.nodes()
     }
 
-    /// Learn a member, dialable at `addr` — the anti-entropy union gossip applies
-    /// for each `(node, addr)` pair a peer advertises. See [`add_members`](Self::add_members).
-    pub fn add_member(&mut self, node: NodeId, addr: Vec<u8>) {
-        self.add_members(std::iter::once((node, addr)));
+    /// Learn a member — the anti-entropy union gossip applies for each node a peer
+    /// advertises. **The address such a tuple carries is no argument here**, because it
+    /// is not what the member is dialed at; see [`add_members`](Self::add_members).
+    pub fn add_member(&mut self, node: NodeId) {
+        self.add_members(std::iter::once(node));
     }
 
-    /// Union a batch of learned members in, rebuilding the [`Cluster`] placement
-    /// once if any were genuinely new. Idempotent: a member already known is
-    /// skipped, so a re-gossip of a fully-known set rebuilds no placement (no
-    /// churn). A member with an empty node id is dropped — it is neither placeable
-    /// nor dialable, so a malformed gossip pair cannot poison the set. When new
-    /// members land, placement is rebuilt from the canonicalized (sorted, de-duped)
-    /// set, so every node that has learned the same members places every room
-    /// identically regardless of the order it learned them in. `self` is a member
-    /// from construction and is never relearned.
-    pub fn add_members(&mut self, members: impl IntoIterator<Item = (NodeId, Vec<u8>)>) {
+    /// Union a batch of learned members into the roster — dialable, probable and
+    /// gossipable, but **pending**: a member learned this way is placed on no room
+    /// until the cluster adopts it ([`note_verified`](Self::note_verified)).
+    /// Idempotent: a member already known is skipped, so a re-gossip of a fully-known
+    /// set changes nothing (no churn). A member with an empty node id is dropped — it
+    /// is neither placeable nor dialable, so a malformed gossip pair cannot poison the
+    /// set. `self` is a member from construction and is never relearned.
+    ///
+    /// **A member is recorded at its own id.** A
+    /// node id *is* an advertise address, so a second address for the same member is a
+    /// second, unauthenticated name for one thing — and the ring turns on it, because a
+    /// node dials a member to verify it. Keeping the advertised one made the roster
+    /// first-write-wins over a field any peer may set: whoever advertised a member
+    /// first decided where every later dial went, so two nodes that saw it in a
+    /// different order verified different endpoints and placed rooms differently,
+    /// forever. Ignoring it makes the dial address a function of the id alone, which
+    /// every node agrees on by construction.
+    pub fn add_members(&mut self, members: impl IntoIterator<Item = NodeId>) {
         let mut added = false;
-        for (node, addr) in members {
+        for node in members {
+            // An address is taken in its one canonical spelling, or not at all: a
+            // second spelling of one endpoint would be a second member, separately
+            // placed, that the same node answers for and never speaks as.
+            let Some(node) = NodeId::canonical(node.as_bytes()) else {
+                continue;
+            };
             // A reaped member is never re-added by a plain re-advertise: only a live
             // return (an `Alive` tuple through `merge_liveness`) escapes the
             // tombstone, so a bare gossip of the member's address — which carries no
             // liveness — cannot resurrect it.
-            if node.as_bytes().is_empty()
-                || self.addrs.contains_key(&node)
-                || self.reaped.contains_key(&node)
-            {
+            if self.addrs.contains_key(&node) || self.reaped.contains_key(&node) {
                 continue;
             }
             self.liveness
                 .insert(node.clone(), MemberLiveness::new(0, MemberState::Alive));
-            self.addrs.insert(node, addr);
+            let dial = node.as_bytes().to_vec();
+            self.addrs.insert(node, dial);
             added = true;
         }
         if added {
-            self.cluster = Cluster::new(self.addrs.keys().cloned());
+            self.rebuild_placement();
         }
     }
 
+    /// The roster in canonical (sorted) order — every member this node knows,
+    /// pending ones included. What a node dials, probes and gossips, as against the
+    /// [`Cluster`] placement, which holds the adopted members only.
+    fn roster(&self) -> Vec<NodeId> {
+        let mut roster: Vec<NodeId> = self.addrs.keys().cloned().collect();
+        roster.sort();
+        roster
+    }
+
     /// The members this node knows, each with its dial address — the payload a
-    /// node gossips. Canonical order (the sorted member set), so the advertisement
-    /// is deterministic. A member's address falls back to its node-id bytes if none
-    /// was recorded, keeping every member dialable.
+    /// node gossips. Canonical order (the sorted roster), so the advertisement is
+    /// deterministic. A member's address falls back to its node-id bytes if none was
+    /// recorded, keeping every member dialable. Pending members are included: a node
+    /// still unadopted has to be reachable and gossiped about, or it could never be
+    /// verified into the ring.
     pub fn known_members(&self) -> Vec<(NodeId, Vec<u8>)> {
-        self.cluster
-            .nodes()
-            .iter()
+        self.roster()
+            .into_iter()
             .map(|node| {
                 let addr = self
                     .addrs
-                    .get(node)
+                    .get(&node)
                     .cloned()
                     .unwrap_or_else(|| node.as_bytes().to_vec());
-                (node.clone(), addr)
+                (node, addr)
             })
             .collect()
     }
@@ -332,6 +528,25 @@ impl Membership {
     /// The shared placement over the member set.
     pub fn cluster(&self) -> &Cluster {
         &self.cluster
+    }
+
+    /// Whether `node`'s advertise address declares a TLS transport — whether a dial
+    /// to it authenticates the far end before a byte is written. Unlike the *inbound*
+    /// direction, where a member's advertised scheme describes its own listener and
+    /// says nothing about the link carrying its identity here, an outbound dial runs
+    /// over exactly the transport that address declares.
+    /// Read off the **id**, not off the roster. A node id is an advertise address, so
+    /// the transport is a property of the id itself and needs no state to decide —
+    /// which is what makes this answer the same on every node. A roster lookup would
+    /// answer `false` for a member this node has not learned yet, so the frame that
+    /// *introduces* a member would be judged differently from every later one, and the
+    /// claims it carries would be kept on the nodes that already knew the sender and
+    /// dropped on the nodes meeting it — one delivery, two states.
+    pub fn advertises_tls(&self, node: &NodeId) -> bool {
+        std::str::from_utf8(node.as_bytes())
+            .ok()
+            .and_then(|addr| crate::dial::PeerEndpoint::parse(addr).ok())
+            .is_some_and(|endpoint| endpoint.is_tls())
     }
 
     /// The ordered replica set for `room`, primary first — the placement Unit 3
@@ -402,27 +617,214 @@ impl Membership {
     }
 
     /// The gossip liveness payload this node advertises: every known member with
-    /// its dial address, current incarnation, and state — canonical (sorted) order,
-    /// so the advertisement is deterministic. `self` rides at its own incarnation,
-    /// always `Alive`.
-    pub fn known_liveness(&self) -> Vec<(NodeId, Vec<u8>, u64, MemberState)> {
-        self.cluster
-            .nodes()
-            .iter()
+    /// its dial address, current incarnation, state, and whether **this node** has
+    /// verified it — canonical (sorted) order, so the advertisement is deterministic.
+    /// `self` rides at its own incarnation, always `Alive`.
+    ///
+    /// The last field is first-hand and self-scoped: a node advertises the links *it*
+    /// completed, never one it heard about, so the claim a receiver acts on is always
+    /// the claim of the member whose link carried it. Relaying another node's
+    /// verifications would make one member's word enough to place any id it liked.
+    pub fn known_liveness(&self) -> Vec<(NodeId, Vec<u8>, u64, MemberState, bool)> {
+        self.roster()
+            .into_iter()
             .map(|node| {
                 let addr = self
                     .addrs
-                    .get(node)
+                    .get(&node)
                     .cloned()
                     .unwrap_or_else(|| node.as_bytes().to_vec());
-                (
-                    node.clone(),
-                    addr,
-                    self.incarnation(node),
-                    self.gossip_state(node),
-                )
+                let incarnation = self.incarnation(&node);
+                let state = self.gossip_state(&node);
+                let verified = self.verified_by_self(&node);
+                (node, addr, incarnation, state, verified)
             })
             .collect()
+    }
+
+    /// Whether `verifier` has reported a completed identity-checked peer link to
+    /// `node` — one entry of the evidence adoption is decided from. A claim is
+    /// admitted only from the member whose link carried it, so this reads "what
+    /// `verifier` itself told this node about `node`", never a relayed opinion.
+    pub fn has_verified(&self, verifier: &NodeId, node: &NodeId) -> bool {
+        self.verifiers
+            .get(node)
+            .is_some_and(|vs| vs.contains(verifier))
+    }
+
+    /// Whether this node has itself verified `node`. `self` is not verified by
+    /// itself — a node vouching for its own place in the ring is exactly what
+    /// adoption exists to refuse — and needs no vouching, since a node is a member of
+    /// its own view from construction.
+    fn verified_by_self(&self, node: &NodeId) -> bool {
+        self.has_verified(&self.self_id, node)
+    }
+
+    /// Whether this node cannot rebuild a ring: its adopted set spans fewer trust units
+    /// than its own adoption bar, so no member it learns can ever clear that bar. The
+    /// ring is empty in that state, and the write path must refuse rather than read the
+    /// emptiness as "single node, serve everything" — which is the same shape a node
+    /// with no membership at all presents.
+    pub fn is_stranded(&self) -> bool {
+        self.stranded
+    }
+
+    /// Whether `node` is adopted — placed on rooms and counted toward their quorums,
+    /// as against merely known (dialed, probed and gossiped about).
+    pub fn is_adopted(&self, node: &NodeId) -> bool {
+        self.adopted.contains(node)
+    }
+
+    /// Record that this node has itself completed an identity-checked peer link to
+    /// `node` — its dial verifying the acceptor's certificate against the address, or
+    /// `node` dialing in with a certificate that names it. This is the one piece of
+    /// evidence a node produces on its own; adoption is what the cluster does with
+    /// enough of them.
+    ///
+    /// Two members are never verified. `self`, because a node's own place in the ring
+    /// is not its to vouch for. And a node outside the roster, because a link is
+    /// evidence about a member and there is no member here to be evidence about —
+    /// learning one is gossip's job, a link that could add one would restore the
+    /// unchecked join this exists to close, and peer admission takes the id a link
+    /// claims, so a certified member could otherwise open a link per port on its own
+    /// host and grow the evidence without limit.
+    pub fn note_verified(&mut self, node: &NodeId) {
+        if !self.can_be_verified(node) {
+            return;
+        }
+        let me = self.self_id.clone();
+        if self.verifiers.entry(node.clone()).or_default().insert(me) {
+            self.rebuild_placement();
+        }
+    }
+
+    /// Whether a verification of `node` is admissible evidence at all — the bar every
+    /// verifier claim clears, this node's own and a peer's alike. See
+    /// [`note_verified`](Self::note_verified) for what each clause refuses.
+    fn can_be_verified(&self, node: &NodeId) -> bool {
+        !self.is_self(node) && self.addrs.contains_key(node)
+    }
+
+    /// How many **trust units** have vouched for `node`: the distinct hosts of the
+    /// adopted members that verified it, its own host excluded.
+    ///
+    /// Hosts rather than node ids, because a host is the unit a certificate names
+    /// (§Peer Identity) and one host mints as many node ids as it likes. Counting ids
+    /// would let a member that holds two of them on one host raise the bar by itself,
+    /// which is the mint one level up. Its own host is excluded for the same reason: a
+    /// member vouching for a sibling on its own host is vouching for itself. A member
+    /// whose id names no host counts for nobody — there is no unit to attribute it to.
+    ///
+    /// The host is reduced by [`member_trust_unit`], the same relation the certificate
+    /// binding compares by, so two spellings of one host are one voucher. Reading it as
+    /// raw text would have let one machine present as several.
+    fn verifier_units(&self, node: &NodeId) -> usize {
+        let Some(own_unit) = member_trust_unit(node.as_bytes()) else {
+            return 0;
+        };
+        let Some(verifiers) = self.verifiers.get(node) else {
+            return 0;
+        };
+        verifiers
+            .iter()
+            .filter(|v| self.adopted.contains(*v))
+            .filter_map(|v| member_trust_unit(v.as_bytes()))
+            .filter(|unit| unit != &own_unit)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Recompute which members rooms are placed on, then rebuild the [`Cluster`] over
+    /// them. **Derived from scratch, never accumulated:** the adopted set is the
+    /// configured members plus every roster member [`ADOPTION_VERIFIERS`] adopted
+    /// trust units have verified, so it is a pure function of `configured` +
+    /// `verifiers` and two nodes holding the same evidence hold the same ring however
+    /// they came by it. Accumulating instead would make it a function of history —
+    /// a member adopted before its vouchers were reaped would stay placed on the node
+    /// that saw that order and never be placed on one that did not, and the ring would
+    /// split permanently.
+    ///
+    /// Run to a fixpoint, because adopting a member makes its own verifications count:
+    /// each round admits every member that meets the bar against the same adopted set,
+    /// so the outcome never depends on the order members were visited in. Terminates
+    /// because each round strictly grows a set bounded by the roster.
+    fn rebuild_placement(&mut self) {
+        self.adopted.clone_from(&self.configured);
+        let bar = self.adoption_bar();
+        loop {
+            let newly: Vec<NodeId> = self
+                .addrs
+                .keys()
+                .filter(|node| !self.adopted.contains(*node))
+                .filter(|node| self.verifier_units(node) >= bar)
+                .cloned()
+                .collect();
+            if newly.is_empty() {
+                break;
+            }
+            self.adopted.extend(newly);
+        }
+        // A node that has reaped away every configured peer has nothing left to seed
+        // the fixpoint from but itself, and `verifier_units` counts only *adopted*
+        // verifiers — so its own vouch is the only one that can ever count, and it can
+        // never reach a bar of two again however completely the roster recovers. That
+        // state is reachable from one node's one-sided egress outage: its peers still
+        // reach it inbound, so they never reap it, while it reaps all of them.
+        //
+        // Placing on `{self}` there is the worst available answer. It makes this node
+        // the sole replica and primary of *every* room at a majority of one, so it
+        // releases `Accepted` for writes no other replica holds while the rest of the
+        // cluster leads the same rooms — a single-node split-brain in a healthy
+        // cluster, with no signal.
+        //
+        // The condition is exactly the majority-of-one hazard, and nothing wider. A
+        // ring of one has a majority of one, so this node alone releases the write —
+        // that is what must not happen. An adopted set that merely spans too few trust
+        // units to admit *new* members is a different thing: two adopted members on one
+        // host give a ring of two and a majority of two, so both must ack and no write
+        // is ever released unreplicated. That deployment — two processes on one machine
+        // — is ordinary, it worked before this guard, and stranding it would refuse
+        // every read and write on a cluster that is merely unable to grow. Its
+        // correlated-failure durability, and its inability to adopt anyone, are real
+        // and are C36's, not this guard's.
+        let was = self.stranded;
+        self.stranded = !self.solitary && self.adopted.len() == 1;
+        if self.stranded && !was {
+            // Fail-closed is not fail-silent: the pre-guard behaviour was indicted for
+            // having no signal, and an empty ring has none either. This is the one
+            // place a node can say that it has stopped serving and why.
+            eprintln!(
+                "membership: this node is the only adopted member, with {} member(s) on \
+                 the roster and an adoption bar of {} — it can place no room and will \
+                 refuse reads and writes until its ring is re-established",
+                self.addrs.len(),
+                bar,
+            );
+        }
+        self.cluster = if self.stranded {
+            Cluster::new(std::iter::empty())
+        } else {
+            Cluster::new(self.adopted.iter().cloned())
+        };
+    }
+
+    /// How many trust units must vouch for a member before it is placed:
+    /// [`ADOPTION_VERIFIERS`], except for a node **configured with no peers at all**.
+    ///
+    /// That exception is narrow and it is decided **once, at construction**, so it is a
+    /// fixed property of a node rather than a bar that moves as the cluster changes
+    /// under it. A node whose config names no peer has no cluster to be outvoted by,
+    /// and the constant would freeze it forever — a second voucher can only ever come
+    /// from a member it has already adopted — so the cluster it places on is exactly
+    /// the members it has itself reached. That is the single-node deployment; a node
+    /// meant to join a cluster is given a seed peer, which is adopted from birth and
+    /// lifts it past this case at boot. Configure one: a node with none takes the ring
+    /// from whoever reaches it.
+    fn adoption_bar(&self) -> usize {
+        match self.solitary {
+            true => 1,
+            false => ADOPTION_VERIFIERS,
+        }
     }
 
     /// Record a *successful* direct gossip exchange with `node` — first-hand proof
@@ -511,9 +913,19 @@ impl Membership {
             self.liveness.remove(node);
             self.addrs.remove(node);
             self.relay_down.remove(node);
+            // A reaped member no longer vouches: its own verifier set goes with it and
+            // it is struck from every other member's, so the ring is recomputed without
+            // its word. It leaves `configured` too — a configured member that departed
+            // durably is gone, and keeping it would place rooms on a node the roster no
+            // longer holds. Were it to return it would be a fresh join, verified again.
+            self.configured.remove(node);
+            self.verifiers.remove(node);
+            for vs in self.verifiers.values_mut() {
+                vs.remove(node);
+            }
         }
         if !to_reap.is_empty() {
-            self.cluster = Cluster::new(self.addrs.keys().cloned());
+            self.rebuild_placement();
         }
         to_reap
     }
@@ -526,8 +938,9 @@ impl Membership {
         self.reaped.contains_key(node)
     }
 
-    /// Merge a gossiped liveness payload into this node's view — the SWIM anti-
-    /// entropy of failure detection. For each `(node, addr, incarnation, state)`:
+    /// Merge a gossiped liveness payload from the member `sender` into this node's
+    /// view — the SWIM anti-entropy of failure detection. For each
+    /// `(node, addr, incarnation, state, verified)`:
     ///
     ///  - a member this node does not know is learned (address recorded, placement
     ///    rebuilt) at the advertised incarnation and state — the same union
@@ -542,17 +955,37 @@ impl Membership {
     ///    its own incarnation above the received one and re-asserts `Alive`, so its
     ///    correction wins everywhere the stale suspicion reached.
     ///
+    /// The `verified` flag is `sender`'s own claim to have completed an
+    /// identity-checked peer link to the member the tuple names, and it is recorded
+    /// **against `sender`** — the member this link is bound to — rather than against
+    /// whoever the payload might name. That is what keeps the evidence first-hand: a
+    /// member can add itself to another's verifier set and to nobody else's, so no
+    /// member can manufacture the verifiers that would place an id it minted. A claim
+    /// naming the sender itself is dropped; the verifier sets are grow-only, so the
+    /// merge is a union and converges however rounds interleave.
+    ///
     /// A malformed pair (empty node id) is dropped, as on the additive path. Order-
     /// independent and idempotent: two nodes that received the same updates in any
     /// order converge on the same liveness.
     pub fn merge_liveness(
         &mut self,
-        payload: impl IntoIterator<Item = (NodeId, Vec<u8>, u64, MemberState)>,
+        sender: &NodeId,
+        payload: impl IntoIterator<Item = (NodeId, Vec<u8>, u64, MemberState, bool)>,
     ) {
         let mut rebuilt = false;
-        for (node, addr, incarnation, state) in payload {
-            if node.as_bytes().is_empty() {
+        let mut claimed = Vec::new();
+        for (node, addr, incarnation, state, verified) in payload {
+            // One spelling per endpoint, or the tuple names no member at all — the
+            // same bar the additive path applies, and the reason a malformed id is
+            // dropped rather than placed.
+            let Some(node) = NodeId::canonical(node.as_bytes()) else {
                 continue;
+            };
+            // A claim is the *sender's*, and a member does not vouch for itself. Both
+            // ends being something other than this node is decided once, by
+            // `can_be_verified`, where the claim is actually recorded.
+            if verified && &node != sender {
+                claimed.push(node.clone());
             }
             if self.is_self(&node) {
                 self.refute_if_stale(incarnation, state);
@@ -575,9 +1008,11 @@ impl Membership {
             }
             match self.liveness.get_mut(&node) {
                 None => {
+                    let _ = addr;
                     self.liveness
                         .insert(node.clone(), MemberLiveness::new(incarnation, state));
-                    self.addrs.insert(node, addr);
+                    let dial = node.as_bytes().to_vec();
+                    self.addrs.insert(node, dial);
                     rebuilt = true;
                 }
                 Some(m) => {
@@ -592,8 +1027,31 @@ impl Membership {
                 }
             }
         }
+        // Record the sender's verifications only for members that survived the merge
+        // above — a claim about a node that was dropped as malformed, or that is
+        // tombstoned, is a claim about no member of this view — and only where the
+        // member is coherently addressed, the same bar this node's own links clear.
+        //
+        // The *sender* clears that same bar, because it is what the entry stores. A
+        // verifier off the roster can never count — `verifier_units` reads only adopted
+        // ones — but it would still be retained, and peer admission takes the id a link
+        // claims: one certified host opens a link per port, claims a distinct id on
+        // each, and banks an entry per link against every member, keyed on ids no reap
+        // will ever strike because they are on no roster. Bounding the evidence by the
+        // roster is what keeps it bounded at all.
+        if self.can_be_verified(sender) {
+            for node in claimed {
+                if self.can_be_verified(&node) {
+                    rebuilt |= self
+                        .verifiers
+                        .entry(node)
+                        .or_default()
+                        .insert(sender.clone());
+                }
+            }
+        }
         if rebuilt {
-            self.cluster = Cluster::new(self.addrs.keys().cloned());
+            self.rebuild_placement();
         }
     }
 
@@ -647,9 +1105,14 @@ fn parse_peers(list: &str) -> Result<Vec<NodeId>, MembershipConfigError> {
         .map(|entry| {
             let entry = entry.trim();
             if entry.is_empty() {
-                Err(MembershipConfigError::EmptyPeer)
-            } else {
-                Ok(NodeId::from_addr(entry))
+                return Err(MembershipConfigError::EmptyPeer);
+            }
+            // A peer with no canonical form is one no member of this cluster could
+            // dial or agree with, so it is refused where it is written rather than
+            // seeded verbatim into a ring nobody else computes the same way.
+            match crate::dial::canonical_member_addr(entry) {
+                Some(_) => Ok(NodeId::from_addr(entry)),
+                None => Err(MembershipConfigError::NotAnAddress(entry.to_string())),
             }
         })
         .collect()

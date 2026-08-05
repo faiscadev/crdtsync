@@ -4,12 +4,22 @@
 //! A node need not know the whole cluster at boot: it seeds from one (or a few)
 //! peer addresses and learns the rest by gossip. Each round a node picks a random
 //! known peer and exchanges liveness with it — a push-pull [`Message::Gossip`]
-//! carrying `(node_id, advertise_addr, incarnation, state)` tuples. The exchange is
-//! a SWIM anti-entropy merge ([`Membership::merge_liveness`]): both sides come away
-//! holding every member either knew and the more-authoritative liveness for each,
-//! so a node that boots knowing only a seed converges on the full set within a few
-//! rounds. Placement (rendezvous/HRW) is order-independent, so once two nodes have
-//! learned the same members they place every room identically.
+//! carrying `(node_id, advertise_addr, incarnation, state, verified)` tuples. The
+//! exchange is a SWIM anti-entropy merge ([`Membership::merge_liveness`]): both
+//! sides come away holding every member either knew and the more-authoritative
+//! liveness for each, so a node that boots knowing only a seed converges on the full
+//! set within a few rounds. Placement (rendezvous/HRW) is order-independent, so once
+//! two nodes have learned the same members they place every room identically.
+//!
+//! The exchange carries **adoption** as well as liveness. Rooms are placed on the
+//! members the cluster has adopted, not on every node it has heard of, so the
+//! `verified` flag on each tuple is the sender's own claim to have completed an
+//! identity-checked peer link to that member. A *direct* round — this node dialed the
+//! peer, and on a TLS member the transport authenticated it before a byte was written
+//! — is what produces such a claim here; an indirect (ping-req) confirmation is
+//! liveness only, since a relay reaching a target says nothing about who this node
+//! would reach. Enough claims from adopted members place a member in the ring; see
+//! [`Membership`].
 //!
 //! Failure detection rides the same exchange (no separate detector socket): a
 //! *successful* round with a peer is first-hand proof it is alive
@@ -56,12 +66,13 @@ use crate::membership::Membership;
 use crate::placement::NodeId;
 
 /// One member's advertisement as the membership layer holds it: its [`NodeId`],
-/// dial address, incarnation, and liveness state.
-pub type GossipMember = (NodeId, Vec<u8>, u64, MemberState);
+/// dial address, incarnation, liveness state, and whether the advertising node has
+/// itself verified it.
+pub type GossipMember = (NodeId, Vec<u8>, u64, MemberState, bool);
 
 /// One member's advertisement as it rides the wire — the [`NodeId`] is raw bytes,
 /// matching [`Message::Gossip`]'s payload. The receiver reconstitutes the id.
-pub type GossipWireMember = (Vec<u8>, Vec<u8>, u64, MemberState);
+pub type GossipWireMember = crdtsync_core::MemberAdvert;
 
 /// How often a node initiates a gossip round. Frequent enough that a fresh joiner
 /// converges within a few seconds, sparse enough that a steady-state cluster's
@@ -88,22 +99,32 @@ pub fn gossip_frame(members: &[GossipMember]) -> Message {
     Message::Gossip {
         members: members
             .iter()
-            .map(|(node, addr, incarnation, state)| {
-                (node.as_bytes().to_vec(), addr.clone(), *incarnation, *state)
+            .map(|(node, addr, incarnation, state, verified)| {
+                (
+                    node.as_bytes().to_vec(),
+                    addr.clone(),
+                    *incarnation,
+                    *state,
+                    *verified,
+                )
             })
             .collect(),
     }
 }
 
-/// Merge a gossiped liveness payload (as it arrives off the wire) into
-/// `membership` — the SWIM anti-entropy merge. Higher incarnation wins, equal
-/// incarnation the more-suspicious state wins, and a stale suspicion of self is
-/// refuted; see [`Membership::merge_liveness`].
-pub fn merge_into(membership: &mut Membership, payload: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>) {
+/// Merge a gossiped liveness payload from the member `sender` (as it arrives off the
+/// wire) into `membership` — the SWIM anti-entropy merge. Higher incarnation wins,
+/// equal incarnation the more-suspicious state wins, a stale suspicion of self is
+/// refuted, and each `verified` flag is recorded as `sender`'s own claim; see
+/// [`Membership::merge_liveness`].
+pub fn merge_into(membership: &mut Membership, sender: &NodeId, payload: Vec<GossipWireMember>) {
     membership.merge_liveness(
+        sender,
         payload
             .into_iter()
-            .map(|(node, addr, incarnation, state)| (NodeId::from(node), addr, incarnation, state)),
+            .map(|(node, addr, incarnation, state, verified)| {
+                (NodeId::from(node), addr, incarnation, state, verified)
+            }),
     );
 }
 
@@ -119,11 +140,30 @@ pub fn merge_into(membership: &mut Membership, payload: Vec<(Vec<u8>, Vec<u8>, u
 /// only that the sender reached *here*, and the reverse path is what this node's own
 /// probe measures. The one-way partition it would otherwise tolerate is already
 /// covered by SWIM indirect probing.
+///
+/// **Only the `initiator` verifies the peer**, for the same reason: it is the side
+/// that dialed, so it is the side whose transport authenticated the far end against
+/// the address it dialed. Being dialed proves the sender reached here and nothing
+/// about who answers at the sender's own address.
 pub fn exchange(initiator: &mut Membership, peer: &mut Membership) {
     let peer_id = peer.self_id().clone();
-    peer.merge_liveness(initiator.known_liveness());
-    initiator.merge_liveness(peer.known_liveness());
+    let initiator_id = initiator.self_id().clone();
+    // The inbound half admits exactly what production's ([`Registry::apply_gossip`])
+    // does: liveness about members the receiver already holds, plus the sender's own
+    // tuple at its own address. An inbound frame introducing a *third* member is
+    // refused there, so accepting one here would model a join the cluster has no path
+    // for — and convergence measured over a push production rejects is not convergence.
+    let pushed: Vec<GossipMember> = initiator
+        .known_liveness()
+        .into_iter()
+        .filter(|(node, addr, ..)| {
+            peer.is_member(node) || (node == &initiator_id && addr.as_slice() == node.as_bytes())
+        })
+        .collect();
+    peer.merge_liveness(&initiator_id, pushed);
+    initiator.merge_liveness(&peer_id, peer.known_liveness());
     initiator.note_gossip_reachable(&peer_id);
+    initiator.note_verified(&peer_id);
 }
 
 /// Pick a random peer to gossip to from `members`, excluding `self_id`, returning
@@ -162,7 +202,7 @@ pub fn choose_relays(
 ) -> Vec<(NodeId, Vec<u8>)> {
     let mut eligible: Vec<(NodeId, Vec<u8>)> = members
         .iter()
-        .filter(|(node, _, _, state)| {
+        .filter(|(node, _, _, state, _)| {
             node != self_id && node != target && *state != MemberState::Dead
         })
         .map(|(node, addr, ..)| (node.clone(), addr.clone()))
@@ -197,6 +237,39 @@ pub fn indirect_reachable(results: &[Option<bool>]) -> bool {
 /// indirect probe *also* fails.
 pub fn probe_outcome(direct_reachable: bool, indirect: &[Option<bool>]) -> bool {
     direct_reachable || indirect_reachable(indirect)
+}
+
+/// How one SWIM probe round reached its target — the whole verdict a round carries
+/// back, since liveness and identity are different questions and a round answers them
+/// differently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GossipRoundOutcome {
+    /// This node dialed the member and it answered. On a TLS member the transport
+    /// authenticated the far end against the address dialed before a byte was
+    /// written, so this is the only outcome that is evidence about *who* is there.
+    Direct,
+    /// The direct probe failed but a relay reported the target reachable. Evidence
+    /// that the member is alive, and about nobody's identity: it says a *relay*
+    /// reaches the target, which this node did not observe and cannot attribute.
+    Relayed,
+    /// Neither the direct probe nor any relay reached the member.
+    Unreachable,
+}
+
+impl GossipRoundOutcome {
+    /// Fold a round's direct and indirect results into its outcome.
+    pub fn of(direct_reachable: bool, indirect: &[Option<bool>]) -> Self {
+        match (direct_reachable, indirect_reachable(indirect)) {
+            (true, _) => GossipRoundOutcome::Direct,
+            (false, true) => GossipRoundOutcome::Relayed,
+            (false, false) => GossipRoundOutcome::Unreachable,
+        }
+    }
+
+    /// Whether the round found the member alive, by either path.
+    pub fn reachable(self) -> bool {
+        self != GossipRoundOutcome::Unreachable
+    }
 }
 
 /// Ask the relay at `relay_addr` to report whether it can reach `target_addr` on
@@ -240,7 +313,7 @@ pub async fn gossip_exchange(
     server: ClientId,
     dialer: &PeerDialer,
     frame: Message,
-) -> Option<Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>> {
+) -> Option<Vec<GossipWireMember>> {
     relay_roundtrip(addr, server, dialer, frame, GOSSIP_TIMEOUT, |m| match m {
         Message::Gossip { members } => Some(members),
         _ => None,

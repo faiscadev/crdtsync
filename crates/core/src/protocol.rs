@@ -132,6 +132,13 @@ pub enum MemberState {
     Dead,
 }
 
+/// One cluster member as a [`Message::Gossip`] frame advertises it: its node id, the
+/// advertise address a peer dials it at, its incarnation, its [`MemberState`], and
+/// whether the **sender of that frame** has itself completed an identity-checked peer
+/// link to it. The last is a first-hand claim about the sender, so a receiver
+/// attributes it to the member its link is bound to and to nobody the payload names.
+pub type MemberAdvert = (Vec<u8>, Vec<u8>, u64, MemberState, bool);
+
 /// A closed set of failure reasons the server reports to a client.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ErrorCode {
@@ -429,18 +436,26 @@ pub enum Message {
     },
     /// A node's advertisement of the cluster members it knows, for gossip
     /// membership discovery and SWIM-style failure detection: `members` is a set of
-    /// `(node_id, advertise_addr, incarnation, state)` tuples — the node id a peer
-    /// places with, the address it dials to reach that member, a monotonic per-node
-    /// refutation counter, and the member's [`MemberState`]. A receiver merges each
-    /// tuple into its own liveness view (anti-entropy: a higher incarnation wins,
-    /// and at equal incarnation the more-suspicious state wins), so a node that
-    /// boots knowing only a seed peer learns the whole cluster — and a node's
-    /// failure propagates to every node — within a few gossip rounds. Node-to-node
-    /// — never a client frame; a client that sends one commits a protocol
-    /// violation.
-    Gossip {
-        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>,
-    },
+    /// `(node_id, advertise_addr, incarnation, state, verified)` tuples — the node id
+    /// a peer places with, the address it dials to reach that member, a monotonic
+    /// per-node refutation counter, the member's [`MemberState`], and whether the
+    /// *sender of this frame* has itself completed an identity-checked peer link to
+    /// that member. A receiver merges each tuple into its own liveness view
+    /// (anti-entropy: a higher incarnation wins, and at equal incarnation the
+    /// more-suspicious state wins), so a node that boots knowing only a seed peer
+    /// learns the whole cluster — and a node's failure propagates to every node —
+    /// within a few gossip rounds.
+    ///
+    /// `verified` is a **first-hand claim about the sender itself**, not a relayed
+    /// fact: it says "I have verified this member", so a receiver attributes it to
+    /// the member its link is bound to and to nobody else. That is what makes it
+    /// safe to act on — a member can assert only its own verifications, never
+    /// another's — and it is the evidence a room's replica set is placed over, so
+    /// that a node cannot mint an id into the placement ring by introducing itself.
+    ///
+    /// Node-to-node — never a client frame; a client that sends one commits a
+    /// protocol violation.
+    Gossip { members: Vec<MemberAdvert> },
     /// Requests the branches of `room` — the app-facing enumeration a client runs
     /// to discover a room's forks and published targets before subscribing one.
     /// Room-keyed rather than channel-keyed: branch management is a room-level
@@ -878,11 +893,12 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
                 &mut out,
                 u32::try_from(members.len()).expect("member count exceeds u32"),
             );
-            for (node, addr, incarnation, state) in members {
+            for (node, addr, incarnation, state, verified) in members {
                 put_bytes(&mut out, node);
                 put_bytes(&mut out, addr);
                 put_u64(&mut out, *incarnation);
                 put_u8(&mut out, member_state_tag(*state));
+                put_u8(&mut out, u8::from(*verified));
             }
         }
         Message::BranchList { room } => {
@@ -1288,7 +1304,19 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 let addr = cur.bytes()?;
                 let incarnation = cur.u64()?;
                 let state = member_state(cur.u8()?)?;
-                members.push((node, addr, incarnation, state));
+                // One byte string per message: the encoder writes 0 or 1, so anything
+                // else is not a frame this cluster produced.
+                let verified = match cur.u8()? {
+                    0 => false,
+                    1 => true,
+                    tag => {
+                        return Err(ProtocolError::BadTag {
+                            what: "gossip member verification",
+                            tag,
+                        })
+                    }
+                };
+                members.push((node, addr, incarnation, state, verified));
             }
             Message::Gossip { members }
         }

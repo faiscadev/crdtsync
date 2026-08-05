@@ -178,6 +178,14 @@ fn two_node_membership(me: &str, other: &str) -> Membership {
     Membership::from_static_config(Some(me), None, other, 2).unwrap()
 }
 
+/// The same view built **without** the config validation. C25 refuses an address with
+/// no canonical form where it is written, so a startup refusal about a member that
+/// reaches the *serve* path with an address no dial can honor needs a membership that
+/// did not come through that door to still have something to refuse.
+fn unvalidated_two_node_membership(me: &str, other: &str) -> Membership {
+    Membership::new(NodeId::from(me), [NodeId::from(other)], 2)
+}
+
 fn clustered(me: &str, other: &str) -> ServeConfig {
     ServeConfig {
         membership: Some(two_node_membership(me, other)),
@@ -465,6 +473,7 @@ async fn anti_entropy_and_ping_req_round_trip_over_tls() {
                 b"10.0.0.9:9000".to_vec(),
                 1,
                 MemberState::Alive,
+                false,
             )]),
         )
     })
@@ -952,12 +961,28 @@ async fn peer_tls_without_a_cluster_refuses_to_start() {
 async fn an_unparseable_member_address_refuses_to_start() {
     // A scheme the dial cannot honor is a typo, not a hostname: folding it into one
     // would produce `ws://http://host/` and a dial that fails forever.
+    // Refused at the membership config first: an address with no canonical form names
+    // a member the cluster could never verify (C25).
+    let e = Membership::from_static_config(Some("10.0.0.1:9000"), None, "http://10.0.0.9:9000", 2)
+        .expect_err("an unknown scheme is not an address");
+    assert!(
+        e.to_string().contains("is not an address a peer can dial"),
+        "{e}"
+    );
+
+    // And still refused where the dialer reads it, for a member that reached the serve
+    // path without passing that door.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let err = startup_error(
         listener,
         ServeConfig {
-            ..clustered(&addr, "http://10.0.0.9:9000")
+            membership: Some(unvalidated_two_node_membership(
+                &addr,
+                "http://10.0.0.9:9000",
+            )),
+            cluster_secret: Some(SECRET.to_vec()),
+            ..ServeConfig::default()
         },
     )
     .await;

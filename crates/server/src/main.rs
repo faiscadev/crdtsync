@@ -186,6 +186,18 @@ fn membership() -> std::io::Result<Option<Membership>> {
     let Some(peers) = path_var("CRDTSYNC_CLUSTER_PEERS")? else {
         return Ok(None);
     };
+    // Present but empty is refused rather than read as either shape. It is neither
+    // single-node mode (which is the variable being *unset*) nor a cluster, and taking
+    // it as a cluster of one gives the node a peer plane while leaving it with nobody
+    // to be outvoted by — so it would adopt a member into the ring on its own word
+    // while every peer it later meets still holds the cluster's bar (§Member Adoption).
+    if peers.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CRDTSYNC_CLUSTER_PEERS is set but empty: list this node's seed peers, or \
+             unset it for single-node mode",
+        ));
+    }
     let node_id = path_var("CRDTSYNC_NODE_ID")?;
     let advertise = path_var("CRDTSYNC_ADVERTISE_ADDR")?;
     let factor = match path_var("CRDTSYNC_REPLICATION_FACTOR")? {
@@ -203,10 +215,14 @@ fn membership() -> std::io::Result<Option<Membership>> {
     let m =
         Membership::from_static_config(node_id.as_deref(), advertise.as_deref(), &peers, factor)
             .map_err(|e| {
+                // Every membership config error is the same class of operator mistake
+                // and every one of them refuses the start. The match stays exhaustive
+                // with no catch-all, so a new one has to be classified here.
                 let kind = match e {
-                    MembershipConfigError::EmptyPeer | MembershipConfigError::MissingSelfId => {
-                        std::io::ErrorKind::InvalidInput
-                    }
+                    MembershipConfigError::EmptyPeer
+                    | MembershipConfigError::MissingSelfId
+                    | MembershipConfigError::NotAnAddress(_)
+                    | MembershipConfigError::NoPeerButSelf => std::io::ErrorKind::InvalidInput,
                 };
                 std::io::Error::new(kind, e)
             })?;

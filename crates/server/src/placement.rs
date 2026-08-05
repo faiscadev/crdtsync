@@ -22,13 +22,27 @@ impl NodeId {
         &self.0
     }
 
-    /// Derive a node's id from its advertise address. The id is the trimmed
-    /// address bytes verbatim — a pure function of the address, so every node
-    /// configured with the same peer address string derives the identical id and
-    /// the cluster agrees on placement. Trimming absorbs padding from the
-    /// comma-separated peer-list carrier.
+    /// Derive a node's id from its advertise address: the address in its one
+    /// canonical spelling ([`canonical_member_addr`](crate::dial::canonical_member_addr)),
+    /// so every node configured with any spelling of the same endpoint derives the
+    /// identical id and the cluster agrees on placement — and one endpoint never holds
+    /// two positions in the ring. An address that is not one a peer can dial has no
+    /// canonical form and is kept verbatim (trimmed), so it stays distinguishable for
+    /// the startup refusal that reports it rather than colliding with another.
     pub fn from_addr(addr: &str) -> Self {
-        Self(addr.trim().as_bytes().to_vec())
+        match crate::dial::canonical_member_addr(addr) {
+            Some(canonical) => Self(canonical.into_bytes()),
+            None => Self(addr.trim().as_bytes().to_vec()),
+        }
+    }
+
+    /// The canonical id for an advertise address arriving from outside — a gossip
+    /// tuple, or the claim a peer link binds to. `None` when the address is not one a
+    /// peer can dial, so a member nobody could reach never enters a roster or a ring,
+    /// and a second spelling of a member already known never becomes a second member.
+    pub fn canonical(addr: &[u8]) -> Option<Self> {
+        let addr = std::str::from_utf8(addr).ok()?;
+        Some(Self(crate::dial::canonical_member_addr(addr)?.into_bytes()))
     }
 }
 

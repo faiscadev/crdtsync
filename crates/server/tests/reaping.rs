@@ -47,6 +47,14 @@ fn kill(m: &mut Membership, node: &NodeId) {
     assert_eq!(m.gossip_state(node), MemberState::Dead);
 }
 
+/// The member a directly-merged liveness payload is attributed to. These payloads
+/// carry no verification claims, so the merge does not turn on which member sent
+/// them — but every anti-entropy frame arrives from one, and the merge records its
+/// claims against it.
+fn sender() -> NodeId {
+    nid(B)
+}
+
 /// Run `n` reap checks, returning every id reaped across them.
 fn reap_n(m: &mut Membership, n: u32) -> Vec<NodeId> {
     let mut reaped = Vec::new();
@@ -138,7 +146,16 @@ fn a_recovered_member_before_reaping_is_kept() {
     reap_n(&mut m, REAP_AFTER_DEAD_TICKS - 1);
     // D refutes with a higher incarnation just before the reap tick — its reap
     // clock resets and it is not removed.
-    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), 5, MemberState::Alive)]);
+    m.merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            5,
+            MemberState::Alive,
+            false,
+        )],
+    );
     assert_eq!(m.gossip_state(&d), MemberState::Alive);
     reap_n(&mut m, REAP_AFTER_DEAD_TICKS);
     assert!(
@@ -187,13 +204,22 @@ fn a_reaped_member_is_not_relearned_from_stale_gossip() {
     assert!(!m.is_member(&d));
     // A peer that has not yet reaped D keeps gossiping it Dead at the same
     // incarnation. The tombstone must keep it out — no reap-then-resurrect.
-    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), d_inc, MemberState::Dead)]);
+    m.merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            d_inc,
+            MemberState::Dead,
+            false,
+        )],
+    );
     assert!(
         !m.is_member(&d),
         "stale Dead gossip does not resurrect a reaped member"
     );
     // The additive union path is likewise blocked.
-    m.add_member(d.clone(), D.as_bytes().to_vec());
+    m.add_member(d.clone());
     assert!(
         !m.is_member(&d),
         "a plain re-advertise does not resurrect it either"
@@ -239,14 +265,40 @@ fn a_returned_member_with_a_higher_incarnation_is_resurrected() {
     assert!(!m.is_member(&d));
     // D returns Alive at a higher incarnation (it refuted before rejoining) — it
     // escapes the tombstone and rejoins the roster.
-    m.merge_liveness([(
-        d.clone(),
-        D.as_bytes().to_vec(),
-        reap_inc + 1,
-        MemberState::Alive,
-    )]);
+    m.merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            reap_inc + 1,
+            MemberState::Alive,
+            false,
+        )],
+    );
     assert!(m.is_member(&d), "a genuinely-returned node rejoins");
     assert_eq!(m.gossip_state(&d), MemberState::Alive);
+    // It rejoins the *roster*, not the ring: reaping struck it from the configured
+    // members, so it is a fresh join and the cluster verifies it again before rooms are
+    // placed on it (C25).
+    assert!(
+        !m.is_adopted(&d),
+        "a returned member is pending until verified"
+    );
+    // Two members other than this node: a claim carried on a link bound to this node's
+    // own id is not this node vouching, so `A` (self here) is not one of them.
+    for voucher in [B, C] {
+        m.merge_liveness(
+            &nid(voucher),
+            [(
+                d.clone(),
+                D.as_bytes().to_vec(),
+                reap_inc + 1,
+                MemberState::Alive,
+                true,
+            )],
+        );
+    }
+    assert!(m.is_adopted(&d), "and takes its place back once it is");
 }
 
 #[test]
@@ -259,13 +311,31 @@ fn a_crash_restarted_member_rejoins_at_incarnation_zero() {
     let d = nid(D);
     // Refute D up to a non-zero incarnation first, so "reaped incarnation" > 0 and a
     // naive incarnation gate would permanently exclude the rebooted D.
-    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), 7, MemberState::Alive)]);
+    m.merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            7,
+            MemberState::Alive,
+            false,
+        )],
+    );
     kill(&mut m, &d);
     assert!(m.incarnation(&d) >= 7);
     reap_n(&mut m, REAP_AFTER_DEAD_TICKS);
     assert!(!m.is_member(&d), "D was reaped");
     // Rebooted D gossips itself Alive at incarnation 0.
-    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), 0, MemberState::Alive)]);
+    m.merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            false,
+        )],
+    );
     assert!(
         m.is_member(&d),
         "a crash-restarted node at incarnation 0 still rejoins"
@@ -296,7 +366,16 @@ fn a_tombstone_within_retention_still_blocks_resurrection() {
         "the tombstone is retained below the threshold"
     );
     // Stale Dead gossip within retention still cannot resurrect it.
-    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), d_inc, MemberState::Dead)]);
+    m.merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            d_inc,
+            MemberState::Dead,
+            false,
+        )],
+    );
     assert!(
         !m.is_member(&d),
         "a retained tombstone still blocks stale-gossip resurrection"
@@ -358,7 +437,16 @@ fn a_pruned_member_reappearing_is_a_fresh_join() {
     assert!(!m.is_tombstoned(&d));
     // With the tombstone gone, D returning Alive at incarnation 0 is a plain fresh
     // join — no resurrection gate, and it is not tombstoned again.
-    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), 0, MemberState::Alive)]);
+    m.merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            0,
+            MemberState::Alive,
+            false,
+        )],
+    );
     assert!(m.is_member(&d), "a pruned member rejoins as a fresh member");
     assert_eq!(m.gossip_state(&d), MemberState::Alive);
     assert!(!m.is_tombstoned(&d));
@@ -385,11 +473,29 @@ fn a_higher_incarnation_dead_does_not_resurrect() {
     kill(&mut m, &d);
     reap_n(&mut m, REAP_AFTER_DEAD_TICKS);
     assert!(!m.is_member(&d));
-    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), 99, MemberState::Dead)]);
+    m.merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            99,
+            MemberState::Dead,
+            false,
+        )],
+    );
     assert!(
         !m.is_member(&d),
         "a higher-incarnation Dead does not resurrect a reaped member"
     );
-    m.merge_liveness([(d.clone(), D.as_bytes().to_vec(), 99, MemberState::Suspect)]);
+    m.merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            99,
+            MemberState::Suspect,
+            false,
+        )],
+    );
     assert!(!m.is_member(&d), "nor does a Suspect");
 }

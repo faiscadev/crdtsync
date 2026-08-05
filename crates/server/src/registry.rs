@@ -23,6 +23,7 @@ use crate::auto_version::{
     AutoVersionState,
 };
 use crate::clock::{Clock, SystemClock};
+use crate::gossip::GossipRoundOutcome;
 use crate::leadership::LeadershipEpochs;
 use crate::membership::Membership;
 use crate::placement::NodeId;
@@ -285,6 +286,14 @@ impl Registry {
     /// (Unit 3) and replication (Unit 4) read placement through this.
     pub fn membership(&self) -> Option<&Membership> {
         self.membership.as_ref()
+    }
+
+    /// The membership view, mutably — the seam a test drives to put a node into a
+    /// state the network would take minutes to produce, such as having reaped every
+    /// configured peer.
+    #[doc(hidden)]
+    pub fn membership_mut_for_test(&mut self) -> &mut Membership {
+        self.membership.as_mut().expect("clustered")
     }
 
     /// Hold the deployment's cluster secret — the credential a peer presents to
@@ -598,10 +607,12 @@ impl Registry {
             return false;
         }
         // A link that names no member has no identity to gate on, so there is nothing
-        // to admit it as.
-        if claimed.is_empty() {
+        // to admit it as — and it must name it in the one spelling the roster and the
+        // ring use, or the identity every gate decides against would be a member of
+        // neither.
+        let Some(member) = NodeId::canonical(claimed) else {
             return false;
-        }
+        };
         let Some(conn) = self.conns.get_mut(&id) else {
             return false;
         };
@@ -626,7 +637,15 @@ impl Registry {
             }
             Some(_) => {}
         }
-        conn.peer = Some(NodeId::from(claimed.to_vec()));
+        conn.peer = Some(member);
+        // Admitting a link is **not** a verification of the member it names, however
+        // well the certificate names it. A member chooses when to dial in and how
+        // often, so a vouch earned that way is one the member caused rather than one
+        // this node independently made — and a certificate names a *host*, which mints
+        // as many node ids as it likes, so a member could dial in under each ground id
+        // in turn and have this node vouch for every one of them. Verification is this
+        // node's own dial and nothing else (see
+        // [`note_peer_verified`](Self::note_peer_verified)).
         true
     }
 
@@ -814,11 +833,33 @@ impl Registry {
     /// This node's known cluster members with liveness — the payload it gossips.
     /// Empty in single-node mode (no membership), so a non-cluster node advertises
     /// nothing.
-    pub fn known_liveness(&self) -> Vec<(NodeId, Vec<u8>, u64, MemberState)> {
+    pub fn known_liveness(&self) -> Vec<(NodeId, Vec<u8>, u64, MemberState, bool)> {
         self.membership
             .as_ref()
             .map(Membership::known_liveness)
             .unwrap_or_default()
+    }
+
+    /// Record that this node has itself completed an identity-checked peer link to
+    /// `node` — the promotion signal a room's placement is built from. Driven by the
+    /// gossip loop's *direct* round, which dials the member and (on a TLS member)
+    /// authenticates it before a byte of the cluster secret is written; an
+    /// indirect-only round confirms a relay reached it and vouches for nothing here.
+    /// Inert in single-node mode.
+    ///
+    /// A deployment that *requires* an identified peer requires the dial to have
+    /// authenticated one, so a plaintext member is not verified this way: the dial had
+    /// no certificate to check, and a round that proves only "something answers here"
+    /// would let such a member take rooms in a cluster whose every inbound link from it
+    /// is refused — stalling their quorums. Without that policy the same round is the
+    /// honest floor, and vouches for reachability alone.
+    pub fn note_peer_verified(&mut self, node: &NodeId) {
+        if !self.dial_establishes_identity(node) {
+            return;
+        }
+        if let Some(membership) = &mut self.membership {
+            membership.note_verified(node);
+        }
     }
 
     /// Merge a gossiped liveness payload into this node's membership — the SWIM
@@ -832,14 +873,70 @@ impl Registry {
     /// it is how a joiner learns the cluster in one round. The *inbound* half is the one
     /// an unknown peer can reach, and it filters first — a peer introduces only itself,
     /// at its own address ([`apply_gossip`](Self::apply_gossip)).
-    pub fn merge_gossip(&mut self, members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>) {
+    ///
+    /// What the reply half hands over freely is the *roster*, and a member reaching the
+    /// roster this way is **pending**: dialed, probed and gossiped about, but on no
+    /// room and in no room's quorum until the cluster verifies it. So the freedom costs
+    /// what it always should have — a joiner converges in one round — without letting
+    /// the node this one dialed choose who takes a place in the ring.
+    ///
+    /// `sender` is the member the payload came from, and every `verified` flag in it is
+    /// recorded as that member's own first-hand claim — but only where `sender`'s
+    /// identity was established. This is the *reply* half of a round this node drove,
+    /// so what establishes it is the dial: a deployment that requires an identified
+    /// peer gets one from a `wss://` member's certificate and nothing at all from a
+    /// plaintext one, and an unattributable claim must not become an adopted member's
+    /// vouch. The liveness in the payload still merges either way — a member's
+    /// reachability is not a claim about anyone's identity.
+    pub fn merge_gossip(
+        &mut self,
+        sender: &NodeId,
+        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)>,
+    ) {
+        let attributable = self.dial_establishes_identity(sender);
+        self.merge_gossip_attributed(sender, members, attributable);
+    }
+
+    /// Merge a gossip payload from `sender`, saying explicitly whether its `verified`
+    /// flags may be attributed to it — the seam both halves of a round share, each
+    /// deciding attribution from the link it actually holds.
+    fn merge_gossip_attributed(
+        &mut self,
+        sender: &NodeId,
+        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)>,
+        attributable: bool,
+    ) {
         if let Some(membership) = &mut self.membership {
             membership.merge_liveness(
+                sender,
                 members
                     .into_iter()
-                    .map(|(node, addr, inc, state)| (NodeId::from(node), addr, inc, state)),
+                    .map(|(node, addr, inc, state, verified)| {
+                        (
+                            NodeId::from(node),
+                            addr,
+                            inc,
+                            state,
+                            verified && attributable,
+                        )
+                    }),
             );
         }
+    }
+
+    /// Whether a dial to `member` establishes who answered — a TLS member's
+    /// certificate does, a plaintext member's transport does not, and a deployment
+    /// that has not declared identity required takes the dial at face value. The
+    /// member's *advertised* transport is the right thing to read here and the wrong
+    /// thing to read of an inbound link: an outbound dial runs over exactly the
+    /// transport that address declares, while an inbound link is one the member dialed
+    /// and its own listener's scheme describes nothing about it.
+    fn dial_establishes_identity(&self, member: &NodeId) -> bool {
+        !self.require_peer_identity
+            || self
+                .membership
+                .as_ref()
+                .is_some_and(|m| m.advertises_tls(member))
     }
 
     /// Run one reap check over the cluster membership: remove members that have
@@ -868,6 +965,24 @@ impl Registry {
         }
     }
 
+    /// Record how one SWIM probe round reached `node` — the whole of what a round
+    /// means to this view, in one place rather than split across the caller.
+    ///
+    /// Liveness and *identity* are different questions and a round answers them
+    /// differently. Every reachable outcome is proof the member is alive, whichever
+    /// path found it. Only [`Direct`](GossipRoundOutcome::Direct) is proof about the
+    /// member itself: this node dialed the address the id names and the transport
+    /// authenticated the far end before a byte was written, which is what a
+    /// verification claims. A relay's second opinion says a *relay* reaches the target,
+    /// which vouches for nobody here — if it did, one member confirming a target would
+    /// place it, and the mint would be open one step over.
+    pub fn note_gossip_round(&mut self, node: NodeId, outcome: GossipRoundOutcome) {
+        self.note_gossip_probe(node.clone(), outcome.reachable());
+        if outcome == GossipRoundOutcome::Direct {
+            self.note_peer_verified(&node);
+        }
+    }
+
     /// Apply an inbound [`Message::Gossip`] from the member `sender` on peer
     /// connection `id`: merge the advertised liveness into this node's view, then
     /// answer with this node's own so the exchange syncs both directions (push-pull
@@ -892,15 +1007,35 @@ impl Registry {
     /// A joining node still converges: it learns the cluster from the seed it *dialed*
     /// (see [`merge_gossip`](Self::merge_gossip), the reply path) and then introduces
     /// itself to each member directly.
+    ///
+    /// **A self-introduction joins the roster, not the ring.** The member is dialed,
+    /// probed and gossiped about, and placed on no room until the cluster has verified
+    /// it — otherwise a member would grind a node id that HRW placed on the room it
+    /// wanted and be inside that room's replica set the moment it said so. Its own
+    /// tuple cannot carry that verification either: a claim naming the sender is
+    /// dropped.
     fn apply_gossip(
         &mut self,
         id: ConnId,
         sender: &NodeId,
-        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState)>,
+        members: Vec<(Vec<u8>, Vec<u8>, u64, MemberState, bool)>,
     ) -> bool {
         let Some(membership) = &self.membership else {
             return false;
         };
+        // An inbound frame introduces only its own sender: admitting a *third* member
+        // from it would be a join with no dial behind it. A tuple that fails that test
+        // is dropped whole, claim included. Holding the claim instead — against a
+        // member this view has not met — sounds strictly better, and is not: those ids
+        // are on no roster, so no reap can ever strike them, and one frame of
+        // attacker-chosen ids banks entries that nothing reclaims. Measured, one 24.9 MB
+        // frame retained 376.5 MB, a 15x amplification of the wire. Dropping costs a
+        // window instead: the maker re-advertises `verified` for every member it has
+        // verified on every round it sends, so a claim arriving before its subject is
+        // re-sent on the next round *with that maker* — O(cluster size) intervals,
+        // since a node gossips to one random peer per interval and claims are never
+        // relayed. Bounded in bytes, unbounded in time only as far as C35's roster
+        // growth allows.
         let members = members
             .into_iter()
             .filter(|(node, addr, ..)| {
@@ -910,7 +1045,17 @@ impl Registry {
                 membership.is_member(&node) || (&node == sender && addr == node.as_bytes())
             })
             .collect();
-        self.merge_gossip(members);
+        // Whether a claim is attributable is asked the same way on both halves of a
+        // round, because `verifiers` has to converge and this is what decides what
+        // enters it. Reading the link here (bound to `sender`, C13) while the reply
+        // half reads the member's advertised transport made the two halves disagree
+        // about the same member: a plaintext member under `require_peer_identity` had
+        // its claims kept by every node it dialed and dropped by every node that dialed
+        // it, so nodes holding identical evidence built different rings and placed
+        // rooms differently — permanently. `dial_establishes_identity` is a function of
+        // configuration and the member's own address, so every node computes it alike.
+        let attributable = self.dial_establishes_identity(sender);
+        self.merge_gossip_attributed(sender, members, attributable);
         let reply = crate::gossip::gossip_frame(&self.known_liveness());
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.outbox.push(reply);
@@ -1021,6 +1166,15 @@ impl Registry {
         let Some(membership) = &self.membership else {
             return (1, Vec::new());
         };
+        // A stranded node's ring is empty, and an empty replica set would otherwise
+        // compute a majority of one — satisfied by self alone, which is exactly the
+        // majority-of-one commit the empty ring exists to prevent. The two states look
+        // identical from `replicas_for` and are opposite in meaning: no membership is a
+        // single-node deployment that owns every room, while a stranded node owns none
+        // and must hold every write rather than release it unreplicated.
+        if membership.is_stranded() {
+            return (usize::MAX, Vec::new());
+        }
         let replicas = membership.replicas_for(room);
         let majority = replicas.len() / 2 + 1;
         let followers = replicas

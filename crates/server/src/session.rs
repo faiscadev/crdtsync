@@ -1968,6 +1968,18 @@ fn project_snapshot_reads(
 /// and a node that does not hold the room never serves it itself.
 fn redirect_if_not_leader(membership: Option<&Membership>, room: &[u8]) -> Option<Message> {
     let membership = membership?;
+    // A stranded node holds no room, and "no primary" must not fall through to serving
+    // it here: `None` means *this node owns the room*, which is the right reading for a
+    // node with no membership and the wrong one for a node whose ring it could not
+    // rebuild. It has no leader to name either, so the client is told the room is
+    // unavailable rather than silently served by a node the cluster does not place.
+    if membership.is_stranded() {
+        return Some(Message::Error {
+            code: ErrorCode::Internal,
+            message: "node holds no ring position and cannot serve this room".to_string(),
+            details: room.to_vec(),
+        });
+    }
     let leader = membership
         .effective_primary_for(room)
         .or_else(|| membership.primary_for(room))?;

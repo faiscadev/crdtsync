@@ -39,7 +39,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use crate::auth::{AllowAll, Identity, Verifier};
 use crate::authz::{Authorizer, PermitAll};
 use crate::dial::{PeerDialer, PeerStream};
-use crate::gossip::{GossipMember, GossipWireMember};
+use crate::gossip::{GossipMember, GossipRoundOutcome, GossipWireMember};
 use crate::membership::Membership;
 use crate::placement::NodeId;
 use crate::webhook::{WebhookConfig, WebhookSink};
@@ -249,9 +249,13 @@ enum Cmd {
     /// success, `learned` carries the liveness the peer advertised back (the
     /// registry merges it) and the peer is noted reachable; on failure (`learned`
     /// is `None`) the peer is noted unreachable — the gossip-driven failover signal.
+    /// `outcome` says how the round reached `peer` — by this node's own dial, through
+    /// a relay's second opinion, or not at all — which is what separates evidence of
+    /// the peer's identity from evidence of its mere liveness.
     GossipRound {
         peer: NodeId,
-        learned: Option<Vec<GossipWireMember>>,
+        learned: Vec<GossipWireMember>,
+        outcome: GossipRoundOutcome,
     },
     /// The blob-fetch plane asks whether `identity` may retrieve blob `blob_id`,
     /// resolved against the live rooms' references (see
@@ -733,17 +737,19 @@ async fn registry_actor(
                     Cmd::GossipSnapshot { reply } => {
                         let _ = reply.send(reg.known_liveness());
                     }
-                    Cmd::GossipRound { peer, learned } => {
+                    Cmd::GossipRound {
+                        peer,
+                        learned,
+                        outcome,
+                    } => {
                         // The next client delivery recomputes placement and
                         // effective leadership off the grown set and updated
-                        // liveness, so there is nothing to flush here.
-                        match learned {
-                            Some(members) => {
-                                reg.note_gossip_probe(peer, true);
-                                reg.merge_gossip(members);
-                            }
-                            None => reg.note_gossip_probe(peer, false),
-                        }
+                        // liveness, so there is nothing to flush here. The round is
+                        // noted *before* its payload merges, so a peer this node has
+                        // just verified can vouch in the same round rather than the
+                        // next one.
+                        reg.note_gossip_round(peer.clone(), outcome);
+                        reg.merge_gossip(&peer, learned);
                     }
                     Cmd::AuthorizeBlob {
                         identity,
@@ -1135,21 +1141,24 @@ async fn gossip_loop(
         // On a direct failure, ask a few other members for a second opinion (SWIM
         // ping-req) before counting the failure toward suspicion: a peer any relay
         // still reaches is not falsely suspected. The direct and indirect signals
-        // fold through the same `probe_outcome` the spec tests drive.
+        // fold through the same outcome the spec tests drive.
         let indirect = if direct.is_some() {
             Vec::new()
         } else {
             indirect_probe(server, &dialer, &members, &self_id, &peer, &peer_addr).await
         };
-        let reachable = crate::gossip::probe_outcome(direct.is_some(), &indirect);
+        let outcome = GossipRoundOutcome::of(direct.is_some(), &indirect);
         // A direct success carries the liveness the peer advertised back; an
-        // indirect-only success reports the peer reachable but has nothing to merge
-        // (an empty learned set); an all-failed round reports it unreachable (`None`).
-        let learned = match direct {
-            Some(members) => Some(members),
-            None => reachable.then(Vec::new),
-        };
-        if cmds.send(Cmd::GossipRound { peer, learned }).is_err() {
+        // indirect-only success has nothing to merge, and neither does a failed round.
+        let learned = direct.unwrap_or_default();
+        if cmds
+            .send(Cmd::GossipRound {
+                peer,
+                learned,
+                outcome,
+            })
+            .is_err()
+        {
             return;
         }
     }
