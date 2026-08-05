@@ -272,7 +272,9 @@ pub struct Membership {
     /// gossip-learned member the evidence now carries. **Derived, never accumulated**
     /// — [`rebuild_placement`](Self::rebuild_placement) recomputes it from
     /// `configured` + `verifiers` — so it is a pure function of state and two nodes
-    /// holding the same evidence hold the same ring, however they came by it.
+    /// holding the same evidence *and the same roster* hold the same ring, however
+    /// they came by it — the fixpoint scans the roster, so a member two units have
+    /// vouched for is not adopted by a node that has not met it yet.
     adopted: HashSet<NodeId>,
     /// Who has verified each member: for every member, the nodes that reported
     /// completing an identity-checked peer link to it. A node inserts itself here
@@ -314,6 +316,12 @@ impl Membership {
         // that count would fall to the single-node rule on a node that has a peer plane
         // and a cluster secret. That is the shape the startup refusal exists to catch,
         // reached without the variable being empty.
+        // "No peer other than this node", read off the *list*: a de-duplicated count
+        // would move as the cluster shrinks, which once let a reap lower the bar. Note
+        // that a list naming only this node is refused at the configuration door
+        // (`NoPeerButSelf`), so the only lists that reach here name a real peer or name
+        // none; between those two this predicate and `peers.is_empty()` agree, and
+        // where they differ this one is the stricter.
         let solitary = !peers.iter().any(|peer| peer != &self_id);
         let members: Vec<NodeId> = std::iter::once(self_id.clone()).chain(peers).collect();
         // Every seeded member dials at its node id — the identity each is derived
@@ -738,7 +746,29 @@ impl Membership {
             }
             self.adopted.extend(newly);
         }
-        self.cluster = Cluster::new(self.adopted.iter().cloned());
+        // A node that has reaped away every configured peer has nothing left to seed
+        // the fixpoint from but itself, and `verifier_units` counts only *adopted*
+        // verifiers — so its own vouch is the only one that can ever count, and it can
+        // never reach a bar of two again however completely the roster recovers. That
+        // state is reachable from one node's one-sided egress outage: its peers still
+        // reach it inbound, so they never reap it, while it reaps all of them.
+        //
+        // Placing on `{self}` there is the worst available answer. It makes this node
+        // the sole replica and primary of *every* room at a majority of one, so it
+        // releases `Accepted` for writes no other replica holds while the rest of the
+        // cluster leads the same rooms — a single-node split-brain in a healthy
+        // cluster, with no signal. Holding no rooms is fail-closed instead: writes are
+        // refused rather than accepted alone. The ring below the bar is empty, and a
+        // solitary deployment is untouched because its bar is one.
+        let stranded = !self.solitary
+            && self.addrs.len() > 1
+            && self.adopted.len() == 1
+            && self.adopted.contains(&self.self_id);
+        self.cluster = if stranded {
+            Cluster::new(std::iter::empty())
+        } else {
+            Cluster::new(self.adopted.iter().cloned())
+        };
     }
 
     /// How many trust units must vouch for a member before it is placed:

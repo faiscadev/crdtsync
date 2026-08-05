@@ -1923,3 +1923,66 @@ fn a_member_reaped_after_it_was_adopted_returns_pending() {
         "and it returned pending: reaping took its vouches with it",
     );
 }
+
+#[test]
+fn a_node_that_reaped_every_peer_holds_no_rooms_rather_than_all_of_them() {
+    // One node loses egress: its peers still reach it inbound, so they never reap it,
+    // while it reaps all of them. `configured` is emptied of peers, and since
+    // `verifier_units` counts only adopted verifiers, its own vouch becomes the only
+    // one that can ever count — the fixpoint is stuck at `{self}` however completely
+    // the roster recovers.
+    //
+    // Placing on `{self}` there would make this node sole replica and primary of every
+    // room at a majority of one, releasing `Accepted` for writes no other replica
+    // holds while the rest of the cluster leads the same rooms. Holding nothing is
+    // fail-closed: writes are refused rather than accepted alone.
+    let mut m = membership_for(SELF_ADDR);
+    let peers: Vec<NodeId> = m
+        .members()
+        .into_iter()
+        .filter(|n| n != m.self_id())
+        .collect();
+    assert!(peers.len() >= 2);
+
+    for peer in &peers {
+        for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+            m.note_gossip_unreachable(peer);
+        }
+    }
+    for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+        m.reap_dead();
+    }
+    assert_eq!(m.members(), vec![m.self_id().clone()], "it reaped them all");
+
+    // Egress returns and the roster recovers completely — every peer comes back under
+    // SWIM's own rule, at a higher incarnation, which is what lifts a tombstone.
+    for peer in &peers {
+        m.merge_liveness(
+            peer,
+            [(
+                peer.clone(),
+                peer.as_bytes().to_vec(),
+                9,
+                MemberState::Alive,
+                false,
+            )],
+        );
+    }
+    assert_eq!(m.members().len(), peers.len() + 1, "the roster recovered");
+
+    // The ring cannot recover, because nothing can clear the bar again. It must hold
+    // nothing rather than everything.
+    assert!(
+        m.adopted_members().len() <= 1,
+        "the bar is unreachable from a single adopted unit",
+    );
+    let led = (0..256u32)
+        .map(|i| format!("room-{i}"))
+        .filter(|r| m.replicas_for(r.as_bytes()).first() == Some(m.self_id()))
+        .count();
+    assert_eq!(led, 0, "it leads no room rather than every room");
+    assert!(
+        (0..256u32).all(|i| m.replicas_for(format!("room-{i}").as_bytes()).is_empty()),
+        "and holds a replica of none",
+    );
+}
