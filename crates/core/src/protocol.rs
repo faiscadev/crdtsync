@@ -365,8 +365,10 @@ pub enum Message {
     /// authority root — the authenticated actor that established it — carried on
     /// every frame so a replica that holds the room holds the root its redactions
     /// resolve against; `None` for a room no authenticated actor has yet written.
-    /// It is set-once and immutable once established, so a frame never contradicts an
-    /// earlier one. Node-to-node — never a client frame; a client that sends one
+    /// A room's root is set-once and immutable once established, so a leader's frames
+    /// for a room all name the same one and re-sending it can never conflict. A frame
+    /// is still an *assertion*: the receiver composes it set-once against whatever it
+    /// already holds. Node-to-node — never a client frame; a client that sends one
     /// commits a protocol violation.
     Replicate {
         room: Vec<u8>,

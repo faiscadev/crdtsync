@@ -232,10 +232,46 @@ fn a_stored_root_is_admitted_whatever_its_id_looks_like() {
         )],
     )
     .unwrap();
+    assert_eq!(hub.seq(ROOM), 1, "the room itself loaded");
     assert_eq!(
         hub.room_creator(ROOM),
         Some(Vec::new()),
         "the durable load admits the same actors a write does",
+    );
+}
+
+#[test]
+fn a_second_stored_record_for_one_room_does_not_displace_its_root() {
+    // `from_rooms` takes a list, so one room can arrive twice — a hand-assembled load,
+    // or a store handed over with a duplicate. The root is set-once here as at every
+    // other seam, so the first record's stands.
+    let log = |actor: &[u8], key: &[u8]| RoomLog {
+        snapshot: None,
+        ops: relay(doc(1).transact(|tx| tx.register(key, Scalar::Int(1)))),
+        versions: Vec::new(),
+        meta: Some(RoomMeta {
+            governing: None,
+            max_op_version: None,
+            creator: Some(actor.to_vec()),
+        }),
+        branches: Vec::new(),
+        branch_ops: Vec::new(),
+        branch_bases: Vec::new(),
+        active_branch: None,
+        epoch: None,
+    };
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![
+            (ROOM.to_vec(), log(b"alice", b"a")),
+            (ROOM.to_vec(), log(b"mallory", b"b")),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        hub.room_creator(ROOM),
+        Some(b"alice".to_vec()),
+        "the root the room came up under is not displaced by a later record",
     );
 }
 

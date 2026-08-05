@@ -423,8 +423,9 @@ struct Room {
     /// its grants confer authority. Set once and never displaced; durable across a
     /// restart. It arrives from whichever seam first names one — a client's write, a
     /// peer's replication frame, or the store — so a replica holds it without ever
-    /// having served a write. `None` for a room no authenticated actor has established
-    /// and no frame has named.
+    /// having served a write. `None` where no seam has named one an authority root can
+    /// be: no authenticated writer, no frame or store record naming a credentialed
+    /// actor.
     creator: Option<Vec<u8>>,
 }
 
@@ -1024,7 +1025,9 @@ impl Hub {
             // could never re-present to exercise the ownership it would be handed.
             if let Some(creator) = meta.creator.filter(|a| crate::acl::is_authenticated(a)) {
                 if let Some(r) = self.rooms.get_mut(&room) {
-                    r.creator = Some(creator);
+                    if r.creator.is_none() {
+                        r.creator = Some(creator);
+                    }
                 }
             }
         }
@@ -1897,11 +1900,11 @@ impl Hub {
     /// caller never displaces it. A no-op for an unknown room, and for an
     /// [anonymous](crate::acl::is_authenticated) actor — an anonymous id is ephemeral
     /// per-connection, so set-once would wedge the room's authority on a principal
-    /// that can never re-present to exercise it. The same rule decides a root arriving
-    /// with an installed snapshot and one read back off the store, so a root is judged
-    /// the same whichever seam carries it. Set-once is this seam's alone: an install
-    /// composes against the standing root itself, and a durable load builds the room
-    /// creatorless, so there is none to displace.
+    /// that can never re-present to exercise it. Both rules decide a root arriving with
+    /// an installed snapshot and one read back off the store too, so a root is judged
+    /// the same whichever seam carries it — each expresses set-once in the shape its
+    /// own seam needs, an install composing against the standing root rather than
+    /// guarding on its absence.
     ///
     /// Persisting is best-effort, matching the governing metadata: a failed write does
     /// not fail the caller's write. Set-once means nothing retries it either. On a
