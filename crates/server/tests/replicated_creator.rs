@@ -8,7 +8,10 @@
 //! replica, so what a replica holds decides what a partial reader landing there is
 //! served, out of every seam that serves a state blob: the op catch-up, the snapshot
 //! catch-up, and the version fetch alike. These pin that a replicated room carries
-//! its root, and that each of those three seams narrows by it.
+//! its root and that each of those three reads narrows by it; that a promoted replica
+//! keeps the root rather than handing `/` to its first writer; that the root installs
+//! set-once through either frame and through the hub call; and which actors may stand
+//! as one.
 //!
 //! The schema tier is what makes the gap observable. It grants root read to any
 //! authenticated actor, so bob passes the room gate on both nodes, while alice's
@@ -751,6 +754,26 @@ fn an_authenticated_actor_roots_a_room_whatever_its_id_looks_like() {
         leader.hub().room_creator(&other),
         Some(Vec::new()),
         "an empty actor is a credentialed one, so it roots the room",
+    );
+}
+
+#[test]
+fn an_installed_root_is_admitted_whatever_its_id_looks_like() {
+    // The rule is the same at the seam a *frame* roots through: an empty actor is a
+    // credentialed one, and refusing it here would leave the room rootless — which
+    // reads every deny in it as inert, the hole this unit closes.
+    let room = room_led_by_a_with_b_next();
+    let leader = seeded_leader(&room);
+    let state = leader.hub().export_room(&room).expect("the room exports");
+    let mut follower = node(B);
+    follower
+        .hub_mut()
+        .install_snapshot(&room, &state, 2, Some(Vec::new()))
+        .expect("the snapshot installs");
+    assert_eq!(
+        follower.hub().room_creator(&room),
+        Some(Vec::new()),
+        "the install admits the same actors a write does",
     );
 }
 

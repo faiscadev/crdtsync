@@ -1897,9 +1897,11 @@ impl Hub {
     /// caller never displaces it. A no-op for an unknown room, and for an
     /// [anonymous](crate::acl::is_authenticated) actor — an anonymous id is ephemeral
     /// per-connection, so set-once would wedge the room's authority on a principal
-    /// that can never re-present to exercise it. The same two rules decide a root
-    /// arriving with an installed snapshot, so a root is
-    /// judged the same whether a client's write or a peer's frame carries it.
+    /// that can never re-present to exercise it. The same rule decides a root arriving
+    /// with an installed snapshot and one read back off the store, so a root is judged
+    /// the same whichever seam carries it. Set-once is this seam's alone: an install
+    /// composes against the standing root itself, and a durable load builds the room
+    /// creatorless, so there is none to displace.
     ///
     /// Persisting is best-effort, matching the governing metadata: a failed write does
     /// not fail the caller's write. Set-once means nothing retries it either. On a

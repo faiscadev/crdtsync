@@ -206,6 +206,40 @@ fn a_stored_creator_that_could_never_re_present_roots_nothing() {
 }
 
 #[test]
+fn a_stored_root_is_admitted_whatever_its_id_looks_like() {
+    // The store applies the same rule the write and frame seams do, and no more: an
+    // empty actor is credentialed, so refusing it on reload would drop a root the
+    // room had — leaving every deny in it inert.
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![(
+            ROOM.to_vec(),
+            RoomLog {
+                snapshot: None,
+                ops: relay(doc(1).transact(|tx| tx.register(b"a", Scalar::Int(1)))),
+                versions: Vec::new(),
+                meta: Some(RoomMeta {
+                    governing: None,
+                    max_op_version: None,
+                    creator: Some(Vec::new()),
+                }),
+                branches: Vec::new(),
+                branch_ops: Vec::new(),
+                branch_bases: Vec::new(),
+                active_branch: None,
+                epoch: None,
+            },
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        hub.room_creator(ROOM),
+        Some(Vec::new()),
+        "the durable load admits the same actors a write does",
+    );
+}
+
+#[test]
 fn a_creator_installed_with_a_snapshot_survives_a_restart() {
     // A follower converged by a state transfer holds the room's authority root, and
     // it is durable there on the same footing a written one is — otherwise a restart
