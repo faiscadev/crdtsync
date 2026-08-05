@@ -25,6 +25,8 @@ Third, and the one the record *adds*: it is per-replica evidence, and a **destra
 
 The record's bound is the dedup set, not the buffer: a key outlives the ops that earned it exactly as a `seen` entry does, so an eviction policy empties the buffer and keeps the key.
 
+One seam interaction worth naming, since C26 (#370) scopes its own caveat more narrowly: `Document::apply` now returns `false` while *mutating* the document — the disagreeing-envelope branch spends two keys and drains, which can apply arbitrarily many buffered ops. The FFI and wasm folds count that op as neither applied nor refused, and the ops it released are uncounted too, so an SDK's applied count can understate a batch by more than the one op C26 describes. No caller gates on the return (`client.rs`, the server ingest seams and the index all discard it), and both refusal counts are computed from `Op::is_admissible` independently, so nothing downstream is wrong — the count is just not a fold size.
+
 **Projections drop the record whole.** A key names an author and a group, never a partition, so a zone- or read-scoped snapshot that kept it would count the groups a withheld partition resolved — the same activity inference `scrub_frontier_to` exists to close. `project_read_paths` clears it on the condition it already clears the buffer on, so an identity projection stays byte-identical on re-encode.
 
 ## 2026-07-29 · C27 diff-query redaction (#375) · a change list is content, so a diff is a redacted read — and the scope it is redacted to is a channel's, which is why the query now names one
