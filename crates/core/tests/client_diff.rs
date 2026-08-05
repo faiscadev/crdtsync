@@ -32,16 +32,20 @@ fn value_change() -> Change {
 #[test]
 fn diff_query_frames_a_channel_keyed_request() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (one, _) = s.subscribe(ROOM);
+    // A second subscription, so the frame carrying the channel it was *asked* for is
+    // told from a frame that hardcodes the first one.
+    let (two, _) = s.subscribe(b"room-b");
+    assert_ne!(one, two);
     assert!(matches!(
-        s.diff_query(ch, DiffKind::Versions, b"v1", b"v2"),
+        s.diff_query(one, DiffKind::Versions, b"v1", b"v2"),
         Some(Message::DiffQuery { channel, kind: DiffKind::Versions, a, b })
-            if channel == ch && a == b"v1" && b == b"v2"
+            if channel == one && a == b"v1" && b == b"v2"
     ));
     assert!(matches!(
-        s.diff_query(ch, DiffKind::Branches, b"main", b"draft"),
+        s.diff_query(two, DiffKind::Branches, b"main", b"draft"),
         Some(Message::DiffQuery { channel, kind: DiffKind::Branches, a, b })
-            if channel == ch && a == b"main" && b == b"draft"
+            if channel == two && a == b"main" && b == b"draft"
     ));
 }
 
@@ -52,6 +56,8 @@ fn a_diff_query_on_an_unheld_channel_frames_nothing() {
     // exactly as a version fetch on an unheld channel is.
     let mut s = ClientSession::new(cid(1));
     let (ch, _) = s.subscribe(ROOM);
+    // Channels are handed out monotonically and never reused, so the next number is
+    // one this session has not assigned.
     assert!(s
         .diff_query(Channel(ch.0 + 1), DiffKind::Versions, b"v1", b"v2")
         .is_none());

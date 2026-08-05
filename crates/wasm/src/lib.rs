@@ -1794,7 +1794,7 @@ impl WasmClient {
     /// other value is an error. Channel-keyed: a change list carries the room's
     /// paths and values, so the server narrows it to what this channel may read.
     /// The reply updates the diff view, keyed by the room the server resolved.
-    /// `null` if the channel isn't held, as a version fetch answers.
+    /// `None` if the channel isn't held, as a version fetch answers.
     #[wasm_bindgen(js_name = diffQuery)]
     pub fn diff_query(
         &self,
