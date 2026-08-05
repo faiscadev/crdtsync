@@ -6,13 +6,12 @@
 //! decides nothing — while `acl_records` is non-empty, because ACL ops ride the log
 //! like any other. Follower reads let a caught-up follower serve a read from its own
 //! replica, so what a replica holds decides what a partial reader landing there is
-//! served, out of every seam that serves a state blob: the op catch-up, the snapshot
-//! catch-up, the version fetch and the diff query alike — every seam that hands a
-//! reader a state. These pin that a replicated room carries its root and that each of
-//! those reads narrows by it; that a promoted replica
-//! keeps the root rather than handing `/` to its first writer; that the root installs
-//! set-once through either frame and through the hub call; and which actors may stand
-//! as one.
+//! served — through the op catch-up, the snapshot catch-up, the version fetch and the
+//! diff query, the four seams that hand a reader a whole state. These pin that a
+//! replicated room carries its root and that each of those four narrows by it; that a
+//! promoted replica keeps the root rather than handing `/` to its first writer; that
+//! the root installs set-once through either frame and through the hub call; and which
+//! actors may stand as one.
 //!
 //! The schema tier is what makes the gap observable. It grants root read to any
 //! authenticated actor, so bob passes the room gate on both nodes, while alice's
