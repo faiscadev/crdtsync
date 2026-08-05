@@ -288,6 +288,14 @@ impl Registry {
         self.membership.as_ref()
     }
 
+    /// The membership view, mutably — the seam a test drives to put a node into a
+    /// state the network would take minutes to produce, such as having reaped every
+    /// configured peer.
+    #[doc(hidden)]
+    pub fn membership_mut_for_test(&mut self) -> &mut Membership {
+        self.membership.as_mut().expect("clustered")
+    }
+
     /// Hold the deployment's cluster secret — the credential a peer presents to
     /// open the peer plane on its connection. Unset (the default) leaves the peer
     /// plane closed to every connection: a node-to-node frame is then refused as
@@ -1158,6 +1166,15 @@ impl Registry {
         let Some(membership) = &self.membership else {
             return (1, Vec::new());
         };
+        // A stranded node's ring is empty, and an empty replica set would otherwise
+        // compute a majority of one — satisfied by self alone, which is exactly the
+        // majority-of-one commit the empty ring exists to prevent. The two states look
+        // identical from `replicas_for` and are opposite in meaning: no membership is a
+        // single-node deployment that owns every room, while a stranded node owns none
+        // and must hold every write rather than release it unreplicated.
+        if membership.is_stranded() {
+            return (usize::MAX, Vec::new());
+        }
         let replicas = membership.replicas_for(room);
         let majority = replicas.len() / 2 + 1;
         let followers = replicas

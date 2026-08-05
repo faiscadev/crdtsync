@@ -276,6 +276,12 @@ pub struct Membership {
     /// they came by it — the fixpoint scans the roster, so a member two units have
     /// vouched for is not adopted by a node that has not met it yet.
     adopted: HashSet<NodeId>,
+    /// Whether this node's adopted set spans too few trust units to ever clear its own
+    /// adoption bar again — see [`rebuild_placement`](Self::rebuild_placement). An
+    /// empty ring alone cannot express this: a node with no membership at all also has
+    /// no replicas, and that one *should* serve every room. The write path has to tell
+    /// the two apart, so it is stored rather than inferred.
+    stranded: bool,
     /// Who has verified each member: for every member, the nodes that reported
     /// completing an identity-checked peer link to it. A node inserts itself here
     /// from its own links, and inserts a peer only from that peer's own gossip
@@ -353,6 +359,9 @@ impl Membership {
             adopted: configured.clone(),
             configured,
             solitary,
+            // Set by the first `rebuild_placement`; a freshly-configured node is not
+            // stranded, since its configured members are adopted from birth.
+            stranded: false,
             verifiers: HashMap::new(),
         }
     }
@@ -651,6 +660,15 @@ impl Membership {
         self.has_verified(&self.self_id, node)
     }
 
+    /// Whether this node cannot rebuild a ring: its adopted set spans fewer trust units
+    /// than its own adoption bar, so no member it learns can ever clear that bar. The
+    /// ring is empty in that state, and the write path must refuse rather than read the
+    /// emptiness as "single node, serve everything" — which is the same shape a node
+    /// with no membership at all presents.
+    pub fn is_stranded(&self) -> bool {
+        self.stranded
+    }
+
     /// Whether `node` is adopted — placed on rooms and counted toward their quorums,
     /// as against merely known (dialed, probed and gossiped about).
     pub fn is_adopted(&self, node: &NodeId) -> bool {
@@ -757,14 +775,35 @@ impl Membership {
         // the sole replica and primary of *every* room at a majority of one, so it
         // releases `Accepted` for writes no other replica holds while the rest of the
         // cluster leads the same rooms — a single-node split-brain in a healthy
-        // cluster, with no signal. Holding no rooms is fail-closed instead: writes are
-        // refused rather than accepted alone. The ring below the bar is empty, and a
-        // solitary deployment is untouched because its bar is one.
-        let stranded = !self.solitary
-            && self.addrs.len() > 1
-            && self.adopted.len() == 1
-            && self.adopted.contains(&self.self_id);
-        self.cluster = if stranded {
+        // cluster, with no signal.
+        //
+        // The condition is *evidence capacity*, not how many members are adopted: what
+        // wedges the fixpoint is that no candidate can ever reach the bar, and the bar
+        // counts distinct trust units. Two adopted members on one host — an ordinary
+        // two-processes-on-one-machine deployment, which is the correlated failure
+        // `member_trust_unit` exists to model — is as wedged as one, and a cardinality
+        // test misses it. A solitary deployment is untouched because its bar is one.
+        let units: std::collections::HashSet<String> = self
+            .adopted
+            .iter()
+            .filter_map(|node| member_trust_unit(node.as_bytes()))
+            .collect();
+        let was = self.stranded;
+        self.stranded = !self.solitary && units.len() < bar;
+        if self.stranded && !was {
+            // Fail-closed is not fail-silent: the pre-guard behaviour was indicted for
+            // having no signal, and an empty ring has none either. This is the one
+            // place a node can say that it has stopped serving and why.
+            eprintln!(
+                "membership: adopted members span {} trust unit(s), below the bar of \
+                 {}, with {} member(s) on the roster — this node can place no room and \
+                 will refuse reads and writes until its ring is re-established",
+                units.len(),
+                bar,
+                self.addrs.len(),
+            );
+        }
+        self.cluster = if self.stranded {
             Cluster::new(std::iter::empty())
         } else {
             Cluster::new(self.adopted.iter().cloned())

@@ -1986,3 +1986,60 @@ fn a_node_that_reaped_every_peer_holds_no_rooms_rather_than_all_of_them() {
         "and holds a replica of none",
     );
 }
+
+#[test]
+fn a_stranded_node_refuses_the_write_rather_than_accepting_it_alone() {
+    // The property the empty ring exists for, asserted where a client can observe it.
+    // Emptying the ring is not by itself fail-closed: an empty replica set computes a
+    // majority of `0 / 2 + 1 = 1`, which self satisfies alone, and a room with no
+    // primary reads as "this node owns it" — the same shape a node with *no* membership
+    // presents, which is a single-node deployment that should serve everything. Read
+    // that way, a stranded node commits at a majority of one and mirrors to nobody:
+    // precisely the split-brain the guard was added to stop.
+    let mut r = registry();
+    let m = membership_for(SELF_ADDR);
+    let room = room_self_leads(&m);
+
+    // Strand it: reap every configured peer, as a one-sided egress outage does.
+    {
+        let view = r.membership_mut_for_test();
+        let peers: Vec<NodeId> = view
+            .members()
+            .into_iter()
+            .filter(|n| n != view.self_id())
+            .collect();
+        for peer in &peers {
+            for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+                view.note_gossip_unreachable(peer);
+            }
+        }
+        for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+            view.reap_dead();
+        }
+        assert!(view.is_stranded(), "it can no longer rebuild a ring");
+        assert!(view.replicas_for(&room).is_empty(), "and holds no room");
+    }
+
+    let c = client(&mut r);
+    r.deliver(c, sub(&room));
+    let replies = r.take_outbox(c);
+    assert!(
+        replies.iter().any(|m| matches!(m, Message::Error { .. })),
+        "a room it cannot place is refused, not served: {replies:?}",
+    );
+
+    r.deliver(
+        c,
+        Message::Ops {
+            channel: CH,
+            ops: write(),
+        },
+    );
+    let replies = r.take_outbox(c);
+    assert!(
+        !replies
+            .iter()
+            .any(|m| matches!(m, Message::Accepted { .. })),
+        "and no write is released at a majority of one: {replies:?}",
+    );
+}
