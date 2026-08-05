@@ -1751,8 +1751,15 @@ fn evicting_replicas_agree_whichever_of_them_had_ticked() {
         late.encode_state(),
         "when each replica ticked decided its state"
     );
+    // And the keys each spent agree, which is what the stray reads: it merges at both
+    // or neither, and the two are still byte-identical once it has.
     assert_eq!(early.apply(&forged), late.apply(&forged));
     assert_eq!(reg(&early, b"late"), reg(&late, b"late"));
+    assert_eq!(
+        early.encode_state(),
+        late.encode_state(),
+        "the stray read a different record at each"
+    );
 }
 
 #[test]
