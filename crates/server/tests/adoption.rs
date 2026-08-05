@@ -1042,6 +1042,59 @@ fn a_pending_member_is_dialed_probed_and_gossiped_about() {
 }
 
 #[test]
+fn the_inbound_half_asks_the_same_attributability_question_as_the_reply_half() {
+    // `verifiers` is what the ring is derived from, so what enters it has to be decided
+    // the same way on both halves of a round or two nodes holding identical evidence
+    // build different rings. The inbound half once answered "attributable" outright,
+    // reasoning from the link being certificate-bound; the reply half asked whether a
+    // dial to that member establishes identity. For a plaintext-advertised member under
+    // `require_peer_identity` those disagree, so its claims were kept by every node it
+    // dialed and dropped by every node that dialed it — permanently different rings.
+    let known = NodeId::from("10.9.9.9:9000");
+
+    let mut r = registry();
+    r.set_require_peer_identity(true);
+    r.merge_gossip(
+        &NodeId::from("10.0.0.1:9000"),
+        advertisements(&[&known], false),
+    );
+
+    // A plaintext-advertised member pushes a claim *inbound*. A dial to it would
+    // authenticate nothing, so the claim is not attributable to it here either.
+    let plain = NodeId::from("10.0.0.2:9000");
+    let conn = certified_peer_as(&mut r, &plain);
+    assert!(r.deliver(
+        conn,
+        Message::Gossip {
+            members: advertisements(&[&known], true),
+        },
+    ));
+    assert!(
+        !r.membership().unwrap().has_verified(&plain, &known),
+        "an inbound claim from a member no dial could identify is not attributable",
+    );
+
+    // The same frame from a `wss://` member is, because a dial to that one does
+    // authenticate it — the reply half's rule, reached through the inbound door.
+    let tls = NodeId::from("wss://10.0.0.3:9000");
+    r.merge_gossip(
+        &NodeId::from("10.0.0.1:9000"),
+        advertisements(&[&tls], false),
+    );
+    let conn = certified_peer_as(&mut r, &tls);
+    assert!(r.deliver(
+        conn,
+        Message::Gossip {
+            members: advertisements(&[&known], true),
+        },
+    ));
+    assert!(
+        r.membership().unwrap().has_verified(&tls, &known),
+        "and one from a member a dial would identify is",
+    );
+}
+
+#[test]
 fn a_plaintext_dial_does_not_verify_where_an_identified_peer_is_required() {
     // A deployment that requires an identified peer requires the dial to have
     // authenticated one. A plaintext member is dialed with no certificate to check, so
