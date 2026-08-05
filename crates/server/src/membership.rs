@@ -777,30 +777,28 @@ impl Membership {
         // cluster leads the same rooms — a single-node split-brain in a healthy
         // cluster, with no signal.
         //
-        // The condition is *evidence capacity*, not how many members are adopted: what
-        // wedges the fixpoint is that no candidate can ever reach the bar, and the bar
-        // counts distinct trust units. Two adopted members on one host — an ordinary
-        // two-processes-on-one-machine deployment, which is the correlated failure
-        // `member_trust_unit` exists to model — is as wedged as one, and a cardinality
-        // test misses it. A solitary deployment is untouched because its bar is one.
-        let units: std::collections::HashSet<String> = self
-            .adopted
-            .iter()
-            .filter_map(|node| member_trust_unit(node.as_bytes()))
-            .collect();
+        // The condition is exactly the majority-of-one hazard, and nothing wider. A
+        // ring of one has a majority of one, so this node alone releases the write —
+        // that is what must not happen. An adopted set that merely spans too few trust
+        // units to admit *new* members is a different thing: two adopted members on one
+        // host give a ring of two and a majority of two, so both must ack and no write
+        // is ever released unreplicated. That deployment — two processes on one machine
+        // — is ordinary, it worked before this guard, and stranding it would refuse
+        // every read and write on a cluster that is merely unable to grow. Its
+        // correlated-failure durability, and its inability to adopt anyone, are real
+        // and are C36's, not this guard's.
         let was = self.stranded;
-        self.stranded = !self.solitary && units.len() < bar;
+        self.stranded = !self.solitary && self.adopted.len() == 1;
         if self.stranded && !was {
             // Fail-closed is not fail-silent: the pre-guard behaviour was indicted for
             // having no signal, and an empty ring has none either. This is the one
             // place a node can say that it has stopped serving and why.
             eprintln!(
-                "membership: adopted members span {} trust unit(s), below the bar of \
-                 {}, with {} member(s) on the roster — this node can place no room and \
-                 will refuse reads and writes until its ring is re-established",
-                units.len(),
-                bar,
+                "membership: this node is the only adopted member, with {} member(s) on \
+                 the roster and an adoption bar of {} — it can place no room and will \
+                 refuse reads and writes until its ring is re-established",
                 self.addrs.len(),
+                bar,
             );
         }
         self.cluster = if self.stranded {

@@ -2043,3 +2043,44 @@ fn a_stranded_node_refuses_the_write_rather_than_accepting_it_alone() {
         "and no write is released at a majority of one: {replies:?}",
     );
 }
+
+#[test]
+fn two_processes_on_one_host_place_and_serve_normally() {
+    // The other side of the stranded boundary. A cluster of two server processes on
+    // one machine is an ordinary deployment — dev, CI, a single beefy box — and both
+    // members are *configured*, so both are adopted from birth. The ring is two and the
+    // majority is two, so a write needs the sibling's ack and none is ever released
+    // unreplicated. That is not the hazard the guard exists for.
+    //
+    // What such a cluster cannot do is adopt anyone new, because one host is one trust
+    // unit and the bar counts units — and its two replicas share a failure domain.
+    // Both are real, both are C36's, and neither is a reason to stop serving. Reading
+    // the guard as "too few trust units" instead of "a ring of one" refused every read
+    // and write here, on a cluster that worked before the guard existed.
+    let mut m = Membership::from_static_config(None, Some(SELF_ADDR), "10.0.0.6:9001", N).unwrap();
+    // Anything that rebuilds placement — the guard is evaluated there, not at
+    // construction, so a test that never rebuilds would not see it at all.
+    m.add_member(NodeId::from("10.9.9.9:9000"));
+
+    assert!(
+        !m.is_stranded(),
+        "a ring of two is a majority of two, not the majority-of-one hazard",
+    );
+    assert_eq!(
+        m.adopted_members().len(),
+        2,
+        "both configured members place"
+    );
+    let held = (0..256u32)
+        .map(|i| format!("room-{i}"))
+        .filter(|r| !m.replicas_for(r.as_bytes()).is_empty())
+        .count();
+    assert_eq!(
+        held, 256,
+        "and it holds every room, as it did before the guard"
+    );
+    assert!(
+        m.replicas_for(b"room-0").len() == 2,
+        "a write here needs the sibling's ack",
+    );
+}
