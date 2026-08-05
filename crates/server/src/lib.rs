@@ -423,9 +423,9 @@ struct Room {
     /// its grants confer authority. Set once and never displaced; durable across a
     /// restart. It arrives from whichever seam first names one — a client's write, a
     /// peer's replication frame, or the store — so a replica holds it without ever
-    /// having served a write. `None` where no seam has named one an authority root can
-    /// be: no authenticated writer, no frame or store record naming a credentialed
-    /// actor.
+    /// having served a write. `None` where no seam has named an actor that may stand as
+    /// one: no authenticated writer, and no frame or store record naming a
+    /// non-anonymous actor.
     creator: Option<Vec<u8>>,
 }
 
@@ -989,6 +989,14 @@ impl Hub {
             let doc = Document::decode_state(&snapshot.state)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
             let seen = doc.seen().collect();
+            // A room can be handed over twice — `from_rooms` takes a list, so a second
+            // record for one room lands on the first. Its authority root and op-version
+            // high-water compose against what stands rather than being replaced with
+            // the state, exactly as a snapshot install does: the root is set-once
+            // wherever it arrives, and the high-water is the room's all-time worst case.
+            let standing = self.rooms.get(&room);
+            let creator = standing.and_then(|r| r.creator.clone());
+            let max_op_version = standing.and_then(|r| r.max_op_version);
             self.rooms.insert(
                 room.clone(),
                 Room {
@@ -996,8 +1004,8 @@ impl Hub {
                     log: Vec::new(),
                     seen,
                     base_seq: snapshot.base_seq,
-                    max_op_version: None,
-                    creator: None,
+                    max_op_version,
+                    creator,
                 },
             );
         }
@@ -1902,9 +1910,9 @@ impl Hub {
     /// per-connection, so set-once would wedge the room's authority on a principal
     /// that can never re-present to exercise it. Both rules decide a root arriving with
     /// an installed snapshot and one read back off the store too, so a root is judged
-    /// the same whichever seam carries it — each expresses set-once in the shape its
-    /// own seam needs, an install composing against the standing root rather than
-    /// guarding on its absence.
+    /// the same whichever seam carries it. An install expresses set-once by composing
+    /// against the standing root rather than guarding on its absence; the answer is
+    /// the same either way.
     ///
     /// Persisting is best-effort, matching the governing metadata: a failed write does
     /// not fail the caller's write. Set-once means nothing retries it either. On a

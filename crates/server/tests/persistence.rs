@@ -13,7 +13,7 @@ use std::fs;
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, Message, Op, Scalar};
-use crdtsync_server::store::{RoomMeta, Store, StoredOp};
+use crdtsync_server::store::{RoomMeta, Snapshot, Store, StoredOp};
 use crdtsync_server::{Catchup, Hub, Registry, RoomId, RoomLog};
 
 /// Tag a batch of ops as relay records (no schema) — the store's unit.
@@ -240,14 +240,13 @@ fn a_stored_root_is_admitted_whatever_its_id_looks_like() {
     );
 }
 
-#[test]
-fn a_second_stored_record_for_one_room_does_not_displace_its_root() {
-    // `from_rooms` takes a list, so one room can arrive twice — a hand-assembled load,
-    // or a store handed over with a duplicate. The root is set-once here as at every
-    // other seam, so the first record's stands.
-    let log = |actor: &[u8], key: &[u8]| RoomLog {
-        snapshot: None,
-        ops: relay(doc(1).transact(|tx| tx.register(key, Scalar::Int(1)))),
+/// A stored record for `ROOM` naming `actor` as its root, carrying one op from
+/// `author` (so two records are genuinely distinct rather than deduped away) and
+/// `snapshot` in front of it.
+fn record(actor: &[u8], author: u8, key: &[u8], snapshot: Option<Snapshot>) -> RoomLog {
+    RoomLog {
+        snapshot,
+        ops: relay(doc(author).transact(|tx| tx.register(key, Scalar::Int(1)))),
         versions: Vec::new(),
         meta: Some(RoomMeta {
             governing: None,
@@ -259,19 +258,67 @@ fn a_second_stored_record_for_one_room_does_not_displace_its_root() {
         branch_bases: Vec::new(),
         active_branch: None,
         epoch: None,
-    };
+    }
+}
+
+#[test]
+fn a_second_stored_record_for_one_room_does_not_displace_its_root() {
+    // `from_rooms` takes a list, so one room can arrive twice — a hand-assembled load,
+    // or a store handed over with a duplicate. The root is set-once here as at every
+    // other seam, so the first record's stands. Everything else about the room is
+    // last-record-wins (the state, the binding, the high-water), so the asymmetry is
+    // the point: only the authority root refuses to move.
     let hub = Hub::from_rooms(
         cid(SERVER),
         vec![
-            (ROOM.to_vec(), log(b"alice", b"a")),
-            (ROOM.to_vec(), log(b"mallory", b"b")),
+            (ROOM.to_vec(), record(b"alice", 1, b"a", None)),
+            (ROOM.to_vec(), record(b"mallory", 2, b"b", None)),
         ],
     )
     .unwrap();
+    assert_eq!(hub.seq(ROOM), 2, "both records replayed");
     assert_eq!(
         hub.room_creator(ROOM),
         Some(b"alice".to_vec()),
         "the root the room came up under is not displaced by a later record",
+    );
+}
+
+#[test]
+fn a_second_stored_record_carrying_a_snapshot_does_not_displace_the_root() {
+    // The snapshot branch replaces the room outright, so it is the shape where a
+    // duplicate could re-root — and the compacted room, the one that has a snapshot,
+    // is exactly what a store hands over. It composes against what stands.
+    let state = {
+        let mut origin = Hub::new(cid(SERVER));
+        origin
+            .ingest(
+                ROOM,
+                doc(3).transact(|tx| tx.register(b"seeded", Scalar::Int(1))),
+                Some(7),
+            )
+            .unwrap();
+        origin.export_room(ROOM).unwrap()
+    };
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![
+            (ROOM.to_vec(), record(b"alice", 1, b"a", None)),
+            (
+                ROOM.to_vec(),
+                record(b"mallory", 2, b"b", Some(Snapshot { base_seq: 1, state })),
+            ),
+        ],
+    )
+    .unwrap();
+    assert!(
+        hub.get(ROOM, b"seeded").is_some(),
+        "the second record's snapshot replaced the state, so its branch really ran",
+    );
+    assert_eq!(
+        hub.room_creator(ROOM),
+        Some(b"alice".to_vec()),
+        "a duplicate carrying a snapshot does not re-root the room either",
     );
 }
 
