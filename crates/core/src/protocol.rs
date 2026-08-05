@@ -22,7 +22,8 @@
 
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, put_bytes, put_u16, put_u32, put_u64, put_u8, Cursor, DecodeError,
+    decode_ops, encode_ops, put_bytes, put_opt_bytes, put_u16, put_u32, put_u64, put_u8, Cursor,
+    DecodeError,
 };
 use crate::elementid::ElementId;
 use crate::op::Op;
@@ -360,14 +361,22 @@ pub enum Message {
     /// leadership generation for the room (a Raft term): a promotion bumps it
     /// strictly above any epoch the promoting node has seen, and a follower fences
     /// a frame whose `epoch` is below the highest it has seen, so a demoted-then-
-    /// recovered stale leader cannot replicate. Node-to-node — never a client
-    /// frame; a client that sends one commits a protocol violation.
+    /// recovered stale leader cannot replicate. `creator` is the room's doc-ACL
+    /// authority root — the authenticated actor that established it — carried on
+    /// every frame so a replica that holds the room holds the root its redactions
+    /// resolve against; `None` for a room no authenticated actor has yet written.
+    /// A room's root is set-once and immutable once established, so no two frames for a
+    /// room ever name *different* roots — one sent before a root exists names none — and
+    /// re-sending it can never conflict. A frame is still an *assertion*: the receiver
+    /// composes it set-once against whatever it already holds. Node-to-node — never a
+    /// client frame; a client that sends one commits a protocol violation.
     Replicate {
         room: Vec<u8>,
         branch: Vec<u8>,
         ops: Vec<Op>,
         base_seq: u64,
         epoch: u64,
+        creator: Option<Vec<u8>>,
     },
     /// A follower's acknowledgement of replicated ops: `through_seq` is the
     /// server sequence the follower's replica of `room` has now reached, the
@@ -385,14 +394,19 @@ pub enum Message {
     /// re-sent snapshot is idempotent — lands its sequence at `seq`, acks it, and
     /// resumes the ops tail above the floor via the steady replication path. `epoch`
     /// is the leader's leadership generation, fenced exactly as a `Replicate`, so a
-    /// stale leader's snapshot cannot resurrect. Node-to-node — never a client
-    /// frame; a client that sends one commits a protocol violation.
+    /// stale leader's snapshot cannot resurrect. `creator` is the room's doc-ACL
+    /// authority root, carried exactly as a `Replicate` carries it: the state bytes
+    /// are a `Document` encoding and hold no server-side metadata, so a room installed
+    /// from them alone would come up with no root and serve every doc-ACL deny as
+    /// inert. Node-to-node — never a client frame; a client that sends one commits a
+    /// protocol violation.
     ReplicateSnapshot {
         room: Vec<u8>,
         branch: Vec<u8>,
         seq: u64,
         state: Vec<u8>,
         epoch: u64,
+        creator: Option<Vec<u8>>,
     },
     /// A (re)joining follower's report of the durable head it can actually prove it
     /// holds for each room it replicates. `reporter` is the reporting node's id (the
@@ -813,12 +827,16 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             ops,
             base_seq,
             epoch,
+            creator,
         } => {
             put_u8(&mut out, 24);
             put_bytes(&mut out, room);
             put_bytes(&mut out, branch);
             put_u64(&mut out, *base_seq);
             put_u64(&mut out, *epoch);
+            // Ahead of the batch: an op batch is length-framed and consumes the
+            // remainder, so every scalar field precedes it.
+            put_opt_bytes(&mut out, creator.as_deref());
             out.extend_from_slice(&encode_ops(ops));
         }
         Message::ReplicaAck { room, through_seq } => {
@@ -832,12 +850,14 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             seq,
             state,
             epoch,
+            creator,
         } => {
             put_u8(&mut out, 49);
             put_bytes(&mut out, room);
             put_bytes(&mut out, branch);
             put_u64(&mut out, *seq);
             put_u64(&mut out, *epoch);
+            put_opt_bytes(&mut out, creator.as_deref());
             put_bytes(&mut out, state);
         }
         Message::FollowerHeads { reporter, heads } => {
@@ -1212,11 +1232,13 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let branch = cur.bytes()?;
             let base_seq = cur.u64()?;
             let epoch = cur.u64()?;
+            let creator = cur.opt_bytes()?;
             return Ok(Message::Replicate {
                 room,
                 branch,
                 base_seq,
                 epoch,
+                creator,
                 ops: decode_ops(cur.rest()).map_err(ProtocolError::Op)?,
             });
         }
@@ -1230,6 +1252,7 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let branch = cur.bytes()?;
             let seq = cur.u64()?;
             let epoch = cur.u64()?;
+            let creator = cur.opt_bytes()?;
             let state = cur.bytes()?;
             Message::ReplicateSnapshot {
                 room,
@@ -1237,6 +1260,7 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 seq,
                 state,
                 epoch,
+                creator,
             }
         }
         50 => {

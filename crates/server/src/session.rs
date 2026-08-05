@@ -1541,19 +1541,14 @@ fn handle_ops(
     // head, never main's. A hub that cannot durably record the ops rejects the write
     // rather than advertising an unpersisted one.
     let applied = if branch == MAIN_BRANCH {
-        // Only an authenticated actor may become the creator: an anonymous id is
-        // ephemeral per-connection, so it could never re-present to exercise the
-        // ownership, and set-once would then wedge the room's authority root on a dead
-        // principal.
-        let creator =
-            crate::acl::is_authenticated(identity.actor()).then(|| identity.actor().to_vec());
         let applied = hub.ingest(&room, ops, write_version);
         // The first authenticated actor to write a room establishes it, so it becomes
-        // the room's creator — the doc-ACL authority root that owns `/`. Set-once: a
-        // later writer never displaces it. A branch write presupposes an
-        // already-established (forked) room, so it never bootstraps a creator.
-        if let (Ok(_), Some(creator)) = (&applied, creator) {
-            hub.ensure_creator(&room, &creator);
+        // the room's creator — the doc-ACL authority root that owns `/`. Set-once and
+        // authenticated-only, both decided by `ensure_creator` so a root arriving over
+        // a replication frame is judged by the same rule. A branch write presupposes
+        // an already-established (forked) room, so it never bootstraps a creator.
+        if applied.is_ok() {
+            hub.ensure_creator(&room, identity.actor());
         }
         applied
     } else {

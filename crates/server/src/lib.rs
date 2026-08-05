@@ -420,9 +420,12 @@ struct Room {
     max_op_version: Option<u32>,
     /// The authenticated actor that established the room — its first writer. The
     /// doc-ACL authority root: it auto-owns `/`, so it may always read and write and
-    /// its grants confer authority. Set once, on the first write, and never
-    /// displaced; durable across a restart. `None` for a room reconstructed from a
-    /// snapshot with no persisted creator, or one never written through the ops path.
+    /// its grants confer authority. Set once and never displaced; durable across a
+    /// restart. It arrives from whichever seam first names one — a client's write, a
+    /// peer's replication frame, or the store — so a replica holds it without ever
+    /// having served a write. `None` where no seam has named an actor that may stand as
+    /// one: no authenticated writer, and no frame or store record naming a
+    /// non-anonymous actor.
     creator: Option<Vec<u8>>,
 }
 
@@ -986,6 +989,14 @@ impl Hub {
             let doc = Document::decode_state(&snapshot.state)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
             let seen = doc.seen().collect();
+            // A room can be handed over twice — `from_rooms` takes a list, so a second
+            // record for one room lands on the first. Its authority root and op-version
+            // high-water compose against what stands rather than being replaced with
+            // the state, exactly as a snapshot install does: the root is set-once
+            // wherever it arrives, and the high-water is the room's all-time worst case.
+            let standing = self.rooms.get(&room);
+            let creator = standing.and_then(|r| r.creator.clone());
+            let max_op_version = standing.and_then(|r| r.max_op_version);
             self.rooms.insert(
                 room.clone(),
                 Room {
@@ -993,8 +1004,8 @@ impl Hub {
                     log: Vec::new(),
                     seen,
                     base_seq: snapshot.base_seq,
-                    max_op_version: None,
-                    creator: None,
+                    max_op_version,
+                    creator,
                 },
             );
         }
@@ -1017,9 +1028,14 @@ impl Hub {
                     r.max_op_version = r.max_op_version.max(Some(persisted));
                 }
             }
-            if let Some(creator) = meta.creator {
+            // The stored bytes are supplied by whoever hands the store over, so the
+            // root they name is checked here as one off a frame is: an anonymous id
+            // could never re-present to exercise the ownership it would be handed.
+            if let Some(creator) = meta.creator.filter(|a| crate::acl::is_authenticated(a)) {
                 if let Some(r) = self.rooms.get_mut(&room) {
-                    r.creator = Some(creator);
+                    if r.creator.is_none() {
+                        r.creator = Some(creator);
+                    }
                 }
             }
         }
@@ -1499,6 +1515,11 @@ impl Hub {
     /// live state needs an explicit delete first. Malformed bytes are an
     /// `InvalidData` error. With a store attached the snapshot is persisted
     /// before the room commits, so the import survives a restart.
+    ///
+    /// A portable snapshot is a `Document` encoding and carries no server-side room
+    /// metadata, so an imported room has no creator until its first authenticated
+    /// write establishes one. Until then it holds no doc-ACL authority root, and the
+    /// tuples that rode the snapshot decide nothing.
     pub fn import_room(&mut self, room: &[u8], state: &[u8]) -> io::Result<bool> {
         if self.rooms.contains_key(room) {
             return Ok(false);
@@ -1507,7 +1528,7 @@ impl Hub {
         // the op count (`None`) — a fresh subscriber lands below it and is served the
         // state rather than an empty delta. Sequences renumber from here; they are
         // server-local, so a move never collides with the origin's.
-        self.install_room_state(room, state, None)?;
+        self.install_room_state(room, state, None, None)?;
         Ok(true)
     }
 
@@ -1520,11 +1541,19 @@ impl Hub {
     /// set come back, so a client resending its ops is deduped exactly as against the
     /// origin. Malformed bytes are an `InvalidData` error; with a store attached the
     /// snapshot is persisted before the room commits, so the install survives a restart.
+    ///
+    /// `creator` is the room's doc-ACL authority root, which the state bytes do not
+    /// carry: the caller supplies it from wherever it holds the room's metadata. It
+    /// composes with any root already installed under `room` the way `creator` is
+    /// defined everywhere else — set-once, never displaced, and never an anonymous
+    /// actor — so a re-sent snapshot that names none leaves the standing root alone
+    /// rather than dropping the authority every deny in the state is decided under.
     fn install_room_state(
         &mut self,
         room: &[u8],
         state: &[u8],
         floor: Option<u64>,
+        creator: Option<Vec<u8>>,
     ) -> io::Result<()> {
         let doc = Document::decode_state(state)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
@@ -1533,6 +1562,13 @@ impl Hub {
         if let Some(store) = self.store.as_mut() {
             store.compact(room, base_seq, state)?;
         }
+        let standing = self.rooms.get(room);
+        let root = standing.and_then(|r| r.creator.clone());
+        // The op-version high-water is the all-time worst case a joiner must down-reach,
+        // so it survives the replace as it survives compaction: the installed state is
+        // this same room's history, and the frame carries no high-water of its own to
+        // raise it with.
+        let max_op_version = standing.and_then(|r| r.max_op_version);
         self.rooms.insert(
             room.to_vec(),
             Room {
@@ -1540,10 +1576,13 @@ impl Hub {
                 log: Vec::new(),
                 seen,
                 base_seq,
-                max_op_version: None,
-                creator: None,
+                max_op_version,
+                creator: root.or_else(|| creator.filter(|a| crate::acl::is_authenticated(a))),
             },
         );
+        // Best-effort, matching the governing metadata: the room is installed either
+        // way, and a failed write does not fail the install.
+        let _ = self.persist_meta(room);
         Ok(())
     }
 
@@ -1562,8 +1601,17 @@ impl Hub {
     /// the leader's and later replicated ops — carried in the leader's sequence space
     /// — place correctly above it. Malformed bytes are an `InvalidData` error; with a
     /// store attached the snapshot is persisted before the room commits.
-    pub fn install_snapshot(&mut self, room: &[u8], state: &[u8], seq: u64) -> io::Result<()> {
-        self.install_room_state(room, state, Some(seq))
+    ///
+    /// `creator` is the room's doc-ACL authority root as the sending leader holds it,
+    /// installed set-once beside the state, which does not carry one.
+    pub fn install_snapshot(
+        &mut self,
+        room: &[u8],
+        state: &[u8],
+        seq: u64,
+        creator: Option<Vec<u8>>,
+    ) -> io::Result<()> {
+        self.install_room_state(room, state, Some(seq), creator)
     }
 
     /// Clone `src`'s live state into a fresh room `dst` — "duplicate this doc as a
@@ -1857,10 +1905,24 @@ impl Hub {
 
     /// Record `actor` as `room`'s creator if it has none yet, persisting the durable
     /// metadata. Set-once: a room keeps its first writer as creator, so a later
-    /// caller never displaces it. A no-op for an unknown room. Best-effort persist,
-    /// matching the governing metadata: a write failure leaves the in-memory creator
-    /// to re-persist rather than failing the write.
+    /// caller never displaces it. A no-op for an unknown room, and for an
+    /// [anonymous](crate::acl::is_authenticated) actor — an anonymous id is ephemeral
+    /// per-connection, so set-once would wedge the room's authority on a principal
+    /// that can never re-present to exercise it. Both rules decide a root arriving with
+    /// an installed snapshot and one read back off the store too, so a root is judged
+    /// the same whichever seam carries it. An install expresses set-once by composing
+    /// against the standing root rather than guarding on its absence; the answer is
+    /// the same either way.
+    ///
+    /// Persisting is best-effort, matching the governing metadata: a failed write does
+    /// not fail the caller's write. Set-once means nothing retries it either. On a
+    /// leader that costs nothing lasting — the room comes back creatorless and its
+    /// next writer establishes it afresh — but a replica serves no client write, so
+    /// its root returns only with the room's next replicated commit.
     pub fn ensure_creator(&mut self, room: &[u8], actor: &[u8]) {
+        if !crate::acl::is_authenticated(actor) {
+            return;
+        }
         let established = match self.rooms.get_mut(room) {
             Some(r) if r.creator.is_none() => {
                 r.creator = Some(actor.to_vec());

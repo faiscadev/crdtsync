@@ -57,6 +57,7 @@ fn replicate_round_trips() {
         ops: sample_ops(),
         base_seq: 9,
         epoch: 4,
+        creator: None,
     });
 }
 
@@ -69,6 +70,7 @@ fn replicate_round_trips_the_epoch() {
         ops: sample_ops(),
         base_seq: 1,
         epoch: 0,
+        creator: None,
     });
     round_trips(Message::Replicate {
         room: b"room-42".to_vec(),
@@ -76,6 +78,7 @@ fn replicate_round_trips_the_epoch() {
         ops: sample_ops(),
         base_seq: 1,
         epoch: u64::MAX,
+        creator: None,
     });
 }
 
@@ -87,6 +90,7 @@ fn replicate_round_trips_an_empty_room() {
         ops: sample_ops(),
         base_seq: 0,
         epoch: 1,
+        creator: None,
     });
 }
 
@@ -98,6 +102,7 @@ fn replicate_round_trips_an_empty_branch() {
         ops: sample_ops(),
         base_seq: 3,
         epoch: 7,
+        creator: None,
     });
 }
 
@@ -109,6 +114,7 @@ fn replicate_round_trips_an_empty_batch() {
         ops: Vec::new(),
         base_seq: 0,
         epoch: 2,
+        creator: None,
     });
 }
 
@@ -120,23 +126,50 @@ fn replicate_round_trips_a_binary_room_and_branch() {
         ops: sample_ops(),
         base_seq: u64::MAX,
         epoch: u64::MAX,
+        creator: None,
+    });
+}
+
+#[test]
+fn replicate_round_trips_the_creator() {
+    // The room's doc-ACL authority root rides every frame. Absent, present, and
+    // present-but-empty are three distinct values on the wire — an empty actor is
+    // not "no creator" — so each must come back as itself.
+    for creator in [None, Some(b"alice".to_vec()), Some(Vec::new())] {
+        round_trips(Message::Replicate {
+            room: b"room-42".to_vec(),
+            branch: b"main".to_vec(),
+            ops: sample_ops(),
+            base_seq: 9,
+            epoch: 4,
+            creator,
+        });
+    }
+    round_trips(Message::Replicate {
+        room: b"room-42".to_vec(),
+        branch: b"main".to_vec(),
+        ops: sample_ops(),
+        base_seq: 9,
+        epoch: 4,
+        creator: Some(vec![0xFF, 0x00, 0x80, 0x7F]),
     });
 }
 
 #[test]
 fn a_truncated_replicate_header_is_an_error_not_a_panic() {
-    // The fixed leading region (room, branch, base_seq, epoch) before the op
-    // batch: truncating anywhere inside it must error, never panic. The batch
+    // The fixed leading region (room, branch, base_seq, epoch, creator) before the
+    // op batch: truncating anywhere inside it must error, never panic. The batch
     // itself consumes the frame's remainder (like `Ops`), so a shorter batch
     // decodes as valid — the corrupt-batch case is covered separately. An empty-
     // batch frame is exactly that leading region, so its length is where the batch
-    // begins.
+    // begins. A present creator, so the sweep covers its flag, length, and bytes.
     let header_len = encode_message(&Message::Replicate {
         room: b"room".to_vec(),
         branch: b"main".to_vec(),
         ops: Vec::new(),
         base_seq: 5,
         epoch: 3,
+        creator: Some(b"alice".to_vec()),
     })
     .len();
     let bytes = encode_message(&Message::Replicate {
@@ -145,6 +178,7 @@ fn a_truncated_replicate_header_is_an_error_not_a_panic() {
         ops: sample_ops(),
         base_seq: 5,
         epoch: 3,
+        creator: Some(b"alice".to_vec()),
     });
     for cut in 0..header_len {
         assert!(
@@ -162,6 +196,7 @@ fn a_corrupt_op_batch_in_a_replicate_is_an_error() {
         ops: sample_ops(),
         base_seq: 5,
         epoch: 1,
+        creator: None,
     });
     // Truncate inside the batch payload; the framed op codec must reject it.
     assert!(matches!(
@@ -180,6 +215,7 @@ fn replicate_snapshot_round_trips() {
         seq: 12,
         state: vec![1, 2, 3, 4, 5],
         epoch: 4,
+        creator: None,
     });
 }
 
@@ -193,6 +229,7 @@ fn replicate_snapshot_round_trips_the_extremes() {
         seq: 0,
         state: Vec::new(),
         epoch: 0,
+        creator: None,
     });
     round_trips(Message::ReplicateSnapshot {
         room: vec![0, 1, 2, 255],
@@ -200,7 +237,29 @@ fn replicate_snapshot_round_trips_the_extremes() {
         seq: u64::MAX,
         state: vec![0xAB; 300],
         epoch: u64::MAX,
+        creator: None,
     });
+}
+
+#[test]
+fn replicate_snapshot_round_trips_the_creator() {
+    // The authority root the state bytes do not carry — absent, present, and
+    // present-but-empty each come back as themselves.
+    for creator in [
+        None,
+        Some(b"alice".to_vec()),
+        Some(Vec::new()),
+        Some(vec![0xFF, 0x00, 0x80, 0x7F]),
+    ] {
+        round_trips(Message::ReplicateSnapshot {
+            room: b"room-42".to_vec(),
+            branch: b"main".to_vec(),
+            seq: 12,
+            state: vec![1, 2, 3, 4, 5],
+            epoch: 4,
+            creator,
+        });
+    }
 }
 
 #[test]
@@ -211,6 +270,7 @@ fn a_truncated_replicate_snapshot_is_an_error_not_a_panic() {
         seq: 9,
         state: vec![7, 8, 9],
         epoch: 3,
+        creator: Some(b"alice".to_vec()),
     });
     for cut in 0..bytes.len() {
         assert!(
@@ -228,6 +288,7 @@ fn trailing_bytes_after_a_replicate_snapshot_are_an_error() {
         seq: 9,
         state: vec![7, 8, 9],
         epoch: 3,
+        creator: None,
     });
     bytes.push(0);
     assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));

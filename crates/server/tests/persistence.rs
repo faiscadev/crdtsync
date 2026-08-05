@@ -13,7 +13,7 @@ use std::fs;
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, Message, Op, Scalar};
-use crdtsync_server::store::{Store, StoredOp};
+use crdtsync_server::store::{RoomMeta, Snapshot, Store, StoredOp};
 use crdtsync_server::{Catchup, Hub, Registry, RoomId, RoomLog};
 
 /// Tag a batch of ops as relay records (no schema) — the store's unit.
@@ -167,6 +167,239 @@ fn a_rooms_doc_acl_creator_survives_a_restart() {
         hub.room_creator(ROOM),
         Some(b"alice".to_vec()),
         "the persisted creator comes back on reload",
+    );
+}
+
+#[test]
+fn a_stored_creator_that_could_never_re_present_roots_nothing() {
+    // The store's bytes are supplied by whoever hands it over, so a root read off disk
+    // is judged like one off a frame: an anonymous id is ephemeral per-connection, and
+    // the root is set-once, so admitting it would wedge the room's authority for good.
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![(
+            ROOM.to_vec(),
+            RoomLog {
+                snapshot: None,
+                ops: relay(doc(1).transact(|tx| tx.register(b"a", Scalar::Int(1)))),
+                versions: Vec::new(),
+                meta: Some(RoomMeta {
+                    governing: None,
+                    max_op_version: None,
+                    creator: Some(b"anon:ephemeral".to_vec()),
+                }),
+                branches: Vec::new(),
+                branch_ops: Vec::new(),
+                branch_bases: Vec::new(),
+                active_branch: None,
+                epoch: None,
+            },
+        )],
+    )
+    .unwrap();
+    assert_eq!(hub.seq(ROOM), 1, "the room itself loaded");
+    assert_eq!(
+        hub.room_creator(ROOM),
+        None,
+        "an anonymous id off the store is not an authority root",
+    );
+}
+
+#[test]
+fn a_stored_root_is_admitted_whatever_its_id_looks_like() {
+    // The store applies the same rule the write and frame seams do, and no more: an
+    // empty actor is credentialed, so refusing it on reload would drop a root the
+    // room had — leaving every deny in it inert.
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![(
+            ROOM.to_vec(),
+            RoomLog {
+                snapshot: None,
+                ops: relay(doc(1).transact(|tx| tx.register(b"a", Scalar::Int(1)))),
+                versions: Vec::new(),
+                meta: Some(RoomMeta {
+                    governing: None,
+                    max_op_version: None,
+                    creator: Some(Vec::new()),
+                }),
+                branches: Vec::new(),
+                branch_ops: Vec::new(),
+                branch_bases: Vec::new(),
+                active_branch: None,
+                epoch: None,
+            },
+        )],
+    )
+    .unwrap();
+    assert_eq!(hub.seq(ROOM), 1, "the room itself loaded");
+    assert_eq!(
+        hub.room_creator(ROOM),
+        Some(Vec::new()),
+        "the durable load admits the same actors a write does",
+    );
+}
+
+/// A stored record for `ROOM` naming `actor` as its root, carrying one op from
+/// `author` (so two records are genuinely distinct rather than deduped away) and
+/// `snapshot` in front of it.
+fn record(actor: &[u8], author: u8, key: &[u8], snapshot: Option<Snapshot>) -> RoomLog {
+    RoomLog {
+        snapshot,
+        ops: relay(doc(author).transact(|tx| tx.register(key, Scalar::Int(1)))),
+        versions: Vec::new(),
+        meta: Some(RoomMeta {
+            governing: None,
+            max_op_version: None,
+            creator: Some(actor.to_vec()),
+        }),
+        branches: Vec::new(),
+        branch_ops: Vec::new(),
+        branch_bases: Vec::new(),
+        active_branch: None,
+        epoch: None,
+    }
+}
+
+#[test]
+fn a_second_stored_record_for_one_room_does_not_displace_its_root() {
+    // `from_rooms` takes a list, so one room can arrive twice — a hand-assembled load,
+    // or a store handed over with a duplicate. Without a snapshot the two records'
+    // ops merge and the high-water composes as a max, so the root is the field with a
+    // rule of its own: set-once here as at every other seam, so the first record's
+    // stands. (The governing binding is the one field a later record simply replaces.)
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![
+            (ROOM.to_vec(), record(b"alice", 1, b"a", None)),
+            (ROOM.to_vec(), record(b"mallory", 2, b"b", None)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(hub.seq(ROOM), 2, "both records replayed");
+    assert_eq!(
+        hub.room_creator(ROOM),
+        Some(b"alice".to_vec()),
+        "the root the room came up under is not displaced by a later record",
+    );
+}
+
+#[test]
+fn a_second_stored_record_carrying_a_snapshot_does_not_displace_the_root() {
+    // The snapshot branch replaces the room outright, so it is the shape where a
+    // duplicate could re-root — and the compacted room, the one that has a snapshot,
+    // is exactly what a store hands over. It composes against what stands.
+    let state = {
+        let mut origin = Hub::new(cid(SERVER));
+        origin
+            .ingest(
+                ROOM,
+                doc(3).transact(|tx| tx.register(b"seeded", Scalar::Int(1))),
+                Some(7),
+            )
+            .unwrap();
+        origin.export_room(ROOM).unwrap()
+    };
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![
+            (ROOM.to_vec(), record(b"alice", 1, b"a", None)),
+            (
+                ROOM.to_vec(),
+                record(b"mallory", 2, b"b", Some(Snapshot { base_seq: 1, state })),
+            ),
+        ],
+    )
+    .unwrap();
+    assert!(
+        hub.get(ROOM, b"seeded").is_some(),
+        "the second record's snapshot replaced the state, so its branch really ran",
+    );
+    assert_eq!(
+        hub.room_creator(ROOM),
+        Some(b"alice".to_vec()),
+        "a duplicate carrying a snapshot does not re-root the room either",
+    );
+}
+
+#[test]
+fn a_second_stored_record_carrying_a_snapshot_keeps_the_high_water() {
+    // The snapshot branch composes the room's op-version high-water for the same reason
+    // it composes the root: the value is the all-time worst case a joiner must down-
+    // reach, so a later record's bytes cannot lower it. The second record carries none.
+    let state = {
+        let mut origin = Hub::new(cid(SERVER));
+        origin
+            .ingest(
+                ROOM,
+                doc(3).transact(|tx| tx.register(b"seeded", Scalar::Int(1))),
+                None,
+            )
+            .unwrap();
+        origin.export_room(ROOM).unwrap()
+    };
+    let mut first = record(b"alice", 1, b"a", None);
+    first.ops = vec![StoredOp::new(
+        doc(4)
+            .transact(|tx| tx.register(b"tagged", Scalar::Int(1)))
+            .remove(0),
+        Some(9),
+    )];
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![
+            (ROOM.to_vec(), first),
+            (
+                ROOM.to_vec(),
+                record(b"mallory", 2, b"b", Some(Snapshot { base_seq: 1, state })),
+            ),
+        ],
+    )
+    .unwrap();
+    assert!(
+        hub.get(ROOM, b"seeded").is_some(),
+        "the second record's snapshot replaced the state, so its branch really ran",
+    );
+    assert_eq!(
+        hub.max_op_version(ROOM),
+        Some(9),
+        "the room's all-time high-water is not lowered by a later record",
+    );
+}
+
+#[test]
+fn a_creator_installed_with_a_snapshot_survives_a_restart() {
+    // A follower converged by a state transfer holds the room's authority root, and
+    // it is durable there on the same footing a written one is — otherwise a restart
+    // would re-open the redaction gap the transfer closed.
+    let tmp = tempdir();
+    let state = {
+        let mut origin = Hub::new(cid(SERVER));
+        origin
+            .ingest(
+                ROOM,
+                doc(1).transact(|tx| tx.register(b"a", Scalar::Int(1))),
+                None,
+            )
+            .unwrap();
+        origin.export_room(ROOM).unwrap()
+    };
+    {
+        let mut hub = Hub::new(cid(SERVER));
+        hub.attach_store(Store::open(tmp.path()).unwrap());
+        hub.install_snapshot(ROOM, &state, 1, Some(b"alice".to_vec()))
+            .unwrap();
+        assert_eq!(hub.room_creator(ROOM), Some(b"alice".to_vec()));
+    }
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        Store::open(tmp.path()).unwrap().load().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        hub.room_creator(ROOM),
+        Some(b"alice".to_vec()),
+        "the installed creator comes back on reload",
     );
 }
 
