@@ -7,8 +7,9 @@
 //! like any other. Follower reads let a caught-up follower serve a read from its own
 //! replica, so what a replica holds decides what a partial reader landing there is
 //! served, out of every seam that serves a state blob: the op catch-up, the snapshot
-//! catch-up, and the version fetch alike. These pin that a replicated room carries
-//! its root and that each of those three reads narrows by it; that a promoted replica
+//! catch-up, the version fetch and the diff query alike — every seam that hands a
+//! reader a state. These pin that a replicated room carries its root and that each of
+//! those reads narrows by it; that a promoted replica
 //! keeps the root rather than handing `/` to its first writer; that the root installs
 //! set-once through either frame and through the hub call; and which actors may stand
 //! as one.
@@ -27,8 +28,9 @@
 use std::sync::{Arc, Mutex};
 
 use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
+use crdtsync_core::diff::{decode_changes, Change};
 use crdtsync_core::path::encode_path;
-use crdtsync_core::protocol::Channel;
+use crdtsync_core::protocol::{Channel, DiffKind};
 use crdtsync_core::{AclEffect, ClientId, Document, Message, Op, Scalar};
 use crdtsync_server::acl::{actor_key, Acl};
 use crdtsync_server::membership::Membership;
@@ -774,6 +776,80 @@ fn an_installed_root_is_admitted_whatever_its_id_looks_like() {
         follower.hub().room_creator(&room),
         Some(Vec::new()),
         "the install admits the same actors a write does",
+    );
+}
+
+/// The encoded paths a served change list mentions.
+fn changed_paths(changes: &[Change]) -> Vec<Vec<u8>> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Added { path, .. }
+            | Change::Removed { path, .. }
+            | Change::Value { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_diff_served_off_a_replica_withholds_the_denied_key() {
+    // The diff query resolves two of the room's states and hands each through the same
+    // projection the other reads use, keyed by the same root — and it is not leader-
+    // gated, so a replica answers it. A change list is content, so a rootless replica
+    // would diff the denied key into view.
+    let room = room_led_by_a_with_b_next();
+    let mut leader = seeded_leader(&room);
+    let mut follower = follower_by_ops(&mut leader, &room);
+    assert!(follower
+        .hub_mut()
+        .create_version(&room, b"before")
+        .expect("the version is captured"));
+
+    // A later write to each key, so a diff of the two versions has something to say
+    // about both — the readable one and the denied one. A fresh author, since alice's
+    // op ids are already in the room's dedup set.
+    let ops = Document::new(cid(5)).transact(|tx| {
+        tx.register(OPEN, Scalar::Int(11));
+        tx.register(SECRET, Scalar::Int(22));
+    });
+    follower
+        .hub_mut()
+        .ingest(&room, ops, None)
+        .expect("the follower ingests");
+    assert!(follower
+        .hub_mut()
+        .create_version(&room, b"after")
+        .expect("the version is captured"));
+
+    let (bob, _) = bob_reads(&mut follower, &room);
+    assert!(follower.deliver(
+        bob,
+        Message::DiffQuery {
+            channel: CH,
+            kind: DiffKind::Versions,
+            a: b"before".to_vec(),
+            b: b"after".to_vec(),
+        }
+    ));
+    let out = follower.take_outbox(bob);
+    let changes = out
+        .iter()
+        .find_map(|m| match m {
+            Message::DiffResult { changes, .. } => Some(changes.clone()),
+            _ => None,
+        })
+        .map(|c| decode_changes(&c).expect("the change list decodes"))
+        .unwrap_or_else(|| panic!("no diff result: {out:?}"));
+
+    let paths = changed_paths(&changes);
+    assert!(
+        paths.contains(&encode_path(&[OPEN])),
+        "the readable key's change is served, so an empty answer is not the reason: {paths:?}",
+    );
+    assert!(
+        !paths.contains(&encode_path(&[SECRET])),
+        "the denied key contributes no change: {paths:?}",
     );
 }
 

@@ -264,10 +264,10 @@ fn record(actor: &[u8], author: u8, key: &[u8], snapshot: Option<Snapshot>) -> R
 #[test]
 fn a_second_stored_record_for_one_room_does_not_displace_its_root() {
     // `from_rooms` takes a list, so one room can arrive twice — a hand-assembled load,
-    // or a store handed over with a duplicate. The root is set-once here as at every
-    // other seam, so the first record's stands. Everything else about the room is
-    // last-record-wins (the state, the binding, the high-water), so the asymmetry is
-    // the point: only the authority root refuses to move.
+    // or a store handed over with a duplicate. Without a snapshot the two records'
+    // ops merge and the high-water composes as a max, so the root is the field with a
+    // rule of its own: set-once here as at every other seam, so the first record's
+    // stands. (The governing binding is the one field a later record simply replaces.)
     let hub = Hub::from_rooms(
         cid(SERVER),
         vec![
@@ -319,6 +319,51 @@ fn a_second_stored_record_carrying_a_snapshot_does_not_displace_the_root() {
         hub.room_creator(ROOM),
         Some(b"alice".to_vec()),
         "a duplicate carrying a snapshot does not re-root the room either",
+    );
+}
+
+#[test]
+fn a_second_stored_record_carrying_a_snapshot_keeps_the_high_water() {
+    // The snapshot branch composes the room's op-version high-water for the same reason
+    // it composes the root: the value is the all-time worst case a joiner must down-
+    // reach, so a later record's bytes cannot lower it. The second record carries none.
+    let state = {
+        let mut origin = Hub::new(cid(SERVER));
+        origin
+            .ingest(
+                ROOM,
+                doc(3).transact(|tx| tx.register(b"seeded", Scalar::Int(1))),
+                None,
+            )
+            .unwrap();
+        origin.export_room(ROOM).unwrap()
+    };
+    let mut first = record(b"alice", 1, b"a", None);
+    first.ops = vec![StoredOp::new(
+        doc(4)
+            .transact(|tx| tx.register(b"tagged", Scalar::Int(1)))
+            .remove(0),
+        Some(9),
+    )];
+    let hub = Hub::from_rooms(
+        cid(SERVER),
+        vec![
+            (ROOM.to_vec(), first),
+            (
+                ROOM.to_vec(),
+                record(b"mallory", 2, b"b", Some(Snapshot { base_seq: 1, state })),
+            ),
+        ],
+    )
+    .unwrap();
+    assert!(
+        hub.get(ROOM, b"seeded").is_some(),
+        "the second record's snapshot replaced the state, so its branch really ran",
+    );
+    assert_eq!(
+        hub.max_op_version(ROOM),
+        Some(9),
+        "the room's all-time high-water is not lowered by a later record",
     );
 }
 
