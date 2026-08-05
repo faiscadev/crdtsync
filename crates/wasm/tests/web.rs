@@ -223,7 +223,11 @@ fn a_refused_op_is_counted_apart_from_a_buffered_one() {
     let mut b = doc(2);
     let outcome = b.apply(&encode_ops(&[refused_op.clone(), write.clone()]));
     assert_eq!(applied(&outcome), 0, "neither op applies now");
-    assert_eq!(refused(&outcome), 1, "only the forged op is refused forever");
+    assert_eq!(
+        refused(&outcome),
+        1,
+        "only the forged op is refused forever"
+    );
 
     // The buffered op was waiting, not refused: the create releases it.
     assert_eq!(applied(&b.apply(&encode_ops(&[create.clone()]))), 1);
@@ -588,10 +592,26 @@ fn a_client_diff_query_round_trips() {
 
     let mut c = wasm_client(1);
     let room = b"room-1";
-    // Both kinds frame a request; a bad kind is an error.
-    assert!(!c.diff_query(room, 0, b"a", b"b").unwrap().is_empty());
-    assert!(!c.diff_query(room, 1, b"main", b"draft").unwrap().is_empty());
-    assert!(c.diff_query(room, 9, b"a", b"b").is_err());
+    let s = c.subscribe(room);
+    // Both kinds frame a request; a bad kind is an error, and a channel this client
+    // does not hold frames nothing. Channel-keyed: the server resolves the room, and
+    // the scope the change list is narrowed to, from the subscription — while the
+    // reply, and so the view, stays keyed by that room.
+    assert!(!c
+        .diff_query(s.channel(), 0, b"a", b"b")
+        .unwrap()
+        .unwrap()
+        .is_empty());
+    assert!(!c
+        .diff_query(s.channel(), 1, b"main", b"draft")
+        .unwrap()
+        .unwrap()
+        .is_empty());
+    assert!(c.diff_query(s.channel(), 9, b"a", b"b").is_err());
+    assert!(c
+        .diff_query(s.channel() + 1, 0, b"a", b"b")
+        .unwrap()
+        .is_none());
     // No result until one is answered.
     assert!(c.diff(room).is_null());
 

@@ -484,7 +484,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     )
     sig(
         lib.crdtsync_client_diff_query,
-        [doc, cbytes, size, c.c_uint32, cbytes, size, cbytes, size],
+        [doc, c.c_uint32, c.c_uint32, cbytes, size, cbytes, size],
         buf,
     )
     sig(lib.crdtsync_client_diff_result, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
@@ -2214,16 +2214,19 @@ class Client:
         return out
 
     def diff_query(
-        self, room: bytes, kind: DiffKind, a: bytes, b: bytes
+        self, channel: int, kind: DiffKind, a: bytes, b: bytes
     ) -> bytes:
         """Frame a request for the structural diff turning state ``a`` into state
-        ``b`` in ``room``. ``kind`` selects whether ``a``/``b`` name two saved
-        versions or two branches. Room-keyed: a client may diff a room before it
-        subscribes any of its branches. The reply updates the diff view, read with
-        :meth:`diff`."""
+        ``b`` in the room that ``channel`` is subscribed to. ``kind`` selects whether
+        ``a``/``b`` name two saved versions or two branches. Channel-keyed: a change
+        list carries the room's paths and values, so the server narrows it to what
+        this channel may read. The reply updates the diff view, read with
+        :meth:`diff` under the room the server resolved. Empty if the channel is not
+        held."""
+        _u32("channel", channel)
         return _take_buf(
             _LIB.crdtsync_client_diff_query(
-                self._handle, room, len(room), int(kind), a, len(a), b, len(b)
+                self._handle, channel, int(kind), a, len(a), b, len(b)
             )
         )
 

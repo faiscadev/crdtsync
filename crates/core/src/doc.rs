@@ -1436,7 +1436,9 @@ impl Document {
         // rule (op_read_paths gates each Ranged op on its distinct anchor seq paths), so
         // a snapshot-served partial reader materializes the same RangedElement subset an
         // op-served one does. An anchor seq the walk does not resolve (a since-deleted
-        // sequence) falls back to root read, so only a whole-document reader keeps it.
+        // sequence) falls back to the **root** read verdict — which is not the
+        // whole-document one: a reader holding a root grant with a subtree deny passes
+        // it, so an orphaned annotation survives its region being cut (C52).
         let ranged_before = self.ranged.len();
         let anchor_reads = |seq: ElementId| match paths.get(&seq) {
             Some(p) => reads(p),

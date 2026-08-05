@@ -119,8 +119,13 @@ pub struct ClientSession {
     branches: HashMap<Vec<u8>, Vec<BranchInfo>>,
     /// The last diff result the server returned per room — the change list a
     /// [`Message::DiffResult`] reply carried, decoded. Room-keyed like the branch
-    /// view; a fresh query replaces the room's entry. Empty until a diff query is
-    /// answered.
+    /// view even though the query is channel-keyed: a change list is a fact about a
+    /// room. A fresh query replaces the room's entry, so two channels diffing one
+    /// room share it — and since the reply carries no channel, a result **cannot be
+    /// attributed to the query that asked for it**. Two channels on one room with
+    /// different zone scopes are now served genuinely different change lists, so this
+    /// view can hand one channel's answer to the other's reader (C50). Empty until a
+    /// diff query is answered.
     diffs: HashMap<Vec<u8>, Vec<Change>>,
     /// The outcome of each clone-room request, keyed by the destination room — the
     /// `created` flag a [`Message::CloneRoomResult`] reply carried. Keyed by `dst`
@@ -596,22 +601,34 @@ impl ClientSession {
         self.branches.get(room).map(Vec::as_slice)
     }
 
-    /// Request the structural diff turning state `a` into state `b` in `room`,
-    /// returning the request frame. `kind` selects whether `a`/`b` name two saved
-    /// versions or two branches. The reply updates the [`diff`](Self::diff) view.
-    /// Room-keyed like branch management: a client may diff a room before it
-    /// subscribes any of its branches.
-    pub fn diff_query(&self, room: &[u8], kind: DiffKind, a: &[u8], b: &[u8]) -> Message {
-        Message::DiffQuery {
-            room: room.to_vec(),
+    /// Request the structural diff turning state `a` into state `b` in the room that
+    /// `channel` is subscribed to, returning the request frame, or `None` if the
+    /// channel isn't held. `kind` selects whether `a`/`b` name two saved versions or
+    /// two branches. The reply updates the [`diff`](Self::diff) view, keyed by the
+    /// room the server resolved. Channel-keyed like a version fetch: a diff reports
+    /// a room's own paths and values, so the server narrows it to what this channel
+    /// may read — and framing one on a channel this session never subscribed is a
+    /// protocol violation at the server, so it is refused here instead.
+    pub fn diff_query(
+        &self,
+        channel: Channel,
+        kind: DiffKind,
+        a: &[u8],
+        b: &[u8],
+    ) -> Option<Message> {
+        self.rooms.get(&channel)?;
+        Some(Message::DiffQuery {
+            channel,
             kind,
             a: a.to_vec(),
             b: b.to_vec(),
-        }
+        })
     }
 
     /// The change list from the last diff query answered for `room`, or `None` if
-    /// none has been. An empty diff is an empty slice, not `None`.
+    /// none has been. An empty diff is an empty slice, not `None`. Keyed by room, so
+    /// two channels of this session diffing one room overwrite each other's answer
+    /// and neither can tell whose it is reading (C50).
     pub fn diff(&self, room: &[u8]) -> Option<&[Change]> {
         self.diffs.get(room).map(Vec::as_slice)
     }

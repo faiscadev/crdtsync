@@ -1,15 +1,17 @@
 //! Client session — the diff-query view and issue method.
 //!
-//! A [`ClientSession`] frames a diff request keyed by room — not channel, so a
-//! client may diff a room before it subscribes any of its branches — and folds
-//! the server's `DiffResult` reply into a per-room change-list view. A malformed
-//! change payload is refused without touching the view; a diff-query frame that
-//! arrives from the server (they only travel client-to-server) is refused.
+//! A [`ClientSession`] frames a diff request keyed by channel — a change list
+//! carries the room's own paths and values, so the server resolves the room and
+//! the scope it narrows to from the subscription — and folds the server's
+//! `DiffResult` reply into a per-room change-list view keyed by that resolved room.
+//! A malformed change payload is refused without touching the view; a diff-query
+//! frame that arrives from the server (they only travel client-to-server) is
+//! refused.
 
 use crdtsync_core::client::{ClientError, ClientSession};
 use crdtsync_core::diff::{encode_changes, Change};
 use crdtsync_core::path::encode_path;
-use crdtsync_core::{ClientId, DiffKind, Message, Scalar};
+use crdtsync_core::{Channel, ClientId, DiffKind, Message, Scalar};
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -28,18 +30,37 @@ fn value_change() -> Change {
 }
 
 #[test]
-fn diff_query_frames_a_room_keyed_request() {
-    let s = ClientSession::new(cid(1));
+fn diff_query_frames_a_channel_keyed_request() {
+    let mut s = ClientSession::new(cid(1));
+    let (one, _) = s.subscribe(ROOM);
+    // A second subscription, so the frame carrying the channel it was *asked* for is
+    // told from a frame that hardcodes the first one.
+    let (two, _) = s.subscribe(b"room-b");
+    assert_ne!(one, two);
     assert!(matches!(
-        s.diff_query(ROOM, DiffKind::Versions, b"v1", b"v2"),
-        Message::DiffQuery { room, kind: DiffKind::Versions, a, b }
-            if room == ROOM && a == b"v1" && b == b"v2"
+        s.diff_query(one, DiffKind::Versions, b"v1", b"v2"),
+        Some(Message::DiffQuery { channel, kind: DiffKind::Versions, a, b })
+            if channel == one && a == b"v1" && b == b"v2"
     ));
     assert!(matches!(
-        s.diff_query(ROOM, DiffKind::Branches, b"main", b"draft"),
-        Message::DiffQuery { room, kind: DiffKind::Branches, a, b }
-            if room == ROOM && a == b"main" && b == b"draft"
+        s.diff_query(two, DiffKind::Branches, b"main", b"draft"),
+        Some(Message::DiffQuery { channel, kind: DiffKind::Branches, a, b })
+            if channel == two && a == b"main" && b == b"draft"
     ));
+}
+
+#[test]
+fn a_diff_query_on_an_unheld_channel_frames_nothing() {
+    // The server answers a query on a channel this connection never bound with a
+    // protocol violation, which closes the session — so the frame is refused here,
+    // exactly as a version fetch on an unheld channel is.
+    let mut s = ClientSession::new(cid(1));
+    let (ch, _) = s.subscribe(ROOM);
+    // Channels are handed out monotonically and never reused, so the next number is
+    // one this session has not assigned.
+    assert!(s
+        .diff_query(Channel(ch.0 + 1), DiffKind::Versions, b"v1", b"v2")
+        .is_none());
 }
 
 #[test]
@@ -93,7 +114,7 @@ fn a_server_sent_diff_query_is_refused() {
     let mut s = ClientSession::new(cid(1));
     assert_eq!(
         s.receive(Message::DiffQuery {
-            room: ROOM.to_vec(),
+            channel: Channel(0),
             kind: DiffKind::Versions,
             a: b"v1".to_vec(),
             b: b"v2".to_vec(),

@@ -4,13 +4,15 @@
 //! A client asks for the diff between two of a room's saved versions or two of
 //! its branches; the server routes the query to the matching `Hub::diff_*` seam,
 //! encodes the change list into a `DiffResult`, and maps an absent version/branch
-//! to a recoverable `NotFound`. The query is a room-level read, gated by the same
-//! read tier as a branch list — a diff request before auth is a protocol
-//! violation, a denied one a recoverable forbidden, never a panic.
+//! to a recoverable `NotFound`. The query is channel-keyed: the room, and the scope
+//! the change list is narrowed to, come from the subscription the channel holds
+//! (`diff_projection` pins the narrowing). Gated by the same read tier a version
+//! request uses — a diff request before auth is a protocol violation, one on an
+//! unbound channel likewise, a denied one a recoverable forbidden, never a panic.
 
 use crdtsync_core::diff::{decode_changes, Change};
 use crdtsync_core::path::encode_path;
-use crdtsync_core::protocol::DiffKind;
+use crdtsync_core::protocol::{Channel, DiffKind};
 use crdtsync_core::{ClientId, Document, ErrorCode, Message, Scalar};
 use crdtsync_server::{Action, ConnId, Identity, Registry, Resource};
 
@@ -29,7 +31,7 @@ fn registry() -> Registry {
 }
 
 const ROOM: &[u8] = b"room-a";
-const CH: crdtsync_core::protocol::Channel = crdtsync_core::protocol::Channel(0);
+const CH: Channel = Channel(0);
 
 /// Drive a connection through Hello + Auth, subscribing `ROOM` on `CH`.
 fn joined(r: &mut Registry, client: u8) -> ConnId {
@@ -81,11 +83,18 @@ fn result_changes(m: &Message) -> Vec<Change> {
     }
 }
 
+/// The identity redaction, for the hub-side oracle: this suite's rooms declare no
+/// zones and hold no doc-ACL state, so the served diff and the unnarrowed one agree
+/// (`diff_projection` is where they are made to differ).
+fn unnarrowed(state: Vec<u8>) -> Vec<u8> {
+    state
+}
+
 fn query(r: &mut Registry, id: ConnId, kind: DiffKind, a: &[u8], b: &[u8]) -> Vec<Message> {
     assert!(r.deliver(
         id,
         Message::DiffQuery {
-            room: ROOM.to_vec(),
+            channel: CH,
             kind,
             a: a.to_vec(),
             b: b.to_vec(),
@@ -104,7 +113,10 @@ fn a_version_diff_returns_what_the_hub_computes() {
     write_age(&mut r, id, &mut main, 40);
     assert!(r.hub_mut().create_version(ROOM, b"v2").unwrap());
 
-    let expected = r.hub_mut().diff_versions(ROOM, b"v1", b"v2").unwrap();
+    let expected = r
+        .hub_mut()
+        .diff_versions(ROOM, b"v1", b"v2", unnarrowed)
+        .unwrap();
     let out = query(&mut r, id, DiffKind::Versions, b"v1", b"v2");
     assert_eq!(result_changes(&out[0]), expected);
     assert_eq!(
@@ -133,7 +145,10 @@ fn a_branch_diff_returns_what_the_hub_computes() {
         .ingest_branch(ROOM, b"draft", ops, None)
         .unwrap();
 
-    let expected = r.hub_mut().diff_branches(ROOM, b"main", b"draft").unwrap();
+    let expected = r
+        .hub_mut()
+        .diff_branches(ROOM, b"main", b"draft", unnarrowed)
+        .unwrap();
     let out = query(&mut r, id, DiffKind::Branches, b"main", b"draft");
     assert_eq!(result_changes(&out[0]), expected);
     assert_eq!(
@@ -169,7 +184,7 @@ fn an_unknown_version_is_a_recoverable_not_found() {
     let keep_open = r.deliver(
         id,
         Message::DiffQuery {
-            room: ROOM.to_vec(),
+            channel: CH,
             kind: DiffKind::Versions,
             a: b"v1".to_vec(),
             b: b"ghost".to_vec(),
@@ -195,7 +210,7 @@ fn an_unknown_branch_is_a_recoverable_not_found() {
     let keep_open = r.deliver(
         id,
         Message::DiffQuery {
-            room: ROOM.to_vec(),
+            channel: CH,
             kind: DiffKind::Branches,
             a: b"main".to_vec(),
             b: b"ghost".to_vec(),
@@ -214,32 +229,17 @@ fn an_unknown_branch_is_a_recoverable_not_found() {
 #[test]
 fn a_read_denied_actor_cannot_diff() {
     let mut r = registry();
-    // Reads denied everywhere.
+    let id = joined(&mut r, 1);
+    // The subscription stands; the read verdict behind it is withdrawn. The gate is
+    // re-asked per request, so the bound channel no longer carries a diff.
     r.set_authorizer(Box::new(
         |_id: &Identity, action: Action, _res: &Resource| action != Action::Read,
     ));
-    let id = r.connect();
-    assert!(r.deliver(
-        id,
-        Message::Hello {
-            client: cid(1),
-            app_id: Vec::new(),
-            schema_version: 0,
-            codecs: Vec::new(),
-        }
-    ));
-    assert!(r.deliver(
-        id,
-        Message::Auth {
-            credential: b"actor-1".to_vec(),
-        }
-    ));
-    r.take_outbox(id);
 
     let keep_open = r.deliver(
         id,
         Message::DiffQuery {
-            room: ROOM.to_vec(),
+            channel: CH,
             kind: DiffKind::Versions,
             a: b"v1".to_vec(),
             b: b"v2".to_vec(),
@@ -250,6 +250,34 @@ fn a_read_denied_actor_cannot_diff() {
         r.take_outbox(id)[0],
         Message::Error {
             code: ErrorCode::Forbidden,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_diff_on_an_unbound_channel_is_a_violation() {
+    // The channel is what names the room and carries the scope the change list is
+    // narrowed to, so a query naming no subscription has nothing to answer — and an
+    // authenticated actor asking on a channel it never bound is a client bug, not a
+    // denial.
+    let mut r = registry();
+    let id = joined(&mut r, 1);
+
+    let keep_open = r.deliver(
+        id,
+        Message::DiffQuery {
+            channel: Channel(7),
+            kind: DiffKind::Versions,
+            a: b"v1".to_vec(),
+            b: b"v2".to_vec(),
+        },
+    );
+    assert!(!keep_open, "a violation closes the connection");
+    assert!(matches!(
+        r.take_outbox(id)[0],
+        Message::Error {
+            code: ErrorCode::ProtocolViolation,
             ..
         }
     ));
@@ -273,7 +301,7 @@ fn a_diff_request_before_auth_is_a_violation() {
     let keep_open = r.deliver(
         id,
         Message::DiffQuery {
-            room: ROOM.to_vec(),
+            channel: CH,
             kind: DiffKind::Versions,
             a: b"v1".to_vec(),
             b: b"v2".to_vec(),

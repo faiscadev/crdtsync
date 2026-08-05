@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::Request;
-use crdtsync_core::protocol::Channel;
+use crdtsync_core::protocol::{Channel, DiffKind};
 use crdtsync_core::{ClientId, Document, Message, Op, Scalar};
 use crdtsync_server::{
     audit_router, blob_router, Action, AuditDecision, AuditLog, AuditQuery, AuditResource, Audited,
@@ -353,6 +353,84 @@ fn a_version_fetch_is_audited_as_a_version_read() {
                 && rec.resource.room() == Some(ROOM)
         }),
         "a version fetch records a VersionRead: {records:?}"
+    );
+}
+
+#[test]
+fn a_diff_query_is_audited_as_a_version_read() {
+    // A change list is the same captured content in a different shape, so it leaves
+    // the same trace: reading a version through a diff must not be the unaudited way
+    // to read it.
+    let (log, _clock, _tmp) = new_log();
+    let mut r = Registry::new(cid(0xFF));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+    r.set_authorizer(Box::new(Audited::new(
+        Box::new(PermitAll),
+        Box::new(DurableAccessLog::new(log.clone())),
+    )));
+
+    let id = authed(&mut r, 1);
+    assert!(r.deliver(
+        id,
+        Message::Subscribe {
+            channel: CH,
+            room: ROOM.to_vec(),
+            zone: Vec::new(),
+            last_seen_seq: 0,
+            branch: Vec::new(),
+        }
+    ));
+    r.take_outbox(id);
+    let ops: Vec<Op> = Document::new(cid(1)).transact(|tx| tx.register(b"age", Scalar::Int(30)));
+    r.deliver(id, Message::Ops { channel: CH, ops });
+    r.take_outbox(id);
+    for name in [b"v1", b"v2"] {
+        r.deliver(
+            id,
+            Message::VersionCreate {
+                channel: CH,
+                name: name.to_vec(),
+            },
+        );
+        r.take_outbox(id);
+    }
+    assert!(r.deliver(
+        id,
+        Message::DiffQuery {
+            channel: CH,
+            kind: DiffKind::Versions,
+            a: b"v1".to_vec(),
+            b: b"v2".to_vec(),
+        }
+    ));
+    assert!(matches!(r.take_outbox(id)[0], Message::DiffResult { .. }));
+
+    // Both kinds record it: a branch diff needs no version at all, which is the
+    // cheaper way to the same captured content and so the one that must not be the
+    // untraced way.
+    assert!(r.deliver(
+        id,
+        Message::DiffQuery {
+            channel: CH,
+            kind: DiffKind::Branches,
+            a: b"main".to_vec(),
+            b: b"main".to_vec(),
+        }
+    ));
+    assert!(matches!(r.take_outbox(id)[0], Message::DiffResult { .. }));
+
+    let records = log.read_all().unwrap();
+    let reads = records
+        .iter()
+        .filter(|rec| {
+            rec.action == Action::VersionRead
+                && rec.actor == b"actor-1"
+                && rec.resource.room() == Some(ROOM)
+        })
+        .count();
+    assert_eq!(
+        reads, 2,
+        "each diff query records a VersionRead: {records:?}"
     );
 }
 

@@ -304,10 +304,12 @@ export class Provider {
   }
 
   /** The structural diff turning state `a` into state `b`, over the room's saved
-   * versions (`DiffKind.Versions`) or its branches' HEADs (`DiffKind.Branches`). */
+   * versions (`DiffKind.Versions`) or its branches' HEADs (`DiffKind.Branches`).
+   * Answered on this provider's channel, so the change list is narrowed to what
+   * this subscription may read. */
   diff(kind: DiffKind, a: Key, b: Key): Promise<Change[]> {
     return this.request(
-      this.client.diffQuery(this.room, kind, keyBytes(a), keyBytes(b)),
+      this.client.diffQuery(this.channel, kind, keyBytes(a), keyBytes(b)),
       (t) => t.kind === "diff" && bytesEqual(t.room, this.room),
       () => this.readDiff(),
     );

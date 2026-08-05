@@ -938,9 +938,9 @@ pub fn step(
         // served only by the room's leader; on a non-leader it is redirected
         // rather than persisted, so a follower never diverges the room's versions.
         Message::VersionCreate { channel, name } => {
-            let Some(room) = version_room(session, channel, authorizer, schema, Action::Write)
+            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Write)
             else {
-                return version_denied(session, channel);
+                return channel_request_denied(session, channel, "version");
             };
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
@@ -951,9 +951,9 @@ pub fn step(
             }
         }
         Message::VersionRename { channel, from, to } => {
-            let Some(room) = version_room(session, channel, authorizer, schema, Action::Write)
+            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Write)
             else {
-                return version_denied(session, channel);
+                return channel_request_denied(session, channel, "version");
             };
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
@@ -964,9 +964,9 @@ pub fn step(
             }
         }
         Message::VersionDelete { channel, name } => {
-            let Some(room) = version_room(session, channel, authorizer, schema, Action::Write)
+            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Write)
             else {
-                return version_denied(session, channel);
+                return channel_request_denied(session, channel, "version");
             };
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
@@ -977,9 +977,9 @@ pub fn step(
             }
         }
         Message::VersionList { channel } => {
-            let Some(room) = version_room(session, channel, authorizer, schema, Action::Read)
+            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Read)
             else {
-                return version_denied(session, channel);
+                return channel_request_denied(session, channel, "version");
             };
             versions_list(hub, channel, &room)
         }
@@ -987,11 +987,11 @@ pub fn step(
             // The reader is resolved before the room, so the redaction below has the
             // identity it narrows for without a second, unreachable lookup.
             let Some(identity) = session.identity() else {
-                return version_denied(session, channel);
+                return channel_request_denied(session, channel, "version");
             };
-            let Some(room) = version_room(session, channel, authorizer, schema, Action::Read)
+            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Read)
             else {
-                return version_denied(session, channel);
+                return channel_request_denied(session, channel, "version");
             };
             match hub.version_state(&room, &name) {
                 Some(state) => {
@@ -1050,7 +1050,7 @@ pub fn step(
                     // The version's state is being served — an auditable history read,
                     // distinct from the live subscribe stream. Record it through the audit
                     // seam once it is actually going out (the read was authorized by
-                    // `version_room` above, so the verdict is granted).
+                    // `channel_room` above, so the verdict is granted).
                     authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     // The replica identity this channel authors under — the one author
                     // whose ids a projection keeps in the frontier it otherwise scrubs,
@@ -1172,28 +1172,109 @@ pub fn step(
                 Err(_) => internal("failed to persist branch"),
             }
         }
-        // A diff query is a room-level read: it computes the structural diff
-        // between two of the room's saved versions or two of its branches, gated
-        // by the same read tier as a branch list — a diff reads room state, no new
-        // authz axis. Served locally from the replicated state, so no leader
-        // redirect. An absent version/branch maps to a recoverable NotFound; a
-        // snapshot that fails to decode is an internal fault.
-        Message::DiffQuery { room, kind, a, b } => {
-            if !branch_authorized(session, authorizer, schema, &room, Action::Read) {
-                return request_denied(session, "diff");
-            }
+        // A diff query serves a room's own content — a change list carries
+        // `core::path`s and the scalar values at them — so it is a state read wearing
+        // a different shape, and it is redacted like one. **Channel-keyed** like a
+        // version fetch rather than room-keyed like a branch list: the channel is what
+        // carries the reader's zone scope, and a room riding the frame leaves a diff
+        // nothing to narrow by. Gated by the read tier every channel-keyed room
+        // request uses (the doc-ACL tier abstains, deployment and schema decide), then
+        // each side is put through `project_served_state` *before* the diff engine
+        // sees it — so a change list is the diff of the two states this reader would
+        // itself have been served (the causal frontier aside, which the two seams
+        // scrub differently and a change list does not carry), and a partition it may
+        // not read contributes no change at all rather than a redacted one — with the
+        // one exception the projections themselves carry, an element the live walk
+        // does not reach, whose diff-visible face is an orphaned annotation (C52).
+        // Served locally from the replicated state, so no leader redirect. A version
+        // or branch that does not materialize answers `NotFound`, and a materialized
+        // side that fails to decode `Internal`;
+        // neither closes. A side is archived or reconstructed state — a version's
+        // captured bytes, a branch's folded stream, the live replica for `main` — and
+        // one of them failing to decode is a server-side fault this channel's live
+        // stream survives, which is the reading the version fetch already takes.
+        Message::DiffQuery {
+            channel,
+            kind,
+            a,
+            b,
+        } => {
+            // The reader is resolved before the room, so the redaction below has the
+            // identity it narrows for without a second, unreachable lookup.
+            let Some(identity) = session.identity() else {
+                return channel_request_denied(session, channel, "diff");
+            };
+            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Read)
+            else {
+                return channel_request_denied(session, channel, "diff");
+            };
+            let records = hub.acl_records(&room);
+            let creator = hub.room_creator(&room);
+            // The channel's zone scope, resolved when it subscribed — the same set the
+            // live fan-out filters this channel's ops by, and the same one a version
+            // fetch on this channel narrows to.
+            let zones = session
+                .channels
+                .get(&channel)
+                .and_then(|sub| sub.zones.clone());
+            // Each side is narrowed against its own tree. An element-scoped grant
+            // resolves to where that element stood in *that* state, and the two sides
+            // of a diff are two different trees — so neither side may be handed the
+            // other's index, nor the live room's (C32). Only the read projection's
+            // whole-document gate reads the index, so a room holding no doc-ACL state
+            // pays no decode to build one.
+            let narrow = |state: Vec<u8>| -> Vec<u8> {
+                let index = if records.is_empty() {
+                    HashMap::new()
+                } else {
+                    // An empty index where the state does not decode, and no guard for
+                    // that case — unlike the version fetch. The projections would hand
+                    // such bytes on unnarrowed, but the engine below decodes them again
+                    // and refuses the whole query: a diff has no way to serve a side it
+                    // cannot read, where a fetch would have served it.
+                    Document::decode_state(&state)
+                        .map(|doc| crate::index::element_paths(&doc))
+                        .unwrap_or_default()
+                };
+                project_served_state(
+                    state,
+                    authorizer,
+                    &records,
+                    creator.as_deref(),
+                    &index,
+                    schema,
+                    identity,
+                    &room,
+                    &zones,
+                    // No recipient. The frontier a projection scrubs is kept back for a
+                    // replica that will *author* from the state it is served (C9); a
+                    // diff is never adopted as state, and the change list carries no
+                    // frontier at all, so the scrub goes whole.
+                    None,
+                )
+            };
             let diff = match kind {
-                DiffKind::Versions => hub.diff_versions(&room, &a, &b),
-                DiffKind::Branches => hub.diff_branches(&room, &a, &b),
+                DiffKind::Versions => hub.diff_versions(&room, &a, &b, narrow),
+                DiffKind::Branches => hub.diff_branches(&room, &a, &b, narrow),
             };
             match diff {
-                Ok(changes) => Response {
-                    replies: vec![Message::DiffResult {
-                        room,
-                        changes: encode_changes(&changes),
-                    }],
-                    ..Response::default()
-                },
+                Ok(changes) => {
+                    // A change list is captured room content leaving the server — the
+                    // same auditable history read a version fetch records, in another
+                    // shape — so it goes through the same audit seam, once the content
+                    // is actually going out. (Later than the fetch's, which fires
+                    // before its projections and so can record a read it then narrows
+                    // to nothing; both are on the reply path.) The read was authorized
+                    // by `channel_room` above, so the verdict is granted.
+                    authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
+                    Response {
+                        replies: vec![Message::DiffResult {
+                            room,
+                            changes: encode_changes(&changes),
+                        }],
+                        ..Response::default()
+                    }
+                }
                 Err(e) => diff_error(e),
             }
         }
@@ -1201,8 +1282,8 @@ pub fn step(
         Message::DiffResult { .. } => violation("client sent a diff result"),
         // Cloning duplicates the live state of `src` into a fresh room `dst` — a
         // read of the whole source composed with a room create. Two gates compose:
-        // the actor must be able to read `src` (the same read tier a branch list or
-        // diff uses — the doc-ACL tier abstains, deployment and schema decide), and
+        // the actor must be able to read `src` (the same read tier a branch list
+        // uses — the doc-ACL tier abstains, deployment and schema decide), and
         // the create is a room-management mutation on `dst`, gated by the write tier
         // a branch mutation uses. A create persists a new room, so like a branch
         // mutation it is served only by `dst`'s leader; on a non-leader it is
@@ -1967,11 +2048,12 @@ fn read_redirect_response(
     })
 }
 
-/// Resolve the room a version request targets, having checked the connection is
-/// authenticated, the channel is bound, and the actor is authorized for
-/// `action`. `None` means the request cannot proceed — [`version_denied`]
-/// distinguishes an unbound channel (a violation) from a denial (forbidden).
-fn version_room(
+/// Resolve the room a channel-keyed request targets — a version request, a diff
+/// query — having checked the connection is authenticated, the channel is bound,
+/// and the actor is authorized for `action`. `None` means the request cannot
+/// proceed — [`channel_request_denied`] distinguishes an unbound channel (a
+/// violation) from a denial (forbidden).
+fn channel_room(
     session: &Session,
     channel: Channel,
     authorizer: &dyn Authorizer,
@@ -1980,8 +2062,10 @@ fn version_room(
 ) -> Option<RoomId> {
     let identity = session.identity()?;
     let room = session.channels.get(&channel)?.room.clone();
-    // Version mutations are not yet gated by the doc-ACL tier — it abstains, so the
-    // deployment and schema tiers decide as before.
+    // Neither a version request nor a diff query is gated by the doc-ACL tier here —
+    // it abstains, so the deployment and schema tiers decide. What a partial reader
+    // may see of the content behind such a request is the projections' answer, not
+    // this gate's.
     authorized(
         authorizer,
         Decision::Abstain,
@@ -1993,16 +2077,18 @@ fn version_room(
     .then_some(room)
 }
 
-/// The refusal for a version request that [`version_room`] rejected: a violation
-/// if the connection is unauthenticated or the channel is unbound, otherwise a
-/// non-closing forbidden.
-fn version_denied(session: &Session, channel: Channel) -> Response {
+/// The refusal for a channel-keyed `what` request that [`channel_room`] rejected: a
+/// violation if the connection is unauthenticated or the channel is unbound,
+/// otherwise a non-closing forbidden. `what` names the request kind (`"version"`,
+/// `"diff"`) so the diagnostic points at the surface the client actually used — the
+/// channel-bound counterpart of [`request_denied`].
+fn channel_request_denied(session: &Session, channel: Channel, what: &str) -> Response {
     if session.actor().is_none() {
-        violation("version request before auth")
+        violation(&format!("{what} request before auth"))
     } else if !session.channels.contains_key(&channel) {
-        violation("version request on an unbound channel")
+        violation(&format!("{what} request on an unbound channel"))
     } else {
-        forbidden("version request denied")
+        forbidden(&format!("{what} request denied"))
     }
 }
 
@@ -2045,7 +2131,7 @@ fn branch_authorized(
 
 /// The refusal for a room-keyed `what` request [`branch_authorized`] rejected: a
 /// violation if the connection is unauthenticated, otherwise a non-closing
-/// forbidden. `what` names the request kind (`"branch"`, `"diff"`) in the
+/// forbidden. `what` names the request kind (`"branch"`, `"clone"`) in the
 /// diagnostic so the message points at the surface the client actually used.
 fn request_denied(session: &Session, what: &str) -> Response {
     if session.actor().is_none() {
@@ -2055,21 +2141,26 @@ fn request_denied(session: &Session, what: &str) -> Response {
     }
 }
 
-/// Map a [`DiffError`] to the client failure it surfaces. An absent version or
-/// branch is a recoverable `NotFound` — a well-formed query naming something the
-/// room does not have, the connection stays open. A snapshot that fails to decode
-/// is a server-side fault, so it closes like any [`internal`] error.
+/// Map a [`DiffError`] to the client failure it surfaces. A version or branch that
+/// does not materialize is a recoverable `NotFound` — usually a name the room does
+/// not have, though a branch whose durable base this node cannot read reaches it too
+/// (C51). A materialized state that fails to decode is an `Internal` fault, since
+/// nothing the client sent caused it. Neither closes: a diff's sides are archived or
+/// reconstructed state, so one of them being unreadable is a server-side fault the
+/// channel's live stream survives — the reading the version fetch takes of the
+/// version bytes, generalized.
 fn diff_error(e: DiffError) -> Response {
-    match e {
-        DiffError::UnknownVersion(_) | DiffError::UnknownBranch(_) => Response {
-            replies: vec![Message::Error {
-                code: ErrorCode::NotFound,
-                message: e.to_string(),
-                details: Vec::new(),
-            }],
-            ..Response::default()
-        },
-        DiffError::Decode => internal("a snapshot failed to decode for diff"),
+    let code = match e {
+        DiffError::UnknownVersion(_) | DiffError::UnknownBranch(_) => ErrorCode::NotFound,
+        DiffError::Decode => ErrorCode::Internal,
+    };
+    Response {
+        replies: vec![Message::Error {
+            code,
+            message: e.to_string(),
+            details: Vec::new(),
+        }],
+        ..Response::default()
     }
 }
 

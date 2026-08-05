@@ -1562,7 +1562,8 @@ impl Registry {
     /// to each recipient's version — redact-then-translate, since translation can
     /// drop ops and would otherwise desync the path lookup. An op whose target the
     /// index cannot resolve reads at the root ([`op_read_path`](crate::acl::op_read_path)),
-    /// so only a whole-document reader carries it — never a subtree-scoped one.
+    /// so whatever the root verdict admits carries it — which includes a root grant
+    /// carved by a subtree deny, not the whole-document reader alone (C52).
     fn fan_out_ops_redacted(
         &mut self,
         writer: ConnId,
@@ -1937,7 +1938,11 @@ impl Registry {
             | Message::VersionRename { channel, .. }
             | Message::VersionDelete { channel, .. }
             | Message::VersionList { channel, .. }
-            | Message::VersionFetch { channel, .. } => self
+            | Message::VersionFetch { channel, .. }
+            // A diff query is channel-keyed for exactly this: the change list it
+            // answers with is narrowed by the room's zone declarations, and those
+            // live in the acting schema, which is what this resolution finds.
+            | Message::DiffQuery { channel, .. } => self
                 .conns
                 .get(&id)
                 .and_then(|c| c.session.room_for_channel(*channel).cloned()),
