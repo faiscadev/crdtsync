@@ -210,6 +210,9 @@ fn replicate(d: &mut Document, room: &[u8], epoch: u64) -> Message {
         epoch,
         base_seq: 0,
         ops,
+        // These frames exercise placement and epoch fencing, not the doc ACL, so the
+        // room carries no creator to replicate.
+        creator: None,
     }
 }
 
@@ -2082,5 +2085,72 @@ fn two_processes_on_one_host_place_and_serve_normally() {
     assert!(
         m.replicas_for(b"room-0").len() == 2,
         "a write here needs the sibling's ack",
+    );
+}
+
+#[test]
+fn a_peerless_node_keeps_serving_everything() {
+    // The single-node deployment. Its adopted set is exactly `{self}` — the same shape
+    // that strands a clustered node — and it must be untouched: there is no cluster to
+    // disagree with it, so a majority of one is the whole truth rather than a split
+    // brain. The `!solitary` clause is the only thing separating the two, and without
+    // it every single-node deployment would refuse every read and write.
+    let mut m = Membership::from_static_config(None, Some(SELF_ADDR), "", N).unwrap();
+    m.add_member(NodeId::from("10.9.9.9:9000"));
+    assert!(
+        !m.is_stranded(),
+        "a node with no peers configured is not stranded"
+    );
+    assert_eq!(m.adopted_members(), vec![NodeId::from(SELF_ADDR)]);
+    let held = (0..256u32)
+        .map(|i| format!("room-{i}"))
+        .filter(|r| {
+            m.replicas_for(r.as_bytes())
+                .contains(&NodeId::from(SELF_ADDR))
+        })
+        .count();
+    assert_eq!(held, 256, "it holds every room, as a single node must");
+}
+
+#[test]
+fn a_stranded_node_never_releases_a_write_it_had_withheld() {
+    // The `quorum` half of the refusal, pinned where `quorum` is actually reached. A
+    // write taken while the node was healthy sits withheld pending a majority; the node
+    // then strands, and a follower ack arrives and drives the release check. With an
+    // empty replica set that check computes a majority of `0 / 2 + 1 = 1`, which self
+    // satisfies alone — so the `Accepted` would be released for a write this node can
+    // no longer confirm anyone else holds. Refusing at subscribe does not cover this:
+    // the client had already joined.
+    let mut r = registry();
+    let (room, c, followers) = led_room_with_a_withheld_write(&mut r);
+    let seq = r.hub().seq(&room);
+
+    {
+        let view = r.membership_mut_for_test();
+        let peers: Vec<NodeId> = view
+            .members()
+            .into_iter()
+            .filter(|n| n != view.self_id())
+            .collect();
+        for peer in &peers {
+            for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+                view.note_gossip_unreachable(peer);
+            }
+        }
+        for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+            view.reap_dead();
+        }
+        assert!(view.is_stranded());
+    }
+
+    for follower in &followers {
+        r.record_replica_ack(follower.clone(), &room, seq);
+    }
+    let replies = r.take_outbox(c);
+    assert!(
+        !replies
+            .iter()
+            .any(|m| matches!(m, Message::Accepted { .. })),
+        "an empty replica set must not compute a majority of one: {replies:?}",
     );
 }
