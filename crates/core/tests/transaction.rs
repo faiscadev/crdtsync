@@ -880,6 +880,57 @@ fn pair() -> (Document, Vec<Op>) {
     (a, ops)
 }
 
+/// A three-member atomic group over `x`, `y` and `z`, and its author.
+fn triple() -> (Document, Vec<Op>) {
+    let mut a = doc(1);
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"x", Scalar::Int(1));
+        tx.register(b"y", Scalar::Int(2));
+        tx.register(b"z", Scalar::Int(3));
+    });
+    (a, ops)
+}
+
+/// Every ordering of `0..n`, so a fold is checked against the whole arrival space
+/// rather than the two orders that happen to disagree.
+fn orderings(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for rest in orderings(n - 1) {
+        for at in 0..n {
+            let mut order = rest.clone();
+            order.insert(at, n - 1);
+            out.push(order);
+        }
+    }
+    out
+}
+
+/// Fold `ops` in every arrival order and assert every fold reads one state,
+/// returning it. The comparison is over the canonical snapshot bytes, so nothing
+/// the replica holds — buffer and resolved group keys included — is left out of
+/// it, and every fold runs under one client id so the bytes are comparable.
+fn one_state_in_every_order(ops: &[Op]) -> Document {
+    let mut folded: Option<(Vec<usize>, Vec<u8>, Document)> = None;
+    for order in orderings(ops.len()) {
+        let mut d = doc(9);
+        for &i in &order {
+            d.apply(&ops[i]);
+        }
+        let bytes = d.encode_state();
+        match &folded {
+            None => folded = Some((order, bytes, d)),
+            Some((first, first_bytes, _)) => assert_eq!(
+                &bytes, first_bytes,
+                "order {order:?} folded to a different state than {first:?}"
+            ),
+        }
+    }
+    folded.expect("an op set has at least one order").2
+}
+
 #[test]
 fn the_codec_refuses_a_group_that_declares_no_members() {
     let (_, ops) = pair();
@@ -1086,83 +1137,511 @@ fn a_rewritten_count_holds_the_same_set_whatever_order_it_arrives_in() {
     }
 }
 
+// --- a resolved group key ---
+//
+// A bucket key is spent when its group commits, so a member that arrives after it
+// re-enters an arrival count the bucket already met — a count no further arrival
+// can satisfy. Which members commit and which are left holding is the arrival
+// order's, so the same ops fold to two states. Recording that a key has resolved
+// is what closes it: a later member of a resolved key is untagged and merges
+// standalone, so every order lands the same set. Three rewrites reach the shape,
+// and none is malformed on any member's own terms.
+
 #[test]
-fn a_group_rewritten_smaller_on_every_member_commits_a_subset_the_order_picks() {
-    // The shape no count rule reaches, pinned as what it is rather than claimed
-    // fixed: a rewrite consistent across every member is, to a receiver, an honest
-    // group of the smaller size followed by a stray. It commits at the size it was
-    // told, and *which* members that is belongs to the arrival order — so two
-    // replicas disagree until each evicts. Closing it needs a record that a group
-    // id has been resolved, which is state of its own (KANBAN C18).
-    let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
-    });
+fn a_group_rewritten_smaller_on_every_member_folds_one_state_in_every_order() {
+    // A rewrite consistent across every member is, to a receiver, an honest group
+    // of the smaller size followed by a stray, so it commits at the size it was
+    // told. Whichever two members that is, the third is a stray of a key that has
+    // resolved, and lands.
+    let (a, ops) = triple();
     let id = tx_id(&ops[0]);
     let shrunk: Vec<Op> = ops.iter().map(|op| retagged(op, id, 2)).collect();
 
-    let mut first = doc(2);
-    for op in &shrunk {
-        first.apply(op);
-    }
-    let mut last = doc(3);
-    for op in shrunk.iter().rev() {
-        last.apply(op);
-    }
-    assert_ne!(
-        reg(&first, b"x").is_some(),
-        reg(&last, b"x").is_some(),
-        "the arrival order decides which members the rewritten size commits"
-    );
-
-    // Eviction is what closes it, and it closes it the same way on both.
-    assert_eq!(first.evict_partial_transactions(), 1);
-    assert_eq!(last.evict_partial_transactions(), 1);
+    let b = one_state_in_every_order(&shrunk);
     for key in [&b"x"[..], b"y", b"z"] {
-        assert_eq!(reg(&first, key), reg(&a, key));
-        assert_eq!(reg(&last, key), reg(&a, key));
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
 }
 
 #[test]
-fn two_envelopes_of_one_member_leave_the_bucket_reading_whichever_landed_first() {
-    // `apply` dedups on op id before it looks at the tag, so when one member
-    // arrives twice under different envelopes the bucket keeps whichever won the
-    // race — a hostile duplicate, or a destranded copy racing the tagged one
-    // across two delivery seams. The size the bucket then reads is the arrival
-    // order's. Pinned as what it is: the record that would settle it is the one
-    // a resolved bucket key does not keep (KANBAN C18).
+fn an_unrelated_op_retagged_into_a_group_folds_one_state_in_every_order() {
+    // The same shape built the other way round: an honest two-member group plus a
+    // fourth op of the same author re-tagged with its id. Whichever two of the
+    // three the order commits, the remaining one is a stray of a resolved key.
     let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
+    let group = a.atomic_transact(|tx| {
+        tx.register(b"m1", Scalar::Int(1));
+        tx.register(b"m2", Scalar::Int(2));
     });
-    let dup = retagged(&ops[2], tx_id(&ops[0]), 2);
+    let stray = a.transact(|tx| {
+        tx.register(b"m4", Scalar::Int(4));
+    });
+    let ops = [
+        group[0].clone(),
+        group[1].clone(),
+        retagged(&stray[0], tx_id(&group[0]), 2),
+    ];
 
-    let mut honest_first = doc(2);
-    for op in [&ops[0], &ops[1], &ops[2], &dup] {
-        honest_first.apply(op);
+    let b = one_state_in_every_order(&ops);
+    for key in [&b"m1"[..], b"m2", b"m4"] {
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
-    let mut dup_first = doc(3);
-    for op in [&ops[0], &ops[1], &dup, &ops[2]] {
-        dup_first.apply(op);
+}
+
+#[test]
+fn one_member_under_two_envelopes_folds_one_state_in_every_order() {
+    // `apply` dedups on op id before it looks at the tag, so one member arriving
+    // twice under different envelopes leaves the bucket reading whichever copy the
+    // dedup kept. The copy that lost the dedup is a member the bucket will never
+    // hold under that envelope, so its key resolves and the rest of the group merges
+    // standalone. Both copies name a group here: a copy carrying *no* tag — what a
+    // filtering seam's destranding produces — leaves the buffer holding nothing to
+    // contradict, and is C46's shape rather than this one.
+    let (a, ops) = triple();
+    let dup = retagged(&ops[2], tx_id(&ops[0]), 2);
+    let set = [ops[0].clone(), ops[1].clone(), ops[2].clone(), dup];
+
+    let b = one_state_in_every_order(&set);
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
-    assert_ne!(
-        reg(&honest_first, b"x").is_some(),
-        reg(&dup_first, b"x").is_some(),
-        "the envelope that won the dedup decides the bucket's size"
+}
+
+#[test]
+fn an_inadmissible_envelope_decides_nothing_about_the_held_groups() {
+    // Admissibility is judged before the dedup, so an envelope no replica may hold
+    // never reaches the conflict rule. Otherwise a forged tag on a *held* member's id
+    // would spend both keys and release the honest group waiting under one of them —
+    // an op every replica refuses deciding what this one shows.
+    let (a, ops) = triple();
+    let mut b = doc(9);
+    assert!(!b.apply(&ops[0]));
+    assert!(!b.apply(&ops[1]));
+    let settled = b.encode_state();
+
+    // A size no group can have, on an id the buffer is holding under a live group.
+    for count in [0, crdtsync_core::MAX_TX_MEMBERS + 1, u32::MAX] {
+        let forged = retagged(&ops[0], crdtsync_core::TxId(0xbeef), count);
+        assert!(!b.apply(&forged), "a size of {count} is refused");
+        assert_eq!(
+            b.encode_state(),
+            settled,
+            "a size of {count} moved the replica's state"
+        );
+    }
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(
+            reg(&b, key),
+            None,
+            "the group was released by a refused envelope"
+        );
+    }
+
+    // And the group still commits on its own last member.
+    assert!(b.apply(&ops[2]));
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), reg(&a, key));
+    }
+}
+
+#[test]
+fn a_resent_member_of_a_waiting_group_leaves_it_atomic() {
+    // The resolved key is read off a *disagreeing* envelope. A plain resend of a
+    // member already held carries the envelope the bucket holds, so it decides
+    // nothing: the group is still waiting, whole, on the member that has not come.
+    let (_, ops) = triple();
+    let mut b = doc(9);
+    assert!(!b.apply(&ops[0]));
+    assert!(!b.apply(&ops[0]), "a resend is a duplicate");
+    assert!(!b.apply(&ops[1]));
+    assert!(!b.apply(&ops[1]));
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), None, "a resend released the group early");
+    }
+    assert!(b.apply(&ops[2]), "the group commits on its own last member");
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert!(reg(&b, key).is_some(), "member {key:?} did not commit");
+    }
+}
+
+#[test]
+fn two_envelopes_naming_different_groups_spend_both_keys() {
+    // When the copies name different *groups* rather than two sizes of one, only
+    // the group the dedup kept the copy under can ever hold this id, and that is
+    // the arrival order's — so a genuine member of the other would be left holding.
+    // Both keys are spent, and each group's own member lands whichever copy won.
+    let (mut a, first) = pair();
+    let second = a.atomic_transact(|tx| {
+        tx.register(b"p", Scalar::Int(3));
+        tx.register(b"q", Scalar::Int(4));
+    });
+    let (t1, t2) = (tx_id(&first[0]), tx_id(&second[0]));
+
+    for order in [[0, 1], [1, 0]] {
+        let both = [retagged(&first[0], t1, 2), retagged(&first[0], t2, 2)];
+        let mut b = doc(9);
+        assert!(!b.apply(&both[order[0]]), "the first copy is held");
+        assert!(!b.apply(&both[order[1]]), "the second copy is a duplicate");
+        assert_eq!(reg(&b, b"x"), reg(&a, b"x"), "the held copy was released");
+        assert!(b.apply(&first[1]), "the first group's own member lands");
+        assert!(b.apply(&second[1]), "the second group's own member lands");
+        assert_eq!(reg(&b, b"y"), reg(&a, b"y"));
+        assert_eq!(reg(&b, b"q"), reg(&a, b"q"));
+    }
+}
+
+/// The residue the record does not reach, and does not claim to. A second copy is
+/// a duplicate only where the first is still *held*, so a copy whose forged tag
+/// carried it into another group's bucket — completing that bucket, and applying
+/// the id — has left the buffer before the honest copy arrives, and the honest
+/// group's own member is left holding. Eviction is what lands it, as for every
+/// group nobody will complete. This is a *fourth* shape, not one of the three the
+/// record closes: it needs the two copies to name different groups, it is
+/// order-dependent on `main` before the record exists, and the record narrows it
+/// from a split in what a replica reads to a split in which keys it has spent.
+/// Filed as its own unit (KANBAN C46).
+#[test]
+fn a_copy_absorbed_by_another_groups_bucket_strands_its_own_group_until_eviction() {
+    let (mut a, first) = pair();
+    let second = a.atomic_transact(|tx| {
+        tx.register(b"p", Scalar::Int(3));
+        tx.register(b"q", Scalar::Int(4));
+    });
+    let ops = [
+        retagged(&first[0], tx_id(&first[0]), 2),
+        retagged(&first[0], tx_id(&second[0]), 2),
+        first[1].clone(),
+        second[1].clone(),
+    ];
+
+    // The forged copy completes the second group's bucket, so the first group's
+    // own member waits on an id that has already applied elsewhere.
+    let mut b = doc(9);
+    for i in [3, 1, 0, 2] {
+        b.apply(&ops[i]);
+    }
+    assert_eq!(reg(&b, b"y"), None, "the stranded member");
+
+    // What every order does agree on, once evicted, is the state a reader sees.
+    for order in orderings(ops.len()) {
+        let mut d = doc(9);
+        for &i in &order {
+            d.apply(&ops[i]);
+        }
+        d.evict_partial_transactions();
+        for key in [&b"x"[..], b"y", b"q"] {
+            assert_eq!(
+                reg(&d, key),
+                reg(&a, key),
+                "order {order:?} left {key:?} stranded past eviction"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stray_of_the_authors_own_group_lands_at_the_author_too() {
+    // The author applies its own edits as it makes them and buckets nothing, so a
+    // group it tags leaves no bucket to commit. Resolved at the mint instead, or a
+    // stray under that id would be held at the author while every receiver merged
+    // it — one op set, two states.
+    let mut a = doc(1);
+    let group = a.atomic_transact(|tx| {
+        tx.register(b"m1", Scalar::Int(1));
+        tx.register(b"m2", Scalar::Int(2));
+    });
+    // An op of the author's own id space that the author has not published — what a
+    // relay forges when it re-tags a stray into a live group.
+    let mut relay = doc(1);
+    relay.transact(|tx| tx.register(b"burn1", Scalar::Int(0)));
+    relay.transact(|tx| tx.register(b"burn2", Scalar::Int(0)));
+    let stray = relay.transact(|tx| {
+        tx.register(b"m4", Scalar::Int(4));
+    });
+    let forged = retagged(&stray[0], tx_id(&group[0]), 2);
+
+    let mut b = doc(9);
+    for op in [&group[0], &group[1], &forged] {
+        b.apply(op);
+    }
+    assert_eq!(
+        reg(&b, b"m4"),
+        Some(Scalar::Int(4)),
+        "the receiver merged it"
     );
 
-    // Eviction closes it, and closes it the same way on both.
-    honest_first.evict_partial_transactions();
-    dup_first.evict_partial_transactions();
-    for key in [&b"x"[..], b"y", b"z"] {
-        assert_eq!(reg(&honest_first, key), reg(&a, key));
-        assert_eq!(reg(&dup_first, key), reg(&a, key));
+    assert!(a.apply(&forged), "the author merged it too");
+    assert_eq!(reg(&a, b"m4"), reg(&b, b"m4"));
+}
+
+#[test]
+fn a_duplicate_of_an_applied_member_changes_nothing() {
+    // A redelivered op is state a replica already holds, so it may not move any:
+    // the resend seams replay more than a peer kept, and a delivery that decided
+    // something would make state a function of how often an op arrived. Only a
+    // member the buffer is *holding* under another group is evidence of anything.
+    let (_, ops) = triple();
+    let id = tx_id(&ops[0]);
+
+    let mut b = doc(9);
+    b.apply(&ops[0]);
+    b.apply(&ops[1]);
+    b.evict_partial_transactions();
+    let settled = b.encode_state();
+
+    // Every envelope of an already-applied member: the honest one, one naming a
+    // size the group never had, one naming a group that never existed.
+    for forged in [
+        ops[0].clone(),
+        retagged(&ops[0], id, 2),
+        retagged(&ops[0], crdtsync_core::TxId(0xfeed), 2),
+    ] {
+        assert!(!b.apply(&forged));
+        assert_eq!(
+            b.encode_state(),
+            settled,
+            "a duplicate moved the replica's state"
+        );
     }
+
+    // And the last member of the evicted group lands the same way whether or not
+    // those duplicates arrived — the eviction spent its key, not the duplicates.
+    let mut c = Document::decode_state(&settled).expect("decode");
+    assert!(b.apply(&ops[2]));
+    assert!(c.apply(&ops[2]));
+    assert_eq!(b.encode_state(), c.encode_state());
+}
+
+#[test]
+fn many_resolved_keys_encode_in_one_order() {
+    // The record is a set, so its iteration order is per-instance and says nothing
+    // about what a replica folded. Replicas that resolved the same groups in
+    // different orders have to encode identical bytes, or the record is itself the
+    // divergence it exists to prevent.
+    // Two authors, so the key's client component is exercised and not just its id —
+    // `TxId::derive` hashes member sequences alone, so two clients collide on a group
+    // id readily, and a sort that ignored the client would leave those pairs in set
+    // order.
+    let mut a = doc(1);
+    let mut second = doc(2);
+    let groups: Vec<Vec<Op>> = (0..12)
+        .map(|i| {
+            let author = if i % 2 == 0 { &mut a } else { &mut second };
+            author.atomic_transact(|tx| {
+                tx.register(format!("k{i}a").as_bytes(), Scalar::Int(i));
+                tx.register(format!("k{i}b").as_bytes(), Scalar::Int(i));
+            })
+        })
+        .collect();
+
+    // Several rotations of the fold order, so the answer does not rest on two hash
+    // sets happening to disagree.
+    let mut folded: Option<Vec<u8>> = None;
+    for rotation in 0..groups.len() {
+        let mut d = doc(9);
+        for i in 0..groups.len() {
+            for op in &groups[(i + rotation) % groups.len()] {
+                d.apply(op);
+            }
+        }
+        let bytes = d.encode_state();
+        match &folded {
+            None => folded = Some(bytes),
+            Some(first) => assert_eq!(
+                &bytes, first,
+                "rotation {rotation} encoded the record in its own order"
+            ),
+        }
+    }
+
+    // And the order is a named one, not merely a stable one: every group committed,
+    // so the buffer is empty and the record is the section just before its length.
+    let bytes = folded.expect("a fold");
+    let count = groups.len();
+    assert_eq!(
+        bytes[bytes.len() - 4..],
+        [0, 0, 0, 0],
+        "every group committed, so the buffer is empty"
+    );
+    let keys_end = bytes.len() - 4;
+    let keys_at = keys_end - count * 24;
+    assert_eq!(
+        u32::from_le_bytes(bytes[keys_at - 4..keys_at].try_into().expect("a length")),
+        count as u32,
+        "the record section is where its length says"
+    );
+    let encoded: Vec<(&[u8], u64)> = (0..count)
+        .map(|i| {
+            let at = keys_at + i * 24;
+            (
+                &bytes[at..at + 16],
+                u64::from_le_bytes(bytes[at + 16..at + 24].try_into().expect("a key")),
+            )
+        })
+        .collect();
+    let mut ascending = encoded.clone();
+    ascending.sort();
+    assert_eq!(
+        encoded, ascending,
+        "the record is not encoded key-ascending"
+    );
+}
+
+#[test]
+fn the_mint_drains_what_spending_its_own_key_releases() {
+    // The author's group is complete the moment it is tagged, so spending its key
+    // releases whatever the buffer held under that id — and a released member applies
+    // on the drain, not on whenever the next unrelated arrival happens to run one.
+    let id = crdtsync_core::TxId::derive([0, 1]);
+
+    // A foreign op under the author's own client id, tagged into the group the next
+    // local transaction derives, at a sequence the mint will not take.
+    let mut elsewhere = doc(7);
+    let mut stray = elsewhere.transact(|tx| {
+        tx.register(b"stray", Scalar::Int(3));
+    })[0]
+        .clone();
+    stray.id.seq = 100;
+    stray.tx = Some(Tx { id, count: 2 });
+
+    let mut a = doc(7);
+    assert!(!a.apply(&stray), "held under the group it names");
+    assert_eq!(reg(&a, b"stray"), None);
+
+    let ops = a.atomic_transact(|tx| {
+        tx.register(b"m1", Scalar::Int(1));
+        tx.register(b"m2", Scalar::Int(2));
+    });
+    assert_eq!(tx_id(&ops[0]), id, "the group the stray named");
+    assert_eq!(
+        reg(&a, b"stray"),
+        Some(Scalar::Int(3)),
+        "the mint spent its key and left what it released in the buffer"
+    );
+}
+
+#[test]
+fn a_projection_serves_no_record_of_the_groups_it_withholds() {
+    // A key names an author and a group, never a partition, so a projection that kept
+    // one would count the groups a withheld partition resolved. It goes whole, and the
+    // recipient buckets a later stray as a group it has never seen resolve.
+    let (mut a, group) = pair();
+    let stray = a.transact(|tx| {
+        tx.register(b"loose", Scalar::Int(7));
+    });
+    let forged = retagged(&stray[0], tx_id(&group[0]), 2);
+    // The group's other member, writing its own key so the reading below proves both
+    // members landed rather than just one.
+    let partner = retagged(
+        &a.transact(|tx| {
+            tx.register(b"looser", Scalar::Int(8));
+        })[0],
+        tx_id(&group[0]),
+        2,
+    );
+
+    let mut room = doc(9);
+    for op in &group {
+        room.apply(op);
+    }
+    let served = room.encode_state();
+
+    let mut whole = Document::decode_state(&served).expect("decode");
+    assert!(
+        whole.apply(&forged),
+        "the unprojected replica holds the record and merges the stray"
+    );
+
+    let mut projected = Document::decode_state(&served).expect("decode");
+    projected.project_read_paths(|path| path != [b"x".to_vec()], None);
+    let mut reader = Document::decode_state(&projected.encode_state()).expect("decode");
+    assert!(
+        !reader.apply(&forged),
+        "the projection served its record of the withheld groups"
+    );
+    assert_eq!(
+        reg(&reader, b"loose"),
+        None,
+        "the stray is held, not applied"
+    );
+    // Held as a *bucket* rather than refused: a second member under that id completes
+    // the pair, which is what tells the two apart.
+    assert!(
+        reader.apply(&partner),
+        "the bucket completed on its second member"
+    );
+    assert_eq!(reg(&reader, b"loose"), Some(Scalar::Int(7)));
+    assert_eq!(reg(&reader, b"looser"), Some(Scalar::Int(8)));
+}
+
+#[test]
+fn a_decoded_member_of_a_spent_key_does_not_wait_on_it() {
+    // A snapshot can present both at once — a spent key and a member still tagged
+    // under it — which an honest encoder never holds together. Whatever the bytes
+    // carry, the member merges rather than waiting on a bucket the record has closed.
+    let (a, ops) = triple();
+    let id = tx_id(&ops[0]);
+    let shrunk: Vec<Op> = ops.iter().map(|op| retagged(op, id, 2)).collect();
+
+    // A replica holding the record, and one holding the stray still tagged.
+    let mut resolved = doc(9);
+    resolved.apply(&shrunk[0]);
+    resolved.apply(&shrunk[1]);
+    let with_record = resolved.encode_state();
+
+    // The committed bucket leaves the buffer empty, so the snapshot's last four bytes
+    // are its length; replacing them frames the stray as still held under the key.
+    assert_eq!(
+        with_record[with_record.len() - 4..],
+        [0, 0, 0, 0],
+        "the committed group left the buffer empty"
+    );
+    let framed = crdtsync_core::encode_ops(&[shrunk[2].clone()]);
+    let mut forged = with_record[..with_record.len() - 4].to_vec();
+    forged.extend_from_slice(&(framed.len() as u32).to_le_bytes());
+    forged.extend_from_slice(&framed);
+
+    let restored = Document::decode_state(&forged).expect("decode");
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(
+            reg(&restored, key),
+            reg(&a, key),
+            "member {key:?} waited on a bucket the record had closed"
+        );
+    }
+}
+
+#[test]
+fn a_resolved_group_key_survives_a_snapshot_restore() {
+    // The record rides `encode_state`: a stray of a key resolved before a restart
+    // has to land at the restored replica too, or a restore re-opens the hole the
+    // record closes.
+    let (a, ops) = triple();
+    let id = tx_id(&ops[0]);
+    let shrunk: Vec<Op> = ops.iter().map(|op| retagged(op, id, 2)).collect();
+
+    let mut b = doc(9);
+    b.apply(&shrunk[0]);
+    b.apply(&shrunk[1]);
+    let mut restored = Document::decode_state(&b.encode_state()).expect("decode");
+    assert!(
+        restored.apply(&shrunk[2]),
+        "the stray of a resolved key was held across the restore"
+    );
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&restored, key), reg(&a, key));
+    }
+
+    // And the restored replica re-encodes to the bytes it decoded from, the record
+    // included.
+    let settled = restored.encode_state();
+    assert_eq!(
+        Document::decode_state(&settled)
+            .expect("decode")
+            .encode_state(),
+        settled,
+        "the record is not byte-stable through a round-trip"
+    );
 }
 
 #[test]
@@ -1235,12 +1714,52 @@ fn evicting_a_partial_transaction_lands_its_members() {
         "an evicted member merges standalone"
     );
 
-    // A member arriving after its group was evicted is a group of its own again:
-    // it holds until the next eviction, which is why eviction is a policy the
-    // caller repeats rather than a one-off.
-    assert!(!b.apply(&ops[1]));
-    assert_eq!(b.evict_partial_transactions(), 1);
+    // Giving up on a group spends its bucket key, so a member arriving afterwards is
+    // a stray of a group this replica has already released rather than the first
+    // member of a fresh one — it merges standalone, without a second eviction. Two
+    // replicas on one policy would otherwise disagree over nothing but which of them
+    // had already ticked when the last member landed.
+    assert!(b.apply(&ops[1]), "the late member merges standalone");
+    assert_eq!(b.evict_partial_transactions(), 0, "nothing is left waiting");
     assert_eq!(reg(&b, b"y"), reg(&a, b"y"));
+}
+
+#[test]
+fn evicting_replicas_agree_whichever_of_them_had_ticked() {
+    // The record covers eviction because eviction resolves a bucket: one replica
+    // evicts between two members and the other after both, and they hold the same
+    // state — down to which keys each has spent, so a later stray lands at both.
+    let (mut a, ops) = pair();
+    let stray = a.transact(|tx| {
+        tx.register(b"late", Scalar::Int(9));
+    });
+    let forged = retagged(&stray[0], tx_id(&ops[0]), 2);
+
+    let mut early = doc(9);
+    early.apply(&ops[0]);
+    early.evict_partial_transactions();
+    early.apply(&ops[1]);
+    early.evict_partial_transactions();
+
+    let mut late = doc(9);
+    late.apply(&ops[0]);
+    late.apply(&ops[1]);
+    late.evict_partial_transactions();
+
+    assert_eq!(
+        early.encode_state(),
+        late.encode_state(),
+        "when each replica ticked decided its state"
+    );
+    // And the keys each spent agree, which is what the stray reads: it merges at both
+    // or neither, and the two are still byte-identical once it has.
+    assert_eq!(early.apply(&forged), late.apply(&forged));
+    assert_eq!(reg(&early, b"late"), reg(&late, b"late"));
+    assert_eq!(
+        early.encode_state(),
+        late.encode_state(),
+        "the stray read a different record at each"
+    );
 }
 
 #[test]
