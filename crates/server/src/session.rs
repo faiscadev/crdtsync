@@ -3,8 +3,8 @@
 //! A [`Session`] is one client connection. [`step`] sequences the protocol —
 //! Hello, then Subscribe, then a stream of Ops — turning each inbound
 //! [`Message`] into hub mutations plus a [`Response`]: messages to reply to
-//! this client, ops to broadcast to the room's other subscribers, and whether
-//! to close. Anything out of order is a protocol violation. Pure logic; the
+//! this client, ops to broadcast to the room's other subscribed channels, and
+//! whether to close. Anything out of order is a protocol violation. Pure logic; the
 //! async transport drives it.
 
 use std::collections::{HashMap, HashSet};
@@ -334,8 +334,8 @@ pub struct AwarenessBroadcast {
 }
 
 /// What a [`step`] yields: replies to this client, ops to broadcast to the
-/// other subscribers of `broadcast_room`, an ephemeral awareness entry to fan
-/// out, and whether the connection should close. The broadcast fields are
+/// other subscribed channels of `broadcast_room`, an ephemeral awareness entry
+/// to fan out, and whether the connection should close. The broadcast fields are
 /// `None`/empty when there is nothing to fan out.
 #[derive(Default)]
 pub struct Response {

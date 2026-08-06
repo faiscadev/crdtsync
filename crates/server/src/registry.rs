@@ -2165,8 +2165,6 @@ impl Registry {
         };
         // The channel a write arrives on — the one replica in the room that
         // already holds its ops, and so the only one the fan-out below omits.
-        // A write is the sole source of a broadcast, so this is present for
-        // every batch there is to fan out.
         let write_channel: Option<Channel> = match &msg {
             Message::Ops { channel, .. } | Message::CrossZoneOps { channel, .. } => Some(*channel),
             _ => None,
@@ -2572,21 +2570,19 @@ impl Registry {
                 }
             }
         }
-        // Awareness is ephemeral: fan the entry out to the room's other
-        // subscribers on each peer's channel; nothing is echoed back to the
-        // originating connection.
+        // Awareness is ephemeral: fan the entry out on each other subscriber's
+        // channel. Presence is connection-scoped, so the *whole* originating
+        // connection is excluded — unlike the op fan-out above, which omits only
+        // the authoring channel. A connection holds one presence entry per room,
+        // keyed by its Hello client id and its authenticated actor, both of which
+        // its channels share: a sibling channel's set replaces this one rather
+        // than coexisting with it, and an update carries only the actor, so an
+        // echo would hand a client its own presence back as a peer's with nothing
+        // on the wire to tell the two apart.
         if let Some(a) = awareness {
             let schema = self.governing_schema(&a.room);
             let authorizer = &*self.authorizer;
             for (peer, conn) in self.conns.iter_mut() {
-                // Presence is connection-scoped, so the *whole* originating
-                // connection is excluded — unlike the op fan-out above, which omits
-                // only the authoring channel. A connection holds one presence entry
-                // per room, keyed by its Hello client id and its authenticated actor,
-                // both of which its channels share: a sibling channel's set replaces
-                // this one rather than coexisting with it, and an update carries only
-                // the actor, so an echo would hand a client its own presence back as a
-                // peer's with nothing on the wire to tell the two apart.
                 if *peer == id {
                     continue;
                 }

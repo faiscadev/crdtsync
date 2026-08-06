@@ -157,14 +157,7 @@ fn subscribe(r: &mut Registry, id: ConnId, zone: &[u8]) -> Vec<Message> {
 }
 
 fn write(r: &mut Registry, id: ConnId, ops: Vec<Op>) {
-    assert!(r.deliver(
-        id,
-        Message::Ops {
-            channel: Channel(0),
-            ops
-        }
-    ));
-    r.take_outbox(id);
+    submit(r, id, ops);
 }
 
 /// Write on channel 0 and hand back what the delivery queued for `id` itself —
@@ -205,13 +198,7 @@ fn flatten(msgs: &[Message]) -> Vec<Op> {
 
 /// The ops delivered to `id`, flattened across every `Ops` frame in its outbox.
 fn received_ops(r: &mut Registry, id: ConnId) -> Vec<Op> {
-    r.take_outbox(id)
-        .into_iter()
-        .flat_map(|m| match m {
-            Message::Ops { ops, .. } => ops,
-            _ => Vec::new(),
-        })
-        .collect()
+    flatten(&r.take_outbox(id))
 }
 
 /// Whether `ops` carry a `RegisterSet` of `key` — the marker each content write
