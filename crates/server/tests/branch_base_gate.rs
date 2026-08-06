@@ -311,9 +311,9 @@ fn an_element_scoped_deny_resolves_against_the_restored_branchs_own_base() {
 
 #[test]
 fn a_path_scoped_deny_narrows_the_restored_branchs_base_too() {
-    // A path scope resolves without a tree, so this half always narrowed — it pins that
-    // the element shape is the only thing the gate's index decided, and that the branch
-    // seam projects at all.
+    // A path scope resolves without a tree, so this half always narrowed. It is also
+    // the coverage for the skip: a room whose tuples are all paths hands the gate the
+    // live index and never decodes the branch's bytes, and its verdict is the same.
     let mut r = restored_room(Deny::Path);
     let snapshot = plain_snapshot(&mut r, 2, "t-bob");
     assert_eq!(nested(&snapshot, b"a", b"aseed"), Some(0));

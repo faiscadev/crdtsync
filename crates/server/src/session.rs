@@ -764,7 +764,8 @@ pub fn step(
                     // (C32). So resolve against the bytes being handed out. Only an
                     // element scope needs a tree at all — a path scope names its own
                     // position and governs whatever occupies it — so a room holding
-                    // none pays neither the decode nor the walk.
+                    // none skips the added decode and walk, nothing consulting the
+                    // index it is then handed.
                     let resolves_elements = records
                         .iter()
                         .any(|r| matches!(r.tuple.scope, AclScope::Element(_)));
@@ -774,7 +775,7 @@ pub fn step(
                         match Document::decode_state(&state) {
                             Ok(doc) => Some(crate::index::element_paths(&doc)),
                             // A stored base that does not decode is already refused
-                            // upstream ([`Catchup::Unavailable`]), so what arrives here
+                            // upstream (`Catchup::Unavailable`), so what arrives here
                             // was materialized this instant by this build. The arm holds
                             // because neither fallback is an answer: the live index
                             // reinstates the very inert deny this resolves, and an empty
@@ -1860,9 +1861,9 @@ fn zone_readable(
 
 /// Narrow a whole-replica state to what one recipient may read: the doc-ACL path
 /// projection, then the zone projection, in that order. **The one composition every
-/// seam that hands a client a state blob runs** — the subscribe catch-up snapshot and
-/// the named-version fetch — so a redaction added to it cannot reach one seam and miss
-/// the other, which is the failure this composition exists to answer.
+/// seam that hands a client a state blob runs** — the subscribe catch-up snapshot, the
+/// named-version fetch, and each side of a diff query — so a redaction added to it
+/// cannot reach one seam and miss the others, which is the failure it exists to answer.
 ///
 /// Read-then-zone is the order the catch-up seam has always used, preserved verbatim
 /// by the extraction rather than re-derived. It is not a containment property: running
@@ -1878,8 +1879,10 @@ fn zone_readable(
 /// can be fed an index from a different tree than the bytes. It must not be: an element
 /// scope that resolves to no path is inert, an inert deny is no deny, and a gate that
 /// finds none serves the state whole. Every caller passes the tree its own bytes are:
-/// the version fetch the version's, the catch-up snapshot the live room's on `main` and
-/// the branch's owned base with its divergent tail folded in on a branch (C32).
+/// the version fetch the version's, each diff side its own decoded state, the catch-up
+/// snapshot the live room's on `main` and the branch's owned base with its divergent
+/// tail folded in on a branch (C32) — except where the room holds no element-scoped
+/// tuple at all, when nothing consults the index and any tree answers the same.
 /// `records.is_empty()` (a room with no doc-ACL state) or a whole-document verdict
 /// skips the read projection; [`zone_narrowing`] decides the zone one.
 #[allow(clippy::too_many_arguments)]
