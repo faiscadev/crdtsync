@@ -15,7 +15,7 @@
 //! create racing a *delete* of its key still encodes two ways — the tombstone
 //! remembers a container it saw installed and not one whose create it outranked —
 //! which is a rule about what a deleted-container tombstone records, not about
-//! what a replica holds. That is C61, and it is unaffected by anything here.
+//! what a replica holds. That is C68, and it is unaffected by anything here.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::{Element, Op, Scalar};
