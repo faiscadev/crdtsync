@@ -987,7 +987,7 @@ impl Registry {
     /// which the caller flushes.
     ///
     /// The reap also carries into the replication bookkeeping: each reaped member's
-    /// acknowledged watermarks go with it ([`Replication::forget_member`]), so the map
+    /// acknowledged watermarks go with it ([`Replication::forget_members`]), so the map
     /// stays keyed on the roster rather than on departed members, and a member that
     /// returns is caught up from nothing instead of from a position it may no longer
     /// hold. [`record_replica_ack`](Self::record_replica_ack) keeps it that way — a
@@ -1005,13 +1005,11 @@ impl Registry {
         let Some(membership) = &mut self.membership else {
             return;
         };
-        let reaped = membership.reap_dead();
+        let reaped: HashSet<NodeId> = membership.reap_dead().into_iter().collect();
         if reaped.is_empty() {
             return;
         }
-        for node in &reaped {
-            self.replication.forget_member(node);
-        }
+        self.replication.forget_members(&reaped);
         self.release_pending_acks(None);
     }
 

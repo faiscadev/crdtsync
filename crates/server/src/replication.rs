@@ -14,7 +14,7 @@
 //! watermark is what a later majority-ack durability unit reads to decide a
 //! write is safely replicated; this unit only records it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crdtsync_core::Message;
 
@@ -71,8 +71,9 @@ impl Replication {
         self.acked.insert((room.to_vec(), follower), through_seq);
     }
 
-    /// Drop every room's watermark held for `node` — the member-reap seam. A reaped
-    /// member leaves the roster and every room's replica set, and should it return it
+    /// Drop every room's watermark held for any of `nodes` — the member-reap seam,
+    /// which reaps a whole round's departures at once and so walks the map once. A
+    /// reaped member leaves the roster and every room's replica set, and should it return it
     /// returns as a fresh join whose durable state this leader has no proof of, so the
     /// positions it once acked are no longer anything to serve it from: keeping them
     /// grows the map on ids no replica set names any more and answers
@@ -81,8 +82,9 @@ impl Replication {
     /// no quorum, and it is caught up from nothing (the retained log from its base, or a
     /// whole-replica snapshot for a room compacted past it) rather than served a tail
     /// past a floor the member may no longer hold.
-    pub fn forget_member(&mut self, node: &NodeId) {
-        self.acked.retain(|(_room, follower), _| follower != node);
+    pub fn forget_members(&mut self, nodes: &HashSet<NodeId>) {
+        self.acked
+            .retain(|(_room, follower), _| !nodes.contains(follower));
     }
 
     /// The server sequence `follower` has acknowledged for `room` — `0` if it has
