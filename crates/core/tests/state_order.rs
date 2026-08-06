@@ -305,6 +305,6 @@ fn a_snapshot_presenting_a_disordered_buffer_re_encodes_in_op_id_order() {
     let back = Document::decode_state(&disordered).expect("decode");
     assert!(
         holds_buffer(&back.encode_state(), &[late, early]),
-        "a disordered buffer is re-served as it arrived"
+        "a disordered buffer was re-served in the order it arrived"
     );
 }
