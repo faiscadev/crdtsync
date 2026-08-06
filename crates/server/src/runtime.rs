@@ -766,9 +766,7 @@ async fn registry_actor(
                 reg.sweep();
                 // Reap members dead past the bounded dead-time, on the same cadence
                 // as the presence sweep — a durably-gone node stops lingering in the
-                // placement set. Inert in single-node mode. The reap re-places rooms,
-                // so it can carry a withheld client `Accepted` to its majority and
-                // queue it; the flush below is what sends it.
+                // placement set. Inert in single-node mode.
                 reg.reap_dead_members();
                 flush(&mut reg, &mut peers);
             }
