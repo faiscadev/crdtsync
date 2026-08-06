@@ -1535,8 +1535,9 @@ fn handle_ops(
     // its ops are logged untagged (`None`, relay-like) and pass verbatim on both the
     // live and the catch-up seam, exactly as the fan-out already leaves them.
     let write_version = governing_target(governing, session).map(|(_, _, client)| client);
-    // The deduped ops fan out to the `(room, branch)` stream's other subscribers;
-    // nothing echoes back to the sender. A `main` write appends to the room's log as
+    // The deduped ops fan out to the `(room, branch)` stream's other subscribed
+    // replicas — the authoring channel's own excepted, its connection's other
+    // channels included. A `main` write appends to the room's log as
     // today; a branch write appends to that branch's divergent tail, advancing its
     // head, never main's. A hub that cannot durably record the ops rejects the write
     // rather than advertising an unpersisted one.

@@ -3,8 +3,8 @@
 //! A [`Registry`] holds every live connection, each with its own session and
 //! an outbox of messages awaiting send. [`Registry::deliver`] drives one
 //! connection's session, queues its replies, and fans a broadcast out to the
-//! room's other connections. Pure, synchronous routing; the async transport
-//! pumps bytes through it.
+//! room's other subscribed channels. Pure, synchronous routing; the async
+//! transport pumps bytes through it.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -12,7 +12,9 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use crdtsync_core::schema::Trigger;
-use crdtsync_core::{ClientId, ElementId, ErrorCode, MemberState, Message, Op, OpKind, Schema};
+use crdtsync_core::{
+    Channel, ClientId, ElementId, ErrorCode, MemberState, Message, Op, OpKind, Schema,
+};
 use subtle::ConstantTimeEq;
 
 use crate::acl::authorized;
@@ -41,6 +43,43 @@ const DEFAULT_GRACE_MILLIS: u64 = 5000;
 /// A live connection's handle, minted by [`Registry::connect`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConnId(u64);
+
+/// The replica a write is not fanned back to: the connection that submitted it
+/// and the channel on that connection which authored it.
+///
+/// The exclusion is per *channel*, not per connection. A connection multiplexes
+/// several subscriptions and two of them may name one room; each holds its own
+/// replica under its own [`ClientId::for_channel`] author, so a sibling channel
+/// is as distinct a recipient as a peer connection is — it converges, and its
+/// seen sequence advances, only if the write actually reaches it. Only the
+/// authoring channel, whose replica already folded the ops locally, is skipped.
+///
+/// Channel handles are numbered per connection, so the exclusion binds to
+/// `conn`: a peer that happens to have opened the same handle is untouched.
+#[derive(Clone, Copy)]
+struct WriteOrigin {
+    conn: ConnId,
+    channel: Channel,
+}
+
+impl WriteOrigin {
+    /// The channels of `peer`'s subscription to `(room, branch)` that receive
+    /// this write — every one it bound to the stream, minus the authoring
+    /// channel when `peer` is the authoring connection.
+    fn recipients(
+        &self,
+        peer: ConnId,
+        session: &Session,
+        room: &[u8],
+        branch: &[u8],
+    ) -> Vec<Channel> {
+        let mut channels = session.channels_for_stream(room, branch);
+        if peer == self.conn {
+            channels.retain(|c| *c != self.channel);
+        }
+        channels
+    }
+}
 
 /// One connection: its protocol session and the messages queued to send it.
 struct Conn {
@@ -1711,17 +1750,17 @@ impl Registry {
     /// among the room's same-app recipients, resolved once (the registry is
     /// locked only here, not across the fan-out). A target whose chain is
     /// unreachable, gapped, or unparseable maps to `None`, so the fan-out drops
-    /// that recipient's batch rather than serving it wrong.
+    /// that recipient's batch rather than serving it wrong. Every connection is
+    /// a candidate — the writing one included, since its sibling channels
+    /// receive the write — so the memo is total over what the fan-out walks.
     fn resolve_chains(
         &self,
-        writer: &ConnId,
         app: &[u8],
         from: u32,
     ) -> HashMap<u32, Option<crate::translate::Chain>> {
         let targets: HashSet<u32> = self
             .conns
             .iter()
-            .filter(|(peer, _)| *peer != writer)
             .filter(|(_, conn)| conn.session.app_id() == app)
             .filter_map(|(_, conn)| conn.session.schema_version())
             .filter(|target| *target != from)
@@ -1759,7 +1798,7 @@ impl Registry {
     /// carved by a subtree deny, not the whole-document reader alone (C52).
     fn fan_out_ops_redacted(
         &mut self,
-        writer: ConnId,
+        origin: WriteOrigin,
         room: &[u8],
         branch: &[u8],
         broadcast: &[Op],
@@ -1790,10 +1829,10 @@ impl Registry {
             .collect();
         // Migration translation rides the same seam as redaction (scoped to the
         // room's governing app); resolve each distinct target's chain once.
-        let source = self.translation_source(room, &writer, broadcast_version);
+        let source = self.translation_source(room, &origin.conn, broadcast_version);
         let chains = source
             .as_ref()
-            .map(|(app, from)| self.resolve_chains(&writer, app, *from));
+            .map(|(app, from)| self.resolve_chains(app, *from));
         let authorizer = &*self.authorizer;
         // The nodes this batch relocates. A move that carries a node into a subtree a
         // recipient can read, out of one it could not, reveals a born-denied node to
@@ -1813,7 +1852,13 @@ impl Registry {
             })
             .collect();
         for (peer, conn) in self.conns.iter_mut() {
-            if *peer == writer {
+            // The channels this connection receives the write on — its whole
+            // subscription to the stream, minus the channel that authored it.
+            // Resolved before the per-recipient redaction so a connection with
+            // nothing to receive (unsubscribed, or the author's sole channel)
+            // costs no path walk.
+            let channels = origin.recipients(*peer, &conn.session, room, branch);
+            if channels.is_empty() {
                 continue;
             }
             let Some(identity) = conn.session.identity() else {
@@ -1951,7 +1996,7 @@ impl Registry {
             if translated.is_empty() {
                 continue;
             }
-            for channel in conn.session.channels_for_stream(room, branch) {
+            for channel in channels {
                 // Narrow to the channel's authorized zone partitions — the wire
                 // redaction for per-zone streams. A channel scoped to a subset of the
                 // room's zones drops the rest; an unauthorized zone never surfaces,
@@ -2012,8 +2057,8 @@ impl Registry {
     }
 
     /// Drive one inbound message through the connection's session, queueing its
-    /// replies and fanning any broadcast out to the room's other connections.
-    /// Returns whether the connection should stay open.
+    /// replies and fanning any broadcast out to the room's other subscribed
+    /// channels. Returns whether the connection should stay open.
     pub fn deliver(&mut self, id: ConnId, msg: Message) -> bool {
         // The cluster secret admits this connection to the peer plane. Handled
         // ahead of everything else and never answered: a wrong or unconfigured
@@ -2116,6 +2161,14 @@ impl Registry {
         // once the subscribe is known to have been accepted below.
         let subscribed_room = match &msg {
             Message::Subscribe { room, .. } => Some(room.clone()),
+            _ => None,
+        };
+        // The channel a write arrives on — the one replica in the room that
+        // already holds its ops, and so the only one the fan-out below omits.
+        // A write is the sole source of a broadcast, so this is present for
+        // every batch there is to fan out.
+        let write_channel: Option<Channel> = match &msg {
+            Message::Ops { channel, .. } | Message::CrossZoneOps { channel, .. } => Some(*channel),
             _ => None,
         };
         // The room this message authorizes against, so its enforcement composes
@@ -2393,14 +2446,22 @@ impl Registry {
             }
         }
         // A broadcast holds only ops the hub durably logged (see `Hub::ingest`),
-        // so fanning it out never advertises an unpersisted write. Each peer is
-        // sent the ops on the channel it opened for the room, so a peer
+        // so fanning it out never advertises an unpersisted write. Each recipient
+        // is sent the ops on the channel it opened for the room, so a connection
         // multiplexing several rooms can route what it receives.
         if !broadcast.is_empty() {
+            // A write is the sole source of a broadcast, so the channel it
+            // arrived on is present for every batch there is to fan out.
+            debug_assert!(write_channel.is_some(), "a broadcast with no author");
             // A broadcast is scoped to its `(room, branch)` stream: an `Ops` write
             // always names both, so a branch write reaches only that branch's
             // subscribers and never crosses into another branch's stream.
-            if let (Some(room), Some(branch)) = (room, broadcast_branch) {
+            if let (Some(room), Some(branch), Some(channel)) =
+                (room, broadcast_branch, write_channel)
+            {
+                // The write's authoring replica, the one this fan-out omits — the
+                // channel it arrived on, not the whole connection that sent it.
+                let origin = WriteOrigin { conn: id, channel };
                 // A room with live doc-ACL tuples redacts per-recipient by the op's
                 // document path — a recipient receives only the ops in subtrees its
                 // actor may read. A room with none (the `else`) fans out unredacted:
@@ -2409,7 +2470,7 @@ impl Registry {
                 let records = self.hub.acl_records(&room);
                 if !records.is_empty() {
                     self.fan_out_ops_redacted(
-                        id,
+                        origin,
                         &room,
                         &branch,
                         &broadcast,
@@ -2441,7 +2502,7 @@ impl Registry {
                     // translate the peer loop against the owned, parsed chains.
                     let chains = source
                         .as_ref()
-                        .map(|(app, from)| self.resolve_chains(&id, app, *from));
+                        .map(|(app, from)| self.resolve_chains(app, *from));
                     // Translate the batch once per distinct target version — the
                     // rewrite depends only on the version, not the recipient, so a
                     // same-version fleet shares one result. A resolved chain
@@ -2461,7 +2522,12 @@ impl Registry {
                         })
                         .collect();
                     for (peer, conn) in self.conns.iter_mut() {
-                        if *peer == id {
+                        // The channels this connection receives the write on — its
+                        // whole subscription to the stream, minus the channel that
+                        // authored it. Resolved first, so a connection with nothing
+                        // to receive costs no read verdict.
+                        let channels = origin.recipients(*peer, &conn.session, &room, &branch);
+                        if channels.is_empty() {
                             continue;
                         }
                         // Per-recipient redaction: a peer whose read was revoked
@@ -2488,7 +2554,7 @@ impl Registry {
                         if ops.is_empty() {
                             continue;
                         }
-                        for channel in conn.session.channels_for_stream(&room, &branch) {
+                        for channel in channels {
                             // Narrow to the channel's authorized zone partitions — the
                             // per-zone wire redaction. A channel scoped to a subset of
                             // the room's zones drops the rest, so an unauthorized zone
@@ -2513,6 +2579,14 @@ impl Registry {
             let schema = self.governing_schema(&a.room);
             let authorizer = &*self.authorizer;
             for (peer, conn) in self.conns.iter_mut() {
+                // Presence is connection-scoped, so the *whole* originating
+                // connection is excluded — unlike the op fan-out above, which omits
+                // only the authoring channel. A connection holds one presence entry
+                // per room, keyed by its Hello client id and its authenticated actor,
+                // both of which its channels share: a sibling channel's set replaces
+                // this one rather than coexisting with it, and an update carries only
+                // the actor, so an echo would hand a client its own presence back as a
+                // peer's with nothing on the wire to tell the two apart.
                 if *peer == id {
                     continue;
                 }
