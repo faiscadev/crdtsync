@@ -44,22 +44,32 @@ const DEFAULT_GRACE_MILLIS: u64 = 5000;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConnId(u64);
 
-/// The replica a write is not fanned back to: the connection that submitted it
-/// and the channel on that connection which authored it.
+/// Where a committed batch entered this node, and with it the replica the
+/// fan-out does not send it back to.
 ///
-/// The exclusion is per *channel*, not per connection. A connection multiplexes
-/// several subscriptions and two of them may name one room; each holds its own
-/// replica under its own [`ClientId::for_channel`] author, so a sibling channel
-/// is as distinct a recipient as a peer connection is — it converges, and its
-/// seen sequence advances, only if the write actually reaches it. Only the
-/// authoring channel, whose replica already folded the ops locally, is skipped.
+/// A [`Local`](WriteOrigin::Local) write excludes per *channel*, not per
+/// connection. A connection multiplexes several subscriptions and two of them
+/// may name one room; each holds its own replica under its own
+/// [`ClientId::for_channel`] author, so a sibling channel is as distinct a
+/// recipient as a peer connection is — it converges, and its seen sequence
+/// advances, only if the write actually reaches it. Only the authoring channel,
+/// whose replica already folded the ops locally, is skipped. Channel handles are
+/// numbered per connection, so that exclusion binds to `conn`: a peer that
+/// happens to have opened the same handle is untouched.
 ///
-/// Channel handles are numbered per connection, so the exclusion binds to
-/// `conn`: a peer that happens to have opened the same handle is untouched.
+/// A [`Replicated`](WriteOrigin::Replicated) batch arrived from the room's
+/// leader, so **no** local replica already holds it and the exclusion set is
+/// empty: every channel subscribed to the stream is a recipient. It also has no
+/// local author, and so no author's declared schema version to translate a
+/// migration from — the relay seam carries the leader's ops untagged, exactly as
+/// the follower logs them and exactly as its own catch-up replays them.
 #[derive(Clone, Copy)]
-struct WriteOrigin {
-    conn: ConnId,
-    channel: Channel,
+enum WriteOrigin {
+    /// Authored on this node by `channel` of `conn`, whose replica folded it
+    /// locally before it was submitted.
+    Local { conn: ConnId, channel: Channel },
+    /// Ingested from the room's leader on the replication plane.
+    Replicated,
 }
 
 impl WriteOrigin {
@@ -74,10 +84,22 @@ impl WriteOrigin {
         branch: &[u8],
     ) -> Vec<Channel> {
         let mut channels = session.channels_for_stream(room, branch);
-        if peer == self.conn {
-            channels.retain(|c| *c != self.channel);
+        if let WriteOrigin::Local { conn, channel } = self {
+            if peer == *conn {
+                channels.retain(|c| c != channel);
+            }
         }
         channels
+    }
+
+    /// The connection that authored this batch on this node, if any — the
+    /// declared-app authority a migration's source version is read against. A
+    /// replicated batch has none.
+    fn author(&self) -> Option<ConnId> {
+        match self {
+            WriteOrigin::Local { conn, .. } => Some(*conn),
+            WriteOrigin::Replicated => None,
+        }
     }
 }
 
@@ -792,13 +814,26 @@ impl Registry {
         // Ingest through the same path a client `Ops` write uses. A replicated write
         // carries no schema version — the leader logs its writers' ops untagged on the
         // relay seam, and the follower mirrors them verbatim.
-        if self.hub.ingest(&room, ops, None).is_err() {
+        let Ok(applied) = self.hub.ingest(&room, ops, None) else {
             return false;
-        }
+        };
         // After the ingest: the room must exist for the root to land on it, and the
         // frame that first creates it is the one that names it.
         if let Some(creator) = &creator {
             self.hub.ensure_creator(&room, creator);
+        }
+        // Serve this node's own subscribers. A follower is an ordinary read-serving
+        // node, so a client subscribed here is subscribed to a stream the leader is
+        // the sole author of, and its replica advances on exactly what this seam
+        // delivers. Fanned out after the creator lands, since the redaction the
+        // fan-out applies is decided against the room's authority root.
+        //
+        // The exclusion set is empty: the batch was authored on the leader, so no
+        // channel here already holds it. Everything else the fan-out decides —
+        // per-recipient reads, zone scoping, migration translation — is re-decided
+        // against this replica, never inherited from the leader ([`fan_out_ops`](Registry::fan_out_ops)).
+        if !applied.is_empty() {
+            self.fan_out_ops(WriteOrigin::Replicated, &room, MAIN_BRANCH, &applied, None);
         }
         let through_seq = self.hub.seq(&room);
         if let Some(conn) = self.conns.get_mut(&id) {
@@ -1739,19 +1774,20 @@ impl Registry {
 
     /// The `(app, version)` a broadcast is translated *from*, or `None` when it
     /// needs no translation. Migration translation walks the room's governing
-    /// app's chain, so it applies only when the write carried a version and the
-    /// writer speaks that same app — a relay write, an unbound room, or a
+    /// app's chain, so it applies only when the write carried a version and its
+    /// author speaks that same app — a relay write, an unbound room, or a
     /// foreign-app write (whose version number is a different app's space) is
-    /// left verbatim.
+    /// left verbatim. A [`Replicated`](WriteOrigin::Replicated) batch has no
+    /// author on this node and arrives untagged, so it is left verbatim too.
     fn translation_source(
         &self,
         room: &[u8],
-        writer: &ConnId,
+        origin: &WriteOrigin,
         version: Option<u32>,
     ) -> Option<(Vec<u8>, u32)> {
         let from = version?;
         let (app, _) = self.room_apps.get(room)?;
-        let writer_app = self.conns.get(writer)?.session.app_id();
+        let writer_app = self.conns.get(&origin.author()?)?.session.app_id();
         (writer_app == app.as_slice()).then(|| (app.clone(), from))
     }
 
@@ -1790,6 +1826,158 @@ impl Registry {
                 )
             })
             .collect()
+    }
+
+    /// Fan a committed op batch out to `(room, branch)`'s subscribers, whatever
+    /// brought it in — a local client's write or the room's leader replicating
+    /// one onto this follower. A room holding live doc-ACL tuples redacts
+    /// per-recipient by the op's document path
+    /// ([`fan_out_ops_redacted`](Registry::fan_out_ops_redacted)); a room holding
+    /// none takes the plain path ([`fan_out_ops_plain`](Registry::fan_out_ops_plain))
+    /// — the whole-document read gate plus per-target migration translation, no
+    /// path walk.
+    ///
+    /// **Every verdict on this seam is re-decided here, against the state this
+    /// node is serving.** For a replicated batch that is the point: what the
+    /// leader computed was a verdict for *its own* subscribers, a different set of
+    /// actors holding different grants at different schema versions under
+    /// different zone scopes, and the wire frame carries none of it — the leader
+    /// relays the committed ops verbatim and untagged. Reusing it would be reusing
+    /// an answer to another question; so the follower resolves the room's creator,
+    /// its ACL tuples, its governing schema and each recipient's read from its own
+    /// replica, which is the state being served (C28).
+    fn fan_out_ops(
+        &mut self,
+        origin: WriteOrigin,
+        room: &[u8],
+        branch: &[u8],
+        broadcast: &[Op],
+        broadcast_version: Option<u32>,
+    ) {
+        // Both paths resolve the room's creator, its ACL tuples, its element-path
+        // index and its element types before they reach a recipient, and each of
+        // those walks the whole room document. A stream nobody has bound a channel
+        // to has no recipient to resolve them for, so it costs nothing at all —
+        // which is the steady state of a replica: a room is replicated to every
+        // node in its set and subscribed on few of them. The bound-channel set is a
+        // superset of what `recipients` keeps (it omits only the authoring channel
+        // of a local write), so an empty one delivers nothing either way.
+        let served = self
+            .conns
+            .values()
+            .any(|conn| !conn.session.channels_for_stream(room, branch).is_empty());
+        if !served {
+            return;
+        }
+        let records = self.hub.acl_records(room);
+        if records.is_empty() {
+            self.fan_out_ops_plain(origin, room, branch, broadcast, broadcast_version);
+        } else {
+            self.fan_out_ops_redacted(origin, room, branch, broadcast, broadcast_version, records);
+        }
+    }
+
+    /// Fan a committed op batch out to `(room, branch)`'s subscribers of a room
+    /// with no doc-ACL tuples: the whole-document read gate per recipient, then
+    /// per-target migration translation, then the per-channel zone filter. No
+    /// path walk — there are no per-path verdicts to resolve.
+    fn fan_out_ops_plain(
+        &mut self,
+        origin: WriteOrigin,
+        room: &[u8],
+        branch: &[u8],
+        broadcast: &[Op],
+        broadcast_version: Option<u32>,
+    ) {
+        // The room's governing schema gates each peer's read consistently,
+        // resolved once (owned) so the peer loop can borrow the conns.
+        let schema = self.governing_schema(room);
+        let authorizer = &*self.authorizer;
+        // The owning-element type of each op, resolved once over the room
+        // document, so a type-scoped migration step narrows to the ops whose
+        // owning element is of its declared type. Empty (no narrowing) when the
+        // room binds no schema.
+        let types = schema
+            .as_ref()
+            .map(|s| self.hub.element_types(room, s))
+            .unwrap_or_default();
+        // Per-recipient migration translation rides the same seam as redaction. It
+        // is scoped to the room's governing app: the write is translated only when
+        // the writer speaks that app (its version number lives in that app's
+        // space), and only to recipients of that app — a foreign-app connection's
+        // version is a different space and must never drive the room's chain.
+        let source = self.translation_source(room, &origin, broadcast_version);
+        // Resolve every distinct target version's chain up front, holding the
+        // registry lock only for that (not across the fan-out), then translate the
+        // peer loop against the owned, parsed chains.
+        let chains = source
+            .as_ref()
+            .map(|(app, from)| self.resolve_chains(app, *from));
+        // Translate the batch once per distinct target version — the rewrite
+        // depends only on the version, not the recipient, so a same-version fleet
+        // shares one result. A resolved chain translates; an unresolved one
+        // (unreachable / gapped / unparseable) yields an empty batch, dropping it
+        // for that target's recipients pending the handshake range-check that
+        // refuses them outright.
+        let translated_by_target: HashMap<u32, Vec<Op>> = chains
+            .iter()
+            .flatten()
+            .map(|(target, chain)| {
+                let ops = match chain {
+                    Some(chain) => chain.translate_ops_scoped(broadcast, &types),
+                    None => Vec::new(),
+                };
+                (*target, ops)
+            })
+            .collect();
+        for (peer, conn) in self.conns.iter_mut() {
+            // The channels this connection receives the write on — its whole
+            // subscription to the stream, minus the channel that authored it.
+            // Resolved first, so a connection with nothing to receive costs no
+            // read verdict.
+            let channels = origin.recipients(*peer, &conn.session, room, branch);
+            if channels.is_empty() {
+                continue;
+            }
+            // Per-recipient redaction: a peer whose read was revoked mid-session
+            // stops receiving the room's ops at once, without waiting for it to
+            // resubscribe.
+            if !peer_may_read(authorizer, schema.as_deref(), &conn.session, room) {
+                continue;
+            }
+            // Translate to the recipient's version, or send verbatim when there is
+            // nothing to bridge — a same-version, relay, or foreign-app recipient,
+            // or a relay write.
+            let translated = match (&source, conn.session.schema_version()) {
+                (Some((app, from)), Some(target))
+                    if conn.session.app_id() == app && target != *from =>
+                {
+                    // Total over every eligible recipient: `resolve_chains` keyed
+                    // the memo on this same (same-app, target != from) predicate,
+                    // so the target is always present.
+                    Some(translated_by_target[&target].as_slice())
+                }
+                _ => None,
+            };
+            let ops = translated.unwrap_or(broadcast);
+            if ops.is_empty() {
+                continue;
+            }
+            for channel in channels {
+                // Narrow to the channel's authorized zone partitions — the
+                // per-zone wire redaction. A channel scoped to a subset of the
+                // room's zones drops the rest, so an unauthorized zone never
+                // surfaces on it; an emptied channel gets no frame.
+                let zoned = conn.session.zone_filter(channel, ops);
+                if zoned.is_empty() {
+                    continue;
+                }
+                conn.outbox.push(Message::Ops {
+                    channel,
+                    ops: zoned,
+                });
+            }
+        }
     }
 
     /// Fan a committed op batch out to `(room, branch)`'s subscribers with
@@ -1838,7 +2026,7 @@ impl Registry {
             .collect();
         // Migration translation rides the same seam as redaction (scoped to the
         // room's governing app); resolve each distinct target's chain once.
-        let source = self.translation_source(room, &origin.conn, broadcast_version);
+        let source = self.translation_source(room, &origin, broadcast_version);
         let chains = source
             .as_ref()
             .map(|(app, from)| self.resolve_chains(app, *from));
@@ -2516,115 +2704,8 @@ impl Registry {
             {
                 // The write's authoring replica, the one this fan-out omits — the
                 // channel it arrived on, not the whole connection that sent it.
-                let origin = WriteOrigin { conn: id, channel };
-                // A room with live doc-ACL tuples redacts per-recipient by the op's
-                // document path — a recipient receives only the ops in subtrees its
-                // actor may read. A room with none (the `else`) fans out unredacted:
-                // the whole-document read gate plus per-target migration translation,
-                // no path walk.
-                let records = self.hub.acl_records(&room);
-                if !records.is_empty() {
-                    self.fan_out_ops_redacted(
-                        origin,
-                        &room,
-                        &branch,
-                        &broadcast,
-                        broadcast_version,
-                        records,
-                    );
-                } else {
-                    // The room's governing schema gates each peer's read consistently,
-                    // resolved once (owned) so the peer loop can borrow the conns.
-                    let schema = self.governing_schema(&room);
-                    let authorizer = &*self.authorizer;
-                    // The owning-element type of each op, resolved once over the room
-                    // document, so a type-scoped migration step narrows to the ops
-                    // whose owning element is of its declared type. Empty (no
-                    // narrowing) when the room binds no schema.
-                    let types = schema
-                        .as_ref()
-                        .map(|s| self.hub.element_types(&room, s))
-                        .unwrap_or_default();
-                    // Per-recipient migration translation rides the same seam as
-                    // redaction. It is scoped to the room's governing app: the write
-                    // is translated only when the writer speaks that app (its version
-                    // number lives in that app's space), and only to recipients of
-                    // that app — a foreign-app connection's version is a different
-                    // space and must never drive the room's chain.
-                    let source = self.translation_source(&room, &id, broadcast_version);
-                    // Resolve every distinct target version's chain up front, holding
-                    // the registry lock only for that (not across the fan-out), then
-                    // translate the peer loop against the owned, parsed chains.
-                    let chains = source
-                        .as_ref()
-                        .map(|(app, from)| self.resolve_chains(app, *from));
-                    // Translate the batch once per distinct target version — the
-                    // rewrite depends only on the version, not the recipient, so a
-                    // same-version fleet shares one result. A resolved chain
-                    // translates; an unresolved one (unreachable / gapped /
-                    // unparseable) yields an empty batch, dropping it for that
-                    // target's recipients pending the handshake range-check that
-                    // refuses them outright.
-                    let translated_by_target: HashMap<u32, Vec<Op>> = chains
-                        .iter()
-                        .flatten()
-                        .map(|(target, chain)| {
-                            let ops = match chain {
-                                Some(chain) => chain.translate_ops_scoped(&broadcast, &types),
-                                None => Vec::new(),
-                            };
-                            (*target, ops)
-                        })
-                        .collect();
-                    for (peer, conn) in self.conns.iter_mut() {
-                        // The channels this connection receives the write on — its
-                        // whole subscription to the stream, minus the channel that
-                        // authored it. Resolved first, so a connection with nothing
-                        // to receive costs no read verdict.
-                        let channels = origin.recipients(*peer, &conn.session, &room, &branch);
-                        if channels.is_empty() {
-                            continue;
-                        }
-                        // Per-recipient redaction: a peer whose read was revoked
-                        // mid-session stops receiving the room's ops at once, without
-                        // waiting for it to resubscribe.
-                        if !peer_may_read(authorizer, schema.as_deref(), &conn.session, &room) {
-                            continue;
-                        }
-                        // Translate to the recipient's version, or send verbatim when
-                        // there is nothing to bridge — a same-version, relay, or
-                        // foreign-app recipient, or a relay write.
-                        let translated = match (&source, conn.session.schema_version()) {
-                            (Some((app, from)), Some(target))
-                                if conn.session.app_id() == app && target != *from =>
-                            {
-                                // Total over every eligible recipient: `resolve_chains`
-                                // keyed the memo on this same (same-app, target != from)
-                                // predicate, so the target is always present.
-                                Some(translated_by_target[&target].as_slice())
-                            }
-                            _ => None,
-                        };
-                        let ops = translated.unwrap_or(&broadcast);
-                        if ops.is_empty() {
-                            continue;
-                        }
-                        for channel in channels {
-                            // Narrow to the channel's authorized zone partitions — the
-                            // per-zone wire redaction. A channel scoped to a subset of
-                            // the room's zones drops the rest, so an unauthorized zone
-                            // never surfaces on it; an emptied channel gets no frame.
-                            let zoned = conn.session.zone_filter(channel, ops);
-                            if zoned.is_empty() {
-                                continue;
-                            }
-                            conn.outbox.push(Message::Ops {
-                                channel,
-                                ops: zoned,
-                            });
-                        }
-                    }
-                }
+                let origin = WriteOrigin::Local { conn: id, channel };
+                self.fan_out_ops(origin, &room, &branch, &broadcast, broadcast_version);
             }
         }
         // Awareness is ephemeral: fan the entry out on each other subscriber's
