@@ -157,6 +157,13 @@ fn subscribe(r: &mut Registry, id: ConnId, zone: &[u8]) -> Vec<Message> {
 }
 
 fn write(r: &mut Registry, id: ConnId, ops: Vec<Op>) {
+    submit(r, id, ops);
+}
+
+/// Write on channel 0 and hand back what the delivery queued for `id` itself —
+/// what `write` drains, which a test observing the writer's own other channels
+/// needs to see.
+fn submit(r: &mut Registry, id: ConnId, ops: Vec<Op>) -> Vec<Message> {
     assert!(r.deliver(
         id,
         Message::Ops {
@@ -164,18 +171,34 @@ fn write(r: &mut Registry, id: ConnId, ops: Vec<Op>) {
             ops
         }
     ));
-    r.take_outbox(id);
+    r.take_outbox(id)
+}
+
+/// The ops `msgs` carried on `channel`.
+fn on_channel(msgs: &[Message], channel: Channel) -> Vec<Op> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            Message::Ops { channel: c, ops } if *c == channel => Some(ops.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// Every op `msgs` carried, across all channels.
+fn flatten(msgs: &[Message]) -> Vec<Op> {
+    msgs.iter()
+        .filter_map(|m| match m {
+            Message::Ops { ops, .. } => Some(ops.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 /// The ops delivered to `id`, flattened across every `Ops` frame in its outbox.
 fn received_ops(r: &mut Registry, id: ConnId) -> Vec<Op> {
-    r.take_outbox(id)
-        .into_iter()
-        .flat_map(|m| match m {
-            Message::Ops { ops, .. } => ops,
-            _ => Vec::new(),
-        })
-        .collect()
+    flatten(&r.take_outbox(id))
 }
 
 /// Whether `ops` carry a `RegisterSet` of `key` — the marker each content write
@@ -261,6 +284,48 @@ fn zone_scoped_subscribe_delivers_only_that_zones_content() {
     write(&mut r, author, notes_write(&mut doc, b"nk", 2));
     let got = received_ops(&mut r, za);
     assert!(!has_key(&got, b"nk"), "za never sees the notes write");
+}
+
+/// The zone filter is per *channel*, so a connection's own zone-scoped channel is
+/// narrowed exactly as a peer's is — the write's originating channel is the only
+/// one the fan-out omits, and being the author buys no wider zone reach.
+#[test]
+fn a_zone_scoped_sibling_channel_of_the_writer_is_still_narrowed() {
+    let (mut r, mut doc, author) = seeded();
+    // The author holds the whole room on channel 0 (from `seeded`) and opens a
+    // second channel scoped to za. Its actor reads both zones; the channel's scope
+    // is the only narrowing.
+    assert!(r.deliver(
+        author,
+        Message::Subscribe {
+            channel: Channel(1),
+            room: ROOM.to_vec(),
+            zone: b"za".to_vec(),
+            last_seen_seq: 0,
+            branch: Vec::new(),
+        }
+    ));
+    r.take_outbox(author);
+
+    // A notes (zb) write on channel 0 reaches neither channel: not channel 0, which
+    // authored it, and not channel 1, whose zone scope excludes zb.
+    let out = submit(&mut r, author, notes_write(&mut doc, b"nk", 2));
+    assert!(
+        !has_key(&flatten(&out), b"nk"),
+        "the za-scoped sibling channel received a zb write: {out:?}"
+    );
+
+    // A board (za) write on channel 0 reaches the sibling, on the sibling's channel
+    // alone — the authoring channel is still not echoed its own write.
+    let out = submit(&mut r, author, board_write(&mut doc, b"bk", 2));
+    assert!(
+        has_key(&on_channel(&out, Channel(1)), b"bk"),
+        "the za-scoped sibling channel lost the za write: {out:?}"
+    );
+    assert!(
+        on_channel(&out, Channel(0)).is_empty(),
+        "the authoring channel was echoed its own write: {out:?}"
+    );
 }
 
 #[test]

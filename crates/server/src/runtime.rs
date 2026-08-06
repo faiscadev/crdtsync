@@ -8,8 +8,8 @@
 //! lives alone on a dedicated thread as an actor. Connection tasks — pure I/O,
 //! and thus `Send` — reach it over channels: they forward decoded messages in
 //! and receive outbound messages back through a per-connection channel. A
-//! deliver's broadcast reaches the room's other connections because the actor
-//! flushes every connection's outbox after each step. A connection whose
+//! deliver's broadcast reaches the room's other subscribed channels because the
+//! actor flushes every connection's outbox after each step. A connection whose
 //! outbound queue overflows is too slow to keep up: it is dropped and its
 //! socket closed.
 
@@ -775,8 +775,9 @@ async fn registry_actor(
 }
 
 /// Push every connection's queued outbox into its sink — how a deliver's
-/// broadcast reaches the room's other connections. A connection whose sink is
-/// full is too slow: it is dropped from the registry and signalled to close.
+/// broadcast reaches the room's other subscribed channels. A connection whose
+/// sink is full is too slow: it is dropped from the registry and signalled to
+/// close.
 fn flush(reg: &mut Registry, peers: &mut HashMap<ConnId, Peer>) {
     let mut dropped = Vec::new();
     for (id, peer) in peers.iter() {
