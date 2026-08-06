@@ -248,6 +248,103 @@ fn the_registry_reaps_through_its_sweep_seam() {
 }
 
 #[test]
+fn reaping_a_member_drops_its_replication_watermarks() {
+    // The acknowledged watermarks a leader holds for a member are positions on the
+    // roster: reaping the member takes them with it, in every room it replicated and
+    // in no other member's stead.
+    let mut r = Registry::new(ClientId::from_bytes([0xFF; 16]));
+    r.set_membership(cluster());
+    let d = nid(D);
+    let c = nid(C);
+    let one = b"room-one".to_vec();
+    let two = b"room-two".to_vec();
+    r.record_replica_ack(d.clone(), &one, 7);
+    r.record_replica_ack(d.clone(), &two, 3);
+    r.record_replica_ack(c.clone(), &one, 4);
+    assert_eq!(r.replica_watermark(&one, &d), 7);
+    let reaped_inc = r.membership().unwrap().incarnation(&d);
+
+    for _ in 0..DEAD_AFTER_FAILURES {
+        r.note_gossip_probe(d.clone(), false);
+    }
+    for _ in 0..REAP_AFTER_DEAD_TICKS {
+        r.reap_dead_members();
+    }
+    assert!(!r.membership().unwrap().members().contains(&d));
+
+    assert_eq!(
+        r.replica_watermark(&one, &d),
+        0,
+        "a reaped member holds no watermark"
+    );
+    assert_eq!(
+        r.replica_watermark(&two, &d),
+        0,
+        "in any room it replicated"
+    );
+    assert_eq!(
+        r.replica_watermark(&one, &c),
+        4,
+        "a surviving member keeps its own"
+    );
+
+    // A node id is its advertised address, so the same id can come back — as a fresh
+    // join, whose durable state this leader has no proof of. It inherits none of the
+    // position it acked in its previous life, so it is caught up from the start rather
+    // than served a tail past a floor it may no longer hold.
+    r.membership_mut_for_test().merge_liveness(
+        &sender(),
+        [(
+            d.clone(),
+            D.as_bytes().to_vec(),
+            reaped_inc + 1,
+            MemberState::Alive,
+            false,
+        )],
+    );
+    assert!(r.membership().unwrap().is_member(&d), "D rejoined");
+    assert_eq!(
+        r.replica_watermark(&one, &d),
+        0,
+        "a returned member starts from nothing"
+    );
+}
+
+#[test]
+fn a_reaped_members_late_ack_records_nothing() {
+    // A replication link outlives the gossip verdict that reaped its far end, so an
+    // in-flight ack can land after the sweep. Recording it would re-key the map on a
+    // departed member that no later reap reaches — and it is owed nothing, being no
+    // room's follower.
+    let mut r = Registry::new(ClientId::from_bytes([0xFF; 16]));
+    r.set_membership(cluster());
+    let d = nid(D);
+    let room = b"room-one".to_vec();
+    for _ in 0..DEAD_AFTER_FAILURES {
+        r.note_gossip_probe(d.clone(), false);
+    }
+    for _ in 0..REAP_AFTER_DEAD_TICKS {
+        r.reap_dead_members();
+    }
+
+    r.record_replica_ack(d.clone(), &room, 9);
+    assert_eq!(
+        r.replica_watermark(&room, &d),
+        0,
+        "a reaped member's ack records no watermark"
+    );
+
+    // A member still on the roster acks as before — a `Dead` one included, since only
+    // the reap ends membership.
+    let c = nid(C);
+    for _ in 0..DEAD_AFTER_FAILURES {
+        r.note_gossip_probe(c.clone(), false);
+    }
+    r.record_replica_ack(c.clone(), &room, 9);
+    assert_eq!(r.replica_watermark(&room, &c), 9);
+}
+
+#[test]
 fn reaping_is_inert_without_membership() {
     // Single-node mode has no membership — reaping is a no-op, never a panic.
     let mut r = Registry::new(ClientId::from_bytes([0xFF; 16]));

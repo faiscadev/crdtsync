@@ -71,6 +71,19 @@ impl Replication {
         self.acked.insert((room.to_vec(), follower), through_seq);
     }
 
+    /// Drop every room's watermark held for `node` — the member-reap seam. A reaped
+    /// member leaves the roster and every room's replica set, and should it return it
+    /// returns as a fresh join whose durable state this leader has no proof of, so the
+    /// positions it once acked are no longer anything to serve it from: keeping them
+    /// grows the map on ids no replica set names any more and answers
+    /// [`watermark`](Self::watermark) with a claim the member cannot honor. Forgotten
+    /// reads as `0`, which is the safe value in both directions — it is credited toward
+    /// no quorum, and a catch-up ranges from the start of the retained log rather than a
+    /// tail past a floor the member may no longer hold.
+    pub fn forget_member(&mut self, node: &NodeId) {
+        self.acked.retain(|(_room, follower), _| follower != node);
+    }
+
     /// The server sequence `follower` has acknowledged for `room` — `0` if it has
     /// acknowledged nothing yet.
     pub fn watermark(&self, room: &[u8], follower: &NodeId) -> u64 {

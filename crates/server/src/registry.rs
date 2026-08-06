@@ -983,9 +983,19 @@ impl Registry {
     /// durably-departed node stops lingering as a placement replica. Driven once per
     /// membership sweep. Inert in single-node mode (no membership); the next delivery
     /// recomputes placement over the reaped roster, so nothing needs flushing here.
+    ///
+    /// The reap also carries into the replication bookkeeping: each reaped member's
+    /// acknowledged watermarks go with it ([`Replication::forget_member`]), so the map
+    /// stays keyed on the roster rather than on departed members, and a member that
+    /// returns is caught up from nothing instead of from a position it may no longer
+    /// hold. [`record_replica_ack`](Self::record_replica_ack) keeps it that way — a
+    /// non-member's late ack records nothing.
     pub fn reap_dead_members(&mut self) {
-        if let Some(membership) = &mut self.membership {
-            membership.reap_dead();
+        let Some(membership) = &mut self.membership else {
+            return;
+        };
+        for node in membership.reap_dead() {
+            self.replication.forget_member(&node);
         }
     }
 
@@ -1188,7 +1198,21 @@ impl Registry {
     /// watermark for the room, then release any withheld client ack the fresh
     /// watermark now carries to a majority. The leader's peer connection calls this
     /// when the follower answers a Replicate.
+    ///
+    /// An ack from a node the roster no longer holds is dropped: a replication link
+    /// outlives the gossip verdict that reaped its far end, so an in-flight ack can
+    /// arrive after the sweep, and recording it would re-key the map on a departed
+    /// member that no later reap reaches. It costs nothing to drop — a non-member is
+    /// no room's follower, so its watermark counts toward no quorum. Single-node mode
+    /// (no membership) has no roster to check and no replication to ack.
     pub fn record_replica_ack(&mut self, follower: NodeId, room: &[u8], through_seq: u64) {
+        if self
+            .membership
+            .as_ref()
+            .is_some_and(|m| !m.is_member(&follower))
+        {
+            return;
+        }
         self.replication.record_ack(follower, room, through_seq);
         self.release_pending_acks(room);
     }
