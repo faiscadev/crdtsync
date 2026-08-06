@@ -313,11 +313,24 @@ fn reaping_followers_releases_a_write_the_smaller_replica_set_holds() {
     r.deliver(c, sub(&room));
     r.take_outbox(c);
 
+    // Two writes: the first reaches one follower, the second reaches nobody.
+    let mut d = doc(1);
+    let ops1 = d.transact(|tx| tx.register(b"a", Scalar::Int(1)));
+    let ops2 = d.transact(|tx| tx.register(b"b", Scalar::Int(2)));
+    let t1 = ops1.iter().map(|o| o.id.seq).max().unwrap();
+    let t2 = ops2.iter().map(|o| o.id.seq).max().unwrap();
     r.deliver(
         c,
         Message::Ops {
             channel: CH,
-            ops: write(),
+            ops: ops1,
+        },
+    );
+    r.deliver(
+        c,
+        Message::Ops {
+            channel: CH,
+            ops: ops2,
         },
     );
     assert!(
@@ -346,9 +359,59 @@ fn reaping_followers_releases_a_write_the_smaller_replica_set_holds() {
         "the reap leaves a three-member replica set",
     );
 
+    let out = r.take_outbox(c);
     assert!(
-        has_accepted(&r.take_outbox(c)),
+        has_accepted_through(&out, t1),
         "the surviving follower's ack is a majority of three — the reap releases it",
+    );
+    assert!(
+        !has_accepted_through(&out, t2),
+        "the smaller majority still does not hold the second write — the reap releases \
+         what the quorum met, not what is pending",
+    );
+}
+
+#[test]
+fn reaping_down_to_a_lone_survivor_releases_nothing() {
+    // A node that has reaped away every other member places no room at all — its ring
+    // is empty and its quorum unsatisfiable. The reap's release pass must honour that:
+    // handing the author an `Accepted` for a write no other replica holds is a
+    // majority-of-one ack inside a cluster that still exists.
+    let room = room_led_by_a(5, 4);
+    let mut r = leader(5);
+    let c = client(&mut r);
+    r.deliver(c, sub(&room));
+    r.take_outbox(c);
+
+    r.deliver(
+        c,
+        Message::Ops {
+            channel: CH,
+            ops: write(),
+        },
+    );
+    let followers = followers_of(&room, 5);
+    r.record_replica_ack(followers[0].clone(), &room, 1);
+    assert!(
+        r.take_outbox(c).is_empty(),
+        "withheld at a majority of five"
+    );
+
+    for node in &followers {
+        for _ in 0..DEAD_AFTER_FAILURES {
+            r.note_gossip_probe(node.clone(), false);
+        }
+    }
+    for _ in 0..REAP_AFTER_DEAD_TICKS {
+        r.reap_dead_members();
+    }
+    assert!(
+        r.membership().unwrap().is_stranded(),
+        "the lone survivor is stranded",
+    );
+    assert!(
+        r.take_outbox(c).is_empty(),
+        "a stranded node releases no write, however many members it reaped",
     );
 }
 

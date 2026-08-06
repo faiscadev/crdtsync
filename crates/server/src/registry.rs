@@ -982,7 +982,9 @@ impl Registry {
     /// stayed `Dead` past the bounded dead-time ([`Membership::reap_dead`]), so a
     /// durably-departed node stops lingering as a placement replica. Driven once per
     /// membership sweep. Inert in single-node mode (no membership); the next delivery
-    /// recomputes placement over the reaped roster, so nothing needs flushing here.
+    /// recomputes placement over the reaped roster, so nothing needs recomputing here.
+    /// The release pass below does queue owed `Accepted`s into their authors' outboxes,
+    /// which the caller flushes.
     ///
     /// The reap also carries into the replication bookkeeping: each reaped member's
     /// acknowledged watermarks go with it ([`Replication::forget_member`]), so the map
@@ -991,11 +993,14 @@ impl Registry {
     /// hold. [`record_replica_ack`](Self::record_replica_ack) keeps it that way — a
     /// non-member's late ack records nothing.
     ///
-    /// A reap resizes every room's replica set, and with it the majority a withheld
-    /// client ack waits on, so the reap re-runs the release pass over the rooms owing
-    /// one: a write held by a majority of the *smaller* set is owed its `Accepted` now.
-    /// Nothing else would deliver it — the release is otherwise driven by a follower
-    /// ack, and the departed member sends no more.
+    /// A reap resizes the replica set of every room the departed member held — and of
+    /// every room whose set was already the whole ring — and with it the majority a
+    /// withheld client ack waits on, so the reap re-runs the release pass over every
+    /// room owing one: a write held by a majority of the *smaller* set is owed its
+    /// `Accepted` now. Nothing else would deliver it — the release is otherwise driven
+    /// by a follower ack, and the departed member sends no more. A reap that leaves this
+    /// node the only adopted member releases nothing: its ring is empty and its quorum
+    /// unsatisfiable, so a write no other replica holds stays withheld.
     pub fn reap_dead_members(&mut self) {
         let Some(membership) = &mut self.membership else {
             return;
@@ -1007,10 +1012,7 @@ impl Registry {
         for node in &reaped {
             self.replication.forget_member(node);
         }
-        let owed: HashSet<RoomId> = self.pending_acks.iter().map(|p| p.room.clone()).collect();
-        for room in owed {
-            self.release_pending_acks(&room);
-        }
+        self.release_pending_acks(None);
     }
 
     /// Record the outcome of a direct gossip round to `node`: a success is
@@ -1220,8 +1222,9 @@ impl Registry {
     /// watermark counts toward no quorum, and the withheld acks its departure did
     /// change are released by the reap itself
     /// ([`reap_dead_members`](Self::reap_dead_members)) rather than by whichever frame
-    /// happens to arrive next. Single-node mode (no membership) has no roster to check
-    /// and no replication to ack.
+    /// happens to arrive next. Single-node mode has no roster to gate on, so an ack
+    /// there records as it always did — it opens no peer connection, so none arrives
+    /// but a test's.
     pub fn record_replica_ack(&mut self, follower: NodeId, room: &[u8], through_seq: u64) {
         if self
             .membership
@@ -1231,7 +1234,7 @@ impl Registry {
             return;
         }
         self.replication.record_ack(follower, room, through_seq);
-        self.release_pending_acks(room);
+        self.release_pending_acks(Some(room));
     }
 
     /// `room`'s quorum: the majority threshold and this leader's followers — its
@@ -1284,19 +1287,28 @@ impl Registry {
         self.quorum_met(room, majority, &followers, seq)
     }
 
-    /// Release every write withheld for `room` that a majority of its replica set
-    /// now holds — a follower ack advanced a watermark — queueing each owed
-    /// `Accepted` to its author's outbox and dropping the record. `room`'s quorum
-    /// is resolved once, since it is invariant across the withheld writes. A write
-    /// whose author has since disconnected is discarded.
-    fn release_pending_acks(&mut self, room: &[u8]) {
-        let (majority, followers) = self.quorum(room);
+    /// Release every withheld write that a majority of its room's replica set now
+    /// holds, queueing each owed `Accepted` to its author's outbox and dropping the
+    /// record. `Some(room)` narrows the pass to the one room whose quorum moved — what
+    /// a follower ack knows; `None` walks every withheld write, for a change that moves
+    /// many quorums at once (a reap re-places rooms cluster-wide). Each room's quorum is
+    /// resolved once however many writes it owes. A write whose author has since
+    /// disconnected is discarded.
+    fn release_pending_acks(&mut self, room: Option<&[u8]>) {
+        let mut quorums: HashMap<RoomId, (usize, Vec<NodeId>)> = HashMap::new();
         let mut i = 0;
         while i < self.pending_acks.len() {
             let entry = &self.pending_acks[i];
-            let release =
-                entry.room == room && self.quorum_met(room, majority, &followers, entry.seq);
-            if release {
+            if room.is_some_and(|room| entry.room != room) {
+                i += 1;
+                continue;
+            }
+            let (owed_room, seq) = (entry.room.clone(), entry.seq);
+            if !quorums.contains_key(&owed_room) {
+                quorums.insert(owed_room.clone(), self.quorum(&owed_room));
+            }
+            let (majority, followers) = &quorums[&owed_room];
+            if self.quorum_met(&owed_room, *majority, followers, seq) {
                 let pending = self.pending_acks.swap_remove(i);
                 if let Some(conn) = self.conns.get_mut(&pending.conn) {
                     conn.outbox.push(pending.accepted);

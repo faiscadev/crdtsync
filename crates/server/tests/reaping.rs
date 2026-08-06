@@ -250,8 +250,8 @@ fn the_registry_reaps_through_its_sweep_seam() {
 #[test]
 fn reaping_a_member_drops_its_replication_watermarks() {
     // The acknowledged watermarks a leader holds for a member are positions on the
-    // roster: reaping the member takes them with it, in every room it replicated and
-    // in no other member's stead.
+    // roster: reaping the member takes them with it, in every room it acked and in no
+    // other member's stead.
     let mut r = Registry::new(ClientId::from_bytes([0xFF; 16]));
     r.set_membership(cluster());
     let d = nid(D);
@@ -277,11 +277,7 @@ fn reaping_a_member_drops_its_replication_watermarks() {
         0,
         "a reaped member holds no watermark"
     );
-    assert_eq!(
-        r.replica_watermark(&two, &d),
-        0,
-        "in any room it replicated"
-    );
+    assert_eq!(r.replica_watermark(&two, &d), 0, "in any room it acked");
     assert_eq!(
         r.replica_watermark(&one, &c),
         4,
