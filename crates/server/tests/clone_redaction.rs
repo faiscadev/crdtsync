@@ -601,6 +601,30 @@ mod a_never_bound_source {
             None,
             "the clone of an ungoverned source is ungoverned",
         );
+
+        // Read behaviourally too: the live binding is consulted ahead of the room's
+        // own, so the squatter's — still subscribed — would keep governing the copy
+        // if the clone did not re-point it. Under `PERM_APP` mallory holds a root
+        // read grant she has under no other tier, so whether she may clone the copy
+        // is exactly the question of which app governs it.
+        let mallory = hello_auth(&mut r, 5, "mallory", PERM_APP);
+        let second: &[u8] = b"copy-of-copy";
+        assert!(r.deliver(
+            mallory,
+            Message::CloneRoom {
+                src: DST.to_vec(),
+                dst: second.to_vec(),
+            }
+        ));
+        let reply = r.take_outbox(mallory).into_iter().next().expect("a reply");
+        assert!(
+            forbidden(&reply),
+            "the copy is governed by nothing, so it grants nothing: {reply:?}",
+        );
+        assert!(
+            !r.hub().holds_room(second),
+            "and nothing was minted from it"
+        );
     }
 
     #[test]

@@ -2172,6 +2172,15 @@ impl Registry {
             Message::Subscribe { room, .. } => Some(room.clone()),
             _ => None,
         };
+        // A clone installs `dst`'s content and, with it, the app that governs it —
+        // the source's, or none. The live map is checked ahead of the hub's binding,
+        // so it has to be re-pointed at the same answer when the clone lands, or a
+        // name someone subscribed to first keeps governing the copy by whatever app
+        // that subscriber declared.
+        let cloned_dst = match &msg {
+            Message::CloneRoom { dst, .. } => Some(dst.clone()),
+            _ => None,
+        };
         // The channel a write arrives on — the one replica in the room that
         // already holds its ops, and so the only one the fan-out below omits.
         let write_channel: Option<Channel> = match &msg {
@@ -2295,6 +2304,7 @@ impl Registry {
             bind,
             newly_subscribed,
             owed_accept,
+            cloned,
         ) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
@@ -2324,6 +2334,13 @@ impl Registry {
                 throttle,
                 msg,
             );
+            // Whether a clone actually landed — a no-op one (an absent or unled
+            // source, a taken destination) installs nothing and so re-points nothing.
+            // Read before the replies are drained into the outbox below.
+            let cloned = resp
+                .replies
+                .iter()
+                .any(|m| matches!(m, Message::CloneRoomResult { created, .. } if *created));
             // A write's `Accepted` is withheld from the outbox and carried out to
             // the majority gate below; every other reply — errors, adverts, the
             // catch-up, an awareness fan-out — is queued for send now.
@@ -2381,6 +2398,7 @@ impl Registry {
                 bind,
                 newly_subscribed,
                 owed_accept,
+                cloned,
             )
         };
         if newly_subscribed {
@@ -2420,6 +2438,16 @@ impl Registry {
         // sweep's reconcile prunes dormant rooms, so the map stays bounded.
         if let Some((room, app_id, version)) = bind {
             self.bind_room_app(room, app_id, version);
+        }
+        if let Some(dst) = cloned_dst.filter(|_| cloned) {
+            match self.hub.governing_app(&dst) {
+                Some(app) => {
+                    self.room_apps.insert(dst, app);
+                }
+                None => {
+                    self.room_apps.remove(&dst);
+                }
+            }
         }
         // A leader mirrors each fresh commit to its follower replicas, so a client
         // redirected to the leader reaches a node that already holds the state.

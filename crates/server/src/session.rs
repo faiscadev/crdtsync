@@ -2255,7 +2255,7 @@ fn reads_source_whole(
 /// resolves to no schema, as at every other zone seam (C30); and a room the hub holds
 /// but nothing ever bound — an import, or a clone of an ungoverned room — is
 /// indistinguishable from a relay room, which genuinely has no partitions and must
-/// stay clonable (C59). Requiring `src`'s leader makes the ACL records and the creator
+/// stay clonable (C60). Requiring `src`'s leader makes the ACL records and the creator
 /// authoritative; it does not conjure a binding that was never made.
 fn reads_every_zone(
     authorizer: &dyn Authorizer,
