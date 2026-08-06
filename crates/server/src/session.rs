@@ -1322,26 +1322,40 @@ pub fn step(
         Message::DiffResult { .. } => violation("client sent a diff result"),
         // Cloning duplicates the live state of `src` into a fresh room `dst` — a
         // read of the whole source composed with a room create. Two gates compose:
-        // the actor must be able to read `src` (the same read tier a branch list
-        // uses — the doc-ACL tier abstains, deployment and schema decide), and
-        // the create is a room-management mutation on `dst`, gated by the write tier
-        // a branch mutation uses. A create persists a new room, so like a branch
+        // the actor must read `src` **whole** ([`reads_source_whole`]) — the clone
+        // carries every byte, so anything less launders what the withheld part is
+        // redacted by into a room the caller names — and the create is a
+        // room-management mutation on `dst`, gated by the write tier a branch
+        // mutation uses. A create persists a new room, so like a branch
         // mutation it is served only by `dst`'s leader; on a non-leader it is
         // redirected rather than persisted. The clone reads `src`'s state from the
-        // node that persists `dst`, so `src` and `dst` must share that leader: a
-        // cluster where they hash to different leaders finds no local `src` and
-        // reports `created == false` rather than misplacing `dst` — cross-leader
-        // clone is a cross-node state transfer this single-hub primitive does not
-        // do. The reply is a `CloneRoomResult` whose `created` is false when the
-        // clone was a no-op (`src` absent from this leader or `dst` already present).
+        // node that persists `dst`, so it is served only where one node leads both:
+        // a replica *holds* `src` and would export it happily, but a replica's view
+        // of the inputs the gate decides on is a follower's — its governing binding
+        // is per-node, so the source's zone declarations read as absent there — and
+        // its ACL records are only as fresh as its last replicated commit. A node
+        // that does not lead `src` reports `created == false` rather than cloning
+        // from a copy it does not own; cross-leader clone is a cross-node state
+        // transfer this single-hub primitive does not do. The reply is a
+        // `CloneRoomResult` whose `created` is false when the clone was a no-op
+        // (`src` absent or not led here, or `dst` already present).
         Message::CloneRoom { src, dst } => {
-            if !branch_authorized(session, authorizer, schema, &src, Action::Read)
+            if !reads_source_whole(hub, session, authorizer, schema, &src)
                 || !branch_authorized(session, authorizer, schema, &dst, Action::Write)
             {
                 return request_denied(session, "clone");
             }
             if let Some(redirect) = redirect_response(membership, &dst) {
                 return redirect;
+            }
+            if redirect_if_not_leader(membership, &src).is_some() {
+                return Response {
+                    replies: vec![Message::CloneRoomResult {
+                        dst,
+                        created: false,
+                    }],
+                    ..Response::default()
+                };
             }
             match hub.clone_room(&src, &dst) {
                 Ok(created) => Response {
@@ -2177,6 +2191,70 @@ fn branch_authorized(
         action,
         &Resource::Room(room),
     )
+}
+
+/// Whether this session's actor may read `room` **whole** — the gate on cloning it.
+/// A clone hands over every byte the source holds, so anything short of a whole read
+/// launders the redaction that governs the withheld part: both dimensions a served
+/// state is narrowed by are keyed by the room the bytes are leaving, and neither
+/// follows them into the destination. The doc-ACL dimension is
+/// [`reads_whole_document`] — a reader an effective `Deny(Read)` carves a subtree out
+/// of is partial, and its own catch-up would have projected that subtree away. The
+/// zone dimension is every declared partition being readable, since a
+/// [`Resource::Zone`] verdict names the source room and decides nothing about a
+/// destination the caller picks.
+///
+/// Room-keyed rather than channel-keyed, like [`branch_authorized`] — a client may
+/// clone a room without holding a subscription — so the room comes from the frame,
+/// checked only that the connection is authenticated.
+fn reads_source_whole(
+    hub: &Hub,
+    session: &Session,
+    authorizer: &dyn Authorizer,
+    schema: Option<&Schema>,
+    room: &[u8],
+) -> bool {
+    let Some(identity) = session.identity() else {
+        return false;
+    };
+    let records = hub.acl_records(room);
+    let creator = hub.room_creator(room);
+    let index = hub.element_paths(room);
+    reads_whole_document(
+        authorizer,
+        &records,
+        creator.as_deref(),
+        &index,
+        schema,
+        identity,
+        room,
+    ) && reads_every_zone(authorizer, identity, schema, room)
+}
+
+/// Whether `identity` may read every zone `schema` declares in `room` — the zone
+/// dimension of reading a room whole. Reached only where the room read verdict
+/// already holds, so an abstaining deployment admits each zone ([`zone_readable`])
+/// and only an explicit per-zone deny carves one out.
+///
+/// `schema` is the room's *governing* schema, never the caller's declared one: a
+/// clone's source is a room the caller is not the incumbent of, so a self-declared
+/// app would let it pick a zone block. A room governed by nothing declares no zones
+/// and so is whole by this measure — the one implicit root partition, the same
+/// reading [`zone_scope`] takes. That is a fact about the room only where this node
+/// is authoritative for it, which is why the clone is served only from `src`'s
+/// leader; a room whose binding is stored but unparseable still resolves to no
+/// schema here, as it does at every other zone seam (C30).
+fn reads_every_zone(
+    authorizer: &dyn Authorizer,
+    identity: &Identity,
+    schema: Option<&Schema>,
+    room: &[u8],
+) -> bool {
+    schema.is_none_or(|s| {
+        s.zones()
+            .iter()
+            .all(|(name, _)| zone_readable(authorizer, identity, room, name.as_bytes(), true))
+    })
 }
 
 /// The refusal for a room-keyed `what` request [`branch_authorized`] rejected: a

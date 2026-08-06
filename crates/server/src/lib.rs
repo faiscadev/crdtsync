@@ -1625,6 +1625,12 @@ impl Hub {
     /// op it already authored to the origin is deduped in the clone too — the same
     /// idempotency import gives a moved room, not a collision.
     ///
+    /// The source's creator rides along as `dst`'s authority root. The doc-ACL tuples
+    /// are part of the state, so they arrive whichever way this goes — but a room with
+    /// no root has no authority to decide them under, which would land every deny in
+    /// the snapshot inert in the clone (C28). The root the tuples were authored against
+    /// is `src`'s creator, so that is what the clone comes up holding.
+    ///
     /// Returns `Ok(false)` — cloning nothing — if `src` is unknown or `dst` already
     /// exists (clone is create-only, like import); with a store attached `dst` is
     /// persisted before it commits. The named-version index is not cloned: a
@@ -1633,7 +1639,12 @@ impl Hub {
         let Some(state) = self.export_room(src) else {
             return Ok(false);
         };
-        self.import_room(dst, &state)
+        if self.rooms.contains_key(dst) {
+            return Ok(false);
+        }
+        let creator = self.room_creator(src);
+        self.install_room_state(dst, &state, None, creator)?;
+        Ok(true)
     }
 
     /// The room's current high-water server sequence (0 if unseen or empty).
@@ -1946,27 +1957,28 @@ impl Hub {
         self.rooms.get(room).and_then(|r| r.max_op_version)
     }
 
-    /// The durable governing `{app_id, version}` bound to `room`, or `None` for an
-    /// unbound room. The registry consults it to re-seed a live binding a dormant
-    /// sweep dropped, or one a restart has not yet rebuilt from a live subscriber,
-    /// so a populated room's first post-restart subscriber is served translated
-    /// rather than verbatim. Empty on a store-less hub, which keeps the pure
-    /// rebuild-on-subscribe behavior.
+    /// The governing `{app_id, version}` bound to `room`, or `None` for an unbound
+    /// room. The registry consults it to re-seed a live binding a dormant sweep
+    /// dropped, or one a restart has not yet rebuilt from a live subscriber, so a
+    /// populated room's first post-restart subscriber is served translated rather
+    /// than verbatim — and so a request against a room nobody is currently
+    /// subscribed to still resolves the schema that governs it. A store carries it
+    /// across a restart; without one it lasts the process.
     pub fn governing_app(&self, room: &[u8]) -> Option<(Vec<u8>, u32)> {
         self.governing.get(room).cloned()
     }
 
-    /// Bind `room`'s durable governing app to `{app_id, version}` and persist it
-    /// beside the room's state, so the binding survives a restart and a
-    /// dormant-room sweep. A no-op without a store attached — a binding is durable
-    /// only where there is a store to hold it, and a store-less hub relies on the
-    /// registry rebuilding the binding from live subscribers. Best-effort persist:
-    /// the binding is derived state, so a write failure leaves it in the mirror to
-    /// re-persist on the next bind rather than failing the caller.
+    /// Bind `room`'s governing app to `{app_id, version}` and persist it beside the
+    /// room's state, so the binding survives a restart and a dormant-room sweep. The
+    /// hub holds it either way: the registry's live map is rebuilt from present
+    /// subscribers and so drops a room nobody currently subscribes — a template room
+    /// is exactly that — and the binding is what resolves the room's `@auth` grants
+    /// and zone declarations for a request against it, which are facts about the
+    /// room rather than about who is connected. Only the *persisting* half needs a
+    /// store, and it is best-effort: the binding is derived state, so a write failure
+    /// leaves it in the mirror to re-persist on the next bind rather than failing the
+    /// caller.
     pub fn bind_governing(&mut self, room: &[u8], app_id: Vec<u8>, version: u32) {
-        if self.store.is_none() {
-            return;
-        }
         let next = (app_id, version);
         if self.governing.get(room) == Some(&next) {
             return;

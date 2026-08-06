@@ -4,11 +4,15 @@
 //! destination; the server duplicates the source's live state into the
 //! destination and replies with a [`Message::CloneRoomResult`] carrying whether
 //! it was created. The clone is create-only: an unknown source or an existing
-//! destination is a no-op (`created == false`), never an error. The gate composes
-//! read on the source with the branch-management write tier on the destination; a
-//! request before auth is a protocol violation, a denied one a recoverable
-//! forbidden. Origin and clone take edits independently — a write to one leaves
-//! the other untouched.
+//! destination is a no-op (`created == false`), never an error. The gate composes a
+//! *whole* read of the source with the branch-management write tier on the
+//! destination; a request before auth is a protocol violation, a denied one a
+//! recoverable forbidden. Origin and clone take edits independently — a write to one
+//! leaves the other untouched.
+//!
+//! What "whole" costs a partial reader, and the redaction the clone carries with it,
+//! is `clone_redaction.rs`; here the source holds no doc-ACL state, so the whole-read
+//! gate is the deployment tier's answer alone.
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, ErrorCode, Message, Op, Scalar};

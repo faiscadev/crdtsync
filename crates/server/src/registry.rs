@@ -2177,6 +2177,12 @@ impl Registry {
             // Room-keyed like branch/clone management: the token request names its
             // room directly, so its schema binds off the frame's room.
             Message::CrossZoneToken { room, .. } => Some(room.clone()),
+            // A clone is a read of `src` whole composed with a create of `dst`, so it
+            // binds off the *source* — the room whose content, doc-ACL tuples and zone
+            // declarations the clone carries, and so the room whose schema the read
+            // gate must compose under. `dst` binds none of its own: the clone is
+            // create-only, so it does not exist yet.
+            Message::CloneRoom { src, .. } => Some(src.clone()),
             Message::Ops { channel, .. }
             | Message::CrossZoneOps { channel, .. }
             | Message::AwarenessSet { channel, .. }
@@ -2218,8 +2224,13 @@ impl Registry {
             // connection's — even when it fails to parse (`None`: no grants).
             Some(Some(app)) => self.parsed_schema(app),
             // Unbound (first subscriber): fall back to the connection's own app.
-            Some(None) => self.connection_schema(id),
-            None => None,
+            // A clone takes no such fallback: it names a room it is *not* about to
+            // become the incumbent of, so a self-declared app there would be the
+            // caller choosing which `@auth` grants and zone declarations govern the
+            // read of someone else's room — the escalation this resolution exists to
+            // refuse. An unbound source is governed by nothing instead.
+            Some(None) if !matches!(msg, Message::CloneRoom { .. }) => self.connection_schema(id),
+            _ => None,
         };
         // The app governing the acted-on room — the chain a catch-up delta is
         // translated along and the space a write's version is tagged in. Resolved
