@@ -810,7 +810,7 @@ impl Registry {
             ReplicaGate::Fenced => return true,
             ReplicaGate::Apply => {}
         }
-        let room = frame.room;
+        let (room, branch) = (frame.room, frame.branch);
         // Ingest through the same path a client `Ops` write uses. A replicated write
         // carries no schema version — the leader logs its writers' ops untagged on the
         // relay seam, and the follower mirrors them verbatim.
@@ -826,14 +826,16 @@ impl Registry {
         // node, so a client subscribed here is subscribed to a stream the leader is
         // the sole author of, and its replica advances on exactly what this seam
         // delivers. Fanned out after the creator lands, since the redaction the
-        // fan-out applies is decided against the room's authority root.
+        // fan-out applies is decided against the room's authority root, and onto the
+        // stream the frame itself names, so the recipient set is the frame's rather
+        // than a restatement of which streams the gate admits.
         //
         // The exclusion set is empty: the batch was authored on the leader, so no
         // channel here already holds it. Everything else the fan-out decides —
         // per-recipient reads, zone scoping, migration translation — is re-decided
         // against this replica, never inherited from the leader ([`fan_out_ops`](Registry::fan_out_ops)).
         if !applied.is_empty() {
-            self.fan_out_ops(WriteOrigin::Replicated, &room, MAIN_BRANCH, &applied, None);
+            self.fan_out_ops(WriteOrigin::Replicated, &room, &branch, &applied, None);
         }
         let through_seq = self.hub.seq(&room);
         if let Some(conn) = self.conns.get_mut(&id) {
@@ -1856,18 +1858,22 @@ impl Registry {
     ) {
         // Both paths resolve the room's creator, its ACL tuples, its element-path
         // index and its element types before they reach a recipient, and each of
-        // those walks the whole room document. A stream nobody has bound a channel
-        // to has no recipient to resolve them for, so it costs nothing at all —
-        // which is the steady state of a replica: a room is replicated to every
-        // node in its set and subscribed on few of them. The bound-channel set is a
-        // superset of what `recipients` keeps (it omits only the authoring channel
-        // of a local write), so an empty one delivers nothing either way.
-        let served = self
-            .conns
-            .values()
-            .any(|conn| !conn.session.channels_for_stream(room, branch).is_empty());
-        if !served {
-            return;
+        // those walks the whole room document. A replicated batch is the one that
+        // can arrive on a stream nobody here has bound a channel to — the steady
+        // state of a replica, since a room is replicated to every node in its set
+        // and subscribed on few of them — so it is checked for a recipient before
+        // any of that is resolved. A local write is not checked: it arrived on a
+        // channel of the writing connection, bound to this very stream (that
+        // binding is what resolved the stream), so the scan could only ever say
+        // yes, and the leader's hot path does not pay for an answer it knows.
+        if matches!(origin, WriteOrigin::Replicated) {
+            let served = self
+                .conns
+                .values()
+                .any(|conn| !conn.session.channels_for_stream(room, branch).is_empty());
+            if !served {
+                return;
+            }
         }
         let records = self.hub.acl_records(room);
         if records.is_empty() {
