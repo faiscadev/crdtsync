@@ -4228,8 +4228,8 @@ pub unsafe extern "C" fn crdtsync_client_branch_at(
 /// the frame to send; empty on a bad handle, a bad `kind`, a bad input, or a channel
 /// this client does not hold.
 /// Channel-keyed: a change list carries the room's paths and values, so the server
-/// narrows it to what this channel may read. The reply updates the diff view, keyed
-/// by the room the server resolved.
+/// narrows it to what this channel may read, and the reply updates this channel's
+/// diff view.
 ///
 /// # Safety
 /// `client` is a live handle; `a`/`a_len` and `b`/`b_len` follow [`as_slice`].
@@ -4256,30 +4256,26 @@ pub unsafe extern "C" fn crdtsync_client_diff_query(
     })
 }
 
-/// The change list from the last diff query answered for `room`, written to `out`
+/// The change list from the last diff query answered on `channel`, written to `out`
 /// as the encoded [`crdtsync_diff`] buffer a binding hands to
 /// [`crdtsync_diff_decode`]. Returns 1 if a result is held (an empty diff is an
-/// empty-but-present change list), 0 if none has been answered, -1 on a bad handle
-/// or a null `out`.
+/// empty-but-present change list), 0 if none has been answered or the channel isn't
+/// held, -1 on a bad handle or a null `out`. Keyed by channel, so two channels of
+/// one room under different zone scopes each read back their own answer.
 ///
 /// # Safety
-/// `client` is a live handle; `room`/`room_len` follow [`as_slice`]; `out` points
-/// to a writable `CrdtBuf`.
+/// `client` is a live handle; `out` points to a writable `CrdtBuf`.
 #[no_mangle]
 pub unsafe extern "C" fn crdtsync_client_diff_result(
     client: *const CrdtClient,
-    room: *const u8,
-    room_len: usize,
+    channel: u32,
     out: *mut CrdtBuf,
 ) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         if client.is_null() || out.is_null() {
             return -1;
         }
-        let Some(r) = as_slice(room, room_len) else {
-            return -1;
-        };
-        match (*client).session.diff(r) {
+        match (*client).session.diff(Channel(channel)) {
             Some(changes) => {
                 *out = CrdtBuf::from_vec(encode_changes(changes));
                 1

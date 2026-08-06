@@ -21,7 +21,7 @@ type ReplyTag =
   | { kind: "versions"; channel: number }
   | { kind: "versionState"; channel: number; name: Uint8Array }
   | { kind: "branches"; room: Uint8Array }
-  | { kind: "diff"; room: Uint8Array }
+  | { kind: "diff"; channel: number }
   | { kind: "clone"; dst: Uint8Array };
 
 // An operator request awaiting its reply. `matches` tests whether a drained reply
@@ -310,7 +310,7 @@ export class Provider {
   diff(kind: DiffKind, a: Key, b: Key): Promise<Change[]> {
     return this.request(
       this.client.diffQuery(this.channel, kind, keyBytes(a), keyBytes(b)),
-      (t) => t.kind === "diff" && bytesEqual(t.room, this.room),
+      (t) => t.kind === "diff" && t.channel === this.channel,
       () => this.readDiff(),
     );
   }
@@ -377,7 +377,7 @@ export class Provider {
   }
 
   private readDiff(): Change[] {
-    const raw = this.client.diff(this.room) as unknown[] | null;
+    const raw = this.client.diff(this.channel) as unknown[] | null;
     if (!raw) return [];
     return raw.map((r) => remarshalChange(r as never).change);
   }

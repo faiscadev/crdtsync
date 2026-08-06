@@ -1335,21 +1335,22 @@ const (
 // in the room that channel is subscribed to. kind selects whether a/b name two
 // saved versions or two branches. Channel-keyed: a change list carries the room's
 // paths and values, so the server narrows it to what this channel may read. The
-// reply updates the diff view, read with DiffResult under the room the server
-// resolved. Empty if the channel is not held.
+// reply updates this channel's diff view, read with DiffResult. Empty if the
+// channel is not held.
 func (c *Client) DiffQuery(channel uint32, kind DiffKind, a, b []byte) []byte {
 	ap, al := bytesArg(a)
 	bp, bl := bytesArg(b)
 	return takeBuf(C.crdtsync_client_diff_query(c.h, C.uint32_t(channel), C.uint32_t(kind), ap, al, bp, bl))
 }
 
-// DiffResult returns the change list from the last diff query answered for room,
+// DiffResult returns the change list from the last diff query answered on channel,
 // decoded through the shared change reader. The bool is false until a result is
-// answered; an empty diff is a non-nil empty slice with the bool true.
-func (c *Client) DiffResult(room []byte) ([]Change, bool, error) {
-	rp, rl := bytesArg(room)
+// answered; an empty diff is a non-nil empty slice with the bool true. Keyed by
+// channel, so two channels of one room under different zone scopes each read back
+// their own answer.
+func (c *Client) DiffResult(channel uint32) ([]Change, bool, error) {
 	var out C.CrdtBuf
-	if C.crdtsync_client_diff_result(c.h, rp, rl, &out) != 1 {
+	if C.crdtsync_client_diff_result(c.h, C.uint32_t(channel), &out) != 1 {
 		return nil, false, nil
 	}
 	changes, err := decodeChanges(takeBuf(out))

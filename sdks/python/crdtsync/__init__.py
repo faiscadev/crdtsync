@@ -487,7 +487,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         [doc, c.c_uint32, c.c_uint32, cbytes, size, cbytes, size],
         buf,
     )
-    sig(lib.crdtsync_client_diff_result, [doc, cbytes, size, c.POINTER(buf)], c.c_int32)
+    sig(lib.crdtsync_client_diff_result, [doc, c.c_uint32, c.POINTER(buf)], c.c_int32)
     sig(lib.crdtsync_client_clone_room, [doc, cbytes, size, cbytes, size], buf)
     sig(
         lib.crdtsync_client_clone_result,
@@ -2220,9 +2220,8 @@ class Client:
         ``b`` in the room that ``channel`` is subscribed to. ``kind`` selects whether
         ``a``/``b`` name two saved versions or two branches. Channel-keyed: a change
         list carries the room's paths and values, so the server narrows it to what
-        this channel may read. The reply updates the diff view, read with
-        :meth:`diff` under the room the server resolved. Empty if the channel is not
-        held."""
+        this channel may read. The reply updates this channel's diff view, read with
+        :meth:`diff`. Empty if the channel is not held."""
         _u32("channel", channel)
         return _take_buf(
             _LIB.crdtsync_client_diff_query(
@@ -2230,12 +2229,15 @@ class Client:
             )
         )
 
-    def diff(self, room: bytes) -> Optional[list]:
-        """The change list from the last diff query answered for ``room``, or
-        ``None`` if none has been. An empty diff is an empty list, not ``None``."""
+    def diff(self, channel: int) -> Optional[list]:
+        """The change list from the last diff query answered on ``channel``, or
+        ``None`` if none has been. An empty diff is an empty list, not ``None``.
+        Keyed by channel, so two channels of one room under different zone scopes
+        each read back their own answer."""
+        _u32("channel", channel)
         out = _CrdtBuf()
         rc = _LIB.crdtsync_client_diff_result(
-            self._handle, room, len(room), ctypes.byref(out)
+            self._handle, channel, ctypes.byref(out)
         )
         if rc != 1:
             return None

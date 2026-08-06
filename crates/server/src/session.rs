@@ -1344,7 +1344,7 @@ pub fn step(
                     authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     Response {
                         replies: vec![Message::DiffResult {
-                            room,
+                            channel,
                             changes: encode_changes(&changes),
                         }],
                         ..Response::default()

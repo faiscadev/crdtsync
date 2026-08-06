@@ -7,7 +7,7 @@
 //! already exists). Rooms are opaque byte strings the core does not parse.
 //! Decoding stays total.
 
-use crdtsync_core::protocol::{decode_message, encode_message, Message, ProtocolError};
+use crdtsync_core::protocol::{decode_message, encode_message, Channel, Message, ProtocolError};
 
 fn round_trip(m: Message) {
     assert_eq!(decode_message(&encode_message(&m)).expect("decodes"), m);
@@ -94,7 +94,7 @@ fn clone_tags_are_distinct_from_each_other_and_the_branch_block() {
             from_branch: Vec::new(),
         },
         Message::DiffResult {
-            room: Vec::new(),
+            channel: Channel(0),
             changes: Vec::new(),
         },
     ]

@@ -19,12 +19,17 @@
 //! The scope that makes it possible is the channel: the query is channel-keyed like
 //! a version fetch, so the subscription's zone set is what a diff narrows by.
 //!
+//! The reply carries that channel too (C50), so a session holding both a wide and a
+//! narrowed channel on one room attributes each change list to the query it answers
+//! rather than to the room they share.
+//!
 //! Everything runs in-process through the [`Registry`] (no socket, no fs), so the
 //! suite runs under Miri.
 
 use std::sync::{Arc, Mutex};
 
 use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
+use crdtsync_core::client::ClientSession;
 use crdtsync_core::diff::{decode_changes, Change};
 use crdtsync_core::path::{encode_path, parse_path};
 use crdtsync_core::protocol::{Channel, DiffKind};
@@ -140,15 +145,15 @@ fn fetch_version(r: &mut Registry, id: ConnId, name: &[u8]) -> Vec<u8> {
         .expect("the fetch replies with the version's state")
 }
 
-/// The change list `id` is served for a diff on its own channel.
-fn diff_on(
+/// The `DiffResult` reply `id` is served for a diff on its own channel.
+fn diff_reply_on(
     r: &mut Registry,
     id: ConnId,
     channel: Channel,
     kind: DiffKind,
     a: &[u8],
     b: &[u8],
-) -> Vec<Change> {
+) -> Message {
     assert!(r.deliver(
         id,
         Message::DiffQuery {
@@ -160,12 +165,26 @@ fn diff_on(
     ));
     let out = r.take_outbox(id);
     out.iter()
-        .find_map(|m| match m {
-            Message::DiffResult { changes, .. } => Some(changes.clone()),
-            _ => None,
-        })
-        .map(|changes| decode_changes(&changes).expect("the change list decodes"))
+        .find(|m| matches!(m, Message::DiffResult { .. }))
+        .cloned()
         .unwrap_or_else(|| panic!("no diff result: {out:?}"))
+}
+
+/// The change list `id` is served for a diff on its own channel.
+fn diff_on(
+    r: &mut Registry,
+    id: ConnId,
+    channel: Channel,
+    kind: DiffKind,
+    a: &[u8],
+    b: &[u8],
+) -> Vec<Change> {
+    match diff_reply_on(r, id, channel, kind, a, b) {
+        Message::DiffResult { changes, .. } => {
+            decode_changes(&changes).expect("the change list decodes")
+        }
+        other => panic!("expected a diff result, got {other:?}"),
+    }
 }
 
 fn diff(r: &mut Registry, id: ConnId, kind: DiffKind, a: &[u8], b: &[u8]) -> Vec<Change> {
@@ -531,6 +550,70 @@ fn a_diff_follows_the_channels_zone_scope_not_the_actors_entitlement() {
     assert!(
         changes.is_empty(),
         "the diff reported a zone this channel did not subscribe to: {changes:?}",
+    );
+}
+
+#[test]
+fn two_channels_of_one_room_each_read_back_their_own_diff() {
+    // The reply is keyed by the channel that asked (C50). Two channels of one room
+    // under different zone scopes are served genuinely different change lists, so a
+    // room-keyed reply would let the second answer overwrite the first, and a reader
+    // would see a narrower diff than it asked for — concluding nothing changed where
+    // something did.
+    let (mut r, mut author_doc, author, _reader) = zoned_room();
+    create_version(&mut r, author, VA);
+    write_into(&mut r, author, &mut author_doc, b"notes", b"nseed", 4242);
+    create_version(&mut r, author, VB);
+
+    // One client session holding both channels — the shape that made the collision
+    // reachable. Its channels are the ones the server subscribes and answers on, so
+    // each reply lands where the session holds it.
+    let mut session = ClientSession::new(cid(1));
+    let (wide_ch, _) = session.subscribe(ROOM);
+    let (narrow_ch, _) = session.subscribe_zone(ROOM, b"za");
+    // The fixture already bound the wide channel, and a Subscribe on a bound channel
+    // is a protocol violation, so it cannot be re-bound to the number this session
+    // minted — the guard states the coupling instead of hiding it.
+    assert_eq!(
+        wide_ch, CH,
+        "the client minted a channel the fixture did not subscribe"
+    );
+    // The za scope is the partition the write did not touch, so this channel's
+    // answer is empty where the whole-room channel's is not.
+    subscribe_on(&mut r, author, narrow_ch, b"za");
+
+    let wide_reply = diff_reply_on(&mut r, author, wide_ch, DiffKind::Versions, VA, VB);
+    let narrow_reply = diff_reply_on(&mut r, author, narrow_ch, DiffKind::Versions, VA, VB);
+    for (reply, channel) in [(&wide_reply, wide_ch), (&narrow_reply, narrow_ch)] {
+        assert!(
+            matches!(reply, Message::DiffResult { channel: c, .. } if *c == channel),
+            "the reply is not keyed by the channel that asked: {reply:?}",
+        );
+    }
+
+    // The narrow reply arrives last, so a room-keyed view would hold it for both.
+    session
+        .receive(wide_reply)
+        .expect("the wide reply was refused");
+    session
+        .receive(narrow_reply)
+        .expect("the narrow reply was refused");
+
+    assert_eq!(
+        touched(
+            session
+                .diff(wide_ch)
+                .expect("the wide channel holds no answer")
+        ),
+        vec![Some(b"notes".to_vec())],
+        "the narrow reply overwrote the wide channel's answer",
+    );
+    assert!(
+        session
+            .diff(narrow_ch)
+            .expect("the narrow channel holds no answer")
+            .is_empty(),
+        "the za-scoped channel was handed the whole-room answer",
     );
 }
 

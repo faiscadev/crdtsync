@@ -588,15 +588,15 @@ fn a_client_branch_requests_marshal() {
 #[wasm_bindgen_test]
 fn a_client_diff_query_round_trips() {
     use crdtsync_core::diff::encode_changes;
-    use crdtsync_core::protocol::{encode_message, Message};
+    use crdtsync_core::protocol::{encode_message, Channel, Message};
 
     let mut c = wasm_client(1);
     let room = b"room-1";
     let s = c.subscribe(room);
     // Both kinds frame a request; a bad kind is an error, and a channel this client
     // does not hold frames nothing. Channel-keyed: the server resolves the room, and
-    // the scope the change list is narrowed to, from the subscription — while the
-    // reply, and so the view, stays keyed by that room.
+    // the scope the change list is narrowed to, from the subscription — and the
+    // reply, and so the view, is keyed by that same channel.
     assert!(!c
         .diff_query(s.channel(), 0, b"a", b"b")
         .unwrap()
@@ -613,7 +613,7 @@ fn a_client_diff_query_round_trips() {
         .unwrap()
         .is_none());
     // No result until one is answered.
-    assert!(c.diff(room).is_null());
+    assert!(c.diff(s.channel()).is_null());
 
     // Build the change payload the server would return, from two snapshots.
     let mut d = doc(2);
@@ -625,12 +625,31 @@ fn a_client_diff_query_round_trips() {
     assert!(!changes.is_empty() && changes != encode_changes(&[]));
 
     let frame = encode_message(&Message::DiffResult {
-        room: room.to_vec(),
+        channel: Channel(s.channel()),
         changes,
     });
     assert!(c.receive(&frame).unwrap());
 
-    let result = js_sys::Array::from(&c.diff(room));
+    // The reply notice names the channel, so an awaiting caller correlates on the
+    // key the reply is stored under.
+    let replies = js_sys::Array::from(&c.take_replies());
+    assert_eq!(replies.length(), 1);
+    let tag = js_sys::Object::from(replies.get(0));
+    assert_eq!(
+        js_sys::Reflect::get(&tag, &"kind".into())
+            .unwrap()
+            .as_string()
+            .as_deref(),
+        Some("diff")
+    );
+    assert_eq!(
+        js_sys::Reflect::get(&tag, &"channel".into())
+            .unwrap()
+            .as_f64(),
+        Some(s.channel() as f64)
+    );
+
+    let result = js_sys::Array::from(&c.diff(s.channel()));
     assert_eq!(result.length(), 1);
     let change = js_sys::Object::from(result.get(0));
     let op = js_sys::Reflect::get(&change, &"op".into()).unwrap();

@@ -520,10 +520,13 @@ pub enum Message {
     /// The structural diff `a`→`b` a [`DiffQuery`](Message::DiffQuery) asked for:
     /// `changes` is the encoded [`Change`](crate::diff::Change) list — the
     /// `encode_changes` codec the diff SDK bindings already decode. An empty diff
-    /// is an empty change list, not an error. Keyed by the `room` the query's
-    /// channel resolved to: a change list is a fact about a room, and the channel
-    /// only supplied the scope it was narrowed to.
-    DiffResult { room: Vec<u8>, changes: Vec<u8> },
+    /// is an empty change list, not an error. Channel-keyed as the version seam is:
+    /// the channel's zone scope is what narrowed the answer, so two channels of one
+    /// room are served genuinely different change lists and only the channel tells
+    /// them apart. It names no query, so two diffs asked on one channel — which
+    /// share a scope, and so differ only in which states they name — are told apart
+    /// by their order alone.
+    DiffResult { channel: Channel, changes: Vec<u8> },
     /// Duplicates the live state of room `src` into a fresh room `dst` — the wire
     /// form of the "duplicate this doc as a template" server primitive. Room-keyed
     /// like branch management, so a client may run it before holding any
@@ -971,9 +974,9 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_bytes(&mut out, a);
             put_bytes(&mut out, b);
         }
-        Message::DiffResult { room, changes } => {
+        Message::DiffResult { channel, changes } => {
             put_u8(&mut out, 41);
-            put_bytes(&mut out, room);
+            put_u32(&mut out, channel.0);
             put_bytes(&mut out, changes);
         }
         Message::CloneRoom { src, dst } => {
@@ -1395,9 +1398,9 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             }
         }
         41 => {
-            let room = cur.bytes()?;
+            let channel = Channel(cur.u32()?);
             let changes = cur.bytes()?;
-            Message::DiffResult { room, changes }
+            Message::DiffResult { channel, changes }
         }
         42 => {
             let src = cur.bytes()?;

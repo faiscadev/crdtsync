@@ -4,8 +4,11 @@
 //! or two of its branches; the server replies with the encoded change list. The
 //! query is channel-keyed like a version fetch — a change list carries the room's
 //! own paths and values, so the server resolves the room and the scope it narrows
-//! to from the channel — while the reply is keyed by that resolved room. The change
-//! payload rides the same `encode_changes` codec the diff SDK bindings decode.
+//! to from the channel — and the reply is keyed by that same channel, so a client
+//! holding two channels on one room attributes each answer to the channel it was
+//! served for. Two queries on one channel share a scope and are told apart by their
+//! order alone. The change payload rides the same `encode_changes` codec the diff
+//! SDK bindings decode.
 //! Rooms, versions, and branch names are opaque byte strings the core does not
 //! parse. Decoding stays total.
 
@@ -56,11 +59,11 @@ fn diff_result_round_trips_an_empty_and_a_many_change_diff() {
     // An empty diff is a valid, distinct result — an empty change list, not an
     // error.
     round_trip(Message::DiffResult {
-        room: b"room".to_vec(),
+        channel: Channel(0),
         changes: encode_changes(&[]),
     });
     round_trip(Message::DiffResult {
-        room: b"room".to_vec(),
+        channel: Channel(u32::MAX),
         changes: sample_changes(),
     });
 }
@@ -74,7 +77,7 @@ fn empty_names_round_trip() {
         b: Vec::new(),
     });
     round_trip(Message::DiffResult {
-        room: Vec::new(),
+        channel: Channel(0),
         changes: Vec::new(),
     });
 }
@@ -91,7 +94,7 @@ fn a_truncated_diff_message_is_an_error_not_a_panic() {
             b: b"draft".to_vec(),
         },
         Message::DiffResult {
-            room: b"room".to_vec(),
+            channel: Channel(7),
             changes: sample_changes(),
         },
     ] {
@@ -147,7 +150,7 @@ fn diff_tags_are_distinct_from_each_other_and_the_branch_frames() {
             b: Vec::new(),
         },
         Message::DiffResult {
-            room: Vec::new(),
+            channel: Channel(0),
             changes: Vec::new(),
         },
         // A branch frame from the sibling region, to prove no collision.

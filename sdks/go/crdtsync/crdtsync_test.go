@@ -542,12 +542,12 @@ func TestClientDiffQueryRoundTrips(t *testing.T) {
 		t.Fatalf("diff query on an unheld channel should frame nothing")
 	}
 	// No result until one is answered.
-	if changes, ok, err := c.DiffResult(room); ok || err != nil || changes != nil {
+	if changes, ok, err := c.DiffResult(ch); ok || err != nil || changes != nil {
 		t.Fatalf("diff result before reply: got %v ok=%v err=%v", changes, ok, err)
 	}
 
-	// A DiffResult reply folds in: tag 41, u32-prefixed room, u32-prefixed
-	// encoded change list. The change list is the DiffEncode of two snapshots.
+	// A DiffResult reply folds in: tag 41, u32 channel, u32-prefixed encoded
+	// change list. The change list is the DiffEncode of two snapshots.
 	d := newDoc(t, 2)
 	defer d.Close()
 	d.RegisterInt(path("age"), 30)
@@ -555,21 +555,40 @@ func TestClientDiffQueryRoundTrips(t *testing.T) {
 	d.RegisterInt(path("age"), 40)
 	changesBytes := DiffEncode(oldState, d.EncodeState())
 
-	frame := make([]byte, 0, 1+4+len(room)+4+len(changesBytes))
-	frame = append(frame, 41)
-	frame = appendBytes(frame, room)
-	frame = appendBytes(frame, changesBytes)
-	if rc, _ := c.Receive(frame); rc != 1 {
+	if rc, _ := c.Receive(diffResultFrame(ch, changesBytes)); rc != 1 {
 		t.Fatalf("diff result receive: got rc=%d, want 1", rc)
 	}
 
-	changes, ok, err := c.DiffResult(room)
+	changes, ok, err := c.DiffResult(ch)
 	if err != nil || !ok {
 		t.Fatalf("diff result: ok=%v err=%v", ok, err)
 	}
 	if len(changes) != 1 || changes[0].Op != "value" || changes[0].New == nil || changes[0].New.Int != 40 {
 		t.Fatalf("diff result changes: got %+v", changes)
 	}
+
+	// A second channel on the same room, zone-scoped: the reply is keyed by the
+	// channel that asked, so each reads back its own answer rather than the last to
+	// arrive.
+	narrow, _ := c.SubscribeZone(room, key("za"))
+	if rc, _ := c.Receive(diffResultFrame(narrow, DiffEncode(oldState, oldState))); rc != 1 {
+		t.Fatalf("narrow diff result receive failed")
+	}
+	if narrowChanges, ok, err := c.DiffResult(narrow); err != nil || !ok || len(narrowChanges) != 0 {
+		t.Fatalf("narrow diff result: got %+v ok=%v err=%v", narrowChanges, ok, err)
+	}
+	if wide, ok, err := c.DiffResult(ch); err != nil || !ok || len(wide) != 1 {
+		t.Fatalf("the narrow reply overwrote the wide channel's answer: got %+v ok=%v err=%v", wide, ok, err)
+	}
+}
+
+// diffResultFrame builds a DiffResult wire frame: tag 41, u32 channel, then the
+// u32-length-prefixed encoded change list.
+func diffResultFrame(channel uint32, changes []byte) []byte {
+	frame := make([]byte, 5, 5+4+len(changes))
+	frame[0] = 41
+	binary.LittleEndian.PutUint32(frame[1:], channel)
+	return appendBytes(frame, changes)
 }
 
 func TestClientCloneRoomRoundTrips(t *testing.T) {
