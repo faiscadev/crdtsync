@@ -1870,7 +1870,7 @@ impl Registry {
             let served = self
                 .conns
                 .values()
-                .any(|conn| !conn.session.channels_for_stream(room, branch).is_empty());
+                .any(|conn| conn.session.serves_stream(room, branch));
             if !served {
                 return;
             }

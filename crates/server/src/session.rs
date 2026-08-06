@@ -273,6 +273,16 @@ impl Session {
             .collect()
     }
 
+    /// Whether this connection has bound any channel to the `(room, branch)`
+    /// stream — the existence question on its own, so a caller asking only
+    /// whether a stream has a recipient here neither builds nor drops a channel
+    /// list to find out.
+    pub fn serves_stream(&self, room: &[u8], branch: &[u8]) -> bool {
+        self.channels
+            .values()
+            .any(|s| s.room == room && s.branch == branch)
+    }
+
     /// The channels this connection has bound to the `(room, branch)` stream. A
     /// branch write fans out on each — the replication unit is `(room, branch)`,
     /// so a write on one branch never reaches another branch's subscribers.
