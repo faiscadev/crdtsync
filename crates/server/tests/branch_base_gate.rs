@@ -291,7 +291,7 @@ fn restored_room(deny: Deny) -> Registry {
 }
 
 #[test]
-fn an_element_scoped_deny_resolves_against_the_restored_branchs_own_base() {
+fn an_element_scoped_deny_resolves_against_the_restored_base() {
     // The gate that decides whether to project at all was fed the live `main` tree,
     // where the denied element no longer stands. An unresolvable element scope is
     // inert, an inert deny is no deny, and a gate that finds none serves the branch's
@@ -310,7 +310,7 @@ fn an_element_scoped_deny_resolves_against_the_restored_branchs_own_base() {
 }
 
 #[test]
-fn a_path_scoped_deny_narrows_the_restored_branchs_base_too() {
+fn a_path_scoped_deny_narrows_the_restored_base_too() {
     // A path scope resolves without a tree, so this half always narrowed. It is also
     // the coverage for the skip: a room whose tuples are all paths hands the gate the
     // live index and never decodes the branch's bytes, and its verdict is the same.
@@ -381,7 +381,7 @@ fn an_element_born_on_the_branch_tail_resolves_and_is_denied() {
 }
 
 #[test]
-fn a_published_branchs_base_is_narrowed_for_a_named_subscribe() {
+fn a_published_base_is_narrowed_for_a_named_subscribe() {
     // A published branch owns its base the same way a restored one does — and its whole
     // audience is read-only consumers, who reach it by name rather than by following
     // the active HEAD.
