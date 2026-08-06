@@ -35,7 +35,7 @@ pub struct Replication {
     /// holding the write, so it must never claim a follower holds more than the leader
     /// produced. Advanced monotonically by [`record_ack`](Self::record_ack) as acks
     /// arrive; set outright (and possibly lowered) by [`set_watermark`](Self::set_watermark)
-    /// when a rejoining follower reports its true durable head; dropped whole for a
+    /// when a rejoining follower reports its true durable head; dropped wholesale for a
     /// departed member by [`forget_members`](Self::forget_members).
     acked: HashMap<(RoomId, NodeId), u64>,
 }
