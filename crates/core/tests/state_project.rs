@@ -488,9 +488,10 @@ fn a_leaf_renamed_onto_a_live_container_converges_with_the_op_seam() {
         "the snapshot and op seams converge"
     );
 
-    // An op targeting the detached container is dropped on the snapshot seam by the
-    // displaced guard, exactly as on the op seam — so the two stay converged rather
-    // than the snapshot seam silently mutating a container the op seam left inert.
+    // An op targeting the evicted container lands in it on the snapshot seam,
+    // exactly as on the op seam — a displaced container is retained, so the write
+    // is held there hidden rather than dropped or buffered, and the two seams stay
+    // converged instead of one of them keeping what the other let go.
     let mut probe = doc();
     probe.transact(|tx| {
         tx.map(b"dst").set(b"inner", Scalar::Int(7));
@@ -507,13 +508,13 @@ fn a_leaf_renamed_onto_a_live_container_converges_with_the_op_seam() {
         op.apply(o);
     }
     assert!(
-        container.borrow().get(b"late").is_none(),
-        "the detached container is not mutated by the targeting op"
+        container.borrow().get(b"late").is_some(),
+        "the retained container takes the write that targets it"
     );
     assert_eq!(
         snap.encode_state(),
         op.encode_state(),
-        "the seams stay converged under an op targeting the detached container"
+        "the seams stay converged under an op targeting the evicted container"
     );
 }
 

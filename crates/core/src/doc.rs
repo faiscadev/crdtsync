@@ -7,10 +7,11 @@
 //! names its target container by id, resolved against a registry of every
 //! container the replica has materialised. That registry retains displaced
 //! containers, so a slot re-won after displacement is the same logical
-//! element: identity persists across displacement. An op whose target isn't
-//! reachable yet — its parent unseen, or an ancestor displaced — is buffered
-//! and replays once a create restores reachability, so out-of-order delivery
-//! converges.
+//! element: identity persists across displacement — and an op naming a displaced
+//! container applies into it hidden, since that is what a reinstatement brings
+//! back. An op whose target is not materialised at all — its create unseen — is
+//! held in the buffer, in op-id order, and replays once the create arrives, so
+//! out-of-order delivery converges.
 
 use crate::acl::{AclEffect, AclGrant, AclRecord, AclScope, AclSubject, AclTuple};
 use crate::anchor::RelativePosition;
@@ -261,7 +262,10 @@ pub struct Document {
     /// returned per edit, so several edits commit as one group.
     atomic: Option<Vec<Op>>,
     seen: HashSet<OpId>,
-    /// Ops whose target isn't reachable yet, held until a create makes it so.
+    /// Ops whose target this replica has not seen created, held until it is — and
+    /// atomic members held for their group. Kept in op-id order, because it rides
+    /// the state encoding and two replicas holding the same ops must encode them
+    /// the same way ([`hold`](Self::hold)).
     buffer: Vec<Op>,
     buffered: HashSet<OpId>,
     /// The `(author, group id)` keys whose bucket has resolved. A member arriving
@@ -2253,7 +2257,13 @@ impl Document {
 
         let buf_len = cur.u32()? as usize;
         let framed = cur.take(buf_len)?;
-        let buffer = decode_ops(framed)?;
+        let mut buffer = decode_ops(framed)?;
+        // Held in id order, whatever order the snapshot presented — the invariant
+        // `hold` maintains and `encode_state` writes out. A peer-supplied snapshot
+        // is the one place a buffer arrives from outside this replica, so sorting
+        // here is what makes the invariant structural: two replicas reading these
+        // bytes hold the same buffer in the same order, and re-encode it the same.
+        buffer.sort_by_key(|op| op_order(op.id));
         // A buffered op that is already applied, or repeated, would be replayed by
         // `drain_buffer`, which dedups against neither: reject both.
         let mut buffered = HashSet::with_capacity(buffer.len().min(1024));
@@ -2809,8 +2819,7 @@ impl Document {
         // that point keeps waiting on its own, so `apply` reports `false` for it.
         if op.tx.is_some() {
             self.record_stamp(op.stamp, span(&op.kind));
-            self.buffered.insert(op.id);
-            self.buffer.push(op.clone());
+            self.hold(op.clone());
             self.drain_buffer();
             return self.seen.contains(&op.id);
         }
@@ -2821,8 +2830,7 @@ impl Document {
             // them is a function of arrival order, and two replicas that folded the
             // same ops disagree.
             self.record_stamp(op.stamp, span(&op.kind));
-            self.buffered.insert(op.id);
-            self.buffer.push(op.clone());
+            self.hold(op.clone());
             return false;
         }
         self.apply_now(op);
@@ -3020,6 +3028,25 @@ impl Document {
         out
     }
 
+    /// Hold `op` in the buffer until it can apply, at the position its
+    /// [`OpId`] gives it.
+    ///
+    /// The buffer is kept in id order rather than arrival order because it is
+    /// replica state: it rides [`encode_state`](Self::encode_state), and the ids
+    /// it holds are the only key over it every replica agrees on. Stored as it
+    /// arrived, two replicas that folded the same ops — holding the same ops,
+    /// reading the same state — would encode different bytes, and snapshot
+    /// identity is byte identity. Nothing reads the buffer positionally except
+    /// [`take_complete_tx`](Self::take_complete_tx)'s tie-break, which wants a
+    /// key both ends of a snapshot share for exactly the same reason.
+    fn hold(&mut self, op: Op) {
+        let at = self
+            .buffer
+            .partition_point(|held| op_order(held.id) < op_order(op.id));
+        self.buffered.insert(op.id);
+        self.buffer.insert(at, op);
+    }
+
     /// Replay buffered ops that a state change just made reachable, to a
     /// fixpoint — one applied op can unblock a whole causal chain, and a
     /// non-atomic apply can complete a waiting transaction (or vice versa).
@@ -3070,7 +3097,7 @@ impl Document {
                         self.apply_now(&op);
                     } else {
                         op.tx = None;
-                        self.buffer.push(op);
+                        self.hold(op);
                     }
                 }
                 progressed = true;
@@ -3081,9 +3108,18 @@ impl Document {
         }
     }
 
-    /// Whether `op` can apply now: its target is reachable, and — for a delete —
-    /// the nodes it removes are present. A delete of a not-yet-inserted node
-    /// would silently no-op and be lost, so it waits for the insert.
+    /// Whether `op` can apply now: its target is **materialised** — this replica
+    /// holds the container, displaced or installed — and, for a delete, the nodes
+    /// it removes are present. A delete of a not-yet-inserted node would silently
+    /// no-op and be lost, so it waits for the insert.
+    ///
+    /// Displacement is not a reason to wait. A container that lost its slot is
+    /// retained, so the op lands in it hidden and is reinstated with it; holding
+    /// it instead would wait on a slot that need never come back, and would make
+    /// the same op set land differently by arrival order (§Map Slot Safety). The
+    /// three sequence cases below ask for *less* than the general gate — the
+    /// holding container alone, not the whole chain to the root — because the
+    /// tree fold is a function of the move-set, not of any parent's reachability.
     fn ready(&self, op: &Op) -> bool {
         // An XmlInsertChild materialises a movable node into a parent's children
         // sequence. A displaced parent still retains that sequence, so the child is
@@ -3122,7 +3158,7 @@ impl Document {
                 .get(&op.target)
                 .is_some_and(|l| l.borrow().contains(*id));
         }
-        if !self.resolvable(op.target) {
+        if !self.materialised(op.target) {
             return false;
         }
         match &op.kind {
@@ -3360,6 +3396,25 @@ impl Document {
         }
     }
 
+    /// A target is materialised when it names a container this replica holds and
+    /// every ancestor up to the root does too — displaced or installed alike.
+    fn materialised(&self, target: ElementId) -> bool {
+        let mut cur = target;
+        loop {
+            if cur == self.root_id() {
+                return true;
+            }
+            if self.displaced_container(cur).is_none() {
+                return false;
+            }
+            match self.parents.get(&cur) {
+                Some(&parent) => cur = parent,
+                None if self.ranged.contains_key(&cur) => cur = self.root_id(),
+                None => return false,
+            }
+        }
+    }
+
     /// Whether the container `id` is displaced: `Some(false)` installed,
     /// `Some(true)` displaced, `None` not materialised.
     fn displaced_container(&self, id: ElementId) -> Option<bool> {
@@ -3391,20 +3446,15 @@ impl Document {
         None
     }
 
-    /// A live list handle for `target`, if any.
-    fn live_list(&self, target: ElementId) -> Option<Rc<RefCell<List>>> {
-        self.lists
-            .get(&target)
-            .filter(|l| !l.borrow().is_displaced())
-            .cloned()
+    /// The list handle `target` names, displaced or installed — a retained
+    /// sequence still takes the edits addressed to it (§Map Slot Safety).
+    fn list_at(&self, target: ElementId) -> Option<Rc<RefCell<List>>> {
+        self.lists.get(&target).cloned()
     }
 
-    /// A live text handle for `target`, if any.
-    fn live_text(&self, target: ElementId) -> Option<Rc<RefCell<Text>>> {
-        self.texts
-            .get(&target)
-            .filter(|t| !t.borrow().is_displaced())
-            .cloned()
+    /// The text handle `target` names, displaced or installed.
+    fn text_at(&self, target: ElementId) -> Option<Rc<RefCell<Text>>> {
+        self.texts.get(&target).cloned()
     }
 
     /// Route a mutation to its target, recording any displaced composite and
@@ -3417,7 +3467,7 @@ impl Document {
         match kind {
             // Sequence and text ops address a list or text directly.
             OpKind::ListInsert { value, anchor } => {
-                if let Some(list) = self.live_list(target) {
+                if let Some(list) = self.list_at(target) {
                     list.borrow_mut()
                         .insert_at(stamp, Element::Scalar(value.clone()), *anchor);
                 }
@@ -3538,13 +3588,13 @@ impl Document {
                 return;
             }
             OpKind::TextInsert { s, anchor } => {
-                if let Some(text) = self.live_text(target) {
+                if let Some(text) = self.text_at(target) {
                     text.borrow_mut().insert_run(stamp, s, *anchor);
                 }
                 return;
             }
             OpKind::TextDelete { ids } => {
-                if let Some(text) = self.live_text(target) {
+                if let Some(text) = self.text_at(target) {
                     text.borrow_mut().delete_ids(ids);
                 }
                 return;
@@ -3587,9 +3637,6 @@ impl Document {
         let Some(map) = self.maps.get(&target).cloned() else {
             return;
         };
-        if map.borrow().is_displaced() {
-            return;
-        }
         let orphan = {
             let mut m = map.borrow_mut();
             match kind {
@@ -3626,9 +3673,6 @@ impl Document {
         let Some(map) = self.maps.get(&map_id).cloned() else {
             return;
         };
-        if map.borrow().is_displaced() {
-            return;
-        }
         let child_id = match &kind {
             Container::XmlElement(tag) => XmlElement::node_id(map_id, key, tag),
             Container::XmlFragment => XmlFragment::node_id(map_id, key),
@@ -4050,9 +4094,6 @@ impl Document {
         let Some(map) = self.maps.get(&map_id).cloned() else {
             return;
         };
-        if map.borrow().is_displaced() {
-            return;
-        }
         let id = ElementId::derive(map_id, key, ElementKind::Counter);
         let counter = match self.counters.get(&id) {
             Some(c) => Rc::clone(c),
@@ -5327,6 +5368,14 @@ fn handles_eq(a: &Element, b: &Element) -> bool {
         (Element::XmlFragment(x), Element::XmlFragment(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
+}
+
+/// The total order over op ids the replica orders its held ops by — author, then
+/// the author's own sequence. It matches the causal-frontier encoding's sort, and
+/// it is total because an id names one op: the dedup set and the buffer each hold
+/// an id once, and a snapshot presenting a repeat is refused.
+fn op_order(id: OpId) -> ([u8; 16], u64) {
+    (id.client.as_bytes(), id.seq)
 }
 
 /// A stamp rendered as derivation-key bytes, so a sequence child's element id
