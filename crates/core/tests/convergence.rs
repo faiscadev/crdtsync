@@ -573,8 +573,8 @@ fn converge_shuffled(ops: &[Op], client: u8, rounds: usize, rng: &mut Rng) -> St
 /// identically-seeded generator drives two pools — one shipping each burst as an
 /// atomic transaction, one streaming the same edits ungrouped — and both must
 /// converge under shuffled re-delivery. Grouping is a visibility boundary; a
-/// member whose container is displaced when its group commits has to wait for
-/// the container rather than apply into it and lose its effect.
+/// member the state cannot express when its group commits — its target's create
+/// still in flight — is re-held untagged rather than applied to nothing.
 #[test]
 fn atomic_groups_do_not_change_what_ops_merge_to() {
     // Miri interprets every op, and this sweep folds each pool many times over;

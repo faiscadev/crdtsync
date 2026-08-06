@@ -1,15 +1,21 @@
-//! `encode_state` is order-canonical: two replicas that folded the same ops
-//! encode the same bytes, whatever order those ops arrived in.
+//! `encode_state` is order-canonical over a **displacement-heavy** pool: two
+//! replicas that folded the same ops encode the same bytes, whatever order those
+//! ops arrived in.
 //!
 //! Byte identity is what the snapshot/compaction arc treats as replica identity —
 //! a snapshot-vs-op convergence check and every digest comparison rest on it — so
-//! agreeing reads are not enough. Two things a displacement-heavy pool used to
-//! break: an op whose target was displaced when it arrived was held forever, while
-//! the same op arriving a moment earlier applied; and the held ops were encoded in
-//! arrival order. A displaced container is *retained*, so a write addressed to one
-//! lands in it hidden rather than waiting on a re-install that may never come, and
-//! what is genuinely still waiting — an op whose target this replica has never seen
-//! created — is held in op-id order.
+//! agreeing reads are not enough. Two things a displacement-heavy pool broke: an
+//! op whose target was displaced when it arrived was held forever, while the same
+//! op arriving a moment earlier applied; and the held ops were encoded in arrival
+//! order. A displaced container is *retained*, so a write addressed to one lands
+//! in it hidden rather than waiting on a re-install that may never come, and what
+//! is genuinely still waiting is written in op-id order.
+//!
+//! Displacement is not the only way one op set reaches two encodings. A container
+//! create racing a *delete* of its key still encodes two ways — the tombstone
+//! remembers a container it saw installed and not one whose create it outranked —
+//! which is a rule about what a deleted-container tombstone records, not about
+//! what a replica holds. That is C61, and it is unaffected by anything here.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::{Element, Op, Scalar};
@@ -55,8 +61,14 @@ fn render(d: &Document, keys: &[&[u8]]) -> String {
 
 /// Whether a snapshot's trailing framed op buffer holds exactly `ops`, in order.
 /// `encode_state` ends with a `u32` length and that many framed bytes, so the
-/// buffer a snapshot carries is a suffix of it.
+/// buffer a snapshot carries is a suffix of it. Says nothing about an *empty*
+/// buffer — that suffix is four zero bytes, which a populated one ends in too —
+/// so "nothing is waiting" is asked of the causal frontier instead.
 fn holds_buffer(snapshot: &[u8], ops: &[Op]) -> bool {
+    assert!(
+        !ops.is_empty(),
+        "an empty buffer is not identified by its suffix"
+    );
     let framed = crdtsync_core::encode_ops(ops);
     let mut tail = (framed.len() as u32).to_le_bytes().to_vec();
     tail.extend_from_slice(&framed);
@@ -183,8 +195,8 @@ fn a_write_under_a_displaced_container_applies_rather_than_waiting() {
         "a write under a displaced container applies into it"
     );
     assert!(
-        holds_buffer(&d.encode_state(), &[]),
-        "nothing is left waiting"
+        d.seen().any(|id| id == creates[1].id),
+        "applied, not held: a held op is out of the causal frontier"
     );
 }
 

@@ -3038,14 +3038,13 @@ impl Document {
 
     /// Hold `op` in the buffer until it can apply.
     ///
-    /// Appended, not placed. The order the buffer is *stored* in decides only which
-    /// of several ready ops the drain replays first and which of several complete
-    /// groups commits first, and the drain runs to a fixpoint, so neither is a state
-    /// decision; the order that is state is the one
-    /// [`encode_state`](Self::encode_state) writes, which is [`op_order`]. Holding
-    /// it sorted would cost a memmove per arrival, and both how much the buffer
-    /// holds and where an arrival lands in it are the sender's to choose — a backlog
-    /// delivered newest-first is quadratic, and cheap to send.
+    /// Appended, not placed. The order that is *state* is the one
+    /// [`encode_state`](Self::encode_state) writes, which is [`op_order`]; what
+    /// the stored order decides — which of several ready ops the drain replays
+    /// first, which of several complete groups commits first — is not a state
+    /// decision, because the drain runs to a fixpoint. Keeping it sorted would
+    /// instead let the sender choose the cost: nothing caps the buffer, and where
+    /// each arrival lands in it is the delivery order's.
     fn hold(&mut self, op: Op) {
         self.buffered.insert(op.id);
         self.buffer.push(op);
@@ -3407,7 +3406,11 @@ impl Document {
     /// every ancestor up to the root does too — displaced or installed alike.
     fn materialised(&self, target: ElementId) -> bool {
         let mut cur = target;
-        loop {
+        // A chain longer than the parent map has revisited a node. The decode
+        // refuses a cycle and the move replay re-checks for one, but the live
+        // path edits `parents` between those points, and this gate runs over every
+        // held op on every drain — so it stops rather than spins.
+        for _ in 0..=self.parents.len() {
             if cur == self.root_id() {
                 return true;
             }
@@ -3420,6 +3423,7 @@ impl Document {
                 None => return false,
             }
         }
+        false
     }
 
     /// Whether the container `id` is displaced: `Some(false)` installed,
