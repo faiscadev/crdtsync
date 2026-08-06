@@ -1538,9 +1538,12 @@ impl Registry {
     /// of that app seen while the room has held presence — the bound version is a
     /// floor a present higher version lifts, so a rolling upgrade adopts the newer
     /// schema and a just-departed newer client's grace-held presence keeps its own
-    /// (longer) TTL rather than an older peer's; the floor resets when the room
-    /// goes dormant. A room with neither presence nor any subscriber is dropped,
-    /// bounding the map on a server that churns through rooms.
+    /// (longer) TTL rather than an older peer's. A room with neither presence nor
+    /// any subscriber is dropped from this map, bounding it on a server that churns
+    /// through rooms — but the *binding* survives on the hub, which holds the room's
+    /// own governing app, so a dormant room's next subscriber rebinds to what
+    /// governed it rather than to whatever app arrives first. The version floor
+    /// resets to that binding, not to nothing.
     fn reconcile_room_apps(&mut self) {
         // One pass over connections: the enforcing apps present per room (each at
         // its highest version) and the set of rooms anyone subscribes.
@@ -1571,8 +1574,9 @@ impl Registry {
                 // floor a currently-present higher version lifts, never lowered.
                 // So a rolling upgrade adopts the newer schema and a just-departed
                 // newer client's grace-held presence is not expired early under an
-                // older peer's shorter TTL; the floor resets when the room goes
-                // dormant and the binding is dropped below.
+                // older peer's shorter TTL. A room that goes dormant drops out of
+                // this map and rebinds from the hub's own binding, so the floor
+                // resets to what governs the room, not to nothing.
                 Some((bound_app, bound_version)) => {
                     let present_version = apps
                         .and_then(|apps| apps.get(bound_app).copied())
@@ -1587,6 +1591,11 @@ impl Registry {
             }
         }
         self.room_apps = next;
+        // The live map is the *presence* view; the hub's binding is the room's own,
+        // read when this one has nothing (a dormant room, a restart). Both are keyed
+        // by a room a subscribe named, and a subscribe can name a room that never
+        // materializes, so the sweep bounds the hub's map to the rooms it holds.
+        self.hub.forget_unheld_governing();
     }
 
     /// Resolve the timed TTLs for this sweep from each bound room's schema. The
@@ -2016,9 +2025,9 @@ impl Registry {
     /// A later subscribe on the *same* app lifts the binding to the higher
     /// version, so a rolling upgrade resolves to the newest version. The incumbent
     /// is the live binding, or — where a dormant sweep or a restart dropped it —
-    /// the durable one the hub restored, so a foreign app cannot seize a
-    /// persisted room by subscribing first after it went idle. A same-app bind (a
-    /// new room or a version lift) is mirrored into the hub's durable binding.
+    /// the room's own, which the hub holds, so a foreign app cannot seize a room by
+    /// subscribing first after it went idle. A same-app bind (a new room or a
+    /// version lift) is mirrored into the hub's binding.
     fn bind_room_app(&mut self, room: RoomId, app_id: Vec<u8>, version: u32) {
         let incumbent = self
             .room_apps
@@ -2163,6 +2172,15 @@ impl Registry {
             Message::Subscribe { room, .. } => Some(room.clone()),
             _ => None,
         };
+        // A clone installs `dst`'s content and, with it, the app that governs it —
+        // the source's, or none. The live map is checked ahead of the hub's binding,
+        // so it has to be re-pointed at the same answer when the clone lands, or a
+        // name someone subscribed to first keeps governing the copy by whatever app
+        // that subscriber declared.
+        let cloned_dst = match &msg {
+            Message::CloneRoom { dst, .. } => Some(dst.clone()),
+            _ => None,
+        };
         // The channel a write arrives on — the one replica in the room that
         // already holds its ops, and so the only one the fan-out below omits.
         let write_channel: Option<Channel> = match &msg {
@@ -2177,6 +2195,12 @@ impl Registry {
             // Room-keyed like branch/clone management: the token request names its
             // room directly, so its schema binds off the frame's room.
             Message::CrossZoneToken { room, .. } => Some(room.clone()),
+            // A clone is a read of `src` whole composed with a create of `dst`, so it
+            // binds off the *source* — the room whose content, doc-ACL tuples and zone
+            // declarations the clone carries, and so the room whose schema the read
+            // gate must compose under. `dst` binds none of its own: the clone is
+            // create-only, so it does not exist yet.
+            Message::CloneRoom { src, .. } => Some(src.clone()),
             Message::Ops { channel, .. }
             | Message::CrossZoneOps { channel, .. }
             | Message::AwarenessSet { channel, .. }
@@ -2218,8 +2242,13 @@ impl Registry {
             // connection's — even when it fails to parse (`None`: no grants).
             Some(Some(app)) => self.parsed_schema(app),
             // Unbound (first subscriber): fall back to the connection's own app.
-            Some(None) => self.connection_schema(id),
-            None => None,
+            // A clone takes no such fallback: it names a room it is *not* about to
+            // become the incumbent of, so a self-declared app there would be the
+            // caller choosing which `@auth` grants and zone declarations govern the
+            // read of someone else's room — the escalation this resolution exists to
+            // refuse. An unbound source is governed by nothing instead.
+            Some(None) if !matches!(msg, Message::CloneRoom { .. }) => self.connection_schema(id),
+            _ => None,
         };
         // The app governing the acted-on room — the chain a catch-up delta is
         // translated along and the space a write's version is tagged in. Resolved
@@ -2275,6 +2304,7 @@ impl Registry {
             bind,
             newly_subscribed,
             owed_accept,
+            cloned,
         ) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
@@ -2304,6 +2334,13 @@ impl Registry {
                 throttle,
                 msg,
             );
+            // Whether a clone actually landed — a no-op one (an absent or unled
+            // source, a taken destination) installs nothing and so re-points nothing.
+            // Read before the replies are drained into the outbox below.
+            let cloned = resp
+                .replies
+                .iter()
+                .any(|m| matches!(m, Message::CloneRoomResult { created, .. } if *created));
             // A write's `Accepted` is withheld from the outbox and carried out to
             // the majority gate below; every other reply — errors, adverts, the
             // catch-up, an awareness fan-out — is queued for send now.
@@ -2361,6 +2398,7 @@ impl Registry {
                 bind,
                 newly_subscribed,
                 owed_accept,
+                cloned,
             )
         };
         if newly_subscribed {
@@ -2400,6 +2438,16 @@ impl Registry {
         // sweep's reconcile prunes dormant rooms, so the map stays bounded.
         if let Some((room, app_id, version)) = bind {
             self.bind_room_app(room, app_id, version);
+        }
+        if let Some(dst) = cloned_dst.filter(|_| cloned) {
+            match self.hub.governing_app(&dst) {
+                Some(app) => {
+                    self.room_apps.insert(dst, app);
+                }
+                None => {
+                    self.room_apps.remove(&dst);
+                }
+            }
         }
         // A leader mirrors each fresh commit to its follower replicas, so a client
         // redirected to the leader reaches a node that already holds the state.
