@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# A pull request's runs share one group, so a force-push supersedes its
+# predecessor instead of racing it. A unit that rebases through several sibling
+# merges would otherwise leave a full 17-job matrix queued per amend, and those
+# obsolete runs hold runner capacity the live head then waits behind. Pushes to
+# main are never cancelled — each one is the only run for a commit that is
+# already merged.
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
