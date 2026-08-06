@@ -372,6 +372,63 @@ fn reaping_followers_releases_a_write_the_smaller_replica_set_holds() {
 }
 
 #[test]
+fn one_reap_releases_every_write_the_new_majority_holds() {
+    // A room owes as many withheld acks as it took writes while short of a majority,
+    // and one reap owes all of them at once — the pass releases every one, not the
+    // first it reaches.
+    let room = room_led_by_a(5, 4);
+    let mut r = leader(5);
+    let c = client(&mut r);
+    r.deliver(c, sub(&room));
+    r.take_outbox(c);
+
+    let mut d = doc(1);
+    let ops1 = d.transact(|tx| tx.register(b"a", Scalar::Int(1)));
+    let ops2 = d.transact(|tx| tx.register(b"b", Scalar::Int(2)));
+    let t1 = ops1.iter().map(|o| o.id.seq).max().unwrap();
+    let t2 = ops2.iter().map(|o| o.id.seq).max().unwrap();
+    r.deliver(
+        c,
+        Message::Ops {
+            channel: CH,
+            ops: ops1,
+        },
+    );
+    r.deliver(
+        c,
+        Message::Ops {
+            channel: CH,
+            ops: ops2,
+        },
+    );
+    let followers = followers_of(&room, 5);
+    r.record_replica_ack(followers[0].clone(), &room, 2);
+    assert!(
+        r.take_outbox(c).is_empty(),
+        "both writes are short of a majority of five",
+    );
+
+    for node in [&followers[1], &followers[2]] {
+        for _ in 0..DEAD_AFTER_FAILURES {
+            r.note_gossip_probe(node.clone(), false);
+        }
+    }
+    for _ in 0..REAP_AFTER_DEAD_TICKS {
+        r.reap_dead_members();
+    }
+
+    let out = r.take_outbox(c);
+    assert!(
+        has_accepted_through(&out, t1),
+        "the first write is released"
+    );
+    assert!(
+        has_accepted_through(&out, t2),
+        "and the second, in the same pass",
+    );
+}
+
+#[test]
 fn reaping_down_to_a_lone_survivor_releases_nothing() {
     // A node that has reaped away every other member places no room at all — its ring
     // is empty and its quorum unsatisfiable. The reap's release pass must honour that:

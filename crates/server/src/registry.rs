@@ -993,9 +993,9 @@ impl Registry {
     /// hold. [`record_replica_ack`](Self::record_replica_ack) keeps it that way — a
     /// non-member's late ack records nothing.
     ///
-    /// A reap resizes the replica set of every room the departed member held — and of
-    /// every room whose set was already the whole ring — and with it the majority a
-    /// withheld client ack waits on, so the reap re-runs the release pass over every
+    /// A reap re-places every room the departed member held, and once the ring falls
+    /// below the replication factor that shrinks the set — and with it the majority a
+    /// withheld client ack waits on — so the reap re-runs the release pass over every
     /// room owing one: a write held by a majority of the *smaller* set is owed its
     /// `Accepted` now. Nothing else would deliver it — the release is otherwise driven
     /// by a follower ack, and the departed member sends no more. A reap that leaves this
@@ -1223,8 +1223,8 @@ impl Registry {
     /// change are released by the reap itself
     /// ([`reap_dead_members`](Self::reap_dead_members)) rather than by whichever frame
     /// happens to arrive next. Single-node mode has no roster to gate on, so an ack
-    /// there records as it always did — it opens no peer connection, so none arrives
-    /// but a test's.
+    /// records unconditionally there — it leads every room alone, at a majority of one,
+    /// so a watermark drives none of its quorums.
     pub fn record_replica_ack(&mut self, follower: NodeId, room: &[u8], through_seq: u64) {
         if self
             .membership
@@ -1298,17 +1298,16 @@ impl Registry {
         let mut quorums: HashMap<RoomId, (usize, Vec<NodeId>)> = HashMap::new();
         let mut i = 0;
         while i < self.pending_acks.len() {
-            let entry = &self.pending_acks[i];
-            if room.is_some_and(|room| entry.room != room) {
+            let owed = &self.pending_acks[i];
+            if room.is_some_and(|target| owed.room != target) {
                 i += 1;
                 continue;
             }
-            let (owed_room, seq) = (entry.room.clone(), entry.seq);
-            if !quorums.contains_key(&owed_room) {
-                quorums.insert(owed_room.clone(), self.quorum(&owed_room));
+            if !quorums.contains_key(&owed.room) {
+                quorums.insert(owed.room.clone(), self.quorum(&owed.room));
             }
-            let (majority, followers) = &quorums[&owed_room];
-            if self.quorum_met(&owed_room, *majority, followers, seq) {
+            let (majority, followers) = &quorums[&owed.room];
+            if self.quorum_met(&owed.room, *majority, followers, owed.seq) {
                 let pending = self.pending_acks.swap_remove(i);
                 if let Some(conn) = self.conns.get_mut(&pending.conn) {
                     conn.outbox.push(pending.accepted);
