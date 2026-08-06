@@ -1654,8 +1654,18 @@ impl Hub {
         };
         let creator = self.room_creator(src);
         self.install_room_state(dst, &state, None, creator)?;
-        if let Some((app, version)) = self.governing.get(src).cloned() {
-            self.bind_governing(dst, app, version);
+        match self.governing.get(src).cloned() {
+            Some((app, version)) => self.bind_governing(dst, app, version),
+            // An ungoverned source makes an ungoverned clone — and the destination
+            // name may already carry a binding, since a subscribe binds before
+            // anything materializes under the name. Letting that stand would govern
+            // the copy by an app whoever named the destination picked, which is the
+            // caller choosing the schema its own clone is read under.
+            None => {
+                if self.governing.remove(dst).is_some() {
+                    let _ = self.persist_meta(dst);
+                }
+            }
         }
         Ok(true)
     }

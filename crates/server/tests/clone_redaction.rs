@@ -574,6 +574,35 @@ mod a_never_bound_source {
         r
     }
 
+    /// A destination name a subscriber bound before anything materialized under it
+    /// must not lend its app to the copy — that is the same caller-chosen schema by
+    /// another door, and the clone of an ungoverned source is ungoverned.
+    #[test]
+    fn a_binding_squatting_on_the_destination_name_does_not_govern_the_clone() {
+        let mut r = seeded();
+        // A connection declaring `PERM_APP` subscribes to the destination name. The
+        // room never materializes, but the name is bound.
+        let squatter = hello_auth(&mut r, 3, "alice", PERM_APP);
+        assert!(r.deliver(squatter, sub(DST)));
+        r.take_outbox(squatter);
+        assert!(
+            r.hub().governing_app(DST).is_some(),
+            "the subscribe bound the destination name",
+        );
+        assert!(!r.hub().holds_room(DST), "and materialized nothing");
+
+        let alice = hello_auth(&mut r, 4, "alice", b"");
+        assert!(matches!(
+            clone(&mut r, alice),
+            Message::CloneRoomResult { created: true, .. }
+        ));
+        assert_eq!(
+            r.hub().governing_app(DST),
+            None,
+            "the clone of an ungoverned source is ungoverned",
+        );
+    }
+
     #[test]
     fn the_caller_cannot_supply_the_schema_that_decides_its_own_read() {
         let mut r = seeded();
