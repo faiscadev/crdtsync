@@ -862,7 +862,7 @@ fn a_room_with_no_acl_tuples_serves_the_full_snapshot() {
 fn a_leaf_level_deny_is_projected_out_of_the_snapshot() {
     // bob reads /a but is denied the leaf /a/v. The op fan-out withholds the RegisterSet
     // at /a/v while delivering the /a MapCreate; the snapshot projection gates each
-    // element on recipient_reads_path at the same path op_read_path resolves to, so it
+    // element on recipient_reads_path at the same path op_read_gate resolves to, so it
     // serves /a as a map with the /a/v slot cut. A snapshot joiner converges with an op
     // joiner: both hold the /a map, neither holds /a/v.
     let build = |compact: bool| -> Document {
@@ -1214,6 +1214,198 @@ fn a_partial_reader_snapshot_keeps_only_ranges_it_fully_reads() {
         ids,
         vec![mark_a],
         "bob's snapshot keeps the /a mark and drops the range spanning into unreadable /b",
+    );
+}
+
+/// A room holding a mark over a sequence that lived in `/secret` and has since been
+/// deleted, so the mark's anchor resolves to nothing on either seam. Two non-creator
+/// readers are set up against it, both reading the root through **doc-ACL** rather than
+/// the deployment tier (which abstains on them), so the whole-document verdict is the
+/// doc-ACL one and the rule under test actually bites: `bob` is carved out by a
+/// `Deny(Read)` on `/secret`; `dave` holds the same root grant with no deny, and so is
+/// denied nothing. Returns the registry with alice joined and her outbox drained.
+fn orphaned_mark_under_a_carve_out() -> (Registry, Document, ConnId) {
+    let mut r = registry();
+    let alice = auth(&mut r, 1, "t-alice");
+    assert!(subscribe(&mut r, alice));
+    r.take_outbox(alice);
+    let mut alice_doc = Document::new(cid(1));
+    submit(&mut r, alice, write_subtree(&mut alice_doc, b"pub", 1));
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"bob")),
+            &encode_path(&[]),
+        ),
+    );
+    submit(
+        &mut r,
+        alice,
+        grant_cap(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"bob")),
+            Capability::Read,
+            AclEffect::Deny,
+            &encode_path(&[b"secret"]),
+        ),
+    );
+    submit(
+        &mut r,
+        alice,
+        grant_read(
+            &mut alice_doc,
+            AclSubject::Actor(actor_key(b"dave")),
+            &encode_path(&[]),
+        ),
+    );
+    seed_list(&mut r, alice, &mut alice_doc, b"secret");
+    seed_mark(&mut r, alice, &mut alice_doc, b"secret");
+    // Delete the annotated sequence. The mark survives — only an explicit RangedDelete
+    // tombstones one — with an anchor that now resolves to no path at all.
+    submit(
+        &mut r,
+        alice,
+        crdtsync_core::path::delete(&mut alice_doc, &encode_path(&[b"secret"])),
+    );
+    r.take_outbox(alice);
+    (r, alice_doc, alice)
+}
+
+#[test]
+fn an_orphaned_marks_op_is_withheld_from_a_carved_out_reader() {
+    // C52, the op seam. bob reads root — a descendant deny does not govern the root
+    // query — so gating the create at the root served him a mark authored wholly inside
+    // the `/secret` he is denied: its name, its payload and its anchor's element id.
+    // An op whose governing target resolves to nothing reaches only a reader denied
+    // nothing, and the `/secret` carve-out is exactly what bob is denied.
+    let (mut r, _alice_doc, _alice) = orphaned_mark_under_a_carve_out();
+    let bob = auth(&mut r, 2, "t-bob");
+    assert!(subscribe(&mut r, bob), "bob's root read admits him");
+    let replay = received_ops(&mut r, bob);
+    assert!(
+        touches_subtree(&replay, b"pub"),
+        "control: the catch-up did deliver the subtree bob may read, so the assertion \
+         below can only pass by the mark specifically being withheld",
+    );
+    assert!(
+        !has_ranged_create(&replay),
+        "the orphaned mark's create is withheld from the carved-out reader's catch-up",
+    );
+}
+
+#[test]
+fn an_orphaned_mark_is_withheld_from_a_carved_out_readers_snapshot() {
+    // The snapshot half of the same rule, so op-join and snapshot-join still agree: a
+    // compacted room's projected snapshot drops exactly the mark the op replay withholds.
+    let (mut r, mut alice_doc, alice) = orphaned_mark_under_a_carve_out();
+    r.set_compaction_threshold(1);
+    submit(&mut r, alice, write_subtree(&mut alice_doc, b"pub", 2));
+    r.take_outbox(alice);
+
+    let bob = auth(&mut r, 2, "t-bob");
+    assert!(subscribe(&mut r, bob), "bob's root read admits him");
+    let snap =
+        served_snapshot(&mut r, bob).expect("the carved-out reader is served a projected snapshot");
+    assert!(
+        has_subtree(&snap, b"pub"),
+        "the readable subtree is still served",
+    );
+    assert!(
+        snap.ranged_elements().is_empty(),
+        "the orphaned mark is dropped from the carved-out reader's snapshot",
+    );
+}
+
+#[test]
+fn an_orphaned_mark_reaches_a_reader_denied_nothing_on_both_seams() {
+    // The converse, and the half that makes the drop safe: dave holds the same root read
+    // grant with no deny anywhere, so his whole-document verdict is a doc-ACL one (the
+    // deployment tier abstains on him) and both seams must carry the mark to him. The op
+    // seam admits it by `OpReadGate::WholeDocument`; the snapshot seam by the caller
+    // declining to project at all, which is why the projection itself can drop
+    // unconditionally.
+    let (mut r, _alice_doc, _alice) = orphaned_mark_under_a_carve_out();
+    let dave = auth(&mut r, 4, "t-dave");
+    assert!(subscribe(&mut r, dave), "dave's root read admits him");
+    assert!(
+        has_ranged_create(&received_ops(&mut r, dave)),
+        "the op seam replays the orphaned mark's create to a reader denied nothing",
+    );
+
+    // The same reader on the snapshot seam, over a compacted room.
+    let (mut r, mut alice_doc, alice) = orphaned_mark_under_a_carve_out();
+    r.set_compaction_threshold(1);
+    submit(&mut r, alice, write_subtree(&mut alice_doc, b"pub", 2));
+    r.take_outbox(alice);
+    let dave = auth(&mut r, 4, "t-dave");
+    assert!(subscribe(&mut r, dave), "dave's root read admits him");
+    let snap = served_snapshot(&mut r, dave).expect("a subscriber below the floor is served one");
+    assert_eq!(
+        snap.ranged_elements().len(),
+        1,
+        "the snapshot seam serves the orphaned mark to a reader denied nothing",
+    );
+}
+
+#[test]
+fn a_marks_composite_payload_rides_the_mark_on_the_op_seam() {
+    // A composite payload container hangs off its range rather than a map slot, so the
+    // element index gives it no path and an op editing its contents fell to the root — the
+    // mark's own content, served to a reader carved out of the region the mark annotates,
+    // while the snapshot projection cuts it with the mark. The gate resolves such an op
+    // through the range's anchors instead, so the two seams withhold the same content.
+    const SECRET: &[u8] = b"payload-content-that-must-not-ride";
+    const NESTED: &[u8] = b"nested-payload-content-that-must-not-ride";
+    let (mut r, mut alice_doc, alice) = orphaned_mark_under_a_carve_out();
+    // A fresh sequence back at the denied /secret, marked with a composite payload.
+    seed_list(&mut r, alice, &mut alice_doc, b"secret");
+    let start = seq_anchor(&alice_doc, b"secret", 0);
+    let end = seq_anchor(&alice_doc, b"secret", 1);
+    let mut rid = None;
+    let ops = alice_doc.transact(|tx| rid = Some(tx.ranged().create_map(start, end)));
+    submit(&mut r, alice, ops);
+    let rid = rid.expect("a create emits a range id");
+
+    let bob = auth(&mut r, 2, "t-bob"); // root read, denied /secret*
+    assert!(subscribe(&mut r, bob), "bob's root read admits him");
+    let dave = auth(&mut r, 4, "t-dave"); // denied nothing
+    assert!(subscribe(&mut r, dave), "dave's root read admits him");
+    r.take_outbox(bob);
+    r.take_outbox(dave);
+
+    // A write into the payload itself, then one into a container *nested* inside it —
+    // the second addresses a further-derived id the element index holds no more than it
+    // holds the payload, so it is the one a one-level keying would still leak.
+    let ops = alice_doc.transact(|tx| {
+        let mut ranged = tx.ranged();
+        let mut payload = ranged.payload_map(rid).expect("a map payload");
+        payload.set(b"k", Scalar::Bytes(SECRET.to_vec()));
+        payload
+            .map(b"inner")
+            .set(b"deep", Scalar::Bytes(NESTED.to_vec()));
+    });
+    submit(&mut r, alice, ops);
+
+    let carries = |ops: &[Op], want: &[u8]| {
+        ops.iter().any(|o| {
+            matches!(&o.kind, OpKind::MapSet { value, .. } if matches!(value, Scalar::Bytes(b) if b == want))
+        })
+    };
+    let to_bob = received_ops(&mut r, bob);
+    assert!(
+        !carries(&to_bob, SECRET),
+        "the payload write is withheld from the reader carved out of the mark's region",
+    );
+    assert!(
+        !carries(&to_bob, NESTED),
+        "and so is a write into a container nested inside the payload",
+    );
+    let to_dave = received_ops(&mut r, dave);
+    assert!(
+        carries(&to_dave, SECRET) && carries(&to_dave, NESTED),
+        "both still reach a reader denied nothing",
     );
 }
 

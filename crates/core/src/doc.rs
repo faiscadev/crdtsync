@@ -482,11 +482,44 @@ impl Document {
     /// [`acl_records`](Self::acl_records), which likewise carries tombstoned tuples;
     /// the live [`ranged_elements`](Self::ranged_elements) view drops deleted ranges
     /// and so cannot serve their anchors.
+    ///
+    /// A range with a **composite payload** keys its payload container and everything
+    /// registered beneath it under the same anchors, beside its own id. A payload hangs off
+    /// the range rather than a map slot, so the tree walk gives it and its descendants no
+    /// path and an op editing their contents would otherwise resolve to none — while the
+    /// state form is redacted with the mark it belongs to. Keying them here is what lets
+    /// the outbound redaction gate such an op by the mark's own governing paths, so the two
+    /// seams withhold the same content. The consumer resolves an op's target through the
+    /// element index first and reaches this map only for a target that index does not hold,
+    /// so an entry here can never override a live element's own path.
     pub fn ranged_anchors(&self) -> HashMap<ElementId, (ElementId, ElementId)> {
-        self.ranged
+        let mut out: HashMap<ElementId, (ElementId, ElementId)> = self
+            .ranged
             .iter()
             .map(|(id, e)| (*id, (e.start.seq, e.end.seq)))
-            .collect()
+            .collect();
+        // The tree walk is paid only where a composite payload exists to enumerate, which
+        // most rooms never hold.
+        let composites: Vec<(ElementId, ElementKind)> = self
+            .ranged
+            .iter()
+            .filter_map(|(id, e)| match e.payload {
+                Payload::Composite { kind } => Some((*id, kind)),
+                Payload::Scalar { .. } => None,
+            })
+            .collect();
+        if composites.is_empty() {
+            return out;
+        }
+        let live = self.element_paths();
+        let below = self.parent_index();
+        for (id, kind) in composites {
+            let anchors = out[&id];
+            let mut subtree = Vec::new();
+            self.registered_subtree(payload_id(id, kind), &below, &live, &mut subtree);
+            out.extend(subtree.into_iter().map(|child| (child, anchors)));
+        }
+        out
     }
 
     /// A live (non-revoked) ACL tuple by id, or `None` if absent or revoked.
@@ -1220,6 +1253,17 @@ impl Document {
     /// a room's zones is served a snapshot narrowed by this projection, so an
     /// unauthorized zone is wholly absent rather than redacted-but-present.
     ///
+    /// An annotation or ACL tuple whose governing element the live walk does not reach
+    /// resolves to no partition — the key its container was derived under is one-way, so
+    /// a displaced or deleted sequence cannot be re-attributed — and is dropped rather
+    /// than read as the root partition every zone-scoped subscriber holds (C52). This
+    /// runs only to narrow, so a subscriber holding every declared zone keeps it by the
+    /// caller declining to project, as the paragraph below already requires. A container
+    /// the walk does not reach is a different question and is still served: those
+    /// registry entries are what displace-then-recreate identity retains, and purging
+    /// them would drop state a scoped subscriber is entitled to when its slot is re-won
+    /// (C67).
+    ///
     /// `recipient` is the replica identity this snapshot is served to: the causal
     /// frontier is cut back to the ids that replica itself published and every other
     /// author's go, so the withheld partition's op count stays absent while the
@@ -1285,6 +1329,21 @@ impl Document {
         for (map, key) in detach {
             map.borrow_mut().take_slot(&key);
         }
+        // An annotation rides the partition of the sequences its endpoints anchor. An
+        // anchor the walk does not reach resolves to no partition at all — the key its
+        // container was derived under is one-way, so a displaced or deleted sequence
+        // cannot be re-attributed, and the mark outlives its region since only an
+        // explicit delete tombstones it. "Names no zone" would put it in the root
+        // partition, which every zone-scoped subscriber holds, so it is dropped instead:
+        // this transform only ever runs to narrow, and a subscriber holding every
+        // declared zone is served by the caller declining to project (C52). Decided here
+        // rather than at the retain below so a dropped mark's composite payload
+        // container joins `purge` — see [`ranged_purge`](Self::ranged_purge).
+        let (hidden_ranged, hidden_payloads) = self.ranged_purge(&paths, |id, e| {
+            let anchored = |seq: &ElementId| !purge.contains(seq) && paths.contains_key(seq);
+            purge.contains(id) || !anchored(&e.start.seq) || !anchored(&e.end.seq)
+        });
+        purge.extend(hidden_payloads);
         // Drop the hidden containers and every id-keyed edge and annotation that
         // names one, so the registries hold only authorized state.
         self.maps.retain(|id, _| !purge.contains(id));
@@ -1295,15 +1354,18 @@ impl Document {
         self.xml_fragments.retain(|id, _| !purge.contains(id));
         self.parents
             .retain(|child, parent| !purge.contains(child) && !purge.contains(parent));
-        self.ranged.retain(|id, e| {
-            !purge.contains(id) && !purge.contains(&e.start.seq) && !purge.contains(&e.end.seq)
-        });
+        self.ranged.retain(|id, _| !hidden_ranged.contains(id));
         // ACL tuples are keyed by their own id, not a container's, so they are
         // dropped by the zone their scope resolves into (an unauthorized zone's
         // grants would leak its path) as well as by a purged id. An element scope
-        // resolves through the live tree's `paths`; a scope that resolves to no key
-        // sequence (an unresolvable element, a malformed path) names no zone and is
-        // kept, as an unzoned grant is.
+        // resolves through the live tree's `paths`; a resolved scope naming no zone is
+        // an unzoned grant and is kept. A scope that resolves to no key sequence at all
+        // — an unresolvable element, a leaf element the walk records no path for, a
+        // malformed path — names no partition either, so like an orphaned annotation it
+        // is dropped rather than read as the root partition every zone-scoped subscriber
+        // holds. A tuple in that state is inert for enforcement, the evaluator's resolver
+        // dropping it on the same lookup, so what a narrowed subscriber loses is a grant
+        // that decides nothing.
         self.acl.retain(|id, e| {
             if purge.contains(id) {
                 return false;
@@ -1312,9 +1374,12 @@ impl Document {
                 AclScope::Path(p) => crate::path::parse_path(p),
                 AclScope::Element(eid) => paths.get(eid).cloned(),
             };
-            match keys.and_then(|keys| zone::zone_id_of(schema, &keys)) {
-                Some(zone) => authorized.contains(&zone),
-                None => true,
+            match keys {
+                None => false,
+                Some(keys) => match zone::zone_id_of(schema, &keys) {
+                    Some(zone) => authorized.contains(&zone),
+                    None => true,
+                },
             }
         });
         self.placements.retain(|node, places| {
@@ -1362,7 +1427,7 @@ impl Document {
     /// hidden subtree's content, structure, ids, or the ACL grants that would reveal who
     /// else may read it. `reads` is the server's composed doc-ACL read verdict at a
     /// `core::path` key sequence — the exact per-path authority the per-op fan-out gates
-    /// each op on (the server's `op_read_path` resolves an op to this same path). This is
+    /// each op on (the server's `op_read_gate` resolves an op to this same path). This is
     /// the doc-ACL analogue of [`project_zones`](Self::project_zones): the state half of the
     /// per-path read redaction, so a compacted room's cold-start snapshot is narrowed to
     /// a partial reader's granted subtrees rather than refused, and a snapshot-served
@@ -1381,7 +1446,23 @@ impl Document {
     /// that path, so a snapshot reader materializes the same ACL subset an op reader does);
     /// a RangedElement is kept only where the path of EVERY sequence its endpoints anchor
     /// is readable (require-all, so a mark leaks no content-region info at an unreadable
-    /// endpoint). A whole-document reader is left untouched, byte-identical on re-encode.
+    /// endpoint), and a dropped one takes its composite payload container with it — the
+    /// payload hangs off the mark's id rather than a map slot, so no path verdict reaches
+    /// it. A reader denied nothing over a document holding no pathless registry state is
+    /// left untouched, byte-identical on re-encode.
+    ///
+    /// A tuple or mark whose governing element the live walk does not reach — a
+    /// since-deleted or displaced sequence, a scope target that left the tree — has no
+    /// path, so no path verdict places it, and it is **dropped**. The root verdict was
+    /// the stand-in and is not strict enough: a root grant a subtree deny carves passes
+    /// the root query, and serving it a mark's name, payload and anchor id out of the
+    /// carved region is the leak this closes (C52). Like [`project_zones`](Self::project_zones)
+    /// this is a narrowing transform, so a reader entitled to the whole document is served
+    /// by the caller declining to project at all — which is what makes the drop
+    /// unconditional here, and what keeps the rule out of the business of re-deriving a
+    /// whole-document verdict the authority already holds. `op_read_gate` admits the
+    /// matching ops to exactly that reader, so the two catch-up seams still materialize
+    /// the same subset.
     ///
     /// `recipient` is the replica identity this snapshot is served to: the causal
     /// frontier is cut back to the ids that replica itself published and every other
@@ -1490,6 +1571,35 @@ impl Document {
         for (map, key) in detach {
             map.borrow_mut().take_slot(&key);
         }
+        // A RangedElement is redacted by the path of EVERY sequence its endpoints
+        // anchor — a require-all rule — since a mark/annotation reveals content-region
+        // info at both endpoints: a reader that cannot read where the range starts OR
+        // ends must not materialize it. A single-sequence mark has one governing path;
+        // a cross-element range has two, and both must read. This mirrors the op-stream
+        // rule (op_read_gate gates each Ranged op on its distinct anchor seq paths), so
+        // a snapshot-served partial reader materializes the same RangedElement subset an
+        // op-served one does — with the one deviation the *prefix* rule below introduces,
+        // for a reader granted a subtree whose ancestor it is denied: the op seam gates a
+        // mark at its anchor's own path and delivers it, while this drops it. What the op
+        // reader then holds is a dangling record, because the anchor sequence never
+        // materialized for it either — the create at the denied ancestor level was
+        // withheld, which is the same reasoning the container rule above rests on — so the
+        // difference is a record that renders nothing, not content. An anchor seq the walk does not resolve — a sequence deleted
+        // or displaced out of the tree — names no path, so no path verdict places the mark it
+        // anchors, and it is dropped for the same reason a pathless scope is: the mark
+        // outlives its region (only an explicit delete tombstones one), so anything short of
+        // the whole document would be served its name, payload and anchor id out of a region
+        // it may not read. Decided here rather than at the retain below so a dropped mark's
+        // composite payload container joins `purge` — see [`ranged_purge`](Self::ranged_purge).
+        // The prefix rule, not the anchor's own verdict: a sequence under an unreadable
+        // ancestor is purged even where a deeper grant re-opens its own path, so reading
+        // that path alone would keep a mark whose sequence the same projection just cut.
+        let anchor_reads = |seq: ElementId| paths.get(&seq).is_some_and(|p| reads(p) && !denied(p));
+        let ranged_before = self.ranged.len();
+        let (hidden_ranged, hidden_payloads) = self.ranged_purge(&paths, |id, e| {
+            purge.contains(id) || !anchor_reads(e.start.seq) || !anchor_reads(e.end.seq)
+        });
+        purge.extend(hidden_payloads);
         // Drop the hidden containers and every id-keyed edge and annotation that names
         // one, so the registries hold only authorized state.
         self.maps.retain(|id, _| !purge.contains(id));
@@ -1513,14 +1623,18 @@ impl Document {
         // An ACL tuple is redacted by the path it governs, not by root read: ACL state is
         // itself privacy-sensitive — a tuple reveals a subject, an effect, and the existence
         // of a governed path — so a reader keeps it only where it may read that path. This
-        // mirrors the op-stream rule (op_read_path maps an AclGrant to its scope's path), so a
+        // mirrors the op-stream rule (op_read_gate maps an AclGrant to its scope's path), so a
         // snapshot-served partial reader materializes the same ACL subset an op-served one
         // would. A `Path` scope is the encoded key path; an `Element` scope resolves to its
-        // element's current path through `paths` (the grant follows the element). An `Element`
-        // scope that does not resolve (an unresolvable element id) falls back to root read —
-        // the same fallback the op-stream takes (`op_read_path` gates it at root), so an
-        // unresolvable-element tuple reaches exactly the readers on either seam and the two
-        // catch-ups stay convergent. A malformed `Path` fails closed (dropped).
+        // element's current path through `paths` (the grant follows the element). A scope
+        // that resolves to no path at all — a malformed `Path`, an `Element` whose target has
+        // left the tree, an `Element` naming a *leaf*, which the walk records no path for —
+        // names nothing a path verdict can place, so it is dropped: this transform only ever
+        // runs to narrow, and the reader entitled to the whole document is served by the
+        // caller declining to project. The op stream resolves every one of those the same
+        // way and admits the grant op to exactly that reader, so the two catch-ups stay
+        // convergent — and a tuple in that state is inert for enforcement anyway, the
+        // evaluator's resolver dropping it on the same lookup.
         let acl_before = self.acl.len();
         self.acl.retain(|id, e| {
             if purge.contains(id) {
@@ -1528,29 +1642,11 @@ impl Document {
             }
             match &e.scope {
                 AclScope::Path(p) => crate::path::parse_path(p).is_some_and(|segs| reads(&segs)),
-                AclScope::Element(eid) => paths.get(eid).map_or(root_reads, |segs| reads(segs)),
+                AclScope::Element(eid) => paths.get(eid).is_some_and(|segs| reads(segs)),
             }
         });
         let acl_cut = self.acl.len() != acl_before;
-        // A RangedElement is redacted by the path of EVERY sequence its endpoints
-        // anchor — a require-all rule — since a mark/annotation reveals content-region
-        // info at both endpoints: a reader that cannot read where the range starts OR
-        // ends must not materialize it. A single-sequence mark has one governing path;
-        // a cross-element range has two, and both must read. This mirrors the op-stream
-        // rule (op_read_paths gates each Ranged op on its distinct anchor seq paths), so
-        // a snapshot-served partial reader materializes the same RangedElement subset an
-        // op-served one does. An anchor seq the walk does not resolve (a since-deleted
-        // sequence) falls back to the **root** read verdict — which is not the
-        // whole-document one: a reader holding a root grant with a subtree deny passes
-        // it, so an orphaned annotation survives its region being cut (C52).
-        let ranged_before = self.ranged.len();
-        let anchor_reads = |seq: ElementId| match paths.get(&seq) {
-            Some(p) => reads(p),
-            None => root_reads,
-        };
-        self.ranged.retain(|id, e| {
-            !purge.contains(id) && anchor_reads(e.start.seq) && anchor_reads(e.end.seq)
-        });
+        self.ranged.retain(|id, _| !hidden_ranged.contains(id));
         let ranged_cut = self.ranged.len() != ranged_before;
         // Drop every placement and move whose list/destination is purged or at a denied
         // path — the reader never received the op that put a node there (a create or move
@@ -1579,8 +1675,10 @@ impl Document {
         // `moved_away` overlay match the filtered log a
         // reload replays — a node kept at its readable origin renders there, not at the
         // denied destination it was folded to, so the projected snapshot is byte-stable
-        // through a round-trip. A pure identity projection (a whole-document reader)
-        // leaves them untouched, staying byte-identical on re-encode.
+        // through a round-trip. A projection that cut nothing leaves them untouched,
+        // staying byte-identical on re-encode — which a reader denied nothing reaches
+        // only over a document holding no pathless registry state, since that is dropped
+        // whatever the predicate admits.
         if !purge.is_empty() || cut_leaf || acl_cut || ranged_cut || !root_reads {
             let published = self.published_by(recipient);
             self.refold_projected_moves();
@@ -1589,6 +1687,123 @@ impl Document {
             self.resolved_tx.clear();
             self.scrub_frontier_to(published);
             self.scrub_high_water_to(recipient);
+        }
+    }
+
+    /// The RangedElements a projection is about to drop, paired with the **composite
+    /// payload containers** that must be purged with them. Resolved before the registry
+    /// retains, so the container goes with the mark by the ordinary purge path.
+    ///
+    /// A composite payload is registered under an id derived from the RangedElement's,
+    /// linked to it rather than held in any map slot, so the root walk never reaches it:
+    /// it has no path, falls in no zone, and no verdict either projection computes would
+    /// ever cut it. Dropping only the `ranged` entry would therefore withhold the mark's
+    /// name and anchor while re-encoding the container holding its content — the region's
+    /// content, served to a reader or subscriber the mark itself was just withheld from.
+    ///
+    /// The payload container's own subtree goes with it: a payload is an ordinary
+    /// container, so an op stream can nest containers and counters inside it, and every
+    /// one of those is registered under a derived id the walk reaches no more than it
+    /// reaches the payload. Collected transitively by
+    /// [`registered_subtree`](Self::registered_subtree), since nothing downstream would.
+    ///
+    /// The predicate is the projection's own drop rule, taking the entry so a Ranged op's
+    /// anchors and scope are decided once.
+    fn ranged_purge(
+        &self,
+        live: &HashMap<ElementId, Vec<Vec<u8>>>,
+        drop: impl Fn(&ElementId, &RangedEntry) -> bool,
+    ) -> (HashSet<ElementId>, Vec<ElementId>) {
+        let mut dropped = HashSet::new();
+        let mut payloads = Vec::new();
+        let mut below = None;
+        for (id, entry) in self.ranged.iter().filter(|(id, e)| drop(id, e)) {
+            dropped.insert(*id);
+            if let Payload::Composite { kind } = entry.payload {
+                let below = below.get_or_insert_with(|| self.parent_index());
+                self.registered_subtree(payload_id(*id, kind), below, live, &mut payloads);
+            }
+        }
+        (dropped, payloads)
+    }
+
+    /// The document's `parents` relation inverted — each element mapped to the elements
+    /// registered directly under it. Built once and shared across a walk's roots, since it
+    /// costs a scan of every parent edge.
+    fn parent_index(&self) -> HashMap<ElementId, Vec<ElementId>> {
+        let mut below: HashMap<ElementId, Vec<ElementId>> = HashMap::new();
+        for (child, parent) in &self.parents {
+            below.entry(*parent).or_default().push(*child);
+        }
+        below
+    }
+
+    /// `root` plus every registered element beneath it, appended to `out`.
+    ///
+    /// Two views unioned, because neither alone is the set a re-encode emits. The live
+    /// handles reach a counter, which carries no parent edge; the `parents` relation
+    /// reaches a container whose slot was deleted or displaced, which the live handles
+    /// skip and which `encode_state` writes all the same. `live` names the elements the
+    /// root walk reaches and none of them is ever collected: an id with a path of its own
+    /// is governed by that path, and a tree-move can leave a `parents` edge pointing into
+    /// a subtree the node has since left.
+    ///
+    /// A counter is the awkward one: it carries no parent edge, and a tombstoned slot
+    /// drops it from `keys()`, so neither view reaches it once deleted. It is swept from
+    /// the holding map's **slot table**, which keeps a tombstoned key, since the id is
+    /// derived from (map, key) — the one place a deleted counter is still named.
+    ///
+    /// `below` is the inverted [`parents`](Self::parent_index) relation, built **once** by
+    /// the caller and reused across every root it walks: a room holding many composite
+    /// marks would otherwise re-scan every parent edge per mark, which is quadratic on a
+    /// path both the fan-out and the catch-up take.
+    fn registered_subtree(
+        &self,
+        root: ElementId,
+        below: &HashMap<ElementId, Vec<ElementId>>,
+        live: &HashMap<ElementId, Vec<Vec<u8>>>,
+        out: &mut Vec<ElementId>,
+    ) {
+        let mut stack = vec![root];
+        let mut seen: HashSet<ElementId> = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if live.contains_key(&id) || !seen.insert(id) {
+                continue;
+            }
+            out.push(id);
+            if let Some(kids) = below.get(&id) {
+                stack.extend(kids);
+            }
+            let held: Vec<Element> = if let Some(m) = self.maps.get(&id) {
+                let m = m.borrow();
+                // A counter carries no parent edge, and it drops out of `keys()` the moment
+                // its slot is tombstoned — so neither view above reaches a deleted counter
+                // slot, while `encode_state` still emits its registry entry. Its id is
+                // derived from (map, key) and a tombstoned slot keeps its key, so the slot
+                // table is the one place that still names it.
+                for key in m.slot_keys() {
+                    let counter = ElementId::derive(id, &key, ElementKind::Counter);
+                    if self.counters.contains_key(&counter) {
+                        stack.push(counter);
+                    }
+                }
+                m.keys().into_iter().filter_map(|k| m.get(&k)).collect()
+            } else if let Some(l) = self.lists.get(&id) {
+                l.borrow().values()
+            } else if let Some(x) = self.xml_elements.get(&id) {
+                let x = x.borrow();
+                vec![Element::Map(x.attrs()), Element::List(x.children())]
+            } else if let Some(f) = self.xml_fragments.get(&id) {
+                vec![Element::List(f.borrow().children())]
+            } else {
+                Vec::new()
+            };
+            for child in held {
+                match child {
+                    Element::Scalar(_) | Element::Register(_) => {}
+                    other => stack.push(other.id()),
+                }
+            }
         }
     }
 
