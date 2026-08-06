@@ -9,15 +9,17 @@
 //! containers, so a slot re-won after displacement is the same logical
 //! element: identity persists across displacement — and an op naming a displaced
 //! container applies into it hidden, since that is what a reinstatement brings
-//! back. An op whose target is not materialised at all — its create unseen — is
-//! held in the buffer, in op-id order, and replays once the create arrives, so
-//! out-of-order delivery converges.
+//! back. An op the current state cannot express — its target's create unseen, the
+//! nodes it deletes absent, its transaction group incomplete — is held in the
+//! buffer and replays once what it waits on arrives, so out-of-order delivery
+//! converges. The buffer is encoded in op-id order, since nothing else about the
+//! order it was filled in is state.
 
 use crate::acl::{AclEffect, AclGrant, AclRecord, AclScope, AclSubject, AclTuple};
 use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, len_u32, put_acl_effect, put_acl_grant, put_acl_scope, put_acl_subject,
+    decode_ops, encode_op, len_u32, put_acl_effect, put_acl_grant, put_acl_scope, put_acl_subject,
     put_bytes, put_opt_bytes, put_range_anchor, put_scalar, put_stamp, put_u32, put_u64, put_u8,
     Cursor, DecodeError,
 };
@@ -79,7 +81,9 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 /// so a format change can never be misread as the current one.
 const STATE_VERSION: u8 = 13;
 
-/// A composite that a mutation displaced from its slot and left unreachable.
+/// A composite that a mutation displaced from its slot. Reported wherever the
+/// displacement happens, a hidden subtree included: an op addressed to a retained
+/// container applies into it, so a slot inside one changes hands like any other.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OrphanEvent {
     pub id: ElementId,
@@ -262,10 +266,9 @@ pub struct Document {
     /// returned per edit, so several edits commit as one group.
     atomic: Option<Vec<Op>>,
     seen: HashSet<OpId>,
-    /// Ops whose target this replica has not seen created, held until it is — and
-    /// atomic members held for their group. Kept in op-id order, because it rides
-    /// the state encoding and two replicas holding the same ops must encode them
-    /// the same way ([`hold`](Self::hold)).
+    /// Ops the current state cannot express, held until it can: a target whose
+    /// create is unseen, a delete whose nodes are absent, a member of an incomplete
+    /// atomic group ([`ready`](Self::ready)).
     buffer: Vec<Op>,
     buffered: HashSet<OpId>,
     /// The `(author, group id)` keys whose bucket has resolved. A member arriving
@@ -1192,8 +1195,18 @@ impl Document {
         }
 
         // The buffer is a framed op log, itself length-prefixed so the reader
-        // knows where it ends inside the document stream.
-        let framed = encode_ops(&self.buffer);
+        // knows where it ends inside the document stream. Written in `op_order`,
+        // because the buffer holds its ops as they arrived while nothing reads it
+        // in that order: two replicas holding the same waiting ops would otherwise
+        // encode different bytes.
+        let mut held: Vec<&Op> = self.buffer.iter().collect();
+        held.sort_by_key(|op| op_order(op.id));
+        let mut framed = Vec::new();
+        for op in held {
+            let body = encode_op(op);
+            put_u32(&mut framed, len_u32(body.len()));
+            framed.extend_from_slice(&body);
+        }
         put_u32(&mut out, len_u32(framed.len()));
         out.extend_from_slice(&framed);
         out
@@ -2223,9 +2236,10 @@ impl Document {
         }
 
         let root_id = ElementId::from_bytes(ROOT_ID);
-        // Following parents must terminate: a cycle would hang `resolvable` on a
-        // later op. Memoize chains already proven to terminate so the walk stays
-        // linear over an untrusted graph.
+        // Following parents must terminate: a cycle would hang the readiness walk
+        // (`materialised`) on a later op, and `resolvable` on an undo. Memoize
+        // chains already proven to terminate so the walk stays linear over an
+        // untrusted graph.
         reject_parent_cycles(&parents, root_id)?;
 
         let seen_count = cur.u32()?;
@@ -2257,13 +2271,7 @@ impl Document {
 
         let buf_len = cur.u32()? as usize;
         let framed = cur.take(buf_len)?;
-        let mut buffer = decode_ops(framed)?;
-        // Held in id order, whatever order the snapshot presented — the invariant
-        // `hold` maintains and `encode_state` writes out. A peer-supplied snapshot
-        // is the one place a buffer arrives from outside this replica, so sorting
-        // here is what makes the invariant structural: two replicas reading these
-        // bytes hold the same buffer in the same order, and re-encode it the same.
-        buffer.sort_by_key(|op| op_order(op.id));
+        let buffer = decode_ops(framed)?;
         // A buffered op that is already applied, or repeated, would be replayed by
         // `drain_buffer`, which dedups against neither: reject both.
         let mut buffered = HashSet::with_capacity(buffer.len().min(1024));
@@ -3028,23 +3036,19 @@ impl Document {
         out
     }
 
-    /// Hold `op` in the buffer until it can apply, at the position its
-    /// [`OpId`] gives it.
+    /// Hold `op` in the buffer until it can apply.
     ///
-    /// The buffer is kept in id order rather than arrival order because it is
-    /// replica state: it rides [`encode_state`](Self::encode_state), and the ids
-    /// it holds are the only key over it every replica agrees on. Stored as it
-    /// arrived, two replicas that folded the same ops — holding the same ops,
-    /// reading the same state — would encode different bytes, and snapshot
-    /// identity is byte identity. Nothing reads the buffer positionally except
-    /// [`take_complete_tx`](Self::take_complete_tx)'s tie-break, which wants a
-    /// key both ends of a snapshot share for exactly the same reason.
+    /// Appended, not placed. The order the buffer is *stored* in decides only which
+    /// of several ready ops the drain replays first and which of several complete
+    /// groups commits first, and the drain runs to a fixpoint, so neither is a state
+    /// decision; the order that is state is the one
+    /// [`encode_state`](Self::encode_state) writes, which is [`op_order`]. Holding
+    /// it sorted would cost a memmove per arrival, and both how much the buffer
+    /// holds and where an arrival lands in it are the sender's to choose — a backlog
+    /// delivered newest-first is quadratic, and cheap to send.
     fn hold(&mut self, op: Op) {
-        let at = self
-            .buffer
-            .partition_point(|held| op_order(held.id) < op_order(op.id));
         self.buffered.insert(op.id);
-        self.buffer.insert(at, op);
+        self.buffer.push(op);
     }
 
     /// Replay buffered ops that a state change just made reachable, to a
@@ -3081,13 +3085,13 @@ impl Document {
                 members.sort_by_key(|op| op.id.seq);
                 for mut op in members {
                     // Every applied op still passes the ordinary readiness gate:
-                    // routing drops a mutation whose container is displaced, so a
-                    // member waved through by the group gate — its target created
-                    // by an earlier member whose create then lost the slot — would
+                    // routing drops a mutation whose container this replica has not
+                    // materialised, so a member waved through by the group gate —
+                    // its target created by another member still in flight — would
                     // silently lose its effect while a replica that saw the group
-                    // against an installed container kept it. A member that is not
+                    // against a materialised container kept it. A member that is not
                     // ready is held instead, untagged, and drains with the ordinary
-                    // buffer once its container is installed. What blocks a member
+                    // buffer once its create lands. What blocks a member
                     // is almost always what makes it unobservable — an unresolvable
                     // target renders nothing — so holding it leaves the group's
                     // all-or-nothing view intact; ARCHITECTURE §Transactions names
@@ -3192,13 +3196,16 @@ impl Document {
     /// arrival order decides, and the same ops would fold to different states.
     fn take_complete_tx(&mut self) -> Option<Vec<Op>> {
         let groups = self.tx_buckets();
-        // Lowest buffer position wins when more than one group is complete, so
-        // the commit order is the buffer's, not the hash map's. Draining to a
-        // fixpoint after every fold keeps a replica's own buffer down to at most
-        // one complete group, so this decides nothing on the live path — it is
-        // the decode of a *peer-supplied* snapshot that can present several at
-        // once, and two replicas reading identical bytes have to reach identical
-        // state whatever those bytes hold.
+        // Lowest buffer position wins when more than one group is complete, so the
+        // commit order is the buffer's, not the hash map's. Draining to a fixpoint
+        // after every fold keeps a replica's own buffer down to at most one complete
+        // group, so this decides nothing on the live path — it is the decode of a
+        // *peer-supplied* snapshot that can present several at once, and two
+        // replicas reading identical bytes have to reach identical state whatever
+        // those bytes hold. Which of them commits first is not a state decision: the
+        // drain runs to a fixpoint, so every complete group commits, and a member
+        // left unready by an earlier commit is re-held untagged and lands on the
+        // same pass.
         let complete = groups
             .into_values()
             .filter(|idxs| {
@@ -4347,9 +4354,12 @@ impl Document {
             if !self.resolvable(target) {
                 self.reinstate(target, &installers);
             }
-            // What is still unreachable is dropped rather than emitted: a peer
-            // would buffer and later replay what this replica applies to nothing.
-            if self.resolvable(target) {
+            // Emitted whether or not the revival took: a step whose container is
+            // displaced lands in the retained one, here and at every peer alike
+            // (ARCHITECTURE §Map Slot Safety), so dropping it would lose the
+            // intention on the one replica that holds it. A step naming a container
+            // no replica has materialised is what cannot land, and nothing revives.
+            if self.materialised(target) {
                 self.emit_inverse(step);
             }
         }
@@ -4589,11 +4599,11 @@ impl Document {
             cur = self.parents.get(&id).copied();
         }
         for (at, kind) in chain.into_iter().rev() {
-            // The copies answer to the same rule as the steps: an op this replica
-            // would apply to nothing is not emitted, because a peer buffers it
-            // and fires it the moment the container returns. Once one link of the
-            // chain cannot land, nothing below it can either.
-            if !self.resolvable(at) {
+            // The copies answer to the same rule as the steps: an op no replica can
+            // resolve is not emitted, because a peer would buffer it against a
+            // create that is not coming. Once one link of the chain cannot land,
+            // nothing below it can either.
+            if !self.materialised(at) {
                 return;
             }
             self.emit(at, kind);
@@ -5370,10 +5380,10 @@ fn handles_eq(a: &Element, b: &Element) -> bool {
     }
 }
 
-/// The total order over op ids the replica orders its held ops by — author, then
-/// the author's own sequence. It matches the causal-frontier encoding's sort, and
-/// it is total because an id names one op: the dedup set and the buffer each hold
-/// an id once, and a snapshot presenting a repeat is refused.
+/// The total order the held ops are encoded in — author, then the author's own
+/// sequence. It matches the causal frontier's sort, and it is total over a buffer
+/// because an id names one op: the buffer holds an id once, and a snapshot
+/// presenting a repeat is refused.
 fn op_order(id: OpId) -> ([u8; 16], u64) {
     (id.client.as_bytes(), id.seq)
 }

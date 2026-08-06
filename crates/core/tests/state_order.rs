@@ -120,6 +120,31 @@ fn a_displacement_heavy_pool_encodes_the_same_bytes_in_every_arrival_order() {
 }
 
 #[test]
+fn a_displacement_heavy_pool_encodes_the_same_bytes_under_a_permutation_sweep() {
+    // Rotations and the reversal are structured orders; these are arbitrary ones,
+    // from a fixed seed so a failure is a case anyone can rerun.
+    let pool = displacement_heavy_pool();
+    let refs: Vec<&Op> = pool.iter().collect();
+    let bytes = fold(&refs).encode_state();
+    let mut seed = 0x5eed_c58u64;
+    for round in 0..64 {
+        let mut order = refs.clone();
+        // Fisher-Yates over a xorshift, so the sweep is deterministic.
+        for i in (1..order.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            order.swap(i, (seed % (i as u64 + 1)) as usize);
+        }
+        assert_eq!(
+            fold(&order).encode_state(),
+            bytes,
+            "permutation {round} encodes different bytes"
+        );
+    }
+}
+
+#[test]
 fn a_reversed_displacement_heavy_pool_encodes_the_same_bytes() {
     // A rotation preserves each op's neighbours; a reversal preserves none, so
     // every create arrives after the displacement that outranks it.
@@ -252,9 +277,9 @@ fn a_held_buffer_is_encoded_in_op_id_order() {
 
 #[test]
 fn a_snapshot_presenting_a_disordered_buffer_re_encodes_in_op_id_order() {
-    // The order is an invariant of the buffer, not a courtesy of the encoder: a
-    // snapshot that arrives holding its ops the other way round is read into the
-    // same state as one holding them in order, and re-encodes identically.
+    // A snapshot handed over holding its ops the other way round re-encodes into
+    // the canonical order, so the bytes a replica serves are a function of the ops
+    // it holds and not of the bytes it was handed.
     let (early, late) = two_held_writes();
     let empty = doc(9).encode_state();
     let tail = 4 + crdtsync_core::encode_ops(&[]).len();
@@ -268,6 +293,6 @@ fn a_snapshot_presenting_a_disordered_buffer_re_encodes_in_op_id_order() {
     let back = Document::decode_state(&disordered).expect("decode");
     assert!(
         holds_buffer(&back.encode_state(), &[late, early]),
-        "a disordered buffer is not normalised on decode"
+        "a disordered buffer is re-served as it arrived"
     );
 }

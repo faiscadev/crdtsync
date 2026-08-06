@@ -575,9 +575,10 @@ fn with_buffer(empty_snapshot: &[u8], ops: &[Op]) -> Vec<u8> {
 /// complete transaction — it drains to a fixpoint before anything can encode it —
 /// so a buffer holding two is a shape only bytes this replica did not produce can
 /// take, which is exactly what arrives over the wire. Which group commits first
-/// decides whether the other's members still resolve, so the choice comes from
-/// the buffer, not from hash order: two replicas reading identical bytes reach
-/// identical state whatever those bytes hold.
+/// decides whether the other's members still resolve, so the choice comes from the
+/// ids the groups hold, not from hash order and not from the order the bytes
+/// present them in: two replicas reading identical bytes reach identical state,
+/// and so do two that were handed the same groups the other way round.
 #[test]
 fn a_snapshot_holding_two_complete_transactions_decodes_the_same_way_every_time() {
     // One group installs a nested map and writes a slot in it; the other takes
@@ -624,7 +625,7 @@ fn a_snapshot_holding_two_complete_transactions_decodes_the_same_way_every_time(
             "the same snapshot bytes decoded to different state"
         );
     }
-    // The buffer's order is the tie-break, so the group sitting first commits
+    // The lowest member id is the tie-break, so the nested write's group commits
     // first and its write survives the takeover.
     assert_eq!(first, (4, Some(Scalar::Int(9))));
 }

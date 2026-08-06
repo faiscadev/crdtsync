@@ -400,6 +400,14 @@ fn child_ops_of_a_losing_map_create_land_in_the_retained_map() {
     assert!(c.apply(&a_ops[0])); // MapCreate applies at root but loses the slot
     assert!(c.apply(&a_ops[1])); // child op lands in the displaced map
     assert_eq!(int(c.get(b"k")), 6); // slot is still the register
+
+    // Marked applied *and* landed: the retained map holds the write, so the slot
+    // re-won later reads what a replica that saw the write first already reads.
+    let winner = c.transact(|tx| {
+        tx.map(b"k").register(b"other", Scalar::Int(0));
+    });
+    replay(&mut c, &winner);
+    assert_eq!(int(child_map(c.get(b"k")).borrow().get(b"x")), 9);
 }
 
 #[test]
