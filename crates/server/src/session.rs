@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use crdtsync_core::acl::AclScope;
 use crdtsync_core::diff::encode_changes;
 use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
@@ -760,10 +761,14 @@ pub fn step(
                     // branch's divergent tail folded in, a tree `main` has moved on from:
                     // an element that has left `main` resolves to no live path there, an
                     // unresolvable element scope is inert, and an inert deny is no deny
-                    // (C32). So resolve against the bytes being handed out. A room with
-                    // no doc-ACL records has no element scope to resolve, and pays
-                    // neither the decode nor the walk.
-                    let served_index = if records.is_empty() || branch == MAIN_BRANCH {
+                    // (C32). So resolve against the bytes being handed out. Only an
+                    // element scope needs a tree at all — a path scope names its own
+                    // position and governs whatever occupies it — so a room holding
+                    // none pays neither the decode nor the walk.
+                    let resolves_elements = records
+                        .iter()
+                        .any(|r| matches!(r.tuple.scope, AclScope::Element(_)));
+                    let served_index = if branch == MAIN_BRANCH || !resolves_elements {
                         None
                     } else {
                         match Document::decode_state(&state) {
