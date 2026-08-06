@@ -1221,6 +1221,8 @@ Standard IAM semantics: explicit deny wins over static and same-or-lower-provena
 
 Connect, op submit, op outbound (per recipient), awareness publish / outbound, version create / restore / delete, branch create / delete, migration apply, snapshot export, ACL grant / revoke. Server is final authority. SDK exposes `canDo` for UI hints — client-side checks advisory only.
 
+**Which schema the composition consults** — step 4 of the decision flow — is the **acted-on room's** governing binding, never the connection's self-declared app. At the points a client **frame** reaches, that room comes from the frame: a **channel-keyed** frame takes the room its channel is subscribed to, and a **room-keyed** one — branch management, a cross-zone token request, a clone (off its *source*) — takes the room it names, since a caller may manage a room it holds no subscription to. The connection's own app is the fallback for a **subscribe** alone: that is the one frame whose caller is about to become the room's incumbent, and anywhere else it would be the caller choosing which `@auth` grants and zone declarations govern someone else's room. (The points reached without a frame resolve their room from what they are serving instead — a fan-out's own room, a blob's referencing room — and the connect and admin-plane gates carry no room at all, deciding on `Resource::App`.) A frame resolving no binding — a subscribe aside — is governed by no schema, so step 4 abstains and the flow default-denies, including a frame naming a room nothing ever bound (C62).
+
 ## Wire-Level Redaction
 
 If bytes hit the client, assume they leak. Server never sends unauthorized data, ever. Per-recipient filtering on every op send and every cold-start snapshot.

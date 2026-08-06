@@ -1671,11 +1671,11 @@ impl Registry {
     }
 
     /// The parsed schema a connection declared — its own `{app_id, version}`
-    /// resolved against the registry. The authorization fallback for a room not
-    /// yet bound (its first subscriber, about to become the room's incumbent):
-    /// once a room is bound, [`governing_schema`](Registry::governing_schema) —
-    /// the room's, not the connection's — governs, so a foreign app cannot pick a
-    /// permissive schema to escalate. `None` for a relay connection.
+    /// resolved against the registry. It is the authorization fallback for a
+    /// **subscribe** to a room not yet bound, and for nothing else: a subscriber is
+    /// about to become that room's incumbent, while every other frame names a room
+    /// it does not establish and so is governed by that room's own binding or by
+    /// nothing. `None` for a relay connection.
     fn connection_schema(&mut self, id: ConnId) -> Option<Arc<Schema>> {
         let conn = self.conns.get(&id)?;
         let version = conn.session.schema_version()?;
@@ -2192,9 +2192,17 @@ impl Registry {
         // self-declared app, which a foreign connection could pick to escalate.
         let authz_room: Option<RoomId> = match &msg {
             Message::Subscribe { .. } => subscribed_room.clone(),
-            // Room-keyed like branch/clone management: the token request names its
-            // room directly, so its schema binds off the frame's room.
-            Message::CrossZoneToken { room, .. } => Some(room.clone()),
+            // Room-keyed management: the frame carries the room it acts on, so a
+            // caller needs no subscription to it and its schema binds off the frame's
+            // room. Branch management and the cross-zone token request are the whole
+            // set; a clone names two rooms and is resolved below.
+            Message::CrossZoneToken { room, .. }
+            | Message::BranchList { room }
+            | Message::BranchFork { room, .. }
+            | Message::BranchForkFromVersion { room, .. }
+            | Message::BranchRestore { room, .. }
+            | Message::BranchPublish { room, .. }
+            | Message::BranchDelete { room, .. } => Some(room.clone()),
             // A clone is a read of `src` whole composed with a create of `dst`, so it
             // binds off the *source* — the room whose content, doc-ACL tuples and zone
             // declarations the clone carries, and so the room whose schema the read
@@ -2241,13 +2249,14 @@ impl Registry {
             // Bound: governed by the room's own app's schema — never the
             // connection's — even when it fails to parse (`None`: no grants).
             Some(Some(app)) => self.parsed_schema(app),
-            // Unbound (first subscriber): fall back to the connection's own app.
-            // A clone takes no such fallback: it names a room it is *not* about to
-            // become the incumbent of, so a self-declared app there would be the
-            // caller choosing which `@auth` grants and zone declarations govern the
-            // read of someone else's room — the escalation this resolution exists to
-            // refuse. An unbound source is governed by nothing instead.
-            Some(None) if !matches!(msg, Message::CloneRoom { .. }) => self.connection_schema(id),
+            // Unbound: the connection's own app is the fallback for a subscribe and
+            // nothing else, because a subscribe is the one frame whose caller is
+            // about to become the room's incumbent. A room-keyed frame names a room
+            // it does not establish, so a self-declared app there would be the caller
+            // choosing which `@auth` grants and zone declarations govern someone
+            // else's room — the escalation this resolution exists to refuse. An
+            // unbound room is governed by nothing instead.
+            Some(None) if matches!(msg, Message::Subscribe { .. }) => self.connection_schema(id),
             _ => None,
         };
         // The app governing the acted-on room — the chain a catch-up delta is
