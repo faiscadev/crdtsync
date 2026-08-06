@@ -921,7 +921,10 @@ fn resolve_read_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, id: ElementId) ->
 /// resolve — a fixed [`Path`](AclScope::Path) is its own bytes; an
 /// [`Element`](AclScope::Element) resolves to the element's current path through the
 /// room's `index`, so an element-scoped grant follows the element across a tree-move.
-/// An id the index does not hold yields `None`: the grant is inert (fail-closed).
+/// An id the index does not hold yields `None`, and an inert grant cuts both ways: an
+/// allow that resolves to nothing withholds, a *deny* that resolves to nothing admits.
+/// So which tree the `index` describes is load-bearing, and every caller owes the gate
+/// the tree it is deciding for rather than whichever one is at hand (C32).
 fn scope_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, scope: &AclScope) -> Option<Vec<u8>> {
     match scope {
         AclScope::Path(p) => Some(p.clone()),
