@@ -981,10 +981,10 @@ impl Registry {
     /// Run one reap check over the cluster membership: remove members that have
     /// stayed `Dead` past the bounded dead-time ([`Membership::reap_dead`]), so a
     /// durably-departed node stops lingering as a placement replica. Driven once per
-    /// membership sweep. Inert in single-node mode (no membership); the next delivery
-    /// recomputes placement over the reaped roster, so nothing needs recomputing here.
-    /// The release pass below does queue owed `Accepted`s into their authors' outboxes,
-    /// which the caller flushes.
+    /// membership sweep. Inert in single-node mode (no membership); `reap_dead` rebuilds
+    /// the placement itself, so the next delivery routes over the reaped roster with
+    /// nothing to recompute here. The release pass below does queue owed `Accepted`s into
+    /// their authors' outboxes, which the caller flushes.
     ///
     /// The reap also carries into the replication bookkeeping: each reaped member's
     /// acknowledged watermarks go with it ([`Replication::forget_members`]), so the map
