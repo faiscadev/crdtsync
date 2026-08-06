@@ -7,16 +7,19 @@
 //! names its target container by id, resolved against a registry of every
 //! container the replica has materialised. That registry retains displaced
 //! containers, so a slot re-won after displacement is the same logical
-//! element: identity persists across displacement. An op whose target isn't
-//! reachable yet — its parent unseen, or an ancestor displaced — is buffered
-//! and replays once a create restores reachability, so out-of-order delivery
-//! converges.
+//! element: identity persists across displacement — and an op naming a displaced
+//! container applies into it hidden, since that is what a reinstatement brings
+//! back. An op the current state cannot express — its target's create unseen, the
+//! nodes it deletes absent, its transaction group incomplete — is held in the
+//! buffer and replays once what it waits on arrives, so out-of-order delivery
+//! converges. The buffer is encoded in op-id order, since nothing else about the
+//! order it was filled in is state.
 
 use crate::acl::{AclEffect, AclGrant, AclRecord, AclScope, AclSubject, AclTuple};
 use crate::anchor::RelativePosition;
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, len_u32, put_acl_effect, put_acl_grant, put_acl_scope, put_acl_subject,
+    decode_ops, encode_op, len_u32, put_acl_effect, put_acl_grant, put_acl_scope, put_acl_subject,
     put_bytes, put_opt_bytes, put_range_anchor, put_scalar, put_stamp, put_u32, put_u64, put_u8,
     Cursor, DecodeError,
 };
@@ -78,7 +81,9 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 /// so a format change can never be misread as the current one.
 const STATE_VERSION: u8 = 13;
 
-/// A composite that a mutation displaced from its slot and left unreachable.
+/// A composite that a mutation displaced from its slot. Reported wherever the
+/// displacement happens, a hidden subtree included: an op addressed to a retained
+/// container applies into it, so a slot inside one changes hands like any other.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OrphanEvent {
     pub id: ElementId,
@@ -261,7 +266,9 @@ pub struct Document {
     /// returned per edit, so several edits commit as one group.
     atomic: Option<Vec<Op>>,
     seen: HashSet<OpId>,
-    /// Ops whose target isn't reachable yet, held until a create makes it so.
+    /// Ops the current state cannot express, held until it can: a target whose
+    /// create is unseen, a delete whose nodes are absent, a member of an incomplete
+    /// atomic group ([`ready`](Self::ready)).
     buffer: Vec<Op>,
     buffered: HashSet<OpId>,
     /// The `(author, group id)` keys whose bucket has resolved. A member arriving
@@ -1188,8 +1195,18 @@ impl Document {
         }
 
         // The buffer is a framed op log, itself length-prefixed so the reader
-        // knows where it ends inside the document stream.
-        let framed = encode_ops(&self.buffer);
+        // knows where it ends inside the document stream. Written in `op_order`,
+        // because the buffer holds its ops as they arrived while nothing reads it
+        // in that order: two replicas holding the same waiting ops would otherwise
+        // encode different bytes.
+        let mut held: Vec<&Op> = self.buffer.iter().collect();
+        held.sort_by_key(|op| op_order(op.id));
+        let mut framed = Vec::new();
+        for op in held {
+            let body = encode_op(op);
+            put_u32(&mut framed, len_u32(body.len()));
+            framed.extend_from_slice(&body);
+        }
         put_u32(&mut out, len_u32(framed.len()));
         out.extend_from_slice(&framed);
         out
@@ -2219,9 +2236,10 @@ impl Document {
         }
 
         let root_id = ElementId::from_bytes(ROOT_ID);
-        // Following parents must terminate: a cycle would hang `resolvable` on a
-        // later op. Memoize chains already proven to terminate so the walk stays
-        // linear over an untrusted graph.
+        // Following parents must terminate: a cycle would hang the readiness walk
+        // (`materialised`) on a later op, and `resolvable` on an undo. Memoize
+        // chains already proven to terminate so the walk stays linear over an
+        // untrusted graph.
         reject_parent_cycles(&parents, root_id)?;
 
         let seen_count = cur.u32()?;
@@ -2809,8 +2827,7 @@ impl Document {
         // that point keeps waiting on its own, so `apply` reports `false` for it.
         if op.tx.is_some() {
             self.record_stamp(op.stamp, span(&op.kind));
-            self.buffered.insert(op.id);
-            self.buffer.push(op.clone());
+            self.hold(op.clone());
             self.drain_buffer();
             return self.seen.contains(&op.id);
         }
@@ -2821,8 +2838,7 @@ impl Document {
             // them is a function of arrival order, and two replicas that folded the
             // same ops disagree.
             self.record_stamp(op.stamp, span(&op.kind));
-            self.buffered.insert(op.id);
-            self.buffer.push(op.clone());
+            self.hold(op.clone());
             return false;
         }
         self.apply_now(op);
@@ -3020,6 +3036,20 @@ impl Document {
         out
     }
 
+    /// Hold `op` in the buffer until it can apply.
+    ///
+    /// Appended, not placed. The order that is *state* is the one
+    /// [`encode_state`](Self::encode_state) writes, which is [`op_order`]; what
+    /// the stored order decides — which of several ready ops the drain replays
+    /// first, which of several complete groups commits first — is not a state
+    /// decision, because the drain runs to a fixpoint. Keeping it sorted would
+    /// instead let the sender choose the cost: nothing caps the buffer, and where
+    /// each arrival lands in it is the delivery order's.
+    fn hold(&mut self, op: Op) {
+        self.buffered.insert(op.id);
+        self.buffer.push(op);
+    }
+
     /// Replay buffered ops that a state change just made reachable, to a
     /// fixpoint — one applied op can unblock a whole causal chain, and a
     /// non-atomic apply can complete a waiting transaction (or vice versa).
@@ -3054,13 +3084,13 @@ impl Document {
                 members.sort_by_key(|op| op.id.seq);
                 for mut op in members {
                     // Every applied op still passes the ordinary readiness gate:
-                    // routing drops a mutation whose container is displaced, so a
-                    // member waved through by the group gate — its target created
-                    // by an earlier member whose create then lost the slot — would
+                    // routing drops a mutation whose container this replica has not
+                    // materialised, so a member waved through by the group gate —
+                    // its target created by another member still in flight — would
                     // silently lose its effect while a replica that saw the group
-                    // against an installed container kept it. A member that is not
+                    // against a materialised container kept it. A member that is not
                     // ready is held instead, untagged, and drains with the ordinary
-                    // buffer once its container is installed. What blocks a member
+                    // buffer once its create lands. What blocks a member
                     // is almost always what makes it unobservable — an unresolvable
                     // target renders nothing — so holding it leaves the group's
                     // all-or-nothing view intact; ARCHITECTURE §Transactions names
@@ -3070,7 +3100,7 @@ impl Document {
                         self.apply_now(&op);
                     } else {
                         op.tx = None;
-                        self.buffer.push(op);
+                        self.hold(op);
                     }
                 }
                 progressed = true;
@@ -3081,9 +3111,18 @@ impl Document {
         }
     }
 
-    /// Whether `op` can apply now: its target is reachable, and — for a delete —
-    /// the nodes it removes are present. A delete of a not-yet-inserted node
-    /// would silently no-op and be lost, so it waits for the insert.
+    /// Whether `op` can apply now: its target is **materialised** — this replica
+    /// holds the container, displaced or installed — and, for a delete, the nodes
+    /// it removes are present. A delete of a not-yet-inserted node would silently
+    /// no-op and be lost, so it waits for the insert.
+    ///
+    /// Displacement is not a reason to wait. A container that lost its slot is
+    /// retained, so the op lands in it hidden and is reinstated with it; holding
+    /// it instead would wait on a slot that need never come back, and would make
+    /// the same op set land differently by arrival order (§Map Slot Safety). The
+    /// three sequence cases below ask for *less* than the general gate — the
+    /// holding container alone, not the whole chain to the root — because the
+    /// tree fold is a function of the move-set, not of any parent's reachability.
     fn ready(&self, op: &Op) -> bool {
         // An XmlInsertChild materialises a movable node into a parent's children
         // sequence. A displaced parent still retains that sequence, so the child is
@@ -3122,7 +3161,7 @@ impl Document {
                 .get(&op.target)
                 .is_some_and(|l| l.borrow().contains(*id));
         }
-        if !self.resolvable(op.target) {
+        if !self.materialised(op.target) {
             return false;
         }
         match &op.kind {
@@ -3156,13 +3195,16 @@ impl Document {
     /// arrival order decides, and the same ops would fold to different states.
     fn take_complete_tx(&mut self) -> Option<Vec<Op>> {
         let groups = self.tx_buckets();
-        // Lowest buffer position wins when more than one group is complete, so
-        // the commit order is the buffer's, not the hash map's. Draining to a
-        // fixpoint after every fold keeps a replica's own buffer down to at most
-        // one complete group, so this decides nothing on the live path — it is
-        // the decode of a *peer-supplied* snapshot that can present several at
-        // once, and two replicas reading identical bytes have to reach identical
-        // state whatever those bytes hold.
+        // Lowest buffer position wins when more than one group is complete, so the
+        // commit order is the buffer's, not the hash map's. Draining to a fixpoint
+        // after every fold keeps a replica's own buffer down to at most one complete
+        // group, so this decides nothing on the live path — it is the decode of a
+        // *peer-supplied* snapshot that can present several at once, and two
+        // replicas reading identical bytes have to reach identical state whatever
+        // those bytes hold. Which of them commits first is not a state decision: the
+        // drain runs to a fixpoint, so every complete group commits, and a member
+        // left unready by an earlier commit is re-held untagged and lands on the
+        // same pass.
         let complete = groups
             .into_values()
             .filter(|idxs| {
@@ -3360,6 +3402,30 @@ impl Document {
         }
     }
 
+    /// A target is materialised when it names a container this replica holds and
+    /// every ancestor up to the root does too — displaced or installed alike.
+    fn materialised(&self, target: ElementId) -> bool {
+        let mut cur = target;
+        // A chain longer than the parent map has revisited a node. The decode
+        // refuses a cycle and the move replay re-checks for one, but the live
+        // path edits `parents` between those points, and this gate runs over every
+        // held op on every drain — so it stops rather than spins.
+        for _ in 0..=self.parents.len() {
+            if cur == self.root_id() {
+                return true;
+            }
+            if self.displaced_container(cur).is_none() {
+                return false;
+            }
+            match self.parents.get(&cur) {
+                Some(&parent) => cur = parent,
+                None if self.ranged.contains_key(&cur) => cur = self.root_id(),
+                None => return false,
+            }
+        }
+        false
+    }
+
     /// Whether the container `id` is displaced: `Some(false)` installed,
     /// `Some(true)` displaced, `None` not materialised.
     fn displaced_container(&self, id: ElementId) -> Option<bool> {
@@ -3391,20 +3457,15 @@ impl Document {
         None
     }
 
-    /// A live list handle for `target`, if any.
-    fn live_list(&self, target: ElementId) -> Option<Rc<RefCell<List>>> {
-        self.lists
-            .get(&target)
-            .filter(|l| !l.borrow().is_displaced())
-            .cloned()
+    /// The list handle `target` names, displaced or installed — a retained
+    /// sequence still takes the edits addressed to it (§Map Slot Safety).
+    fn list_at(&self, target: ElementId) -> Option<Rc<RefCell<List>>> {
+        self.lists.get(&target).cloned()
     }
 
-    /// A live text handle for `target`, if any.
-    fn live_text(&self, target: ElementId) -> Option<Rc<RefCell<Text>>> {
-        self.texts
-            .get(&target)
-            .filter(|t| !t.borrow().is_displaced())
-            .cloned()
+    /// The text handle `target` names, displaced or installed.
+    fn text_at(&self, target: ElementId) -> Option<Rc<RefCell<Text>>> {
+        self.texts.get(&target).cloned()
     }
 
     /// Route a mutation to its target, recording any displaced composite and
@@ -3417,7 +3478,7 @@ impl Document {
         match kind {
             // Sequence and text ops address a list or text directly.
             OpKind::ListInsert { value, anchor } => {
-                if let Some(list) = self.live_list(target) {
+                if let Some(list) = self.list_at(target) {
                     list.borrow_mut()
                         .insert_at(stamp, Element::Scalar(value.clone()), *anchor);
                 }
@@ -3538,13 +3599,13 @@ impl Document {
                 return;
             }
             OpKind::TextInsert { s, anchor } => {
-                if let Some(text) = self.live_text(target) {
+                if let Some(text) = self.text_at(target) {
                     text.borrow_mut().insert_run(stamp, s, *anchor);
                 }
                 return;
             }
             OpKind::TextDelete { ids } => {
-                if let Some(text) = self.live_text(target) {
+                if let Some(text) = self.text_at(target) {
                     text.borrow_mut().delete_ids(ids);
                 }
                 return;
@@ -3587,9 +3648,6 @@ impl Document {
         let Some(map) = self.maps.get(&target).cloned() else {
             return;
         };
-        if map.borrow().is_displaced() {
-            return;
-        }
         let orphan = {
             let mut m = map.borrow_mut();
             match kind {
@@ -3626,9 +3684,6 @@ impl Document {
         let Some(map) = self.maps.get(&map_id).cloned() else {
             return;
         };
-        if map.borrow().is_displaced() {
-            return;
-        }
         let child_id = match &kind {
             Container::XmlElement(tag) => XmlElement::node_id(map_id, key, tag),
             Container::XmlFragment => XmlFragment::node_id(map_id, key),
@@ -4050,9 +4105,6 @@ impl Document {
         let Some(map) = self.maps.get(&map_id).cloned() else {
             return;
         };
-        if map.borrow().is_displaced() {
-            return;
-        }
         let id = ElementId::derive(map_id, key, ElementKind::Counter);
         let counter = match self.counters.get(&id) {
             Some(c) => Rc::clone(c),
@@ -4306,9 +4358,12 @@ impl Document {
             if !self.resolvable(target) {
                 self.reinstate(target, &installers);
             }
-            // What is still unreachable is dropped rather than emitted: a peer
-            // would buffer and later replay what this replica applies to nothing.
-            if self.resolvable(target) {
+            // Emitted whether or not the revival took: a step whose container is
+            // displaced lands in the retained one, here and at every peer alike
+            // (ARCHITECTURE §Map Slot Safety), so dropping it would lose the
+            // intention on the one replica that holds it. A step naming a container
+            // no replica has materialised is what cannot land, and nothing revives.
+            if self.materialised(target) {
                 self.emit_inverse(step);
             }
         }
@@ -4548,11 +4603,11 @@ impl Document {
             cur = self.parents.get(&id).copied();
         }
         for (at, kind) in chain.into_iter().rev() {
-            // The copies answer to the same rule as the steps: an op this replica
-            // would apply to nothing is not emitted, because a peer buffers it
-            // and fires it the moment the container returns. Once one link of the
-            // chain cannot land, nothing below it can either.
-            if !self.resolvable(at) {
+            // The copies answer to the same rule as the steps: an op no replica can
+            // resolve is not emitted, because a peer would buffer it against a
+            // create that is not coming. Once one link of the chain cannot land,
+            // nothing below it can either.
+            if !self.materialised(at) {
                 return;
             }
             self.emit(at, kind);
@@ -5327,6 +5382,14 @@ fn handles_eq(a: &Element, b: &Element) -> bool {
         (Element::XmlFragment(x), Element::XmlFragment(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
+}
+
+/// The total order the held ops are encoded in — author, then the author's own
+/// sequence. It matches the causal frontier's sort, and it is total over a buffer
+/// because an id names one op: the buffer holds an id once, and a snapshot
+/// presenting a repeat is refused.
+fn op_order(id: OpId) -> ([u8; 16], u64) {
+    (id.client.as_bytes(), id.seq)
 }
 
 /// A stamp rendered as derivation-key bytes, so a sequence child's element id

@@ -1744,7 +1744,7 @@ fn a_revival_in_one_zone_does_not_re_point_another_zones_delete() {
 }
 
 #[test]
-fn an_inverse_onto_a_container_a_peer_displaced_is_dropped_not_emitted() {
+fn an_inverse_onto_a_container_a_peer_displaced_lands_in_the_retained_one() {
     let mut a = doc(1);
     let mut b = Document::new(cid(2));
     let root = p(&[b"root"]);
@@ -1764,15 +1764,25 @@ fn an_inverse_onto_a_container_a_peer_displaced_is_dropped_not_emitted() {
 
     let ops = a.undo(ORIGIN).expect("the intention comes off the stack");
     assert!(
-        ops.is_empty(),
-        "an op the author would apply to nothing is not emitted: a peer would \
-         buffer it and replay it once the container returned"
+        !ops.is_empty(),
+        "the retained element is still the target its children address, so the \
+         inverse is emitted rather than lost on the one replica that holds it"
     );
     apply_all(&mut b, &ops);
     assert_eq!(observe(&a), observe(&b));
     assert!(
         a.can_redo(ORIGIN),
-        "an intention whose inverses were all inert still owes a redo"
+        "an intention whose inverses landed hidden still owes a redo"
+    );
+
+    // And the revival is there on both once the element takes its slot back.
+    let back = path::xml_element(&mut a, &root, b"doc");
+    apply_all(&mut b, &back);
+    assert_eq!(observe(&a), observe(&b));
+    assert_eq!(
+        path::xml_children_len(&a, &root),
+        Some(1),
+        "the undone delete is visible again with the element"
     );
 }
 
