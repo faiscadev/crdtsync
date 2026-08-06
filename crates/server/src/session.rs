@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use crdtsync_core::acl::AclScope;
 use crdtsync_core::diff::encode_changes;
 use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
@@ -528,10 +529,11 @@ pub fn step(
             let creator = hub.room_creator(&room);
             // The element-context index resolves an element-scoped grant to its
             // element's current path, so a grant follows the element across a
-            // tree-move. Built once and shared by every doc-ACL read decision on this
-            // subscribe (root gate, subtree admission, per-op catch-up, whole-document
-            // snapshot check), so they all resolve an element to the same path. A room
-            // with no doc-ACL records has no scopes to resolve, so skip the tree walk.
+            // tree-move. The live room's tree, built once and shared by the doc-ACL
+            // read decisions that ask about it — the root gate, subtree admission, and
+            // the per-op catch-up. The whole-document snapshot gate resolves against
+            // the tree it is deciding for instead, which is this one only on `main`. A
+            // room with no doc-ACL records has no scopes to resolve, so skip the walk.
             let index = if records.is_empty() {
                 HashMap::new()
             } else {
@@ -752,12 +754,50 @@ pub fn step(
                     // the recipient authors under, and so the one author whose ids the
                     // projections keep in the frontier they otherwise scrub.
                     let recipient = session.client.map(|c| c.for_channel(channel.0));
+                    // The whole-document gate resolves element-scoped grants against the
+                    // tree it is deciding for. A `main` snapshot is the live room, which
+                    // `index` already describes. A branch owns its base — a version's
+                    // captured state, or a publish of one — and serves it with the
+                    // branch's divergent tail folded in, a tree `main` has moved on from:
+                    // an element that has left `main` resolves to no live path there, an
+                    // unresolvable element scope is inert, and an inert deny is no deny
+                    // (C32). So resolve against the bytes being handed out. Only an
+                    // element scope needs a tree at all — a path scope names its own
+                    // position and governs whatever occupies it — so a room holding
+                    // none skips the added decode and walk, nothing consulting the
+                    // index it is then handed.
+                    let resolves_elements = records
+                        .iter()
+                        .any(|r| matches!(r.tuple.scope, AclScope::Element(_)));
+                    let served_index = if branch == MAIN_BRANCH || !resolves_elements {
+                        None
+                    } else {
+                        match Document::decode_state(&state) {
+                            Ok(doc) => Some(crate::index::element_paths(&doc)),
+                            // A stored base that does not decode is already refused
+                            // upstream (`Catchup::Unavailable`), so what arrives here
+                            // was materialized this instant by this build. The arm holds
+                            // because neither fallback is an answer: the live index
+                            // reinstates the very inert deny this resolves, and an empty
+                            // one is inert by construction. Same refusal as that arm.
+                            Err(_) => {
+                                return Response {
+                                    replies: vec![Message::Error {
+                                        code: ErrorCode::Internal,
+                                        message: "branch state is unreadable".to_string(),
+                                        details: Vec::new(),
+                                    }],
+                                    ..Response::default()
+                                }
+                            }
+                        }
+                    };
                     let state = project_served_state(
                         state,
                         authorizer,
                         &records,
                         creator.as_deref(),
-                        &index,
+                        served_index.as_ref().unwrap_or(&index),
                         schema,
                         identity,
                         &room,
@@ -1821,9 +1861,9 @@ fn zone_readable(
 
 /// Narrow a whole-replica state to what one recipient may read: the doc-ACL path
 /// projection, then the zone projection, in that order. **The one composition every
-/// seam that hands a client a state blob runs** — the subscribe catch-up snapshot and
-/// the named-version fetch — so a redaction added to it cannot reach one seam and miss
-/// the other, which is the failure this composition exists to answer.
+/// seam that hands a client a state blob runs** — the subscribe catch-up snapshot, the
+/// named-version fetch, and each side of a diff query — so a redaction added to it
+/// cannot reach one seam and miss the others, which is the failure it exists to answer.
 ///
 /// Read-then-zone is the order the catch-up seam has always used, preserved verbatim
 /// by the extraction rather than re-derived. It is not a containment property: running
@@ -1838,9 +1878,11 @@ fn zone_readable(
 /// always derives its own index from the state it is about to narrow, so only the gate
 /// can be fed an index from a different tree than the bytes. It must not be: an element
 /// scope that resolves to no path is inert, an inert deny is no deny, and a gate that
-/// finds none serves the state whole. The version fetch passes the version's own tree;
-/// the catch-up snapshot passes the live room's, which is the same tree for a `main`
-/// snapshot and **not** for a branch whose base was forked from a version (C32).
+/// finds none serves the state whole. Every caller passes the tree its own bytes are:
+/// the version fetch the version's, each diff side its own decoded state, the catch-up
+/// snapshot the live room's on `main` and the branch's owned base with its divergent
+/// tail folded in on a branch (C32) — except where the room holds no element-scoped
+/// tuple at all, when nothing consults the index and any tree answers the same.
 /// `records.is_empty()` (a room with no doc-ACL state) or a whole-document verdict
 /// skips the read projection; [`zone_narrowing`] decides the zone one.
 #[allow(clippy::too_many_arguments)]
