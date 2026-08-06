@@ -1340,9 +1340,12 @@ pub fn step(
         // `CloneRoomResult` whose `created` is false when the clone was a no-op
         // (`src` absent or not led here, or `dst` already present).
         Message::CloneRoom { src, dst } => {
-            if !reads_source_whole(hub, session, authorizer, schema, &src)
-                || !branch_authorized(session, authorizer, schema, &dst, Action::Write)
-            {
+            // Authentication, then routing, then the gate. A node that will not clone
+            // must not decide the gate at all: its records, creator and binding for
+            // `src` are a follower's, so the verdict would be computed from state it
+            // is not authoritative for — and `Authorizer::observe` would record a read
+            // of a room it does not serve.
+            if session.identity().is_none() {
                 return request_denied(session, "clone");
             }
             if let Some(redirect) = redirect_response(membership, &dst) {
@@ -1356,6 +1359,11 @@ pub fn step(
                     }],
                     ..Response::default()
                 };
+            }
+            if !reads_source_whole(hub, session, authorizer, schema, &src)
+                || !branch_authorized(session, authorizer, schema, &dst, Action::Write)
+            {
+                return request_denied(session, "clone");
             }
             match hub.clone_room(&src, &dst) {
                 Ok(created) => Response {
@@ -2240,10 +2248,15 @@ fn reads_source_whole(
 /// clone's source is a room the caller is not the incumbent of, so a self-declared
 /// app would let it pick a zone block. A room governed by nothing declares no zones
 /// and so is whole by this measure — the one implicit root partition, the same
-/// reading [`zone_scope`] takes. That is a fact about the room only where this node
-/// is authoritative for it, which is why the clone is served only from `src`'s
-/// leader; a room whose binding is stored but unparseable still resolves to no
-/// schema here, as it does at every other zone seam (C30).
+/// reading [`zone_scope`] takes.
+///
+/// That reading is a *fact* about the room only where the room is bound. Two ways it
+/// is not, and neither is closed here: a binding the registry stores but cannot parse
+/// resolves to no schema, as at every other zone seam (C30); and a room the hub holds
+/// but nothing ever bound — an import, or a clone of an ungoverned room — is
+/// indistinguishable from a relay room, which genuinely has no partitions and must
+/// stay clonable (C59). Requiring `src`'s leader makes the ACL records and the creator
+/// authoritative; it does not conjure a binding that was never made.
 fn reads_every_zone(
     authorizer: &dyn Authorizer,
     identity: &Identity,

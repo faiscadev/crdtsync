@@ -633,13 +633,16 @@ pub struct Hub {
     rooms: HashMap<RoomId, Room>,
     store: Option<Store>,
     compaction_threshold: u64,
-    /// The durable governing `{app_id, version}` per room, the mirror of the
-    /// store's persisted binding. Seeded from the store on load and updated by
-    /// [`bind_governing`](Hub::bind_governing) when a store is attached, so it
-    /// survives a restart and a dormant-room sweep that drops the registry's live
-    /// binding; a store-less hub leaves it empty, keeping the in-memory
-    /// rebuild-on-subscribe behavior. It rides here (not on `Room`) so a bound but
-    /// never-written room needs no empty replica.
+    /// The governing `{app_id, version}` per room. Seeded from the store on load
+    /// and updated by [`bind_governing`](Hub::bind_governing), so it survives a
+    /// restart and a dormant-room sweep that drops the registry's live binding —
+    /// which room a request resolves its `@auth` grants and zone declarations
+    /// against is a fact about the room, not about who is currently subscribed. A
+    /// store carries it across a restart; without one it lasts the process. It
+    /// rides here (not on `Room`) so a bound but never-written room needs no empty
+    /// replica, and is pruned to the rooms the hub holds
+    /// ([`forget_unheld_governing`](Hub::forget_unheld_governing)) so naming rooms
+    /// that never materialize cannot grow it without bound.
     governing: HashMap<RoomId, (Vec<u8>, u32)>,
     /// Ephemeral presence per room: each owner client's latest [`Presence`] per
     /// key. Never persisted or snapshotted. Nesting by client keeps the per-client
@@ -1629,22 +1632,43 @@ impl Hub {
     /// are part of the state, so they arrive whichever way this goes — but a room with
     /// no root has no authority to decide them under, which would land every deny in
     /// the snapshot inert in the clone (C28). The root the tuples were authored against
-    /// is `src`'s creator, so that is what the clone comes up holding.
+    /// is `src`'s creator, so that is what the clone comes up holding. The governing
+    /// app travels for the same reason: the clone is the source's content, so the
+    /// schema whose `@auth` grants and zone declarations decide how it is read is the
+    /// source's — a clone that came up ungoverned would be read by no zone block at
+    /// all. A source that is itself ungoverned binds nothing, and the clone is
+    /// ungoverned too.
     ///
     /// Returns `Ok(false)` — cloning nothing — if `src` is unknown or `dst` already
     /// exists (clone is create-only, like import); with a store attached `dst` is
     /// persisted before it commits. The named-version index is not cloned: a
     /// template starts from the live state with a fresh version history.
     pub fn clone_room(&mut self, src: &[u8], dst: &[u8]) -> io::Result<bool> {
-        let Some(state) = self.export_room(src) else {
-            return Ok(false);
-        };
+        // Create-only, so a taken destination decides the whole call — asked before
+        // the source is encoded, which a no-op clone then never pays for.
         if self.rooms.contains_key(dst) {
             return Ok(false);
         }
+        let Some(state) = self.export_room(src) else {
+            return Ok(false);
+        };
         let creator = self.room_creator(src);
         self.install_room_state(dst, &state, None, creator)?;
+        if let Some((app, version)) = self.governing.get(src).cloned() {
+            self.bind_governing(dst, app, version);
+        }
         Ok(true)
+    }
+
+    /// Drop the governing binding of every room this hub does not hold. A subscribe
+    /// binds before the room's first write materializes it, so a client naming rooms
+    /// that never materialize would otherwise grow the map without bound; a held
+    /// room keeps its binding for as long as the hub holds it, which is what the
+    /// dormant-sweep fallback reads. Runs on the same sweep that rebuilds the
+    /// registry's live map.
+    pub fn forget_unheld_governing(&mut self) {
+        let rooms = &self.rooms;
+        self.governing.retain(|room, _| rooms.contains_key(room));
     }
 
     /// The room's current high-water server sequence (0 if unseen or empty).
@@ -1978,6 +2002,10 @@ impl Hub {
     /// store, and it is best-effort: the binding is derived state, so a write failure
     /// leaves it in the mirror to re-persist on the next bind rather than failing the
     /// caller.
+    ///
+    /// A subscribe binds before the room's first write materializes it, so a binding
+    /// may name a room the hub does not hold; the sweep prunes those
+    /// ([`forget_unheld_governing`](Hub::forget_unheld_governing)).
     pub fn bind_governing(&mut self, room: &[u8], app_id: Vec<u8>, version: u32) {
         let next = (app_id, version);
         if self.governing.get(room) == Some(&next) {

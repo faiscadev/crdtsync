@@ -97,18 +97,29 @@ fn tokens() -> StaticTokens {
     t
 }
 
-/// A deployment that abstains on everything except zoe's read of the source's `zb`
-/// partition, which it denies — the zone carve-out the room-keyed tier cannot see,
-/// since a zone verdict names the room the clone is copying *out of*.
+/// A deployment that abstains on everything except zoe's read of the `zb` partition,
+/// which it denies in both the source and the copy — the zone carve-out the room-keyed
+/// tier cannot see, since a zone verdict names a room and the clone's whole point is to
+/// put the bytes under another one. Naming both is what an operator has to write, and
+/// what lets the copy be read apart from the original here.
 fn deployment() -> Acl {
-    Acl::new().deny(
-        Subject::Actor(b"zoe".to_vec()),
-        Some(Action::Read),
-        ResourceMatch::Zone {
-            room: SRC.to_vec(),
-            zone: b"zb".to_vec(),
-        },
-    )
+    Acl::new()
+        .deny(
+            Subject::Actor(b"zoe".to_vec()),
+            Some(Action::Read),
+            ResourceMatch::Zone {
+                room: SRC.to_vec(),
+                zone: b"zb".to_vec(),
+            },
+        )
+        .deny(
+            Subject::Actor(b"zoe".to_vec()),
+            Some(Action::Read),
+            ResourceMatch::Zone {
+                room: DST.to_vec(),
+                zone: b"zb".to_vec(),
+            },
+        )
 }
 
 fn registry() -> Registry {
@@ -415,6 +426,44 @@ fn the_source_is_still_read_whole_by_its_creator() {
         Some(2),
         "the creator reads the source whole",
     );
+}
+
+/// The clone carries the source's governing app, so the gate reads the same zone
+/// block over the copy as over the original — a clone of a clone is still governed,
+/// where a clone that came up unbound would resolve to no schema and so to no zones.
+#[test]
+fn the_clone_carries_the_sources_governing_app() {
+    let mut r = seeded();
+    let alice = hello_auth(&mut r, 4, "alice");
+    assert!(matches!(
+        clone(&mut r, alice),
+        Message::CloneRoomResult { created: true, .. }
+    ));
+    assert_eq!(
+        r.hub().governing_app(DST),
+        r.hub().governing_app(SRC),
+        "the clone is governed by the app that governs its source",
+    );
+
+    // The copy is now the source of a second clone. The deployment denies zoe `zb`
+    // there too, and the gate can only find that deny by enumerating the zones the
+    // copy's *own* governing schema declares — which it has because the clone carried
+    // it. An unbound copy would declare none and serve zoe the partition.
+    let zoe = hello_auth(&mut r, 8, "zoe");
+    let second: &[u8] = b"copy-of-copy";
+    assert!(r.deliver(
+        zoe,
+        Message::CloneRoom {
+            src: DST.to_vec(),
+            dst: second.to_vec(),
+        }
+    ));
+    let reply = r.take_outbox(zoe).into_iter().next().expect("a reply");
+    assert!(
+        forbidden(&reply),
+        "the clone's own zone block refuses a zone-denied cloner: {reply:?}",
+    );
+    assert!(!r.hub().holds_room(second), "no second copy was minted");
 }
 
 /// A source no app governs — one a relay connection opened, or an import minted —
