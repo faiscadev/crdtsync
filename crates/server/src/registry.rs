@@ -990,12 +990,26 @@ impl Registry {
     /// returns is caught up from nothing instead of from a position it may no longer
     /// hold. [`record_replica_ack`](Self::record_replica_ack) keeps it that way — a
     /// non-member's late ack records nothing.
+    ///
+    /// A reap resizes every room's replica set, and with it the majority a withheld
+    /// client ack waits on, so the reap re-runs the release pass over the rooms owing
+    /// one: a write held by a majority of the *smaller* set is owed its `Accepted` now.
+    /// Nothing else would deliver it — the release is otherwise driven by a follower
+    /// ack, and the departed member sends no more.
     pub fn reap_dead_members(&mut self) {
         let Some(membership) = &mut self.membership else {
             return;
         };
-        for node in membership.reap_dead() {
-            self.replication.forget_member(&node);
+        let reaped = membership.reap_dead();
+        if reaped.is_empty() {
+            return;
+        }
+        for node in &reaped {
+            self.replication.forget_member(node);
+        }
+        let owed: HashSet<RoomId> = self.pending_acks.iter().map(|p| p.room.clone()).collect();
+        for room in owed {
+            self.release_pending_acks(&room);
         }
     }
 
@@ -1202,9 +1216,12 @@ impl Registry {
     /// An ack from a node the roster no longer holds is dropped: a replication link
     /// outlives the gossip verdict that reaped its far end, so an in-flight ack can
     /// arrive after the sweep, and recording it would re-key the map on a departed
-    /// member that no later reap reaches. It costs nothing to drop — a non-member is
-    /// no room's follower, so its watermark counts toward no quorum. Single-node mode
-    /// (no membership) has no roster to check and no replication to ack.
+    /// member that no later reap reaches. A non-member is no room's follower, so its
+    /// watermark counts toward no quorum, and the withheld acks its departure did
+    /// change are released by the reap itself
+    /// ([`reap_dead_members`](Self::reap_dead_members)) rather than by whichever frame
+    /// happens to arrive next. Single-node mode (no membership) has no roster to check
+    /// and no replication to ack.
     pub fn record_replica_ack(&mut self, follower: NodeId, room: &[u8], through_seq: u64) {
         if self
             .membership

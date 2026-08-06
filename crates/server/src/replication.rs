@@ -78,8 +78,9 @@ impl Replication {
     /// grows the map on ids no replica set names any more and answers
     /// [`watermark`](Self::watermark) with a claim the member cannot honor. Forgotten
     /// reads as `0`, which is the safe value in both directions — it is credited toward
-    /// no quorum, and a catch-up ranges from the start of the retained log rather than a
-    /// tail past a floor the member may no longer hold.
+    /// no quorum, and it is caught up from nothing (the retained log from its base, or a
+    /// whole-replica snapshot for a room compacted past it) rather than served a tail
+    /// past a floor the member may no longer hold.
     pub fn forget_member(&mut self, node: &NodeId) {
         self.acked.retain(|(_room, follower), _| follower != node);
     }

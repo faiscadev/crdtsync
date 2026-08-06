@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Message, Op, Scalar};
-use crdtsync_server::membership::Membership;
+use crdtsync_server::membership::{Membership, DEAD_AFTER_FAILURES, REAP_AFTER_DEAD_TICKS};
 use crdtsync_server::placement::NodeId;
 use crdtsync_server::{ConnId, ManualClock, Registry};
 
@@ -295,6 +295,60 @@ fn a_stale_follower_ack_does_not_release_a_later_write() {
     assert!(
         has_accepted_through(&r.take_outbox(c), t2),
         "the follower reaching sequence 2 releases the second write",
+    );
+}
+
+// --- a reap resizes the replica set the withheld ack waits on ---
+
+#[test]
+fn reaping_followers_releases_a_write_the_smaller_replica_set_holds() {
+    // A withheld ack waits on a majority of the room's replica set, and a reap
+    // resizes that set. R=5 needs two follower acks; reaping two silent members
+    // leaves R=3, which the one ack already satisfies. The release must ride the
+    // reap — the departed members send no further ack to drive it, and an idle room
+    // takes no further write.
+    let room = room_led_by_a(5, 4);
+    let mut r = leader(5);
+    let c = client(&mut r);
+    r.deliver(c, sub(&room));
+    r.take_outbox(c);
+
+    r.deliver(
+        c,
+        Message::Ops {
+            channel: CH,
+            ops: write(),
+        },
+    );
+    assert!(
+        r.take_outbox(c).is_empty(),
+        "a majority of five is self plus two followers",
+    );
+    let followers = followers_of(&room, 5);
+    r.record_replica_ack(followers[0].clone(), &room, 1);
+    assert!(
+        r.take_outbox(c).is_empty(),
+        "one follower ack is short of a majority of five",
+    );
+
+    // Two of the silent followers depart durably.
+    for node in [&followers[1], &followers[2]] {
+        for _ in 0..DEAD_AFTER_FAILURES {
+            r.note_gossip_probe(node.clone(), false);
+        }
+    }
+    for _ in 0..REAP_AFTER_DEAD_TICKS {
+        r.reap_dead_members();
+    }
+    assert_eq!(
+        r.membership().unwrap().replicas_for(&room).len(),
+        3,
+        "the reap leaves a three-member replica set",
+    );
+
+    assert!(
+        has_accepted(&r.take_outbox(c)),
+        "the surviving follower's ack is a majority of three — the reap releases it",
     );
 }
 

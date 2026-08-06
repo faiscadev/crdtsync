@@ -303,10 +303,11 @@ fn reaping_a_member_drops_its_replication_watermarks() {
         )],
     );
     assert!(r.membership().unwrap().is_member(&d), "D rejoined");
+    r.record_replica_ack(d.clone(), &one, 2);
     assert_eq!(
         r.replica_watermark(&one, &d),
-        0,
-        "a returned member starts from nothing"
+        2,
+        "a returned member acks from nothing, not from its old position"
     );
 }
 
