@@ -2,13 +2,16 @@
 //! replicates as.
 //!
 //! A document's lamport allocation is partitioned by zone: an op is stamped from
-//! the clock of the zone it belongs to — the zone its target resolves to, or, for a
-//! container-create, the created child's zone — so an edit in one zone never
-//! advances another's. Two zones' ops are therefore concurrent by construction —
-//! no false causal edge crosses the boundary — while causal order within a zone
-//! is intact. With no schema, or a schema with no zones, every op is in the one
-//! root partition, exactly as before zones. Convergence holds over both the
-//! observable state and the per-zone clocks, and a snapshot round-trips them.
+//! the clock of the zone it belongs to — the zone of the region it governs, which is
+//! the target's position for an ordinary edit, the created child's for a
+//! container-create, the anchored sequences' for an annotation, the scope's for an ACL
+//! tuple and the mark's for an edit inside a mark's composite payload — so an edit in
+//! one zone never advances another's. Two zones' ops are
+//! therefore concurrent by construction — no false causal edge crosses the boundary —
+//! while causal order within a zone is intact. With no schema, or a schema with no
+//! zones, every op is in the one root partition, exactly as before zones. Convergence
+//! holds over both the observable state and the per-zone clocks, and a snapshot
+//! round-trips them.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::Op;

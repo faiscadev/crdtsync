@@ -294,10 +294,16 @@ pub struct Op {
     pub tx: Option<Tx>,
     /// Which replication partition the op belongs to: the compact id of the zone
     /// (`Schema::zones()` declaration index, see [`zone::zone_id_of`](crate::zone::zone_id_of))
-    /// its `target` resolves to, or `None` for the root partition (an unzoned
-    /// target, or a document with no zones). The op is stamped from that
-    /// partition's own lamport clock, so zones are causally independent — an op in
-    /// one zone never orders an op in another. The dimension travels on the
+    /// of the region the op **governs**, or `None` for the root partition (an unzoned
+    /// region, a region that resolves to no path, anchors that resolve to two different
+    /// zones, a document with no zones, or no schema bound at all). The governed region
+    /// is the target's position for an ordinary edit, the created child's for a
+    /// container-create, the anchored sequences' for a `RangedElement` op and the
+    /// scope's for an ACL op — the last two being doc-level state addressed at the root,
+    /// whose target names no region at all — and the mark's, for an edit inside a
+    /// mark's composite payload. The op is stamped from that partition's own lamport
+    /// clock, so zones are causally independent — an op in one zone never orders an op
+    /// in another. The dimension travels on the
     /// envelope rather than being re-derived on receipt, so a replica advances the
     /// right clock even for an op whose target it cannot yet resolve, and a later
     /// per-zone stream can route by it without materialising the tree.
@@ -306,8 +312,8 @@ pub struct Op {
 
 impl Op {
     /// A standalone (non-atomic) op in the root partition. The zone dimension is
-    /// assigned by the emitting [`Document`](crate::Document) from the target's
-    /// position; an op minted without that context (a test fixture, a translated
+    /// assigned by the emitting [`Document`](crate::Document) from the region the op
+    /// governs; an op minted without that context (a test fixture, a translated
     /// or replayed op) defaults to the root partition.
     pub fn new(id: OpId, stamp: Stamp, target: ElementId, kind: OpKind) -> Self {
         Self {

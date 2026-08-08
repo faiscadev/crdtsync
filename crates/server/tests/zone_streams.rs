@@ -15,16 +15,22 @@
 //! another zone advancing. These tests drive the whole path in-process through the
 //! multi-subscriber [`Registry`], so they run under Miri (no socket, no fs).
 //!
-//! A container-create belongs to the created child's zone (not the parent it
-//! targets), so a zone owns its own root container's creation — the whole lifecycle
-//! of a zoned subtree, its root container included, is stamped in the zone and
-//! withheld from an unauthorized subscriber on every seam (live fan-out, catch-up
-//! delta, and cold-start snapshot alike). The tests create the containers in setup
-//! (before the subscribers join) only so a later content write is a pure set the
-//! marker assertions can key on, not because the create would otherwise leak.
+//! An op belongs to the partition of the region it *governs*, so a container-create
+//! belongs to the created child's zone (not the parent it targets) and an annotation
+//! or an ACL tuple to the region its anchors or its scope name (not the root it is
+//! emitted at) — the whole lifecycle of a zoned subtree, its root container included,
+//! is stamped in the zone and withheld from an unauthorized subscriber on every seam
+//! (live fan-out, catch-up delta, and cold-start snapshot alike). The tests create the
+//! containers in setup (before the subscribers join) only so a later content write is a
+//! pure set the marker assertions can key on, not because the create would otherwise
+//! leak.
 
 use std::sync::{Arc, Mutex};
 
+use crdtsync_core::acl::{AclEffect, AclGrant, AclScope, AclSubject, Capability};
+use crdtsync_core::elementid::{ElementId, ElementKind};
+use crdtsync_core::list::Side;
+use crdtsync_core::path::{encode_path, mark};
 use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, ErrorCode, Message, Op, OpKind, Scalar, Schema};
 use crdtsync_server::acl::{Acl, ResourceMatch, Subject};
@@ -43,7 +49,8 @@ const ZONED: &str = r#"{
     "types": {
         "Doc": { "kind": "map", "children": {
             "board": "Sect", "notes": "Sect", "loose": "Sect" } },
-        "Sect": { "kind": "map" }
+        "Sect": { "kind": "map", "children": { "seq": "Body" } },
+        "Body": { "kind": "text" }
     },
     "zones": { "za": "/board", "zb": "/notes" }
 }"#;
@@ -55,7 +62,8 @@ const UNZONED: &str = r#"{
     "types": {
         "Doc": { "kind": "map", "children": {
             "board": "Sect", "notes": "Sect", "loose": "Sect" } },
-        "Sect": { "kind": "map" }
+        "Sect": { "kind": "map", "children": { "seq": "Body" } },
+        "Body": { "kind": "text" }
     }
 }"#;
 
@@ -638,4 +646,154 @@ fn an_acl_zone_deny_isolates_the_partition_through_the_shipped_policy() {
         [Message::Error { code, .. }] => assert_eq!(*code, ErrorCode::Forbidden),
         other => panic!("expected Forbidden, got {other:?}"),
     }
+}
+
+// --- an annotation and a grant ride the partition of the region they govern (C74) ---
+//
+// Both are emitted at the document root, so the op's target names no region and the
+// partition has to come from what the op governs: a mark's anchors', a grant's scope's.
+// A mark carries its name, its scalar payload and its anchor's element id, and a grant
+// its subject and effect, so both are content of the region they name — withheld from a
+// subscriber that region's zone does not admit, on the live stream and the catch-up
+// delta alike.
+
+/// Whether `ops` carry a `RangedCreate` named `name` — the marker a mark leaves.
+fn has_mark(ops: &[Op], name: &[u8]) -> bool {
+    ops.iter().any(
+        |op| matches!(&op.kind, OpKind::RangedCreate { name: Some(n), .. } if n.as_slice() == name),
+    )
+}
+
+/// Whether `ops` carry an `AclGrant` scoped to the path `scope`.
+fn has_grant(ops: &[Op], scope: &[u8]) -> bool {
+    ops.iter().any(
+        |op| matches!(&op.kind, OpKind::AclGrant { scope: AclScope::Path(p), .. } if p == scope),
+    )
+}
+
+/// A text sequence under `sect`, so a mark has a live region to span.
+fn seq_write(doc: &mut Document, sect: &[u8]) -> Vec<Op> {
+    doc.transact(|tx| tx.map(sect).text(b"seq").insert(0, "hello world"))
+}
+
+/// The id of the text sequence under `sect` — the anchor that tells two same-named
+/// marks apart.
+fn seq_id(doc: &Document, sect: &[u8]) -> ElementId {
+    let map = ElementId::derive(doc.root_id(), sect, ElementKind::Map);
+    ElementId::derive(map, b"seq", ElementKind::Text)
+}
+
+/// A `bold` mark over `[0, 5)` of the sequence under `sect`.
+fn mark_write(doc: &mut Document, sect: &[u8]) -> Vec<Op> {
+    let path = encode_path(&[sect, b"seq"]);
+    let (ops, id) = mark(
+        doc,
+        &path,
+        0,
+        Side::Right,
+        5,
+        Side::Left,
+        b"bold",
+        Scalar::Bool(true),
+    );
+    assert!(id.is_some(), "the mark is authored over a live sequence");
+    ops
+}
+
+/// A path-scoped read grant naming `path`.
+fn grant_write(doc: &mut Document, path: Vec<u8>) -> Vec<Op> {
+    doc.transact(|tx| {
+        tx.acl().grant(
+            AclSubject::Actor(cid(7)),
+            AclGrant::Capability(Capability::Read),
+            AclEffect::Allow,
+            path,
+            cid(1),
+        );
+    })
+}
+
+#[test]
+fn a_mark_over_a_zoned_sequence_is_withheld_from_another_zones_subscriber() {
+    let (mut r, mut doc, author) = seeded();
+    write(&mut r, author, seq_write(&mut doc, b"board"));
+    write(&mut r, author, seq_write(&mut doc, b"notes"));
+
+    let za = auth(&mut r, 2, "c-za", APP);
+    subscribe(&mut r, za, b"za");
+    r.take_outbox(za);
+
+    // A mark over the sequence in zb: its name, its payload and its anchor's element
+    // id all name a region za may not read, so za receives nothing of it.
+    write(&mut r, author, mark_write(&mut doc, b"notes"));
+    let got = received_ops(&mut r, za);
+    assert!(
+        !has_mark(&got, b"bold"),
+        "za is served a mark anchored in zb: {got:?}"
+    );
+
+    // The same mark over za's own sequence does arrive — the rule narrows by region,
+    // it does not withhold the family.
+    write(&mut r, author, mark_write(&mut doc, b"board"));
+    let got = received_ops(&mut r, za);
+    assert!(has_mark(&got, b"bold"), "za is served its own zone's mark");
+}
+
+#[test]
+fn a_path_scoped_grant_naming_a_zoned_path_is_withheld_from_another_zones_subscriber() {
+    let (mut r, mut doc, author) = seeded();
+    let za = auth(&mut r, 2, "c-za", APP);
+    subscribe(&mut r, za, b"za");
+    r.take_outbox(za);
+
+    let notes = encode_path(&[b"notes"]);
+    let board = encode_path(&[b"board"]);
+    write(&mut r, author, grant_write(&mut doc, notes.clone()));
+    let got = received_ops(&mut r, za);
+    assert!(
+        !has_grant(&got, &notes),
+        "za is served a grant naming zb's path, its subject and effect with it: {got:?}"
+    );
+
+    write(&mut r, author, grant_write(&mut doc, board.clone()));
+    let got = received_ops(&mut r, za);
+    assert!(has_grant(&got, &board), "za is served its own zone's grant");
+}
+
+#[test]
+fn a_zone_scoped_catch_up_omits_another_zones_marks_and_grants() {
+    // The same cut on the catch-up delta: a subscriber joining after the writes must
+    // not read them out of the log either.
+    let (mut r, mut doc, author) = seeded();
+    write(&mut r, author, seq_write(&mut doc, b"board"));
+    write(&mut r, author, seq_write(&mut doc, b"notes"));
+    write(&mut r, author, mark_write(&mut doc, b"notes"));
+    write(&mut r, author, mark_write(&mut doc, b"board"));
+    let notes = encode_path(&[b"notes"]);
+    let board = encode_path(&[b"board"]);
+    write(&mut r, author, grant_write(&mut doc, notes.clone()));
+    write(&mut r, author, grant_write(&mut doc, board.clone()));
+
+    let zb = auth(&mut r, 3, "c-zb", APP);
+    let catchup = flatten(&subscribe(&mut r, zb, b"zb"));
+    assert!(has_mark(&catchup, b"bold"), "zb catches up on its own mark");
+    assert!(has_grant(&catchup, &notes), "and its own grant");
+    assert!(
+        !has_grant(&catchup, &board),
+        "but never za's grant: {catchup:?}"
+    );
+    // Both zones' marks carry the same name, so each is identified by the sequence it
+    // spans: the only mark zb reads anchors in zb's own sequence.
+    let anchors: Vec<ElementId> = catchup
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::RangedCreate { start, .. } => Some(start.seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        anchors,
+        vec![seq_id(&doc, b"notes")],
+        "exactly one mark, zb's own"
+    );
 }

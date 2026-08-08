@@ -199,9 +199,11 @@ pub struct Document {
     /// revoke wins on merge and survives a snapshot reload. Storage only — core
     /// merges the set but enforces no authority (see [`crate::acl`]).
     acl: HashMap<ElementId, AclEntry>,
-    /// The lamport clock of the root partition — the zone every unzoned target
-    /// (and every op of a document with no zones) is stamped from. With no zones
-    /// this is the document's whole lamport clock, exactly as before zones.
+    /// The lamport clock of the root partition — the one every op the envelope's
+    /// [`zone`](crate::op::Op::zone) leaves `None` is stamped from: an op governing an
+    /// unzoned region, one whose region names no partition, and every op of a document
+    /// with no zones. With no zones this is the document's whole lamport clock, exactly
+    /// as before zones.
     lamport: u64,
     /// The per-zone lamport clocks, keyed by compact zone id
     /// ([`zone::zone_id_of`]). Each declared zone advances its own clock, so an op
@@ -3172,8 +3174,9 @@ impl Document {
     /// The partition a local `kind` edit on `target` belongs to: the compact id of
     /// the zone it resolves to, or `None` (the root partition) when no schema is
     /// bound, the schema declares no zones, or the location is unzoned. Resolved from
-    /// the structural path, so it is a pure function of the shared schema and the
-    /// tree — every replica assigns the same op to the same partition.
+    /// the structural path — of the tree, or of the annotation or ACL tuple the op
+    /// governs — so it is a pure function of the shared schema and converged state,
+    /// and every replica assigns the same op to the same partition.
     ///
     /// A container-create belongs to the partition of the *child* it installs, not
     /// the parent it targets: the child's path is the parent's extended by the
@@ -3183,18 +3186,120 @@ impl Document {
     /// see), materializing an empty zone-root container for it — and diverging from
     /// the snapshot projection, which drops that container. With it the create is
     /// stamped in the zone, withheld from an unauthorized subscriber on every seam.
-    /// Every other op belongs to the partition of the container it targets.
+    ///
+    /// An annotation and an ACL tuple are doc-level state addressed at the root, so
+    /// the target names no region at all: their partition is the region they
+    /// **govern**. A `RangedElement` op belongs to the partition of the sequences its
+    /// endpoints anchor — require-agreement, since endpoints in two zones are a
+    /// [`CrossZoneAnchor`](crate::validate::ViolationKind::CrossZoneAnchor) violation
+    /// the read repairs away, so a straddling mark takes the root partition rather than
+    /// asserting one of the two — and an op editing a mark's composite payload rides
+    /// the mark, the payload hanging off the range rather than a map slot. An ACL op
+    /// belongs to the partition its scope resolves into. These are the same regions
+    /// the snapshot projection keeps such state by, so the op seam and the state seam
+    /// withhold from the same subscribers; without them a mark over a zoned sequence,
+    /// and a grant naming a zoned path, ride the root partition to *every* zone-scoped
+    /// subscriber, carrying the mark's name, payload and anchor id — and the grant's
+    /// subject and effect — out of a zone the recipient is not admitted to (C74).
+    ///
+    /// A governing region that resolves to no path names no partition, and the root is
+    /// the only one an envelope can express, so such an op keeps the root partition
+    /// while the snapshot projection drops the state form (C52) — one of the two places
+    /// the two seams still part company, tracked as C82. The partition is also a mint
+    /// floor, so a follow-on that falls back this way is stamped under the family its
+    /// create was stamped in, and an LWW one loses to the value it means to replace.
+    ///
+    /// Every other op belongs to the partition of the container it targets. A keyed op
+    /// naming a zone-root slot on the container *above* it therefore rides the parent's
+    /// partition unless it is a create — a gap of the same shape as the one the
+    /// container-create rule closed, tracked as C83.
     fn zone_of_op(&self, target: ElementId, kind: &OpKind) -> Option<u32> {
         let schema = self.schema.as_ref()?;
         if schema.zones().is_empty() {
             return None;
         }
         let paths = self.element_paths();
-        let mut path = paths.get(&target)?.clone();
-        if let Some(key) = create_child_key(kind) {
-            path.push(key.to_vec());
+        let anchored_in = |start: ElementId, end: ElementId| {
+            let start = zone::zone_id_of(schema, paths.get(&start)?);
+            let end = zone::zone_id_of(schema, paths.get(&end)?);
+            if start == end {
+                start
+            } else {
+                None
+            }
+        };
+        let scoped_in = |scope: &AclScope| {
+            let keys = match scope {
+                AclScope::Path(p) => crate::path::parse_path(p)?,
+                AclScope::Element(id) => paths.get(id)?.clone(),
+            };
+            zone::zone_id_of(schema, &keys)
+        };
+        match kind {
+            OpKind::RangedCreate { start, end, .. } => anchored_in(start.seq, end.seq),
+            OpKind::RangedSetPayload { id, .. } | OpKind::RangedDelete { id } => {
+                let e = self.ranged.get(id)?;
+                anchored_in(e.start.seq, e.end.seq)
+            }
+            OpKind::AclGrant { scope, .. } => scoped_in(scope),
+            OpKind::AclRevoke { id } => scoped_in(&self.acl.get(id)?.scope),
+            // The tree ops, listed rather than caught, because the fall-through here is
+            // the **root** partition — the one every zone-scoped subscriber holds. A
+            // catch-all would let a new `Ranged*` or `Acl*` variant ride it silently,
+            // which is the leak this rule exists to close; spelled out, the compiler
+            // asks where the variant belongs. `op_read_gate` guards its own widest
+            // answer the same way.
+            OpKind::RegisterSet { .. }
+            | OpKind::CounterInc { .. }
+            | OpKind::CounterDec { .. }
+            | OpKind::MapSet { .. }
+            | OpKind::MapDelete { .. }
+            | OpKind::MapCreate { .. }
+            | OpKind::ListCreate { .. }
+            | OpKind::ListInsert { .. }
+            | OpKind::ListDelete { .. }
+            | OpKind::TextCreate { .. }
+            | OpKind::TextInsert { .. }
+            | OpKind::TextDelete { .. }
+            | OpKind::XmlElementCreate { .. }
+            | OpKind::XmlFragmentCreate { .. }
+            | OpKind::XmlInsertChild { .. }
+            | OpKind::XmlMove { .. }
+            | OpKind::XmlReveal { .. } => match paths.get(&target) {
+                Some(base) => {
+                    let mut path = base.clone();
+                    if let Some(key) = create_child_key(kind) {
+                        path.push(key.to_vec());
+                    }
+                    zone::zone_id_of(schema, &path)
+                }
+                // The tree walk reaches no payload container, so a target it does not
+                // hold may still be one — or a container registered beneath one.
+                None => {
+                    let (start, end) = self.payload_host_anchors(target)?;
+                    anchored_in(start, end)
+                }
+            },
         }
-        zone::zone_id_of(schema, &path)
+    }
+
+    /// The anchors of the RangedElement whose composite payload holds `target` — the
+    /// payload container itself, or anything registered beneath it — or `None` when no
+    /// mark hosts it. A payload container's parent link names the range it hangs off
+    /// ([`install_payload`](Self::install_payload)), so the walk up the links reaches
+    /// the range from anywhere in the payload's subtree.
+    fn payload_host_anchors(&self, target: ElementId) -> Option<(ElementId, ElementId)> {
+        let mut cur = target;
+        // A chain longer than the parent map has revisited a node, so the bound is
+        // what keeps a cyclic link from spinning here.
+        for _ in 0..=self.parents.len() {
+            let parent = *self.parents.get(&cur)?;
+            if let Some(e) = self.ranged.get(&parent) {
+                return Some((e.start.seq, e.end.seq));
+            }
+            cur = parent;
+        }
+        None
     }
 
     /// Every materialised container mapped to its `core::path` key sequence — the
