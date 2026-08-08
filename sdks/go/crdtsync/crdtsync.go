@@ -772,7 +772,7 @@ var ErrChannelsExhausted = errors.New("the session's channel numbers are exhaust
 // came before it — those ops are applied here and go to the room. Nor does it mean
 // the replica is spent outright: a run reserves one id per codepoint, so a shorter
 // edit can still fit where a longer one was refused.
-var ErrMintExhausted = errors.New("the replica has no id left to mint, so the edit was refused")
+var ErrMintExhausted = errors.New("the edit was refused: the replica could not mint the ids it needed")
 
 // assigned reports the channel and Subscribe frame a subscribe produced. An
 // empty frame is the C ABI declining to assign one, leaving the channel

@@ -23,10 +23,10 @@ export type { RepairStep } from "./path.js";
 
 const EMPTY = new Uint8Array();
 
-/** Thrown by an edit the replica had no id left to mint.
+/** Thrown by an edit the replica had no id left for.
  *
- * A refused mint is the fail-closed answer to a spent id space, never a re-issued
- * id that would collide with one already published. Without this it is
+ * A refused mint is the fail-closed answer, never a re-issued id that would
+ * collide with one already published. Without this it is
  * indistinguishable from an inert edit and the application reports a write that
  * never happened.
  *
@@ -39,7 +39,7 @@ const EMPTY = new Uint8Array();
  * (`can_mint` on the core is the capacity reading). */
 export class MintExhausted extends Error {
   constructor(cause?: unknown) {
-    super("crdtsync: the replica had no id left to mint, so the edit was refused", {
+    super("crdtsync: the edit was refused, the replica could not mint the ids it needed", {
       cause,
     });
     this.name = "MintExhausted";

@@ -167,9 +167,8 @@ class ChannelsExhausted(RuntimeError):
 
 
 class MintExhausted(RuntimeError):
-    """An edit the replica had no id left to mint. A refused mint is the fail-closed
-    answer to a spent id space, never a re-issued id that would collide with one
-    already published. Raised because a refused edit otherwise returns the same empty
+    """An edit the replica had no id left for. A refused mint is the fail-closed
+    answer, never a re-issued id that would collide with one already published. Raised because a refused edit otherwise returns the same empty
     ops an inert one does, so the application would report a write that never
     happened.
 
@@ -180,7 +179,7 @@ class MintExhausted(RuntimeError):
     refused."""
 
     def __init__(self) -> None:
-        super().__init__("the replica has no id left to mint, so the edit was refused")
+        super().__init__("the edit was refused: the replica could not mint the ids it needed")
 
 
 class Redirect(NamedTuple):
@@ -1336,7 +1335,9 @@ class Document:
         recently opened. Every mutator returns the ops to broadcast, and a refused
         edit produces the same empty bytes an inert one does; this is what tells the
         two apart. An atomic group is one intention, so a refusal inside one stays
-        raised for the rest of the group."""
+        raised for the rest of the group and across the commit that closes it; it
+        clears when the next intention opens. Read it straight after the edit it is
+        meant to answer for."""
         return _LIB.crdtsync_doc_mint_refused(self._handle) == 1
 
     def begin_atomic(self) -> None:
