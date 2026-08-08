@@ -465,8 +465,8 @@ func TestClientHandshakeAndLifecycle(t *testing.T) {
 }
 
 func TestSubscribeSurfacesTheCoresRefusalAsAnError(t *testing.T) {
-	// An empty frame is the core declining to assign a channel, which the
-	// wrapper reads as a spent range.
+	// An empty frame is the C ABI declining to assign one, which the wrapper
+	// reads as a spent range.
 	if _, _, err := assigned(uint32(0), nil); err != ErrChannelsExhausted {
 		t.Fatalf("empty frame: got %v, want ErrChannelsExhausted", err)
 	}

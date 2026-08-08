@@ -42,8 +42,8 @@ pub enum ClientError {
 /// Why a room could not be joined on a fresh channel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SubscribeError {
-    /// The session has handed out every channel number it holds. Numbers are
-    /// assigned in subscribe order and never recycled — a channel's replica
+    /// The session's channel range is spent. Numbers are assigned in subscribe
+    /// order and never recycled — a channel's replica
     /// identity is derived from its number ([`ClientId::for_channel`]), so
     /// re-issuing a freed one would hand a fresh replica, minting from seq 0, the
     /// identity of ops the retired one still has in flight. A spent range is
@@ -247,9 +247,9 @@ impl ClientSession {
     /// Returns the assigned channel and the Subscribe frame to send. Scoped to
     /// the default `main` branch and the whole room (every zone the actor may
     /// read); [`subscribe_branch`](Self::subscribe_branch) names another branch,
-    /// [`subscribe_zone`](Self::subscribe_zone) narrows to one zone.
-    /// [`SubscribeError::ChannelsExhausted`] once the session's channel range is
-    /// spent.
+    /// [`subscribe_zone`](Self::subscribe_zone) narrows to one zone. Returns
+    /// [`SubscribeError::ChannelsExhausted`] instead once the session's channel
+    /// range is spent.
     pub fn subscribe(&mut self, room: &[u8]) -> Result<(Channel, Message), SubscribeError> {
         self.subscribe_inner(room, b"", b"")
     }
