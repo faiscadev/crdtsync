@@ -231,7 +231,10 @@ export class Doc {
     // the cause rather than dropping it.
     const delivery = this.deliver(this.backend.commitAtomic(), before);
     if (threw) {
-      if (body instanceof MintExhausted && delivery !== undefined && body.cause === undefined) {
+      // The body's own failure is what the caller asked for — a refusal or anything
+      // else it threw — and a delivery failure rides along as its cause rather than
+      // replacing it.
+      if (delivery !== undefined && body instanceof Error && body.cause === undefined) {
         (body as { cause?: unknown }).cause = delivery;
       }
       throw body;

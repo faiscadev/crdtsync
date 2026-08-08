@@ -556,9 +556,11 @@ int32_t crdtsync_doc_apply(CrdtDoc *doc,
 // to broadcast, and a refused edit produces the same empty buffer an inert one
 // does. A refusal means the replica's id space is spent — honest traffic reaches
 // that after 2^63 edits, a peer authoring under this replica's client id can put it
-// there in one op — or that a run was longer than the space that is left. Nothing
-// was emitted and nothing changed; a caller that ignores this reports the edit as
-// having happened.
+// there in one op — or that a run was longer than the space that is left. The
+// intention was not completed; a caller that ignores this reports it as having
+// been. It does not say that nothing happened — a refusal cuts an intention at
+// the edit that could not mint, so edits before it are applied and their ops are
+// in the buffer this call returned.
 //
 // True from the refusal until the next *intention* begins — a further edit inside
 // an open atomic group does not clear it, since the group is one intention — so it

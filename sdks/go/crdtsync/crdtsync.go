@@ -993,6 +993,10 @@ func (c *Client) CommitAtomic(channel uint32) []byte {
 // during the intention most recently opened there. Per channel, because each
 // channel holds its own replica minting under its own identity; false for a
 // channel this session does not hold.
+//
+// Latched for the whole intention, as the per-document reading is: an atomic group
+// is one intention, so a refusal inside one stays raised across the edits that
+// follow it and across the commit, and clears when the next intention opens.
 func (c *Client) MintRefused(channel uint32) bool {
 	return C.crdtsync_client_mint_refused(c.h, C.uint32_t(channel)) == 1
 }

@@ -145,5 +145,6 @@ def test_a_transactions_commit_delivery_does_not_take_the_refusals_place():
             raise boom
 
     doc.on_update(explode)
-    with pytest.raises(MintExhausted):
+    with pytest.raises(MintExhausted) as caught:
         doc.transact(lambda: doc.get_text("t").insert(0, "abcdefghij"))
+    assert caught.value.__cause__ is boom

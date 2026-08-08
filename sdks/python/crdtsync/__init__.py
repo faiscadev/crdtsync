@@ -3111,6 +3111,9 @@ class Doc:
                     except BaseException as exc:  # noqa: BLE001 - re-raised below
                         delivery = exc
                 if body is not None:
+                    # The body's own failure is what the caller asked for — a
+                    # refusal or anything else it raised — and a delivery failure
+                    # rides along as its cause rather than replacing it.
                     if delivery is not None and body.__cause__ is None:
                         raise body from delivery
                     raise body

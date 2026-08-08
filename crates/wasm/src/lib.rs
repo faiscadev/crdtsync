@@ -1198,6 +1198,11 @@ impl WasmClient {
     /// intention most recently opened there. Per channel, because each channel
     /// holds its own replica minting under its own identity. `false` for a channel
     /// this session does not hold.
+    ///
+    /// Latched for the whole intention, as the per-document reading is: an atomic
+    /// group is one intention, so a refusal inside one stays raised across the
+    /// edits that follow it and across the commit, and clears when the next
+    /// intention opens.
     #[wasm_bindgen(js_name = mintRefused)]
     pub fn mint_refused(&self, channel: u32) -> bool {
         self.inner.mint_refused(Channel(channel)).unwrap_or(false)
