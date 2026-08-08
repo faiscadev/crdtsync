@@ -135,23 +135,31 @@ pub(crate) fn retain_atomic_cloned<T: CarriesOp + Clone>(
 const CROSS_ZONE_TOKEN_TTL_MILLIS: u64 = 30_000;
 
 /// One channel's subscription: the room it joined, the branch within it, and the
-/// zone partitions it carries. An empty subscribe branch is normalized to
+/// zone selector it carries. An empty subscribe branch is normalized to
 /// [`MAIN_BRANCH`] here, so every bound channel names a concrete branch and fan-out
 /// matches `(room, branch)` exactly.
 ///
-/// `zones` scopes the stream to a subset of the room's schema-declared partitions:
-/// `None` is no filtering (a room that declares no zones, or a relay with no schema
-/// — one implicit root partition, byte-identical to a zoneless subscribe); `Some`
-/// admits an op only if it is unzoned (the root partition, always carried) or its
-/// zone id is in the set. The set holds exactly the zones the actor is authorized
-/// to read, resolved at subscribe, so the fan-out and catch-up never deliver — and
-/// never even signal, via a clock jump or an op count — a zone this subscription
-/// may not see.
+/// The selector is held as the **name** the channel subscribed under, never as the id
+/// set it resolves to. A zone id is a *position* in the acting schema's declaration
+/// order, and the schema acting over a room moves under a bound channel — a newer
+/// client of the app subscribing lifts the governing version, a clone landing
+/// re-points a name's binding, a room nothing had bound acquires one — so an id set
+/// is a fact about one moment, not about the channel. Every seam that narrows by zone
+/// resolves the name through [`acting_zone_scope`] against the schema it is about to
+/// narrow with.
 #[derive(Clone)]
 struct Subscription {
     room: RoomId,
     branch: Vec<u8>,
-    zones: Option<HashSet<u32>>,
+    /// The zone this channel subscribed to: empty is the whole room — every zone
+    /// the actor may read — and a name is that one zone.
+    zone: Vec<u8>,
+    /// The room read verdict this channel was admitted on — what a per-zone abstain
+    /// inherits ([`zone_readable`]). Unlike the selector's resolution it is not
+    /// re-taken here, and does not need to be: every caller of
+    /// [`acting_zone_scope`] gates the room read itself, ahead of the scope, so a
+    /// revoked room read stops the frame before the zone question is asked.
+    room_read: bool,
 }
 
 /// Whether a subscription scoped to `zones` admits an op in partition `op_zone`:
@@ -300,13 +308,42 @@ impl Session {
     /// omitted, so an unauthorized zone never surfaces on this stream. An unfiltered
     /// channel (a no-zones room, or a relay) takes the whole batch. An unbound
     /// channel admits nothing.
-    pub fn zone_filter(&self, channel: Channel, batch: &[Op]) -> Vec<Op> {
+    ///
+    /// `schema` is the room's governing schema as it governs now, and the selector is
+    /// resolved through it here — so the partitions a channel is served track what the
+    /// room declares rather than what was acting when the channel joined. Those differ
+    /// even at the first write: a subscribe to a room nothing had bound is admitted
+    /// against the connection's own schema, or none at all. An unauthenticated
+    /// connection cannot hold a bound channel; if one somehow does, it admits nothing
+    /// rather than everything.
+    ///
+    /// A batch carrying no zoned op is admitted whole without resolving the scope at
+    /// all: every scope admits the root partition, so the resolution could only
+    /// confirm it. That is the whole of a room declaring no zones and most batches in
+    /// one that does, which keeps the per-channel resolution off the paths that have
+    /// nothing to narrow.
+    pub fn zone_filter(
+        &self,
+        channel: Channel,
+        batch: &[Op],
+        authorizer: &dyn Authorizer,
+        schema: Option<&Schema>,
+    ) -> Vec<Op> {
         let Some(sub) = self.channels.get(&channel) else {
             return Vec::new();
         };
-        match &sub.zones {
+        let Some(identity) = self.identity.as_ref() else {
+            return Vec::new();
+        };
+        // Ordered after the identity check so that check is the backstop its comment
+        // claims: an unauthenticated connection admits nothing, whatever the batch.
+        if batch.iter().all(|op| op.zone.is_none()) {
+            return batch.to_vec();
+        }
+        let zones = acting_zone_scope(authorizer, identity, schema, sub);
+        match &zones {
             None => batch.to_vec(),
-            Some(_) => retain_atomic_cloned(batch, |_, op| zone_admits(&sub.zones, op.zone)),
+            Some(_) => retain_atomic_cloned(batch, |_, op| zone_admits(&zones, op.zone)),
         }
     }
 
@@ -904,7 +941,8 @@ pub fn step(
                 Subscription {
                     room,
                     branch,
-                    zones,
+                    zone,
+                    room_read: may_read,
                 },
             );
             Response {
@@ -1105,12 +1143,30 @@ pub fn step(
                     // exactly the partitions the live stream does.
                     let records = hub.acl_records(&room);
                     let creator = hub.room_creator(&room);
-                    // The channel's zone scope, resolved when it subscribed — the same
-                    // set the live fan-out filters this channel's ops by.
+                    // The channel's zone scope against the acting schema — the same
+                    // set the live fan-out filters this channel's ops by, resolved
+                    // the same way and at the same moment, so a version read and the
+                    // live stream serve the same partitions.
                     let zones = session
                         .channels
                         .get(&channel)
-                        .and_then(|sub| sub.zones.clone());
+                        .and_then(|sub| acting_zone_scope(authorizer, identity, schema, sub));
+                    // A zone-limited channel whose room resolves no schema cannot be
+                    // served this state at all: the projection needs the schema to know
+                    // where the partitions are, so with none it would hand over the
+                    // whole room to the narrowest scope there is. Refused, without
+                    // closing — the live stream this channel carries is unaffected,
+                    // since an op names its own partition and is filtered on that.
+                    if zone_scope_unprojectable(schema, &zones) {
+                        return Response {
+                            replies: vec![Message::Error {
+                                code: ErrorCode::Internal,
+                                message: "room schema is unavailable".to_string(),
+                                details: Vec::new(),
+                            }],
+                            ..Response::default()
+                        };
+                    }
                     // Whether either redaction is configured over these bytes on this
                     // channel at all. A room with no doc-ACL state, read by a channel that
                     // is not zone-limited, is served the captured bytes as it always was,
@@ -1311,13 +1367,27 @@ pub fn step(
             };
             let records = hub.acl_records(&room);
             let creator = hub.room_creator(&room);
-            // The channel's zone scope, resolved when it subscribed — the same set the
+            // The channel's zone scope against the acting schema — the same set the
             // live fan-out filters this channel's ops by, and the same one a version
             // fetch on this channel narrows to.
             let zones = session
                 .channels
                 .get(&channel)
-                .and_then(|sub| sub.zones.clone());
+                .and_then(|sub| acting_zone_scope(authorizer, identity, schema, sub));
+            // The same refusal the version fetch takes: a zone-limited channel whose
+            // room resolves no schema has no projection available, and both sides of a
+            // diff are states, so neither can be narrowed to the scope this channel
+            // holds.
+            if zone_scope_unprojectable(schema, &zones) {
+                return Response {
+                    replies: vec![Message::Error {
+                        code: ErrorCode::Internal,
+                        message: "room schema is unavailable".to_string(),
+                        details: Vec::new(),
+                    }],
+                    ..Response::default()
+                };
+            }
             // Each side is narrowed against its own tree. An element-scoped grant
             // resolves to where that element stood in *that* state, and the two sides
             // of a diff are two different trees — so neither side may be handed the
@@ -1924,6 +1994,75 @@ fn zone_scope(
     }
 }
 
+/// The zone partitions `sub` admits against the schema acting over its room: its
+/// selector resolved to ids, each id gated on the deployment's per-zone read verdict.
+/// **The one reading every seam that narrows by zone takes** — the live fan-out, the
+/// version fetch, each side of a diff query — so one channel's three answers are one
+/// answer, resolved against the schema each is about to narrow with rather than
+/// against whichever schema was acting when the channel joined.
+///
+/// A **named** selector the acting schema does not declare, or whose read the
+/// deployment now denies, narrows to the **empty set**: the root partition alone. Not
+/// `None`, which is "do not filter" and would serve the whole room on the one input
+/// that has become unanswerable. Where the acting schema declares no zones the room
+/// has a single implicit partition, so the empty set carries every op that partition
+/// holds — a name against a block that does not declare it is narrowed to the only
+/// partition there is, not to nothing. Within one registered chain that case cannot
+/// arise at all: a `zones` block may only be extended.
+///
+/// That reading is about the *acting* schema, not about the log. A room whose acting
+/// schema declares no zones can still hold ops stamped in a partition an earlier
+/// binding declared, and those the empty set drops while a state read of the same room
+/// serves them — the same two-seams disagreement this guard closes for a `None` schema,
+/// left open for a zero-zone one and filed as **C106**.
+///
+/// The **whole-room** selector against no acting schema is the one input this cannot
+/// answer: it is `None`, and a room genuinely declaring no partitions is
+/// indistinguishable here from one whose schema this node cannot resolve (C101, C62).
+fn acting_zone_scope(
+    authorizer: &dyn Authorizer,
+    identity: &Identity,
+    schema: Option<&Schema>,
+    sub: &Subscription,
+) -> Option<HashSet<u32>> {
+    zone_scope(
+        authorizer,
+        identity,
+        schema,
+        &sub.room,
+        &sub.zone,
+        sub.room_read,
+    )
+    .unwrap_or(Some(HashSet::new()))
+}
+
+/// Whether a scope names a narrowing that cannot be performed against `schema`. A
+/// `Some` scope is the claim that this channel sees a subset of the room's partitions,
+/// and cutting a *state* down to that subset needs the schema that defines where they
+/// are — so with no schema [`zone_narrowing`] declines, the projection is skipped, and
+/// the whole state goes out.
+///
+/// The op seam has an answer that needs no schema: an op carries its partition in its
+/// envelope, so the empty set drops every zoned op and keeps the root. A state carries
+/// no such marking — the partitions are positions in a tree the schema names — so the
+/// two seams cannot agree here by narrowing, only by the state read refusing. A
+/// channel that named a zone against a schema that no longer resolves is exactly that
+/// case: [`acting_zone_scope`] hands it the empty set, and serving it a state whole
+/// would be the widest possible reading of the narrowest possible scope.
+///
+/// Reached in three frames on one node, with no registry lag and no restart: a
+/// subscribe binds a room name *before* anything materializes under it, so a channel
+/// is admitted to a zone against the **connection's** schema and the name binds to it;
+/// a clone from an **ungoverned** source then removes that binding outright
+/// ([`Hub::clone_room`](crate::Hub::clone_room)'s `None` arm, which exists so a caller
+/// cannot pick the schema its own clone is read under); and every later frame on that
+/// name resolves no schema, since the connection's-own fallback is a subscribe-only
+/// rule. The channel then names a partition of a room that declares none, while the
+/// clone has filled it with content that partition never held.
+fn zone_scope_unprojectable(schema: Option<&Schema>, zones: &Option<HashSet<u32>>) -> bool {
+    schema.is_none() && zones.is_some()
+}
+
 /// Whether `identity` may read the zone named `zone` in `room`. A deployment that
 /// explicitly allows or denies the [`Resource::Zone`] decides; one that abstains
 /// inherits the room read verdict — a zone is visible by default within a readable
@@ -2000,11 +2139,11 @@ fn project_served_state(
 /// against. The single home of that rule, so [`project_snapshot_zones`] and a caller
 /// that must know whether narrowing is even possible cannot drift apart.
 ///
-/// "Whole-zone" means the set is *exactly* the declared id range, rather than merely
-/// having as many members. A set is resolved once, when a channel subscribes, and the
-/// room's governing schema can lift underneath it, so a set can both miss a declared
-/// partition and name ids no longer declared — and a member count says nothing about
-/// which of the two it is. Anything short of the exact range projects, which is the
+/// "Whole-zone" means the set is *exactly* the declared id range, not merely as large
+/// as it. A caller may hand this an id the schema does not declare — the callers that
+/// resolve their set through [`acting_zone_scope`] cannot, but the rule is a property
+/// of the pair rather than of any one caller — so a count is not a claim about *which*
+/// partitions a set names. Anything short of the exact range projects, which is the
 /// only reading that is never wider than either a count or a containment test alone.
 fn zone_narrowing<'a>(
     schema: Option<&'a Schema>,
@@ -2310,13 +2449,14 @@ fn reads_source_whole(
 /// and so is whole by this measure — the one implicit root partition, the same
 /// reading [`zone_scope`] takes.
 ///
-/// That reading is a *fact* about the room only where the room is bound. Two ways it
-/// is not, and neither is closed here: a binding the registry stores but cannot parse
-/// resolves to no schema, as at every other zone seam (C30); and a room the hub holds
-/// but nothing ever bound — an import, or a clone of an ungoverned room — is
-/// indistinguishable from a relay room, which genuinely has no partitions and must
-/// stay clonable (C62). Requiring `src`'s leader makes the ACL records and the creator
-/// authoritative; it does not conjure a binding that was never made.
+/// That reading is a *fact* about the room only where the binding resolves. Two ways
+/// it does not, and neither is closed here: a room bound to a version this node's
+/// registry does not hold — the window between a restart and the app re-registering
+/// (C101), registration itself parsing what it stores so an unreadable body is not one
+/// of them; and a room the hub holds that nothing ever bound — an import, or a clone
+/// of an ungoverned room — which is indistinguishable from a relay room, genuinely
+/// partitionless and rightly clonable (C62). Requiring `src`'s leader makes the ACL
+/// records and the creator authoritative; it does not conjure a binding.
 fn reads_every_zone(
     authorizer: &dyn Authorizer,
     identity: &Identity,

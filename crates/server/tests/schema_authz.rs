@@ -41,10 +41,11 @@ const SCHEMA_STRICT: &str = r#"{ "schema": "strict", "version": 1, "root": "R",
         "grants": [ { "allow": "read", "to": "owner", "on": "/" } ]
     } }"#;
 
-/// A third app whose registered body is not valid schema text — it binds a room
-/// but resolves to no parsed schema (so it grants nothing).
-const APP_BROKEN: &[u8] = b"broken";
-const SCHEMA_BROKEN: &[u8] = b"not valid schema json {";
+/// A third app whose schema declares no `@auth` block at all — it binds a room and
+/// grants nothing, so only the deployment tier can admit a read there.
+const APP_GRANTLESS: &[u8] = b"grantless";
+const SCHEMA_GRANTLESS: &str = r#"{ "schema": "grantless", "version": 1, "root": "R",
+    "types": { "R": { "kind": "map" } } }"#;
 
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
@@ -60,7 +61,8 @@ fn registry(tokens: StaticTokens) -> Registry {
     sr.register(APP, 1, SCHEMA.as_bytes(), b"").unwrap();
     sr.register(APP_STRICT, 1, SCHEMA_STRICT.as_bytes(), b"")
         .unwrap();
-    sr.register(APP_BROKEN, 1, SCHEMA_BROKEN, b"").unwrap();
+    sr.register(APP_GRANTLESS, 1, SCHEMA_GRANTLESS.as_bytes(), b"")
+        .unwrap();
     let mut r = Registry::new(cid(0xFF));
     r.set_schema_registry(Arc::new(Mutex::new(sr)));
     r.set_verifier(Box::new(tokens));
@@ -251,10 +253,10 @@ fn a_foreign_app_cannot_read_a_room_governed_by_a_stricter_schema() {
 }
 
 #[test]
-fn a_room_bound_to_an_unparseable_schema_does_not_fall_back_to_a_foreign_app() {
-    // `keeper` (app `broken`, whose registered body will not parse) binds the room
-    // — its own read is permitted by the deployment, not its schema. `broken`
-    // resolves to no parsed schema, so the room grants nothing. A foreign `mallory`
+fn a_room_bound_to_a_grantless_schema_does_not_fall_back_to_a_foreign_app() {
+    // `keeper` (app `grantless`, whose schema declares no grants) binds the room —
+    // its own read is permitted by the deployment, not its schema. `grantless`
+    // grants nothing, so the room grants nothing. A foreign `mallory`
     // (app `collab`, which grants read to any authenticated actor) then subscribes:
     // the room is *bound*, so its (empty) governing schema gates the read — the
     // fallback to mallory's own permissive schema must not fire.
@@ -269,16 +271,16 @@ fn a_room_bound_to_an_unparseable_schema_does_not_fall_back_to_a_foreign_app() {
         ResourceMatch::Room(ROOM.to_vec()),
     )));
 
-    let keeper = hello_auth_app(&mut r, 1, "t-keeper", APP_BROKEN);
+    let keeper = hello_auth_app(&mut r, 1, "t-keeper", APP_GRANTLESS);
     assert!(
         subscribe_ok(&mut r, keeper),
-        "the deployment permits keeper's read, binding the room to the broken app",
+        "the deployment permits keeper's read, binding the room to the grantless app",
     );
 
     let mallory = hello_auth_app(&mut r, 2, "t-mallory", APP);
     assert!(
         !subscribe_ok(&mut r, mallory),
-        "a room bound to an unparseable schema must not fall back to a foreign app's grants",
+        "a room bound to a grantless schema must not fall back to a foreign app's grants",
     );
 }
 
@@ -339,5 +341,87 @@ fn a_relay_client_of_an_unregistered_app_falls_to_the_deployment_deny() {
     assert!(
         !subscribe_ok(&mut r, id),
         "a relay connection has no schema grant, so the abstaining ACL denies it",
+    );
+}
+
+struct TempDir(std::path::PathBuf);
+impl TempDir {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tempdir() -> TempDir {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("crdtsync-schema-authz-{pid}-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    TempDir(dir)
+}
+
+/// A room's governing binding is durable while the schema registry is in-memory, so a
+/// restart before the app re-registers leaves the room bound to a version this node
+/// cannot resolve. The binding is still a binding: the acting schema is the *room's*,
+/// resolving to no grants, and the fallback to a foreign connection's own app — a
+/// subscribe-only rule for a room nobody has bound — must not fire for it. Registration
+/// parsing what it stores closes the unreadable-body door onto the same state; this one
+/// stays open until C101, and it must stay fail-closed while it does.
+#[cfg_attr(miri, ignore)] // drives the durable store on the filesystem
+#[test]
+fn a_room_bound_to_an_unresolvable_version_does_not_fall_back_to_a_foreign_app() {
+    let dir = tempdir();
+    // The deployment permits only keeper's read, abstaining for everyone else — so on
+    // the second boot mallory's verdict comes from the room's governing schema, which
+    // is the resolution under test.
+    let authorizer = || {
+        Acl::new().allow(
+            Subject::Actor(b"keeper".to_vec()),
+            Some(Action::Read),
+            ResourceMatch::Room(ROOM.to_vec()),
+        )
+    };
+    // First boot: `keeper` binds the room to the grantless app, which persists.
+    {
+        let store = crdtsync_server::store::Store::open(dir.path()).unwrap();
+        let mut sr = crdtsync_server::SchemaRegistry::new();
+        sr.register(APP_GRANTLESS, 1, SCHEMA_GRANTLESS.as_bytes(), b"")
+            .unwrap();
+        let mut r = Registry::with_store(cid(0xFF), store).unwrap();
+        r.set_schema_registry(Arc::new(Mutex::new(sr)));
+        r.set_verifier(Box::new(tokens(&[("t-keeper", "keeper", &[])])));
+        r.set_authorizer(Box::new(authorizer()));
+        r.set_clock(Arc::new(ManualClock::new(0)));
+        let keeper = hello_auth_app(&mut r, 1, "t-keeper", APP_GRANTLESS);
+        // The subscribe is what binds the room and persists that binding, so no write
+        // is needed here — and none would land: the deployment tier matches whole
+        // rooms while the write gate is per path, and `grantless` grants nothing.
+        assert!(
+            subscribe_ok(&mut r, keeper),
+            "the room binds to `grantless`"
+        );
+    }
+    // Second boot: the bindings come back, the registry does not.
+    let store = crdtsync_server::store::Store::open(dir.path()).unwrap();
+    let mut sr = crdtsync_server::SchemaRegistry::new();
+    sr.register(APP, 1, SCHEMA.as_bytes(), b"").unwrap();
+    let mut r = Registry::with_store(cid(0xFF), store).unwrap();
+    r.set_schema_registry(Arc::new(Mutex::new(sr)));
+    r.set_verifier(Box::new(tokens(&[("t-mallory", "mallory", &[])])));
+    r.set_authorizer(Box::new(authorizer()));
+    r.set_clock(Arc::new(ManualClock::new(0)));
+
+    let mallory = hello_auth_app(&mut r, 2, "t-mallory", APP);
+    assert!(
+        !subscribe_ok(&mut r, mallory),
+        "a bound room whose version does not resolve must not be governed by a \
+         foreign app's grants",
     );
 }

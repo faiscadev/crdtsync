@@ -55,7 +55,13 @@ fn empty() -> Mutex<SchemaRegistry> {
 
 fn registered() -> Mutex<SchemaRegistry> {
     let mut r = SchemaRegistry::new();
-    r.register(APP, 1, br#"{"v":1}"#, b"").unwrap();
+    r.register(
+        APP,
+        1,
+        br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#,
+        b"",
+    )
+    .unwrap();
     Mutex::new(r)
 }
 

@@ -18,6 +18,11 @@ use crdtsync_server::translate::{resolve_chain, translate_snapshot_scoped};
 
 const APP: &[u8] = b"app";
 
+/// The registered body every version in these chains carries: the chain's shape and
+/// its migration edges are what is under test, not the schema itself, so one
+/// well-formed body serves every link.
+const SCHEMA_BODY: &[u8] = br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#;
+
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
     b[0] = first;
@@ -42,12 +47,13 @@ fn schema(note_field: &str) -> Schema {
 }
 
 /// A registry whose `APP` chain carries `edges[0]` as the 1→2 migration, etc.
-/// The schema body registered at each version is opaque to translation.
+/// Translation reads the edges, not the schema bodies, so every version registers
+/// the same one.
 fn registry_with(edges: &[&str]) -> SchemaRegistry {
     let mut reg = SchemaRegistry::new();
-    reg.register(APP, 1, b"{}", b"").unwrap();
+    reg.register(APP, 1, SCHEMA_BODY, b"").unwrap();
     for (i, e) in edges.iter().enumerate() {
-        reg.register(APP, (i + 2) as u32, b"{}", e.as_bytes())
+        reg.register(APP, (i + 2) as u32, SCHEMA_BODY, e.as_bytes())
             .unwrap();
     }
     reg
@@ -274,8 +280,8 @@ fn a_deleted_container_field_converges_across_seams() {
     let edge = r#"{ "from": 1, "to": 2, "steps": [
         { "kind": "renameField", "type": "Doc", "from": "foo", "to": "bar" } ] }"#;
     let mut reg = SchemaRegistry::new();
-    reg.register(APP, 1, b"{}", b"").unwrap();
-    reg.register(APP, 2, b"{}", edge.as_bytes()).unwrap();
+    reg.register(APP, 1, SCHEMA_BODY, b"").unwrap();
+    reg.register(APP, 2, SCHEMA_BODY, edge.as_bytes()).unwrap();
     let s2 = container_schema("bar");
 
     let mut w = Document::new(cid(1));
