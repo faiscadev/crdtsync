@@ -1018,12 +1018,33 @@ impl Registry {
     /// Run one reap check over the cluster membership: remove members that have
     /// stayed `Dead` past the bounded dead-time ([`Membership::reap_dead`]), so a
     /// durably-departed node stops lingering as a placement replica. Driven once per
-    /// membership sweep. Inert in single-node mode (no membership); the next delivery
-    /// recomputes placement over the reaped roster, so nothing needs flushing here.
+    /// membership sweep. Inert in single-node mode (no membership); `reap_dead` rebuilds
+    /// the placement itself, so the next delivery routes over the reaped roster with
+    /// nothing to recompute here.
+    ///
+    /// The reap also carries into the replication bookkeeping: each reaped member's
+    /// acknowledged watermarks go with it ([`Replication::forget_members`]), so the map
+    /// stays keyed on the roster rather than on departed members, and a member that
+    /// returns is caught up from nothing instead of from a position it may no longer
+    /// hold. [`record_replica_ack`](Self::record_replica_ack) keeps it that way — a
+    /// non-member's late ack records nothing.
+    ///
+    /// A withheld client ack is deliberately **not** released here. A reap re-places
+    /// rooms at the same size while the ring holds the replication factor, so the
+    /// majority a withheld write waits on moves only once the ring falls *below* it —
+    /// and a release there would hand the author an `Accepted` for a write held by
+    /// fewer replicas than it was accepted against, which on the minority side of a
+    /// partition is a write the majority side never saw. Which quorum a withheld ack
+    /// waits on after the roster shrinks is C69's to settle.
     pub fn reap_dead_members(&mut self) {
-        if let Some(membership) = &mut self.membership {
-            membership.reap_dead();
+        let Some(membership) = &mut self.membership else {
+            return;
+        };
+        let reaped: HashSet<NodeId> = membership.reap_dead().into_iter().collect();
+        if reaped.is_empty() {
+            return;
         }
+        self.replication.forget_members(&reaped);
     }
 
     /// Record the outcome of a direct gossip round to `node`: a success is
@@ -1225,7 +1246,25 @@ impl Registry {
     /// watermark for the room, then release any withheld client ack the fresh
     /// watermark now carries to a majority. The leader's peer connection calls this
     /// when the follower answers a Replicate.
+    ///
+    /// An ack from a node the roster no longer holds is dropped: a replication link
+    /// outlives the gossip verdict that reaped its far end, so an in-flight ack can
+    /// arrive after the sweep, and recording it would re-key the map on a departed
+    /// member that no later reap reaches. A non-member is no room's follower, so its
+    /// watermark counts toward no quorum and dropping the ack costs the quorum nothing;
+    /// it does cost the release pass a trigger it was only ever an accident of, which
+    /// C64 and C69 own — what re-evaluates a withheld ack when the roster, rather than a
+    /// watermark, is what moved. Single-node mode has no roster to gate on, so an ack
+    /// records unconditionally there — it leads every room alone, at a majority of one,
+    /// so a watermark drives none of its quorums.
     pub fn record_replica_ack(&mut self, follower: NodeId, room: &[u8], through_seq: u64) {
+        if self
+            .membership
+            .as_ref()
+            .is_some_and(|m| !m.is_member(&follower))
+        {
+            return;
+        }
         self.replication.record_ack(follower, room, through_seq);
         self.release_pending_acks(room);
     }
