@@ -2119,15 +2119,31 @@ impl Registry {
         // that recipient (reveal-on-move-in) — a shell must precede the move so the
         // recipient can materialize it, mirroring the catch-up seam.
         let hub = &self.hub;
-        // Each relocated node paired with its move's zone: a reveal shell (and its
-        // back-filled content) is stamped with the move's zone so the per-channel zone
-        // filter co-travels them — a shell never rides to a channel whose zone filter
-        // drops its placing move (which would strand an unplaced node). For a room with no
-        // zones every zone is `None`, so this is a no-op.
+        // Each relocated node paired with the partition it **lands in**, read off the
+        // tree this stream serves now the batch is folded. A reveal shell, its
+        // back-filled content, and the batch's own ops inside the revealed subtree all
+        // ride that partition, so the per-channel zone filter co-travels them: a shell
+        // never rides to a channel whose filter drops its placing move (which would
+        // strand an unplaced node), and the content never rides without the shell.
+        //
+        // The landing partition, not the move op's own — an op's envelope carries the
+        // partition its author resolved when it was emitted, which for a move emitted
+        // before the one that relocates its new parent is the partition the subtree is
+        // *leaving*. Reading the folded tree instead gives every copy of every node in
+        // one relocated subtree the same answer, whatever order the transaction emitted
+        // them in. A node the served tree does not resolve keeps its move's answer,
+        // which is the only other partition claim there is. For a room with no zones
+        // every zone is `None`, so this is a no-op.
         let moved_nodes: Vec<(ElementId, Option<u32>)> = broadcast
             .iter()
             .filter_map(|op| match &op.kind {
-                OpKind::XmlMove { node, .. } => Some((*node, op.zone)),
+                OpKind::XmlMove { node, .. } => {
+                    let landed = schema
+                        .as_deref()
+                        .zip(index.get(node))
+                        .map(|(s, path)| crdtsync_core::zone::zone_id_of(s, path));
+                    Some((*node, landed.unwrap_or(op.zone)))
+                }
                 _ => None,
             })
             .collect();
@@ -2250,6 +2266,15 @@ impl Registry {
                     // that op out of its transaction's count for good.
                     let mut carried: HashSet<crdtsync_core::OpId> =
                         readable.iter().map(|op| op.id).collect();
+                    // The landing partition of each op the back-fill yielded but the batch
+                    // already carries. That surviving copy is the batch's, stamped in the
+                    // partition its author resolved when it was emitted — for an edit
+                    // inside a node emitted before the move that relocates it, the
+                    // partition the node is leaving. Left alone the zone filter would drop
+                    // it and keep the shell, leaving the reader a materialised node it
+                    // never fills, so it takes the same partition its back-filled copy
+                    // would have (C16).
+                    let mut co_travel: HashMap<crdtsync_core::OpId, Option<u32>> = HashMap::new();
                     for shell in shells {
                         let OpKind::XmlReveal { node, .. } = &shell.kind else {
                             continue;
@@ -2257,35 +2282,46 @@ impl Registry {
                         let node = *node;
                         let zone = shell.zone;
                         prefix.push(shell);
-                        let backfill: Vec<Op> = hub
-                            .reveal_backfill(
-                                room,
-                                node,
-                                &records,
-                                |p| {
-                                    crate::acl::recipient_reads_path(
-                                        authorizer,
-                                        &records,
-                                        creator.as_deref(),
-                                        &index,
-                                        schema.as_deref(),
-                                        identity,
-                                        room,
-                                        p,
-                                    )
-                                },
-                                reads_whole,
-                            )
-                            .into_iter()
-                            .filter(|op| carried.insert(op.id))
-                            .map(|mut op| {
+                        let backfill = hub.reveal_backfill(
+                            room,
+                            node,
+                            &records,
+                            |p| {
+                                crate::acl::recipient_reads_path(
+                                    authorizer,
+                                    &records,
+                                    creator.as_deref(),
+                                    &index,
+                                    schema.as_deref(),
+                                    identity,
+                                    room,
+                                    p,
+                                )
+                            },
+                            reads_whole,
+                        );
+                        for mut op in backfill {
+                            if carried.insert(op.id) {
                                 op.zone = zone;
-                                op
-                            })
-                            .collect();
-                        prefix.extend(backfill);
+                                prefix.push(op);
+                            } else {
+                                // First shell wins, matching the copy `carried` kept.
+                                // Nested reveals agree anyway: a node inside a relocated
+                                // subtree lands where the subtree lands, and every shell
+                                // reads its partition off that one folded tree.
+                                co_travel.entry(op.id).or_insert(zone);
+                            }
+                        }
                     }
-                    prefix.into_iter().chain(readable).collect()
+                    prefix
+                        .into_iter()
+                        .chain(readable.into_iter().map(|mut op| {
+                            if let Some(zone) = co_travel.get(&op.id) {
+                                op.zone = *zone;
+                            }
+                            op
+                        }))
+                        .collect()
                 }
             };
             // Translate the surviving subset to the recipient's version, or send it
