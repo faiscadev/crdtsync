@@ -180,9 +180,11 @@ export class Doc {
     return this.backend.encodeState();
   }
 
-  /** Run `fn`'s edits as one atomic group — they apply together on every replica
-   * and ride the wire as a single batch, firing one update. Nested calls flatten
-   * into the outermost transaction. */
+  /** Run `fn`'s edits as an atomic group — they apply together on every replica
+   * and ride the wire as a single batch, firing one update. Edits spanning two zones
+   * form one group per zone, since a transaction stays inside one zone, so each
+   * applies together at the replicas served that zone. Nested calls flatten into the
+   * outermost transaction. */
   transact(fn: () => void): void {
     if (this.transacting) {
       fn();

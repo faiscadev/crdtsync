@@ -11,10 +11,10 @@
 //! (`project_read_paths`, the doc-ACL analogue, clears the buffer whole as soon as it
 //! drops anything, so nothing survives there to strand.)
 //!
-//! No local commit mints a straddling group any more — C2 cuts one to a group per
-//! partition — but the wire admits one, so the groups here are assembled the way a
-//! replica can still meet one: from a peer whose emitter does not cut. Destranding is
-//! the floor underneath the emit rule, not a substitute for it.
+//! A local commit mints no straddling group — it is cut to one group per partition
+//! (C2) — but the wire admits one, so the groups here are assembled the way a replica
+//! meets one: from a peer whose emitter does not cut. Destranding is the floor
+//! underneath the emit rule, not a substitute for it.
 
 use std::collections::HashSet;
 

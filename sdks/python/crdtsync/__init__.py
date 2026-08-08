@@ -3024,8 +3024,10 @@ class Doc:
         return CrdtXml(self, (_key_bytes(key),))
 
     def transact(self, fn: Callable[[], object]) -> None:
-        """Run ``fn``'s edits as one atomic group — they apply together on every
-        replica, ride the wire as a single batch, and fire one update. Nested calls
+        """Run ``fn``'s edits as an atomic group — they apply together on every
+        replica, ride the wire as a single batch, and fire one update. Edits spanning
+        two zones form one group per zone, since a transaction stays inside one zone,
+        so each applies together at the replicas served that zone. Nested calls
         flatten into the outermost transaction."""
         # The atomic group is state of the shared replica, not of the caller, so
         # the whole transaction is one indivisible step: another thread's edit

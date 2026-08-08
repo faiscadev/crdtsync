@@ -2,27 +2,27 @@
 //!
 //! ARCHITECTURE §Scope Constraints says a Tx must stay within one zone, and
 //! §Not Shipped lists cross-zone transactions among the things the engine does not
-//! offer. Nothing used to enforce either: [`Document::commit_atomic`] tagged every
-//! edit of a commit with one group id whatever partition each op was stamped in, so
-//! a commit touching two zones shipped a group no zone-scoped subscriber could
-//! receive whole. Each of those holds a subscription to a subset of the room's
-//! partitions, so its zone filter withholds the other zone's members and destrands
-//! (C11) what is left — the group loses its atomic view at exactly the recipients
-//! zones exist to serve, while a full-doc subscriber keeps it.
+//! offer. A commit closes one group per partition its ops fall in, which is what
+//! makes that true at the seam it is decided: a commit wholly inside one partition —
+//! the ordinary case, and every case in a document declaring no zones — is a single
+//! group, and one that straddles is a group per zone, each id derived from its own
+//! members' sequences.
 //!
-//! The commit now closes one group per partition its ops fall in. A commit wholly
-//! inside one partition — the ordinary case, and every case in a document with no
-//! zones — emits exactly the group it always did. A commit that straddles emits one
-//! group per zone, each id derived from its own members' sequences, so every
-//! recipient receives whole every group its subscription admits at all.
+//! The reason is that only a subscriber admitted to every partition a group spans can
+//! receive it whole. A zone-scoped subscription is served a subset of the room's
+//! partitions, so its filter withholds the other zone's members and destrands (C11)
+//! what is left; a group straddling the cut therefore loses its atomic view at exactly
+//! the recipients zones exist to serve, while a full-doc subscriber keeps it. Cut to
+//! partitions, every recipient the emitter serves holds a group whole or not at all.
 //!
 //! What a straddling commit gives up is atomicity *across* the zones, which
 //! §Not Shipped never offered; what it keeps is every edit and per-zone atomicity.
 //! The rejected alternative was refusing the straddle at emit — see DECISIONS.md.
 //!
-//! Destranding stays the wire-level floor underneath this: the doc-ACL read filter
-//! cuts on a dimension no scope constraint aligns groups to, so a group it splits
-//! still ships untagged. Partitioning only removes the cut the *zone* filter made.
+//! Destranding is the wire-level floor underneath this, not a thing it replaces: the
+//! doc-ACL read filter cuts on a dimension no scope constraint aligns groups to, so a
+//! group it splits still ships untagged, and the wire admits a straddling group from a
+//! peer whose emitter does not cut.
 
 use std::collections::BTreeMap;
 
@@ -157,7 +157,7 @@ fn a_commit_wholly_inside_one_zone_is_one_atomic_group() {
 #[test]
 fn a_commit_in_an_unpartitioned_document_is_one_atomic_group() {
     // No schema bound means no zones, so every op takes the root partition and the
-    // rule collapses to what a commit always did.
+    // commit has exactly one partition to cut to.
     let mut d = Document::new(cid(1));
     let ops = d.atomic_transact(|tx| {
         tx.register(b"a", Scalar::Int(1));
@@ -245,11 +245,11 @@ fn a_straddling_commit_still_emits_every_edit_and_converges() {
 
 #[test]
 fn a_zone_scoped_subscriber_receives_its_partitions_group_whole() {
-    // The payoff. A subscription admitting only zb withholds the za members; before
-    // the split those members belonged to the same group as zb's, so withholding
-    // them destranded the group and the subscriber watched the zb edits merge one by
-    // one. Cut to partitions, the withheld ops name a group the subscriber holds no
-    // member of, so nothing it receives is split.
+    // The payoff. A subscription admitting only zb withholds the za members, and
+    // those name a group this subscriber holds no member of — so the cut runs
+    // between groups rather than through one, and nothing it receives is destranded.
+    // A group spanning both partitions would instead lose its tags here, leaving the
+    // zb edits to merge one at a time.
     let (mut a, seed) = seeded(1);
     a.begin_atomic();
     edit(&mut a, b"board", "x");
@@ -421,5 +421,81 @@ fn a_stray_of_either_split_group_lands_at_the_author() {
         path::text_get(&a, &seq_of(b"loose")),
         path::text_get(&b, &seq_of(b"loose")),
         "the author and the receiver merged the same strays"
+    );
+}
+
+// --- the cap bounds a partition, not the commit ---
+
+#[test]
+#[cfg_attr(miri, ignore = "thousand-member groups are slow under Miri")]
+fn the_member_cap_bounds_a_partition_rather_than_the_commit() {
+    // A partition is a group, and the cap is a per-group bound — so an oversized
+    // partition streams untagged while an in-range one beside it is still tagged,
+    // where an uncut commit would have streamed both. What bounds the members a
+    // commit asks a recipient to hold is therefore the cap times the partitions it
+    // spans, at most one per declared zone plus the root.
+    let (mut d, _) = seeded(1);
+    d.begin_atomic();
+    d.transact(|tx| {
+        for i in 0..=crdtsync_core::MAX_TX_MEMBERS {
+            tx.map(b"board")
+                .register(format!("k{i}").as_bytes(), Scalar::Int(i64::from(i)));
+        }
+        tx.map(b"notes").register(b"n1", Scalar::Int(1));
+        tx.map(b"notes").register(b"n2", Scalar::Int(2));
+    });
+    let ops = d.commit_atomic();
+
+    let board = Some(zone_of(b"board"));
+    let notes = Some(zone_of(b"notes"));
+    assert!(
+        members(&ops, board) > crdtsync_core::MAX_TX_MEMBERS,
+        "the za partition is past the cap"
+    );
+    assert!(
+        ops.iter()
+            .filter(|op| op.zone == board)
+            .all(|op| op.tx.is_none()),
+        "a partition no receiver may accept is streamed rather than tagged"
+    );
+    let tagged = groups(&ops)[&notes].expect("the in-range partition is tagged");
+    assert_eq!(tagged.count, members(&ops, notes));
+}
+
+// --- undo replays through the same cut ---
+
+#[test]
+fn undoing_a_cross_zone_atomic_intention_replays_one_group_per_zone() {
+    // An intention is undone by emitting its inverses through the same commit seam,
+    // so the undo is cut exactly as the forward edits were: a peer scoped to one
+    // zone sees the revert of its own partition all-or-nothing, and never a group
+    // half of which it can never receive.
+    let (mut d, _) = seeded(1);
+    let undo = crdtsync_core::UndoManager::new();
+    let forward = undo.atomic_group(&mut d, |doc| {
+        edit(doc, b"board", "x");
+        edit(doc, b"notes", "y");
+    });
+    assert_eq!(
+        groups(&forward).len(),
+        2,
+        "the forward edits were cut in two"
+    );
+
+    let inverses = undo.undo(&mut d).expect("the intention undoes");
+    let groups = groups(&inverses);
+    assert_eq!(groups.len(), 2, "the undo is cut the same way");
+    for zone in [Some(zone_of(b"board")), Some(zone_of(b"notes"))] {
+        let tx = groups[&zone].expect("each partition's inverses are tagged");
+        assert_eq!(tx.count, members(&inverses, zone));
+    }
+    assert_eq!(
+        path::text_get(&d, &seq_of(b"board")).as_deref(),
+        Some("hello"),
+        "the board edit is reverted"
+    );
+    assert_eq!(
+        path::text_get(&d, &seq_of(b"notes")).as_deref(),
+        Some("hello")
     );
 }

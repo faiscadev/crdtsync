@@ -2940,16 +2940,19 @@ impl Document {
     /// Tag a commit's ops as atomic transactions, **one group per partition** — the
     /// scope constraint ARCHITECTURE §Scope Constraints states and §Not Shipped
     /// repeats: a transaction stays inside one zone. A commit wholly in one
-    /// partition, which is every commit in a document that declares no zones, is
-    /// the one group it has always been.
+    /// partition, which is every commit in a document that declares no zones, is a
+    /// single group.
     ///
     /// A group is only ever received whole by a subscriber admitted to every
     /// partition it spans, since a zone-scoped subscription withholds the other
     /// partitions' members and [destrands](crate::destrand_split) the survivors —
-    /// so a group cut to a partition is one every recipient that holds any of it
-    /// holds all of it. What a straddling commit gives up is atomicity *across* the
-    /// zones, which is the thing never offered; what it keeps is every edit, and
-    /// per-zone atomicity where the constraint holds.
+    /// so a group cut to a partition is one every recipient this replica serves
+    /// holds whole or not at all. What a straddling commit gives up is atomicity
+    /// *across* the zones, which is the thing never offered; what it keeps is every
+    /// edit, and per-zone atomicity where the constraint holds. The cut is the
+    /// emitter's, not a property of the whole path: a relay that re-stamps an op's
+    /// partition can hand a downstream filter a group spanning two again, so every
+    /// filter still destrands what it splits.
     ///
     /// A partition whose size is outside the representable range — empty, or past
     /// [`MAX_TX_MEMBERS`] — is left untagged, so its ops stream and merge
@@ -2960,8 +2963,8 @@ impl Document {
     ///
     /// Each id is [derived](TxId::derive) from its own partition's member sequences,
     /// so it is as durable as the op ids it sits beside and needs no state of its
-    /// own — and two partitions of one commit hold disjoint sequences, so they never
-    /// name one group.
+    /// own — and two partitions of one commit hold disjoint sequences, so they
+    /// collide only where two distinct member sets would.
     ///
     /// Tagging resolves each group's key here, as a receiver's commit resolves it
     /// there: the author applied these edits as it made them and never buckets

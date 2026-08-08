@@ -301,10 +301,12 @@ func (d *Doc) GetXml(key string) *CrdtXml {
 	return &CrdtXml{doc: d, path: [][]byte{[]byte(key)}}
 }
 
-// Transact runs fn's edits as one atomic group — they apply together on every
-// replica, ride the wire as a single batch, and fire one update. Nested calls
-// flatten into the outermost transaction. The group is doc-wide, so an edit
-// another goroutine makes while it is open joins it.
+// Transact runs fn's edits as an atomic group — they apply together on every
+// replica, ride the wire as a single batch, and fire one update. Edits spanning two
+// zones form one group per zone, since a transaction stays inside one zone, so each
+// applies together at the replicas served that zone. Nested calls flatten into the
+// outermost transaction. The group is doc-wide, so an edit another goroutine makes
+// while it is open joins it.
 func (d *Doc) Transact(fn func()) {
 	d.mu.Lock()
 	if d.transacting {

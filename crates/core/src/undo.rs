@@ -18,7 +18,9 @@
 //!
 //! An undo step is one *intention* — the edits of a single transact, of an
 //! explicit [`Document::begin_intention`] group, or of one atomic transaction,
-//! which undoes and redoes as one atomic transaction in turn. Replaying an
+//! which undoes and redoes atomically in turn: as one transaction, or as one per
+//! zone partition where the intention spans several, exactly as the forward edits
+//! were emitted (ARCHITECTURE §Scope Constraints). Replaying an
 //! intention emits ordinary forward ops, and those ops are themselves recorded,
 //! so the mirror intention that would undo the undo is derived from live state
 //! rather than guessed at record time — which is what makes undo and redo
@@ -136,8 +138,9 @@ pub(crate) enum Step {
 /// One undo step: the inverses of the edits of a single intention, in the order
 /// those edits were made, tagged with the origin that authored them. `atomic`
 /// records that they were made as an atomic transaction, so the undo (and the
-/// redo) replays as one atomic transaction too — a peer never sees a partially
-/// undone group.
+/// redo) replays through the same commit seam — a peer never sees a partially
+/// undone group, and an intention spanning two zones undoes as one group per
+/// partition just as it was emitted.
 pub(crate) struct Intention {
     pub(crate) origin: Vec<u8>,
     pub(crate) steps: Vec<Step>,
@@ -470,10 +473,11 @@ impl UndoManager {
         out
     }
 
-    /// Like [`group`](Self::group), but the edits form one atomic transaction:
-    /// their ops ship as a group a peer folds in all-or-nothing, and a later undo
-    /// (or redo) of the intention replays as one atomic transaction too. Returns
-    /// the group's ops.
+    /// Like [`group`](Self::group), but the edits form an atomic transaction: their
+    /// ops ship as a group a peer folds in all-or-nothing — one group per zone
+    /// partition the edits fall in, since a transaction stays inside one zone — and
+    /// a later undo (or redo) of the intention replays through the same seam.
+    /// Returns the ops.
     pub fn atomic_group<F>(&self, doc: &mut Document, edits: F) -> Vec<Op>
     where
         F: FnOnce(&mut Document),

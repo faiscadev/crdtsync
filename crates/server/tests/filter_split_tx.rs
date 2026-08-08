@@ -147,8 +147,8 @@ fn all_tagged(ops: &[Op]) -> bool {
 
 /// Re-tag `ops` as one group spanning every zone partition they fall in — the
 /// envelopes a peer that does not cut its commits to partitions (C2) puts on the
-/// wire. A local commit no longer mints such a group, but the wire admits one, so
-/// every filter still has to destrand what it splits.
+/// wire. A local commit mints no such group, but the wire admits one, so every filter
+/// has to destrand what it splits.
 fn as_one_group(ops: Vec<Op>) -> Vec<Op> {
     let count = u32::try_from(ops.len()).expect("a small group");
     let id = TxId::derive(ops.iter().map(|op| op.id.seq));
@@ -614,6 +614,54 @@ fn a_group_the_zone_filter_carries_whole_stays_atomic() {
     doc.apply(&got[1]);
     assert_eq!(zoned_int(&doc, b"board", b"one"), Some(1));
     assert_eq!(zoned_int(&doc, b"board", b"two"), Some(2));
+}
+
+#[test]
+fn an_emitters_cross_zone_commit_reaches_a_zone_subscriber_atomically() {
+    // C2's payoff, driven end to end on the emitter's own output rather than a
+    // hand-forged group: a commit spanning za and zb is cut to a group per zone, so
+    // the za subscriber's filter withholds zb's members without splitting anything
+    // it holds. Its za members therefore arrive tagged and all-or-nothing, where a
+    // group spanning both would have been destranded here and merged one at a time.
+    let (mut r, mut doc, author) = zone_seeded();
+    let (za, base) = zone_join(&mut r, 2, "c-za", b"za");
+
+    let sent = doc.atomic_transact(|tx| {
+        tx.map(b"board").register(b"bk", Scalar::Int(2));
+        tx.map(b"notes").register(b"nk", Scalar::Int(3));
+        tx.map(b"board").register(b"bk2", Scalar::Int(4));
+    });
+    submit(&mut r, author, sent.clone());
+    let got = received_ops(&mut r, za);
+    assert!(has_key(&got, b"bk"), "the za members are delivered");
+    assert!(!has_key(&got, b"nk"), "the zb member is withheld");
+
+    let members = members_of(&sent, &got);
+    assert!(
+        members.len() > 1,
+        "the za group has members to hold together"
+    );
+    assert!(
+        members.iter().all(|op| op.tx.is_some()),
+        "the za group survives the cut tagged"
+    );
+
+    // All-or-nothing at the subscriber: every member but the last is held, and they
+    // land together on the arrival that completes the group.
+    let mut za_doc = folded(2, &base);
+    let (last, held) = got.split_last().expect("the batch is not empty");
+    for op in held {
+        za_doc.apply(op);
+    }
+    assert_eq!(
+        zoned_int(&za_doc, b"board", b"bk"),
+        None,
+        "the partial group is invisible"
+    );
+    za_doc.apply(last);
+    assert_eq!(zoned_int(&za_doc, b"board", b"bk"), Some(2));
+    assert_eq!(zoned_int(&za_doc, b"board", b"bk2"), Some(4));
+    assert_eq!(zoned_int(&za_doc, b"notes", b"nk"), None);
 }
 
 #[test]

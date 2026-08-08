@@ -390,11 +390,13 @@ impl ClientSession {
         self.enqueue_ops(channel, ops)
     }
 
-    /// Like [`edit`](Self::edit), but the emitted ops form one atomic
-    /// transaction: a peer folds them in all-or-nothing, never observing a
-    /// partial group. The ops travel as an ordinary `Message::Ops` — the
-    /// transaction membership rides on the ops themselves. `None` if the channel
-    /// isn't held.
+    /// Like [`edit`](Self::edit), but the emitted ops form an atomic transaction:
+    /// a peer folds them in all-or-nothing, never observing a partial group. Edits
+    /// spanning two zones form one transaction per zone, since a transaction stays
+    /// inside one zone (ARCHITECTURE §Scope Constraints), so a zone-scoped peer
+    /// receives whole the group it is served. The ops travel as an ordinary
+    /// `Message::Ops` — the transaction membership rides on the ops themselves.
+    /// `None` if the channel isn't held.
     pub fn atomic_edit<F>(&mut self, channel: Channel, f: F) -> Option<Message>
     where
         F: FnOnce(&mut MapCursor),
@@ -414,8 +416,9 @@ impl ClientSession {
     }
 
     /// Commit the atomic transaction opened by [`begin_atomic`](Self::begin_atomic)
-    /// on `channel`, returning the group's ops as one `Message::Ops` to send.
-    /// `None` if the channel isn't held.
+    /// on `channel`, returning its ops as one `Message::Ops` to send — carrying one
+    /// tagged group per zone partition the edits fall in. `None` if the channel
+    /// isn't held.
     pub fn commit_atomic(&mut self, channel: Channel) -> Option<Message> {
         let ops = self.rooms.get_mut(&channel)?.doc.commit_atomic();
         self.enqueue_ops(channel, ops)
