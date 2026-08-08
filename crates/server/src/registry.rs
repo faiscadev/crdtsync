@@ -2121,19 +2121,19 @@ impl Registry {
         let hub = &self.hub;
         // Each relocated node paired with the partition it **lands in**, read off the
         // tree this stream serves now the batch is folded. A reveal shell, its
-        // back-filled content, and the batch's own ops inside the revealed subtree all
-        // ride that partition, so the per-channel zone filter co-travels them: a shell
-        // never rides to a channel whose filter drops its placing move (which would
-        // strand an unplaced node), and the content never rides without the shell.
+        // back-filled content, and the batch's own copy of any op that content covers
+        // all ride that one partition, so the per-channel zone filter takes a revealed
+        // node's shell and its contents together or not at all.
         //
         // The landing partition, not the move op's own — an op's envelope carries the
         // partition its author resolved when it was emitted, which for a move emitted
         // before the one that relocates its new parent is the partition the subtree is
-        // *leaving*. Reading the folded tree instead gives every copy of every node in
-        // one relocated subtree the same answer, whatever order the transaction emitted
-        // them in. A node the served tree does not resolve keeps its move's answer,
-        // which is the only other partition claim there is. For a room with no zones
-        // every zone is `None`, so this is a no-op.
+        // *leaving*. Reading the folded tree instead gives every node inside one
+        // relocated subtree the same answer whatever order the transaction emitted its
+        // moves in, and answers in the partition ids a channel's zone scope was resolved
+        // in, which an author's envelope only coincidentally does. A node the served
+        // tree does not resolve keeps its move's answer, the only other partition claim
+        // there is. For a room with no zones every zone is `None`, so this is a no-op.
         let moved_nodes: Vec<(ElementId, Option<u32>)> = broadcast
             .iter()
             .filter_map(|op| match &op.kind {
@@ -2255,8 +2255,7 @@ impl Registry {
                     // so without the back-fill a live reader would materialize an empty
                     // node and diverge from a fresh/snapshot joiner. The shell + content
                     // lead the delta; the readable move (in `readable`) then folds them
-                    // into place. The shell and content carry the move's zone so the
-                    // per-channel zone filter keeps them together.
+                    // into place.
                     let mut prefix: Vec<Op> = Vec::new();
                     // An op is back-filled only if this frame is not already carrying
                     // it — neither in the batch nor in an earlier shell's back-fill,
@@ -2305,10 +2304,12 @@ impl Registry {
                                 op.zone = zone;
                                 prefix.push(op);
                             } else {
-                                // First shell wins, matching the copy `carried` kept.
-                                // Nested reveals agree anyway: a node inside a relocated
-                                // subtree lands where the subtree lands, and every shell
-                                // reads its partition off that one folded tree.
+                                // Either the batch carries it or an earlier shell's
+                                // back-fill already stamped it; the map is read against
+                                // the batch alone, so an entry for the second is inert.
+                                // First shell wins, matching the copy `carried` kept —
+                                // and nested shells agree anyway, a node inside a
+                                // relocated subtree landing where the subtree lands.
                                 co_travel.entry(op.id).or_insert(zone);
                             }
                         }
