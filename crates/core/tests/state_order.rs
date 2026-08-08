@@ -43,7 +43,11 @@ fn fold(pool: &[&Op]) -> Document {
 fn fold_applied(pool: &[&Op]) -> Document {
     let mut d = doc(9);
     for op in pool {
-        assert!(d.apply(op), "every op in this pool targets the root map");
+        assert!(
+            d.apply(op),
+            "{:?} was held: this pool is meant to target only the root map",
+            op.kind
+        );
     }
     d
 }
@@ -399,7 +403,7 @@ fn a_create_shadowed_by_a_leaf_round_trips_its_retained_create() {
     assert_eq!(
         back.encode_state(),
         bytes,
-        "the retained create round-trips"
+        "a decode/encode round trip changed the retained create"
     );
 }
 

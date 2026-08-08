@@ -717,7 +717,8 @@ impl Document {
     /// the exact element a snapshot migration resurrects at the old key, chosen by
     /// the kind the deleted-container tombstone recorded (a key that hosted more
     /// than one kind keeps each registered, so the recorded kind disambiguates).
-    /// `None` for a non-key-derived (XML) kind or one never created.
+    /// `None` for a kind the key does not name — an XML element, whose id mixes its
+    /// tag in below the key — or one never created.
     fn container_handle(
         &self,
         map_id: ElementId,
@@ -732,6 +733,10 @@ impl Document {
             ElementKind::Map => self.maps.get(&id).map(|m| Element::Map(Rc::clone(m))),
             ElementKind::List => self.lists.get(&id).map(|l| Element::List(Rc::clone(l))),
             ElementKind::Text => self.texts.get(&id).map(|t| Element::Text(Rc::clone(t))),
+            ElementKind::XmlFragment => self
+                .xml_fragments
+                .get(&id)
+                .map(|f| Element::XmlFragment(Rc::clone(f))),
             _ => None,
         }
     }
@@ -761,10 +766,10 @@ impl Document {
     /// create verbatim either way. A tombstone that resurrects nothing migrates by
     /// what the registry still holds at the key: a container of some key-derived
     /// kind there and the slot is carried verbatim rather than mis-migrated as a
-    /// leaf, none and it re-keys as the leaf tombstone it reads as. An XML kind ranks
-    /// against the creates it wins a key from, but derives its id by node rather
-    /// than by key, so it resolves to no handle and never resurrects — faithful
-    /// XML-field migration being out of scope.
+    /// leaf, none and it re-keys as the leaf tombstone it reads as. An XML element
+    /// ranks against the creates it wins a key from but resolves to no handle — its
+    /// id mixes its tag in below the key, so the key alone does not name it — and so
+    /// never resurrects; an XML fragment derives by key like the rest and does.
     pub fn migrate_leaf_slots(&mut self, fate: impl Fn(&[u8]) -> SlotFate) -> bool {
         self.migrate_leaf_slots_scoped(|_, key| fate(key))
     }
@@ -852,8 +857,9 @@ impl Document {
                 }
                 // The slot body is carried verbatim for a container slot — a live
                 // one, or a tombstoned one the branch above could not resurrect
-                // (a key whose retained create resolves to no handle, an XML one
-                // among them, or a tombstone retaining no create at all) while
+                // (a key whose retained create resolves to no handle, an XML
+                // element among them, or a tombstone retaining no create at all)
+                // while
                 // the registry still holds a container there. The COUNTER
                 // registry at the key's derived id migrates regardless: it is a
                 // separate identity from the slot body and from any container at

@@ -85,10 +85,10 @@ struct Entry {
 
 /// The identity a snapshot migration resurrects a container by: the stamp its
 /// create landed at, plus which kind it was, so a key that hosted more than one
-/// container kind resurrects the exact one. An XML kind derives its id by node
-/// rather than by key, so it is recorded — it ranks against the creates it wins
-/// the slot from — but resolves to no handle, and its key migrates by what the
-/// registry still holds there instead.
+/// container kind resurrects the exact one. An XML element mixes its tag in below
+/// the key, so the key alone does not name it: it is recorded — it ranks against
+/// the creates it wins the slot from — but resolves to no handle, and its key
+/// migrates by what the registry still holds there instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ContainerCreate {
     stamp: Stamp,
@@ -115,7 +115,8 @@ fn higher(a: Option<ContainerCreate>, b: Option<ContainerCreate>) -> Option<Cont
 /// The create identity installing `value` at `stamp` contributes: a container of
 /// any kind records one, a leaf none. A migration re-keys a leaf write and leaves
 /// every container create at the key, so the creates are what rank against each
-/// other there — including an XML one, which ranks without being resurrectable.
+/// other there — including an XML element, which ranks without being nameable by
+/// the key it sits at.
 fn create_of(value: &Element, stamp: Stamp) -> Option<ContainerCreate> {
     value.is_container().then_some(ContainerCreate {
         stamp,

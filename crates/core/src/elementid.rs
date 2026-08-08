@@ -67,17 +67,14 @@ impl ElementKind {
 
     /// Whether a container of this kind derives its id from its parent and key — so
     /// the key alone names it, and a snapshot migration can resurrect it there. An
-    /// XML node derives by node instead, and a leaf is not a container at all.
-    /// Exhaustive with no catch-all, so a new kind must be classified here rather
-    /// than defaulting to unresurrectable.
+    /// XML *element* mixes its tag in below the key, so the key alone does not name
+    /// it; a fragment derives by key like the rest. A leaf is not a container at
+    /// all. Exhaustive with no catch-all, so a new kind must be classified here
+    /// rather than defaulting to unresurrectable.
     pub(crate) fn is_key_derived_container(self) -> bool {
         match self {
-            Self::Map | Self::List | Self::Text => true,
-            Self::Scalar
-            | Self::Register
-            | Self::Counter
-            | Self::XmlElement
-            | Self::XmlFragment => false,
+            Self::Map | Self::List | Self::Text | Self::XmlFragment => true,
+            Self::Scalar | Self::Register | Self::Counter | Self::XmlElement => false,
         }
     }
 
@@ -85,7 +82,8 @@ impl ElementKind {
     /// resolves a retained create against. Kept in step with
     /// [`is_key_derived_container`](Self::is_key_derived_container) by
     /// `every_key_derived_kind_is_a_candidate`.
-    pub(crate) const KEY_DERIVED_CONTAINERS: [Self; 3] = [Self::Map, Self::List, Self::Text];
+    pub(crate) const KEY_DERIVED_CONTAINERS: [Self; 4] =
+        [Self::Map, Self::List, Self::Text, Self::XmlFragment];
 }
 
 #[cfg(test)]

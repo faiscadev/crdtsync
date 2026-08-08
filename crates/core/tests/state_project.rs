@@ -208,7 +208,7 @@ fn a_multi_kind_key_resurrects_the_highest_create() {
     assert!(d.migrate_leaf_slots(rename(b"k", b"k2")));
     assert!(
         matches!(d.get(b"k"), Some(Element::List(_))),
-        "the last-deleted kind (list) resurrects, not the map a fixed priority would pick"
+        "the highest-ranked create (the list) resurrects, not the map a fixed priority would pick"
     );
     let bytes = d.encode_state();
     let back = Document::decode_state(&bytes).unwrap();
@@ -304,6 +304,29 @@ fn a_container_a_leaf_displaced_before_the_delete_still_resurrects() {
         matches!(d.get(b"note"), Some(Element::Map(_))),
         "the displaced container resurrects at the old key"
     );
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).unwrap();
+    assert_eq!(back.encode_state(), bytes, "re-encode is canonical");
+}
+
+#[test]
+fn a_deleted_xml_fragment_resurrects_at_its_old_key() {
+    // A fragment's id derives from its parent and key exactly as a map's does, so
+    // the key names it and the create the tombstone retains resolves to it: the
+    // fragment lands live at the old key and the delete re-keys, the same state an
+    // op-served joiner reaches. Only an XML *element*, whose id mixes its tag in
+    // below the key, is unreachable this way.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_fragment(b"body");
+    });
+    d.transact(|tx| tx.delete(b"body"));
+    assert!(d.migrate_leaf_slots(rename(b"body", b"renamed")));
+    assert!(
+        matches!(d.get(b"body"), Some(Element::XmlFragment(_))),
+        "the fragment resurrects live at the old key"
+    );
+    assert!(d.get(b"renamed").is_none());
     let bytes = d.encode_state();
     let back = Document::decode_state(&bytes).unwrap();
     assert_eq!(back.encode_state(), bytes, "re-encode is canonical");
