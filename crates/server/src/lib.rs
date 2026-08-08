@@ -1688,7 +1688,26 @@ impl Hub {
             return Ok(false);
         };
         let creator = self.room_creator(src);
+        // The clone carries the source's whole state, and that state carries every
+        // author's id-space high-water — so the identities bound in the source are
+        // live in the copy, and a copy that came up with no claims would leave each
+        // of them open to whoever writes it first. They travel for the same reason
+        // the creator does: the clone is the source's content.
+        let claims: Vec<(ClientId, Vec<u8>)> = self
+            .rooms
+            .get(src)
+            .map(|r| {
+                r.client_actors
+                    .iter()
+                    .map(|(client, actor)| (*client, actor.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         self.install_room_state(dst, &state, None, creator)?;
+        if let Some(room) = self.rooms.get_mut(dst) {
+            room.client_actors.extend(claims);
+        }
+        let _ = self.persist_meta(dst);
         match self.governing.get(src).cloned() {
             Some((app, version)) => self.bind_governing(dst, app, version),
             // An ungoverned source makes an ungoverned clone — and the destination

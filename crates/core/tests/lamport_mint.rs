@@ -48,6 +48,7 @@
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::Op;
+use crdtsync_core::path;
 use crdtsync_core::schema::Schema;
 use crdtsync_core::stamp::{LAMPORT_STATE_CEILING, LAMPORT_WIRE_CEILING};
 use crdtsync_core::{ClientId, Element, OpKind, Scalar, Stamp};
@@ -1265,10 +1266,9 @@ fn a_saturated_high_water_refuses_rather_than_re_issuing_one_stamp() {
 
 #[test]
 fn a_refused_edit_is_reported_where_an_empty_batch_says_nothing() {
-    // A refused edit and an inert one both return no ops, so the batch cannot be
-    // the signal — and every SDK mutation path had only the batch. `mint_refused`
-    // is the answer, and it has to survive the close of the intention that set it
-    // or the caller that ran the transact has nothing left to read.
+    // A refused edit and an inert one both return no ops, so the batch is not the
+    // signal. `mint_refused` is, and it has to survive the close of the intention
+    // that set it or the caller that ran the transact has nothing to read.
     let me = cid(1);
     let mut doc = Document::new(me);
     assert!(!doc.mint_refused(), "a fresh replica has refused nothing");
@@ -1306,9 +1306,8 @@ fn capacity_and_refusal_are_separate_questions() {
     // `can_mint` reports capacity between operations; `mint_refused` reports what
     // the last intention did. They part company exactly where a run is refused for
     // its length: a single-id edit still fits, so capacity is intact, and the edit
-    // that was attempted was still refused. Folding the latch into `can_mint` made
-    // it answer "no room" for a replica that has room — and left the refusal itself
-    // unreadable once the intention closed, which is the whole defect.
+    // that was attempted was refused. One predicate answering both questions can
+    // only be wrong about one of them.
     let me = cid(1);
     let mut doc = Document::new(me);
     assert!(doc.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING - 2)));
@@ -1358,4 +1357,88 @@ fn an_undo_replay_reports_its_own_refusal() {
     assert!(doc.apply(&plant_at_lamport(me, b"planted", LAMPORT_STATE_CEILING, 99)));
     assert!(doc.undo(b"seat").is_some_and(|ops| ops.is_empty()));
     assert!(doc.mint_refused(), "a refused undo reported nothing");
+}
+
+#[test]
+fn the_latch_spans_an_intention_a_nested_group_only_joins() {
+    // An atomic group nested in an explicit intention joins that intention, so
+    // neither end of the group is an intention boundary: opening it must not hand
+    // the mint a fresh answer, and closing it must not either. The latch therefore
+    // covers every edit up to `end_intention`, and `mint_refused` still reports it
+    // after the group has been committed.
+    let me = cid(1);
+    let mut doc = Document::new(me);
+    assert!(doc.apply(&op_at_lamport(me, b"planted", LAMPORT_STATE_CEILING - 6)));
+
+    doc.begin_intention();
+    doc.begin_atomic();
+    // Ten codepoints do not fit in the six ids that are left; a single-id edit does.
+    doc.transact(|tx| tx.text(b"t").insert(0, "abcdefghij"));
+    let group = doc.commit_atomic();
+    assert!(
+        group
+            .iter()
+            .all(|op| !matches!(op.kind, OpKind::TextInsert { .. })),
+        "a run reaching past the end of the space was emitted"
+    );
+    assert!(
+        doc.mint_refused(),
+        "the group's refusal is unread at commit"
+    );
+
+    doc.transact(|tx| tx.set(b"after", Scalar::Int(1)));
+    assert!(
+        doc.get(b"after").is_none(),
+        "an edit after the refusal reached state inside the same intention"
+    );
+    doc.end_intention();
+
+    // The intention is over, so the next one gets a fresh answer — and the space
+    // that was there all along.
+    assert!(doc.can_mint(None));
+    let next = doc.transact(|tx| tx.set(b"after", Scalar::Int(1)));
+    assert_eq!(next.len(), 1, "the latch outlived its intention");
+    assert!(!doc.mint_refused());
+}
+
+#[test]
+fn an_edit_that_resolves_to_nothing_is_not_a_refusal() {
+    // An inert edit and a refused one both emit nothing, which is the whole reason
+    // `mint_refused` exists — so a mutator that resolves to nothing must answer for
+    // *itself* rather than leave the previous edit's refusal standing. Several path
+    // mutators return early without reaching a cursor (a delete naming no live item,
+    // an XML insert on a path that is not an XML node), and those are exactly the
+    // ones that would report a stale answer.
+    let me = cid(1);
+    let mut doc = Document::new(me);
+    doc.transact(|tx| {
+        tx.text(b"t").insert(0, "ab");
+    });
+    assert!(doc.apply(&plant_at_lamport(
+        me,
+        b"planted",
+        LAMPORT_STATE_CEILING - 6,
+        99
+    )));
+
+    // Refuse a run for its length: capacity survives, the report is raised. The
+    // refused call still returns the ops it emitted before the refusal cut it,
+    // which is why the batch cannot be the signal.
+    path::text_insert(&mut doc, &path::encode_path(&[b"t"]), 0, "abcdefghij");
+    assert!(doc.mint_refused());
+    assert!(doc.can_mint(None));
+
+    // An edit that resolves to nothing clears it rather than inheriting it.
+    let nowhere = path::encode_path(&[b"nope"]);
+    assert!(path::xml_insert_element(&mut doc, &nowhere, 0, b"p").is_empty());
+    assert!(
+        !doc.mint_refused(),
+        "an inert edit reported the previous edit's refusal"
+    );
+    assert!(path::list_delete(&mut doc, &nowhere, 3).is_empty());
+    assert!(!doc.mint_refused());
+
+    // And the replica really did still have room.
+    assert!(!path::text_insert(&mut doc, &path::encode_path(&[b"t"]), 0, "z").is_empty());
+    assert!(!doc.mint_refused());
 }

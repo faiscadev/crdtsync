@@ -47,6 +47,16 @@ fn is_violation(m: &Message) -> bool {
     )
 }
 
+fn is_forbidden(m: &Message) -> bool {
+    matches!(
+        m,
+        Message::OpsRejected {
+            reason: ErrorCode::Forbidden,
+            ..
+        }
+    )
+}
+
 /// A connected connection declaring `client` and authenticated as `actor` — the
 /// default `AllowAll` verifier adopts the credential bytes as the actor, so the
 /// credential *is* the actor here.
@@ -85,12 +95,21 @@ fn subscribe(r: &mut Registry, id: ConnId, channel: Channel, room: &[u8]) {
     r.take_outbox(id);
 }
 
-/// A one-op `Message::Ops` on `channel` authored under `client`.
-fn ops_frame(channel: Channel, client: ClientId, key: &[u8]) -> Message {
-    Message::Ops {
-        channel,
-        ops: Document::new(client).transact(|tx| tx.set(key, Scalar::Int(1))),
+/// A one-op `Message::Ops` on `channel` authored under `client`, at op-id sequence
+/// `seq`. A fresh `Document` mints from sequence 0 every time, so two frames built
+/// without a distinct `seq` carry one op id and the room dedups the second — which
+/// would let a test that means to watch a second write land watch nothing at all.
+fn ops_frame_seq(channel: Channel, client: ClientId, key: &[u8], seq: u64) -> Message {
+    let mut ops = Document::new(client).transact(|tx| tx.set(key, Scalar::Int(1)));
+    for op in ops.iter_mut() {
+        op.id.seq = seq;
     }
+    Message::Ops { channel, ops }
+}
+
+/// [`ops_frame_seq`] at the sequence a fresh replica's first write takes.
+fn ops_frame(channel: Channel, client: ClientId, key: &[u8]) -> Message {
+    ops_frame_seq(channel, client, key, 0)
 }
 
 /// The same, with the op's stamp moved to the last id of the space — the position
@@ -142,11 +161,14 @@ fn an_op_under_another_actors_replica_identity_cannot_spend_its_mint() {
     let mallory = hello(&mut r, victim, b"mallory");
     subscribe(&mut r, mallory, Channel(0), ROOM);
     r.take_outbox(alice);
-    r.deliver(mallory, ceiling_frame(Channel(0), victim, b"planted"));
+    assert!(
+        r.deliver(mallory, ceiling_frame(Channel(0), victim, b"planted")),
+        "a refused write closed the connection"
+    );
 
     let reply = r.take_outbox(mallory);
     assert!(
-        reply.iter().any(is_violation),
+        reply.iter().any(is_forbidden),
         "the plant was admitted: {reply:?}"
     );
     assert!(
@@ -159,12 +181,17 @@ fn an_op_under_another_actors_replica_identity_cannot_spend_its_mint() {
     );
 
     // And the victim goes on writing — the damage is a write-lock, so the proof is
-    // that a later mint still lands.
-    assert!(r.deliver(alice, ops_frame(Channel(0), victim, b"after")));
+    // that a later write actually lands rather than being deduped away.
+    let head = r.hub().seq(ROOM);
+    assert!(r.deliver(alice, ops_frame_seq(Channel(0), victim, b"after", 1)));
     assert!(r
         .take_outbox(alice)
         .iter()
-        .all(|m| !is_violation(m) && !matches!(m, Message::OpsRejected { .. })));
+        .all(|m| !is_violation(m) && !is_forbidden(m)));
+    assert!(
+        r.hub().seq(ROOM) > head,
+        "the victim's later write reached the room's log"
+    );
     assert!(victim_can_still_mint(&r, victim));
 }
 
@@ -187,8 +214,8 @@ fn a_derived_channel_identity_is_claimed_as_its_own() {
     // simply declare the victim's base and use the same channel number.
     let mallory = hello(&mut r, victim, b"mallory");
     subscribe(&mut r, mallory, Channel(1), ROOM);
-    r.deliver(mallory, ceiling_frame(Channel(1), derived, b"planted"));
-    assert!(r.take_outbox(mallory).iter().any(is_violation));
+    assert!(r.deliver(mallory, ceiling_frame(Channel(1), derived, b"planted")));
+    assert!(r.take_outbox(mallory).iter().any(is_forbidden));
     assert!(victim_can_still_mint(&r, derived));
 }
 
@@ -257,8 +284,8 @@ fn a_claimed_identity_still_serves_the_actor_that_holds_it_after_a_peer_tries() 
 
     let mallory = hello(&mut r, client, b"mallory");
     subscribe(&mut r, mallory, Channel(0), ROOM);
-    r.deliver(mallory, ops_frame(Channel(0), client, b"b"));
-    assert!(r.take_outbox(mallory).iter().any(is_violation));
+    assert!(r.deliver(mallory, ops_frame(Channel(0), client, b"b")));
+    assert!(r.take_outbox(mallory).iter().any(is_forbidden));
     assert_eq!(r.hub().client_actor(ROOM, client), Some(&b"alice"[..]));
 
     let third = hello(&mut r, client, b"alice");
@@ -291,6 +318,122 @@ fn an_empty_batch_claims_nothing() {
     subscribe(&mut r, alice, Channel(0), ROOM);
     assert!(r.deliver(alice, ops_frame(Channel(0), client, b"a")));
     assert_eq!(r.hub().client_actor(ROOM, client), Some(&b"alice"[..]));
+}
+
+#[test]
+fn an_empty_batch_is_never_refused_by_the_claim() {
+    // An inert edit frames an `Ops` batch with no ops, and one authors no stamp, so
+    // it can spend no id space. Refusing it would disconnect an honest client from a
+    // room it has merely made a no-op edit in.
+    let mut r = Registry::new(cid(0xFF));
+    let client = cid(VICTIM);
+
+    let alice = hello(&mut r, client, b"alice");
+    subscribe(&mut r, alice, Channel(0), ROOM);
+    assert!(r.deliver(alice, ops_frame(Channel(0), client, b"a")));
+
+    let mallory = hello(&mut r, client, b"mallory");
+    subscribe(&mut r, mallory, Channel(0), ROOM);
+    assert!(r.deliver(
+        mallory,
+        Message::Ops {
+            channel: Channel(0),
+            ops: Vec::new()
+        }
+    ));
+    let out = r.take_outbox(mallory);
+    assert!(out.iter().all(|m| !is_violation(m) && !is_forbidden(m)));
+}
+
+#[test]
+fn a_claim_taken_before_the_owner_writes_locks_the_owner_out_of_that_room() {
+    // The stated limit of a claim established by first write. A `ClientId` rides
+    // every op its replica authors, so it is public wherever that replica has
+    // written — and an actor the room already lets write can take it here first.
+    // The room the victim has written in is protected; a room it has not is not,
+    // and there the claim denies the owner instead of the squatter.
+    //
+    // Refused recoverably rather than as a violation, which is what keeps the
+    // outcome bounded: the owner keeps its connection and its ops, and is told.
+    // Filed as C96 — an operator surface to release a claim, or a binding made
+    // before the first write, is the fix, and neither is derivable from what the
+    // room records today.
+    let mut r = Registry::new(cid(0xFF));
+    let victim = cid(VICTIM);
+
+    let mallory = hello(&mut r, victim, b"mallory");
+    subscribe(&mut r, mallory, Channel(0), ROOM);
+    assert!(r.deliver(mallory, ops_frame(Channel(0), victim, b"squat")));
+    assert_eq!(r.hub().client_actor(ROOM, victim), Some(&b"mallory"[..]));
+
+    let alice = hello(&mut r, victim, b"alice");
+    subscribe(&mut r, alice, Channel(0), ROOM);
+    assert!(
+        r.deliver(alice, ops_frame(Channel(0), victim, b"mine")),
+        "the owner was disconnected rather than told"
+    );
+    assert!(r.take_outbox(alice).iter().any(is_forbidden));
+}
+
+#[test]
+fn a_clone_carries_the_sources_claims() {
+    // A clone carries the source's whole state, and that state carries every
+    // author's id-space high-water — so the identities bound in the source are live
+    // in the copy. A copy that came up with no claims would leave each of them open
+    // to whoever writes it first, which is the plant again in a room the victim may
+    // later join.
+    let mut r = Registry::new(cid(0xFF));
+    let client = cid(VICTIM);
+    let alice = hello(&mut r, client, b"alice");
+    subscribe(&mut r, alice, Channel(0), ROOM);
+    assert!(r.deliver(alice, ops_frame(Channel(0), client, b"a")));
+
+    let dst: &[u8] = b"room-clone";
+    assert!(r.hub_mut().clone_room(ROOM, dst).expect("the clone runs"));
+    assert_eq!(r.hub().client_actor(dst, client), Some(&b"alice"[..]));
+}
+
+#[test]
+fn a_batch_the_room_deduped_claims_nothing() {
+    // A claim records the *use* of an identity, and a batch whose every op the room
+    // already holds authored nothing new. Admitting one would let whoever replays
+    // another replica's historic ops take the identity that wrote them — the lockout
+    // the claim exists to prevent, reached from the other side.
+    let mut r = Registry::new(cid(0xFF));
+    let victim = cid(VICTIM);
+
+    // A room that holds the victim's ops with no claim recorded — what a replication
+    // frame leaves behind, since the peer plane reaches the log without crossing the
+    // op gate (C95), and what a restart that lost the record leaves too.
+    let Message::Ops { ops: seed_ops, .. } = ops_frame(Channel(0), victim, b"mine") else {
+        unreachable!("ops_frame builds an Ops")
+    };
+    r.hub_mut()
+        .ingest(ROOM, seed_ops.clone(), None)
+        .expect("the seed lands");
+    assert_eq!(r.hub().client_actor(ROOM, victim), None);
+
+    // Mallory resends exactly those ops. Every one dedups, so nothing lands.
+    let mallory = hello(&mut r, victim, b"mallory");
+    subscribe(&mut r, mallory, Channel(0), ROOM);
+    assert!(r.deliver(
+        mallory,
+        Message::Ops {
+            channel: Channel(0),
+            ops: seed_ops
+        }
+    ));
+    assert_eq!(
+        r.hub().client_actor(ROOM, victim),
+        None,
+        "a replay of the owner's own ops claimed its identity"
+    );
+
+    // The owner's next real write takes it back.
+    let alice = hello(&mut r, victim, b"alice");
+    subscribe(&mut r, alice, Channel(0), ROOM);
+    assert!(r.deliver(alice, ops_frame_seq(Channel(0), victim, b"next", 1)));
+    assert_eq!(r.hub().client_actor(ROOM, victim), Some(&b"alice"[..]));
 }
 
 // --- the record ---

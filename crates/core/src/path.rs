@@ -100,6 +100,9 @@ pub fn set_blob(
     bytes: &[u8],
 ) -> Option<Vec<Op>> {
     if bytes.len() > INLINE_MAX {
+        // Too big to inline is an answer of its own, and it is still an edit that
+        // resolved to nothing — see [`inert`].
+        inert(doc);
         return None;
     }
     let mut id = [0u8; 16];
@@ -182,7 +185,7 @@ pub fn xml_insert_element(
     tag: &[u8],
 ) -> Vec<Op> {
     if !slot_ok(doc, elem_path, is_xml_node) {
-        return Vec::new();
+        return inert(doc);
     }
     let tag = tag.to_vec();
     xml_children_emit(doc, elem_path, move |kids| {
@@ -196,7 +199,7 @@ pub fn xml_insert_element(
 /// transaction.
 pub fn xml_insert_text(doc: &mut Document, elem_path: &[u8], index: usize, s: &str) -> Vec<Op> {
     if !slot_ok(doc, elem_path, is_xml_node) {
-        return Vec::new();
+        return inert(doc);
     }
     let s = s.to_owned();
     xml_children_emit(doc, elem_path, move |kids| {
@@ -215,7 +218,7 @@ pub fn xml_child_delete(doc: &mut Document, elem_path: &[u8], index: usize) -> V
     if !slot_ok(doc, elem_path, |e| {
         xml_children_of(e).is_some_and(|l| index < l.borrow().len())
     }) {
-        return Vec::new();
+        return inert(doc);
     }
     xml_children_emit(doc, elem_path, move |kids| kids.delete(index))
 }
@@ -246,10 +249,10 @@ pub fn xml_move_child(
     dest_index: usize,
 ) -> Vec<Op> {
     let Some(node) = xml_child_id(doc, parent_path, child_index) else {
-        return Vec::new();
+        return inert(doc);
     };
     let Some(new_parent) = xml_node_id(doc, new_parent_path) else {
-        return Vec::new();
+        return inert(doc);
     };
     doc.transact(|tx| tx.move_xml(node, new_parent, dest_index))
 }
@@ -270,7 +273,7 @@ pub fn list_delete(doc: &mut Document, path: &[u8], index: usize) -> Vec<Op> {
         path,
         |e| matches!(e, Element::List(l) if index < l.borrow().len()),
     ) {
-        return Vec::new();
+        return inert(doc);
     }
     emit(doc, path, move |cur, key| cur.list(key).delete(index))
 }
@@ -283,7 +286,7 @@ pub fn list_delete_id(doc: &mut Document, path: &[u8], id: Stamp) -> Vec<Op> {
         path,
         |e| matches!(e, Element::List(l) if l.borrow().contains(id)),
     ) {
-        return Vec::new();
+        return inert(doc);
     }
     emit(doc, path, move |cur, key| cur.list(key).delete_id(id))
 }
@@ -310,7 +313,7 @@ pub fn text_delete(doc: &mut Document, path: &[u8], index: usize, count: usize) 
         path,
         |e| matches!(e, Element::Text(t) if count > 0 && index < t.borrow().len()),
     ) {
-        return Vec::new();
+        return inert(doc);
     }
     emit(doc, path, move |cur, key| {
         cur.text(key).delete(index, count)
@@ -326,7 +329,7 @@ pub fn text_delete_ids(doc: &mut Document, path: &[u8], ids: &[Stamp]) -> Vec<Op
         path,
         |e| matches!(e, Element::Text(t) if ids.iter().any(|id| t.borrow().contains(*id))),
     ) {
-        return Vec::new();
+        return inert(doc);
     }
     let ids = ids.to_vec();
     emit(doc, path, move |cur, key| cur.text(key).delete_ids(&ids))
@@ -502,7 +505,7 @@ pub fn mark(
 /// the handle does not decode to a live scalar mark.
 pub fn mark_set_value(doc: &mut Document, mark_id: &[u8], value: Scalar) -> Vec<Op> {
     let Some(id) = element_id(mark_id) else {
-        return Vec::new();
+        return inert(doc);
     };
     doc.transact(|tx| tx.ranged().set_payload(id, value))
 }
@@ -511,7 +514,7 @@ pub fn mark_set_value(doc: &mut Document, mark_id: &[u8], value: Scalar) -> Vec<
 /// decode to a live mark.
 pub fn mark_delete(doc: &mut Document, mark_id: &[u8]) -> Vec<Op> {
     let Some(id) = element_id(mark_id) else {
-        return Vec::new();
+        return inert(doc);
     };
     doc.transact(|tx| tx.ranged().delete(id))
 }
@@ -740,10 +743,10 @@ where
     F: FnOnce(&mut XmlChildrenCursor),
 {
     let Some(keys) = parse_path(path) else {
-        return Vec::new();
+        return inert(doc);
     };
     let Some((leaf_key, parents)) = keys.split_last() else {
-        return Vec::new();
+        return inert(doc);
     };
     doc.transact(|tx| {
         descend(tx, parents, |cur| {
@@ -756,15 +759,27 @@ where
 
 /// Run a path-addressed edit, apply it locally, and return its emitted ops.
 /// A malformed or leaf-less path emits nothing.
+/// An edit that resolved to nothing: an unparseable path, a dead-end parent, a
+/// delete naming no live item, a mark handle naming no live mark.
+///
+/// It emits no ops, and it still opens and closes an intention. Every mutator here
+/// is one attempt by this replica, and [`Document::mint_refused`] answers for the
+/// intention most recently opened — so a mutator that resolved to nothing without
+/// opening one would leave the *previous* edit's refusal standing and report it as
+/// this edit's, which is the inert case being read as the refused one.
+fn inert(doc: &mut Document) -> Vec<Op> {
+    doc.transact(|_| {})
+}
+
 fn emit<F>(doc: &mut Document, path: &[u8], leaf: F) -> Vec<Op>
 where
     F: FnOnce(&mut MapCursor, &[u8]),
 {
     let Some(keys) = parse_path(path) else {
-        return Vec::new();
+        return inert(doc);
     };
     let Some((leaf_key, parents)) = keys.split_last() else {
-        return Vec::new();
+        return inert(doc);
     };
     // A dead-end path (a parent is a fragment, which has no attrs) emits nothing
     // — the emptiness of the returned ops is the "did this write land" signal a
@@ -773,7 +788,7 @@ where
     // stay a pre-check: descending-then-refusing would emit the ancestor maps
     // before discovering a deeper dead end.
     if !writable(doc, parents) {
-        return Vec::new();
+        return inert(doc);
     }
     doc.transact(|tx| descend(tx, parents, |cur| leaf(cur, leaf_key)))
 }

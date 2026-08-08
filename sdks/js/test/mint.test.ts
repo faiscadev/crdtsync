@@ -15,16 +15,19 @@ function cid(first: number): Uint8Array {
 }
 
 // An op body opens with its author's 16-byte client id, its 8-byte sequence and
-// the stamp's 8-byte lamport — so the lamport runs from body offset 24, past the
-// frame's 4-byte length prefix.
+// the stamp's 8-byte lamport — so the sequence runs from body offset 16 and the
+// lamport from 24, both past the frame's 4-byte length prefix.
+const OP_SEQ = 4 + 16;
 const LAMPORT = 4 + 16 + 8;
+// An op-id sequence the receiving replica has not spent, so the plant is not
+// deduplicated away as one of that replica's own ops.
+const UNSPENT_SEQ = 9999n;
 // The last id of the space: `u64::MAX >> 1`. A stamp may legally sit there, which
 // is why one op is enough to spend its author's mint.
 const CEILING = 0x7fffffffffffffffn;
 
-/** One op frame from a doc authored under `client`, its stamp moved to the last
- *  id of the space. */
-function planted(client: Uint8Array): Uint8Array {
+/** One op frame from a doc authored under `client`, its stamp moved to `lamport`. */
+function stampedAt(client: Uint8Array, lamport: bigint): Uint8Array {
   const d = new Doc({ clientId: client });
   const emitted: Uint8Array[] = [];
   d.on("update", (e) => {
@@ -36,8 +39,20 @@ function planted(client: Uint8Array): Uint8Array {
   const len = view.getUint32(0, true);
   const frame = log.slice(0, 4 + len);
   const framed = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
-  framed.setBigUint64(LAMPORT, CEILING, true);
+  framed.setBigUint64(OP_SEQ, UNSPENT_SEQ, true);
+  framed.setBigUint64(LAMPORT, lamport, true);
   return frame;
+}
+
+/** The plant that spends the space outright. */
+function planted(client: Uint8Array): Uint8Array {
+  return stampedAt(client, CEILING);
+}
+
+/** A plant that leaves a handful of ids — enough for a single-id edit, not for a
+ *  ten-codepoint run. */
+function nearlySpent(client: Uint8Array): Uint8Array {
+  return stampedAt(client, CEILING - 6n);
 }
 
 describe("a spent id space", () => {
@@ -63,16 +78,51 @@ describe("a spent id space", () => {
       }),
     ).toThrow(MintExhausted);
 
+    // `mark` returns the mark's handle, so it goes through the returning funnel.
     const text = new Doc({ clientId: cid(3) });
+    text.getText("t").insert(0, "hello");
     text.applyUpdate(planted(cid(3)));
-    expect(() => text.getText("t").insert(0, "hello")).toThrow(MintExhausted);
+    expect(() => text.getText("t").mark(0, 3, "bold", true)).toThrow(MintExhausted);
   });
 
-  it("leaves an ordinary edit alone", () => {
-    const d = new Doc({ clientId: cid(4) });
-    d.getMap("root").set("k", 1);
-    // An inert edit emits nothing either, and that is not a refusal.
-    d.getMap("root").set("k", 1);
-    expect(d.getMap("root").get("k")).toBe(1);
+  it("still ships what the refused call emitted before the refusal", () => {
+    // One handle call is one core transaction, and a refusal cuts it at the edit
+    // that could not mint — so a refused call can carry ops that did. They are
+    // applied to this replica already; withholding them would leave it ahead of
+    // every peer.
+    const me = cid(5);
+    const d = new Doc({ clientId: me });
+    const updates: Uint8Array[] = [];
+    d.on("update", (e) => {
+      if (e.origin === "local") updates.push(e.ops);
+    });
+    d.applyUpdate(nearlySpent(me));
+
+    // The text does not exist, so this emits a container-create the space still has
+    // room for, then a ten-codepoint run it does not.
+    expect(() => d.getText("t").insert(0, "abcdefghij")).toThrow(MintExhausted);
+    expect(updates.length).toBe(1);
+    expect(d.getText("t").toString()).toBe("");
+  });
+
+  it("does not report an inert edit as a refusal", () => {
+    // An inert edit and a refused one both emit nothing, which is the whole reason
+    // the query exists — so an edit that resolves to nothing must answer for itself
+    // rather than inherit the previous edit's refusal.
+    const me = cid(6);
+    const d = new Doc({ clientId: me });
+    d.getText("t").insert(0, "ab");
+    d.applyUpdate(nearlySpent(me));
+
+    expect(() => d.getText("t").insert(0, "abcdefghij")).toThrow(MintExhausted);
+    // An XML insert on a path that holds no XML node resolves to nothing.
+    expect(() => d.getXml("nope").insertElement(0, "p")).not.toThrow();
+    // A blob too large to inline answers `false` — its own answer, not a refusal.
+    expect(() => d.getText("t").insert(0, "abcdefghij")).toThrow(MintExhausted);
+    expect(d.getMap("m").setBlob("big", "application/octet-stream", new Uint8Array(4097))).toBe(
+      false,
+    );
+    // And the replica really did still have room.
+    expect(() => d.getText("t").insert(0, "z")).not.toThrow();
   });
 });

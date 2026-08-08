@@ -1384,9 +1384,48 @@ fn a_refused_edit_is_reported_where_the_ops_bytes_cannot_say_it() {
     .transact(|tx| tx.set(b"planted", crdtsync_core::Scalar::Int(1)))
     .remove(0);
     plant.stamp.lamport = crdtsync_core::stamp::LAMPORT_STATE_CEILING;
+    // An op-id sequence this replica has not spent, so the plant is not deduplicated
+    // away as one of its own ops.
     plant.id.seq = 99;
     d.apply(&encode_ops(&[plant]));
 
     assert!(d.register_int(&p, 2).is_empty(), "a refused edit emitted ops");
     assert!(d.mint_refused(), "the refusal was not reported");
+}
+
+#[wasm_bindgen_test]
+fn a_channel_reports_the_refusal_its_empty_frame_cannot() {
+    // Each channel holds its own replica minting under its own derived identity, so
+    // a peer that spends one channel's id space leaves its siblings untouched — and
+    // the client seam frames every edit, so a refusal is not even an empty buffer
+    // here.
+    let mut c = wasm_client(1);
+    let spent = c.subscribe(b"room-spent").unwrap();
+    let fresh = c.subscribe(b"room-fresh").unwrap();
+    assert!(!c.mint_refused(spent.channel()));
+
+    // Channel 0 authors under the declared id unchanged.
+    let mut plant = crdtsync_core::Document::new(ClientId::from_bytes(
+        cid(1).try_into().expect("16 bytes"),
+    ))
+    .transact(|tx| tx.set(b"planted", crdtsync_core::Scalar::Int(1)))
+    .remove(0);
+    plant.stamp.lamport = crdtsync_core::stamp::LAMPORT_STATE_CEILING;
+    plant.id.seq = 99;
+    let frame = crdtsync_core::encode_message(&crdtsync_core::Message::Ops {
+        channel: crdtsync_core::Channel(spent.channel()),
+        ops: vec![plant],
+    });
+    assert!(c.receive(&frame).unwrap());
+
+    let p = path(&["k"]);
+    c.register_int(spent.channel(), &p, 1);
+    assert!(c.mint_refused(spent.channel()), "the refusal was not reported");
+
+    c.register_int(fresh.channel(), &p, 1);
+    assert!(
+        !c.mint_refused(fresh.channel()),
+        "one channel's exhaustion was reported on another's replica"
+    );
+    assert!(!c.mint_refused(9), "an unheld channel reported a refusal");
 }

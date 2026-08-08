@@ -25,17 +25,14 @@ const EMPTY = new Uint8Array();
 
 /** Thrown by an edit the replica had no id left to mint.
  *
- * A stamp is drawn from this replica's own id space, and the space is finite:
- * honest traffic reaches the end of it after 2^63 edits, and a peer authoring
- * under this replica's client id can put it there in one op. The edit emitted
- * nothing and changed nothing — a refused mint is the fail-closed answer, never a
- * re-issued id that would collide with one already published. Without this the
- * refusal is indistinguishable from an inert edit and the application reports a
- * write that never happened.
+ * The edit emitted nothing and changed nothing, and no retry helps: a refused mint
+ * is the fail-closed answer to a spent id space, never a re-issued id that would
+ * collide with one already published. Without this it is indistinguishable from an
+ * inert edit and the application reports a write that never happened.
  *
- * A refusal inside `Doc.transact` also ends that transaction: the edits after it
- * would address what it failed to create, so nothing further is emitted. What was
- * emitted before it is already applied here and still ships. */
+ * A refusal ends the transaction it happened in — the edits after it would address
+ * what it failed to create. What was emitted before it is applied here already and
+ * still ships. */
 export class MintExhausted extends Error {
   constructor() {
     super("crdtsync: the replica has no id left to mint, so the edit was refused");
@@ -224,10 +221,14 @@ export class Doc {
     }
   }
 
-  /** Raise the refusal an edit's empty byte string cannot express. Read after the
-   * edit, never before: the core clears the latch as each intention opens, so this
-   * answers for the edit just made — and inside a transaction it stays raised for
-   * the rest of the group, which is the group's own semantics. */
+  /** Raise the refusal an edit's empty byte string cannot express.
+   *
+   * Read after the edit, never before: the core clears the latch as each intention
+   * opens, so this answers for the edit just made. Raised after the ops have gone
+   * to the wire and the listeners, never instead of them — one backend call is one
+   * core transaction, and a refusal cuts it at the edit that could not mint, so a
+   * refused call can carry ops that did. Those are applied to this replica already;
+   * withholding them would leave it ahead of every peer. */
   private guardMint(): void {
     if (this.backend.mintRefused()) throw new MintExhausted();
   }
@@ -241,11 +242,12 @@ export class Doc {
     }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const outbound = run(this.backend);
+    if (outbound.length > 0) {
+      this.wire?.(outbound);
+      this.dispatch("local", outbound, before);
+      this.emitRepairs();
+    }
     this.guardMint();
-    if (outbound.length === 0) return;
-    this.wire?.(outbound);
-    this.dispatch("local", outbound, before);
-    this.emitRepairs();
   }
 
   private mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T {
@@ -256,12 +258,12 @@ export class Doc {
     }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const [value, outbound] = run(this.backend);
-    this.guardMint();
     if (outbound.length > 0) {
       this.wire?.(outbound);
       this.dispatch("local", outbound, before);
       this.emitRepairs();
     }
+    this.guardMint();
     return value;
   }
 
