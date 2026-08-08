@@ -10,7 +10,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use crdtsync_core::acl::AclScope;
 use crdtsync_core::diff::encode_changes;
 use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::PROTOCOL_VERSION;
@@ -528,6 +527,22 @@ pub fn step(
             {
                 return redirect;
             }
+            // A default (empty) subscribe follows the room's active HEAD — `main`
+            // until a restore-as-branch switched it — so a plain subscriber tracks
+            // the restored state. An explicitly named branch (including `main`) is
+            // taken as given, so the old branch stays subscribable by name. The
+            // resolved branch is stored on the channel, so a channel bound before a
+            // later restore keeps writing to the branch it joined.
+            //
+            // Resolved before the read gate, because the gate is a verdict about the
+            // stream's tree and cannot be reached without knowing which stream that is
+            // (C60). Whether the branch *exists* is answered below the gate, so an
+            // unauthorized reader still learns only that its read was denied.
+            let branch = if branch.is_empty() {
+                hub.active_branch(&room)
+            } else {
+                branch
+            };
             // A subscription reads the room; the server never serves a room the
             // actor may not read. The doc-ACL read tier composes at the root: the
             // creator (owns `/`) and a root-level read grant pass here. A
@@ -539,15 +554,30 @@ pub fn step(
             let creator = hub.room_creator(&room);
             // The element-context index resolves an element-scoped grant to its
             // element's current path, so a grant follows the element across a
-            // tree-move. The live room's tree, built once and shared by the doc-ACL
-            // read decisions that ask about it — the root gate, subtree admission, and
-            // the per-op catch-up. The whole-document snapshot gate resolves against
-            // the tree it is deciding for instead, which is this one only on `main`. A
-            // room with no doc-ACL records has no scopes to resolve, so skip the walk.
-            let index = if records.is_empty() {
-                HashMap::new()
+            // tree-move. It is the tree **this stream serves**, built once and shared by
+            // every doc-ACL read decision this subscribe makes — the root gate, subtree
+            // admission, the per-op catch-up filter, and the whole-document snapshot
+            // gate — so they all resolve an element to the same path, and that path is
+            // one in the state being handed out (C28, C32, C60). On `main` that is the
+            // live room. What it does *not* cover is the reveal-shell synthesis (C85) or
+            // the migration type projection (C90) further down, both of which still read
+            // the live room. A room with no doc-ACL records has no scopes to resolve and no op
+            // to place, so skip the walk entirely — and with it the refusal below, since
+            // an unredacted stream needs no tree to serve correctly.
+            //
+            // A stream with no tree cannot be redacted at all: `main`'s index and an
+            // empty one both resolve *less* than the truth, and a scope or an op target
+            // that resolves to nothing is admitted rather than withheld. So the branch is
+            // refused — after the read gate, which borrows the live room's index purely
+            // to keep "read denied" ahead of the refusal, and after the unknown-branch
+            // check, which is the other thing that answers `None` here.
+            let (index, no_tree) = if records.is_empty() {
+                (HashMap::new(), false)
             } else {
-                hub.element_paths(&room)
+                match hub.stream_element_paths(&room, &branch) {
+                    Some(index) => (index, false),
+                    None => (hub.element_paths(&room), true),
+                }
             };
             let root_path = crdtsync_core::path::encode_path(&[]);
             // Whole-document read: the composed verdict at the root — the creator, a
@@ -574,17 +604,6 @@ pub fn step(
             if !may_read {
                 return forbidden("read denied");
             }
-            // A default (empty) subscribe follows the room's active HEAD — `main`
-            // until a restore-as-branch switched it — so a plain subscriber tracks
-            // the restored state. An explicitly named branch (including `main`) is
-            // taken as given, so the old branch stays subscribable by name. The
-            // resolved branch is stored on the channel, so a channel bound before a
-            // later restore keeps writing to the branch it joined.
-            let branch = if branch.is_empty() {
-                hub.active_branch(&room)
-            } else {
-                branch
-            };
             // A named branch must already exist (forked via the engine) to be
             // served — an unknown one is refused rather than silently served
             // `main`'s stream, which would cross replication units. The default
@@ -594,6 +613,21 @@ pub fn step(
                     replies: vec![Message::Error {
                         code: ErrorCode::UnknownRoom,
                         message: "unknown branch".to_string(),
+                        details: Vec::new(),
+                    }],
+                    ..Response::default()
+                };
+            }
+            // The branch exists and this node cannot fold its tree, so the redaction this
+            // room's tuples call for cannot be resolved. `Catchup::Unavailable` refuses
+            // the below-fork-point catch-up on its own, but a subscriber already past the
+            // fork point is served its tail delta — deliberately, since it holds the base
+            // already — and that delta has no correct index to be filtered through.
+            if no_tree {
+                return Response {
+                    replies: vec![Message::Error {
+                        code: ErrorCode::Internal,
+                        message: "branch state is unreadable".to_string(),
                         details: Vec::new(),
                     }],
                     ..Response::default()
@@ -648,7 +682,22 @@ pub fn step(
                     let delta = if records.is_empty() {
                         delta
                     } else {
-                        let ranged_anchors = hub.ranged_anchors(&room);
+                        // The anchor set of the tree this stream serves, the co-input to
+                        // `index` in the same gate — so a range's endpoints resolve in
+                        // the tree its ops are being filtered for. It describes the tree
+                        // `index` does, having been asked of the same stream, and a
+                        // stream with none was refused above — and were that ever to
+                        // change, an empty set gates a Ranged op on the whole-document
+                        // verdict (C52), which withholds rather than admits.
+                        let ranged_anchors = hub
+                            .stream_ranged_anchors(&room, &branch)
+                            .unwrap_or_default();
+                        // The container ids that tree has materialised, live or retained
+                        // — what tells an unresolvable target this stream *keeps* from
+                        // one that belongs to another.
+                        let held = hub
+                            .stream_held_containers(&room, &branch)
+                            .unwrap_or_default();
                         // The whole-document verdict an unplaceable op is gated on is one
                         // answer for the whole delta, and costs a read verdict per
                         // governing tuple path — so it is resolved at most once, and not
@@ -677,7 +726,7 @@ pub fn step(
                             // op — so a range replays only where both endpoints read.
                             // An op that resolves to no path at all replays only to a
                             // reader denied nothing.
-                            op_read_gate(&index, &ranged_anchors, &records, &rec.op).admits(
+                            op_read_gate(&index, &held, &ranged_anchors, &records, &rec.op).admits(
                                 |p| {
                                     recipient_reads_path(
                                         authorizer,
@@ -790,49 +839,18 @@ pub fn step(
                     // projections keep in the frontier they otherwise scrub.
                     let recipient = session.client.map(|c| c.for_channel(channel.0));
                     // The whole-document gate resolves element-scoped grants against the
-                    // tree it is deciding for. A `main` snapshot is the live room, which
-                    // `index` already describes. A branch owns its base — a version's
-                    // captured state, or a publish of one — and serves it with the
-                    // branch's divergent tail folded in, a tree `main` has moved on from:
-                    // an element that has left `main` resolves to no live path there, an
-                    // unresolvable element scope is inert, and an inert deny is no deny
-                    // (C32). So resolve against the bytes being handed out. Only an
-                    // element scope needs a tree at all — a path scope names its own
-                    // position and governs whatever occupies it — so a room holding
-                    // none skips the added decode and walk, nothing consulting the
-                    // index it is then handed.
-                    let resolves_elements = records
-                        .iter()
-                        .any(|r| matches!(r.tuple.scope, AclScope::Element(_)));
-                    let served_index = if branch == MAIN_BRANCH || !resolves_elements {
-                        None
-                    } else {
-                        match Document::decode_state(&state) {
-                            Ok(doc) => Some(crate::index::element_paths(&doc)),
-                            // A stored base that does not decode is already refused
-                            // upstream (`Catchup::Unavailable`), so what arrives here
-                            // was materialized this instant by this build. The arm holds
-                            // because neither fallback is an answer: the live index
-                            // reinstates the very inert deny this resolves, and an empty
-                            // one is inert by construction. Same refusal as that arm.
-                            Err(_) => {
-                                return Response {
-                                    replies: vec![Message::Error {
-                                        code: ErrorCode::Internal,
-                                        message: "branch state is unreadable".to_string(),
-                                        details: Vec::new(),
-                                    }],
-                                    ..Response::default()
-                                }
-                            }
-                        }
-                    };
+                    // tree it is deciding for, and `index` is that tree: this snapshot is
+                    // the stream's own state — the live room on `main`, a branch's base
+                    // with its divergent tail folded in on a branch — and `index` was
+                    // built from that same stream (C32, C60). An element that has left
+                    // `main` still resolves on the branch that holds it, so a deny on it
+                    // is not inert here.
                     let state = project_served_state(
                         state,
                         authorizer,
                         &records,
                         creator.as_deref(),
-                        served_index.as_ref().unwrap_or(&index),
+                        &index,
                         schema,
                         identity,
                         &room,
@@ -1937,9 +1955,8 @@ fn zone_readable(
 /// scope that resolves to no path is inert, an inert deny is no deny, and a gate that
 /// finds none serves the state whole. Every caller passes the tree its own bytes are:
 /// the version fetch the version's, each diff side its own decoded state, the catch-up
-/// snapshot the live room's on `main` and the branch's owned base with its divergent
-/// tail folded in on a branch (C32) — except where the room holds no element-scoped
-/// tuple at all, when nothing consults the index and any tree answers the same.
+/// snapshot the tree of the stream it is catching up on — the live room on `main`, a
+/// branch's base with its divergent tail folded in on a branch (C32, C60).
 /// `records.is_empty()` (a room with no doc-ACL state) or a whole-document verdict
 /// skips the read projection; [`zone_narrowing`] decides the zone one.
 #[allow(clippy::too_many_arguments)]

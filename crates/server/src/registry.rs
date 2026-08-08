@@ -2033,7 +2033,8 @@ impl Registry {
     /// op; a subtree-scoped reader receives just its granted subtrees.
     ///
     /// Redaction runs on the *authored* ops (their target resolves through the
-    /// room's element-path index), then the surviving subset is migration-translated
+    /// element-path index of the tree this `(room, branch)` stream serves), then the
+    /// surviving subset is migration-translated
     /// to each recipient's version — redact-then-translate, since translation can
     /// drop ops and would otherwise desync the path lookup. An op whose *container*
     /// target the index cannot resolve reads at the root
@@ -2053,11 +2054,35 @@ impl Registry {
     ) {
         let creator = self.hub.room_creator(room);
         let schema = self.governing_schema(room);
-        let index = self.hub.element_paths(room);
+        // Every read verdict below resolves through the tree **this stream** serves, not
+        // `main`'s. A branch owns its base — a captured version, a publish — or shares
+        // only `main`'s history below its fork point, and `main` moves on past both: an
+        // element scope `main` cannot resolve is an inert deny, and an op target it
+        // cannot resolve falls back to the root, which a root-readable but
+        // subtree-denied reader carries (C60). A stream with no tree — an undecodable
+        // owned base, a shared base compaction has clipped — is fanned nothing: the only
+        // indexes left to redact with resolve *less* than the truth, and a scope or a
+        // target that resolves to nothing is admitted rather than withheld. The subscribe
+        // seam refuses such a branch outright, so a joiner is told; a channel bound while
+        // the room still held no doc-ACL tuple keeps its subscription and stops receiving
+        // instead, which is the fail-closed reading of a stream this node cannot redact.
+        let Some(index) = self.hub.stream_element_paths(room, branch) else {
+            return;
+        };
         // A RangedElement op resolves its governing seq paths through the held anchor
         // set (a SetPayload/Delete carries only the range id); tombstoned ranges are
-        // included so a just-applied delete still resolves.
-        let ranged_anchors = self.hub.ranged_anchors(room);
+        // included so a just-applied delete still resolves. Asked of the same stream as
+        // the index, and refused on the same terms, so neither can describe a tree the
+        // other does not.
+        let Some(ranged_anchors) = self.hub.stream_ranged_anchors(room, branch) else {
+            return;
+        };
+        // Which container ids that tree has materialised at all, live or retained — what
+        // separates a target it *keeps* (unresolvable by the walk, still its own state)
+        // from one belonging to another stream entirely.
+        let Some(held) = self.hub.stream_held_containers(room, branch) else {
+            return;
+        };
         // The owning-element type of each op, resolved once over the room document
         // — a type-scoped migration step narrows to the ops whose owning element is
         // of its declared type. Empty (no narrowing) when the room binds no schema.
@@ -2071,7 +2096,7 @@ impl Registry {
         // whole where the op resolves to no path at all.
         let op_gates: Vec<crate::acl::OpReadGate> = broadcast
             .iter()
-            .map(|op| crate::acl::op_read_gate(&index, &ranged_anchors, &records, op))
+            .map(|op| crate::acl::op_read_gate(&index, &held, &ranged_anchors, &records, op))
             .collect();
         // Migration translation rides the same seam as redaction (scoped to the
         // room's governing app); resolve each distinct target's chain once.
