@@ -3203,12 +3203,12 @@ impl Document {
     /// A governing region that resolves to no path names no partition, and the root is
     /// the only one an envelope can express, so such an op keeps the root partition
     /// while the snapshot projection drops the state form (C52) — the one place the two
-    /// seams still part company, tracked as C75.
+    /// seams still part company, tracked as C82.
     ///
     /// Every other op belongs to the partition of the container it targets. A keyed op
     /// naming a zone-root slot on the container *above* it therefore rides the parent's
     /// partition unless it is a create — a gap of the same shape as the one the
-    /// container-create rule closed, tracked as C76.
+    /// container-create rule closed, tracked as C83.
     fn zone_of_op(&self, target: ElementId, kind: &OpKind) -> Option<u32> {
         let schema = self.schema.as_ref()?;
         if schema.zones().is_empty() {

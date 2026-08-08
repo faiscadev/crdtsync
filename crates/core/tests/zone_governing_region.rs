@@ -19,7 +19,7 @@
 //!
 //! A governing region that resolves to no path names no partition. The root is the
 //! only partition an envelope can express, so such an op keeps it while the snapshot
-//! projection drops the state form (C52) — pinned below as the residual it is (C75).
+//! projection drops the state form (C52) — pinned below as the residual it is (C82).
 
 use std::collections::HashSet;
 
@@ -467,7 +467,7 @@ fn an_op_served_replica_converges_with_a_snapshot_served_one_over_a_mark_and_a_g
     );
 }
 
-// --- the residual: a governing region that resolves to no path (C75) ---
+// --- the residual: a governing region that resolves to no path (C82) ---
 
 #[test]
 fn a_scope_that_resolves_to_no_path_keeps_the_root_partition() {
@@ -475,7 +475,7 @@ fn a_scope_that_resolves_to_no_path_keeps_the_root_partition() {
     // that is not a `core::path` names a position no partition can be resolved at.
     // The root is the only partition an envelope expresses, so the op keeps it —
     // while the projection drops the tuple, which is the one place the two seams
-    // still part company (C75).
+    // still part company (C82).
     let mut d = seeded(1);
     let scope = AclScope::Path(vec![0xff, 0xff, 0xff]);
     let (ops, _) = grant_path(&mut d, vec![0xff, 0xff, 0xff]);
@@ -494,7 +494,7 @@ fn a_mark_whose_endpoints_straddle_two_zones_keeps_the_root_partition() {
     // Endpoints in two zones are a `CrossZoneAnchor` violation the read repairs away
     // by dropping the range, so the two anchors must *agree* for the mark to name a
     // partition. Disagreement resolves to no partition, and the op keeps the root
-    // (C75) rather than picking one endpoint's zone over the other's.
+    // (C82) rather than picking one endpoint's zone over the other's.
     let mut d = seeded(1);
     let board = text_id(&d, b"board");
     let notes = text_id(&d, b"notes");
