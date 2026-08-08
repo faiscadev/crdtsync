@@ -4,7 +4,8 @@
 //! driver. It opens with Hello, then holds several room subscriptions at once —
 //! each on its own [`Channel`], with its own local [`Document`], its own derived
 //! replica identity ([`ClientId::for_channel`]), and its own caught-up
-//! sequence. Subscribe assigns the next channel and draws the server's catch-up
+//! sequence. Subscribe assigns the next channel — never a number a previous room
+//! freed, since the identity rides on it — and draws the server's catch-up
 //! — an op delta or a whole-replica [`Message::Snapshot`]. Inbound frames route
 //! to a room by their channel; a reconnect resumes each room from where it left
 //! off instead of replaying from zero. Pure logic: messages in, local replicas
@@ -36,6 +37,21 @@ pub enum ClientError {
     UnsupportedCodec(u32),
     /// The server reported a failure.
     Server { code: ErrorCode, message: String },
+}
+
+/// Why a room could not be joined on a fresh channel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubscribeError {
+    /// The session's channel range is spent. Numbers are assigned in subscribe
+    /// order and never recycled — a channel's replica
+    /// identity is derived from its number ([`ClientId::for_channel`]), so
+    /// re-issuing a freed one would hand a fresh replica, minting from seq 0, the
+    /// identity of ops the retired one still has in flight. A spent range is
+    /// therefore refused rather than wrapped: the session keeps every room it
+    /// already holds. Only a session opened under a *fresh* [`ClientId`] has a
+    /// fresh range — the derivation is pure over `(id, channel)`, so reopening
+    /// under the same id re-mints the identities the spent session authored under.
+    ChannelsExhausted,
 }
 
 /// The server's redirect of a room to its leader: this node does not lead the
@@ -109,6 +125,10 @@ pub struct ClientSession {
     /// receive rather than letting the caller pump on.
     fatal: Option<ClientError>,
     rooms: HashMap<Channel, Room>,
+    /// The channel number the next subscription takes. It only ever climbs: a
+    /// number a room freed is never handed out again, since a channel's replica
+    /// identity is derived from it. Once it reaches [`u32::MAX`] the range is
+    /// spent and every further subscribe is refused — see [`SubscribeError`].
     next_channel: u32,
     /// Op batches the server refused, awaiting the app's drain. Held at the
     /// session, not the room, so one [`take_rejected`](Self::take_rejected)
@@ -227,15 +247,23 @@ impl ClientSession {
     /// Returns the assigned channel and the Subscribe frame to send. Scoped to
     /// the default `main` branch and the whole room (every zone the actor may
     /// read); [`subscribe_branch`](Self::subscribe_branch) names another branch,
-    /// [`subscribe_zone`](Self::subscribe_zone) narrows to one zone.
-    pub fn subscribe(&mut self, room: &[u8]) -> (Channel, Message) {
+    /// [`subscribe_zone`](Self::subscribe_zone) narrows to one zone. Returns
+    /// [`SubscribeError::ChannelsExhausted`] instead once the session's channel
+    /// range is spent.
+    pub fn subscribe(&mut self, room: &[u8]) -> Result<(Channel, Message), SubscribeError> {
         self.subscribe_inner(room, b"", b"")
     }
 
     /// Join `branch` of `room` on a fresh channel, requesting everything from the
     /// start. An empty `branch` is the default `main`. Returns the assigned
-    /// channel and the Subscribe frame to send.
-    pub fn subscribe_branch(&mut self, room: &[u8], branch: &[u8]) -> (Channel, Message) {
+    /// channel and the Subscribe frame to send, or
+    /// [`SubscribeError::ChannelsExhausted`] once the session's channel range is
+    /// spent.
+    pub fn subscribe_branch(
+        &mut self,
+        room: &[u8],
+        branch: &[u8],
+    ) -> Result<(Channel, Message), SubscribeError> {
         self.subscribe_inner(room, branch, b"")
     }
 
@@ -243,14 +271,31 @@ impl ClientSession {
     /// from the start. An empty `zone` is the whole room (every zone the actor may
     /// read); a named `zone` narrows the stream to that partition plus the unzoned
     /// root it is entitled to. Scoped to the default `main` branch. Returns the
-    /// assigned channel and the Subscribe frame to send.
-    pub fn subscribe_zone(&mut self, room: &[u8], zone: &[u8]) -> (Channel, Message) {
+    /// assigned channel and the Subscribe frame to send, or
+    /// [`SubscribeError::ChannelsExhausted`] once the session's channel range is
+    /// spent.
+    pub fn subscribe_zone(
+        &mut self,
+        room: &[u8],
+        zone: &[u8],
+    ) -> Result<(Channel, Message), SubscribeError> {
         self.subscribe_inner(room, b"", zone)
     }
 
-    fn subscribe_inner(&mut self, room: &[u8], branch: &[u8], zone: &[u8]) -> (Channel, Message) {
+    fn subscribe_inner(
+        &mut self,
+        room: &[u8],
+        branch: &[u8],
+        zone: &[u8],
+    ) -> Result<(Channel, Message), SubscribeError> {
+        // The number is claimed before the room is bound, so a refusal binds
+        // nothing and every held room stays where it is.
+        let next = self
+            .next_channel
+            .checked_add(1)
+            .ok_or(SubscribeError::ChannelsExhausted)?;
         let channel = Channel(self.next_channel);
-        self.next_channel += 1;
+        self.next_channel = next;
         self.rooms.insert(
             channel,
             Room {
@@ -269,7 +314,7 @@ impl ClientSession {
                 diff: None,
             },
         );
-        (
+        Ok((
             channel,
             Message::Subscribe {
                 channel,
@@ -278,7 +323,7 @@ impl ClientSession {
                 zone: zone.to_vec(),
                 last_seen_seq: 0,
             },
-        )
+        ))
     }
 
     /// Re-issue the Subscribe for a held channel from its caught-up position, so
@@ -1037,5 +1082,92 @@ impl ClientSession {
     /// The zone selector bound to `channel`, if held — empty for the whole room.
     pub fn zone(&self, channel: Channel) -> Option<&[u8]> {
         self.rooms.get(&channel).map(|r| r.zone.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROOM_A: &[u8] = b"room-a";
+    const ROOM_B: &[u8] = b"room-b";
+
+    fn session() -> ClientSession {
+        ClientSession::new(ClientId::from_bytes([7; 16]))
+    }
+
+    /// Park the counter one number below the ceiling, so the next subscribe takes
+    /// the last channel the range holds and the one after it has none. Driving
+    /// there by subscribing 2^32 times is not a test anyone can run.
+    fn at_last_channel(s: &mut ClientSession) {
+        s.next_channel = u32::MAX - 1;
+    }
+
+    #[test]
+    fn a_spent_channel_range_refuses_rather_than_wrapping_onto_channel_zero() {
+        let mut s = session();
+        let (first, _) = s.subscribe(ROOM_A).expect("channel 0 is free");
+        assert_eq!(first, Channel(0));
+
+        at_last_channel(&mut s);
+        let (last, _) = s.subscribe(ROOM_B).expect("the last channel is free");
+        assert_eq!(last, Channel(u32::MAX - 1));
+
+        assert_eq!(s.subscribe(ROOM_B), Err(SubscribeError::ChannelsExhausted));
+    }
+
+    #[test]
+    fn a_refused_subscribe_leaves_the_rooms_it_holds_bound_where_they_are() {
+        let mut s = session();
+        let (held, _) = s.subscribe(ROOM_A).expect("channel 0 is free");
+        s.edit(held, |c| c.register(b"n", crate::Scalar::Int(1)))
+            .expect("a held channel edits");
+        let authored = s.outbox_len(held);
+        assert!(authored > 0, "the edit reached the outbox");
+
+        at_last_channel(&mut s);
+        s.subscribe(ROOM_B).expect("the last channel is free");
+        assert_eq!(
+            s.subscribe(ROOM_B),
+            Err(SubscribeError::ChannelsExhausted),
+            "the range is spent"
+        );
+
+        assert_eq!(s.room(held), Some(ROOM_A), "channel 0 still holds its room");
+        assert_eq!(s.outbox_len(held), authored, "and its authored ops");
+        assert_eq!(
+            s.document(held).map(|d| d.client()),
+            Some(ClientId::from_bytes([7; 16])),
+            "under the identity it authored them with"
+        );
+    }
+
+    #[test]
+    fn every_subscribe_entry_point_refuses_a_spent_range_and_keeps_refusing() {
+        let mut s = session();
+        s.next_channel = u32::MAX;
+
+        assert_eq!(s.subscribe(ROOM_A), Err(SubscribeError::ChannelsExhausted));
+        assert_eq!(
+            s.subscribe_branch(ROOM_A, b"topic"),
+            Err(SubscribeError::ChannelsExhausted)
+        );
+        assert_eq!(
+            s.subscribe_zone(ROOM_A, b"zone"),
+            Err(SubscribeError::ChannelsExhausted)
+        );
+        assert_eq!(s.next_channel, u32::MAX, "a refusal spends no number");
+        assert!(s.rooms.is_empty(), "and binds no room");
+    }
+
+    #[test]
+    fn unsubscribing_does_not_hand_a_freed_channel_number_back_out() {
+        let mut s = session();
+        let (freed, _) = s.subscribe(ROOM_A).expect("channel 0 is free");
+        s.unsubscribe(freed).expect("a held channel leaves");
+
+        let (next, _) = s.subscribe(ROOM_A).expect("a fresh channel");
+        assert_ne!(next, freed, "the retired number is spent, not recycled");
+        assert_eq!(next, Channel(1));
     }
 }

@@ -256,6 +256,38 @@ func newClient(t *testing.T, first byte) *Client {
 	return c
 }
 
+// subscribe joins room on a fresh channel, failing the test if the session
+// refuses — a refused subscribe reports channel 0, which a test expecting the
+// first channel would not otherwise tell apart from an assigned one.
+func subscribe(t *testing.T, c *Client, room []byte) (uint32, []byte) {
+	t.Helper()
+	channel, frame, err := c.Subscribe(room)
+	if err != nil {
+		t.Fatalf("Subscribe(%q): %v", room, err)
+	}
+	return channel, frame
+}
+
+// subscribeBranch is subscribe scoped to a named branch.
+func subscribeBranch(t *testing.T, c *Client, room, branch []byte) (uint32, []byte) {
+	t.Helper()
+	channel, frame, err := c.SubscribeBranch(room, branch)
+	if err != nil {
+		t.Fatalf("SubscribeBranch(%q, %q): %v", room, branch, err)
+	}
+	return channel, frame
+}
+
+// subscribeZone is subscribe narrowed to a named zone.
+func subscribeZone(t *testing.T, c *Client, room, zone []byte) (uint32, []byte) {
+	t.Helper()
+	channel, frame, err := c.SubscribeZone(room, zone)
+	if err != nil {
+		t.Fatalf("SubscribeZone(%q, %q): %v", room, zone, err)
+	}
+	return channel, frame
+}
+
 func TestDeclaredAppRidesAlongInTheHelloFrame(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()
@@ -334,8 +366,8 @@ func TestClientEditTravelsToAPeer(t *testing.T) {
 	defer b.Close()
 
 	// Both fresh sessions assign channel 0 to their first subscription.
-	ca, _ := a.Subscribe(key("room-1"))
-	cb, _ := b.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, a, key("room-1"))
+	cb, _ := subscribe(t, b, key("room-1"))
 	if ca != 0 || cb != 0 {
 		t.Fatalf("first channel: got %d and %d, want 0 and 0", ca, cb)
 	}
@@ -358,7 +390,7 @@ func TestClientEditTravelsToAPeer(t *testing.T) {
 func TestClientOutboxDrainsOnAck(t *testing.T) {
 	a := newClient(t, 1)
 	defer a.Close()
-	ca, _ := a.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, a, key("room-1"))
 
 	a.RegisterInt(ca, path("age"), 30)
 	if n := a.OutboxLen(ca); n != 1 {
@@ -394,8 +426,8 @@ func TestClientBytesRoundTrip(t *testing.T) {
 	defer a.Close()
 	b := newClient(t, 2)
 	defer b.Close()
-	ca, _ := a.Subscribe(key("room-1"))
-	cb, _ := b.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, a, key("room-1"))
+	cb, _ := subscribe(t, b, key("room-1"))
 
 	b.Receive(a.SetBytes(ca, path("blob"), []byte{0, 1, 0xff}))
 	if got, ok := b.GetBytes(cb, path("blob")); !ok || !bytes.Equal(got, []byte{0, 1, 0xff}) {
@@ -414,7 +446,7 @@ func TestClientHandshakeAndLifecycle(t *testing.T) {
 		t.Fatal("actor should be absent before AuthOk")
 	}
 
-	ch, _ := c.Subscribe(key("room-1"))
+	ch, _ := subscribe(t, c, key("room-1"))
 	if len(c.SetAwareness(ch, key("cursor"), key("x"))) == 0 {
 		t.Fatal("set_awareness should yield a frame")
 	}
@@ -432,12 +464,24 @@ func TestClientHandshakeAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestSubscribeSurfacesTheCoresRefusalAsAnError(t *testing.T) {
+	// An empty frame is the C ABI declining to assign one, which the wrapper
+	// reads as a spent range.
+	if _, _, err := assigned(uint32(0), nil); err != ErrChannelsExhausted {
+		t.Fatalf("empty frame: got %v, want ErrChannelsExhausted", err)
+	}
+	ch, frame, err := assigned(uint32(3), []byte{1, 2})
+	if err != nil || ch != 3 || !bytes.Equal(frame, []byte{1, 2}) {
+		t.Fatalf("assigned frame: got (%d, %v, %v), want (3, [1 2], nil)", ch, frame, err)
+	}
+}
+
 func TestClientSubscribeBranchCarriesTheNamedBranch(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()
 
 	// A named branch rides along in the Subscribe frame.
-	ch, frame := c.SubscribeBranch(key("room-1"), key("feature-x"))
+	ch, frame := subscribeBranch(t, c, key("room-1"), key("feature-x"))
 	if ch != 0 {
 		t.Fatalf("first channel: got %d, want 0", ch)
 	}
@@ -445,10 +489,10 @@ func TestClientSubscribeBranchCarriesTheNamedBranch(t *testing.T) {
 		t.Fatal("subscribe-branch frame should carry the branch name")
 	}
 	// An empty branch is the default/active branch, as the plain Subscribe.
-	if _, def := c.SubscribeBranch(key("room-1"), nil); bytes.Contains(def, key("feature-x")) {
+	if _, def := subscribeBranch(t, c, key("room-1"), nil); bytes.Contains(def, key("feature-x")) {
 		t.Fatal("empty-branch frame should not carry a branch name")
 	}
-	if _, plain := c.Subscribe(key("room-1")); bytes.Contains(plain, key("feature-x")) {
+	if _, plain := subscribe(t, c, key("room-1")); bytes.Contains(plain, key("feature-x")) {
 		t.Fatal("plain subscribe frame should not carry a branch name")
 	}
 }
@@ -458,7 +502,7 @@ func TestClientSubscribeZoneCarriesTheNamedZone(t *testing.T) {
 	defer c.Close()
 
 	// A named zone rides along in the Subscribe frame.
-	ch, frame := c.SubscribeZone(key("room-1"), key("west"))
+	ch, frame := subscribeZone(t, c, key("room-1"), key("west"))
 	if ch != 0 {
 		t.Fatalf("first channel: got %d, want 0", ch)
 	}
@@ -466,10 +510,10 @@ func TestClientSubscribeZoneCarriesTheNamedZone(t *testing.T) {
 		t.Fatal("subscribe-zone frame should carry the zone name")
 	}
 	// An empty zone is the whole room, as the plain Subscribe.
-	if _, def := c.SubscribeZone(key("room-1"), nil); bytes.Contains(def, key("west")) {
+	if _, def := subscribeZone(t, c, key("room-1"), nil); bytes.Contains(def, key("west")) {
 		t.Fatal("empty-zone frame should not carry a zone name")
 	}
-	if _, plain := c.Subscribe(key("room-1")); bytes.Contains(plain, key("west")) {
+	if _, plain := subscribe(t, c, key("room-1")); bytes.Contains(plain, key("west")) {
 		t.Fatal("plain subscribe frame should not carry a zone name")
 	}
 }
@@ -478,7 +522,7 @@ func TestClientVersionRequestsMarshal(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()
 
-	ch, _ := c.Subscribe(key("room-1"))
+	ch, _ := subscribe(t, c, key("room-1"))
 	frames := [][]byte{
 		c.CreateVersion(ch, key("v1")),
 		c.RenameVersion(ch, key("v1"), key("v2")),
@@ -529,7 +573,7 @@ func TestClientDiffQueryRoundTrips(t *testing.T) {
 	defer c.Close()
 
 	room := key("room-1")
-	ch, _ := c.Subscribe(room)
+	ch, _ := subscribe(t, c, room)
 	// Both kinds frame a request; channel-keyed, so the server resolves the room
 	// and the scope the change list is narrowed to. A channel this client does not
 	// hold frames nothing.
@@ -570,7 +614,7 @@ func TestClientDiffQueryRoundTrips(t *testing.T) {
 	// A second channel on the same room, zone-scoped: the reply is keyed by the
 	// channel that asked, so each reads back its own answer rather than the last to
 	// arrive.
-	narrow, _ := c.SubscribeZone(room, key("za"))
+	narrow, _ := subscribeZone(t, c, room, key("za"))
 	if rc, _ := c.Receive(diffResultFrame(narrow, DiffEncode(oldState, oldState))); rc != 1 {
 		t.Fatalf("narrow diff result receive failed")
 	}
@@ -662,7 +706,7 @@ func TestServerErrorFrameSurfacesItsCode(t *testing.T) {
 	}
 
 	// A normal frame still applies cleanly, carrying no error code.
-	ca, _ := c.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, c, key("room-1"))
 	if rc, code := c.Receive(c.RegisterInt(ca, path("age"), 30)); rc != 1 || code != NoErrorCode {
 		t.Fatalf("normal frame: got rc=%d code=%d, want 1 %d", rc, code, NoErrorCode)
 	}
@@ -684,7 +728,7 @@ func TestServerOpsRejectionSurfacesTheRefusedBatch(t *testing.T) {
 
 	c := newClient(t, 1)
 	defer c.Close()
-	ca, _ := c.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, c, key("room-1"))
 
 	// Author an edit; its ops enter the outbox with per-client sequences 0..n.
 	c.RegisterInt(ca, path("age"), 30)
@@ -733,7 +777,7 @@ func TestServerOpsRejectionSurfacesTheRefusedBatch(t *testing.T) {
 func TestTakeRejectedIsEmptyWithoutARejection(t *testing.T) {
 	c := newClient(t, 1)
 	defer c.Close()
-	c.Subscribe(key("room-1"))
+	subscribe(t, c, key("room-1"))
 	if r := c.TakeRejected(); len(r) != 0 {
 		t.Fatalf("take rejected without a rejection: got %d, want 0", len(r))
 	}
@@ -976,8 +1020,8 @@ func TestClientAtomicTransactionTravelsToAPeer(t *testing.T) {
 	b := newClient(t, 2)
 	defer b.Close()
 
-	ca, _ := a.Subscribe(key("room-1"))
-	cb, _ := b.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, a, key("room-1"))
+	cb, _ := subscribe(t, b, key("room-1"))
 
 	a.BeginAtomic(ca)
 	// Edits accumulate while recording; only the commit frame is sent.
@@ -1335,8 +1379,8 @@ func TestClientXmlEditRoutesThroughTheOutbox(t *testing.T) {
 	defer a.Close()
 	b := newClient(t, 2)
 	defer b.Close()
-	ca, _ := a.Subscribe(key("room-1"))
-	cb, _ := b.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, a, key("room-1"))
+	cb, _ := subscribe(t, b, key("room-1"))
 	_ = cb
 	doc := path("doc")
 
@@ -1371,7 +1415,7 @@ func TestClientXmlEditRoutesThroughTheOutbox(t *testing.T) {
 func TestClientMarkOnAFreshRoomIsInert(t *testing.T) {
 	a := newClient(t, 1)
 	defer a.Close()
-	ca, _ := a.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, a, key("room-1"))
 
 	// No sequence exists at the path yet, so the mark author yields no id handle
 	// and enqueues nothing to resend.

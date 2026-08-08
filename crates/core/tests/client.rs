@@ -206,7 +206,7 @@ fn a_later_advert_replaces_the_recorded_schema() {
 #[test]
 fn set_awareness_frames_a_publish_on_the_channel() {
     let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     match session.set_awareness(ch, b"cursor", &[1, 2, 3]) {
         Some(Message::AwarenessSet {
             channel,
@@ -230,7 +230,7 @@ fn set_awareness_on_an_unknown_channel_is_none() {
 #[test]
 fn an_update_records_a_peers_entry() {
     let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     session
         .receive(Message::AwarenessUpdate {
             channel: ch,
@@ -246,7 +246,7 @@ fn an_update_records_a_peers_entry() {
 #[test]
 fn an_update_is_last_writer_wins_per_actor_and_key() {
     let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     let upd = |value: Vec<u8>| Message::AwarenessUpdate {
         channel: ch,
         actor: b"alice".to_vec(),
@@ -262,7 +262,7 @@ fn an_update_is_last_writer_wins_per_actor_and_key() {
 #[test]
 fn distinct_actors_coexist() {
     let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     for actor in [b"alice".to_vec(), b"bob".to_vec()] {
         session
             .receive(Message::AwarenessUpdate {
@@ -280,7 +280,7 @@ fn distinct_actors_coexist() {
 #[test]
 fn an_update_on_an_unknown_channel_is_rejected() {
     let mut session = ClientSession::new(cid(1));
-    session.subscribe(ROOM_A);
+    session.subscribe(ROOM_A).unwrap();
     let err = session.receive(Message::AwarenessUpdate {
         channel: Channel(9),
         actor: b"alice".to_vec(),
@@ -293,7 +293,7 @@ fn an_update_on_an_unknown_channel_is_rejected() {
 #[test]
 fn a_clear_drops_all_of_an_actors_entries() {
     let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     let upd = |actor: &[u8], key: &[u8]| Message::AwarenessUpdate {
         channel: ch,
         actor: actor.to_vec(),
@@ -320,7 +320,7 @@ fn a_clear_drops_all_of_an_actors_entries() {
 #[test]
 fn a_per_key_clear_drops_only_that_entry() {
     let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     let upd = |actor: &[u8], key: &[u8]| Message::AwarenessUpdate {
         channel: ch,
         actor: actor.to_vec(),
@@ -349,7 +349,7 @@ fn a_per_key_clear_drops_only_that_entry() {
 #[test]
 fn a_clear_on_an_unknown_channel_is_rejected() {
     let mut session = ClientSession::new(cid(1));
-    session.subscribe(ROOM_A);
+    session.subscribe(ROOM_A).unwrap();
     let err = session.receive(Message::AwarenessClear {
         channel: Channel(9),
         actor: b"alice".to_vec(),
@@ -360,7 +360,7 @@ fn a_clear_on_an_unknown_channel_is_rejected() {
 #[test]
 fn subscribe_assigns_a_channel_and_requests_from_zero() {
     let mut session = ClientSession::new(cid(1));
-    let (channel, msg) = session.subscribe(ROOM_A);
+    let (channel, msg) = session.subscribe(ROOM_A).unwrap();
     match msg {
         Message::Subscribe {
             channel: c,
@@ -385,7 +385,7 @@ fn subscribe_assigns_a_channel_and_requests_from_zero() {
 #[test]
 fn subscribe_branch_names_its_branch_on_the_frame_and_records_it() {
     let mut session = ClientSession::new(cid(1));
-    let (channel, msg) = session.subscribe_branch(ROOM_A, b"release-2");
+    let (channel, msg) = session.subscribe_branch(ROOM_A, b"release-2").unwrap();
     match msg {
         Message::Subscribe {
             channel: c,
@@ -408,7 +408,7 @@ fn subscribe_branch_names_its_branch_on_the_frame_and_records_it() {
 #[test]
 fn subscribe_branch_with_an_empty_branch_is_main() {
     let mut session = ClientSession::new(cid(1));
-    let (channel, msg) = session.subscribe_branch(ROOM_A, b"");
+    let (channel, msg) = session.subscribe_branch(ROOM_A, b"").unwrap();
     match msg {
         Message::Subscribe { branch, .. } => assert_eq!(branch, b""),
         other => panic!("expected Subscribe, got {other:?}"),
@@ -419,7 +419,7 @@ fn subscribe_branch_with_an_empty_branch_is_main() {
 #[test]
 fn subscribe_leaves_the_zone_empty_for_the_whole_room() {
     let mut session = ClientSession::new(cid(1));
-    let (channel, msg) = session.subscribe(ROOM_A);
+    let (channel, msg) = session.subscribe(ROOM_A).unwrap();
     match msg {
         Message::Subscribe { zone, .. } => assert_eq!(zone, b""),
         other => panic!("expected Subscribe, got {other:?}"),
@@ -430,7 +430,7 @@ fn subscribe_leaves_the_zone_empty_for_the_whole_room() {
 #[test]
 fn subscribe_zone_names_its_zone_on_the_frame_and_records_it() {
     let mut session = ClientSession::new(cid(1));
-    let (channel, msg) = session.subscribe_zone(ROOM_A, b"west");
+    let (channel, msg) = session.subscribe_zone(ROOM_A, b"west").unwrap();
     match msg {
         Message::Subscribe {
             channel: c,
@@ -455,7 +455,7 @@ fn subscribe_zone_names_its_zone_on_the_frame_and_records_it() {
 #[test]
 fn subscribe_zone_selector_rides_the_wire() {
     let mut session = ClientSession::new(cid(1));
-    let (_, msg) = session.subscribe_zone(ROOM_A, b"west");
+    let (_, msg) = session.subscribe_zone(ROOM_A, b"west").unwrap();
     let decoded = crdtsync_core::decode_message(&crdtsync_core::encode_message(&msg))
         .expect("Subscribe round-trips");
     match decoded {
@@ -470,7 +470,7 @@ fn subscribe_zone_selector_rides_the_wire() {
 #[test]
 fn resume_preserves_the_zone() {
     let mut session = ClientSession::new(cid(1));
-    let (channel, _) = session.subscribe_zone(ROOM_A, b"west");
+    let (channel, _) = session.subscribe_zone(ROOM_A, b"west").unwrap();
     match session.resume(channel).expect("held channel resumes") {
         Message::Subscribe { zone, .. } => assert_eq!(zone, b"west"),
         other => panic!("expected Subscribe, got {other:?}"),
@@ -480,8 +480,8 @@ fn resume_preserves_the_zone() {
 #[test]
 fn two_rooms_get_distinct_channels() {
     let mut session = ClientSession::new(cid(1));
-    let (a, _) = session.subscribe(ROOM_A);
-    let (b, _) = session.subscribe(ROOM_B);
+    let (a, _) = session.subscribe(ROOM_A).unwrap();
+    let (b, _) = session.subscribe(ROOM_B).unwrap();
     assert_ne!(a, b);
     assert_eq!(session.room(a), Some(ROOM_A));
     assert_eq!(session.room(b), Some(ROOM_B));
@@ -496,7 +496,7 @@ fn an_ops_catch_up_converges_the_rooms_replica_and_tracks_the_sequence() {
     delta.extend(srv.transact(|tx| tx.register(b"b", Scalar::Int(2))));
 
     let mut session = ClientSession::new(cid(2));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     session.receive(ops_msg(ch, delta)).unwrap();
 
     let doc = session.document(ch).unwrap();
@@ -514,7 +514,7 @@ fn a_snapshot_catch_up_rebuilds_the_replica_and_adopts_the_sequence() {
     });
 
     let mut session = ClientSession::new(cid(2));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     session
         .receive(Message::Snapshot {
             channel: ch,
@@ -535,7 +535,7 @@ fn live_ops_advance_the_replica_and_the_sequence() {
     let first = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
     let mut session = ClientSession::new(cid(2));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     session.receive(ops_msg(ch, first)).unwrap();
     assert_eq!(session.last_seen_seq(ch), Some(1));
 
@@ -553,8 +553,8 @@ fn ops_on_one_channel_do_not_touch_another_rooms_replica() {
     let a_ops = srv_a.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
     let mut session = ClientSession::new(cid(2));
-    let (ca, _) = session.subscribe(ROOM_A);
-    let (cb, _) = session.subscribe(ROOM_B);
+    let (ca, _) = session.subscribe(ROOM_A).unwrap();
+    let (cb, _) = session.subscribe(ROOM_B).unwrap();
     session.receive(ops_msg(ca, a_ops)).unwrap();
 
     // Room A caught up; room B is untouched.
@@ -572,7 +572,7 @@ fn resume_resubscribes_a_room_from_its_last_seen_sequence() {
     delta.extend(srv.transact(|tx| tx.register(b"b", Scalar::Int(2))));
 
     let mut session = ClientSession::new(cid(2));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     session.receive(ops_msg(ch, delta)).unwrap();
 
     // Reconnecting, the client asks only for what it missed past its position,
@@ -597,7 +597,7 @@ fn resume_resubscribes_a_room_from_its_last_seen_sequence() {
 #[test]
 fn resume_carries_the_subscribed_branch() {
     let mut session = ClientSession::new(cid(2));
-    let (ch, _) = session.subscribe_branch(ROOM_A, b"release-2");
+    let (ch, _) = session.subscribe_branch(ROOM_A, b"release-2").unwrap();
     match session.resume(ch) {
         Some(Message::Subscribe { branch, .. }) => assert_eq!(branch, b"release-2"),
         other => panic!("expected a Subscribe, got {other:?}"),
@@ -616,7 +616,7 @@ fn a_redelivered_op_is_idempotent_but_still_advances_the_sequence() {
     let op = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
     let mut session = ClientSession::new(cid(2));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     session.receive(ops_msg(ch, op.clone())).unwrap();
     assert_eq!(session.last_seen_seq(ch), Some(1));
 
@@ -630,7 +630,7 @@ fn a_redelivered_op_is_idempotent_but_still_advances_the_sequence() {
 #[test]
 fn a_local_edit_yields_ops_on_its_channel_without_advancing_the_sequence() {
     let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
 
     let outbound = session
         .edit(ch, |tx| tx.register(b"a", Scalar::Int(7)))
@@ -664,7 +664,7 @@ fn a_snapshot_replaces_prior_local_state_with_the_server_state() {
 
     let mut peer = Document::new(cid(3));
     let mut session = ClientSession::new(cid(2));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     session
         .receive(ops_msg(
             ch,
@@ -691,7 +691,7 @@ fn edits_after_a_snapshot_still_carry_the_channels_own_id() {
     srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
     let mut session = ClientSession::new(cid(2));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     session
         .receive(Message::Snapshot {
             channel: ch,
@@ -712,7 +712,7 @@ fn edits_after_a_snapshot_still_carry_the_channels_own_id() {
 #[test]
 fn unsubscribe_drops_the_room_and_frees_the_channel() {
     let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     match session.unsubscribe(ch) {
         Some(Message::Unsubscribe { channel }) => assert_eq!(channel, ch),
         other => panic!("expected Unsubscribe, got {other:?}"),
@@ -734,7 +734,7 @@ fn ops_on_an_unknown_channel_are_rejected() {
     let mut srv = srv();
     let op = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM_A);
+    session.subscribe(ROOM_A).unwrap();
     let err = session.receive(ops_msg(Channel(9), op));
     assert!(matches!(err, Err(ClientError::UnknownChannel(_))));
 }
@@ -742,7 +742,7 @@ fn ops_on_an_unknown_channel_are_rejected() {
 #[test]
 fn a_snapshot_on_an_unknown_channel_is_rejected() {
     let mut session = ClientSession::new(cid(2));
-    session.subscribe(ROOM_A);
+    session.subscribe(ROOM_A).unwrap();
     let err = session.receive(Message::Snapshot {
         channel: Channel(9),
         seq: 1,
@@ -757,7 +757,7 @@ fn a_garbage_snapshot_is_rejected_and_leaves_the_replica_intact() {
     let op = srv.transact(|tx| tx.register(b"a", Scalar::Int(1)));
 
     let mut session = ClientSession::new(cid(2));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     session.receive(ops_msg(ch, op)).unwrap();
 
     let err = session.receive(Message::Snapshot {
@@ -823,7 +823,7 @@ fn a_client_only_message_from_the_server_is_a_violation() {
 #[test]
 fn atomic_edit_tags_its_ops_as_one_transaction() {
     let mut session = ClientSession::new(cid(1));
-    let (ch, _) = session.subscribe(ROOM_A);
+    let (ch, _) = session.subscribe(ROOM_A).unwrap();
     let ops = ops_of(
         session
             .atomic_edit(ch, |tx| {
@@ -842,8 +842,8 @@ fn atomic_edit_tags_its_ops_as_one_transaction() {
 fn a_peer_folds_in_an_atomic_edit_all_or_nothing() {
     let mut a = ClientSession::new(cid(1));
     let mut b = ClientSession::new(cid(2));
-    let (ca, _) = a.subscribe(ROOM_A);
-    let (cb, _) = b.subscribe(ROOM_A);
+    let (ca, _) = a.subscribe(ROOM_A).unwrap();
+    let (cb, _) = b.subscribe(ROOM_A).unwrap();
 
     let ops = ops_of(
         a.atomic_edit(ca, |tx| {
@@ -869,8 +869,8 @@ fn a_peer_folds_in_an_atomic_edit_all_or_nothing() {
 fn begin_and_commit_atomic_group_edits_on_a_channel() {
     let mut a = ClientSession::new(cid(1));
     let mut b = ClientSession::new(cid(2));
-    let (ca, _) = a.subscribe(ROOM_A);
-    let (cb, _) = b.subscribe(ROOM_A);
+    let (ca, _) = a.subscribe(ROOM_A).unwrap();
+    let (cb, _) = b.subscribe(ROOM_A).unwrap();
 
     a.begin_atomic(ca).expect("held channel");
     // Edits accumulate while recording; each emits an empty op batch.

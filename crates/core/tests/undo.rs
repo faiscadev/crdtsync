@@ -1296,7 +1296,7 @@ fn channel_doc(s: &ClientSession, ch: Channel) -> &Document {
 #[test]
 fn a_channels_edits_are_undoable_and_ship_as_ordinary_ops() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     s.set_undo_origin(ch, ORIGIN);
     let first = ops_of(
         s.edit(ch, |c| c.register(b"title", Scalar::Int(1)))
@@ -1332,7 +1332,7 @@ fn a_channels_edits_are_undoable_and_ship_as_ordinary_ops() {
 #[test]
 fn a_channels_undo_ops_go_through_the_outbox() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     s.set_undo_origin(ch, ORIGIN);
     let edit = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     let undone = ops_of(s.undo(ch, ORIGIN).unwrap());
@@ -1346,8 +1346,8 @@ fn a_channels_undo_ops_go_through_the_outbox() {
 #[test]
 fn each_channel_keeps_its_own_undo_stack() {
     let mut s = ClientSession::new(cid(1));
-    let (a, _) = s.subscribe(b"room-a");
-    let (b, _) = s.subscribe(b"room-b");
+    let (a, _) = s.subscribe(b"room-a").unwrap();
+    let (b, _) = s.subscribe(b"room-b").unwrap();
     s.set_undo_origin(a, ORIGIN);
     s.set_undo_origin(b, ORIGIN);
     s.edit(a, |c| c.register(b"k", Scalar::Int(1)));
@@ -1360,7 +1360,7 @@ fn each_channel_keeps_its_own_undo_stack() {
 #[test]
 fn a_channel_with_no_origin_records_nothing() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     s.edit(ch, |c| c.register(b"k", Scalar::Int(1)));
     assert!(!s.can_undo(ch, ORIGIN));
     assert_eq!(s.undo(ch, ORIGIN), None);
@@ -1372,7 +1372,7 @@ fn a_channels_remote_ops_are_not_undoable() {
     let ops = path::register(&mut author, &p(&[b"k"]), Scalar::Int(1));
 
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     s.set_undo_origin(ch, ORIGIN);
     s.receive(Message::Ops { channel: ch, ops }).unwrap();
     assert_eq!(
@@ -1388,7 +1388,7 @@ fn a_channels_remote_ops_are_not_undoable() {
 #[test]
 fn a_channels_atomic_edit_undoes_as_one_transaction() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     s.set_undo_origin(ch, ORIGIN);
     s.atomic_edit(ch, |c| {
         c.register(b"a", Scalar::Int(1));
@@ -2398,7 +2398,7 @@ fn a_channel_keeps_recording_across_a_snapshot_catch_up() {
     path::register(&mut author, &p(&[b"seed"]), Scalar::Int(1));
 
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     s.set_undo_origin(ch, ORIGIN);
     s.edit(ch, |c| c.register(b"k", Scalar::Int(1)));
     assert!(s.can_undo(ch, ORIGIN));

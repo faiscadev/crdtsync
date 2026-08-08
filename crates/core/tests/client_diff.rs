@@ -41,10 +41,10 @@ fn added_change(name: &[u8]) -> Change {
 #[test]
 fn diff_query_frames_a_channel_keyed_request() {
     let mut s = ClientSession::new(cid(1));
-    let (one, _) = s.subscribe(ROOM);
+    let (one, _) = s.subscribe(ROOM).unwrap();
     // A second subscription, so the frame carrying the channel it was *asked* for is
     // told from a frame that hardcodes the first one.
-    let (two, _) = s.subscribe(b"room-b");
+    let (two, _) = s.subscribe(b"room-b").unwrap();
     assert_ne!(one, two);
     assert!(matches!(
         s.diff_query(one, DiffKind::Versions, b"v1", b"v2"),
@@ -64,7 +64,7 @@ fn a_diff_query_on_an_unheld_channel_frames_nothing() {
     // protocol violation, which closes the session — so the frame is refused here,
     // exactly as a version fetch on an unheld channel is.
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     // Channels are handed out monotonically and never reused, so the next number is
     // one this session has not assigned.
     assert!(s
@@ -75,7 +75,7 @@ fn a_diff_query_on_an_unheld_channel_frames_nothing() {
 #[test]
 fn a_diff_result_updates_the_answering_channel_view() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     assert!(
         s.diff(ch).is_none(),
         "a view existed before any reply arrived"
@@ -107,8 +107,8 @@ fn two_channels_on_one_room_read_back_their_own_diffs() {
     // the same room are served genuinely different change lists, and each reader gets
     // the answer served to *its* channel, not the last reply to arrive.
     let mut s = ClientSession::new(cid(1));
-    let (wide, _) = s.subscribe(ROOM);
-    let (narrow, _) = s.subscribe_zone(ROOM, b"zone-b");
+    let (wide, _) = s.subscribe(ROOM).unwrap();
+    let (narrow, _) = s.subscribe_zone(ROOM, b"zone-b").unwrap();
     assert_ne!(wide, narrow);
 
     let wide_changes = [added_change(b"root-field"), added_change(b"zone-b-field")];
@@ -153,10 +153,10 @@ fn two_channels_on_one_room_read_back_their_own_diffs() {
 #[test]
 fn diff_views_are_isolated_per_channel() {
     let mut s = ClientSession::new(cid(1));
-    let (one, _) = s.subscribe(ROOM);
+    let (one, _) = s.subscribe(ROOM).unwrap();
     // A second channel on the *same* room, so isolation is the channel's doing and
     // not the room's.
-    let (two, _) = s.subscribe(ROOM);
+    let (two, _) = s.subscribe(ROOM).unwrap();
     s.receive(Message::DiffResult {
         channel: one,
         changes: encode_changes(&[value_change()]),
@@ -172,7 +172,7 @@ fn diff_views_are_isolated_per_channel() {
 #[test]
 fn a_diff_result_on_an_unheld_channel_is_refused() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     s.receive(Message::DiffResult {
         channel: ch,
         changes: encode_changes(&[value_change()]),
@@ -199,7 +199,7 @@ fn an_unheld_channel_is_refused_before_the_payload_is_read() {
     // The channel names the view a result belongs to, so a result with nowhere to
     // land is refused as an unknown channel — the payload is never read.
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     let unheld = Channel(ch.0 + 1);
     assert_eq!(
         s.receive(Message::DiffResult {
@@ -213,7 +213,7 @@ fn an_unheld_channel_is_refused_before_the_payload_is_read() {
 #[test]
 fn a_malformed_change_payload_is_refused_without_touching_the_view() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     assert_eq!(
         s.receive(Message::DiffResult {
             channel: ch,
@@ -227,7 +227,7 @@ fn a_malformed_change_payload_is_refused_without_touching_the_view() {
 #[test]
 fn unsubscribing_drops_the_channel_diff_view() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM);
+    let (ch, _) = s.subscribe(ROOM).unwrap();
     s.receive(Message::DiffResult {
         channel: ch,
         changes: encode_changes(&[value_change()]),

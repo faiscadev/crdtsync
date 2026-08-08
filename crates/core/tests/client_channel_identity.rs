@@ -85,8 +85,8 @@ fn list_stored(doc: &Document, key: &[u8]) -> usize {
 /// uses a single pair.
 fn two_channels() -> (ClientSession, Channel, Channel) {
     let mut session = ClientSession::new(cid(1));
-    let a = session.subscribe(ROOM).0;
-    let b = session.subscribe_zone(ROOM, b"z").0;
+    let a = session.subscribe(ROOM).unwrap().0;
+    let b = session.subscribe_zone(ROOM, b"z").unwrap().0;
     (session, a, b)
 }
 
@@ -116,10 +116,10 @@ fn each_channel_authors_under_its_derived_identity() {
 #[test]
 fn every_subscribe_flavour_takes_a_fresh_identity() {
     let mut session = ClientSession::new(cid(1));
-    let whole = session.subscribe(ROOM).0;
-    let branch = session.subscribe_branch(ROOM, b"feature").0;
-    let zone_a = session.subscribe_zone(ROOM, b"z1").0;
-    let zone_b = session.subscribe_zone(ROOM, b"z2").0;
+    let whole = session.subscribe(ROOM).unwrap().0;
+    let branch = session.subscribe_branch(ROOM, b"feature").unwrap().0;
+    let zone_a = session.subscribe_zone(ROOM, b"z1").unwrap().0;
+    let zone_b = session.subscribe_zone(ROOM, b"z2").unwrap().0;
 
     let channels = [whole, branch, zone_a, zone_b];
     for (i, x) in channels.iter().enumerate() {
@@ -583,7 +583,7 @@ fn a_channels_identity_survives_a_snapshot_catch_up() {
 #[test]
 fn a_resubscribed_channel_authors_under_a_fresh_identity() {
     let mut session = ClientSession::new(cid(1));
-    let (a, _) = session.subscribe(ROOM);
+    let (a, _) = session.subscribe(ROOM).unwrap();
     let retired = ops_of(
         session
             .edit(a, |tx| tx.register(b"a", Scalar::Int(1)))
@@ -591,7 +591,7 @@ fn a_resubscribed_channel_authors_under_a_fresh_identity() {
     );
     session.unsubscribe(a).expect("the channel is held");
 
-    let (b, _) = session.subscribe(ROOM);
+    let (b, _) = session.subscribe(ROOM).unwrap();
     assert_ne!(a, b, "a freed channel number is not reused");
     let fresh = ops_of(
         session

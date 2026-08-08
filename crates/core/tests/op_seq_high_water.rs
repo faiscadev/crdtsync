@@ -447,7 +447,7 @@ fn a_restarted_session_caught_up_by_an_op_delta_mints_past_its_durable_run() {
     let (_, durable) = authored(cid(1), 3);
 
     let mut session = ClientSession::new(cid(1));
-    let (channel, _) = session.subscribe(ROOM);
+    let (channel, _) = session.subscribe(ROOM).unwrap();
     session
         .receive(Message::Ops {
             channel,
@@ -477,7 +477,7 @@ fn a_restarted_session_caught_up_by_a_snapshot_mints_past_its_durable_run() {
     }
 
     let mut session = ClientSession::new(cid(1));
-    let (channel, _) = session.subscribe(ROOM);
+    let (channel, _) = session.subscribe(ROOM).unwrap();
     session
         .receive(Message::Snapshot {
             channel,
@@ -498,7 +498,7 @@ fn a_restarted_session_caught_up_by_a_snapshot_mints_past_its_durable_run() {
 #[test]
 fn a_forged_catch_up_frame_leaves_a_session_minting_ordinarily() {
     let mut session = ClientSession::new(cid(1));
-    let (channel, _) = session.subscribe(ROOM);
+    let (channel, _) = session.subscribe(ROOM).unwrap();
     session
         .receive(Message::Ops {
             channel,

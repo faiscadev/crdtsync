@@ -97,8 +97,8 @@ fn two_channels_of_one_connection_both_reach_the_room() {
     // A real client session: two subscriptions to one room, each with its own
     // replica, both minting from seq 0.
     let mut session = ClientSession::new(cid(1));
-    let (a, sub_a) = session.subscribe(ROOM);
-    let (b, sub_b) = session.subscribe(ROOM);
+    let (a, sub_a) = session.subscribe(ROOM).unwrap();
+    let (b, sub_b) = session.subscribe(ROOM).unwrap();
     assert!(r.deliver(writer, sub_a));
     assert!(r.deliver(writer, sub_b));
     r.take_outbox(writer);

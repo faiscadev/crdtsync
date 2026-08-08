@@ -20,7 +20,7 @@ const ROOM_A: &[u8] = b"room-a";
 #[test]
 fn create_frames_a_request_on_the_channel() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     match s.create_version(ch, b"v1") {
         Some(Message::VersionCreate { channel, name }) => {
             assert_eq!(channel, ch);
@@ -33,7 +33,7 @@ fn create_frames_a_request_on_the_channel() {
 #[test]
 fn rename_delete_list_fetch_frame_their_requests() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     assert!(matches!(
         s.rename_version(ch, b"a", b"b"),
         Some(Message::VersionRename { channel, from, to })
@@ -67,7 +67,7 @@ fn issue_methods_on_an_unknown_channel_are_none() {
 #[test]
 fn a_versions_reply_replaces_the_name_view() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     assert_eq!(s.versions(ch), Some(&[][..]), "empty until a reply arrives");
 
     s.receive(Message::Versions {
@@ -89,7 +89,7 @@ fn a_versions_reply_replaces_the_name_view() {
 #[test]
 fn a_version_state_reply_is_cached_by_name() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
 
     let mut server = Document::new(cid(2));
     server.transact(|tx| tx.register(b"age", Scalar::Int(30)));
@@ -120,7 +120,7 @@ fn a_version_state_reply_is_cached_by_name() {
 #[test]
 fn a_version_reply_for_an_unknown_channel_is_refused() {
     let mut s = ClientSession::new(cid(1));
-    s.subscribe(ROOM_A);
+    s.subscribe(ROOM_A).unwrap();
     assert_eq!(
         s.receive(Message::Versions {
             channel: Channel(9),

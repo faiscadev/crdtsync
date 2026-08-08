@@ -7,6 +7,18 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
+## 2026-08-08 · C7 channel exhaustion · a never-recycled number is a finite resource, so subscribe is fallible in every binding
+
+**Changed:** ARCHITECTURE §"A channel's replica is its own author" now states that non-recycling makes channel numbers finite, and that a session which has spent its `u32` range refuses further subscriptions rather than wrapping.
+
+**The defect.** `ClientSession::subscribe_inner` did a bare `self.next_channel += 1`. The counter panics on overflow in debug and wraps to 0 in release, at which point channel 0 is re-issued, `for_channel(0)` hands the new replica the session's *declared* id, and `self.rooms.insert` silently replaces the live room bound to that channel — its replica, its outbox of unacknowledged ops, and its caught-up sequence, all gone with no error anywhere. Unreachable in practice (2^32 subscriptions on one session) and the handle collision predates the identity scheme, but C4 (#351) made non-recycling *load-bearing* — ARCHITECTURE, the `for_channel` rustdoc and DECISIONS all state that reusing a freed number hands a fresh replica the identity of ops the retired one still has in flight — and a documented invariant with no guard is a defect regardless of its reachability.
+
+**Refuse, don't recycle.** The alternative — a free-list handing retired numbers back out — is the exact collision C4 closed, so it was never open. The counter takes `checked_add` and the range's last value is the exhausted marker rather than a channel, which costs one number out of 2^32 and needs no second field to remember that the range is spent. The number is claimed before the room is bound, so a refusal binds nothing: every held room keeps its replica, its outbox, and its identity, which is the damage that actually mattered.
+
+**Fallible in every binding, break the signatures outright.** A refusal the caller cannot see is the bug again one layer up, so `subscribe`/`subscribe_branch`/`subscribe_zone` return `Result<_, SubscribeError>` and each binding takes its language's existing convention rather than a parallel fallible API: the C ABI returns an empty `CrdtBuf` leaving `out_channel` unwritten (the failure signal this whole family already uses — no new status-code channel for one condition), wasm returns `Result<_, JsError>` so JS throws, Python raises `ChannelsExhausted`, Go returns `ErrChannelsExhausted` as a third value. Pre-release, so the old infallible signatures are simply gone.
+
+**Tested by setting the counter, not by subscribing 2^32 times.** The regression tests live in `crates/core/src/client.rs` beside the field they park at the ceiling — an integration test cannot reach a private counter, and exposing an accessor purely to test it would put the invariant's mechanism in the public surface. They assert the refusal instead of a wrap, that every entry point refuses, that a refusal spends no number and binds no room, that a held channel keeps its room, outbox and identity across one, and that an unsubscribe does not hand its number back.
+
 ## 2026-08-06 · C50 diff-reply channel key · the channel keys both halves of a content-carrying request, and the client's diff view is per channel
 
 **Changed:** ARCHITECTURE §Schema-Aware Diff's surface rule now reads on both halves — a request whose answer carries a room's content is channel-keyed in its reply as well as its query — and states why: only the channel tells two answers to the same room apart.

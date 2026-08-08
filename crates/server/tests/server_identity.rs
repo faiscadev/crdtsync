@@ -185,7 +185,7 @@ fn a_restarted_client_caught_up_by_an_op_delta_keeps_its_writes() {
     let conn = hello(&mut r, cid(1));
 
     let mut before = ClientSession::new(cid(1));
-    let (channel, sub) = before.subscribe(ROOM);
+    let (channel, sub) = before.subscribe(ROOM).unwrap();
     assert!(r.deliver(conn, sub));
     r.take_outbox(conn);
     for i in 0..3 {
@@ -201,7 +201,7 @@ fn a_restarted_client_caught_up_by_an_op_delta_keeps_its_writes() {
     // from the start so the node serves the whole log as a delta.
     let restarted_conn = hello(&mut r, cid(1));
     let mut after = ClientSession::new(cid(1));
-    let (channel, sub) = after.subscribe(ROOM);
+    let (channel, sub) = after.subscribe(ROOM).unwrap();
     assert!(r.deliver(restarted_conn, sub));
     let catch_up = r.take_outbox(restarted_conn);
     assert!(

@@ -41,7 +41,7 @@ fn server_snapshot(ops: &[Op]) -> Vec<u8> {
 #[test]
 fn adopting_a_snapshot_does_not_rewind_the_op_seq() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
 
     // Author ops — advances this client's op-seq counter past 0.
     let mut authored = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());

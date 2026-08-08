@@ -385,8 +385,8 @@ fn a_client_edit_travels_to_a_peer() {
     let mut a = wasm_client(1);
     let mut b = wasm_client(2);
     // Both fresh sessions assign channel 0 to their first subscription.
-    let sa = a.subscribe(b"room-1");
-    let sb = b.subscribe(b"room-1");
+    let sa = a.subscribe(b"room-1").unwrap();
+    let sb = b.subscribe(b"room-1").unwrap();
     assert_eq!(sa.channel(), 0);
     assert_eq!(sb.channel(), 0);
 
@@ -402,8 +402,8 @@ fn a_client_edit_travels_to_a_peer() {
 fn a_channels_edits_undo_over_the_wire_surface() {
     let mut a = wasm_client(1);
     let mut b = wasm_client(2);
-    let sa = a.subscribe(b"room-undo");
-    let sb = b.subscribe(b"room-undo");
+    let sa = a.subscribe(b"room-undo").unwrap();
+    let sb = b.subscribe(b"room-undo").unwrap();
     let origin = b"local";
     assert!(a.set_undo_origin(sa.channel(), origin));
 
@@ -437,13 +437,13 @@ fn subscribe_branch_carries_the_named_branch() {
 
     let mut a = wasm_client(1);
     // A named branch rides along in the Subscribe frame.
-    let sub = a.subscribe_branch(b"room-1", b"feature-x");
+    let sub = a.subscribe_branch(b"room-1", b"feature-x").unwrap();
     assert_eq!(sub.channel(), 0);
     assert_eq!(branch_of(&sub.frame()), b"feature-x");
     // An empty branch is the default/active branch, as the plain subscribe.
-    let sub = a.subscribe_branch(b"room-1", b"");
+    let sub = a.subscribe_branch(b"room-1", b"").unwrap();
     assert!(branch_of(&sub.frame()).is_empty());
-    let sub = a.subscribe(b"room-1");
+    let sub = a.subscribe(b"room-1").unwrap();
     assert!(branch_of(&sub.frame()).is_empty());
 }
 
@@ -458,13 +458,13 @@ fn subscribe_zone_carries_the_named_zone() {
 
     let mut a = wasm_client(1);
     // A named zone rides along in the Subscribe frame.
-    let sub = a.subscribe_zone(b"room-1", b"west");
+    let sub = a.subscribe_zone(b"room-1", b"west").unwrap();
     assert_eq!(sub.channel(), 0);
     assert_eq!(zone_of(&sub.frame()), b"west");
     // An empty zone is the whole room, as the plain subscribe.
-    let sub = a.subscribe_zone(b"room-1", b"");
+    let sub = a.subscribe_zone(b"room-1", b"").unwrap();
     assert!(zone_of(&sub.frame()).is_empty());
-    let sub = a.subscribe(b"room-1");
+    let sub = a.subscribe(b"room-1").unwrap();
     assert!(zone_of(&sub.frame()).is_empty());
 }
 
@@ -475,7 +475,7 @@ fn a_client_handshake_and_awareness_marshal() {
     assert!(!c.auth(b"token").is_empty());
     assert_eq!(c.actor(), None);
 
-    let sub = c.subscribe(b"room-1");
+    let sub = c.subscribe(b"room-1").unwrap();
     assert!(c.set_awareness(sub.channel(), b"cursor", b"x").is_some());
     assert_eq!(c.awareness_len(sub.channel()), 0);
     assert!(c.unsubscribe(sub.channel()).is_some());
@@ -533,7 +533,7 @@ fn the_server_advertised_schema_is_recorded_and_readable() {
 fn a_client_outbox_drains_on_ack() {
     use crdtsync_core::protocol::{encode_message, Channel, Message};
     let mut a = wasm_client(1);
-    let sa = a.subscribe(b"room-1");
+    let sa = a.subscribe(b"room-1").unwrap();
     let ch = sa.channel();
 
     a.register_int(ch, &path(&["age"]), 30);
@@ -556,7 +556,7 @@ fn a_client_outbox_drains_on_ack() {
 #[wasm_bindgen_test]
 fn a_client_version_requests_marshal() {
     let mut c = wasm_client(1);
-    let sub = c.subscribe(b"room-1");
+    let sub = c.subscribe(b"room-1").unwrap();
     let ch = sub.channel();
     assert!(c.create_version(ch, b"v1").is_some());
     assert!(c.rename_version(ch, b"v1", b"v2").is_some());
@@ -592,7 +592,7 @@ fn a_client_diff_query_round_trips() {
 
     let mut c = wasm_client(1);
     let room = b"room-1";
-    let s = c.subscribe(room);
+    let s = c.subscribe(room).unwrap();
     // Both kinds frame a request; a bad kind is an error, and a channel this client
     // does not hold frames nothing. Channel-keyed: the server resolves the room, and
     // the scope the change list is narrowed to, from the subscription — and the
@@ -704,7 +704,7 @@ fn a_server_error_frame_throws_its_code() {
         thrown.as_f64(),
         Some(ErrorCode::UpdateRequired as i32 as f64)
     );
-    let sa = c.subscribe(b"room-1");
+    let sa = c.subscribe(b"room-1").unwrap();
     let ops = c.register_int(sa.channel(), &path(&["age"]), 30);
     assert!(c.receive(&ops).unwrap());
 }
@@ -714,7 +714,7 @@ fn a_server_ops_rejection_surfaces_the_refused_batch() {
     use crdtsync_core::protocol::{encode_message, Channel, ErrorCode as CoreErrorCode, Message};
     use crdtsync_wasm::ErrorCode;
     let mut c = wasm_client(1);
-    let sub = c.subscribe(b"room-1");
+    let sub = c.subscribe(b"room-1").unwrap();
     let ch = sub.channel();
 
     // Author an edit; its ops enter the outbox with per-client sequences 0..n.
@@ -785,8 +785,8 @@ fn a_server_redirect_surfaces_the_room_and_leader() {
 fn a_client_atomic_transaction_travels_to_a_peer() {
     let mut a = wasm_client(1);
     let mut b = wasm_client(2);
-    let sa = a.subscribe(b"room-1");
-    let sb = b.subscribe(b"room-1");
+    let sa = a.subscribe(b"room-1").unwrap();
+    let sb = b.subscribe(b"room-1").unwrap();
 
     a.begin_atomic(sa.channel());
     // Edits accumulate while recording; only the commit frame is sent.
@@ -1040,8 +1040,8 @@ fn a_schema_binds_or_is_rejected_and_repairs_drain() {
 fn a_client_xml_edit_rides_the_outbox_and_travels_to_a_peer() {
     let mut a = wasm_client(1);
     let mut b = wasm_client(2);
-    let sa = a.subscribe(b"room-1");
-    let sb = b.subscribe(b"room-1");
+    let sa = a.subscribe(b"room-1").unwrap();
+    let sb = b.subscribe(b"room-1").unwrap();
     let p = path(&["body"]);
     // Each edit enters the outbox — resent / acknowledged, not framed and forgotten.
     let frame = a.xml_element(sa.channel(), &p, b"div");
@@ -1060,7 +1060,7 @@ fn a_client_xml_edit_rides_the_outbox_and_travels_to_a_peer() {
 #[wasm_bindgen_test]
 fn a_client_mark_over_a_non_sequence_is_inert() {
     let mut a = wasm_client(1);
-    let sa = a.subscribe(b"room-1");
+    let sa = a.subscribe(b"room-1").unwrap();
     // A fragment is not a sequence, so this author enqueues nothing and hands back
     // no handle.
     let t = path(&["body"]);
@@ -1079,7 +1079,7 @@ fn a_client_binds_a_channel_schema_and_drains_repairs() {
         "types": { "Doc": { "kind": "map", "children": { "body": "Body" } },
                    "Body": { "kind": "text", "max": 5 } } }"#;
     let mut a = wasm_client(1);
-    let sa = a.subscribe(b"room-1");
+    let sa = a.subscribe(b"room-1").unwrap();
     let ch = sa.channel();
     // A well-formed schema binds to the channel replica; a malformed one or an
     // unheld channel binds nothing.
@@ -1181,8 +1181,8 @@ fn a_bad_blob_ref_id_throws() {
 fn a_client_blob_edit_enqueues_and_travels() {
     let mut a = wasm_client(1);
     let mut b = wasm_client(2);
-    let sa = a.subscribe(b"room-1");
-    b.subscribe(b"room-1");
+    let sa = a.subscribe(b"room-1").unwrap();
+    b.subscribe(b"room-1").unwrap();
 
     let frame = a.set_blob(sa.channel(), &path(&["avatar"]), "image/png", b"tiny-png");
     assert!(!frame.is_empty());
@@ -1331,8 +1331,8 @@ fn acl_authoring_throws_on_bad_input() {
 fn client_acl_routes_through_the_outbox() {
     let mut a = wasm_client(1);
     let mut b = wasm_client(2);
-    let sa = a.subscribe(b"room-1");
-    let sb = b.subscribe(b"room-1");
+    let sa = a.subscribe(b"room-1").unwrap();
+    let sb = b.subscribe(b"room-1").unwrap();
     let ch = sa.channel();
     let _ = sb;
 

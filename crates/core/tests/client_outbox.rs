@@ -38,7 +38,7 @@ const ROOM_B: &[u8] = b"room-b";
 #[test]
 fn an_edit_enqueues_its_ops() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let ops = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     assert_eq!(s.outbox_len(ch), ops.len());
     assert!(ops.len() >= 1);
@@ -47,7 +47,7 @@ fn an_edit_enqueues_its_ops() {
 #[test]
 fn edits_accumulate_in_the_outbox() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let first = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     let second = ops_of(s.edit(ch, |c| c.register(b"b", Scalar::Int(2))).unwrap());
     assert_eq!(s.outbox_len(ch), first.len() + second.len());
@@ -56,7 +56,7 @@ fn edits_accumulate_in_the_outbox() {
 #[test]
 fn an_atomic_edit_enqueues_the_whole_group() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let ops = ops_of(
         s.atomic_edit(ch, |c| {
             c.register(b"x", Scalar::Int(1));
@@ -71,7 +71,7 @@ fn an_atomic_edit_enqueues_the_whole_group() {
 #[test]
 fn a_recorded_group_enqueues_only_on_commit() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     s.begin_atomic(ch).unwrap();
     // Edits during recording emit empty batches — nothing to enqueue yet.
     assert!(ops_of(s.edit(ch, |c| c.register(b"x", Scalar::Int(1))).unwrap()).is_empty());
@@ -87,7 +87,7 @@ fn a_recorded_group_enqueues_only_on_commit() {
 #[test]
 fn accepted_prunes_ops_through_the_frontier() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let first = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     let second = ops_of(s.edit(ch, |c| c.register(b"b", Scalar::Int(2))).unwrap());
 
@@ -105,7 +105,7 @@ fn accepted_prunes_ops_through_the_frontier() {
 #[test]
 fn accepted_at_the_last_seq_drains_the_outbox() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let a = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     let b = ops_of(s.edit(ch, |c| c.register(b"b", Scalar::Int(2))).unwrap());
     let last = max_seq(&b).max(max_seq(&a));
@@ -121,7 +121,7 @@ fn accepted_at_the_last_seq_drains_the_outbox() {
 #[test]
 fn accepted_is_idempotent_and_a_stale_frontier_prunes_nothing_new() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let first = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     let second = ops_of(s.edit(ch, |c| c.register(b"b", Scalar::Int(2))).unwrap());
     let through = max_seq(&first);
@@ -143,7 +143,7 @@ fn accepted_is_idempotent_and_a_stale_frontier_prunes_nothing_new() {
 #[test]
 fn accepted_on_an_unheld_channel_is_rejected() {
     let mut s = ClientSession::new(cid(1));
-    s.subscribe(ROOM_A);
+    s.subscribe(ROOM_A).unwrap();
     let err = s.receive(Message::Accepted {
         channel: Channel(9),
         through: 0,
@@ -156,7 +156,7 @@ fn accepted_on_an_unheld_channel_is_rejected() {
 #[test]
 fn resend_reemits_the_unacked_tail() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let first = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     let second = ops_of(s.edit(ch, |c| c.register(b"b", Scalar::Int(2))).unwrap());
     s.receive(Message::Accepted {
@@ -178,7 +178,7 @@ fn resend_reemits_the_unacked_tail() {
 fn a_resent_tail_still_applies_on_a_peer() {
     // The tail a reconnect replays is ordinary ops a peer folds in.
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     s.edit(ch, |c| c.register(b"a", Scalar::Int(7))).unwrap();
 
     let resent = s.resend(ch).expect("outstanding ops");
@@ -197,7 +197,7 @@ fn a_resent_tail_still_applies_on_a_peer() {
 #[test]
 fn resend_after_a_full_ack_is_none() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let ops = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     s.receive(Message::Accepted {
         channel: ch,
@@ -210,7 +210,7 @@ fn resend_after_a_full_ack_is_none() {
 #[test]
 fn resend_on_a_fresh_room_is_none() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     assert!(s.resend(ch).is_none());
 }
 
@@ -230,7 +230,7 @@ fn seqs_of(ops: &[Op]) -> Vec<u64> {
 #[test]
 fn a_rejection_drains_the_named_ops_from_the_outbox() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let ops = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
 
     s.receive(Message::OpsRejected {
@@ -248,7 +248,7 @@ fn a_rejection_drains_the_named_ops_from_the_outbox() {
 #[test]
 fn a_rejection_leaves_the_unnamed_ops_outstanding() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let first = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     let second = ops_of(s.edit(ch, |c| c.register(b"b", Scalar::Int(2))).unwrap());
 
@@ -270,7 +270,7 @@ fn a_rejection_leaves_the_unnamed_ops_outstanding() {
 #[test]
 fn take_rejected_reports_the_ops_and_reason_once() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let ops = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
 
     s.receive(Message::OpsRejected {
@@ -296,7 +296,7 @@ fn take_rejected_reports_the_ops_and_reason_once() {
 #[test]
 fn take_rejected_is_empty_without_a_rejection() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap();
     assert!(s.take_rejected().is_empty());
 }
@@ -304,7 +304,7 @@ fn take_rejected_is_empty_without_a_rejection() {
 #[test]
 fn a_rejection_and_an_accepted_prune_independently() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let first = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     let second = ops_of(s.edit(ch, |c| c.register(b"b", Scalar::Int(2))).unwrap());
 
@@ -336,7 +336,7 @@ fn a_rejection_and_an_accepted_prune_independently() {
 #[test]
 fn a_rejection_on_an_unheld_channel_is_rejected() {
     let mut s = ClientSession::new(cid(1));
-    s.subscribe(ROOM_A);
+    s.subscribe(ROOM_A).unwrap();
     let err = s.receive(Message::OpsRejected {
         channel: Channel(9),
         seqs: vec![1],
@@ -348,8 +348,8 @@ fn a_rejection_on_an_unheld_channel_is_rejected() {
 #[test]
 fn rejections_across_channels_drain_together() {
     let mut s = ClientSession::new(cid(1));
-    let (a, _) = s.subscribe(ROOM_A);
-    let (b, _) = s.subscribe(ROOM_B);
+    let (a, _) = s.subscribe(ROOM_A).unwrap();
+    let (b, _) = s.subscribe(ROOM_B).unwrap();
     let a_ops = ops_of(s.edit(a, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     let b_ops = ops_of(s.edit(b, |c| c.register(b"b", Scalar::Int(2))).unwrap());
 
@@ -378,7 +378,7 @@ fn rejections_across_channels_drain_together() {
 #[test]
 fn inbound_peer_ops_do_not_touch_the_outbox() {
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap();
     let before = s.outbox_len(ch);
 
@@ -397,8 +397,8 @@ fn inbound_peer_ops_do_not_touch_the_outbox() {
 #[test]
 fn two_channels_keep_separate_outboxes() {
     let mut s = ClientSession::new(cid(1));
-    let (a, _) = s.subscribe(ROOM_A);
-    let (b, _) = s.subscribe(ROOM_B);
+    let (a, _) = s.subscribe(ROOM_A).unwrap();
+    let (b, _) = s.subscribe(ROOM_B).unwrap();
     let a_ops = ops_of(s.edit(a, |c| c.register(b"a", Scalar::Int(1))).unwrap());
     s.edit(b, |c| c.register(b"b", Scalar::Int(2))).unwrap();
 
@@ -418,7 +418,7 @@ fn the_outbox_survives_a_reconnect_and_resends() {
     // resume re-subscribes from the last-seen sequence and resend replays the
     // unacknowledged ops.
     let mut s = ClientSession::new(cid(1));
-    let (ch, _) = s.subscribe(ROOM_A);
+    let (ch, _) = s.subscribe(ROOM_A).unwrap();
     let authored = ops_of(s.edit(ch, |c| c.register(b"a", Scalar::Int(1))).unwrap());
 
     match s.resume(ch) {

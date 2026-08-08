@@ -33,6 +33,7 @@ __all__ = [
     "Branch",
     "Capability",
     "ChangeEvent",
+    "ChannelsExhausted",
     "Client",
     "CrdtList",
     "CrdtMap",
@@ -149,6 +150,19 @@ class ServerError(RuntimeError):
     def __init__(self, code: ErrorCode):
         super().__init__(f"server reported {code.name}")
         self.code = code
+
+
+class ChannelsExhausted(RuntimeError):
+    """A subscribe this session has no channel number left for. Numbers are
+    assigned in subscribe order and never recycled — each channel's replica
+    identity is derived from its number, so re-issuing a freed one would hand a
+    fresh replica the identity of ops the retired one still has in flight. The
+    session keeps every room it already holds; only a :class:`Client` under a
+    fresh client id has a fresh range, since the derivation is pure over the id
+    and the channel number."""
+
+    def __init__(self) -> None:
+        super().__init__("the session's channel numbers are exhausted")
 
 
 class Redirect(NamedTuple):
@@ -540,6 +554,15 @@ def _take_buf(buf: _CrdtBuf) -> bytes:
     data = ctypes.string_at(buf.ptr, buf.len)
     _LIB.crdtsync_buf_free(buf)
     return data
+
+
+def _assigned(channel: "ctypes.c_uint32", frame: bytes) -> Tuple[int, bytes]:
+    """The channel and Subscribe frame a subscribe produced. An empty frame is the
+    C ABI declining to assign one, leaving ``channel`` unwritten, which this
+    wrapper reads as a spent range."""
+    if not frame:
+        raise ChannelsExhausted()
+    return channel.value, frame
 
 
 def actor_key(actor: bytes) -> bytes:
@@ -1460,40 +1483,44 @@ class Client:
     # --- subscription lifecycle ---
 
     def subscribe(self, room: bytes) -> Tuple[int, bytes]:
-        """Join ``room`` on a fresh channel; return ``(channel, subscribe_frame)``."""
+        """Join ``room`` on a fresh channel; return ``(channel, subscribe_frame)``.
+        Raises :class:`ChannelsExhausted` once this session's channel numbers are
+        spent."""
         channel = ctypes.c_uint32()
         frame = _take_buf(
             _LIB.crdtsync_client_subscribe(
                 self._handle, room, len(room), ctypes.byref(channel)
             )
         )
-        return channel.value, frame
+        return _assigned(channel, frame)
 
     def subscribe_branch(self, room: bytes, branch: bytes) -> Tuple[int, bytes]:
         """Join ``branch`` of ``room`` on a fresh channel; return
         ``(channel, subscribe_frame)``. An empty ``branch`` is the default/active
-        branch, matching :meth:`subscribe`."""
+        branch, matching :meth:`subscribe`. Raises :class:`ChannelsExhausted` once
+        this session's channel numbers are spent."""
         channel = ctypes.c_uint32()
         frame = _take_buf(
             _LIB.crdtsync_client_subscribe_branch(
                 self._handle, room, len(room), branch, len(branch), ctypes.byref(channel)
             )
         )
-        return channel.value, frame
+        return _assigned(channel, frame)
 
     def subscribe_zone(self, room: bytes, zone: bytes) -> Tuple[int, bytes]:
         """Join ``room`` on a fresh channel scoped to one ``zone``; return
         ``(channel, subscribe_frame)``. An empty ``zone`` is the whole room (every
         zone the actor may read), matching :meth:`subscribe`; a named ``zone``
         narrows the stream to that partition plus the unzoned root it is entitled
-        to. Scoped to the default branch."""
+        to. Scoped to the default branch. Raises :class:`ChannelsExhausted` once
+        this session's channel numbers are spent."""
         channel = ctypes.c_uint32()
         frame = _take_buf(
             _LIB.crdtsync_client_subscribe_zone(
                 self._handle, room, len(room), zone, len(zone), ctypes.byref(channel)
             )
         )
-        return channel.value, frame
+        return _assigned(channel, frame)
 
     def resume(self, channel: int) -> bytes:
         """Re-issue Subscribe for a held channel from its caught-up position."""

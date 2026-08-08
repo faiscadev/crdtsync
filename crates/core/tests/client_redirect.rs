@@ -90,7 +90,7 @@ fn redirects_accumulate_across_rooms() {
 #[test]
 fn a_normal_frame_surfaces_no_redirect() {
     let mut session = ClientSession::new(cid(1));
-    let (channel, _sub) = session.subscribe(ROOM);
+    let (channel, _sub) = session.subscribe(ROOM).unwrap();
     session
         .receive(Message::Ops {
             channel,

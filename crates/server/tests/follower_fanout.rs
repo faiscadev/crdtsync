@@ -154,7 +154,7 @@ fn pump(r: &mut Registry, conn: ConnId, session: &mut ClientSession) -> Vec<Mess
 /// A subscribed client session on `r`'s `room`, its catch-up folded in.
 fn subscriber(r: &mut Registry, room: &[u8], id: u8) -> (ConnId, ClientSession, Channel) {
     let (conn, mut session) = client(r, cid(id));
-    let (channel, sub) = session.subscribe(room);
+    let (channel, sub) = session.subscribe(room).unwrap();
     assert!(r.deliver(conn, sub), "the subscribe is served");
     pump(r, conn, &mut session);
     (conn, session, channel)
@@ -337,8 +337,8 @@ fn every_channel_subscribed_on_the_follower_receives_the_replicated_write() {
     assert_eq!(replicate(&mut leader, &mut follower, peer), 1);
 
     let (conn, mut session) = client(&mut follower, cid(9));
-    let (first, sub_first) = session.subscribe(&room);
-    let (second, sub_second) = session.subscribe(&room);
+    let (first, sub_first) = session.subscribe(&room).unwrap();
+    let (second, sub_second) = session.subscribe(&room).unwrap();
     assert!(follower.deliver(conn, sub_first));
     assert!(follower.deliver(conn, sub_second));
     pump(&mut follower, conn, &mut session);
@@ -549,7 +549,7 @@ fn the_replication_fan_out_still_redacts_a_denied_subtree() {
     assert!(follower.deliver(conn, session.hello()));
     assert!(follower.deliver(conn, session.auth(BOB.as_bytes())));
     pump(&mut follower, conn, &mut session);
-    let (_, sub) = session.subscribe(&room);
+    let (_, sub) = session.subscribe(&room).unwrap();
     assert!(follower.deliver(conn, sub), "bob's follower read is served");
     pump(&mut follower, conn, &mut session);
 
@@ -605,7 +605,7 @@ fn a_wholly_denied_reader_gets_no_replication_frame_at_all() {
     assert!(follower.deliver(conn, session.hello()));
     assert!(follower.deliver(conn, session.auth(BOB.as_bytes())));
     pump(&mut follower, conn, &mut session);
-    let (_, sub) = session.subscribe(&room);
+    let (_, sub) = session.subscribe(&room).unwrap();
     let subscribed = follower.deliver(conn, sub);
     follower.take_outbox(conn);
     assert!(subscribed, "the connection survives bob's subscribe");
