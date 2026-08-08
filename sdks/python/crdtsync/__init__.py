@@ -2076,7 +2076,13 @@ class Client:
         """Whether an edit on ``channel`` was refused for want of an id during the
         intention most recently opened there. Per channel, because each channel
         holds its own replica minting under its own identity; ``False`` for a
-        channel this session does not hold."""
+        channel this session does not hold.
+
+        Latched for the whole intention, as the per-document reading is: an atomic
+        group is one intention, so a refusal inside one stays raised across the
+        edits that follow it and across the commit, and clears when the next
+        intention opens. Read it straight after the edit it is meant to answer
+        for."""
         _u32("channel", channel)
         return _LIB.crdtsync_client_mint_refused(self._handle, channel) == 1
 
