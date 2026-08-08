@@ -48,7 +48,7 @@ pub mod undo;
 
 pub use acl::{AclEffect, AclGrant, AclScope, AclSubject, AclTuple, Capability};
 pub use anchor::RelativePosition;
-pub use client::{ClientError, ClientSession, Redirect, Rejected};
+pub use client::{ClientError, ClientSession, Redirect, Rejected, SubscribeError};
 pub use clientid::ClientId;
 pub use codec::{decode_op, decode_ops, encode_op, encode_ops, DecodeError};
 pub use counter::Counter;

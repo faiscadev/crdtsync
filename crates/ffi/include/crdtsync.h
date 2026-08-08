@@ -743,7 +743,10 @@ int32_t crdtsync_client_active_schema(const CrdtClient *client, CrdtBuf *out);
 CrdtBuf crdtsync_client_hello(const CrdtClient *client);
 
 // Join `room` on a fresh channel, writing the assigned channel to `out_channel`
-// and returning the Subscribe frame to send. Empty on a bad handle or input.
+// and returning the Subscribe frame to send. Empty — leaving `out_channel`
+// untouched — on a bad handle or input, or once the session's channel numbers
+// are spent; channel numbers are never recycled, so an exhausted session joins
+// no further rooms and keeps the ones it holds.
 //
 // # Safety
 // `client` is a live handle; `room`/`room_len` follow [`as_slice`];
@@ -755,8 +758,9 @@ CrdtBuf crdtsync_client_subscribe(CrdtClient *client,
 
 // Join `branch` of `room` on a fresh channel, writing the assigned channel to
 // `out_channel` and returning the Subscribe frame to send. An empty `branch` is
-// the default/active branch, matching [`crdtsync_client_subscribe`]. Empty on a
-// bad handle or input.
+// the default/active branch, matching [`crdtsync_client_subscribe`]. Empty —
+// leaving `out_channel` untouched — on a bad handle or input, or once the
+// session's channel numbers are spent.
 //
 // # Safety
 // `client` is a live handle; `room`/`room_len` and `branch`/`branch_len` follow
@@ -772,8 +776,9 @@ CrdtBuf crdtsync_client_subscribe_branch(CrdtClient *client,
 // channel to `out_channel` and returning the Subscribe frame to send. An empty
 // `zone` is the whole room (every zone the actor may read), matching
 // [`crdtsync_client_subscribe`]; a named `zone` narrows the stream to that
-// partition plus the unzoned root it is entitled to. Empty on a bad handle or
-// input.
+// partition plus the unzoned root it is entitled to. Empty — leaving
+// `out_channel` untouched — on a bad handle or input, or once the session's
+// channel numbers are spent.
 //
 // # Safety
 // `client` is a live handle; `room`/`room_len` and `zone`/`zone_len` follow

@@ -509,7 +509,7 @@ fn the_author_outbox_drains_against_the_server_ack() {
     st(&mut h, &mut s, sub(ROOM, 0));
 
     let mut client = ClientSession::new(cid(1));
-    let (ch, _) = client.subscribe(ROOM);
+    let (ch, _) = client.subscribe(ROOM).unwrap();
     let outbound = client
         .edit(ch, |c| c.register(b"age", Scalar::Int(30)))
         .unwrap();

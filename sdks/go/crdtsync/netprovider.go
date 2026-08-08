@@ -300,7 +300,12 @@ func NewNetProvider(url, room string, opts ProviderOptions) (*NetProvider, error
 	if p.catchupTimeout == 0 {
 		p.catchupTimeout = 5 * time.Minute
 	}
-	p.channel, p.subscribeFrame = client.Subscribe(p.room)
+	channel, subscribeFrame, err := client.Subscribe(p.room)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+	p.channel, p.subscribeFrame = channel, subscribeFrame
 	p.doc = newNetworkedDoc(NewClientBackend(client, p.channel), p.sendFrame)
 
 	go p.openSocket(0)

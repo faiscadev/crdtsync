@@ -569,8 +569,8 @@ fn two_channels_of_one_room_each_read_back_their_own_diff() {
     // reachable. Its channels are the ones the server subscribes and answers on, so
     // each reply lands where the session holds it.
     let mut session = ClientSession::new(cid(1));
-    let (wide_ch, _) = session.subscribe(ROOM);
-    let (narrow_ch, _) = session.subscribe_zone(ROOM, b"za");
+    let (wide_ch, _) = session.subscribe(ROOM).unwrap();
+    let (narrow_ch, _) = session.subscribe_zone(ROOM, b"za").unwrap();
     // The fixture already bound the wide channel, and a Subscribe on a bound channel
     // is a protocol violation, so it cannot be re-bound to the number this session
     // minted — the guard states the coupling instead of hiding it.

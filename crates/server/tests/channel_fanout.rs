@@ -89,8 +89,8 @@ fn ops_on(msgs: &[Message], channel: Channel) -> Vec<Op> {
 /// A connection holding two channels on `ROOM`, its subscribe replies folded in.
 fn two_channels(r: &mut Registry) -> (ConnId, ClientSession, Channel, Channel) {
     let (conn, mut session) = client(r, cid(1));
-    let (a, sub_a) = session.subscribe(ROOM);
-    let (b, sub_b) = session.subscribe(ROOM);
+    let (a, sub_a) = session.subscribe(ROOM).unwrap();
+    let (b, sub_b) = session.subscribe(ROOM).unwrap();
     assert!(r.deliver(conn, sub_a));
     assert!(r.deliver(conn, sub_b));
     pump(r, conn, &mut session);
@@ -161,7 +161,7 @@ fn the_authoring_channel_is_not_echoed_its_own_write() {
 fn a_single_channel_connection_is_not_echoed_its_own_write() {
     let mut r = registry();
     let (conn, mut session) = client(&mut r, cid(1));
-    let (a, sub) = session.subscribe(ROOM);
+    let (a, sub) = session.subscribe(ROOM).unwrap();
     assert!(r.deliver(conn, sub));
     pump(&mut r, conn, &mut session);
 
@@ -182,7 +182,7 @@ fn a_peer_connection_still_receives_the_write() {
     let mut r = registry();
     let (conn, mut session, a, _b) = two_channels(&mut r);
     let (peer_conn, mut peer) = client(&mut r, cid(2));
-    let (p, sub) = peer.subscribe(ROOM);
+    let (p, sub) = peer.subscribe(ROOM).unwrap();
     assert!(r.deliver(peer_conn, sub));
     pump(&mut r, peer_conn, &mut peer);
 
@@ -204,8 +204,8 @@ fn a_peer_connection_still_receives_the_write() {
 fn a_sibling_channel_on_another_room_receives_nothing() {
     let mut r = registry();
     let (conn, mut session) = client(&mut r, cid(1));
-    let (a, sub_a) = session.subscribe(ROOM);
-    let (b, sub_b) = session.subscribe(OTHER_ROOM);
+    let (a, sub_a) = session.subscribe(ROOM).unwrap();
+    let (b, sub_b) = session.subscribe(OTHER_ROOM).unwrap();
     assert!(r.deliver(conn, sub_a));
     assert!(r.deliver(conn, sub_b));
     pump(&mut r, conn, &mut session);
@@ -226,7 +226,7 @@ fn a_sibling_channel_on_another_room_receives_nothing() {
 fn a_sibling_channel_on_another_branch_receives_nothing() {
     let mut r = registry();
     let (conn, mut session) = client(&mut r, cid(1));
-    let (a, sub_a) = session.subscribe(ROOM);
+    let (a, sub_a) = session.subscribe(ROOM).unwrap();
     assert!(r.deliver(conn, sub_a));
     pump(&mut r, conn, &mut session);
     // The room must exist before a branch can fork off it, so `a` bootstraps it.
@@ -235,7 +235,7 @@ fn a_sibling_channel_on_another_branch_receives_nothing() {
         .expect("the channel is subscribed");
     assert!(r.deliver(conn, seed));
     assert!(r.deliver(conn, session.fork_branch(ROOM, BRANCH, b"main")));
-    let (b, sub_b) = session.subscribe_branch(ROOM, BRANCH);
+    let (b, sub_b) = session.subscribe_branch(ROOM, BRANCH).unwrap();
     assert!(r.deliver(conn, sub_b));
     pump(&mut r, conn, &mut session);
 
@@ -352,7 +352,7 @@ fn awareness_still_reaches_a_peer_connection() {
     let mut r = registry();
     let (conn, mut session, a, _b) = two_channels(&mut r);
     let (peer_conn, mut peer) = client(&mut r, cid(2));
-    let (p, sub) = peer.subscribe(ROOM);
+    let (p, sub) = peer.subscribe(ROOM).unwrap();
     assert!(r.deliver(peer_conn, sub));
     pump(&mut r, peer_conn, &mut peer);
 

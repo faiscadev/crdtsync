@@ -407,7 +407,7 @@ fn bob_session(r: &mut Registry, credential: &[u8]) -> (ClientSession, ConnId, C
     let conn = r.connect();
     assert!(r.deliver(conn, session.hello()));
     assert!(r.deliver(conn, session.auth(credential)));
-    let (channel, subscribe) = session.subscribe(ROOM);
+    let (channel, subscribe) = session.subscribe(ROOM).unwrap();
     assert!(r.deliver(conn, subscribe));
     for reply in r.take_outbox(conn) {
         session
@@ -502,7 +502,7 @@ fn a_partial_readers_snapshot_names_no_other_replicas_ids() {
     let mut probe = ClientSession::new(cid(2));
     assert!(r.deliver(back, probe.hello()));
     assert!(r.deliver(back, probe.auth(b"t-bob2")));
-    let (_, subscribe) = probe.subscribe(ROOM);
+    let (_, subscribe) = probe.subscribe(ROOM).unwrap();
     assert!(r.deliver(back, subscribe));
     let state = snapshot_in(r.take_outbox(back)).expect("a below-floor join is served a snapshot");
     let projected = Document::decode_state(&state).expect("decodes");
@@ -530,7 +530,7 @@ fn a_restarted_reader_does_not_re_mint_on_a_second_channel() {
     assert!(r.deliver(conn, bob.hello()));
     assert!(r.deliver(conn, bob.auth(b"t-bob")));
     for _ in 0..2 {
-        let (_, subscribe) = bob.subscribe(ROOM);
+        let (_, subscribe) = bob.subscribe(ROOM).unwrap();
         assert!(r.deliver(conn, subscribe));
     }
     drain_into(&mut r, conn, &mut bob);
@@ -566,7 +566,7 @@ fn a_restarted_reader_does_not_re_mint_on_a_second_channel() {
     assert!(r.deliver(conn2, back.hello()));
     assert!(r.deliver(conn2, back.auth(b"t-bob2")));
     for _ in 0..2 {
-        let (_, subscribe) = back.subscribe(ROOM);
+        let (_, subscribe) = back.subscribe(ROOM).unwrap();
         assert!(r.deliver(conn2, subscribe));
     }
     drain_into(&mut r, conn2, &mut back);

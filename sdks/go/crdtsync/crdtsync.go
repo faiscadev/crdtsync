@@ -739,34 +739,55 @@ func (c *Client) Actor() ([]byte, bool) {
 	return takeBuf(out), true
 }
 
-// Subscribe joins room on a fresh channel; returns the channel and the frame.
-func (c *Client) Subscribe(room []byte) (uint32, []byte) {
+// ErrChannelsExhausted is returned by a subscribe the session has no channel
+// number left for. Numbers are assigned in subscribe order and never recycled —
+// each channel's replica identity is derived from its number, so re-issuing a
+// freed one would hand a fresh replica the identity of ops the retired one still
+// has in flight. The session keeps every room it already holds; only a Client
+// under a fresh client id has a fresh range, since the derivation is pure over
+// the id and the channel number.
+var ErrChannelsExhausted = errors.New("the session's channel numbers are exhausted")
+
+// assigned reports the channel and Subscribe frame a subscribe produced. The
+// core signals its refusal with an empty frame, leaving the channel unwritten.
+func assigned(channel uint32, frame []byte) (uint32, []byte, error) {
+	if len(frame) == 0 {
+		return 0, nil, ErrChannelsExhausted
+	}
+	return channel, frame, nil
+}
+
+// Subscribe joins room on a fresh channel; returns the channel and the frame,
+// or ErrChannelsExhausted once the session's channel numbers are spent.
+func (c *Client) Subscribe(room []byte) (uint32, []byte, error) {
 	rp, rl := bytesArg(room)
 	var channel C.uint32_t
 	frame := takeBuf(C.crdtsync_client_subscribe(c.h, rp, rl, &channel))
-	return uint32(channel), frame
+	return assigned(uint32(channel), frame)
 }
 
 // SubscribeBranch joins branch of room on a fresh channel; returns the channel
 // and the frame. An empty branch is the default/active branch, as Subscribe.
-func (c *Client) SubscribeBranch(room, branch []byte) (uint32, []byte) {
+// ErrChannelsExhausted once the session's channel numbers are spent.
+func (c *Client) SubscribeBranch(room, branch []byte) (uint32, []byte, error) {
 	rp, rl := bytesArg(room)
 	bp, bl := bytesArg(branch)
 	var channel C.uint32_t
 	frame := takeBuf(C.crdtsync_client_subscribe_branch(c.h, rp, rl, bp, bl, &channel))
-	return uint32(channel), frame
+	return assigned(uint32(channel), frame)
 }
 
 // SubscribeZone joins room on a fresh channel scoped to one zone; returns the
 // channel and the frame. An empty zone is the whole room (every zone the actor
 // may read), as Subscribe; a named zone narrows the stream to that partition
 // plus the unzoned root it is entitled to. Scoped to the default branch.
-func (c *Client) SubscribeZone(room, zone []byte) (uint32, []byte) {
+// ErrChannelsExhausted once the session's channel numbers are spent.
+func (c *Client) SubscribeZone(room, zone []byte) (uint32, []byte, error) {
 	rp, rl := bytesArg(room)
 	zp, zl := bytesArg(zone)
 	var channel C.uint32_t
 	frame := takeBuf(C.crdtsync_client_subscribe_zone(c.h, rp, rl, zp, zl, &channel))
-	return uint32(channel), frame
+	return assigned(uint32(channel), frame)
 }
 
 // Resume re-issues Subscribe for a held channel from its caught-up position.

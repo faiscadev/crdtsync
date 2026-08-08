@@ -1,7 +1,12 @@
 """The Python SDK drives the wire client over the C ABI: a local edit produces a
 frame a peer folds in and converges on, and the handshake surface marshals."""
 
+import ctypes
+
+import pytest
+
 from crdtsync import (
+    ChannelsExhausted,
     Client,
     DiffKind,
     Document,
@@ -10,6 +15,7 @@ from crdtsync import (
     Rejected,
     ServerError,
     Side,
+    _assigned,
 )
 
 
@@ -109,6 +115,14 @@ def test_awareness_publish_and_lifecycle():
         assert len(a.unsubscribe(ch)) > 0
         assert a.last_seen_seq(ch) is None
         assert a.resume(ch) == b""
+
+
+def test_subscribe_surfaces_the_cores_refusal_as_an_exception():
+    # The core refuses a subscribe with an empty frame, leaving the channel
+    # unwritten — the only way it declines to assign one is a spent range.
+    with pytest.raises(ChannelsExhausted):
+        _assigned(ctypes.c_uint32(0), b"")
+    assert _assigned(ctypes.c_uint32(3), b"\x01\x02") == (3, b"\x01\x02")
 
 
 def test_subscribe_branch_carries_the_named_branch():

@@ -1971,7 +1971,10 @@ pub unsafe extern "C" fn crdtsync_client_hello(client: *const CrdtClient) -> Crd
 }
 
 /// Join `room` on a fresh channel, writing the assigned channel to `out_channel`
-/// and returning the Subscribe frame to send. Empty on a bad handle or input.
+/// and returning the Subscribe frame to send. Empty — leaving `out_channel`
+/// untouched — on a bad handle or input, or once the session's channel numbers
+/// are spent; channel numbers are never recycled, so an exhausted session joins
+/// no further rooms and keeps the ones it holds.
 ///
 /// # Safety
 /// `client` is a live handle; `room`/`room_len` follow [`as_slice`];
@@ -1990,7 +1993,9 @@ pub unsafe extern "C" fn crdtsync_client_subscribe(
         let Some(r) = as_slice(room, room_len) else {
             return CrdtBuf::empty();
         };
-        let (channel, msg) = (*client).session.subscribe(r);
+        let Ok((channel, msg)) = (*client).session.subscribe(r) else {
+            return CrdtBuf::empty();
+        };
         *out_channel = channel.0;
         CrdtBuf::from_vec(encode_message(&msg))
     }))
@@ -1999,8 +2004,9 @@ pub unsafe extern "C" fn crdtsync_client_subscribe(
 
 /// Join `branch` of `room` on a fresh channel, writing the assigned channel to
 /// `out_channel` and returning the Subscribe frame to send. An empty `branch` is
-/// the default/active branch, matching [`crdtsync_client_subscribe`]. Empty on a
-/// bad handle or input.
+/// the default/active branch, matching [`crdtsync_client_subscribe`]. Empty —
+/// leaving `out_channel` untouched — on a bad handle or input, or once the
+/// session's channel numbers are spent.
 ///
 /// # Safety
 /// `client` is a live handle; `room`/`room_len` and `branch`/`branch_len` follow
@@ -2021,7 +2027,9 @@ pub unsafe extern "C" fn crdtsync_client_subscribe_branch(
         let (Some(r), Some(b)) = (as_slice(room, room_len), as_slice(branch, branch_len)) else {
             return CrdtBuf::empty();
         };
-        let (channel, msg) = (*client).session.subscribe_branch(r, b);
+        let Ok((channel, msg)) = (*client).session.subscribe_branch(r, b) else {
+            return CrdtBuf::empty();
+        };
         *out_channel = channel.0;
         CrdtBuf::from_vec(encode_message(&msg))
     }))
@@ -2032,8 +2040,9 @@ pub unsafe extern "C" fn crdtsync_client_subscribe_branch(
 /// channel to `out_channel` and returning the Subscribe frame to send. An empty
 /// `zone` is the whole room (every zone the actor may read), matching
 /// [`crdtsync_client_subscribe`]; a named `zone` narrows the stream to that
-/// partition plus the unzoned root it is entitled to. Empty on a bad handle or
-/// input.
+/// partition plus the unzoned root it is entitled to. Empty — leaving
+/// `out_channel` untouched — on a bad handle or input, or once the session's
+/// channel numbers are spent.
 ///
 /// # Safety
 /// `client` is a live handle; `room`/`room_len` and `zone`/`zone_len` follow
@@ -2054,7 +2063,9 @@ pub unsafe extern "C" fn crdtsync_client_subscribe_zone(
         let (Some(r), Some(z)) = (as_slice(room, room_len), as_slice(zone, zone_len)) else {
             return CrdtBuf::empty();
         };
-        let (channel, msg) = (*client).session.subscribe_zone(r, z);
+        let Ok((channel, msg)) = (*client).session.subscribe_zone(r, z) else {
+            return CrdtBuf::empty();
+        };
         *out_channel = channel.0;
         CrdtBuf::from_vec(encode_message(&msg))
     }))

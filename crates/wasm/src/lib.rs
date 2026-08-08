@@ -18,7 +18,7 @@ use crdtsync_core::{
     decode_message, decode_ops, encode_message, encode_op, encode_ops, path, AclEffect, AclGrant,
     AclSubject, BlobRef, BranchInfo, Capability, Channel, ClientError, ClientId, ClientSession,
     DiffKind, Document, ErrorCode as CoreErrorCode, Host, Message, Redirect, Rejected,
-    RelativePosition, Scalar,
+    RelativePosition, Scalar, SubscribeError,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -813,6 +813,18 @@ impl WasmSubscription {
     }
 }
 
+/// The channel and encoded frame a core subscribe produced, or the JS error a
+/// refusal throws as.
+fn subscription(
+    assigned: Result<(Channel, Message), SubscribeError>,
+) -> Result<WasmSubscription, JsError> {
+    let (channel, msg) = assigned.map_err(|e| JsError::new(&format!("{e:?}")))?;
+    Ok(WasmSubscription {
+        channel: channel.0,
+        frame: encode_message(&msg),
+    })
+}
+
 /// A wire client session for one 16-byte client id. It holds a replica per
 /// subscribed room and turns local edits into wire frames to send; [`receive`]
 /// folds a peer's frame back in. A room is addressed by the channel
@@ -949,38 +961,37 @@ impl WasmClient {
     }
 
     /// Join `room` on a fresh channel; returns the channel and Subscribe frame.
-    pub fn subscribe(&mut self, room: &[u8]) -> WasmSubscription {
-        let (channel, msg) = self.inner.subscribe(room);
-        WasmSubscription {
-            channel: channel.0,
-            frame: encode_message(&msg),
-        }
+    /// Throws once the session's channel numbers are spent — they are never
+    /// recycled, since each channel's replica identity is derived from its
+    /// number.
+    pub fn subscribe(&mut self, room: &[u8]) -> Result<WasmSubscription, JsError> {
+        subscription(self.inner.subscribe(room))
     }
 
     /// Join `branch` of `room` on a fresh channel; returns the channel and
     /// Subscribe frame. An empty `branch` is the default/active branch, as
-    /// `subscribe`.
+    /// `subscribe`. Throws once the session's channel numbers are spent.
     #[wasm_bindgen(js_name = subscribeBranch)]
-    pub fn subscribe_branch(&mut self, room: &[u8], branch: &[u8]) -> WasmSubscription {
-        let (channel, msg) = self.inner.subscribe_branch(room, branch);
-        WasmSubscription {
-            channel: channel.0,
-            frame: encode_message(&msg),
-        }
+    pub fn subscribe_branch(
+        &mut self,
+        room: &[u8],
+        branch: &[u8],
+    ) -> Result<WasmSubscription, JsError> {
+        subscription(self.inner.subscribe_branch(room, branch))
     }
 
     /// Join `room` on a fresh channel scoped to one `zone`; returns the channel
     /// and Subscribe frame. An empty `zone` is the whole room (every zone the
     /// actor may read), as `subscribe`; a named `zone` narrows the stream to that
     /// partition plus the unzoned root it is entitled to. Scoped to the default
-    /// branch.
+    /// branch. Throws once the session's channel numbers are spent.
     #[wasm_bindgen(js_name = subscribeZone)]
-    pub fn subscribe_zone(&mut self, room: &[u8], zone: &[u8]) -> WasmSubscription {
-        let (channel, msg) = self.inner.subscribe_zone(room, zone);
-        WasmSubscription {
-            channel: channel.0,
-            frame: encode_message(&msg),
-        }
+    pub fn subscribe_zone(
+        &mut self,
+        room: &[u8],
+        zone: &[u8],
+    ) -> Result<WasmSubscription, JsError> {
+        subscription(self.inner.subscribe_zone(room, zone))
     }
 
     /// Re-issue Subscribe for a held channel from its caught-up position; `None`
