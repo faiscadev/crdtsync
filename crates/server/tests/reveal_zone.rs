@@ -70,7 +70,12 @@ fn registry() -> Registry {
     let mut r = Registry::new(cid(0xFF));
     r.set_schema_registry(Arc::new(Mutex::new(sr)));
     let mut t = StaticTokens::new();
-    for (cred, actor) in [("t-alice", "alice"), ("t-bob", "bob"), ("t-carol", "carol")] {
+    for (cred, actor) in [
+        ("t-alice", "alice"),
+        ("t-bob", "bob"),
+        ("t-bob2", "bob"),
+        ("t-carol", "carol"),
+    ] {
         t.insert(cred.as_bytes().to_vec(), actor.as_bytes().to_vec());
     }
     r.set_verifier(Box::new(t));
@@ -389,9 +394,12 @@ fn a_zone_scoped_reader_revealed_a_moved_node_receives_the_batchs_own_content_to
         edit.zone, place.zone,
         "the edit inside the card and the move that places it must carry different partitions",
     );
+    // One `atomic_transact`, two groups: a commit closes one atomic transaction per
+    // partition its ops fall in (C2), so the edit and the move never shared a count and
+    // the co-travel is the only thing keeping them on one channel.
     assert!(
-        edit.tx.is_some() && edit.tx == place.tx,
-        "the fixture's two ops are one atomic group",
+        edit.tx.is_some() && place.tx.is_some() && edit.tx != place.tx,
+        "the fixture's two ops are one commit cut into one group per partition",
     );
     cross_zone(&mut r, alice, batch, tok);
 
@@ -412,7 +420,7 @@ fn a_zone_scoped_reader_revealed_a_moved_node_receives_the_batchs_own_content_to
     );
     assert_eq!(
         delivered.tx, edit.tx,
-        "co-travelling leaves the transaction whole rather than destranding it",
+        "the surviving copy keeps its own group rather than being destranded",
     );
     for op in &revealed {
         replica.apply(op);
@@ -478,7 +486,7 @@ fn a_nested_reveals_inner_shell_rides_the_partition_its_subtree_lands_in() {
 }
 
 #[test]
-fn a_reader_the_reveal_does_not_fire_for_receives_the_batch_unaltered() {
+fn a_reader_the_reveal_does_not_fire_for_is_not_re_stamped() {
     // The co-travel rewrite is scoped to a recipient a reveal actually fires for. carol
     // reads the whole document, so no node is born denied to her and she is revealed
     // nothing; every op her za channel admits carries the partition its author stamped
@@ -505,5 +513,29 @@ fn a_reader_the_reveal_does_not_fire_for_receives_the_batch_unaltered() {
         got.iter().find(|op| op.id == edit.id).map(|op| op.zone),
         Some(edit.zone),
         "the op reaches the za channel in the partition its author stamped",
+    );
+}
+
+#[test]
+fn a_channel_scoped_to_the_partition_a_revealed_node_leaves_is_told_nothing_of_it() {
+    // The other side of the co-travel, and the direction it fails in. bob holds a second
+    // connection scoped to za — the partition the card is leaving. The reveal fires for
+    // his identity, so the shell, the back-fill and the batch's own edit all ride zb and
+    // his za channel admits none of them. He is told nothing about a node that has left
+    // his partition, rather than handed content for a node he can never place.
+    let (mut r, mut doc, alice, t) = seeded();
+    let origin = auth(&mut r, 4, "t-bob2");
+    subscribe(&mut r, origin, b"za");
+
+    let tok = token(&mut r, alice, t.card, b"zb");
+    let batch = doc.atomic_transact(|tx| {
+        tx.move_xml(t.pin, t.card, 0);
+        tx.move_xml(t.card, t.dest, 0);
+    });
+    cross_zone(&mut r, alice, batch, tok);
+
+    assert!(
+        received_ops(&mut r, origin).is_empty(),
+        "the origin-scoped channel is told nothing of the departed node",
     );
 }

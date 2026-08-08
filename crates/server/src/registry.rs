@@ -2123,7 +2123,7 @@ impl Registry {
         // tree this stream serves now the batch is folded. A reveal shell, its
         // back-filled content, and the batch's own copy of any op that content covers
         // all ride that one partition, so the per-channel zone filter takes a revealed
-        // node's shell and its contents together or not at all.
+        // node's shell and the content the back-fill reaches together or not at all.
         //
         // The landing partition, not the move op's own — an op's envelope carries the
         // partition its author resolved when it was emitted, which for a move emitted
@@ -2308,8 +2308,9 @@ impl Registry {
                                 // back-fill already stamped it; the map is read against
                                 // the batch alone, so an entry for the second is inert.
                                 // First shell wins, matching the copy `carried` kept —
-                                // and nested shells agree anyway, a node inside a
-                                // relocated subtree landing where the subtree lands.
+                                // and nested shells agree anyway, since the path index
+                                // does not extend through an XML subtree, so every node
+                                // inside one shares its holding slot's partition.
                                 co_travel.entry(op.id).or_insert(zone);
                             }
                         }
