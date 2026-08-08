@@ -2982,12 +2982,16 @@ impl Document {
                 _ => continue,
             };
             let id = TxId::derive(seqs);
-            self.resolve_tx((self.client, id));
+            // The keys are recorded together and released once below: releasing is a
+            // scan of the buffer against the whole resolved set, so running it per
+            // partition would re-scan for an answer only the union decides.
+            self.resolved_tx.insert((self.client, id));
             tags.insert(zone, Tx { id, count });
         }
         if tags.is_empty() {
             return ops;
         }
+        self.untag_resolved();
         // Spending a key releases what it held, and a released member applies on the
         // drain — never on whenever the next unrelated arrival happens to run one.
         self.drain_buffer();

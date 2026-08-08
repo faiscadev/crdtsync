@@ -288,6 +288,10 @@ fn a_zone_scoped_subscriber_receives_its_partitions_group_whole() {
             .collect::<Vec<_>>(),
     );
     let (last, held) = delivered.split_last().expect("the group has members");
+    // The zb group is multi-member — its create rides beside its insert — so the
+    // hold below is a real one. Asserted rather than assumed: a one-member group
+    // completes on arrival and would make the loop vacuous.
+    assert!(!held.is_empty(), "the group has a member to hold");
     for op in held {
         assert!(!b.apply(op), "an incomplete group applies nothing");
     }
