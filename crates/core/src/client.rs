@@ -393,8 +393,11 @@ impl ClientSession {
     /// Like [`edit`](Self::edit), but the emitted ops form an atomic transaction:
     /// a peer folds them in all-or-nothing, never observing a partial group. Edits
     /// spanning two zones form one transaction per zone, since a transaction stays
-    /// inside one zone (ARCHITECTURE §Scope Constraints), so a zone-scoped peer
-    /// receives whole the group it is served. The ops travel as an ordinary
+    /// inside one zone (ARCHITECTURE §Scope Constraints), so a peer whose
+    /// subscription cuts on zone receives whole the group it is served. A seam that
+    /// cuts on some other dimension — the doc-ACL read filter, or a relay that
+    /// re-stamps a partition — still splits a group, and destrands what it splits.
+    /// The ops travel as an ordinary
     /// `Message::Ops` — the transaction membership rides on the ops themselves.
     /// `None` if the channel isn't held.
     pub fn atomic_edit<F>(&mut self, channel: Channel, f: F) -> Option<Message>

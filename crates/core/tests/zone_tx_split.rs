@@ -13,7 +13,8 @@
 //! partitions, so its filter withholds the other zone's members and destrands (C11)
 //! what is left; a group straddling the cut therefore loses its atomic view at exactly
 //! the recipients zones exist to serve, while a full-doc subscriber keeps it. Cut to
-//! partitions, every recipient the emitter serves holds a group whole or not at all.
+//! partitions, every recipient whose subscription cuts on zone holds a group whole or
+//! not at all.
 //!
 //! What a straddling commit gives up is atomicity *across* the zones, which
 //! §Not Shipped never offered; what it keeps is every edit and per-zone atomicity.

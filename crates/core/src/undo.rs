@@ -19,8 +19,10 @@
 //! An undo step is one *intention* — the edits of a single transact, of an
 //! explicit [`Document::begin_intention`] group, or of one atomic transaction,
 //! which undoes and redoes atomically in turn: as one transaction, or as one per
-//! zone partition where the intention spans several, exactly as the forward edits
-//! were emitted (ARCHITECTURE §Scope Constraints). Replaying an
+//! zone partition its inverses fall in, since a transaction stays inside one zone
+//! (ARCHITECTURE §Scope Constraints). The partitions are resolved against live state
+//! at replay, so a region that has since crossed a zone cuts the undo differently
+//! from the commit (C84). Replaying an
 //! intention emits ordinary forward ops, and those ops are themselves recorded,
 //! so the mirror intention that would undo the undo is derived from live state
 //! rather than guessed at record time — which is what makes undo and redo
@@ -140,7 +142,7 @@ pub(crate) enum Step {
 /// records that they were made as an atomic transaction, so the undo (and the
 /// redo) replays through the same commit seam — a peer never sees a partially
 /// undone group, and an intention spanning two zones undoes as one group per
-/// partition just as it was emitted.
+/// partition its inverses fall in.
 pub(crate) struct Intention {
     pub(crate) origin: Vec<u8>,
     pub(crate) steps: Vec<Step>,

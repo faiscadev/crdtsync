@@ -654,9 +654,12 @@ fn an_emitters_cross_zone_commit_reaches_a_zone_subscriber_atomically() {
         za_doc.apply(op);
     }
     assert_eq!(
-        zoned_int(&za_doc, b"board", b"bk"),
-        None,
-        "the partial group is invisible"
+        (
+            zoned_int(&za_doc, b"board", b"bk"),
+            zoned_int(&za_doc, b"board", b"bk2")
+        ),
+        (None, None),
+        "the partial group is invisible, whichever member the batch ends on"
     );
     za_doc.apply(last);
     assert_eq!(zoned_int(&za_doc, b"board", b"bk"), Some(2));

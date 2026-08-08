@@ -2946,8 +2946,8 @@ impl Document {
     /// A group is only ever received whole by a subscriber admitted to every
     /// partition it spans, since a zone-scoped subscription withholds the other
     /// partitions' members and [destrands](crate::destrand_split) the survivors —
-    /// so a group cut to a partition is one every recipient this replica serves
-    /// holds whole or not at all. What a straddling commit gives up is atomicity
+    /// so a group cut to a partition is one every recipient whose
+    /// subscription cuts on *zone* holds whole or not at all. What a straddling commit gives up is atomicity
     /// *across* the zones, which is the thing never offered; what it keeps is every
     /// edit, and per-zone atomicity where the constraint holds. The cut is the
     /// emitter's, not a property of the whole path: a relay that re-stamps an op's
