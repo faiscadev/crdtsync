@@ -7,9 +7,10 @@
 //! container-create, the anchored sequences' for an annotation and the scope's for an
 //! ACL tuple — so an edit in one zone never advances another's. Two zones' ops are
 //! therefore concurrent by construction — no false causal edge crosses the boundary —
-//! while causal order within a zone is intact. With no schema, or a schema with no zones, every op is in the one
-//! root partition, exactly as before zones. Convergence holds over both the
-//! observable state and the per-zone clocks, and a snapshot round-trips them.
+//! while causal order within a zone is intact. With no schema, or a schema with no
+//! zones, every op is in the one root partition, exactly as before zones. Convergence
+//! holds over both the observable state and the per-zone clocks, and a snapshot
+//! round-trips them.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::op::Op;
