@@ -1705,7 +1705,9 @@ impl Hub {
             .unwrap_or_default();
         self.install_room_state(dst, &state, None, creator)?;
         if let Some(room) = self.rooms.get_mut(dst) {
-            room.client_actors.extend(claims);
+            for (client, actor) in claims {
+                room.client_actors.entry(client).or_insert(actor);
+            }
         }
         let _ = self.persist_meta(dst);
         match self.governing.get(src).cloned() {

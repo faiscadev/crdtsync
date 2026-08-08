@@ -266,11 +266,13 @@ pub struct Document {
     /// ran.
     ///
     /// One rule follows and is the reason clearing is on the opening side alone: an
-    /// atomic group nested inside an explicit intention **joins** that intention, so
-    /// neither opening nor closing the group is an intention boundary and the latch
-    /// spans the whole of the outer one. Clearing at a nested `commit_atomic` would
+    /// atomic group nested inside an explicit intention **joins** that intention for
+    /// the purpose of the mint, so the latch spans the whole of the outer one and
+    /// neither end of the group clears it. Clearing at a nested `commit_atomic` would
     /// hand the mint a fresh answer mid-intention, which is exactly what
     /// [`begin_atomic`](Self::begin_atomic) is already guarded against on the way in.
+    /// The undo history draws its own boundary at that same point and is not this
+    /// field's concern.
     mint_refused: bool,
     seq: u64,
     /// When recording an atomic transaction (between `begin_atomic` and

@@ -47,6 +47,7 @@
 //!   no replica ever emits what its peers reject.
 
 use crdtsync_core::doc::Document;
+use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::path;
 use crdtsync_core::schema::Schema;
@@ -1421,24 +1422,50 @@ fn an_edit_that_resolves_to_nothing_is_not_a_refusal() {
         99
     )));
 
-    // Refuse a run for its length: capacity survives, the report is raised. The
-    // refused call still returns the ops it emitted before the refusal cut it,
-    // which is why the batch cannot be the signal.
-    path::text_insert(&mut doc, &path::encode_path(&[b"t"]), 0, "abcdefghij");
-    assert!(doc.mint_refused());
-    assert!(doc.can_mint(None));
-
-    // An edit that resolves to nothing clears it rather than inheriting it.
+    let text = path::encode_path(&[b"t"]);
     let nowhere = path::encode_path(&[b"nope"]);
+    // A run longer than the space that is left refuses; capacity survives it, so
+    // each probe below starts from a raised report on a replica that can still mint.
+    let refuse = |doc: &mut Document| {
+        path::text_insert(doc, &text, 0, "abcdefghij");
+        assert!(doc.mint_refused(), "the run was not refused");
+        assert!(doc.can_mint(None), "the single-id space was spent");
+    };
+
+    // Each of these resolves to nothing, and each must answer for itself rather
+    // than inherit the refusal standing when it was called.
+    refuse(&mut doc);
     assert!(path::xml_insert_element(&mut doc, &nowhere, 0, b"p").is_empty());
     assert!(
         !doc.mint_refused(),
-        "an inert edit reported the previous edit's refusal"
+        "an XML insert on an absent node reported the previous refusal"
     );
-    assert!(path::list_delete(&mut doc, &nowhere, 3).is_empty());
-    assert!(!doc.mint_refused());
 
-    // And the replica really did still have room.
-    assert!(!path::text_insert(&mut doc, &path::encode_path(&[b"t"]), 0, "z").is_empty());
+    refuse(&mut doc);
+    assert!(path::list_delete(&mut doc, &nowhere, 3).is_empty());
+    assert!(
+        !doc.mint_refused(),
+        "a delete naming no live item reported the previous refusal"
+    );
+
+    refuse(&mut doc);
+    let (ops, id) = path::mark(
+        &mut doc,
+        &nowhere,
+        0,
+        Side::Left,
+        1,
+        Side::Right,
+        b"b",
+        Scalar::Bool(true),
+    );
+    assert!(ops.is_empty() && id.is_none());
+    assert!(
+        !doc.mint_refused(),
+        "a mark over an absent sequence reported the previous refusal"
+    );
+
+    // And the replica really did still have room throughout.
+    assert!(!path::text_insert(&mut doc, &text, 0, "z").is_empty());
     assert!(!doc.mint_refused());
 }

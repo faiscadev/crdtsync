@@ -223,47 +223,51 @@ export class Doc {
 
   /** Raise the refusal an edit's empty byte string cannot express.
    *
-   * Read after the edit, never before: the core clears the latch as each intention
-   * opens, so this answers for the edit just made. Raised after the ops have gone
-   * to the wire and the listeners, never instead of them — one backend call is one
-   * core transaction, and a refusal cuts it at the edit that could not mint, so a
-   * refused call can carry ops that did. Those are applied to this replica already;
-   * withholding them would leave it ahead of every peer. */
-  private guardMint(): void {
-    if (this.backend.mintRefused()) throw new MintExhausted();
+   * `refused` is read straight after the edit, never before and never later: the
+   * core clears the latch as each intention opens, so reading it there is what makes
+   * it this edit's answer, and reading it after the dispatch block would lose it to
+   * a listener that throws. It is *raised* after the ops have gone to the wire and
+   * the listeners, though — one backend call is one core transaction, and a refusal
+   * cuts it at the edit that could not mint, so a refused call can carry ops that
+   * did. Those are applied to this replica already; withholding them would leave it
+   * ahead of every peer. */
+  private guardMint(refused: boolean): void {
+    if (refused) throw new MintExhausted();
   }
 
   private mutate(run: (backend: Backend) => Uint8Array): void {
     // Inside a transaction the edit just accumulates; the commit sends + dispatches.
     if (this.transacting) {
       run(this.backend);
-      this.guardMint();
+      this.guardMint(this.backend.mintRefused());
       return;
     }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const outbound = run(this.backend);
+    const refused = this.backend.mintRefused();
     if (outbound.length > 0) {
       this.wire?.(outbound);
       this.dispatch("local", outbound, before);
       this.emitRepairs();
     }
-    this.guardMint();
+    this.guardMint(refused);
   }
 
   private mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T {
     if (this.transacting) {
       const [value] = run(this.backend);
-      this.guardMint();
+      this.guardMint(this.backend.mintRefused());
       return value;
     }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const [value, outbound] = run(this.backend);
+    const refused = this.backend.mintRefused();
     if (outbound.length > 0) {
       this.wire?.(outbound);
       this.dispatch("local", outbound, before);
       this.emitRepairs();
     }
-    this.guardMint();
+    this.guardMint(refused);
     return value;
   }
 

@@ -488,10 +488,10 @@ pub fn mark(
     value: Scalar,
 ) -> (Vec<Op>, Option<Vec<u8>>) {
     let Some(start) = range_anchor(doc, seq_path, start_index, start_side) else {
-        return (Vec::new(), None);
+        return (inert(doc), None);
     };
     let Some(end) = range_anchor(doc, seq_path, end_index, end_side) else {
-        return (Vec::new(), None);
+        return (inert(doc), None);
     };
     let name = name.to_vec();
     let mut id = None;
@@ -757,10 +757,9 @@ where
     })
 }
 
-/// Run a path-addressed edit, apply it locally, and return its emitted ops.
-/// A malformed or leaf-less path emits nothing.
 /// An edit that resolved to nothing: an unparseable path, a dead-end parent, a
-/// delete naming no live item, a mark handle naming no live mark.
+/// delete naming no live item, an anchor index off the end of its sequence, a
+/// mark handle naming no live mark, a blob too large to inline.
 ///
 /// It emits no ops, and it still opens and closes an intention. Every mutator here
 /// is one attempt by this replica, and [`Document::mint_refused`] answers for the
@@ -771,6 +770,8 @@ fn inert(doc: &mut Document) -> Vec<Op> {
     doc.transact(|_| {})
 }
 
+/// Run a path-addressed edit, apply it locally, and return its emitted ops.
+/// A malformed or leaf-less path emits nothing.
 fn emit<F>(doc: &mut Document, path: &[u8], leaf: F) -> Vec<Op>
 where
     F: FnOnce(&mut MapCursor, &[u8]),
