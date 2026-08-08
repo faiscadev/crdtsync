@@ -105,8 +105,8 @@ func TestClientBlobEditEnqueuesAndTravels(t *testing.T) {
 	b := newClient(t, 2)
 	defer b.Close()
 
-	ca, _, _ := a.Subscribe(key("room-1"))
-	b.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, a, key("room-1"))
+	subscribe(t, b, key("room-1"))
 
 	frame := a.SetBlob(ca, path("avatar"), "image/png", []byte("tiny-png"))
 	if n := a.OutboxLen(ca); n != 1 {

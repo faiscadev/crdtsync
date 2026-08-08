@@ -118,8 +118,8 @@ def test_awareness_publish_and_lifecycle():
 
 
 def test_subscribe_surfaces_the_cores_refusal_as_an_exception():
-    # The core refuses a subscribe with an empty frame, leaving the channel
-    # unwritten — the only way it declines to assign one is a spent range.
+    # An empty frame is the core declining to assign a channel, which the
+    # wrapper reads as a spent range.
     with pytest.raises(ChannelsExhausted):
         _assigned(ctypes.c_uint32(0), b"")
     assert _assigned(ctypes.c_uint32(3), b"\x01\x02") == (3, b"\x01\x02")

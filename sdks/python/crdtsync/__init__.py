@@ -557,8 +557,9 @@ def _take_buf(buf: _CrdtBuf) -> bytes:
 
 
 def _assigned(channel: "ctypes.c_uint32", frame: bytes) -> Tuple[int, bytes]:
-    """The channel and Subscribe frame a subscribe produced. The core signals its
-    refusal with an empty frame, leaving ``channel`` unwritten."""
+    """The channel and Subscribe frame a subscribe produced. An empty frame is the
+    core declining to assign a channel — it leaves ``channel`` unwritten — which
+    this wrapper reads as a spent range."""
     if not frame:
         raise ChannelsExhausted()
     return channel.value, frame

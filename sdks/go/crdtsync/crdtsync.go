@@ -748,8 +748,9 @@ func (c *Client) Actor() ([]byte, bool) {
 // the id and the channel number.
 var ErrChannelsExhausted = errors.New("the session's channel numbers are exhausted")
 
-// assigned reports the channel and Subscribe frame a subscribe produced. The
-// core signals its refusal with an empty frame, leaving the channel unwritten.
+// assigned reports the channel and Subscribe frame a subscribe produced. An
+// empty frame is the core declining to assign a channel — it leaves the channel
+// unwritten — which this wrapper reads as a spent range.
 func assigned(channel uint32, frame []byte) (uint32, []byte, error) {
 	if len(frame) == 0 {
 		return 0, nil, ErrChannelsExhausted

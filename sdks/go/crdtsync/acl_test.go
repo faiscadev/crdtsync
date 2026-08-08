@@ -118,8 +118,8 @@ func TestClientAclRoutesThroughTheOutbox(t *testing.T) {
 	defer a.Close()
 	b := newClient(t, 2)
 	defer b.Close()
-	ca, _, _ := a.Subscribe(key("room-1"))
-	cb, _, _ := b.Subscribe(key("room-1"))
+	ca, _ := subscribe(t, a, key("room-1"))
+	cb, _ := subscribe(t, b, key("room-1"))
 	_ = cb
 
 	id, frame := a.AclGrant(ca, SubjectActor, cid(7), CapabilityGrant(CapWrite), Allow, path("doc"), cid(1))
