@@ -52,4 +52,20 @@ impl ElementKind {
             _ => None,
         }
     }
+
+    /// Whether a container of this kind derives its id from its parent and key — so
+    /// the key alone names it, and a snapshot migration can resurrect it there. An
+    /// XML node derives by node instead, and a leaf is not a container at all.
+    /// Exhaustive with no catch-all, so a new kind must be classified here rather
+    /// than defaulting to unresurrectable.
+    pub(crate) fn is_key_derived_container(self) -> bool {
+        match self {
+            Self::Map | Self::List | Self::Text => true,
+            Self::Scalar
+            | Self::Register
+            | Self::Counter
+            | Self::XmlElement
+            | Self::XmlFragment => false,
+        }
+    }
 }

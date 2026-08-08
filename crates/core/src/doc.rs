@@ -79,7 +79,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 13;
+const STATE_VERSION: u8 = 14;
 
 /// A composite that a mutation displaced from its slot. Reported wherever the
 /// displacement happens, a hidden subtree included: an op addressed to a retained
@@ -752,12 +752,16 @@ impl Document {
     /// the composition of the chain's per-step key rewrites; supplying `|_| Keep`
     /// is a no-op.
     ///
-    /// A deleted container whose create identity did not survive — a re-created
-    /// key a scalar or counter later displaced — cannot be resurrected faithfully
-    /// and is carried verbatim rather than mis-migrated as a leaf. An XML kind,
+    /// The create a tombstoned key retains is the highest-ranked one the key ever
+    /// saw, so a container a leaf or counter displaced before the delete resurrects
+    /// as readily as one the delete tombstoned directly — the op seam carries that
+    /// create verbatim either way. A tombstone that resurrects nothing migrates by
+    /// what the registry still holds at the key: a container of some key-derived
+    /// kind there and the slot is carried verbatim rather than mis-migrated as a
+    /// leaf, none and it re-keys as the leaf tombstone it reads as. An XML kind,
     /// whose id derives by node rather than key, is not resurrectable here and
     /// records no create identity; its deleted slot migrates as a leaf tombstone,
-    /// the pre-existing behaviour, faithful XML-field migration being out of scope.
+    /// faithful XML-field migration being out of scope.
     pub fn migrate_leaf_slots(&mut self, fate: impl Fn(&[u8]) -> SlotFate) -> bool {
         self.migrate_leaf_slots_scoped(|_, key| fate(key))
     }
@@ -798,10 +802,11 @@ impl Document {
                 // create the op seam carries verbatim there) and the delete re-keys
                 // — a tombstone at the new key under a rename, dropped under a drop.
                 // The recorded (stamp, kind) resolves the exact retained container,
-                // and is only ever set on such a tombstone, so its presence
-                // alongside a resolvable handle is the whole condition. The counter
-                // registry at the key re-homes / prunes alongside via the same
-                // machinery as a leaf, a separate identity from the container.
+                // and a live slot reports none — nothing there is deleted — so its
+                // presence alongside a resolvable handle is the whole condition.
+                // The counter registry at the key re-homes / prunes alongside via
+                // the same machinery as a leaf, a separate identity from the
+                // container.
                 let deleted = map.borrow().slot_deleted_container(&key);
                 if let Some((create_stamp, container)) = deleted.and_then(|(stamp, kind)| {
                     self.container_handle(map_id, &key, kind)
@@ -2411,7 +2416,7 @@ impl Document {
                         &xml_fragments,
                     )?),
                 };
-                if m.insert_decoded(slot.key, slot.stamp, value, slot.tombstone, slot.deleted) {
+                if m.insert_decoded(slot.key, slot.stamp, value, slot.tombstone, slot.container) {
                     return Err(DecodeError::BadTag {
                         what: "document: duplicate map slot",
                         tag: 0,
