@@ -524,6 +524,27 @@ impl Document {
         out
     }
 
+    /// Every container id this replica has materialised — live in the tree, or retained
+    /// in the persistent identity registry after a displacement — for a consumer that has
+    /// to tell "this replica holds the element, the tree walk just does not reach it"
+    /// from "this replica has never held the element at all".
+    ///
+    /// The two are one answer to a tree walk (both are simply absent from it) and
+    /// different answers to a redaction: a *retained* container is state this replica
+    /// keeps and a re-won slot restores whole, while a target the replica never held
+    /// names nothing here to place, redact, or come back to.
+    pub fn container_ids(&self) -> HashSet<ElementId> {
+        self.maps
+            .keys()
+            .chain(self.lists.keys())
+            .chain(self.texts.keys())
+            .chain(self.counters.keys())
+            .chain(self.xml_elements.keys())
+            .chain(self.xml_fragments.keys())
+            .copied()
+            .collect()
+    }
+
     /// A live (non-revoked) ACL tuple by id, or `None` if absent or revoked.
     pub fn acl_tuple(&self, id: ElementId) -> Option<AclTuple> {
         self.acl

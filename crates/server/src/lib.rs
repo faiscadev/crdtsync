@@ -285,6 +285,31 @@ struct BranchLog {
     seen: HashSet<OpId>,
 }
 
+/// A non-`main` branch's materialized tree — the document its stream serves,
+/// folded from the same [`catch_up_branch`](Hub::catch_up_branch) derivation a
+/// subscriber is served, plus the inputs that derivation depends on so the entry
+/// can be re-checked rather than trusted.
+///
+/// The recorded inputs are the whole of what the fold reads: the branch's fork point,
+/// the length of its owned base (`None` for a live-log fork, which has none), the
+/// extent of `main`'s log a live-log fork draws its *shared* base from, and the length
+/// of the branch's own tail. A tail that has only grown is folded forward op by op;
+/// anything else is refolded from scratch.
+struct StreamTree {
+    doc: Document,
+    fork_point: u64,
+    base_len: Option<usize>,
+    /// The window of `main`'s log a live-log fork's shared base is read from —
+    /// `(main's compaction floor, the fork point clamped to main's head)`. Both ends
+    /// move: compaction raises the floor and drops the records below it, and a fork
+    /// point *above* `main`'s head (a fork taken off a branch whose tail runs past it)
+    /// keeps admitting `main`'s later writes until `main` catches up. `None` for a
+    /// branch that owns its base, which reads none of `main`'s log and is therefore
+    /// untouched by either.
+    shared_base: Option<(u64, u64)>,
+    tail_len: usize,
+}
+
 /// One room's authoritative replica and its op log. A server sequence is a
 /// 1-based position across the room's whole history; `base_seq` counts the ops
 /// already compacted away (sequences `1..=base_seq`), so a retained op at
@@ -673,6 +698,19 @@ pub struct Hub {
     /// source version's deletion. The presence of an entry is what marks a branch
     /// a snapshot fork, routing its catch-up to the owned base.
     branch_bases: HashMap<RoomId, HashMap<Vec<u8>, Vec<u8>>>,
+    /// Each non-`main` branch's materialized tree, keyed by room then branch — the
+    /// tree a read of that stream is redacted against
+    /// ([`stream_element_paths`](Hub::stream_element_paths)). Derived, never
+    /// authoritative: it is folded on demand from the branch's own stream and
+    /// re-checked against that stream's inputs on every use, so it holds no fact the
+    /// base and the tail do not already carry. Materialized only for a branch some
+    /// redaction actually asks about, so a room whose reads need no tree — no doc-ACL
+    /// tuples, or `main`-only traffic — carries none. Bounded above by the room's fork
+    /// count, which no reader can widen: an unknown branch answers before anything is
+    /// folded. It is a *document* per fork, though, not the bytes a snapshot fork
+    /// already holds in `branch_bases` — a live-log fork stores only its divergence, so
+    /// for that flavor this is new resident state rather than a second copy.
+    stream_trees: HashMap<RoomId, HashMap<Vec<u8>, StreamTree>>,
     /// The active-HEAD branch per room — the branch a default (unnamed) subscribe
     /// follows. A room absent here serves the default `main`; a restore-as-branch
     /// switches it to the restored branch, so a plain subscriber then follows the
@@ -712,6 +750,7 @@ impl Hub {
             branches: HashMap::new(),
             branch_logs: HashMap::new(),
             branch_bases: HashMap::new(),
+            stream_trees: HashMap::new(),
             active_branch: HashMap::new(),
             sinks: Vec::new(),
             zone_sealer: None,
@@ -988,6 +1027,7 @@ impl Hub {
     /// the log then replays through the same dedup as a live ingest, so a record
     /// the snapshot already covers is a no-op and a crash-left overlap converges.
     fn install_room(&mut self, room: RoomId, log: RoomLog) -> io::Result<()> {
+        self.forget_room_stream_trees(&room);
         if let Some(snapshot) = log.snapshot {
             let doc = Document::decode_state(&snapshot.state)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
@@ -1418,7 +1458,7 @@ impl Hub {
         // self-contained stream: a fresh subscriber (below `fork_point`) is served
         // the base with the tail folded in as one whole-replica snapshot, while one
         // already past the base is served just the divergent tail.
-        if let Some(base) = self.branch_bases.get(room).and_then(|m| m.get(branch)) {
+        if self.owns_base(room, branch) {
             let tail = self
                 .branch_logs
                 .get(room)
@@ -1426,14 +1466,12 @@ impl Hub {
                 .map(|log| log.ops.as_slice())
                 .unwrap_or(&[]);
             if last_seen_seq < fork_point {
-                let Ok(mut doc) = Document::decode_state(base) else {
+                let seq = fork_point + tail.len() as u64;
+                let Some(doc) = self.owned_base_doc(room, branch) else {
                     return Catchup::Unavailable;
                 };
-                for rec in tail {
-                    doc.apply(&rec.op);
-                }
                 return Catchup::Snapshot {
-                    seq: fork_point + tail.len() as u64,
+                    seq,
                     state: doc.encode_state(),
                 };
             }
@@ -1565,6 +1603,7 @@ impl Hub {
         if let Some(store) = self.store.as_mut() {
             store.compact(room, base_seq, state)?;
         }
+        self.forget_room_stream_trees(room);
         let standing = self.rooms.get(room);
         let root = standing.and_then(|r| r.creator.clone());
         // The op-version high-water is the all-time worst case a joiner must down-reach,
@@ -1749,6 +1788,234 @@ impl Hub {
             .unwrap_or_default()
     }
 
+    /// The document the `(room, branch)` **stream** serves — `main`'s live replica, or
+    /// a named branch's own tree: its shared or owned base with its divergent tail
+    /// folded in. `None` when the stream has no tree to serve: an unknown room or
+    /// branch, or a branch whose owned base does not decode. A caller that redacts owes
+    /// that `None` a refusal — the two indexes it could reach for instead resolve *less*
+    /// than the truth, and a scope or an op target that resolves to nothing is admitted,
+    /// not withheld.
+    ///
+    /// Every redaction decision is made against the state being served (C28), and on a
+    /// branch that state is **not** `main`: a branch owns its base — a captured version,
+    /// a publish — or shares only `main`'s history below its fork point, and `main` moves
+    /// on past both. So a seam redacting a branch read asks this, not
+    /// [`element_paths`](Hub::element_paths).
+    ///
+    /// The branch tree is folded once and then held, because the seams that ask are on
+    /// the hot write path: the live fan-out resolves an index per committed batch, and
+    /// refolding a whole base per write is the cost that kept it on `main`'s tree. The
+    /// held tree is re-checked against the stream's own inputs on every call and folded
+    /// forward by the tail ops appended since — a branch write costs the ops it wrote,
+    /// not the base it wrote onto — while a changed base or fork point refolds. `main`
+    /// holds nothing: its live replica *is* the served tree.
+    fn stream_doc(&mut self, room: &[u8], branch: &[u8]) -> Option<&Document> {
+        if branch == MAIN_BRANCH {
+            return self.rooms.get(room).map(|r| &r.doc);
+        }
+        let fork_point = self
+            .branches
+            .get(room)
+            .and_then(|registry| registry.branch(branch))
+            .map(|b| b.fork_point)?;
+        let base_len = self
+            .branch_bases
+            .get(room)
+            .and_then(|bases| bases.get(branch))
+            .map(Vec::len);
+        // A live-log fork reads `main`'s log in `(floor, fork point clamped to main's
+        // head]` — the window [`catch_up_branch`](Hub::catch_up_branch) computes — so
+        // both ends belong in the check. A branch that owns its base reads none of it,
+        // and recording the window for one would refold it on every `main` compaction
+        // for nothing.
+        let shared_base = base_len.is_none().then(|| {
+            let (floor, head) = self
+                .rooms
+                .get(room)
+                .map_or((0, 0), |r| (r.base_seq, r.head()));
+            (floor, fork_point.min(head))
+        });
+        // A live-log fork's shared base is only as complete as `main`'s *retained* log,
+        // and compaction folds those records into the replica and drops them. What the
+        // stream serves after that is the branch's tail over nothing — a tree resolving
+        // far less than the branch actually holds, and less is the fail-open direction:
+        // a scope resolving to nothing is an inert deny, an op target that does is
+        // root-bound. So a clipped shared base yields no tree to redact against rather
+        // than a poorer one. What such a stream *serves* is wrong too, and predates this
+        // (C88). Whatever was held for it was folded from a base that is gone, so it is
+        // retired here as it is on a failed refold — a stream that has become unfoldable
+        // stops holding the tree it last folded.
+        if shared_base.is_some_and(|(floor, base_end)| floor > 0 && base_end > 0) {
+            self.forget_stream_tree(room, branch);
+            return None;
+        }
+        let tail_len = self
+            .branch_logs
+            .get(room)
+            .and_then(|logs| logs.get(branch))
+            .map_or(0, |log| log.ops.len());
+        let held = self
+            .stream_trees
+            .get(room)
+            .and_then(|trees| trees.get(branch));
+        // A held tree stands only while every input it was folded from still holds, and
+        // its tail is still a prefix of the branch's. A grown tail folds forward;
+        // anything else — a shrunk tail, a repointed base, a moved shared-base window —
+        // means the stream serves a different tree now, so refold.
+        let extends = held.is_some_and(|t| {
+            t.fork_point == fork_point
+                && t.base_len == base_len
+                && t.shared_base == shared_base
+                && t.tail_len <= tail_len
+        });
+        if !extends {
+            // A refold that cannot complete retires the entry with it, so an unfoldable
+            // stream stops holding the tree it last folded.
+            let Some(doc) = self.fold_stream(room, branch) else {
+                self.forget_stream_tree(room, branch);
+                return None;
+            };
+            self.stream_trees.entry(room.to_vec()).or_default().insert(
+                branch.to_vec(),
+                StreamTree {
+                    doc,
+                    fork_point,
+                    base_len,
+                    shared_base,
+                    tail_len,
+                },
+            );
+        } else if held.is_some_and(|t| t.tail_len < tail_len) {
+            let tree = self
+                .stream_trees
+                .get_mut(room)
+                .and_then(|trees| trees.get_mut(branch))
+                .expect("the held tree was just observed");
+            let tail = self
+                .branch_logs
+                .get(room)
+                .and_then(|logs| logs.get(branch))
+                .map_or(&[][..], |log| log.ops.as_slice());
+            for rec in &tail[tree.tail_len..] {
+                tree.doc.apply(&rec.op);
+            }
+            tree.tail_len = tail_len;
+        }
+        self.stream_trees
+            .get(room)
+            .and_then(|trees| trees.get(branch))
+            .map(|t| &t.doc)
+    }
+
+    /// Drop any held tree for `(room, branch)`, so the next read of that stream refolds.
+    /// The held tree re-checks the inputs it was folded from, which catches every *edit*
+    /// to a standing branch — but a name is reusable, and the stream behind a re-forked
+    /// one is not the retired one's, so each seam that retires or repoints a name says so
+    /// here rather than resting on the numbers happening to differ.
+    fn forget_stream_tree(&mut self, room: &[u8], branch: &[u8]) {
+        if let Some(trees) = self.stream_trees.get_mut(room) {
+            trees.remove(branch);
+            if trees.is_empty() {
+                self.stream_trees.remove(room);
+            }
+        }
+    }
+
+    /// Drop every held tree for `room`. Taken where a whole replica is installed over
+    /// what stands — a handover, a snapshot install — which reseats the room's document
+    /// and each branch's base and tail at once, in bytes rather than by an edit the
+    /// per-stream re-check would read.
+    fn forget_room_stream_trees(&mut self, room: &[u8]) {
+        self.stream_trees.remove(room);
+    }
+
+    /// Whether `(room, branch)` is a snapshot fork — one that owns a copy of a version's
+    /// state rather than sharing `main`'s log. The presence of the base is what marks it.
+    fn owns_base(&self, room: &[u8], branch: &[u8]) -> bool {
+        self.branch_bases
+            .get(room)
+            .is_some_and(|bases| bases.contains_key(branch))
+    }
+
+    /// A snapshot fork's owned base with its divergent tail folded in — the document its
+    /// stream serves. `None` when the branch owns no base, or holds one this node cannot
+    /// decode. The one fold of that shape: the catch-up encodes it for a fresh subscriber
+    /// and the redaction index walks it, off the same call, so neither can describe a
+    /// stream the other does not.
+    fn owned_base_doc(&self, room: &[u8], branch: &[u8]) -> Option<Document> {
+        let base = self.branch_bases.get(room).and_then(|m| m.get(branch))?;
+        let mut doc = Document::decode_state(base).ok()?;
+        if let Some(log) = self.branch_logs.get(room).and_then(|logs| logs.get(branch)) {
+            for rec in &log.ops {
+                doc.apply(&rec.op);
+            }
+        }
+        Some(doc)
+    }
+
+    /// Fold `(room, branch)`'s whole stream into a document, from the very derivation a
+    /// subscriber joining at sequence 0 is served — so the tree a read is redacted
+    /// against cannot describe a stream different from the one the read is served. `None`
+    /// for an unservable stream.
+    fn fold_stream(&mut self, room: &[u8], branch: &[u8]) -> Option<Document> {
+        // An unknown branch has no stream at all, and `catch_up_branch` answers it with an
+        // empty delta — which folds to an empty document rather than to nothing. Both
+        // callers resolve the name first, so this is the precondition being stated rather
+        // than a case reached.
+        self.branch(room, branch)?;
+        if self.owns_base(room, branch) {
+            return self.owned_base_doc(room, branch);
+        }
+        match self.catch_up_branch(room, branch, 0) {
+            Catchup::Ops(ops) => {
+                let mut doc = Document::new(self.server);
+                for rec in &ops {
+                    doc.apply(&rec.op);
+                }
+                Some(doc)
+            }
+            // A live-log fork's catch-up is always a delta over `main`'s log; the other
+            // two arms belong to the owned-base flavor answered above.
+            Catchup::Snapshot { state, .. } => Document::decode_state(&state).ok(),
+            Catchup::Unavailable => None,
+        }
+    }
+
+    /// [`element_paths`](Hub::element_paths) over the tree the `(room, branch)` stream
+    /// serves ([`stream_doc`](Hub::stream_doc)) — the index every seam redacting a read
+    /// of that stream resolves its element scopes and op targets through. `None` where
+    /// the stream has no tree, which is fail-closed at the callers: an empty index
+    /// resolves nothing, and a scope that resolves to nothing is an *inert* deny.
+    pub fn stream_element_paths(&mut self, room: &[u8], branch: &[u8]) -> Option<ElementPaths> {
+        self.stream_doc(room, branch).map(index::element_paths)
+    }
+
+    /// Every container id the tree the `(room, branch)` stream serves has materialised,
+    /// live or retained ([`Document::container_ids`]) — the co-input that tells
+    /// [`op_read_gate`](crate::acl::op_read_gate) whether a target its index cannot
+    /// resolve is a container this state *retains* or one it has never held. On a branch
+    /// the second is ordinary: a container only `main` holds resolves nowhere here.
+    pub fn stream_held_containers(
+        &mut self,
+        room: &[u8],
+        branch: &[u8],
+    ) -> Option<HashSet<ElementId>> {
+        self.stream_doc(room, branch).map(Document::container_ids)
+    }
+
+    /// [`ranged_anchors`](Hub::ranged_anchors) over the tree the `(room, branch)` stream
+    /// serves — the anchor set that resolves a RangedElement op's governing path *set*,
+    /// the co-input to [`op_read_gate`](crate::acl::op_read_gate) beside
+    /// [`stream_element_paths`](Hub::stream_element_paths). Both describe one tree, so
+    /// they are asked of one stream.
+    pub fn stream_ranged_anchors(
+        &mut self,
+        room: &[u8],
+        branch: &[u8],
+    ) -> Option<HashMap<ElementId, (ElementId, ElementId)>> {
+        self.stream_doc(room, branch).map(Document::ranged_anchors)
+    }
+
     /// Every live blob reference in `room`'s document, its blob id mapped to the
     /// encoded `core::path`s that hold it — the index a blob-fetch authorization
     /// resolves read authority against (see
@@ -1827,12 +2094,13 @@ impl Hub {
             return Vec::new();
         }
         let index = index::element_paths(&r.doc);
+        let held = r.doc.container_ids();
         let ranged = r.doc.ranged_anchors();
         r.log
             .iter()
             .filter(|rec| subtree.contains(&rec.op.target))
             .filter(|rec| {
-                crate::acl::op_read_gate(&index, &ranged, records, &rec.op)
+                crate::acl::op_read_gate(&index, &held, &ranged, records, &rec.op)
                     .admits(&reads, &reads_whole)
             })
             .map(|rec| Op {
@@ -1849,6 +2117,10 @@ impl Hub {
     /// gates a `RangedSetPayload`/`RangedDelete` by
     /// ([`op_read_gate`](crate::acl::op_read_gate)), so a delete's already-tombstoned
     /// range still resolves to the sequences it annotated. Empty for an unknown room.
+    /// `main`'s own, kept as the room-scoped accessor beside
+    /// [`element_paths`](Hub::element_paths); the redaction seams take the
+    /// stream-scoped [`stream_ranged_anchors`](Hub::stream_ranged_anchors) instead,
+    /// since a branch resolves a range's endpoints in its own tree.
     pub fn ranged_anchors(&self, room: &[u8]) -> HashMap<ElementId, (ElementId, ElementId)> {
         self.rooms
             .get(room)
@@ -2258,7 +2530,8 @@ impl Hub {
     /// [`DiffError::UnknownBranch`] — which today covers more than an unknown name,
     /// since [`materialize_branch`](Hub::materialize_branch) also answers `None` for a
     /// branch whose durable base this node cannot read, and for `main` on a room it
-    /// holds no state for (C51). A *materialized* state that does not decode is
+    /// holds no state for (C51), or a live-log fork whose shared base `main`'s
+    /// compaction has dropped (C88). A *materialized* state that does not decode is
     /// [`DiffError::Decode`]. `narrow` is the reader's redaction, as in
     /// [`Hub::diff_versions`].
     pub fn diff_branches(
@@ -2398,14 +2671,23 @@ impl Hub {
             Some(source) => at.min(source.head),
             None => at,
         };
-        self.mutate_branches(room, |registry| registry.fork(new, from, at))
+        let forked = self.mutate_branches(room, |registry| registry.fork(new, from, at))?;
+        if forked {
+            self.forget_stream_tree(room, new);
+        }
+        Ok(forked)
     }
 
     /// Rename branch `from` to `to`. Returns `Ok(false)` — changing nothing — for
     /// the default `main`, an absent `from`, or a `to` already taken. Persisted
     /// before the rename commits when a store is attached.
     pub fn rename_branch(&mut self, room: &[u8], from: &[u8], to: &[u8]) -> io::Result<bool> {
-        self.mutate_branches(room, |registry| registry.rename(from, to))
+        let renamed = self.mutate_branches(room, |registry| registry.rename(from, to))?;
+        if renamed {
+            self.forget_stream_tree(room, from);
+            self.forget_stream_tree(room, to);
+        }
+        Ok(renamed)
     }
 
     /// Delete branch `name`, returning whether one was removed. The default `main`
@@ -2423,6 +2705,7 @@ impl Hub {
             if let Some(bases) = self.branch_bases.get_mut(room) {
                 bases.remove(name);
             }
+            self.forget_stream_tree(room, name);
             if let Some(store) = self.store.as_mut() {
                 store.remove_branch_log(room, name)?;
                 store.remove_branch_base(room, name)?;
@@ -2548,6 +2831,7 @@ impl Hub {
             .entry(room.to_vec())
             .or_default()
             .insert(new.to_vec(), state);
+        self.forget_stream_tree(room, new);
         // Record the pointer at the version's covered sequence. The source-branch
         // check is satisfied by the always-present `main`; the name was checked
         // free above, so this only fails on a persist error — roll the base back.
@@ -2651,6 +2935,9 @@ impl Hub {
             .entry(room.to_vec())
             .or_default()
             .insert(published.to_vec(), state);
+        // The base is replaced whether or not the pointer commits, and the rollback
+        // below restores a third one, so the held tree is dropped on every outcome.
+        self.forget_stream_tree(room, published);
         match self.mutate_branches(room, |registry| registry.point_published(published, seq)) {
             Ok(true) => {
                 // The pointer committed. A published target never diverges — drop any
@@ -2696,29 +2983,26 @@ impl Hub {
     /// onto the published branch. `main` is the room's live replica; a named branch
     /// folds its own stream (shared base plus divergent tail, or its owned snapshot
     /// base) into one state. `None` for an unknown room or branch.
+    ///
+    /// The fold is [`fold_stream`](Hub::fold_stream)'s, the one the redaction index also
+    /// walks — what a publish freezes and what a read is narrowed by are the same stream,
+    /// and there is one statement of what that stream is. `None` for an unservable one:
+    /// folding it into a fresh document would materialize an *empty* replica, and the
+    /// publish path writes what it is handed straight over the target branch's base and
+    /// its captured version, so answering `None` is what keeps a stream this node cannot
+    /// read from destroying the branch it names.
     fn materialize_branch(&mut self, room: &[u8], branch: &[u8]) -> Option<Vec<u8>> {
         if branch == MAIN_BRANCH {
             return self.export_room(room);
         }
-        if self.branch(room, branch).is_none() {
-            return None;
-        }
-        match self.catch_up_branch(room, branch, 0) {
-            Catchup::Snapshot { state, .. } => Some(state),
-            Catchup::Ops(ops) => {
-                let mut doc = Document::new(self.server);
-                for rec in &ops {
-                    doc.apply(&rec.op);
-                }
-                Some(doc.encode_state())
-            }
-            // No state to freeze. Folding an unservable stream into a fresh
-            // document would materialize an *empty* replica, and the publish path
-            // writes what it is handed straight over the target branch's base and
-            // its captured version — so answering `None` is what keeps a stream
-            // this node cannot read from destroying the branch it names.
-            Catchup::Unavailable => None,
-        }
+        // The tree the stream serves, which is also the tree its reads are redacted
+        // against — one fold, so what a publish freezes and what a read is narrowed by
+        // cannot describe different streams. A stream this node cannot state answers
+        // `None` rather than a substitute: a publish writes what it folds over the target
+        // branch's base *and* captures it as a permanent version, so a clipped shared
+        // base would freeze the loss instead of exposing it (C88). Refusing is
+        // recoverable; the capture is not.
+        self.stream_doc(room, branch).map(Document::encode_state)
     }
 
     /// Apply `change` to `room`'s registry, persisting the result before it
