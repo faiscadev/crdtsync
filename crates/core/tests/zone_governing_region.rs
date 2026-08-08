@@ -17,9 +17,11 @@
 //! stay consistent with the projections, since an op stamped in a zone advances that
 //! zone's clock and a projection that drops the zone drops its clock with it.
 //!
-//! A governing region that resolves to no path names no partition. The root is the
-//! only partition an envelope can express, so such an op keeps it while the snapshot
-//! projection drops the state form (C52) — pinned below as the residual it is (C82).
+//! A governing region that resolves to no path — or to two that disagree — names no
+//! partition. The root is the only partition an envelope can express, so such an op
+//! keeps it while the snapshot projection drops the state form (C52), and since the
+//! partition is also a mint floor an LWW follow-on stamped that way loses to the value
+//! it means to replace. Pinned below as the residual it is (C82).
 
 use std::collections::HashSet;
 
@@ -486,6 +488,53 @@ fn a_scope_that_resolves_to_no_path_keeps_the_root_partition() {
     assert!(
         !holds_scope(&d, &scope),
         "the projection drops a tuple that names no partition"
+    );
+}
+
+#[test]
+fn a_follow_on_that_falls_back_to_the_root_partition_mints_below_its_familys_clock() {
+    // The residual's second face, and the sharper one: the root partition's clock is
+    // the mint floor for a fallback op, and on a replica that has authored nothing it
+    // sits far below the zone clock the family's create was stamped from. A
+    // `RangedSetPayload` is LWW on the stamp, so a follow-on written after the anchored
+    // sequence's container is gone loses to the payload it means to replace — the write
+    // is dropped rather than merely mis-audienced (C82).
+    let mut author = Document::new(cid(1));
+    author.set_schema(zoned());
+    let setup = author.transact(|tx| {
+        tx.map(b"notes").text(b"seq").insert(0, "hello world");
+    });
+    let (create, handle) = mark_in(&mut author, b"notes");
+    let zb = zone_of(b"notes");
+    assert_eq!(one_zone(&create), Some(zb));
+    let drop_seq = author.transact(|tx| {
+        tx.map(b"notes").delete(b"seq");
+    });
+
+    // A peer that folded all of it, every op of it inside zb, and has minted nothing.
+    let mut peer = Document::new(cid(2));
+    peer.set_schema(zoned());
+    for op in setup.iter().chain(&create).chain(&drop_seq) {
+        peer.apply(op);
+    }
+    let created_at = create[0].stamp.lamport;
+    assert!(peer.zone_clock(Some(zb)) >= created_at);
+    assert_eq!(
+        peer.zone_clock(None),
+        0,
+        "the peer's root partition is idle"
+    );
+
+    let set = path::mark_set_value(&mut peer, &handle, Scalar::Int(9));
+    assert_eq!(
+        one_zone(&set),
+        None,
+        "the anchors resolve to nothing, so the follow-on falls back to the root"
+    );
+    assert!(
+        set[0].stamp.lamport < created_at,
+        "the root floor is below the zone the create was stamped from: {} vs {created_at}",
+        set[0].stamp.lamport
     );
 }
 

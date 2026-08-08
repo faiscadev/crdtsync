@@ -4,8 +4,9 @@
 //! A document's lamport allocation is partitioned by zone: an op is stamped from
 //! the clock of the zone it belongs to — the zone of the region it governs, which is
 //! the target's position for an ordinary edit, the created child's for a
-//! container-create, the anchored sequences' for an annotation and the scope's for an
-//! ACL tuple — so an edit in one zone never advances another's. Two zones' ops are
+//! container-create, the anchored sequences' for an annotation, the scope's for an ACL
+//! tuple and the mark's for an edit inside a mark's composite payload — so an edit in
+//! one zone never advances another's. Two zones' ops are
 //! therefore concurrent by construction — no false causal edge crosses the boundary —
 //! while causal order within a zone is intact. With no schema, or a schema with no
 //! zones, every op is in the one root partition, exactly as before zones. Convergence

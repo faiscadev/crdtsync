@@ -199,9 +199,11 @@ pub struct Document {
     /// revoke wins on merge and survives a snapshot reload. Storage only — core
     /// merges the set but enforces no authority (see [`crate::acl`]).
     acl: HashMap<ElementId, AclEntry>,
-    /// The lamport clock of the root partition — the zone every op governing an
-    /// unzoned region (and every op of a document with no zones) is stamped from. With
-    /// no zones this is the document's whole lamport clock, exactly as before zones.
+    /// The lamport clock of the root partition — the one every op the envelope's
+    /// [`zone`](crate::op::Op::zone) leaves `None` is stamped from: an op governing an
+    /// unzoned region, one whose region names no partition, and every op of a document
+    /// with no zones. With no zones this is the document's whole lamport clock, exactly
+    /// as before zones.
     lamport: u64,
     /// The per-zone lamport clocks, keyed by compact zone id
     /// ([`zone::zone_id_of`]). Each declared zone advances its own clock, so an op
@@ -3202,8 +3204,10 @@ impl Document {
     ///
     /// A governing region that resolves to no path names no partition, and the root is
     /// the only one an envelope can express, so such an op keeps the root partition
-    /// while the snapshot projection drops the state form (C52) — the one place the two
-    /// seams still part company, tracked as C82.
+    /// while the snapshot projection drops the state form (C52) — one of the two places
+    /// the two seams still part company, tracked as C82. The partition is also a mint
+    /// floor, so a follow-on that falls back this way is stamped under the family its
+    /// create was stamped in, and an LWW one loses to the value it means to replace.
     ///
     /// Every other op belongs to the partition of the container it targets. A keyed op
     /// naming a zone-root slot on the container *above* it therefore rides the parent's
@@ -3239,7 +3243,29 @@ impl Document {
             }
             OpKind::AclGrant { scope, .. } => scoped_in(scope),
             OpKind::AclRevoke { id } => scoped_in(&self.acl.get(id)?.scope),
-            _ => match paths.get(&target) {
+            // The tree ops, listed rather than caught, because the fall-through here is
+            // the **root** partition — the one every zone-scoped subscriber holds. A
+            // catch-all would let a new `Ranged*` or `Acl*` variant ride it silently,
+            // which is the leak this rule exists to close; spelled out, the compiler
+            // asks where the variant belongs. `op_read_gate` guards its own widest
+            // answer the same way.
+            OpKind::RegisterSet { .. }
+            | OpKind::CounterInc { .. }
+            | OpKind::CounterDec { .. }
+            | OpKind::MapSet { .. }
+            | OpKind::MapDelete { .. }
+            | OpKind::MapCreate { .. }
+            | OpKind::ListCreate { .. }
+            | OpKind::ListInsert { .. }
+            | OpKind::ListDelete { .. }
+            | OpKind::TextCreate { .. }
+            | OpKind::TextInsert { .. }
+            | OpKind::TextDelete { .. }
+            | OpKind::XmlElementCreate { .. }
+            | OpKind::XmlFragmentCreate { .. }
+            | OpKind::XmlInsertChild { .. }
+            | OpKind::XmlMove { .. }
+            | OpKind::XmlReveal { .. } => match paths.get(&target) {
                 Some(base) => {
                     let mut path = base.clone();
                     if let Some(key) = create_child_key(kind) {
