@@ -10,10 +10,15 @@
 //!
 //! (`project_read_paths`, the doc-ACL analogue, clears the buffer whole as soon as it
 //! drops anything, so nothing survives there to strand.)
+//!
+//! No local commit mints a straddling group any more — C2 cuts one to a group per
+//! partition — but the wire admits one, so the groups here are assembled the way a
+//! replica can still meet one: from a peer whose emitter does not cut. Destranding is
+//! the floor underneath the emit rule, not a substitute for it.
 
 use std::collections::HashSet;
 
-use crdtsync_core::{zone, ClientId, Document, Element, Op, Scalar, Schema};
+use crdtsync_core::{zone, ClientId, Document, Element, Op, Scalar, Schema, Tx, TxId};
 
 mod common;
 use common::cid;
@@ -93,15 +98,28 @@ fn round_trip(d: &Document) -> Document {
     Document::decode_state(&d.encode_state()).expect("the projected snapshot decodes")
 }
 
+/// Re-tag `ops` as one group spanning every partition they fall in — the envelopes a
+/// peer that does not cut its commits to partitions puts on the wire.
+fn as_one_group(ops: Vec<Op>) -> Vec<Op> {
+    let count = u32::try_from(ops.len()).expect("a small group");
+    let id = TxId::derive(ops.iter().map(|op| op.id.seq));
+    ops.into_iter()
+        .map(|mut op| {
+            op.tx = Some(Tx { id, count });
+            op
+        })
+        .collect()
+}
+
 /// A three-member group straddling za and zb, of which the room has folded the first
 /// two — so both sit in its buffer, waiting on the third, and the projection is what
 /// cuts the group rather than the room's own arrival order.
 fn straddling(author: &mut Document) -> Vec<Op> {
-    author.atomic_transact(|tx| {
+    as_one_group(author.atomic_transact(|tx| {
         tx.map(b"board").register(b"bk", Scalar::Int(1));
         tx.map(b"notes").register(b"nk", Scalar::Int(2));
         tx.map(b"board").register(b"bk2", Scalar::Int(3));
-    })
+    }))
 }
 
 #[test]
@@ -153,11 +171,11 @@ fn an_unzoned_member_of_a_straddling_group_lands_too() {
     // The root partition is always authorized, so an unzoned member survives every
     // zone cut — and must not be held back by a withheld zone's member.
     let (mut author, setup) = seeded();
-    let group = author.atomic_transact(|tx| {
+    let group = as_one_group(author.atomic_transact(|tx| {
         tx.map(b"loose").register(b"lk", Scalar::Int(4));
         tx.map(b"notes").register(b"nk", Scalar::Int(5));
         tx.map(b"loose").register(b"lk2", Scalar::Int(6));
-    });
+    }));
     let mut projected = room(&setup, &group[..2]);
     projected.project_zones(&zoned(), &za_only(), None);
 

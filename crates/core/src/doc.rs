@@ -2907,13 +2907,17 @@ impl Document {
     }
 
     /// Close the atomic transaction opened by [`begin_atomic`] and return its ops,
-    /// tagged as one group for all-or-nothing delivery — untagged, and so
-    /// streamed, if the group is past [`MAX_TX_MEMBERS`]. Returns empty (and tags
-    /// nothing) if no edits were recorded or no transaction was open.
+    /// tagged for all-or-nothing delivery — one group per zone partition the ops
+    /// fall in, so a transaction stays inside one zone as ARCHITECTURE §Scope
+    /// Constraints requires; untagged, and so streamed, if a partition's group is
+    /// past [`MAX_TX_MEMBERS`]. Returns empty (and tags nothing) if no edits were
+    /// recorded or no transaction was open. See
+    /// [`tag_atomic`](Self::tag_atomic) for what a commit that straddles zones keeps
+    /// and gives up.
     ///
-    /// Tagging spends the group's bucket key, so closing a transaction can also apply
-    /// a *foreign* member the buffer was holding under that id: the returned ops are
-    /// this transaction's, not everything the close changed.
+    /// Tagging spends each group's bucket key, so closing a transaction can also apply
+    /// a *foreign* member the buffer was holding under one of those ids: the returned
+    /// ops are this transaction's, not everything the close changed.
     pub fn commit_atomic(&mut self) -> Vec<Op> {
         // With no transaction open there is nothing to close — and nothing to
         // record either: closing here would cut an explicit intention in half and
@@ -2933,43 +2937,71 @@ impl Document {
         self.atomic.is_some()
     }
 
-    /// Tag a group's ops as one atomic transaction. A group whose size is outside
-    /// the representable range — empty, or past [`MAX_TX_MEMBERS`] — is left
-    /// untagged, so its ops stream and merge individually. Tagging it would put a
-    /// size on the wire every recipient's codec refuses, and the refusal is of the
-    /// whole framed batch, so an oversized transaction would become dropped ops
-    /// rather than a non-atomic one.
+    /// Tag a commit's ops as atomic transactions, **one group per partition** — the
+    /// scope constraint ARCHITECTURE §Scope Constraints states and §Not Shipped
+    /// repeats: a transaction stays inside one zone. A commit wholly in one
+    /// partition, which is every commit in a document that declares no zones, is
+    /// the one group it has always been.
     ///
-    /// The id is [derived](TxId::derive) from the members' own sequences, so it is
-    /// as durable as the op ids it sits beside and needs no state of its own.
+    /// A group is only ever received whole by a subscriber admitted to every
+    /// partition it spans, since a zone-scoped subscription withholds the other
+    /// partitions' members and [destrands](crate::destrand_split) the survivors —
+    /// so a group cut to a partition is one every recipient that holds any of it
+    /// holds all of it. What a straddling commit gives up is atomicity *across* the
+    /// zones, which is the thing never offered; what it keeps is every edit, and
+    /// per-zone atomicity where the constraint holds.
     ///
-    /// Tagging resolves the group's key here, as a receiver's commit resolves it
+    /// A partition whose size is outside the representable range — empty, or past
+    /// [`MAX_TX_MEMBERS`] — is left untagged, so its ops stream and merge
+    /// individually. Tagging it would put a size on the wire every recipient's codec
+    /// refuses, and the refusal is of the whole framed batch, so an oversized
+    /// transaction would become dropped ops rather than a non-atomic one. The bound
+    /// is per group, so it applies to each partition rather than to the commit.
+    ///
+    /// Each id is [derived](TxId::derive) from its own partition's member sequences,
+    /// so it is as durable as the op ids it sits beside and needs no state of its
+    /// own — and two partitions of one commit hold disjoint sequences, so they never
+    /// name one group.
+    ///
+    /// Tagging resolves each group's key here, as a receiver's commit resolves it
     /// there: the author applied these edits as it made them and never buckets
-    /// them, so without this a stray arriving under the group's id would be held
+    /// them, so without this a stray arriving under one of the ids would be held
     /// at the author while every receiver merged it — one op set, two states.
     fn tag_atomic(&mut self, ops: Vec<Op>) -> Vec<Op> {
-        let count = match u32::try_from(ops.len()) {
-            Ok(count) if (1..=MAX_TX_MEMBERS).contains(&count) => count,
-            _ => return ops,
-        };
-        let id = TxId::derive(ops.iter().map(|op| op.id.seq));
-        self.resolve_tx((self.client, id));
+        let mut partitions: HashMap<Option<u32>, Vec<u64>> = HashMap::new();
+        for op in &ops {
+            partitions.entry(op.zone).or_default().push(op.id.seq);
+        }
+        let mut tags: HashMap<Option<u32>, Tx> = HashMap::new();
+        for (zone, seqs) in partitions {
+            let count = match u32::try_from(seqs.len()) {
+                Ok(count) if (1..=MAX_TX_MEMBERS).contains(&count) => count,
+                _ => continue,
+            };
+            let id = TxId::derive(seqs);
+            self.resolve_tx((self.client, id));
+            tags.insert(zone, Tx { id, count });
+        }
+        if tags.is_empty() {
+            return ops;
+        }
         // Spending a key releases what it held, and a released member applies on the
         // drain — never on whenever the next unrelated arrival happens to run one.
         self.drain_buffer();
         ops.into_iter()
             .map(|mut op| {
-                op.tx = Some(Tx { id, count });
+                op.tx = tags.get(&op.zone).copied();
                 op
             })
             .collect()
     }
 
-    /// Like [`transact`](Self::transact), but tag the emitted ops as one atomic
+    /// Like [`transact`](Self::transact), but tag the emitted ops as an atomic
     /// transaction. A receiver holds the members until the whole group arrives,
-    /// then applies them together, so no peer observes a partial transaction. A
-    /// group past [`MAX_TX_MEMBERS`] is emitted untagged and streams instead —
-    /// see [`tag_atomic`](Self::tag_atomic). A
+    /// then applies them together, so no peer observes a partial transaction. An
+    /// edit set that spans two zones is emitted as one transaction per zone rather
+    /// than one straddling both, and a group past [`MAX_TX_MEMBERS`] is emitted
+    /// untagged and streams instead — see [`tag_atomic`](Self::tag_atomic). A
     /// member whose own dependencies are still unmet when the group arrives keeps
     /// waiting on its own — grouping never changes what a set of ops merges to,
     /// and such a member almost never has an effect the current state could show
