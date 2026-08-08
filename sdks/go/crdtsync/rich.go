@@ -88,12 +88,12 @@ func (t *CrdtText) MarkWithGravity(start, end int, startSide, endSide, name stri
 		return nil, err
 	}
 	var markID []byte
-	t.doc.mutate(func(b Backend) []byte {
+	_, err = t.doc.mutate(func(b Backend) []byte {
 		id, ops := b.Mark(t.path, uint(start), sideFromString(startSide), uint(end), sideFromString(endSide), []byte(name), sc)
 		markID = id
 		return ops
 	})
-	return markID, nil
+	return markID, err
 }
 
 // SetMarkValue changes the native value of the mark markID. Returns an error for
@@ -103,8 +103,8 @@ func (t *CrdtText) SetMarkValue(markID []byte, value any) error {
 	if err != nil {
 		return err
 	}
-	t.doc.mutate(func(b Backend) []byte { return b.MarkSetValue(markID, sc) })
-	return nil
+	_, err = t.doc.mutate(func(b Backend) []byte { return b.MarkSetValue(markID, sc) })
+	return err
 }
 
 // DeleteMark tombstones the mark markID.

@@ -1470,8 +1470,6 @@ fn handle_ops(
     // self-consistent and each channel keeps its own op-id space. Two channels of
     // one connection can be bound to the same room, and identities shared across
     // them would make one channel's ops dedup away as duplicates of the other's.
-    // Authenticating that the client is who it claims is the transport's
-    // credential check; this driver only enforces consistency.
     let authoring = client.for_channel(channel.0);
     if ops.iter().any(|op| op.id.client != authoring) {
         return violation("op client mismatch");
@@ -1489,6 +1487,25 @@ fn handle_ops(
     // ingest seam with its own (absent) authentication, not this gate's to close.
     if authoring == hub.replica_identity() {
         return violation("ops authored under the node's replica identity");
+    }
+    // A replica identity belongs to the authenticated actor that first wrote under
+    // it in this room, and no other actor may author under it afterwards. Without
+    // this the `ClientId` is a bare declaration — Hello names it and nothing binds
+    // it — and the declaration is enough to reach the one place it does lasting
+    // damage: a stamp names its author, so an op admitted under a victim's identity
+    // raises *that* replica's id-space high-water, and one op stamped at the top of
+    // the space spends it outright, on every replica that folds the op and in the
+    // durable snapshot. The mint's refusal is fail-closed rather than a re-issued
+    // live id, so the victim does not diverge — it simply can never write again.
+    //
+    // The claim is per room, because the damage is: an id space is a property of a
+    // document, and a replica identity is spent in the room whose replica holds the
+    // stamp. It is established by the writer's own first batch below, so an honest
+    // client claims what it uses on its way in and nothing has to be provisioned.
+    if let Some(owner) = hub.client_actor(&room, authoring) {
+        if Some(owner) != session.actor() {
+            return violation("ops authored under another actor's replica identity");
+        }
     }
     // An `XmlReveal` is a redaction-time synthesis the server injects into a partial
     // reader's stream — never an authored op. A client that submits one is rejected
@@ -1652,6 +1669,18 @@ fn handle_ops(
     } else {
         hub.ingest_branch(&room, &branch, ops, write_version)
     };
+    // A written batch claims the replica identity it was authored under, so the gate
+    // above has an owner to compare the next actor against. It runs on both branches
+    // of the write: a branch has its own log and its own materialised replica, and a
+    // stamp planted through one is in the room's id space just the same.
+    //
+    // An *empty* batch claims nothing. It authors no stamp, so it is not the use of
+    // an identity that the claim records — and admitting it would let any actor the
+    // room lets write reserve an identity it never intends to author under, which is
+    // the same lockout the claim exists to prevent, reached from the other side.
+    if applied.is_ok() && through.is_some() {
+        hub.claim_client(&room, authoring, identity.actor());
+    }
     match applied {
         Ok(applied) => Response {
             replies: through

@@ -291,6 +291,7 @@ fn governing_metadata_round_trips() {
                 governing: Some((b"app".to_vec(), 3)),
                 max_op_version: Some(5),
                 creator: None,
+                client_actors: Vec::new(),
             },
         )
         .unwrap();
@@ -311,6 +312,7 @@ fn a_relay_high_water_without_a_binding_round_trips() {
                 governing: None,
                 max_op_version: Some(2),
                 creator: None,
+                client_actors: Vec::new(),
             },
         )
         .unwrap();
@@ -331,6 +333,7 @@ fn metadata_with_neither_field_removes_the_record() {
                 governing: Some((b"app".to_vec(), 1)),
                 max_op_version: Some(1),
                 creator: None,
+                client_actors: Vec::new(),
             },
         )
         .unwrap();
@@ -342,6 +345,7 @@ fn metadata_with_neither_field_removes_the_record() {
                 governing: None,
                 max_op_version: None,
                 creator: None,
+                client_actors: Vec::new(),
             },
         )
         .unwrap();
@@ -361,6 +365,7 @@ fn a_malformed_metadata_record_loads_as_absent_and_never_panics() {
                 governing: Some((b"app".to_vec(), 1)),
                 max_op_version: Some(1),
                 creator: None,
+                client_actors: Vec::new(),
             },
         )
         .unwrap();
@@ -472,4 +477,48 @@ fn tempdir() -> TempDir {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     TempDir(dir)
+}
+
+#[test]
+fn the_replica_identity_claims_round_trip() {
+    // Which actor owns each replica identity is not derivable from the log — a
+    // stored op carries the per-device `ClientId`, never the credential actor — so
+    // it rides the metadata record beside the creator, and a restart that lost it
+    // would leave every identity in the room open to whoever writes next.
+    let tmp = tempdir();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let claims = vec![
+        (cid(1), b"alice".to_vec()),
+        (cid(2), b"bob@example.test".to_vec()),
+    ];
+    store
+        .write_meta(
+            ROOM,
+            &RoomMeta {
+                governing: None,
+                max_op_version: None,
+                creator: None,
+                client_actors: claims.clone(),
+            },
+        )
+        .unwrap();
+
+    let meta = loaded_meta(&store, ROOM).expect("metadata present");
+    assert_eq!(meta.client_actors, claims);
+    assert_eq!(meta.creator, None, "a claim record invented a creator");
+
+    // The claims alone are enough to keep the record: dropping them with nothing
+    // else present removes the file, as every other field does.
+    store
+        .write_meta(
+            ROOM,
+            &RoomMeta {
+                governing: None,
+                max_op_version: None,
+                creator: None,
+                client_actors: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(loaded_meta(&store, ROOM).is_none());
 }

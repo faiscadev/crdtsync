@@ -894,3 +894,41 @@ fn atomic_channel_methods_reject_an_unheld_channel() {
     assert!(s.begin_atomic(Channel(9)).is_none());
     assert!(s.commit_atomic(Channel(9)).is_none());
 }
+
+#[test]
+fn a_channel_reports_the_refusal_its_empty_frame_cannot() {
+    // `edit` frames the ops to send, and a refused edit frames the same empty batch
+    // an inert one does — so a session that only reads the frame reports a write
+    // that never happened. The report is per channel because each channel holds its
+    // own replica, minting under its own derived identity: a peer that spends one
+    // channel's id space leaves its siblings untouched.
+    let mut session = ClientSession::new(cid(1));
+    let (spent, _) = session.subscribe(ROOM_A).unwrap();
+    let (fresh, _) = session.subscribe(ROOM_B).unwrap();
+    assert_eq!(session.mint_refused(spent), Some(false));
+
+    // Author under the spent channel's own replica identity, at the last id of the
+    // space — the position a peer needs only one admissible op to occupy.
+    let victim = session.channel_client(spent).expect("the channel is held");
+    let mut plant = Document::new(victim)
+        .transact(|tx| tx.set(b"planted", Scalar::Int(1)))
+        .remove(0);
+    plant.stamp.lamport = crdtsync_core::stamp::LAMPORT_STATE_CEILING;
+    plant.id.seq = 99;
+    assert!(session
+        .document_mut(spent)
+        .expect("the channel is held")
+        .apply(&plant));
+
+    let frame = session.edit(spent, |tx| tx.set(b"k", Scalar::Int(1)));
+    assert!(matches!(frame, Some(Message::Ops { ref ops, .. }) if ops.is_empty()));
+    assert_eq!(session.mint_refused(spent), Some(true));
+
+    session.edit(fresh, |tx| tx.set(b"k", Scalar::Int(1)));
+    assert_eq!(
+        session.mint_refused(fresh),
+        Some(false),
+        "one channel's exhaustion was reported on another's replica"
+    );
+    assert_eq!(session.mint_refused(Channel(9)), None);
+}

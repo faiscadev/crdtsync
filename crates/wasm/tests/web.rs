@@ -1365,3 +1365,28 @@ fn client_acl_on_an_unheld_channel_is_inert() {
     );
     assert!(a.acl_revoke(99, &[0u8; 16]).unwrap().is_empty());
 }
+
+#[wasm_bindgen_test]
+fn a_refused_edit_is_reported_where_the_ops_bytes_cannot_say_it() {
+    // A refused edit returns the same empty ops an inert one does, so the JS SDK
+    // reads this to throw rather than report a write that never happened.
+    let mut d = doc(1);
+    let p = path(&["k"]);
+    assert!(!d.mint_refused());
+    assert!(!d.register_int(&p, 1).is_empty());
+    assert!(!d.mint_refused());
+
+    // Fold in a peer op authored under this replica's own identity, at the last id
+    // of the space — the position that spends the mint for good.
+    let mut plant = crdtsync_core::Document::new(ClientId::from_bytes(
+        cid(1).try_into().expect("16 bytes"),
+    ))
+    .transact(|tx| tx.set(b"planted", crdtsync_core::Scalar::Int(1)))
+    .remove(0);
+    plant.stamp.lamport = crdtsync_core::stamp::LAMPORT_STATE_CEILING;
+    plant.id.seq = 99;
+    d.apply(&encode_ops(&[plant]));
+
+    assert!(d.register_int(&p, 2).is_empty(), "a refused edit emitted ops");
+    assert!(d.mint_refused(), "the refusal was not reported");
+}

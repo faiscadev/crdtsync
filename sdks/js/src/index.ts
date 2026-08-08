@@ -2,7 +2,7 @@
 // CRDT core. Edit a document through live typed handles (`Doc.getMap`/`getList`/
 // `getText`) with native-value marshaling; the byte-path core stays hidden.
 
-export { Doc } from "./doc.js";
+export { Doc, MintExhausted } from "./doc.js";
 export type {
   ApplyOutcome,
   Change,

@@ -713,6 +713,16 @@ impl WasmDocument {
     pub fn commit_atomic(&mut self) -> Vec<u8> {
         encode_ops(&self.inner.commit_atomic())
     }
+
+    /// Whether the edit most recently made through this document was refused for
+    /// want of an id. Every mutator returns the ops to broadcast, and a refused
+    /// edit produces the same empty buffer an inert one does — this is what tells
+    /// the two apart, so a caller can raise rather than report an edit that never
+    /// happened.
+    #[wasm_bindgen(js_name = mintRefused)]
+    pub fn mint_refused(&self) -> bool {
+        self.inner.mint_refused()
+    }
 }
 
 /// A per-user undo/redo handle over a [`WasmDocument`]. It holds no history of
@@ -1178,6 +1188,14 @@ impl WasmClient {
     #[wasm_bindgen(js_name = commitAtomic)]
     pub fn commit_atomic(&mut self, channel: u32) -> Vec<u8> {
         self.ops_frame(channel, |d| d.commit_atomic())
+    }
+
+    /// Whether the edit most recently made on `channel` was refused for want of an
+    /// id. Per channel, because each channel holds its own replica minting under
+    /// its own identity. `false` for a channel this session does not hold.
+    #[wasm_bindgen(js_name = mintRefused)]
+    pub fn mint_refused(&self, channel: u32) -> bool {
+        self.inner.mint_refused(Channel(channel)).unwrap_or(false)
     }
 
     /// Read an integer Register at a path in `channel`'s room.
