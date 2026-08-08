@@ -1062,9 +1062,9 @@ impl ClientSession {
         self.rooms.get(&channel).map(|r| &r.doc)
     }
 
-    /// Whether the edit most recently made on `channel` was refused for want of an
-    /// id — [`Document::mint_refused`] of that channel's replica. `None` if the
-    /// channel isn't held.
+    /// Whether an edit on `channel` was refused for want of an id during the
+    /// intention most recently opened there — [`Document::mint_refused`] of that
+    /// channel's replica. `None` if the channel isn't held.
     ///
     /// Each channel holds its own replica and mints under its own identity, so a
     /// channel exhausted by a peer authoring under that identity says nothing about

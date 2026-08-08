@@ -215,17 +215,19 @@ export class Doc {
     const before = this.observing() ? this.backend.encodeState() : undefined;
     this.transacting = true;
     this.backend.beginAtomic();
+    let delivery: unknown;
     try {
       fn();
     } finally {
       this.transacting = false;
-      const outbound = this.backend.commitAtomic();
-      if (outbound.length > 0) {
-        this.wire?.(outbound);
-        this.dispatch("local", outbound, before);
-        this.emitRepairs();
-      }
+      // The group is committed and delivered whatever the body did, so a body that
+      // threw never strands it open. A listener that throws during that delivery is
+      // held rather than propagated: a `MintExhausted` already on its way out of
+      // `fn` is the answer to the edit the application made, and must not be
+      // replaced by it.
+      delivery = this.deliver(this.backend.commitAtomic(), before);
     }
+    if (delivery !== undefined) throw delivery;
   }
 
   /** Raise the refusal an edit's empty byte string cannot express.

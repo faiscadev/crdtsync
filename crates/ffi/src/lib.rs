@@ -1303,8 +1303,8 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
     applied
 }
 
-/// Whether the edit most recently made through this handle was refused for want
-/// of an id (1), was not (0), or the handle is bad (-1).
+/// Whether an edit was refused for want of an id during the intention most
+/// recently opened on this handle (1), none was (0), or the handle is bad (-1).
 ///
 /// The answer a mutation entry point cannot give: every one of them returns the ops
 /// to broadcast, and a refused edit produces the same empty buffer an inert one
@@ -3503,8 +3503,9 @@ pub unsafe extern "C" fn crdtsync_client_clear_undo_origin(
     .unwrap_or(-1)
 }
 
-/// Whether the edit most recently made on `channel` was refused for want of an id
-/// (1), was not (0), or the handle is bad or the channel unheld (-1).
+/// Whether an edit on `channel` was refused for want of an id during the intention
+/// most recently opened there (1), none was (0), or the handle is bad or the
+/// channel unheld (-1).
 ///
 /// The per-channel form of [`crdtsync_doc_mint_refused`], and it answers per
 /// channel because each channel holds its own replica minting under its own

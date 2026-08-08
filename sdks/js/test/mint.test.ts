@@ -128,6 +128,27 @@ describe("a spent id space", () => {
     }
   });
 
+  it("keeps the refusal when a transaction's commit delivery throws", () => {
+    // `transact` commits and delivers in its `finally`, so a listener that throws
+    // there sits between the refusal and the caller. The refusal still wins.
+    const me = cid(8);
+    const d = new Doc({ clientId: me });
+    d.applyUpdate(nearlySpent(me));
+    const boom = new Error("listener");
+    d.on("update", (e) => {
+      if (e.origin === "local") throw boom;
+    });
+
+    try {
+      d.transact(() => {
+        d.getText("t").insert(0, "abcdefghij");
+      });
+      expect.unreachable("the refusal was swallowed");
+    } catch (e) {
+      expect(e).toBeInstanceOf(MintExhausted);
+    }
+  });
+
   it("does not report an inert edit as a refusal", () => {
     // An inert edit and a refused one both emit nothing, which is the whole reason
     // the query exists — so an edit that resolves to nothing must answer for itself

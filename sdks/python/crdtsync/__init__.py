@@ -1332,10 +1332,11 @@ class Document:
         return ApplyOutcome(applied=applied, refused=refused.value)
 
     def mint_refused(self) -> bool:
-        """Whether the edit most recently made through this document was refused
-        for want of an id. Every mutator returns the ops to broadcast, and a
-        refused edit produces the same empty bytes an inert one does; this is what
-        tells the two apart."""
+        """Whether an edit was refused for want of an id during the intention most
+        recently opened. Every mutator returns the ops to broadcast, and a refused
+        edit produces the same empty bytes an inert one does; this is what tells the
+        two apart. An atomic group is one intention, so a refusal inside one stays
+        raised for the rest of the group."""
         return _LIB.crdtsync_doc_mint_refused(self._handle) == 1
 
     def begin_atomic(self) -> None:
@@ -2072,10 +2073,10 @@ class Client:
         )
 
     def mint_refused(self, channel: int) -> bool:
-        """Whether the edit most recently made on ``channel`` was refused for want
-        of an id. Per channel, because each channel holds its own replica minting
-        under its own identity; ``False`` for a channel this session does not
-        hold."""
+        """Whether an edit on ``channel`` was refused for want of an id during the
+        intention most recently opened there. Per channel, because each channel
+        holds its own replica minting under its own identity; ``False`` for a
+        channel this session does not hold."""
         _u32("channel", channel)
         return _LIB.crdtsync_client_mint_refused(self._handle, channel) == 1
 
@@ -3215,6 +3216,7 @@ class Doc:
     def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
         with self._gate:
             ops, changes, repairs, refused = b"", [], [], False
+            delivery = None
             try:
                 with self._lock:
                     # Inside a transaction the edit just accumulates; the commit
@@ -3237,17 +3239,25 @@ class Doc:
             finally:
                 # The ops are stamped into this replica and its outbox the moment
                 # `run` returns, so they have to reach the room even if reading
-                # the change set afterwards failed.
+                # the change set afterwards failed. A wire write or a listener that
+                # raises is held rather than propagated, so it cannot take the
+                # refusal's place — the refusal is the answer to the call the
+                # application made.
                 if ops:
-                    self._send(ops)
-                    self._publish("local", ops, changes)
-                    self._publish_repairs(repairs)
+                    try:
+                        self._send(ops)
+                        self._publish("local", ops, changes)
+                        self._publish_repairs(repairs)
+                    except BaseException as exc:  # noqa: BLE001 - re-raised below
+                        delivery = exc
             # Raised outside the `finally`, so a failure of the body's own is not
             # replaced by this one. It is raised after delivery, though: a refusal
             # cuts an intention at the edit that could not mint, and what it emitted
             # before that is already applied here.
             if refused:
-                raise MintExhausted()
+                raise MintExhausted() from delivery
+            if delivery is not None:
+                raise delivery
             return ops
 
     def _fold_remote(self, receive: Callable[[], object]):

@@ -549,8 +549,8 @@ int32_t crdtsync_doc_apply(CrdtDoc *doc,
                            uintptr_t len,
                            uint32_t *out_refused);
 
-// Whether the edit most recently made through this handle was refused for want
-// of an id (1), was not (0), or the handle is bad (-1).
+// Whether an edit was refused for want of an id during the intention most
+// recently opened on this handle (1), none was (0), or the handle is bad (-1).
 //
 // The answer a mutation entry point cannot give: every one of them returns the ops
 // to broadcast, and a refused edit produces the same empty buffer an inert one
@@ -1452,8 +1452,9 @@ int32_t crdtsync_client_set_undo_origin(CrdtClient *client,
 // `client` is a live handle.
 int32_t crdtsync_client_clear_undo_origin(CrdtClient *client, uint32_t channel);
 
-// Whether the edit most recently made on `channel` was refused for want of an id
-// (1), was not (0), or the handle is bad or the channel unheld (-1).
+// Whether an edit on `channel` was refused for want of an id during the intention
+// most recently opened there (1), none was (0), or the handle is bad or the
+// channel unheld (-1).
 //
 // The per-channel form of [`crdtsync_doc_mint_refused`], and it answers per
 // channel because each channel holds its own replica minting under its own

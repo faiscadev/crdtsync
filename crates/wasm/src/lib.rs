@@ -716,11 +716,12 @@ impl WasmDocument {
         encode_ops(&self.inner.commit_atomic())
     }
 
-    /// Whether the edit most recently made through this document was refused for
-    /// want of an id. Every mutator returns the ops to broadcast, and a refused
+    /// Whether an edit was refused for want of an id during the intention most
+    /// recently opened. Every mutator returns the ops to broadcast, and a refused
     /// edit produces the same empty buffer an inert one does — this is what tells
     /// the two apart, so a caller can raise rather than report an edit that never
-    /// happened.
+    /// happened. An atomic group is one intention, so a refusal inside one stays
+    /// raised for the rest of the group.
     #[wasm_bindgen(js_name = mintRefused)]
     pub fn mint_refused(&self) -> bool {
         self.inner.mint_refused()
@@ -1193,9 +1194,10 @@ impl WasmClient {
         self.ops_frame(channel, |d| d.commit_atomic())
     }
 
-    /// Whether the edit most recently made on `channel` was refused for want of an
-    /// id. Per channel, because each channel holds its own replica minting under
-    /// its own identity. `false` for a channel this session does not hold.
+    /// Whether an edit on `channel` was refused for want of an id during the
+    /// intention most recently opened there. Per channel, because each channel
+    /// holds its own replica minting under its own identity. `false` for a channel
+    /// this session does not hold.
     #[wasm_bindgen(js_name = mintRefused)]
     pub fn mint_refused(&self, channel: u32) -> bool {
         self.inner.mint_refused(Channel(channel)).unwrap_or(false)

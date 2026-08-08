@@ -576,10 +576,14 @@ func (d *Document) CommitAtomic() []byte {
 	return takeBuf(C.crdtsync_doc_commit_atomic(d.h))
 }
 
-// MintRefused reports whether the edit most recently made through this document
-// was refused for want of an id. Every mutator returns the ops to broadcast, and
+// MintRefused reports whether an edit was refused for want of an id during the
+// intention most recently opened. Every mutator returns the ops to broadcast, and
 // a refused edit produces the same empty slice an inert one does; this is what
 // tells the two apart.
+//
+// Intention-scoped rather than per-edit: an atomic group is one intention, so once
+// a refusal is raised inside one it stays raised for the rest of the group and is
+// cleared by the next intention rather than by a later edit within this one.
 func (d *Document) MintRefused() bool {
 	return C.crdtsync_doc_mint_refused(d.h) == 1
 }
@@ -985,9 +989,10 @@ func (c *Client) CommitAtomic(channel uint32) []byte {
 	return takeBuf(C.crdtsync_client_commit_atomic(c.h, C.uint32_t(channel)))
 }
 
-// MintRefused reports whether the edit most recently made on channel was refused
-// for want of an id. Per channel, because each channel holds its own replica
-// minting under its own identity; false for a channel this session does not hold.
+// MintRefused reports whether an edit on channel was refused for want of an id
+// during the intention most recently opened there. Per channel, because each
+// channel holds its own replica minting under its own identity; false for a
+// channel this session does not hold.
 func (c *Client) MintRefused(channel uint32) bool {
 	return C.crdtsync_client_mint_refused(c.h, C.uint32_t(channel)) == 1
 }

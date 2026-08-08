@@ -1373,14 +1373,28 @@ fn the_latch_spans_an_intention_a_nested_group_only_joins() {
 
     doc.begin_intention();
     doc.begin_atomic();
-    // Ten codepoints do not fit in the six ids that are left; a single-id edit does.
+    // A single-id edit fits and lands, so the group is genuinely *torn* rather than
+    // empty: what came before the refusal is emitted and applied, and only what
+    // follows it is cut.
+    doc.transact(|tx| tx.set(b"before", Scalar::Int(1)));
+    // Ten codepoints do not fit in the ids that are left; a single-id edit does.
     doc.transact(|tx| tx.text(b"t").insert(0, "abcdefghij"));
     let group = doc.commit_atomic();
     assert!(
         group
             .iter()
+            .any(|op| matches!(op.kind, OpKind::MapSet { .. })),
+        "the edit before the refusal was taken back out of the group"
+    );
+    assert!(
+        group
+            .iter()
             .all(|op| !matches!(op.kind, OpKind::TextInsert { .. })),
         "a run reaching past the end of the space was emitted"
+    );
+    assert!(
+        doc.get(b"before").is_some(),
+        "the landed edit left no state"
     );
     assert!(
         doc.mint_refused(),

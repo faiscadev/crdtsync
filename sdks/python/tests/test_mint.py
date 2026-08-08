@@ -109,3 +109,23 @@ def test_an_inert_edit_is_not_reported_as_a_refusal():
     # And the replica really did still have room.
     doc.get_text("t").insert(0, "z")
     assert str(doc.get_text("t")) == "zab"
+
+
+def test_a_throwing_listener_does_not_take_the_refusals_place():
+    # The refusal is the answer to the call the application made; a listener's own
+    # failure must not replace it, or the edit reads as a listener bug and the write
+    # that never happened is reported as one that did.
+    me = cid(5)
+    doc = Doc(me)
+    doc.apply_update(nearly_spent(me))
+
+    boom = RuntimeError("listener")
+
+    def explode(event):
+        if event.origin == "local":
+            raise boom
+
+    doc.on_update(explode)
+    with pytest.raises(MintExhausted) as caught:
+        doc.get_text("t").insert(0, "abcdefghij")
+    assert caught.value.__cause__ is boom
