@@ -555,13 +555,21 @@ Tx must stay within one branch, one zone, one schema version. Cannot include mig
 
 The cap is a protocol constant, not a per-deployment setting. A receiver decides a group complete from the `count` its members declare, so a deployment that raised its own cap would emit groups every peer refuses, and one that lowered it would refuse groups the room holds; a bound both ends compute identically is what makes the field decidable at all. It is enforced at three points: the decode boundary, where a `count` of zero or one past the cap fails the frame carrying it; the apply seam an in-process caller reaches without decoding, where the one op is refused and its group-mates are not; and the mint, where a group past the cap is emitted untagged rather than tagged with a size no receiver will accept — so an oversized transaction is a non-atomic one rather than a frame every peer rejects.
 
+The zone constraint is enforced at that same mint, on the same principle. A commit whose edits fall in more than one zone is emitted as **one atomic transaction per zone** rather than one straddling both, each group's id derived from its own members' sequences. Only a subscriber admitted to every partition a group spans can receive it whole — a zone-scoped subscription withholds the other partitions' members and destrands the survivors (§Opt-In: Atomic) — so no zone-scoped filter can cut *through* a group — it runs between them. A straddling commit gives up atomicity *across* the zones, which §Not Shipped never offered, and keeps every edit plus per-zone atomicity everywhere the constraint does hold.
+
+The cut is by the partition each op is stamped in, which is the region it **governs** rather than the position it is emitted at (§Internal Data Model). So an op whose governing region resolves to no single partition — a mark whose two anchors land in different zones, which is a `CrossZoneAnchor` violation the read repairs away — keeps the root partition and groups there, rather than being assigned to one of the two zones it names. The group boundary follows the envelope's partition exactly; nothing re-derives it.
+
+Two limits on how far that reaches. The cut holds at the emitter, not end-to-end: a relay that re-stamps an op's partition can hand a downstream filter a group spanning two again, and the doc-ACL read filter cuts on paths no group is aligned to at all — which is why destranding stays the floor beneath all of this rather than being replaced by it. And the cap applies per group, so it bounds each partition rather than the commit: a commit's total held members is bounded by the number of partitions it spans times the cap, at most one per declared zone plus the root.
+
+The remaining halves of the constraint line rest on something other than a seam. A channel's replica is bound to one branch, so a commit has no second one to span. A document binds one schema version, but the zone ids a commit is cut on are indices into that schema's declaration order, so the guarantee rests on an unenforced precondition — rebinding a schema is a settle-point operation, and nothing yet refuses one inside an open transaction (C97). Migration needs no prohibition at all: no op kind represents one, so a transaction cannot carry one.
+
 ## Interaction with Invariant Repair
 
 For atomic txs, repair runs inside the commit pipeline, not after. Visible effect of a tx is the repaired state. No two-step "tx done + then repair changed it" surprise.
 
 ## Interaction with Undo
 
-A transaction is naturally an undo intention. Undo of atomic tx = generate inverse ops for all members, wrap in new atomic tx, apply atomically. Atomicity preserved through undo / redo.
+A transaction is naturally an undo intention. Undo of atomic tx = generate inverse ops for all members, wrap in a new atomic tx per zone partition the inverses fall in (§Scope Constraints), apply atomically. Atomicity preserved through undo / redo, on the same terms the forward commit had it.
 
 ## Not Shipped
 
@@ -589,7 +597,7 @@ Rejected: an SDK-layer origin-filtered *inverter* (Yjs-style, but Yjs is single-
 
 Inverse ops emit into the normal op stream. Ops that overwrite or delete state require prior-state capture at op creation time — the seam reads the inverse off the state an op is about to overwrite, before it lands. A tombstone drops the value it held, so reviving a deleted sequence node re-creates it: a scalar as a fresh insert, a composite XML child rebuilt from a subtree snapshot taken at record time, both anchored on the tombstone so the revival lands where the node was.
 
-An intention is one transact, one explicit begin/end intention group, or one atomic transaction — which undoes and redoes as one atomic transaction in turn. Manual begin / end intention covers explicit grouping (paste, paragraph break); auto-grouping on debounced gaps (>500ms idle = boundary by default) is an SDK concern, since core injects its clock rather than reading one.
+An intention is one transact, one explicit begin/end intention group, or one atomic transaction — which undoes and redoes atomically in turn: as one transaction, or as one per zone partition where the intention spans several (§Scope Constraints). Manual begin / end intention covers explicit grouping (paste, paragraph break); auto-grouping on debounced gaps (>500ms idle = boundary by default) is an SDK concern, since core injects its clock rather than reading one.
 
 The stack lives in the **document** — so a channel's replica carries its own, and undo works identically offline and over a live connection — with the SDK holding only the origin tag. Offline editing produces undoable ops without network. The stack drops at a migration boundary and when a channel adopts a server snapshot — in both cases the recorded inverses describe slot shapes the document no longer has — while recording itself continues past either.
 

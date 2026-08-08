@@ -1316,7 +1316,8 @@ class Document:
         _LIB.crdtsync_doc_begin_atomic(self._handle)
 
     def commit_atomic(self) -> bytes:
-        """Commit the atomic transaction; returns the group's ops to broadcast."""
+        """Commit the atomic transaction; returns its ops to broadcast — one group per
+        zone partition the edits fall in, since a transaction stays inside one zone."""
         return _take_buf(_LIB.crdtsync_doc_commit_atomic(self._handle))
 
     def encode_state(self) -> bytes:
@@ -2049,7 +2050,8 @@ class Client:
         _LIB.crdtsync_client_begin_atomic(self._handle, channel)
 
     def commit_atomic(self, channel: int) -> bytes:
-        """Commit the atomic transaction on ``channel``; returns the Ops frame to send."""
+        """Commit the atomic transaction on ``channel``; returns the Ops frame to send,
+        carrying one group per zone partition the edits fall in."""
         _u32("channel", channel)
         return _take_buf(_LIB.crdtsync_client_commit_atomic(self._handle, channel))
 
@@ -3024,9 +3026,11 @@ class Doc:
         return CrdtXml(self, (_key_bytes(key),))
 
     def transact(self, fn: Callable[[], object]) -> None:
-        """Run ``fn``'s edits as one atomic group — they apply together on every
-        replica, ride the wire as a single batch, and fire one update. Nested calls
-        flatten into the outermost transaction."""
+        """Run ``fn``'s edits as an atomic group — they apply together on every
+        replica served the zone they fall in, ride the wire as a single batch, and
+        fire one update. Edits spanning two zones form one group per zone, since a
+        transaction stays inside one zone. Nested calls flatten into the outermost
+        transaction."""
         # The atomic group is state of the shared replica, not of the caller, so
         # the whole transaction is one indivisible step: another thread's edit
         # must queue behind it rather than be swept into the group, and its own

@@ -708,7 +708,9 @@ impl WasmDocument {
         self.inner.begin_atomic();
     }
 
-    /// Commit the atomic transaction, returning the group's ops to broadcast.
+    /// Commit the atomic transaction, returning its ops to broadcast — one tagged
+    /// group per zone partition the edits fall in, since a transaction stays inside
+    /// one zone.
     #[wasm_bindgen(js_name = commitAtomic)]
     pub fn commit_atomic(&mut self) -> Vec<u8> {
         encode_ops(&self.inner.commit_atomic())
@@ -1173,8 +1175,9 @@ impl WasmClient {
         }
     }
 
-    /// Commit the atomic transaction on `channel`, returning the Ops frame to
-    /// send.
+    /// Commit the atomic transaction on `channel`, returning the Ops frame to send —
+    /// carrying one tagged group per zone partition the edits fall in, since a
+    /// transaction stays inside one zone.
     #[wasm_bindgen(js_name = commitAtomic)]
     pub fn commit_atomic(&mut self, channel: u32) -> Vec<u8> {
         self.ops_frame(channel, |d| d.commit_atomic())

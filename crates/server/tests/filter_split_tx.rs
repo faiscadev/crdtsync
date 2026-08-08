@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use crdtsync_core::acl::{AclGrant, AclSubject, Capability};
 use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::Channel;
-use crdtsync_core::{AclEffect, ClientId, Document, Element, Message, Op, OpKind, Scalar, Schema};
+use crdtsync_core::{
+    AclEffect, ClientId, Document, Element, Message, Op, OpKind, Scalar, Schema, Tx, TxId,
+};
 use crdtsync_server::acl::{actor_key, Acl, ResourceMatch, Subject};
 use crdtsync_server::{
     Action, ConnId, Identity, ManualClock, Registry, Resource, SchemaRegistry, StaticTokens,
@@ -141,6 +143,21 @@ fn top_int(d: &Document, key: &[u8]) -> Option<i64> {
 /// Whether every op in `ops` carries a transaction tag.
 fn all_tagged(ops: &[Op]) -> bool {
     !ops.is_empty() && ops.iter().all(|op| op.tx.is_some())
+}
+
+/// Re-tag `ops` as one group spanning every zone partition they fall in — the
+/// envelopes a peer that does not cut its commits to partitions (C2) puts on the
+/// wire. A local commit mints no such group, but the wire admits one, so every filter
+/// has to destrand what it splits.
+fn as_one_group(ops: Vec<Op>) -> Vec<Op> {
+    let count = u32::try_from(ops.len()).expect("a small group");
+    let id = TxId::derive(ops.iter().map(|op| op.id.seq));
+    ops.into_iter()
+        .map(|mut op| {
+            op.tx = Some(Tx { id, count });
+            op
+        })
+        .collect()
 }
 
 // --- doc-ACL harness -------------------------------------------------------
@@ -483,10 +500,10 @@ fn zone_join(r: &mut Registry, client: u8, credential: &str, zone: &[u8]) -> (Co
 /// One atomic transaction spanning zone za (`/board`) and zone zb (`/notes`): two
 /// members, of which a za-scoped subscription admits exactly one.
 fn atomic_across_zones(doc: &mut Document) -> Vec<Op> {
-    doc.atomic_transact(|tx| {
+    as_one_group(doc.atomic_transact(|tx| {
         tx.map(b"board").register(b"bk", Scalar::Int(2));
         tx.map(b"notes").register(b"nk", Scalar::Int(3));
-    })
+    }))
 }
 
 /// Whether `ops` carry a `RegisterSet` of `key`.
@@ -600,6 +617,57 @@ fn a_group_the_zone_filter_carries_whole_stays_atomic() {
 }
 
 #[test]
+fn an_emitters_cross_zone_commit_reaches_a_zone_subscriber_atomically() {
+    // C2's payoff, driven end to end on the emitter's own output rather than a
+    // hand-forged group: a commit spanning za and zb is cut to a group per zone, so
+    // the za subscriber's filter withholds zb's members without splitting anything
+    // it holds. Its za members therefore arrive tagged and all-or-nothing, where a
+    // group spanning both would have been destranded here and merged one at a time.
+    let (mut r, mut doc, author) = zone_seeded();
+    let (za, base) = zone_join(&mut r, 2, "c-za", b"za");
+
+    let sent = doc.atomic_transact(|tx| {
+        tx.map(b"board").register(b"bk", Scalar::Int(2));
+        tx.map(b"notes").register(b"nk", Scalar::Int(3));
+        tx.map(b"board").register(b"bk2", Scalar::Int(4));
+    });
+    submit(&mut r, author, sent.clone());
+    let got = received_ops(&mut r, za);
+    assert!(has_key(&got, b"bk"), "the za members are delivered");
+    assert!(!has_key(&got, b"nk"), "the zb member is withheld");
+
+    let members = members_of(&sent, &got);
+    assert!(
+        members.len() > 1,
+        "the za group has members to hold together"
+    );
+    assert!(
+        members.iter().all(|op| op.tx.is_some()),
+        "the za group survives the cut tagged"
+    );
+
+    // All-or-nothing at the subscriber: every member but the last is held, and they
+    // land together on the arrival that completes the group.
+    let mut za_doc = folded(2, &base);
+    let (last, held) = got.split_last().expect("the batch is not empty");
+    for op in held {
+        za_doc.apply(op);
+    }
+    assert_eq!(
+        (
+            zoned_int(&za_doc, b"board", b"bk"),
+            zoned_int(&za_doc, b"board", b"bk2")
+        ),
+        (None, None),
+        "the partial group is invisible, whichever member the batch ends on"
+    );
+    za_doc.apply(last);
+    assert_eq!(zoned_int(&za_doc, b"board", b"bk"), Some(2));
+    assert_eq!(zoned_int(&za_doc, b"board", b"bk2"), Some(4));
+    assert_eq!(zoned_int(&za_doc, b"notes", b"nk"), None);
+}
+
+#[test]
 fn the_root_partition_travels_with_a_zone_split_group() {
     // A group spanning the root partition and one zone: the unzoned member is always
     // admitted, the foreign zone's is not, so the survivors — root and za alike —
@@ -607,11 +675,11 @@ fn the_root_partition_travels_with_a_zone_split_group() {
     let (mut r, mut doc, author) = zone_seeded();
     let (za, base) = zone_join(&mut r, 2, "c-za", b"za");
 
-    let sent = doc.atomic_transact(|tx| {
+    let sent = as_one_group(doc.atomic_transact(|tx| {
         tx.map(b"loose").register(b"lk", Scalar::Int(4));
         tx.map(b"board").register(b"bk", Scalar::Int(5));
         tx.map(b"notes").register(b"nk", Scalar::Int(6));
-    });
+    }));
     submit(&mut r, author, sent.clone());
     let got = received_ops(&mut r, za);
     assert!(

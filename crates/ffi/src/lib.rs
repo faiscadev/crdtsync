@@ -1318,8 +1318,9 @@ pub unsafe extern "C" fn crdtsync_doc_begin_atomic(doc: *mut CrdtDoc) {
 }
 
 /// Commit the atomic transaction opened by [`crdtsync_doc_begin_atomic`],
-/// returning the group's ops tagged for all-or-nothing delivery. Empty on a bad
-/// handle, no open transaction, or an empty group.
+/// returning its ops tagged for all-or-nothing delivery — one group per zone
+/// partition the edits fall in, since a transaction stays inside one zone. Empty on
+/// a bad handle, no open transaction, or an empty group.
 ///
 /// # Safety
 /// `doc` must be a handle returned by a constructor and not yet freed.
@@ -3281,7 +3282,8 @@ pub unsafe extern "C" fn crdtsync_client_begin_atomic(client: *mut CrdtClient, c
 
 /// Commit the atomic transaction opened on `channel` by
 /// [`crdtsync_client_begin_atomic`], returning the Ops frame carrying the tagged
-/// group. Empty on a bad handle, an unheld channel, or an empty group.
+/// group — one group per zone partition the edits fall in, since a transaction stays
+/// inside one zone. Empty on a bad handle, an unheld channel, or an empty group.
 ///
 /// # Safety
 /// `client` must be a handle from a constructor and not yet freed.

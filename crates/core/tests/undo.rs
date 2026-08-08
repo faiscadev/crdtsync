@@ -12,7 +12,8 @@
 //! histories (a user's, a subtree-scoped manager's), and undo takes the newest
 //! intention of the origin asked for, skipping the rest. An intention is one
 //! transact, one explicit group, or one atomic transaction — and an atomic
-//! intention undoes and redoes as one atomic transaction in turn.
+//! intention undoes and redoes atomically in turn — as one transaction, or one per
+//! zone partition where it spans several (C2).
 
 use crdtsync_core::acl::{AclEffect, AclGrant, AclSubject, Capability};
 use crdtsync_core::doc::{Document, SlotFate};
