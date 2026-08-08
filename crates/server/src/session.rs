@@ -23,7 +23,7 @@ use crdtsync_core::{
 use crdtsync_core::schema::Schema;
 
 use crate::acl::{
-    authorized, doc_acl_tier, doc_acl_write_at, has_any_read_grant, op_read_paths,
+    authorized, doc_acl_tier, doc_acl_write_at, has_any_read_grant, op_read_gate,
     reads_whole_document, recipient_reads_path,
 };
 use crate::auth::{Identity, Verifier};
@@ -649,13 +649,36 @@ pub fn step(
                         delta
                     } else {
                         let ranged_anchors = hub.ranged_anchors(&room);
+                        // The whole-document verdict an unplaceable op is gated on is one
+                        // answer for the whole delta, and costs a read verdict per
+                        // governing tuple path — so it is resolved at most once, and not
+                        // at all for a delta that holds no such op (the common case).
+                        let whole_verdict: std::cell::Cell<Option<bool>> =
+                            std::cell::Cell::new(None);
+                        let reads_whole = || match whole_verdict.get() {
+                            Some(v) => v,
+                            None => {
+                                let v = reads_whole_document(
+                                    authorizer,
+                                    &records,
+                                    creator.as_deref(),
+                                    &index,
+                                    schema,
+                                    identity,
+                                    &room,
+                                );
+                                whole_verdict.set(Some(v));
+                                v
+                            }
+                        };
                         retain_atomic(delta, |_, rec| {
                             // Require-all over the op's governing path set — a Ranged
                             // op's distinct anchor seq paths, one path for every other
                             // op — so a range replays only where both endpoints read.
-                            op_read_paths(&index, &ranged_anchors, &records, &rec.op)
-                                .iter()
-                                .all(|p| {
+                            // An op that resolves to no path at all replays only to a
+                            // reader denied nothing.
+                            op_read_gate(&index, &ranged_anchors, &records, &rec.op).admits(
+                                |p| {
                                     recipient_reads_path(
                                         authorizer,
                                         &records,
@@ -666,7 +689,9 @@ pub fn step(
                                         &room,
                                         p,
                                     )
-                                })
+                                },
+                                reads_whole,
+                            )
                         })
                     };
                     // Then keep only the ops in this subscription's authorized zones
@@ -1234,8 +1259,8 @@ pub fn step(
         // itself have been served (the causal frontier aside, which the two seams
         // scrub differently and a change list does not carry), and a partition it may
         // not read contributes no change at all rather than a redacted one — with the
-        // one exception the projections themselves carry, an element the live walk
-        // does not reach, whose diff-visible face is an orphaned annotation (C52).
+        // one exception the projections themselves carry, a *container* the live walk
+        // does not reach, which they still serve (C67).
         // Served locally from the replicated state, so no leader redirect. A version
         // or branch that does not materialize answers `NotFound`, and a materialized
         // side that fails to decode `Internal`;
@@ -1995,7 +2020,7 @@ fn project_snapshot_zones(
 /// element its doc-ACL read tier does not admit so the snapshot carries no trace of it —
 /// the state half of the per-op read redaction. The projection gates each element on the
 /// same [`recipient_reads_path`] the op fan-out applies, at the same `core::path` the
-/// op's [`op_read_path`](crate::acl::op_read_path) resolves to, so a snapshot-served
+/// op's [`op_read_gate`](crate::acl::op_read_gate) resolves to, so a snapshot-served
 /// joiner drops exactly the elements an op-served joiner never received — the two
 /// converge. An unreadable container's whole subtree goes, a leaf-level deny drops its
 /// slot, and doc-level ACL/ranged state goes with an unreadable root.

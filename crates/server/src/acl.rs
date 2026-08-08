@@ -754,40 +754,28 @@ pub fn reads_whole_document(
 }
 
 /// The document path an op reads — the `core::path` key sequence its target
-/// resolves to, for the per-recipient read redaction. `index` maps each live
-/// container element id to its key path (see
-/// [`Hub::element_paths`](crate::Hub::element_paths)); a keyed op appends its slot
-/// key, an id-addressed op takes its target container's own path.
+/// resolves to, for the per-recipient read redaction. Private, and reached only through
+/// [`op_read_gate`]: the kinds that resolve to a *set* of paths, or to no path at all,
+/// never reach this function, so the front that resolves them is the only public one.
 ///
-/// An op whose target the index does not resolve — a since-deleted container, a
-/// composite annotation payload the walk does not enter — resolves to the **root**,
-/// so a reader the *root verdict* admits carries it. That is not the same set as a
-/// whole-document reader: a root grant carved by a subtree deny passes the root
-/// query, since a descendant deny does not `govern` it (C52). Root is still the
-/// strictest single path a target can fall to, and a root-readable reader stays
-/// convergent — but "unresolved reaches only a whole-document reader" is the claim
-/// this seam does *not* make.
+/// `index` maps each live container element id to its key path (see
+/// [`Hub::element_paths`](crate::Hub::element_paths)); a keyed op appends its slot key,
+/// an id-addressed op takes its target container's own path.
 ///
-/// An ACL op is redacted by the document path it governs, not by root: ACL state is
-/// itself privacy-sensitive — a tuple reveals a subject, an effect, and the existence
-/// of a governed path — so a recipient receives an [`AclGrant`](OpKind::AclGrant) only
-/// where it may read that grant's path, and an [`AclRevoke`](OpKind::AclRevoke) only
-/// where it may read the tombstoned tuple's path (resolved through `records`, the full
-/// tuple set the server holds) — so a recipient sees the revoke exactly where it saw,
-/// or would have seen, the grant. A revoke naming an id no held tuple carries falls back
-/// to the root (a moot revoke reaching whatever the root verdict admits — C52).
+/// An op whose *container* target the index does not resolve — a since-deleted or
+/// displaced container — resolves to the **root**, so a reader the root verdict admits
+/// carries it. That is not the same set as a whole-document reader: a root grant carved
+/// by a subtree deny passes the root query, since a descendant deny does not `govern`
+/// it. It stands here because such an op carries the retained container's own payload,
+/// which displace-then-recreate identity keeps deliberately, so narrowing it is C67's
+/// ruling to make against the snapshot projections that keep the same state — not C52's,
+/// which narrowed the targets that carry no container at all.
 ///
-/// A RangedElement op is governed by the *set* of its anchor-sequence paths, which a
-/// single path cannot express: it goes through [`op_read_paths`], the multi-path front
-/// this function's single-path cases fold into. Here the three Ranged ops fall to the
-/// root as the single-path degenerate — a root-readable reader always carries them —
-/// but the fan-out and catch-up filters resolve them through [`op_read_paths`], never
-/// this arm.
-pub fn op_read_path(
-    index: &HashMap<ElementId, Vec<Vec<u8>>>,
-    records: &[AclRecord],
-    op: &Op,
-) -> Vec<u8> {
+/// The kinds that never arrive here — the three RangedElement ops, whose governing
+/// authority is the *set* of their anchor-sequence paths, and the two ACL ops, whose
+/// scope may resolve to no path at all — are answered by [`op_read_gate`] before it
+/// delegates, so this function neither states nor folds a rule for them.
+fn op_read_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, op: &Op) -> Vec<u8> {
     let root = || encode_path(&[]);
     let encode =
         |segs: &[Vec<u8>]| encode_path(&segs.iter().map(|s| s.as_slice()).collect::<Vec<_>>());
@@ -817,44 +805,93 @@ pub fn op_read_path(
         | OpKind::TextDelete { .. }
         | OpKind::XmlInsertChild { .. }
         | OpKind::XmlMove { .. } => resolve_read_path(index, op.target),
-        // A RangedElement op is governed by the set of its anchor-sequence paths, which
-        // `op_read_paths` resolves; the single-path form folds it to root (whatever the
-        // root verdict admits carries it) and is never taken by the redaction filters.
-        OpKind::RangedCreate { .. }
-        | OpKind::RangedSetPayload { .. }
-        | OpKind::RangedDelete { .. } => root(),
         // An `XmlReveal` is a redaction-time synthesis injected for a specific reader
         // (reveal-on-move-in), never a committed op the redaction filters gate — but as
         // the strictest read authority it folds to root here, so it can never leak.
         OpKind::XmlReveal { .. } => root(),
-        // An ACL grant is gated by the path its scope governs: a fixed path directly,
-        // an element scope resolved to its element's current path through `index` (so
-        // the grant op reaches exactly the readers of the element's live location). An
-        // unresolvable element scope falls back to the root, reaching whatever the root
-        // verdict admits — wider than the whole-document reader (C52).
-        OpKind::AclGrant { scope, .. } => {
-            scope_path(index, scope).unwrap_or_else(|| encode_path(&[]))
+        // [`op_read_gate`] answers these before delegating: a RangedElement op by its
+        // anchor-sequence path set, an ACL op by its scope's path or — where that does not
+        // resolve — by the whole document. So this arm is unreachable, and it must not be
+        // quiet about it: root is *wider* than the gate those ops want, admitting exactly
+        // the carved-out root grant C52 closes, so a future variant or a reordering that
+        // let one fall through here would reintroduce that leak silently. The assertion is
+        // what stops it shipping — the suites and the Miri job run in debug, so any path
+        // that reaches this fails loudly in CI. Release still answers root rather than
+        // panicking: these `OpKind`s arrive off the wire, and a panic on decoded input is
+        // a denial-of-service trade this seam does not want to make.
+        OpKind::RangedCreate { .. }
+        | OpKind::RangedSetPayload { .. }
+        | OpKind::RangedDelete { .. }
+        | OpKind::AclGrant { .. }
+        | OpKind::AclRevoke { .. } => {
+            debug_assert!(
+                false,
+                "op_read_gate resolves Ranged and ACL ops itself; reaching op_read_path \
+                 with one means a variant or an arm order changed and the gate silently \
+                 widened to root (C52)"
+            );
+            root()
         }
-        // A revoke names only the tombstoned tuple's id; gate it by that tuple's
-        // governing path so a recipient sees the revoke where it may read the grant.
-        // For a `Path` scope that is the same fixed path the grant was gated at; an
-        // `Element` scope gates at the element's *current* path, so — as with the grant
-        // itself — the revoke's audience follows the element, and a move between a grant
-        // and its revoke shifts both with the element (consistent with the grant's
-        // enforcement, which likewise tracks the element). An id resolving to no held
-        // tuple is a moot revoke → root.
-        OpKind::AclRevoke { id } => records
-            .iter()
-            .find(|r| r.tuple.id == *id)
-            .map_or_else(root, |r| {
-                scope_path(index, &r.tuple.scope).unwrap_or_else(|| encode_path(&[]))
-            }),
     }
 }
 
-/// The set of document paths an op reads — the governing paths a recipient must
-/// **all** be able to read to receive it. For every op but the three RangedElement
-/// ops this is the single [`op_read_path`] wrapped in a one-element vec; a
+/// The path the tuple `id` names governs, or `None` when the tuple is not held or its
+/// element scope does not resolve. A revoke names only the tombstoned tuple's id, so it
+/// is gated by that tuple's governing path and a recipient sees the revoke exactly where
+/// it saw, or would have seen, the grant: for a `Path` scope the same fixed path the
+/// grant was gated at; for an `Element` scope the element's *current* path, so — as with
+/// the grant itself — the revoke's audience follows the element across a move. Used by
+/// [`op_read_gate`]'s revoke arm — the one place a revoke's audience is decided.
+fn acl_op_scope(
+    index: &HashMap<ElementId, Vec<Vec<u8>>>,
+    records: &[AclRecord],
+    id: ElementId,
+) -> Option<Vec<u8>> {
+    records
+        .iter()
+        .find(|r| r.tuple.id == id)
+        .and_then(|r| scope_path(index, &r.tuple.scope))
+}
+
+/// What a recipient must satisfy to receive an op — the outbound read gate, resolved
+/// once per op and then asked of each recipient ([`OpReadGate::admits`]).
+///
+/// Two shapes, because an op's governing authority is not always a path. Most ops name
+/// a document position, and the recipient must read every path in the set — require-all,
+/// since a RangedElement's two endpoints each reveal content-region info. An op whose
+/// governing target does not resolve names no position at all, and no path verdict can
+/// place it; that one is gated on the whole document instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpReadGate {
+    /// Every path must read.
+    Paths(Vec<Vec<u8>>),
+    /// Only a reader denied nothing — [`reads_whole_document`].
+    WholeDocument,
+}
+
+impl OpReadGate {
+    /// Whether a recipient carries the op: it reads every governing path, or — for a
+    /// gate no path can express — it reads the document whole. `reads_whole` resolves the
+    /// recipient's [`reads_whole_document`] verdict and is taken lazily, because it costs
+    /// a read verdict per governing tuple path while most batches hold no gate that asks
+    /// for it. It is also one answer per recipient, so a caller driving a batch owes it a
+    /// memo rather than a fresh evaluation per op.
+    pub fn admits<'a>(
+        &'a self,
+        mut reads: impl FnMut(&'a [u8]) -> bool,
+        reads_whole: impl FnOnce() -> bool,
+    ) -> bool {
+        match self {
+            OpReadGate::Paths(paths) => paths.iter().all(|p| reads(p)),
+            OpReadGate::WholeDocument => reads_whole(),
+        }
+    }
+}
+
+/// The read gate an op resolves to — the governing paths a recipient must **all** be
+/// able to read, or the whole-document requirement no path set expresses. For every op
+/// but the three RangedElement ops, the two ACL ops, and one addressing a mark's
+/// composite payload, this is the single [`op_read_path`]; a
 /// RangedElement is redacted by the path of *every* sequence its endpoints anchor
 /// (a require-all rule), since a mark/annotation reveals content-region info at both
 /// endpoints — a reader that cannot read where the range starts **or** ends must not
@@ -867,49 +904,89 @@ pub fn op_read_path(
 /// [`RangedDelete`](OpKind::RangedDelete) carries only the RangedElement id, so its
 /// anchors resolve through `ranged` — the server's held anchor set, tombstoned ranges
 /// included (a delete's target is already tombstoned) — exactly as a revoke resolves
-/// its tuple through `records`. An id that resolves to no held range is one the
-/// recipient never received (its region was unreadable): it falls back to the root,
-/// reaching whatever the root verdict admits. Each governing seq resolves to its path
-/// through `index`; an unresolved seq falls back to the root the same way — which
-/// admits a root-granted reader even where a subtree deny carves it (C52), not the
-/// whole-document reader alone.
-pub fn op_read_paths(
+/// its tuple through `records`. That set also keys each composite payload container and
+/// its registered descendants under their range's anchors, so an op *editing* a mark's
+/// payload is gated by the mark rather than falling to the root the index leaves it at.
+///
+/// A governing target that does not resolve — an anchor seq the tree no longer holds,
+/// a range id no held anchor set names, an element scope whose target has left the tree
+/// — names no path, so no path verdict places the op, and it takes
+/// [`WholeDocument`](OpReadGate::WholeDocument): only a reader denied nothing carries
+/// it. The root verdict is not that reader, and gating there served a root-granted
+/// reader an op out of the very subtree a deny carves out of its grant (C52). The
+/// snapshot projections drop the state form for every reader they narrow, and a reader
+/// denied nothing is served by the caller declining to project — the same partition of
+/// recipients, so op-join and snapshot-join agree.
+pub fn op_read_gate(
     index: &HashMap<ElementId, Vec<Vec<u8>>>,
     ranged: &HashMap<ElementId, (ElementId, ElementId)>,
     records: &[AclRecord],
     op: &Op,
-) -> Vec<Vec<u8>> {
+) -> OpReadGate {
+    let at = |path: Vec<u8>| OpReadGate::Paths(vec![path]);
+    let scope_gate = |path: Option<Vec<u8>>| match path {
+        // A `Path` scope is raw bytes the evaluator prefix-matches, and nothing validates
+        // them on the way in, so one that is not a `core::path` names a position no verdict
+        // can be asked at. The snapshot projection drops such a tuple for the same reason;
+        // gating it here on the whole document keeps the two seams' audiences equal.
+        Some(path) if crdtsync_core::path::parse_path(&path).is_some() => at(path),
+        _ => OpReadGate::WholeDocument,
+    };
     match &op.kind {
-        OpKind::RangedCreate { start, end, .. } => anchor_paths(index, start.seq, end.seq),
+        OpKind::RangedCreate { start, end, .. } => anchor_gate(index, start.seq, end.seq),
         OpKind::RangedSetPayload { id, .. } | OpKind::RangedDelete { id } => match ranged.get(id) {
-            Some((start, end)) => anchor_paths(index, *start, *end),
-            None => vec![encode_path(&[])],
+            Some((start, end)) => anchor_gate(index, *start, *end),
+            None => OpReadGate::WholeDocument,
         },
-        _ => vec![op_read_path(index, records, op)],
+        OpKind::AclGrant { scope, .. } => scope_gate(scope_path(index, scope)),
+        OpKind::AclRevoke { id } => scope_gate(acl_op_scope(index, records, *id)),
+        // An op editing a mark's composite payload rides the mark: `ranged` keys a payload
+        // container, and everything registered beneath it, under its range's anchors, since
+        // a payload hangs off the range rather than a map slot and the tree walk gives it no
+        // path of its own. Without this it would fall to the root while the snapshot
+        // projection cuts it with the mark, which is both a divergence and the mark's
+        // content leaking op-side. Consulted only where the index does *not* resolve the
+        // target, so a live element is always governed by its own path — which is what
+        // makes keying a whole payload subtree here safe against a stale edge.
+        _ if !index.contains_key(&op.target) => match ranged.get(&op.target) {
+            Some((start, end)) => anchor_gate(index, *start, *end),
+            None => at(op_read_path(index, op)),
+        },
+        _ => at(op_read_path(index, op)),
     }
 }
 
-/// The distinct governing paths of a range's two anchor sequences: each seq's own
-/// path through `index`, an unresolved seq falling back to the root. Deduped, so the
-/// common single-sequence mark yields one path and a cross-element range two.
-fn anchor_paths(
+/// The gate of a range's two anchor sequences: the distinct paths they resolve to
+/// through `index`, deduped — so the common single-sequence mark yields one path and a
+/// cross-element range two — or [`WholeDocument`](OpReadGate::WholeDocument) as soon as
+/// either seq resolves to nothing, since a mark reveals content-region info at *both*
+/// endpoints and one unplaceable endpoint is enough to make the whole mark unplaceable.
+fn anchor_gate(
     index: &HashMap<ElementId, Vec<Vec<u8>>>,
     start_seq: ElementId,
     end_seq: ElementId,
-) -> Vec<Vec<u8>> {
-    let start = resolve_read_path(index, start_seq);
-    let end = resolve_read_path(index, end_seq);
-    if start == end {
-        vec![start]
-    } else {
-        vec![start, end]
+) -> OpReadGate {
+    let mut paths: Vec<Vec<u8>> = Vec::new();
+    for seq in [start_seq, end_seq] {
+        let Some(segs) = index.get(&seq) else {
+            return OpReadGate::WholeDocument;
+        };
+        let path = encode_path(&segs.iter().map(|s| s.as_slice()).collect::<Vec<_>>());
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
     }
+    OpReadGate::Paths(paths)
 }
 
 /// The encoded `core::path` element `id` resolves to through the context `index`, or
-/// the root when the index does not hold it — a since-deleted or otherwise unindexed
-/// target reads at the root, so whatever the root verdict admits carries an op naming
-/// it, which is a wider set than the whole-document reader (C52).
+/// the root when the index does not hold it — a since-deleted or displaced container
+/// reads at the root, so whatever the root verdict admits carries an op naming it,
+/// which is a wider set than the whole-document reader. That is deliberate here and
+/// not the C52 fallback: an op addressed to a retained-but-unreachable *container*
+/// carries the container's own payload, which displace-then-recreate identity keeps
+/// on purpose, and narrowing it is C67's ruling to make against the snapshot
+/// projections that keep the same state.
 fn resolve_read_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, id: ElementId) -> Vec<u8> {
     index.get(&id).map_or_else(
         || encode_path(&[]),
@@ -924,8 +1001,10 @@ fn resolve_read_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, id: ElementId) ->
 /// An id the index does not hold yields `None`; what that means is the caller's.
 /// [`reads_whole_document`], [`has_any_read_grant`] and [`element_resolver`] drop the
 /// tuple, so the grant goes inert — an allow that resolves to nothing withholds, a
-/// *deny* that resolves to nothing admits — while [`op_read_path`] falls it back to the
-/// root (C52). Either way the tree the `index` describes is load-bearing, so a caller
+/// *deny* that resolves to nothing admits — while [`op_read_gate`] takes
+/// [`OpReadGate::WholeDocument`] for the grant op itself, reaching only a reader denied
+/// nothing (C52).
+/// Either way the tree the `index` describes is load-bearing, so a caller
 /// owes it the tree it is deciding for rather than whichever one is at hand (C32).
 fn scope_path(index: &HashMap<ElementId, Vec<Vec<u8>>>, scope: &AclScope) -> Option<Vec<u8>> {
     match scope {

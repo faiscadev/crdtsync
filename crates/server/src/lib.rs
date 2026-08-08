@@ -1734,11 +1734,14 @@ impl Hub {
     /// is covered: a map keys its children, and a non-map container's node-addressed
     /// descendants (list items, an XML element's attrs / children / nested elements)
     /// inherit that container's own path, since read authority governs a whole
-    /// subtree. An op whose target is still unindexed (a since-deleted container, a
-    /// composite annotation payload) resolves to the root by
-    /// [`op_read_path`](crate::acl::op_read_path), so whatever the root verdict admits
-    /// carries it — wider than the whole-document reader (C52). Empty for an unknown
-    /// room.
+    /// subtree. An op whose container target is still unindexed (a since-deleted or
+    /// displaced container) resolves to the root by
+    /// [`op_read_gate`](crate::acl::op_read_gate), so whatever the root verdict admits
+    /// carries it — wider than the whole-document reader, which is C67's ruling to
+    /// narrow. An op naming no container at all — a mark whose anchor sequence the walk
+    /// does not reach, an ACL scope whose target has left the tree — is gated instead by
+    /// [`OpReadGate::WholeDocument`](crate::acl::OpReadGate), reaching only a reader denied
+    /// nothing (C52). Empty for an unknown room.
     pub fn element_paths(&self, room: &[u8]) -> ElementPaths {
         self.rooms
             .get(room)
@@ -1786,9 +1789,15 @@ impl Hub {
     /// withheld on the live stream and not in the move's batch) must still reach the
     /// reader so it converges with a fresh joiner. This replays that content from the log:
     /// the ops targeting a container in the node's current subtree whose read paths the
-    /// reader may now read, in log order. Gated by the same `op_read_paths` authority the
+    /// reader may now read, in log order. Gated by the same [`op_read_gate`] authority the
     /// fan-out applies, so a deep deny inside the revealed subtree drops the same slots the
-    /// snapshot projection does. Empty for an unknown room or a node with no subtree.
+    /// snapshot projection does. `reads_whole` resolves the reader's
+    /// [`reads_whole_document`] verdict, which gates the ops that resolve to no path at
+    /// all; it is taken lazily, and by a reader this seam only ever runs for it is
+    /// `false` — a reveal shell exists because the node's *birth* path is denied, which
+    /// is what a whole-document verdict rules out — so a caller that reaches it has
+    /// already paid nothing for the ops that do resolve. Empty for an unknown room or a
+    /// node with no subtree.
     ///
     /// Every back-filled op rides untagged. A back-fill is a replay of committed
     /// history assembled around one node, so its selection — a subtree crossed with a
@@ -1800,12 +1809,15 @@ impl Hub {
     /// back-filled beside it.
     ///
     /// [`recipient_reads_path`]: crate::acl::recipient_reads_path
+    /// [`op_read_gate`]: crate::acl::op_read_gate
+    /// [`reads_whole_document`]: crate::acl::reads_whole_document
     pub fn reveal_backfill(
         &self,
         room: &[u8],
         node: ElementId,
         records: &[crdtsync_core::acl::AclRecord],
         reads: impl Fn(&[u8]) -> bool,
+        reads_whole: impl Fn() -> bool,
     ) -> Vec<Op> {
         let Some(r) = self.rooms.get(room) else {
             return Vec::new();
@@ -1820,9 +1832,8 @@ impl Hub {
             .iter()
             .filter(|rec| subtree.contains(&rec.op.target))
             .filter(|rec| {
-                crate::acl::op_read_paths(&index, &ranged, records, &rec.op)
-                    .iter()
-                    .all(|p| reads(p))
+                crate::acl::op_read_gate(&index, &ranged, records, &rec.op)
+                    .admits(&reads, &reads_whole)
             })
             .map(|rec| Op {
                 tx: None,
@@ -1831,10 +1842,12 @@ impl Hub {
             .collect()
     }
 
-    /// Project `room`'s document to `RangedElement id → (start seq, end seq)`,
-    /// tombstoned ranges included — the anchor resolution the per-recipient redaction
+    /// Project `room`'s document to `RangedElement id → (start seq, end seq)`, each
+    /// composite payload container and its registered descendants keyed under their
+    /// range's anchors beside it (a payload has no path of its own, so an op editing it
+    /// is gated by the mark it belongs to), tombstoned ranges included — the anchor resolution the per-recipient redaction
     /// gates a `RangedSetPayload`/`RangedDelete` by
-    /// ([`op_read_paths`](crate::acl::op_read_paths)), so a delete's already-tombstoned
+    /// ([`op_read_gate`](crate::acl::op_read_gate)), so a delete's already-tombstoned
     /// range still resolves to the sequences it annotated. Empty for an unknown room.
     pub fn ranged_anchors(&self, room: &[u8]) -> HashMap<ElementId, (ElementId, ElementId)> {
         self.rooms

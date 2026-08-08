@@ -613,12 +613,13 @@ fn the_scope_codec_is_total_over_truncation_and_a_bad_tag() {
 }
 
 #[test]
-fn a_projection_redacts_an_unresolvable_element_tuple_by_root_read() {
-    // Regression: a snapshot projection must redact an unresolvable-element ACL tuple by
-    // ROOT read — the same fallback the server op-stream takes (`op_read_path` gates it
-    // at root) — so a snapshot-served reader and an op-served reader converge on it.
-    // Dropping it here (fail-closed to nothing) diverged the two catch-up seams: an
-    // op-served root reader kept the tuple while a snapshot-served one lost it.
+fn a_projection_drops_an_unresolvable_element_tuple() {
+    // A snapshot projection drops an unresolvable-element ACL tuple: it names no path, so
+    // no path verdict places it, and keeping it for every reader the *root* query admits
+    // leaked its subject and effect to a root grant a subtree deny carves out (C52).
+    // The drop is unconditional because the transform only ever runs to narrow — the
+    // server declines to project for a reader denied nothing, and the op stream admits
+    // the grant op to exactly that reader, so the two catch-up seams still converge.
     let mut d = Document::new(cid(1));
     let card = board(&mut d);
     let gid = std::cell::Cell::new(ElementId::from_bytes([0u8; 16]));
@@ -639,22 +640,22 @@ fn a_projection_redacts_an_unresolvable_element_tuple_by_root_read() {
         "the card is unresolvable after deletion"
     );
 
-    // A root-reading projection keeps the tuple (root fallback) — as the op-stream does.
-    let mut keep = Document::decode_state(&d.encode_state()).expect("round-trip");
-    keep.project_read_paths(|_path| true, None);
-    assert!(
-        keep.acl_tuple(gid.get()).is_some(),
-        "a root reader keeps the unresolvable-element tuple, matching the op-stream"
-    );
-
-    // A projection that cannot read root drops it — as the op-stream withholds a
-    // root-gated op from a non-root reader.
-    let mut cut = Document::decode_state(&d.encode_state()).expect("round-trip");
-    cut.project_read_paths(|path| !path.is_empty(), None);
-    assert!(
-        cut.acl_tuple(gid.get()).is_none(),
-        "a reader that cannot read root drops the unresolvable-element tuple"
-    );
+    for (label, reads) in [
+        (
+            "an identity predicate",
+            &(|_: &[Vec<u8>]| true) as &dyn Fn(&[Vec<u8>]) -> bool,
+        ),
+        ("a reader denied at root", &|path: &[Vec<u8>]| {
+            !path.is_empty()
+        }),
+    ] {
+        let mut cut = Document::decode_state(&d.encode_state()).expect("round-trip");
+        cut.project_read_paths(reads, None);
+        assert!(
+            cut.acl_tuple(gid.get()).is_none(),
+            "{label}: the projection drops the unresolvable-element tuple"
+        );
+    }
 }
 
 /// Emit one element-scoped `AclGrant` op against `d` and return its wire bytes.

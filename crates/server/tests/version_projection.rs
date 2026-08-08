@@ -643,6 +643,62 @@ fn partial_room(deny: Deny) -> (Registry, Document, ConnId, Document, ConnId) {
     (r, alice_doc, alice, bob_doc, bob)
 }
 
+/// Seed a two-item sequence under `/b`, mark its first span, then delete `/b` — leaving
+/// the mark in the room with an anchor that resolves to no path at all. Returns the
+/// mark's RangedElement id.
+fn orphan_a_mark_under_b(r: &mut Registry, alice: ConnId, doc: &mut Document) -> ElementId {
+    for i in 0..2 {
+        let ops = crdtsync_core::path::list_insert(doc, &encode_path(&[b"b", b"seq"]), i, b"x");
+        submit(r, alice, ops);
+    }
+    let (ops, id) = crdtsync_core::path::mark(
+        doc,
+        &encode_path(&[b"b", b"seq"]),
+        0,
+        crdtsync_core::Side::Left,
+        1,
+        crdtsync_core::Side::Right,
+        b"bold",
+        Scalar::Bool(true),
+    );
+    let id = id.expect("a mark over a live sequence emits an id");
+    submit(r, alice, ops);
+    let ops = crdtsync_core::path::delete(doc, &encode_path(&[b"b"]));
+    submit(r, alice, ops);
+    ElementId::from_bytes(id.try_into().expect("a mark id is 16 bytes"))
+}
+
+#[test]
+fn a_version_fetch_keeps_an_orphaned_mark_for_a_reader_denied_nothing() {
+    // The read projection drops a mark whose anchor resolves to no path *unconditionally*,
+    // which is only safe because `project_served_state` declines to project at all for a
+    // reader `reads_whole_document` admits. The catch-up snapshot pins that decline; this
+    // pins it on the version fetch, the second seam running the same composition — a
+    // regression in its gate deletes the reader's data rather than over-serving it.
+    let (mut r, mut alice_doc, alice, _bob_doc, bob) = partial_room(Deny::Path);
+    let mark = orphan_a_mark_under_b(&mut r, alice, &mut alice_doc);
+    create_version(&mut r, alice, V1);
+
+    let whole = Document::decode_state(&fetch_version(&mut r, alice, V1))
+        .expect("the served version state decodes");
+    assert_eq!(
+        whole
+            .ranged_elements()
+            .into_iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>(),
+        vec![mark],
+        "a reader denied nothing is served the orphaned mark, unprojected",
+    );
+
+    let carved = Document::decode_state(&fetch_version(&mut r, bob, V1))
+        .expect("the served version state decodes");
+    assert!(
+        carved.ranged_elements().is_empty(),
+        "the reader carved out at /b is served no trace of a mark authored there",
+    );
+}
+
 #[test]
 fn a_partial_readers_version_withholds_the_denied_subtree() {
     let (mut r, _alice_doc, alice, _bob_doc, bob) = partial_room(Deny::Path);

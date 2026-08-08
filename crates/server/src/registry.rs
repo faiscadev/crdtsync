@@ -6,6 +6,7 @@
 //! room's other subscribed channels. Pure, synchronous routing; the async
 //! transport pumps bytes through it.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::rc::Rc;
@@ -2034,10 +2035,13 @@ impl Registry {
     /// Redaction runs on the *authored* ops (their target resolves through the
     /// room's element-path index), then the surviving subset is migration-translated
     /// to each recipient's version — redact-then-translate, since translation can
-    /// drop ops and would otherwise desync the path lookup. An op whose target the
-    /// index cannot resolve reads at the root ([`op_read_path`](crate::acl::op_read_path)),
-    /// so whatever the root verdict admits carries it — which includes a root grant
-    /// carved by a subtree deny, not the whole-document reader alone (C52).
+    /// drop ops and would otherwise desync the path lookup. An op whose *container*
+    /// target the index cannot resolve reads at the root
+    /// ([`op_read_gate`](crate::acl::op_read_gate)), so whatever the root verdict admits
+    /// carries it — which includes a root grant carved by a subtree deny, and is C67's
+    /// ruling to narrow. An op naming no container — a mark whose anchor sequence has
+    /// left the tree, an ACL scope whose target has — reaches only a reader denied
+    /// nothing ([`op_read_gate`](crate::acl::op_read_gate), C52).
     fn fan_out_ops_redacted(
         &mut self,
         origin: WriteOrigin,
@@ -2061,13 +2065,13 @@ impl Registry {
             .as_ref()
             .map(|s| self.hub.element_types(room, s))
             .unwrap_or_default();
-        // Each op's set of governing document paths is recipient-independent, so
-        // resolve it once. A recipient must read every path in an op's set to receive
-        // it (require-all — a Ranged op's distinct anchor seq paths, one path for every
-        // other op).
-        let op_paths: Vec<Vec<Vec<u8>>> = broadcast
+        // Each op's read gate is recipient-independent, so resolve it once. A recipient
+        // must read every path in an op's set to receive it (require-all — a Ranged op's
+        // distinct anchor seq paths, one path for every other op), or read the document
+        // whole where the op resolves to no path at all.
+        let op_gates: Vec<crate::acl::OpReadGate> = broadcast
             .iter()
-            .map(|op| crate::acl::op_read_paths(&index, &ranged_anchors, &records, op))
+            .map(|op| crate::acl::op_read_gate(&index, &ranged_anchors, &records, op))
             .collect();
         // Migration translation rides the same seam as redaction (scoped to the
         // room's governing app); resolve each distinct target's chain once.
@@ -2111,24 +2115,48 @@ impl Registry {
             // a batch touching one subtree resolves once — memoized per distinct path to
             // avoid re-hashing the actor per op.
             let mut verdict: HashMap<&[u8], bool> = HashMap::new();
-            debug_assert_eq!(op_paths.len(), broadcast.len());
+            // The whole-document verdict an unplaceable op is gated on is likewise one
+            // answer for this whole recipient, and costs a read verdict per governing
+            // tuple path — so it is resolved at most once, and not at all for a batch
+            // that holds no such op (the common case).
+            let whole_verdict: Cell<Option<bool>> = Cell::new(None);
+            let reads_whole = || match whole_verdict.get() {
+                Some(v) => v,
+                None => {
+                    let v = crate::acl::reads_whole_document(
+                        authorizer,
+                        &records,
+                        creator.as_deref(),
+                        &index,
+                        schema.as_deref(),
+                        identity,
+                        room,
+                    );
+                    whole_verdict.set(Some(v));
+                    v
+                }
+            };
+            debug_assert_eq!(op_gates.len(), broadcast.len());
             let readable: Vec<Op> = crate::session::retain_atomic_cloned(broadcast, |i, _| {
-                // `op_paths` parallels `broadcast`, so the op's governing path set is
-                // its own position in it.
-                op_paths[i].iter().all(|path| {
-                    *verdict.entry(path).or_insert_with(|| {
-                        crate::acl::recipient_reads_path(
-                            authorizer,
-                            &records,
-                            creator.as_deref(),
-                            &index,
-                            schema.as_deref(),
-                            identity,
-                            room,
-                            path,
-                        )
-                    })
-                })
+                // `op_gates` parallels `broadcast`, so the op's gate is its own position
+                // in it.
+                op_gates[i].admits(
+                    |path| {
+                        *verdict.entry(path).or_insert_with(|| {
+                            crate::acl::recipient_reads_path(
+                                authorizer,
+                                &records,
+                                creator.as_deref(),
+                                &index,
+                                schema.as_deref(),
+                                identity,
+                                room,
+                                path,
+                            )
+                        })
+                    },
+                    reads_whole,
+                )
             });
             if readable.is_empty() {
                 continue;
@@ -2196,18 +2224,24 @@ impl Registry {
                         let zone = shell.zone;
                         prefix.push(shell);
                         let backfill: Vec<Op> = hub
-                            .reveal_backfill(room, node, &records, |p| {
-                                crate::acl::recipient_reads_path(
-                                    authorizer,
-                                    &records,
-                                    creator.as_deref(),
-                                    &index,
-                                    schema.as_deref(),
-                                    identity,
-                                    room,
-                                    p,
-                                )
-                            })
+                            .reveal_backfill(
+                                room,
+                                node,
+                                &records,
+                                |p| {
+                                    crate::acl::recipient_reads_path(
+                                        authorizer,
+                                        &records,
+                                        creator.as_deref(),
+                                        &index,
+                                        schema.as_deref(),
+                                        identity,
+                                        room,
+                                        p,
+                                    )
+                                },
+                                reads_whole,
+                            )
                             .into_iter()
                             .filter(|op| carried.insert(op.id))
                             .map(|mut op| {

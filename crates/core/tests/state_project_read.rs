@@ -776,15 +776,15 @@ fn op_join_and_snapshot_join_materialize_the_same_ranged_subset() {
 }
 
 #[test]
-fn a_range_whose_anchor_seq_is_deleted_falls_back_to_root_gating() {
+fn a_range_whose_anchor_seq_is_deleted_is_dropped() {
     // Once a range's anchor sequence leaves the tree (deleted or re-parented away), its
-    // anchor no longer resolves, so it is gated by root. The reader below is denied at
-    // root, so it drops the orphaned range — which is what this pins. It is not the
-    // general rule: a reader the *root verdict admits* keeps the range, and a root
-    // grant carved by a subtree deny is such a reader, so the fallback is not
-    // fail-closed for it (C52). This is the same fallback op_read_paths applies on the
-    // op seam, so a fresh op-served and a fresh snapshot-served reader agree either
-    // way.
+    // anchor no longer resolves, so no path verdict places the range and the projection
+    // drops it — whatever the predicate admits, since the transform only ever runs to
+    // narrow and a reader denied nothing is served by the caller declining to project.
+    // The carved-out reader that passes the root query and is denied deeper is what the
+    // old root fallback leaked to; that face is pinned in `state_project_reach.rs` (C52).
+    // `op_read_gate` gates the matching op on the same partition of recipients, so a
+    // fresh op-served and a fresh snapshot-served reader agree either way.
     let build = || {
         let mut d = doc();
         list_ops(&mut d, b"a", 2);
@@ -797,14 +797,13 @@ fn a_range_whose_anchor_seq_is_deleted_falls_back_to_root_gating() {
     partial.project_read_paths(reads_top(false, &[b"a"]), None);
     assert!(
         ranged_ids(&partial).is_empty(),
-        "a partial reader drops a range whose deleted anchor falls back to root",
+        "a reader denied at root drops a range whose deleted anchor resolves to no path",
     );
 
-    let (mut whole, id) = build();
-    whole.project_read_paths(|_| true, None);
-    assert_eq!(
-        ranged_ids(&whole),
-        vec![id],
-        "a whole-document reader keeps the orphaned range",
+    let (mut identity, _) = build();
+    identity.project_read_paths(|_| true, None);
+    assert!(
+        ranged_ids(&identity).is_empty(),
+        "an identity predicate is a narrowing projection too, so the orphan still goes",
     );
 }
