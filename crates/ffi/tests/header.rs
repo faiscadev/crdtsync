@@ -76,6 +76,7 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_repair_path_decode",
         // atomic transactions
         "crdtsync_doc_begin_atomic",
+        "crdtsync_doc_mint_refused",
         "crdtsync_doc_commit_atomic",
         // undo / redo
         "crdtsync_doc_set_undo_origin",
@@ -123,6 +124,7 @@ fn the_header_declares_every_exported_symbol() {
         "crdtsync_client_mark_set_value",
         "crdtsync_client_mark_delete",
         "crdtsync_client_begin_atomic",
+        "crdtsync_client_mint_refused",
         "crdtsync_client_commit_atomic",
         // `get_counter`'s doc comment names `get_int`, `inc`, and `dec`, so
         // those three carry the trailing `(` of their prototype too.

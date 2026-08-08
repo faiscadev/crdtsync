@@ -23,6 +23,23 @@ export type { RepairStep } from "./path.js";
 
 const EMPTY = new Uint8Array();
 
+/** Thrown by an edit the replica had no id left to mint.
+ *
+ * The edit emitted nothing and changed nothing, and no retry helps: a refused mint
+ * is the fail-closed answer to a spent id space, never a re-issued id that would
+ * collide with one already published. Without this it is indistinguishable from an
+ * inert edit and the application reports a write that never happened.
+ *
+ * A refusal ends the transaction it happened in — the edits after it would address
+ * what it failed to create. What was emitted before it is applied here already and
+ * still ships. */
+export class MintExhausted extends Error {
+  constructor() {
+    super("crdtsync: the replica has no id left to mint, so the edit was refused");
+    this.name = "MintExhausted";
+  }
+}
+
 /** An applied change to the document, delivered to `Doc.on("update")`. */
 export interface UpdateEvent {
   /** `"local"` for an edit made on this replica, `"remote"` for an applied peer update. */
@@ -204,32 +221,53 @@ export class Doc {
     }
   }
 
+  /** Raise the refusal an edit's empty byte string cannot express.
+   *
+   * `refused` is read straight after the edit, never before and never later: the
+   * core clears the latch as each intention opens, so reading it there is what makes
+   * it this edit's answer, and reading it after the dispatch block would lose it to
+   * a listener that throws. It is *raised* after the ops have gone to the wire and
+   * the listeners, though — one backend call is one core transaction, and a refusal
+   * cuts it at the edit that could not mint, so a refused call can carry ops that
+   * did. Those are applied to this replica already; withholding them would leave it
+   * ahead of every peer. */
+  private guardMint(refused: boolean): void {
+    if (refused) throw new MintExhausted();
+  }
+
   private mutate(run: (backend: Backend) => Uint8Array): void {
     // Inside a transaction the edit just accumulates; the commit sends + dispatches.
     if (this.transacting) {
       run(this.backend);
+      this.guardMint(this.backend.mintRefused());
       return;
     }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const outbound = run(this.backend);
-    if (outbound.length === 0) return;
-    this.wire?.(outbound);
-    this.dispatch("local", outbound, before);
-    this.emitRepairs();
-  }
-
-  private mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T {
-    if (this.transacting) {
-      const [value] = run(this.backend);
-      return value;
-    }
-    const before = this.observing() ? this.backend.encodeState() : undefined;
-    const [value, outbound] = run(this.backend);
+    const refused = this.backend.mintRefused();
     if (outbound.length > 0) {
       this.wire?.(outbound);
       this.dispatch("local", outbound, before);
       this.emitRepairs();
     }
+    this.guardMint(refused);
+  }
+
+  private mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T {
+    if (this.transacting) {
+      const [value] = run(this.backend);
+      this.guardMint(this.backend.mintRefused());
+      return value;
+    }
+    const before = this.observing() ? this.backend.encodeState() : undefined;
+    const [value, outbound] = run(this.backend);
+    const refused = this.backend.mintRefused();
+    if (outbound.length > 0) {
+      this.wire?.(outbound);
+      this.dispatch("local", outbound, before);
+      this.emitRepairs();
+    }
+    this.guardMint(refused);
     return value;
   }
 

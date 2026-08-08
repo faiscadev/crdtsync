@@ -2552,3 +2552,46 @@ fn map_keys_enumerates_live_slots() {
         crdtsync_doc_free(a);
     }
 }
+
+#[test]
+fn a_refused_edit_is_reported_where_the_ops_buffer_cannot_say_it() {
+    // Every mutation entry point answers an empty ops buffer for a refused edit and
+    // for an inert one alike, and that buffer already carries a bad handle too — so
+    // the refusal is a query of its own rather than a third meaning on it.
+    unsafe {
+        let c = client(1);
+        let doc = crdtsync_doc_new(c.as_ptr());
+        let p = path(&[b"k"]);
+        assert_eq!(crdtsync_doc_mint_refused(doc), 0);
+
+        let ops = register_int(doc, &p, 1);
+        assert!(ops.len > 0);
+        assert_eq!(crdtsync_doc_mint_refused(doc), 0);
+        crdtsync_buf_free(ops);
+
+        // Fold in a peer op authored under this replica's own identity, at the last
+        // id of the space — the position that spends the mint for good.
+        let mut plant = crdtsync_core::Document::new(crdtsync_core::ClientId::from_bytes(c))
+            .transact(|tx| tx.set(b"planted", Scalar::Int(1)))
+            .remove(0);
+        plant.stamp.lamport = crdtsync_core::stamp::LAMPORT_STATE_CEILING;
+        plant.id.seq = 99;
+        let bytes = crdtsync_core::encode_ops(&[plant]);
+        assert_eq!(
+            crdtsync_doc_apply(doc, bytes.as_ptr(), bytes.len(), ptr::null_mut()),
+            1
+        );
+
+        let refused = register_int(doc, &p, 2);
+        assert_eq!(refused.len, 0, "a refused edit emitted ops");
+        crdtsync_buf_free(refused);
+        assert_eq!(crdtsync_doc_mint_refused(doc), 1);
+
+        crdtsync_doc_free(doc);
+        assert_eq!(
+            crdtsync_doc_mint_refused(ptr::null()),
+            -1,
+            "a bad handle reports as neither refused nor accepted"
+        );
+    }
+}

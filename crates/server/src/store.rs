@@ -24,7 +24,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crdtsync_core::{decode_op, encode_op, Op};
+use crdtsync_core::{decode_op, encode_op, ClientId, Op};
 
 use crate::RoomId;
 
@@ -68,6 +68,14 @@ pub struct RoomMeta {
     /// authority root that auto-owns `/`. Persisted so creator-auto-owns survives a
     /// restart; `None` for a room with no established creator.
     pub creator: Option<Vec<u8>>,
+    /// Which authenticated actor each replica identity in this room belongs to —
+    /// the actor that first wrote under it. A stamp names its author, so an op
+    /// authored under another replica's `ClientId` moves that replica's id-space
+    /// high-water; the claim is what refuses one. Sorted by `ClientId`, so the
+    /// record is byte-stable. Not re-derivable from the log for the same reason
+    /// `creator` is not: a stored op carries the per-device `ClientId`, never the
+    /// credential actor behind it.
+    pub client_actors: Vec<(ClientId, Vec<u8>)>,
 }
 
 /// One branch of a room: a named pointer into the op log. `fork_point` is the
@@ -308,17 +316,24 @@ impl Store {
     /// the length-prefixed app id and the 4-byte little-endian version, then a
     /// 1-byte high-water present-flag then — when present — the 4-byte
     /// little-endian op version, then a 1-byte creator present-flag then — when
-    /// present — the length-prefixed creator actor. The file lands atomically — temp,
+    /// present — the length-prefixed creator actor, then a 4-byte little-endian count
+    /// of replica-identity claims followed by that many `(16-byte ClientId,
+    /// length-prefixed actor)` pairs. The file lands atomically — temp,
     /// flushed, renamed, directory flushed — so a crash never leaves a torn record; a
     /// record with no field removes the file. The governing binding and op-version
     /// high-water are re-derivable (from live subscribers and the op log), so a write
-    /// failure of those degrades to a durability-cache miss. The creator is **not**
-    /// re-derivable — the op log carries per-device `ClientId`s, not the credential
-    /// actor — so its persist is still best-effort but a lost creator record means a
-    /// later authenticated writer bootstraps the room's authority root instead; the
-    /// caller persists it eagerly on the establishing write to keep that window small.
+    /// failure of those degrades to a durability-cache miss. The creator and the
+    /// claims are **not** re-derivable — the op log carries per-device `ClientId`s,
+    /// not the credential actor — so their persist is still best-effort but a lost
+    /// record means a later authenticated writer bootstraps the room's authority root,
+    /// and re-claims each replica identity it writes under, instead; the
+    /// caller persists eagerly on the establishing write to keep that window small.
     pub fn write_meta(&mut self, room: &[u8], meta: &RoomMeta) -> io::Result<()> {
-        if meta.governing.is_none() && meta.max_op_version.is_none() && meta.creator.is_none() {
+        if meta.governing.is_none()
+            && meta.max_op_version.is_none()
+            && meta.creator.is_none()
+            && meta.client_actors.is_empty()
+        {
             return self.remove_if_present(&self.meta_path(room));
         }
         let mut buf = Vec::new();
@@ -343,6 +358,12 @@ impl Store {
                 put_bytes(&mut buf, actor);
             }
             None => buf.push(0),
+        }
+        let claims = u32::try_from(meta.client_actors.len()).unwrap_or(u32::MAX);
+        buf.extend_from_slice(&claims.to_le_bytes());
+        for (client, actor) in meta.client_actors.iter().take(claims as usize) {
+            buf.extend_from_slice(&client.as_bytes());
+            put_bytes(&mut buf, actor);
         }
         self.atomic_write(&self.meta_path(room), &self.meta_tmp_path(room), &buf)
     }
@@ -706,7 +727,7 @@ fn parse_versions(bytes: &[u8]) -> io::Result<Vec<(Vec<u8>, u64, Option<Vec<u8>>
 /// Parse a governing-metadata record, or `None` if it is absent or malformed —
 /// the load path treats metadata as a durability cache and never fails on it, so
 /// any framing shortfall or bad flag reconstructs from the log instead. A record
-/// with neither field present decodes to `None`, matching the file's removal when
+/// with no field present decodes to `None`, matching the file's removal when
 /// there is nothing to persist.
 fn parse_meta(bytes: &[u8]) -> Option<RoomMeta> {
     let mut at = 0;
@@ -729,16 +750,30 @@ fn parse_meta(bytes: &[u8]) -> Option<RoomMeta> {
         1 => Some(take_bytes(bytes, &mut at).ok()?),
         _ => return None,
     };
+    let count = take_u32(bytes, &mut at).ok()?;
+    let mut client_actors = Vec::with_capacity((count as usize).min(1024));
+    for _ in 0..count {
+        let mut id = [0u8; 16];
+        for slot in id.iter_mut() {
+            *slot = take_u8(bytes, &mut at).ok()?;
+        }
+        client_actors.push((ClientId::from_bytes(id), take_bytes(bytes, &mut at).ok()?));
+    }
     if at != bytes.len() {
         return None;
     }
-    if governing.is_none() && max_op_version.is_none() && creator.is_none() {
+    if governing.is_none()
+        && max_op_version.is_none()
+        && creator.is_none()
+        && client_actors.is_empty()
+    {
         return None;
     }
     Some(RoomMeta {
         governing,
         max_op_version,
         creator,
+        client_actors,
     })
 }
 

@@ -1470,8 +1470,6 @@ fn handle_ops(
     // self-consistent and each channel keeps its own op-id space. Two channels of
     // one connection can be bound to the same room, and identities shared across
     // them would make one channel's ops dedup away as duplicates of the other's.
-    // Authenticating that the client is who it claims is the transport's
-    // credential check; this driver only enforces consistency.
     let authoring = client.for_channel(channel.0);
     if ops.iter().any(|op| op.id.client != authoring) {
         return violation("op client mismatch");
@@ -1532,6 +1530,36 @@ fn handle_ops(
         return redirect;
     }
     let identity = session.identity().expect("identity set, checked above");
+    // A replica identity belongs to the authenticated actor that first wrote under
+    // it in this room, and no other actor may author under it afterwards. Without
+    // this the `ClientId` is a bare declaration — Hello names it and nothing binds
+    // it — and the declaration is enough to reach the one place it does lasting
+    // damage: a stamp names its author, so an op admitted under a victim's identity
+    // raises *that* replica's id-space high-water, and one op stamped at the top of
+    // the space spends it outright, on every replica that folds the op and in the
+    // durable snapshot. The mint's refusal is fail-closed rather than a re-issued
+    // live id, so the victim does not diverge — it simply can never write again.
+    //
+    // The claim is per room, because the damage is: an id space is a property of a
+    // document, and a replica identity is spent in the room whose replica holds the
+    // stamp. It is established by the writer's own first batch below, so an honest
+    // client claims what it uses on its way in and nothing has to be provisioned.
+    //
+    // Refused recoverably, not as a protocol violation. Ownership is server-side
+    // state the client cannot observe, and it is decided per node — a batch this
+    // node refuses is one another may hold the claim for, and a client whose actor
+    // legitimately changed has no rotation to reach for (C94). The two violations
+    // above are about the batch's consistency with the client's *own* declaration,
+    // which the client can always check; this one is not, so it keeps the connection
+    // and leaves the author holding its ops. An empty batch is exempt: it authors no
+    // stamp, so it can spend no id space, and it is what an inert edit frames.
+    if !ops.is_empty() {
+        if let Some(owner) = hub.client_actor(&room, authoring) {
+            if Some(owner) != session.actor() {
+                return ops_rejected(channel, &ops, ErrorCode::Forbidden);
+            }
+        }
+    }
     // The doc-ACL tuple tier gates the write between the deployment and schema tiers:
     // the room creator owns `/`, and its grants let others in. A first write to a
     // fresh room finds no creator and no tuples, so the tier abstains and the
@@ -1652,6 +1680,19 @@ fn handle_ops(
     } else {
         hub.ingest_branch(&room, &branch, ops, write_version)
     };
+    // A written batch claims the replica identity it was authored under, so the gate
+    // above has an owner to compare the next actor against. It runs on both branches
+    // of the write: a branch has its own log and its own materialised replica, and a
+    // stamp planted through one is in the room's id space just the same.
+    //
+    // Only a batch that actually landed an op claims. An empty one authors no stamp,
+    // and one the room deduped away authors nothing *new* — a replay of another
+    // replica's historic ops would otherwise let whoever resends them take the
+    // identity that wrote them, which is the lockout the claim exists to prevent
+    // reached from the other side.
+    if matches!(&applied, Ok(landed) if !landed.is_empty()) {
+        hub.claim_client(&room, authoring, identity.actor());
+    }
     match applied {
         Ok(applied) => Response {
             replies: through

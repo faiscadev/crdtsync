@@ -438,26 +438,59 @@ func (d *Doc) applyRemote(receive func()) func() {
 // mutate runs one edit, transmits its bytes, and dispatches them as a local
 // update. Inside a transaction the edit just accumulates; Transact's commit
 // transmits and dispatches once.
-func (d *Doc) mutate(run func(Backend) []byte) []byte {
+func (d *Doc) mutate(run func(Backend) []byte) ([]byte, error) {
 	d.mu.Lock()
 	if d.transacting {
 		run(d.backend)
+		refused := d.backend.MintRefused()
 		d.mu.Unlock()
-		return nil
+		return nil, refusal(refused)
 	}
 	var before []byte
 	if d.observingLocked() {
 		before = d.backend.EncodeState()
 	}
 	ops := run(d.backend)
+	// Read straight after the edit, never before: the core clears the latch as
+	// each intention opens, so this answers for the edit just made.
+	refused := d.backend.MintRefused()
 	if len(ops) == 0 {
 		d.mu.Unlock()
-		return ops
+		return ops, refusal(refused)
 	}
 	plan := d.planDispatchLocked("local", ops, before)
 	d.mu.Unlock()
+	// The ops are stamped into this replica and its outbox already, so they reach
+	// the room even when the edit that followed them could not mint.
 	plan.run()
-	return ops
+	return ops, refusal(refused)
+}
+
+// refusal turns the backend's reading into the sentinel the mutators return.
+func refusal(refused bool) error {
+	if refused {
+		return ErrMintExhausted
+	}
+	return nil
+}
+
+// Err reports ErrMintExhausted when the edit most recently made through this
+// document was refused for want of an id, and nil otherwise.
+//
+// It is the seam for the mutators that return no error of their own — the XML
+// handles chain, so an error return there would cost the chaining the API is
+// built on, and Delete/Insert have nothing to say but this. A mutator that does
+// return an error returns this same sentinel directly; both read the one
+// condition, so a caller may use whichever suits its call site.
+//
+// It answers for the edit most recently made on this document by any goroutine,
+// so it is meaningful only where the document is edited from one. A concurrent
+// edit between a refused call and its Err clears the answer; the mutators that
+// return an error hand it back per call and are unaffected.
+func (d *Doc) Err() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return refusal(d.backend.MintRefused())
 }
 
 // observingLocked reports whether any update listener or subtree observer is
@@ -647,8 +680,8 @@ func (m *CrdtMap) Set(key string, value any) error {
 		return err
 	}
 	slot := m.slot(key)
-	m.doc.mutate(func(b Backend) []byte { return b.SetScalar(slot, scalar) })
-	return nil
+	_, err = m.doc.mutate(func(b Backend) []byte { return b.SetScalar(slot, scalar) })
+	return err
 }
 
 // Get reads key: a native scalar for a leaf, a BlobRef for a blob, a nested
@@ -808,7 +841,7 @@ func (l *CrdtList) Insert(index int, value any) error {
 	// Resolve the index against the same live length the insert lands in — an
 	// index read in an earlier critical section could be stale by the time the
 	// item is placed.
-	l.doc.mutate(func(b Backend) []byte {
+	_, err = l.doc.mutate(func(b Backend) []byte {
 		at := index
 		n := l.lenLocked()
 		if at < 0 {
@@ -822,7 +855,7 @@ func (l *CrdtList) Insert(index int, value any) error {
 		}
 		return b.ListInsert(l.path, uint(at), item)
 	})
-	return nil
+	return err
 }
 
 // Append appends a scalar item.
@@ -831,17 +864,17 @@ func (l *CrdtList) Append(value any) error {
 	if err != nil {
 		return err
 	}
-	l.doc.mutate(func(b Backend) []byte {
+	_, err = l.doc.mutate(func(b Backend) []byte {
 		return b.ListInsert(l.path, uint(l.lenLocked()), item)
 	})
-	return nil
+	return err
 }
 
 // Delete tombstones the live item at index. A negative index counts from the
 // end. Returns an error when index is out of range.
 func (l *CrdtList) Delete(index int) error {
 	var err error
-	l.doc.mutate(func(b Backend) []byte {
+	_, mintErr := l.doc.mutate(func(b Backend) []byte {
 		var idx uint
 		idx, err = l.checkedLocked(index)
 		if err != nil {
@@ -849,7 +882,10 @@ func (l *CrdtList) Delete(index int) error {
 		}
 		return b.ListDelete(l.path, idx)
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return mintErr
 }
 
 // Get reads the item at index. The bool is false when index is out of range.
