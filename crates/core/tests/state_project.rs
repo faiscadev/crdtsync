@@ -318,27 +318,34 @@ fn a_deleted_xml_fragment_resurrects_at_its_old_key() {
     // below the key, is unreachable this way.
     let mut d = doc();
     d.transact(|tx| {
-        tx.xml_fragment(b"body");
+        tx.xml_fragment(b"body").children().insert_element(0, b"p");
     });
     d.transact(|tx| tx.delete(b"body"));
     assert!(d.migrate_leaf_slots(rename(b"body", b"renamed")));
+    match d.get(b"body") {
+        Some(Element::XmlFragment(f)) => assert_eq!(
+            f.borrow().children().borrow().len(),
+            1,
+            "the resurrected fragment keeps the children its id derives"
+        ),
+        _ => panic!("expected the resurrected fragment at the old key"),
+    }
     assert!(
-        matches!(d.get(b"body"), Some(Element::XmlFragment(_))),
-        "the fragment resurrects live at the old key"
+        d.get(b"renamed").is_none(),
+        "the delete re-keyed: the new key holds a tombstone, not a live slot"
     );
-    assert!(d.get(b"renamed").is_none());
     let bytes = d.encode_state();
     let back = Document::decode_state(&bytes).unwrap();
     assert_eq!(back.encode_state(), bytes, "re-encode is canonical");
 }
 
 #[test]
-fn an_xml_create_outranking_a_map_create_leaves_the_key_carried_verbatim() {
-    // An XML create wins the slot from a map create and is itself deleted. XML
-    // derives its id by node rather than by key, so the key resolves no handle to
-    // resurrect — and the map create it outranks is not the one the op seam leaves
-    // live there, so resurrecting that instead would put the wrong container at the
-    // key. The slot is carried verbatim, the pre-existing XML behaviour.
+fn an_xml_element_create_outranking_a_map_create_leaves_the_key_carried_verbatim() {
+    // An XML element wins the slot from a map create and is itself deleted. Its id
+    // mixes its tag in below the key, so the key resolves no handle to resurrect —
+    // and the map create it outranks is not the one the op seam leaves live there,
+    // so resurrecting that instead would put the wrong container at the key. The
+    // slot is carried verbatim, the pre-existing behaviour for an element.
     let mut d = doc();
     d.transact(|tx| {
         tx.map(b"k");

@@ -704,9 +704,8 @@ impl Document {
         self.holds_any_container(map_id, key)
     }
 
-    /// Whether `key` in `map_id` currently holds a retained container of any
-    /// key-derived kind (map / list / text) — the identity a leaf migration must
-    /// not disturb.
+    /// Whether `key` in `map_id` currently holds a retained container of a kind the
+    /// key names — the identity a leaf migration must not disturb.
     fn holds_any_container(&self, map_id: ElementId, key: &[u8]) -> bool {
         ElementKind::KEY_DERIVED_CONTAINERS
             .into_iter()
@@ -735,9 +734,15 @@ impl Document {
             ElementKind::Text => self.texts.get(&id).map(|t| Element::Text(Rc::clone(t))),
             ElementKind::XmlFragment => self
                 .xml_fragments
-                .get(&id)
+                .get(&XmlFragment::node_id(map_id, key))
                 .map(|f| Element::XmlFragment(Rc::clone(f))),
-            _ => None,
+            // Every kind the guard above admits resolves; the rest are spelled out
+            // rather than swallowed, so a kind that becomes key-derived has to be
+            // given its registry here.
+            ElementKind::Scalar
+            | ElementKind::Register
+            | ElementKind::Counter
+            | ElementKind::XmlElement => None,
         }
     }
 
@@ -859,8 +864,7 @@ impl Document {
                 // one, or a tombstoned one the branch above could not resurrect
                 // (a key whose retained create resolves to no handle, an XML
                 // element among them, or a tombstone retaining no create at all)
-                // while
-                // the registry still holds a container there. The COUNTER
+                // that the registry still holds a container for. The COUNTER
                 // registry at the key's derived id migrates regardless: it is a
                 // separate identity from the slot body and from any container at
                 // the key, retained across displacement, so it must prune /
