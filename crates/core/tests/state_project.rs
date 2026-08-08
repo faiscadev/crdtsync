@@ -310,6 +310,29 @@ fn a_container_a_leaf_displaced_before_the_delete_still_resurrects() {
 }
 
 #[test]
+fn an_xml_create_outranking_a_map_create_leaves_the_key_carried_verbatim() {
+    // An XML create wins the slot from a map create and is itself deleted. XML
+    // derives its id by node rather than by key, so the key resolves no handle to
+    // resurrect — and the map create it outranks is not the one the op seam leaves
+    // live there, so resurrecting that instead would put the wrong container at the
+    // key. The slot is carried verbatim, the pre-existing XML behaviour.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"k");
+    });
+    d.transact(|tx| {
+        tx.xml_element(b"k", b"p");
+    });
+    d.transact(|tx| tx.delete(b"k"));
+    assert!(
+        !d.migrate_leaf_slots(rename(b"k", b"k2")),
+        "the slot is carried verbatim, not re-keyed"
+    );
+    assert!(d.get(b"k").is_none(), "no container is resurrected");
+    assert!(d.get(b"k2").is_none());
+}
+
+#[test]
 fn a_deleted_container_slot_is_resurrected_on_drop() {
     // Dropping a deleted container's field drops its delete op (the op seam drops
     // a removed field's ops) while the create carries verbatim — so the container

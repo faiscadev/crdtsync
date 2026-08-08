@@ -708,7 +708,7 @@ impl Document {
     /// key-derived kind (map / list / text) — the identity a leaf migration must
     /// not disturb.
     fn holds_any_container(&self, map_id: ElementId, key: &[u8]) -> bool {
-        [ElementKind::Map, ElementKind::List, ElementKind::Text]
+        ElementKind::KEY_DERIVED_CONTAINERS
             .into_iter()
             .any(|kind| self.container_handle(map_id, key, kind).is_some())
     }
@@ -848,11 +848,11 @@ impl Document {
                     continue;
                 }
                 // The slot body is carried verbatim for a container slot — a live
-                // one, or a tombstoned deleted one whose container identity the
-                // registry still holds but whose create-stamp is gone (a re-created
-                // key that a scalar or counter later displaced, so a faithful
-                // resurrection is impossible). The COUNTER registry at the key's
-                // derived id migrates regardless: it is a separate identity from the
+                // one, or a tombstoned one the branch above could not resurrect
+                // (a key whose retained create resolves to no handle, an XML one
+                // among them, or a tombstone retaining no create at all) while
+                // the registry still holds a container there. The COUNTER
+                // registry at the key's derived id migrates regardless: it is a separate identity from the
                 // slot body and from any container at the key, retained across
                 // displacement, so it must prune / re-home even when the slot is
                 // carried verbatim.

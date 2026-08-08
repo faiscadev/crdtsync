@@ -11,12 +11,11 @@
 //! in it hidden rather than waiting on a re-install that may never come, and what
 //! is genuinely still waiting is written in op-id order.
 //!
-//! Displacement is not the only way one op set reaches two encodings. A container
-//! create racing a *delete* of its key reached two as well, for a reason about
-//! what a slot records rather than what a replica holds: a tombstone remembered
-//! only a container it had seen installed. What a key retains is now the greatest
-//! container create it has ever seen there, recorded whether that create won the
-//! slot, lost it to the delete, or was later shadowed by a leaf — a running
+//! Displacement is not the only way one op set can reach two encodings: a
+//! container create racing a *delete* of its key turns on what a slot records
+//! rather than on what a replica holds. What a key retains is the greatest
+//! container create it has ever seen there, recorded whether that create wins the
+//! slot, loses it to the delete, or is later shadowed by a leaf — a running
 //! maximum, which no arrival order can reorder.
 
 use crdtsync_core::doc::Document;
@@ -34,6 +33,17 @@ fn fold(pool: &[&Op]) -> Document {
     let mut d = doc(9);
     for op in pool {
         d.apply(op);
+    }
+    d
+}
+
+/// Fold `pool` in the given order, requiring every op to land — the pools whose
+/// ops all target the root map, where a held op would mean the buffer is under
+/// test rather than the slots.
+fn fold_applied(pool: &[&Op]) -> Document {
+    let mut d = doc(9);
+    for op in pool {
+        assert!(d.apply(op), "every op in this pool targets the root map");
     }
     d
 }
@@ -308,7 +318,7 @@ fn generated_create_and_delete_pools_encode_alike_under_a_shuffle_sweep() {
     for seed in 1..seeds {
         let pool = generated_pool(seed);
         let refs: Vec<&Op> = pool.iter().collect();
-        let bytes = fold(&refs).encode_state();
+        let bytes = fold_applied(&refs).encode_state();
         let mut shuffle = seed.wrapping_mul(0x9e37_79b9) | 1;
         for round in 0..shuffles {
             let mut order = refs.clone();
@@ -319,7 +329,7 @@ fn generated_create_and_delete_pools_encode_alike_under_a_shuffle_sweep() {
                 order.swap(i, (shuffle % (i as u64 + 1)) as usize);
             }
             assert_eq!(
-                fold(&order).encode_state(),
+                fold_applied(&order).encode_state(),
                 bytes,
                 "pool {seed} shuffle {round} encodes different bytes"
             );
@@ -342,6 +352,26 @@ fn two_creates_of_different_kinds_under_one_delete_encode_the_same_bytes_in_ever
     every_order_encodes_alike(&two_kinds_and_a_delete(), &[b"k"]);
 }
 
+/// A map create, an XML create that takes the key from it, and a delete over
+/// both — the XML create outranks a key-derived one it is not interchangeable
+/// with, so the rank has to see it.
+fn an_xml_create_over_a_map_create() -> Vec<Op> {
+    let mut a = doc(1);
+    let map = a.transact(|tx| {
+        tx.map(b"k");
+    });
+    let xml = a.transact(|tx| {
+        tx.xml_element(b"k", b"p");
+    });
+    let delete = a.transact(|tx| tx.delete(b"k"));
+    map.into_iter().chain(xml).chain(delete).collect()
+}
+
+#[test]
+fn an_xml_create_over_a_map_create_encodes_the_same_bytes_in_every_order() {
+    every_order_encodes_alike(&an_xml_create_over_a_map_create(), &[b"k"]);
+}
+
 #[test]
 fn a_create_shadowed_by_a_leaf_and_then_deleted_encodes_the_same_bytes_in_every_order() {
     // The key retains the create across the scalar that outranks it, so a fold
@@ -350,9 +380,11 @@ fn a_create_shadowed_by_a_leaf_and_then_deleted_encodes_the_same_bytes_in_every_
 }
 
 #[test]
-fn a_create_shadowed_by_a_leaf_encodes_the_same_bytes_in_either_order() {
-    // The retained create rides on a *live* leaf slot, so it has to survive an
-    // encode/decode round trip with no delete anywhere in the pool.
+fn a_create_shadowed_by_a_leaf_round_trips_its_retained_create() {
+    // With no delete in the pool the retained create rides on a *live* leaf slot,
+    // which is the shape that has to survive an encode/decode round trip. Both
+    // orders reach it, and the round trip is what pins that the slot spells the
+    // create out at all.
     let mut a = doc(1);
     let create = a.transact(|tx| {
         tx.map(b"k");

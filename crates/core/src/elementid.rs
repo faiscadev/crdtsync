@@ -53,6 +53,18 @@ impl ElementKind {
         }
     }
 
+    /// Whether this kind is a nested container rather than a leaf — the kinds
+    /// addressed by element id, whose create a migration leaves at its key. The
+    /// single source of truth for the container/leaf split, which
+    /// [`Element::is_container`](crate::element::Element::is_container) reads
+    /// through; exhaustive with no catch-all, so a new kind must be classified.
+    pub fn is_container(self) -> bool {
+        match self {
+            Self::Map | Self::List | Self::Text | Self::XmlElement | Self::XmlFragment => true,
+            Self::Scalar | Self::Register | Self::Counter => false,
+        }
+    }
+
     /// Whether a container of this kind derives its id from its parent and key — so
     /// the key alone names it, and a snapshot migration can resurrect it there. An
     /// XML node derives by node instead, and a leaf is not a container at all.
@@ -68,4 +80,8 @@ impl ElementKind {
             | Self::XmlFragment => false,
         }
     }
+
+    /// The container kinds a key names — the candidates a snapshot migration
+    /// resolves a retained create against.
+    pub(crate) const KEY_DERIVED_CONTAINERS: [Self; 3] = [Self::Map, Self::List, Self::Text];
 }

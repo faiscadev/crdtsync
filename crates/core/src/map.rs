@@ -84,10 +84,11 @@ struct Entry {
 }
 
 /// The identity a snapshot migration resurrects a container by: the stamp its
-/// create landed at, plus which key-derived kind (map / list / text) it was, so a
-/// key that hosted more than one container kind resurrects the exact one. XML
-/// kinds derive ids by node, not key, so they are not resurrectable here and never
-/// recorded.
+/// create landed at, plus which kind it was, so a key that hosted more than one
+/// container kind resurrects the exact one. An XML kind derives its id by node
+/// rather than by key, so it is recorded — it ranks against the creates it wins
+/// the slot from — but resolves to no handle, and its key is carried verbatim
+/// instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ContainerCreate {
     stamp: Stamp,
@@ -111,12 +112,15 @@ fn higher(a: Option<ContainerCreate>, b: Option<ContainerCreate>) -> Option<Cont
     }
 }
 
-/// The create identity installing `value` at `stamp` contributes: a key-derived
-/// container records one, anything else none.
+/// The create identity installing `value` at `stamp` contributes: a container of
+/// any kind records one, a leaf none. A migration re-keys a leaf write and leaves
+/// every container create at the key, so the creates are what rank against each
+/// other there — including an XML one, which ranks without being resurrectable.
 fn create_of(value: &Element, stamp: Stamp) -> Option<ContainerCreate> {
-    let kind = value.kind();
-    kind.is_key_derived_container()
-        .then_some(ContainerCreate { stamp, kind })
+    value.is_container().then_some(ContainerCreate {
+        stamp,
+        kind: value.kind(),
+    })
 }
 
 pub struct Map {
@@ -188,9 +192,10 @@ impl Map {
 
     /// The retained (create-stamp, kind) of the deleted container at `key`, if the
     /// slot is a tombstone the key's container create sits under — what a snapshot
-    /// migration resurrects the create by. `None` for a live slot — a live container
-    /// is carried verbatim, and a create under a live *leaf* is out of scope here
-    /// (C76) — or for a tombstone on a key no container create ever named.
+    /// migration resurrects the create by, when the kind resolves to a handle at
+    /// all. `None` for a live slot — a live container is carried verbatim, and a
+    /// create under a live *leaf* is out of scope here (C76) — or for a tombstone
+    /// on a key no container create ever named.
     pub(crate) fn slot_deleted_container(&self, key: &[u8]) -> Option<(Stamp, ElementKind)> {
         self.slots
             .get(key)
@@ -267,8 +272,8 @@ impl Map {
             // retained container create, `3` a live slot whose value outranks one.
             // Only `2` and `3` cost the extra stamp + kind byte, and only where the
             // create is not already spelled out by the slot itself — a live
-            // container is its own create, so it stays tag `0`. A key that never
-            // held a container encodes exactly as before.
+            // container is its own create, so it stays tag `0`, and a key no
+            // container create ever named carries nothing to spell.
             let spelled = match entry.value.as_ref() {
                 Some(v) if !entry.tombstone => entry
                     .container
@@ -337,7 +342,7 @@ impl Map {
                     cur.note_stamp_reach(stamp.client, stamp.lamport);
                     let kind_tag = cur.u8()?;
                     let kind = match ElementKind::from_tag(kind_tag) {
-                        Some(k) if k.is_key_derived_container() => k,
+                        Some(k) if k.is_container() => k,
                         _ => {
                             return Err(DecodeError::BadTag {
                                 what: "retained container kind",
@@ -624,20 +629,17 @@ impl Map {
 
     pub fn map(&mut self, key: &[u8], stamp: Stamp) -> Rc<RefCell<Self>> {
         if let Some(Element::Map(m)) = self.live_value(key) {
-            // A create at a slot already holding this container is the same write a
-            // re-set of the installed handle is: it advances the slot where it wins
-            // and folds its create into the key's identity either way, so a repeated
-            // create ranks with every other one rather than passing through.
+            // Reaching a container already live at the key is a create there like any
+            // other, so it goes through `set`: the slot advances where the create
+            // wins, and the key's retained identity ranks it either way.
             self.set(key, Element::Map(Rc::clone(&m)), stamp);
             return m;
         }
         let id = ElementId::derive(self.id, key, ElementKind::Map);
         let fresh = Rc::new(RefCell::new(Self::new(id)));
-        if self.wins(key, stamp) {
-            self.evict(key);
-            self.install(key, Element::Map(Rc::clone(&fresh)), stamp);
-        } else {
-            self.note_create(key, stamp, ElementKind::Map);
+        let won = self.wins(key, stamp);
+        self.set(key, Element::Map(Rc::clone(&fresh)), stamp);
+        if !won {
             fresh.borrow().displace();
         }
         fresh
@@ -645,20 +647,14 @@ impl Map {
 
     pub fn list(&mut self, key: &[u8], stamp: Stamp) -> Rc<RefCell<List>> {
         if let Some(Element::List(l)) = self.live_value(key) {
-            // A create at a slot already holding this container is the same write a
-            // re-set of the installed handle is: it advances the slot where it wins
-            // and folds its create into the key's identity either way, so a repeated
-            // create ranks with every other one rather than passing through.
             self.set(key, Element::List(Rc::clone(&l)), stamp);
             return l;
         }
         let id = ElementId::derive(self.id, key, ElementKind::List);
         let fresh = Rc::new(RefCell::new(List::new(id)));
-        if self.wins(key, stamp) {
-            self.evict(key);
-            self.install(key, Element::List(Rc::clone(&fresh)), stamp);
-        } else {
-            self.note_create(key, stamp, ElementKind::List);
+        let won = self.wins(key, stamp);
+        self.set(key, Element::List(Rc::clone(&fresh)), stamp);
+        if !won {
             fresh.borrow().displace();
         }
         fresh
@@ -666,20 +662,14 @@ impl Map {
 
     pub fn text(&mut self, key: &[u8], stamp: Stamp) -> Rc<RefCell<Text>> {
         if let Some(Element::Text(t)) = self.live_value(key) {
-            // A create at a slot already holding this container is the same write a
-            // re-set of the installed handle is: it advances the slot where it wins
-            // and folds its create into the key's identity either way, so a repeated
-            // create ranks with every other one rather than passing through.
             self.set(key, Element::Text(Rc::clone(&t)), stamp);
             return t;
         }
         let id = ElementId::derive(self.id, key, ElementKind::Text);
         let fresh = Rc::new(RefCell::new(Text::new(id)));
-        if self.wins(key, stamp) {
-            self.evict(key);
-            self.install(key, Element::Text(Rc::clone(&fresh)), stamp);
-        } else {
-            self.note_create(key, stamp, ElementKind::Text);
+        let won = self.wins(key, stamp);
+        self.set(key, Element::Text(Rc::clone(&fresh)), stamp);
+        if !won {
             fresh.borrow().displace();
         }
         fresh
@@ -694,14 +684,6 @@ impl Map {
 
     fn wins(&self, key: &[u8], stamp: Stamp) -> bool {
         self.slots.get(key).map_or(true, |e| stamp.gt(&e.stamp))
-    }
-
-    /// Fold a create the slot did not take into the key's retained identity — the
-    /// losing half of the same rank the winning install records.
-    fn note_create(&mut self, key: &[u8], stamp: Stamp, kind: ElementKind) {
-        if let Some(e) = self.slots.get_mut(key) {
-            e.container = higher(e.container, Some(ContainerCreate { stamp, kind }));
-        }
     }
 
     fn install(&mut self, key: &[u8], value: Element, stamp: Stamp) {
