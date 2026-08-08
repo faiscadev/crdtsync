@@ -16,7 +16,7 @@
 //! behind.
 
 use crdtsync_core::doc::{Document, SlotFate};
-use crdtsync_core::{Element, ElementId, ElementKind, Scalar};
+use crdtsync_core::{Element, ElementId, ElementKind, Op, Scalar};
 
 mod common;
 use common::cid;
@@ -189,12 +189,13 @@ fn a_deleted_container_slot_is_re_keyed_faithfully_on_rename() {
 }
 
 #[test]
-fn a_multi_kind_key_resurrects_the_last_deleted_kind() {
+fn a_multi_kind_key_resurrects_the_highest_create() {
     // A key can host more than one container kind over its life — a map created
     // then deleted, then a list created then deleted. Both ids stay registered, so
-    // the resurrection must pick the kind the last delete tombstoned (the list),
-    // not a fixed priority. The list won the slot before its delete, so the op
-    // seam resurrects the list; the snapshot must match.
+    // the resurrection must pick the highest-ranked create (the list), not a fixed
+    // priority. The list won the slot before its delete, so the op seam resurrects
+    // the list; the snapshot must match. Here the highest create is also the last
+    // deleted; the two are told apart where one delete outranks both creates.
     let mut d = doc();
     d.transact(|tx| {
         tx.map(b"k").set(b"m", Scalar::Int(1));
@@ -207,11 +208,158 @@ fn a_multi_kind_key_resurrects_the_last_deleted_kind() {
     assert!(d.migrate_leaf_slots(rename(b"k", b"k2")));
     assert!(
         matches!(d.get(b"k"), Some(Element::List(_))),
-        "the last-deleted kind (list) resurrects, not the map a fixed priority would pick"
+        "the highest-ranked create (the list) resurrects, not the map a fixed priority would pick"
     );
     let bytes = d.encode_state();
     let back = Document::decode_state(&bytes).unwrap();
     assert_eq!(back.encode_state(), bytes, "re-encode is canonical");
+}
+
+/// Fold `pool` into a fresh replica in the given order — the seam where a create
+/// and the delete that outranks it can arrive either way round.
+fn fold(pool: &[&Op]) -> Document {
+    let mut d = Document::new(cid(9));
+    for op in pool {
+        assert!(d.apply(op), "every op in these pools targets the root map");
+    }
+    d
+}
+
+#[test]
+fn a_create_the_delete_outranked_resurrects_all_the_same() {
+    // A replica that saw the delete first never watched the container land, and it
+    // re-keys exactly like one that did: the create the op seam carries verbatim at
+    // the old key is the create the key retains, not the one a fold happened to see
+    // installed. Both orders migrate to the same bytes.
+    let mut a = doc();
+    let create = a.transact(|tx| {
+        tx.map(b"note");
+    });
+    let delete = a.transact(|tx| tx.delete(b"note"));
+    let (create, delete) = (&create[0], &delete[0]);
+
+    let mut late = fold(&[delete, create]);
+    assert!(late.migrate_leaf_slots(rename(b"note", b"renamed")));
+    assert!(
+        matches!(late.get(b"note"), Some(Element::Map(_))),
+        "the create the delete outranked resurrects at the old key"
+    );
+    let mut early = fold(&[create, delete]);
+    assert!(early.migrate_leaf_slots(rename(b"note", b"renamed")));
+    assert_eq!(
+        late.encode_state(),
+        early.encode_state(),
+        "the two arrival orders migrate to the same snapshot"
+    );
+}
+
+#[test]
+fn the_highest_create_is_the_one_a_shared_delete_resurrects() {
+    // Two creates of different kinds at one key, both outranked by a single delete.
+    // Which one resurrects is the creates' own rank — the higher stamp, the one
+    // that won or would have won the slot — never the order a replica saw them in.
+    // The reading converges on every order regardless, so it is the resurrection
+    // that pins the rank.
+    let mut a = doc();
+    let map = a.transact(|tx| {
+        tx.map(b"k");
+    });
+    let list = a.transact(|tx| {
+        tx.list(b"k");
+    });
+    let delete = a.transact(|tx| tx.delete(b"k"));
+    let (map, list, delete) = (&map[0], &list[0], &delete[0]);
+
+    for order in [
+        [map, list, delete],
+        [map, delete, list],
+        [list, map, delete],
+        [list, delete, map],
+        [delete, map, list],
+        [delete, list, map],
+    ] {
+        let mut d = fold(&order);
+        assert!(d.migrate_leaf_slots(rename(b"k", b"k2")));
+        assert!(
+            matches!(d.get(b"k"), Some(Element::List(_))),
+            "the higher-stamped create (the list) resurrects, whatever the order"
+        );
+    }
+}
+
+#[test]
+fn a_container_a_leaf_displaced_before_the_delete_still_resurrects() {
+    // A scalar takes the key from a live container, then a delete tombstones the
+    // scalar. The op seam still holds the create and carries it verbatim, so the
+    // snapshot resurrects it too — the create the key retains outlives the leaf
+    // that outranked it.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"note");
+    });
+    d.transact(|tx| tx.set(b"note", Scalar::Int(1)));
+    d.transact(|tx| tx.delete(b"note"));
+    assert!(d.migrate_leaf_slots(rename(b"note", b"renamed")));
+    assert!(
+        matches!(d.get(b"note"), Some(Element::Map(_))),
+        "the displaced container resurrects at the old key"
+    );
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).unwrap();
+    assert_eq!(back.encode_state(), bytes, "re-encode is canonical");
+}
+
+#[test]
+fn a_deleted_xml_fragment_resurrects_at_its_old_key() {
+    // A fragment's id derives from its parent and key exactly as a map's does, so
+    // the key names it and the create the tombstone retains resolves to it: the
+    // fragment lands live at the old key and the delete re-keys, the same state an
+    // op-served joiner reaches. Only an XML *element*, whose id mixes its tag in
+    // below the key, is unreachable this way.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.xml_fragment(b"body").children().insert_element(0, b"p");
+    });
+    d.transact(|tx| tx.delete(b"body"));
+    assert!(d.migrate_leaf_slots(rename(b"body", b"renamed")));
+    match d.get(b"body") {
+        Some(Element::XmlFragment(f)) => assert_eq!(
+            f.borrow().children().borrow().len(),
+            1,
+            "the resurrected fragment keeps the children its id derives"
+        ),
+        _ => panic!("expected the resurrected fragment at the old key"),
+    }
+    assert!(
+        d.get(b"renamed").is_none(),
+        "the delete re-keyed: the new key holds a tombstone, not a live slot"
+    );
+    let bytes = d.encode_state();
+    let back = Document::decode_state(&bytes).unwrap();
+    assert_eq!(back.encode_state(), bytes, "re-encode is canonical");
+}
+
+#[test]
+fn an_xml_element_create_outranking_a_map_create_leaves_the_key_carried_verbatim() {
+    // An XML element wins the slot from a map create and is itself deleted. Its id
+    // mixes its tag in below the key, so the key resolves no handle to resurrect —
+    // and the map create it outranks is not the one the op seam leaves live there,
+    // so resurrecting that instead would put the wrong container at the key. The
+    // slot is carried verbatim, the pre-existing behaviour for an element.
+    let mut d = doc();
+    d.transact(|tx| {
+        tx.map(b"k");
+    });
+    d.transact(|tx| {
+        tx.xml_element(b"k", b"p");
+    });
+    d.transact(|tx| tx.delete(b"k"));
+    assert!(
+        !d.migrate_leaf_slots(rename(b"k", b"k2")),
+        "the slot is carried verbatim, not re-keyed"
+    );
+    assert!(d.get(b"k").is_none(), "no container is resurrected");
+    assert!(d.get(b"k2").is_none());
 }
 
 #[test]
@@ -738,7 +886,7 @@ fn a_stale_state_version_is_rejected() {
     let mut d = doc();
     d.transact(|tx| tx.set(b"a", Scalar::Int(1)));
     let mut bytes = d.encode_state();
-    assert_eq!(bytes[0], 13, "the current state version");
+    assert_eq!(bytes[0], 14, "the current state version");
     bytes[0] = 10;
     assert!(
         Document::decode_state(&bytes).is_err(),
@@ -747,14 +895,18 @@ fn a_stale_state_version_is_rejected() {
 }
 
 #[test]
-fn only_a_deleted_container_tombstone_pays_the_extra_bytes() {
-    // The retained create identity is a per-deleted-container-tombstone cost; a
-    // leaf tombstone pays nothing new. Deleting a leaf vs an (empty) container at
-    // the same key, both one tombstone slot, isolates the delta: the create
-    // identity (one stamp = u64 lamport + 16-byte client + 1-byte offset flag =
-    // 25 bytes, plus a 1-byte kind tag) plus the pre-existing per-container costs
-    // a leaf never had — the child-map registry entry (id + zero-slot count = 20
-    // bytes) and its parent link (child id + parent id = 32 bytes).
+fn only_a_slot_that_retains_a_create_pays_the_extra_bytes() {
+    // The retained create identity is a per-slot cost, and only on the two slot
+    // shapes that have one to spell out: a tombstone over a create, and a live leaf
+    // that outranks one. A key no container create ever named pays nothing new, and
+    // neither does a live container, which is its own create.
+    //
+    // Deleting a leaf vs an (empty) container at the same key, both one tombstone
+    // slot, isolates the delta: the create identity (one stamp = u64 lamport +
+    // 16-byte client + 1-byte offset flag = 25 bytes, plus a 1-byte kind tag) plus
+    // the pre-existing per-container costs a leaf never had — the child-map registry
+    // entry (id + zero-slot count = 20 bytes) and its parent link (child id + parent
+    // id = 32 bytes).
     let leaf_tomb = {
         let mut d = doc();
         d.transact(|tx| tx.set(b"k", Scalar::Int(1)));
@@ -776,5 +928,53 @@ fn only_a_deleted_container_tombstone_pays_the_extra_bytes() {
         container_tomb.len() - leaf_tomb.len(),
         CREATE_IDENTITY + CHILD_MAP_REGISTRY + PARENT_LINK,
         "of the delta over a leaf tombstone, only the create identity is this change's tax"
+    );
+
+    // The same tax, and only it, on a live leaf that shadows a create: a scalar at a
+    // plain key against the same scalar at a key a container create sits under. The
+    // baseline takes two writes as well, so the two differ only in what the first
+    // one put at the key.
+    let leaf = {
+        let mut d = doc();
+        d.transact(|tx| tx.set(b"k", Scalar::Int(0)));
+        d.transact(|tx| tx.set(b"k", Scalar::Int(1)));
+        d.encode_state()
+    };
+    let shadowed_leaf = {
+        let mut d = doc();
+        d.transact(|tx| {
+            tx.map(b"k");
+        });
+        d.transact(|tx| tx.set(b"k", Scalar::Int(1)));
+        d.encode_state()
+    };
+    assert_eq!(
+        shadowed_leaf.len() - leaf.len(),
+        CREATE_IDENTITY + CHILD_MAP_REGISTRY + PARENT_LINK,
+        "a live leaf pays the create identity only where it shadows a create"
+    );
+
+    // A live container spells its create out through its own slot stamp and kind, so
+    // it carries no second copy: one write putting a map at a key against one write
+    // putting a scalar there differ by the slot body and the container's registry
+    // entries, and by nothing for the identity.
+    let one_leaf_write = {
+        let mut d = doc();
+        d.transact(|tx| tx.set(b"k", Scalar::Int(1)));
+        d.encode_state()
+    };
+    let one_container_write = {
+        let mut d = doc();
+        d.transact(|tx| {
+            tx.map(b"k");
+        });
+        d.encode_state()
+    };
+    const MAP_SLOT_BODY: usize = 1 + 16; // the slot's kind tag and the child's id
+    const INT_SLOT_BODY: usize = 1 + 1 + 8; // the slot's kind tag, the scalar tag, the int
+    assert_eq!(
+        one_container_write.len() + INT_SLOT_BODY,
+        one_leaf_write.len() + MAP_SLOT_BODY + CHILD_MAP_REGISTRY + PARENT_LINK,
+        "a live container pays no create identity of its own"
     );
 }

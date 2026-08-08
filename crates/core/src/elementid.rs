@@ -52,4 +52,58 @@ impl ElementKind {
             _ => None,
         }
     }
+
+    /// Whether this kind is a nested container rather than a leaf — the kinds
+    /// addressed by element id, whose create a migration leaves at its key. The
+    /// single source of truth for the container/leaf split, which
+    /// [`Element::is_container`](crate::element::Element::is_container) reads
+    /// through; exhaustive with no catch-all, so a new kind must be classified.
+    pub fn is_container(self) -> bool {
+        match self {
+            Self::Map | Self::List | Self::Text | Self::XmlElement | Self::XmlFragment => true,
+            Self::Scalar | Self::Register | Self::Counter => false,
+        }
+    }
+
+    /// Whether a container of this kind derives its id from its parent and key — so
+    /// the key alone names it, and a snapshot migration can resurrect it there. An
+    /// XML *element* mixes its tag in below the key, so the key alone does not name
+    /// it; a fragment derives by key like the rest. A leaf is not a container at
+    /// all. Exhaustive with no catch-all, so a new kind must be classified here
+    /// rather than defaulting to unresurrectable.
+    pub(crate) fn is_key_derived_container(self) -> bool {
+        match self {
+            Self::Map | Self::List | Self::Text | Self::XmlFragment => true,
+            Self::Scalar | Self::Register | Self::Counter | Self::XmlElement => false,
+        }
+    }
+
+    /// The container kinds a key names — the candidates a snapshot migration
+    /// resolves a retained create against. Kept in step with
+    /// [`is_key_derived_container`](Self::is_key_derived_container) by
+    /// `every_key_derived_kind_is_a_candidate`.
+    pub(crate) const KEY_DERIVED_CONTAINERS: [Self; 4] =
+        [Self::Map, Self::List, Self::Text, Self::XmlFragment];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ElementKind;
+
+    #[test]
+    fn every_key_derived_kind_is_a_candidate() {
+        // The candidate list a migration walks and the predicate that classifies a
+        // kind are two statements of one fact; a kind in either and not the other
+        // records a create no resolution ever reaches, or the reverse.
+        for tag in 0..=u8::MAX {
+            let Some(kind) = ElementKind::from_tag(tag) else {
+                continue;
+            };
+            assert_eq!(
+                kind.is_key_derived_container(),
+                ElementKind::KEY_DERIVED_CONTAINERS.contains(&kind),
+                "{kind:?} is classified one way and listed the other"
+            );
+        }
+    }
 }

@@ -11,11 +11,12 @@
 //! in it hidden rather than waiting on a re-install that may never come, and what
 //! is genuinely still waiting is written in op-id order.
 //!
-//! Displacement is not the only way one op set reaches two encodings. A container
-//! create racing a *delete* of its key still encodes two ways — the tombstone
-//! remembers a container it saw installed and not one whose create it outranked —
-//! which is a rule about what a deleted-container tombstone records, not about
-//! what a replica holds. That is C68, and it is unaffected by anything here.
+//! Displacement is not the only way one op set can reach two encodings: a
+//! container create racing a *delete* of its key turns on what a slot records
+//! rather than on what a replica holds. What a key retains is the greatest
+//! container create it has ever seen there, recorded whether that create wins the
+//! slot, loses it to the delete, or is later shadowed by a leaf — a running
+//! maximum, which no arrival order can reorder.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::{Element, Op, Scalar};
@@ -32,6 +33,21 @@ fn fold(pool: &[&Op]) -> Document {
     let mut d = doc(9);
     for op in pool {
         d.apply(op);
+    }
+    d
+}
+
+/// Fold `pool` in the given order, requiring every op to land — the pools whose
+/// ops all target the root map, where a held op would mean the buffer is under
+/// test rather than the slots.
+fn fold_applied(pool: &[&Op]) -> Document {
+    let mut d = doc(9);
+    for op in pool {
+        assert!(
+            d.apply(op),
+            "{:?} was held: this pool is meant to target only the root map",
+            op.kind
+        );
     }
     d
 }
@@ -167,6 +183,227 @@ fn a_reversed_displacement_heavy_pool_encodes_the_same_bytes() {
     assert_eq!(
         fold(&backward).encode_state(),
         fold(&forward).encode_state()
+    );
+}
+
+/// Every ordering of `pool`, as index permutations — a small pool's whole order
+/// space, where the sweeps above sample a large one's.
+fn orders(pool: &[Op]) -> Vec<Vec<&Op>> {
+    fn walk<'a>(rest: &[&'a Op], taken: &mut Vec<&'a Op>, out: &mut Vec<Vec<&'a Op>>) {
+        if rest.is_empty() {
+            out.push(taken.clone());
+            return;
+        }
+        for (i, op) in rest.iter().enumerate() {
+            let mut without = rest.to_vec();
+            without.remove(i);
+            taken.push(op);
+            walk(&without, taken, out);
+            taken.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(&pool.iter().collect::<Vec<_>>(), &mut Vec::new(), &mut out);
+    out
+}
+
+/// Assert every arrival order of `pool` folds to the same bytes, naming the order
+/// that broke it by its op kinds.
+fn every_order_encodes_alike(pool: &[Op], keys: &[&[u8]]) {
+    let first = fold(&pool.iter().collect::<Vec<_>>());
+    let bytes = first.encode_state();
+    for order in orders(pool) {
+        let other = fold(&order);
+        let names: Vec<String> = order.iter().map(|op| format!("{:?}", op.kind)).collect();
+        assert_eq!(
+            render(&other, keys),
+            render(&first, keys),
+            "order {names:?} reads differently"
+        );
+        assert_eq!(
+            other.encode_state(),
+            bytes,
+            "order {names:?} encodes different bytes"
+        );
+    }
+}
+
+/// A container create and a delete of its key, from one author. The create is
+/// outranked either way round: seen first it is installed and then tombstoned,
+/// seen second it never installs at all.
+fn create_and_delete() -> Vec<Op> {
+    let mut a = doc(1);
+    let create = a.transact(|tx| {
+        tx.map(b"k");
+    });
+    let delete = a.transact(|tx| tx.delete(b"k"));
+    create.into_iter().chain(delete).collect()
+}
+
+/// Two creates of *different kinds* at one key, both outranked by one delete.
+fn two_kinds_and_a_delete() -> Vec<Op> {
+    let mut a = doc(1);
+    let map = a.transact(|tx| {
+        tx.map(b"k");
+    });
+    let list = a.transact(|tx| {
+        tx.list(b"k");
+    });
+    let delete = a.transact(|tx| tx.delete(b"k"));
+    map.into_iter().chain(list).chain(delete).collect()
+}
+
+/// A create, a scalar that outranks it at the same key, and a delete over both —
+/// the container is never live when the delete lands, in any order.
+fn create_shadowed_then_deleted() -> Vec<Op> {
+    let mut a = doc(1);
+    let create = a.transact(|tx| {
+        tx.map(b"k");
+    });
+    let shadow = a.transact(|tx| tx.set(b"k", Scalar::Int(1)));
+    let delete = a.transact(|tx| tx.delete(b"k"));
+    create.into_iter().chain(shadow).chain(delete).collect()
+}
+
+/// A pool of creates, deletes and leaf writes over three keys by three authors —
+/// the shapes a create/delete race is drawn from, generated rather than hand-cut,
+/// so the hand-cut pools below are not the only thing between this rule and a
+/// regression. Every op targets the root map, so none is ever held.
+fn generated_pool(seed: u64) -> Vec<Op> {
+    let mut state = seed | 1;
+    let mut roll = |n: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % n
+    };
+    const KEYS: [&[u8]; 3] = [b"a", b"b", b"c"];
+    let mut authors: Vec<Document> = (1..=3).map(doc).collect();
+    let mut pool = Vec::new();
+    for _ in 0..12 {
+        let author = roll(3) as usize;
+        let key = KEYS[roll(3) as usize];
+        let choice = roll(6);
+        let written = authors[author].transact(|tx| match choice {
+            0 => {
+                tx.map(key);
+            }
+            1 => {
+                tx.list(key);
+            }
+            2 => {
+                tx.text(key);
+            }
+            3 => tx.delete(key),
+            4 => tx.set(key, Scalar::Int(1)),
+            _ => tx.inc(key, 1),
+        });
+        // The other two see the write, so later ops race it rather than stacking
+        // on one author's clock.
+        for (i, other) in authors.iter_mut().enumerate() {
+            if i != author {
+                for op in &written {
+                    other.apply(op);
+                }
+            }
+        }
+        pool.extend(written);
+    }
+    pool
+}
+
+#[test]
+fn generated_create_and_delete_pools_encode_alike_under_a_shuffle_sweep() {
+    // Whole-order sweeps are affordable on a two- or three-op pool; over a dozen
+    // ops they are not, so these are sampled — deterministically, so a failure
+    // names a pool anyone can rerun.
+    let seeds = if cfg!(miri) { 3 } else { 64 };
+    let shuffles = if cfg!(miri) { 2 } else { 4 };
+    for seed in 1..seeds {
+        let pool = generated_pool(seed);
+        let refs: Vec<&Op> = pool.iter().collect();
+        let bytes = fold_applied(&refs).encode_state();
+        let mut shuffle = seed.wrapping_mul(0x9e37_79b9) | 1;
+        for round in 0..shuffles {
+            let mut order = refs.clone();
+            for i in (1..order.len()).rev() {
+                shuffle ^= shuffle << 13;
+                shuffle ^= shuffle >> 7;
+                shuffle ^= shuffle << 17;
+                order.swap(i, (shuffle % (i as u64 + 1)) as usize);
+            }
+            assert_eq!(
+                fold_applied(&order).encode_state(),
+                bytes,
+                "pool {seed} shuffle {round} encodes different bytes"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_create_racing_a_delete_of_its_key_encodes_the_same_bytes_in_either_order() {
+    // The delete-first order records the container whose create it outranks, so
+    // both orders leave the same deleted-container tombstone. Nothing about the
+    // reading distinguishes them, which is why this is pinned on the bytes.
+    every_order_encodes_alike(&create_and_delete(), &[b"k"]);
+}
+
+#[test]
+fn two_creates_of_different_kinds_under_one_delete_encode_the_same_bytes_in_every_order() {
+    // Which of the two the tombstone retains is settled by the creates' stamps,
+    // not by which of them the fold happened to see first.
+    every_order_encodes_alike(&two_kinds_and_a_delete(), &[b"k"]);
+}
+
+/// A map create, an XML create that takes the key from it, and a delete over
+/// both — the XML create outranks a key-derived one it is not interchangeable
+/// with, so the rank has to see it.
+fn an_xml_create_over_a_map_create() -> Vec<Op> {
+    let mut a = doc(1);
+    let map = a.transact(|tx| {
+        tx.map(b"k");
+    });
+    let xml = a.transact(|tx| {
+        tx.xml_element(b"k", b"p");
+    });
+    let delete = a.transact(|tx| tx.delete(b"k"));
+    map.into_iter().chain(xml).chain(delete).collect()
+}
+
+#[test]
+fn an_xml_create_over_a_map_create_encodes_the_same_bytes_in_every_order() {
+    // Which of the two the key retains is pinned where it is observable — by the
+    // migration, in `state_project.rs`; here it is only that every order agrees.
+    every_order_encodes_alike(&an_xml_create_over_a_map_create(), &[b"k"]);
+}
+
+#[test]
+fn a_create_shadowed_by_a_leaf_and_then_deleted_encodes_the_same_bytes_in_every_order() {
+    // The key retains the create across the scalar that outranks it, so a fold
+    // that never had the container live at the delete records it all the same.
+    every_order_encodes_alike(&create_shadowed_then_deleted(), &[b"k"]);
+}
+
+#[test]
+fn a_create_shadowed_by_a_leaf_round_trips_its_retained_create() {
+    // With no delete in the pool the retained create rides on a *live* leaf slot,
+    // which is the shape that has to survive an encode/decode round trip. Both
+    // orders reach it, and the round trip is what pins that the slot spells the
+    // create out at all.
+    let mut a = doc(1);
+    let create = a.transact(|tx| {
+        tx.map(b"k");
+    });
+    let shadow = a.transact(|tx| tx.set(b"k", Scalar::Int(1)));
+    let pool: Vec<Op> = create.into_iter().chain(shadow).collect();
+    every_order_encodes_alike(&pool, &[b"k"]);
+    let bytes = fold(&pool.iter().collect::<Vec<_>>()).encode_state();
+    let back = Document::decode_state(&bytes).expect("decode");
+    assert_eq!(
+        back.encode_state(),
+        bytes,
+        "a decode/encode round trip changed the retained create"
     );
 }
 
