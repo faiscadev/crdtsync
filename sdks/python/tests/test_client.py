@@ -181,7 +181,7 @@ def test_diff_query_round_trips():
         assert len(a.diff_query(ch, DiffKind.BRANCHES, b"main", b"draft")) > 0
         assert a.diff_query(ch + 1, DiffKind.VERSIONS, b"a", b"b") == b""
         # No result until one is answered.
-        assert a.diff(room) is None
+        assert a.diff(ch) is None
 
         # Build the change payload the server would return.
         with Document(cid(2)) as d:
@@ -190,15 +190,24 @@ def test_diff_query_round_trips():
             d.register_int([b"age"], 40)
             changes = _diff_raw(old, d.encode_state())
 
-        # A DiffResult reply: tag 41, u32-prefixed room, u32-prefixed change list.
-        frame = struct.pack("<B", 41) + put_bytes(room) + put_bytes(changes)
+        # A DiffResult reply: tag 41, u32 channel, u32-prefixed change list.
+        frame = struct.pack("<BI", 41, ch) + put_bytes(changes)
         assert a.receive(frame) == 1
 
-        result = a.diff(room)
+        result = a.diff(ch)
         assert result is not None
         assert len(result) == 1
         assert result[0]["op"] == "value"
         assert result[0]["new"] == {"t": "int", "v": 40}
+
+        # A second channel on the same room, zone-scoped: the reply is keyed by the
+        # channel that asked, so each reads back its own answer rather than the last
+        # to arrive.
+        narrow, _ = a.subscribe_zone(room, b"za")
+        empty = struct.pack("<BI", 41, narrow) + put_bytes(_diff_raw(old, old))
+        assert a.receive(empty) == 1
+        assert a.diff(narrow) == []
+        assert a.diff(ch) == result
 
 
 def test_clone_room_round_trips():

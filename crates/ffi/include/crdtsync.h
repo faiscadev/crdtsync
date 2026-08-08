@@ -1737,8 +1737,8 @@ int32_t crdtsync_client_branch_at(const CrdtClient *client,
 // the frame to send; empty on a bad handle, a bad `kind`, a bad input, or a channel
 // this client does not hold.
 // Channel-keyed: a change list carries the room's paths and values, so the server
-// narrows it to what this channel may read. The reply updates the diff view, keyed
-// by the room the server resolved.
+// narrows it to what this channel may read, and the reply updates this channel's
+// diff view.
 //
 // # Safety
 // `client` is a live handle; `a`/`a_len` and `b`/`b_len` follow [`as_slice`].
@@ -1750,19 +1750,16 @@ CrdtBuf crdtsync_client_diff_query(const CrdtClient *client,
                                    const uint8_t *b,
                                    uintptr_t b_len);
 
-// The change list from the last diff query answered for `room`, written to `out`
+// The change list from the last diff query answered on `channel`, written to `out`
 // as the encoded [`crdtsync_diff`] buffer a binding hands to
 // [`crdtsync_diff_decode`]. Returns 1 if a result is held (an empty diff is an
-// empty-but-present change list), 0 if none has been answered, -1 on a bad handle
-// or a null `out`.
+// empty-but-present change list), 0 if none has been answered or the channel isn't
+// held, -1 on a bad handle or a null `out`. Keyed by channel, so two channels of
+// one room under different zone scopes each read back their own answer.
 //
 // # Safety
-// `client` is a live handle; `room`/`room_len` follow [`as_slice`]; `out` points
-// to a writable `CrdtBuf`.
-int32_t crdtsync_client_diff_result(const CrdtClient *client,
-                                    const uint8_t *room,
-                                    uintptr_t room_len,
-                                    CrdtBuf *out);
+// `client` is a live handle; `out` points to a writable `CrdtBuf`.
+int32_t crdtsync_client_diff_result(const CrdtClient *client, uint32_t channel, CrdtBuf *out);
 
 // Frame a request to duplicate room `src`'s live state into a fresh room `dst`;
 // returns the frame to send. Empty on a bad handle or input. Room-keyed: a

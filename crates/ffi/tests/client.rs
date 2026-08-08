@@ -9,7 +9,8 @@
 use crdtsync_core::diff::{decode_changes, encode_changes, Change};
 use crdtsync_core::protocol::BranchInfo;
 use crdtsync_core::{
-    decode_message, decode_ops, encode_message, encode_op, Channel, ErrorCode, Message, Op, Scalar,
+    decode_message, decode_ops, encode_message, encode_op, Channel, ElementKind, ErrorCode,
+    Message, Op, Scalar,
 };
 use crdtsync_ffi::*;
 use std::ptr;
@@ -726,19 +727,17 @@ fn a_diff_query_round_trips_over_the_client() {
 
         // No result until one is answered.
         let mut none = out_buf();
-        assert_eq!(
-            crdtsync_client_diff_result(c, b"room-1".as_ptr(), 6, &mut none),
-            0
-        );
+        assert_eq!(crdtsync_client_diff_result(c, ch, &mut none), 0);
 
-        // The server's diff result lands in the view, keyed by room.
+        // The server's diff result lands in the view, keyed by the channel that
+        // asked.
         let expected = Change::Value {
             path: path(&[b"age"]),
             old: Scalar::Int(30),
             new: Scalar::Int(40),
         };
         let result = encode_message(&Message::DiffResult {
-            room: b"room-1".to_vec(),
+            channel: Channel(ch),
             changes: encode_changes(std::slice::from_ref(&expected)),
         });
         assert_eq!(
@@ -747,10 +746,7 @@ fn a_diff_query_round_trips_over_the_client() {
         );
 
         let mut got = out_buf();
-        assert_eq!(
-            crdtsync_client_diff_result(c, b"room-1".as_ptr(), 6, &mut got),
-            1
-        );
+        assert_eq!(crdtsync_client_diff_result(c, ch, &mut got), 1);
         let raw = std::slice::from_raw_parts(got.ptr, got.len);
         // The buffer feeds the existing diff-decode binding back to the change.
         assert_eq!(decode_changes(raw).unwrap(), vec![expected]);
@@ -758,6 +754,49 @@ fn a_diff_query_round_trips_over_the_client() {
         assert_eq!(crdtsync_diff_decode(got.ptr, got.len, &mut decoded), 1);
         crdtsync_buf_free(decoded);
         crdtsync_buf_free(got);
+
+        crdtsync_client_free(c);
+    }
+}
+
+#[test]
+fn two_channels_of_one_room_read_back_their_own_diff() {
+    // A wide channel and a zone-narrowed one on the same room are served genuinely
+    // different change lists; each reader gets the answer to its own query.
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        let (wide, sub) = subscribe(c, b"room-1");
+        crdtsync_buf_free(sub);
+        let (narrow, sub) = subscribe_zone(c, b"room-1", b"zone-b");
+        crdtsync_buf_free(sub);
+        assert_ne!(wide, narrow);
+
+        let wide_change = Change::Added {
+            path: path(&[b"root-field"]),
+            kind: ElementKind::Map,
+        };
+        let narrow_change = Change::Added {
+            path: path(&[b"zone-b-field"]),
+            kind: ElementKind::Map,
+        };
+        for (channel, change) in [(wide, &wide_change), (narrow, &narrow_change)] {
+            let result = encode_message(&Message::DiffResult {
+                channel: Channel(channel),
+                changes: encode_changes(std::slice::from_ref(change)),
+            });
+            assert_eq!(
+                crdtsync_client_receive(c, result.as_ptr(), result.len(), ptr::null_mut()),
+                1
+            );
+        }
+
+        for (channel, change) in [(wide, wide_change), (narrow, narrow_change)] {
+            let mut got = out_buf();
+            assert_eq!(crdtsync_client_diff_result(c, channel, &mut got), 1);
+            let raw = std::slice::from_raw_parts(got.ptr, got.len);
+            assert_eq!(decode_changes(raw).unwrap(), vec![change]);
+            crdtsync_buf_free(got);
+        }
 
         crdtsync_client_free(c);
     }

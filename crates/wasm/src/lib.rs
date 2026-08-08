@@ -834,7 +834,7 @@ enum ReplyTag {
     Versions { channel: u32 },
     VersionState { channel: u32, name: Vec<u8> },
     Branches { room: Vec<u8> },
-    Diff { room: Vec<u8> },
+    Diff { channel: u32 },
     Clone { dst: Vec<u8> },
 }
 
@@ -849,7 +849,7 @@ impl ReplyTag {
                 name: name.clone(),
             },
             Message::Branches { room, .. } => ReplyTag::Branches { room: room.clone() },
-            Message::DiffResult { room, .. } => ReplyTag::Diff { room: room.clone() },
+            Message::DiffResult { channel, .. } => ReplyTag::Diff { channel: channel.0 },
             Message::CloneRoomResult { dst, .. } => ReplyTag::Clone { dst: dst.clone() },
             _ => return None,
         })
@@ -879,13 +879,9 @@ impl ReplyTag {
                     &js_sys::Uint8Array::from(room.as_slice()).into(),
                 );
             }
-            ReplyTag::Diff { room } => {
+            ReplyTag::Diff { channel } => {
                 set(&obj, "kind", &JsValue::from_str("diff"));
-                set(
-                    &obj,
-                    "room",
-                    &js_sys::Uint8Array::from(room.as_slice()).into(),
-                );
+                set(&obj, "channel", &JsValue::from_f64(*channel as f64));
             }
             ReplyTag::Clone { dst } => {
                 set(&obj, "kind", &JsValue::from_str("clone"));
@@ -1045,7 +1041,7 @@ impl WasmClient {
     /// version/branch/diff/clone request/reply correlation seam, mirroring
     /// [`takeRejected`](Self::take_rejected) — as an array of tagged objects:
     /// `{ kind: "versions", channel }`, `{ kind: "versionState", channel, name }`,
-    /// `{ kind: "branches", room }`, `{ kind: "diff", room }`, or
+    /// `{ kind: "branches", room }`, `{ kind: "diff", channel }`, or
     /// `{ kind: "clone", dst }` (`name`/`room`/`dst` a `Uint8Array`). The result
     /// itself is read with the matching reader (`versions`/`versionState`/
     /// `branches`/`diff`/`cloneResult`). Empty when none arrived; draining, so a
@@ -1792,9 +1788,9 @@ impl WasmClient {
     /// state `b` in the room that channel is subscribed to. `kind` selects the
     /// state space — 0 diffs two saved versions, 1 diffs two branches' HEADs; any
     /// other value is an error. Channel-keyed: a change list carries the room's
-    /// paths and values, so the server narrows it to what this channel may read.
-    /// The reply updates the diff view, keyed by the room the server resolved.
-    /// `None` if the channel isn't held, as a version fetch answers.
+    /// paths and values, so the server narrows it to what this channel may read,
+    /// and the reply updates this channel's diff view. `None` if the channel isn't
+    /// held, as a version fetch answers.
     #[wasm_bindgen(js_name = diffQuery)]
     pub fn diff_query(
         &self,
@@ -1819,11 +1815,12 @@ impl WasmClient {
             .map(encode_message))
     }
 
-    /// The change list from the last diff query answered for `room`, as an array
+    /// The change list from the last diff query answered on `channel`, as an array
     /// of change objects — the same shape [`WasmDocument::diff`] yields — or `null`
-    /// if none has been answered. An empty diff is an empty array.
-    pub fn diff(&self, room: &[u8]) -> JsValue {
-        match self.inner.diff(room) {
+    /// if none has been answered. An empty diff is an empty array. Keyed by channel,
+    /// so two channels of one room each read back their own answer.
+    pub fn diff(&self, channel: u32) -> JsValue {
+        match self.inner.diff(Channel(channel)) {
             Some(changes) => changes
                 .iter()
                 .map(change_to_js)

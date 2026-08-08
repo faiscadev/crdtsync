@@ -64,8 +64,9 @@ pub struct Rejected {
 /// One subscribed room: its local replica, the room name and the branch within
 /// it (empty is the default `main`), how far it has caught up, the outbox of
 /// authored-but-unacknowledged ops, the peers' ephemeral awareness entries keyed
-/// by `(actor, key)`, and the version view — the last name list the server
-/// reported and any fetched version states keyed by name.
+/// by `(actor, key)`, the version view — the last name list the server reported
+/// and any fetched version states keyed by name — and the last diff answered on
+/// this channel.
 struct Room {
     room: Vec<u8>,
     branch: Vec<u8>,
@@ -76,6 +77,12 @@ struct Room {
     awareness: HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
     version_names: Vec<Vec<u8>>,
     version_states: HashMap<Vec<u8>, (u64, Vec<u8>)>,
+    /// The change list this channel's last [`Message::DiffResult`] carried,
+    /// decoded. Held per channel rather than per room: the channel's zone scope is
+    /// what narrowed the answer, so two channels of one room hold genuinely
+    /// different lists and each reader must get the one served to its own channel.
+    /// `None` until a diff query on this channel is answered.
+    diff: Option<Vec<Change>>,
 }
 
 /// A replica's connection carrying several room subscriptions, each keyed by the
@@ -117,16 +124,6 @@ pub struct ClientSession {
     /// holds any subscription. Empty until a list request or a mutation is
     /// answered.
     branches: HashMap<Vec<u8>, Vec<BranchInfo>>,
-    /// The last diff result the server returned per room — the change list a
-    /// [`Message::DiffResult`] reply carried, decoded. Room-keyed like the branch
-    /// view even though the query is channel-keyed: a change list is a fact about a
-    /// room. A fresh query replaces the room's entry, so two channels diffing one
-    /// room share it — and since the reply carries no channel, a result **cannot be
-    /// attributed to the query that asked for it**. Two channels on one room with
-    /// different zone scopes are now served genuinely different change lists, so this
-    /// view can hand one channel's answer to the other's reader (C50). Empty until a
-    /// diff query is answered.
-    diffs: HashMap<Vec<u8>, Vec<Change>>,
     /// The outcome of each clone-room request, keyed by the destination room — the
     /// `created` flag a [`Message::CloneRoomResult`] reply carried. Keyed by `dst`
     /// so a client reads the result of the clone it issued. Empty until a clone is
@@ -157,7 +154,6 @@ impl ClientSession {
             rejected: Vec::new(),
             redirects: Vec::new(),
             branches: HashMap::new(),
-            diffs: HashMap::new(),
             clone_results: HashMap::new(),
             cross_zone_tokens: HashMap::new(),
         }
@@ -270,6 +266,7 @@ impl ClientSession {
                 awareness: HashMap::new(),
                 version_names: Vec::new(),
                 version_states: HashMap::new(),
+                diff: None,
             },
         );
         (
@@ -604,11 +601,11 @@ impl ClientSession {
     /// Request the structural diff turning state `a` into state `b` in the room that
     /// `channel` is subscribed to, returning the request frame, or `None` if the
     /// channel isn't held. `kind` selects whether `a`/`b` name two saved versions or
-    /// two branches. The reply updates the [`diff`](Self::diff) view, keyed by the
-    /// room the server resolved. Channel-keyed like a version fetch: a diff reports
-    /// a room's own paths and values, so the server narrows it to what this channel
-    /// may read — and framing one on a channel this session never subscribed is a
-    /// protocol violation at the server, so it is refused here instead.
+    /// two branches. The reply updates this channel's [`diff`](Self::diff) view.
+    /// Channel-keyed like a version fetch: a diff reports a room's own paths and
+    /// values, so the server narrows it to what this channel may read — and framing
+    /// one on a channel this session never subscribed is a protocol violation at the
+    /// server, so it is refused here instead.
     pub fn diff_query(
         &self,
         channel: Channel,
@@ -625,12 +622,12 @@ impl ClientSession {
         })
     }
 
-    /// The change list from the last diff query answered for `room`, or `None` if
-    /// none has been. An empty diff is an empty slice, not `None`. Keyed by room, so
-    /// two channels of this session diffing one room overwrite each other's answer
-    /// and neither can tell whose it is reading (C50).
-    pub fn diff(&self, room: &[u8]) -> Option<&[Change]> {
-        self.diffs.get(room).map(Vec::as_slice)
+    /// The change list from the last diff query answered on `channel`, or `None` if
+    /// none has been. An empty diff is an empty slice, not `None`. Keyed by channel,
+    /// so two channels of this session diffing one room under different zone scopes
+    /// each read back the answer served to their own channel.
+    pub fn diff(&self, channel: Channel) -> Option<&[Change]> {
+        self.rooms.get(&channel)?.diff.as_deref()
     }
 
     /// Duplicate room `src`'s live state into a fresh room `dst`, returning the
@@ -929,10 +926,13 @@ impl ClientSession {
                 self.branches.insert(room, branches);
                 Ok(())
             }
-            Message::DiffResult { room, changes } => {
+            Message::DiffResult { channel, changes } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
                 // A malformed change list is refused without touching the view.
-                let changes = decode_changes(&changes).map_err(|_| ClientError::BadDiff)?;
-                self.diffs.insert(room, changes);
+                room.diff = Some(decode_changes(&changes).map_err(|_| ClientError::BadDiff)?);
                 Ok(())
             }
             Message::CloneRoomResult { dst, created } => {
