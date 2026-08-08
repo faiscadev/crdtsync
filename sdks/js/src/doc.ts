@@ -215,17 +215,26 @@ export class Doc {
     const before = this.observing() ? this.backend.encodeState() : undefined;
     this.transacting = true;
     this.backend.beginAtomic();
-    let delivery: unknown;
+    let body: unknown;
+    let threw = false;
     try {
       fn();
-    } finally {
-      this.transacting = false;
-      // The group is committed and delivered whatever the body did, so a body that
-      // threw never strands it open. A listener that throws during that delivery is
-      // held rather than propagated: a `MintExhausted` already on its way out of
-      // `fn` is the answer to the edit the application made, and must not be
-      // replaced by it.
-      delivery = this.deliver(this.backend.commitAtomic(), before);
+    } catch (e) {
+      body = e;
+      threw = true;
+    }
+    this.transacting = false;
+    // The group is committed and delivered whatever the body did, so a body that
+    // threw never strands it open. A listener that throws during that delivery is
+    // held rather than propagated: a refusal already on its way out of `fn` is the
+    // answer to the edit the application made, and outranks it — carrying it as
+    // the cause rather than dropping it.
+    const delivery = this.deliver(this.backend.commitAtomic(), before);
+    if (threw) {
+      if (body instanceof MintExhausted && delivery !== undefined && body.cause === undefined) {
+        (body as { cause?: unknown }).cause = delivery;
+      }
+      throw body;
     }
     if (delivery !== undefined) throw delivery;
   }

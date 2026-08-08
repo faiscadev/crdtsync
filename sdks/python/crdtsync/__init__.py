@@ -3073,6 +3073,7 @@ class Doc:
         # transaction must not degrade into loose edits.
         with self._gate:
             outbound, changes, repairs = b"", [], []
+            body: Optional[BaseException] = None
             try:
                 with self._lock:
                     if self._transacting:
@@ -3086,6 +3087,8 @@ class Doc:
                     self._transacting = True
                     try:
                         fn()
+                    except BaseException as exc:  # noqa: BLE001 - re-raised below
+                        body = exc
                     finally:
                         self._transacting = False
                         outbound = self._backend.commit_atomic()
@@ -3095,11 +3098,24 @@ class Doc:
             finally:
                 # Whatever the body did before it raised is committed to this
                 # replica, so it has to reach the room too — dropping it would
-                # leave this replica ahead of every peer.
+                # leave this replica ahead of every peer. A wire write or a listener
+                # that raises here is held: a refusal already on its way out of the
+                # body is the answer to the edit the application made, and outranks
+                # it, carrying it as the cause.
+                delivery = None
                 if outbound:
-                    self._send(outbound)
-                    self._publish("local", outbound, changes)
-                    self._publish_repairs(repairs)
+                    try:
+                        self._send(outbound)
+                        self._publish("local", outbound, changes)
+                        self._publish_repairs(repairs)
+                    except BaseException as exc:  # noqa: BLE001 - re-raised below
+                        delivery = exc
+                if body is not None:
+                    if delivery is not None and body.__cause__ is None:
+                        raise body from delivery
+                    raise body
+                if delivery is not None:
+                    raise delivery
 
     def on_update(self, callback: Callable[[UpdateEvent], None]) -> Callable[[], None]:
         """Subscribe to every applied change to the document; returns a function

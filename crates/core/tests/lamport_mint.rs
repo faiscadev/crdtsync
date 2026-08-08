@@ -1384,7 +1384,7 @@ fn the_latch_spans_an_intention_a_nested_group_only_joins() {
         group
             .iter()
             .any(|op| matches!(op.kind, OpKind::MapSet { .. })),
-        "the edit before the refusal was taken back out of the group"
+        "the edit before the refusal did not land in the group"
     );
     assert!(
         group

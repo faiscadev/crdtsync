@@ -129,3 +129,21 @@ def test_a_throwing_listener_does_not_take_the_refusals_place():
     with pytest.raises(MintExhausted) as caught:
         doc.get_text("t").insert(0, "abcdefghij")
     assert caught.value.__cause__ is boom
+
+
+def test_a_transactions_commit_delivery_does_not_take_the_refusals_place():
+    # ``transact`` commits and delivers in its ``finally``, so a listener that raises
+    # there sits between the refusal and the caller. The refusal still wins.
+    me = cid(6)
+    doc = Doc(me)
+    doc.apply_update(nearly_spent(me))
+
+    boom = RuntimeError("listener")
+
+    def explode(event):
+        if event.origin == "local":
+            raise boom
+
+    doc.on_update(explode)
+    with pytest.raises(MintExhausted):
+        doc.transact(lambda: doc.get_text("t").insert(0, "abcdefghij"))
