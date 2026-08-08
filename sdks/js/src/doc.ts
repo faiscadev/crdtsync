@@ -23,6 +23,26 @@ export type { RepairStep } from "./path.js";
 
 const EMPTY = new Uint8Array();
 
+/** Thrown by an edit the replica had no id left to mint.
+ *
+ * A stamp is drawn from this replica's own id space, and the space is finite:
+ * honest traffic reaches the end of it after 2^63 edits, and a peer authoring
+ * under this replica's client id can put it there in one op. The edit emitted
+ * nothing and changed nothing — a refused mint is the fail-closed answer, never a
+ * re-issued id that would collide with one already published. Without this the
+ * refusal is indistinguishable from an inert edit and the application reports a
+ * write that never happened.
+ *
+ * A refusal inside `Doc.transact` also ends that transaction: the edits after it
+ * would address what it failed to create, so nothing further is emitted. What was
+ * emitted before it is already applied here and still ships. */
+export class MintExhausted extends Error {
+  constructor() {
+    super("crdtsync: the replica has no id left to mint, so the edit was refused");
+    this.name = "MintExhausted";
+  }
+}
+
 /** An applied change to the document, delivered to `Doc.on("update")`. */
 export interface UpdateEvent {
   /** `"local"` for an edit made on this replica, `"remote"` for an applied peer update. */
@@ -205,14 +225,24 @@ export class Doc {
     }
   }
 
+  /** Raise the refusal an edit's empty byte string cannot express. Read after the
+   * edit, never before: the core clears the latch as each intention opens, so this
+   * answers for the edit just made — and inside a transaction it stays raised for
+   * the rest of the group, which is the group's own semantics. */
+  private guardMint(): void {
+    if (this.backend.mintRefused()) throw new MintExhausted();
+  }
+
   private mutate(run: (backend: Backend) => Uint8Array): void {
     // Inside a transaction the edit just accumulates; the commit sends + dispatches.
     if (this.transacting) {
       run(this.backend);
+      this.guardMint();
       return;
     }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const outbound = run(this.backend);
+    this.guardMint();
     if (outbound.length === 0) return;
     this.wire?.(outbound);
     this.dispatch("local", outbound, before);
@@ -222,10 +252,12 @@ export class Doc {
   private mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T {
     if (this.transacting) {
       const [value] = run(this.backend);
+      this.guardMint();
       return value;
     }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const [value, outbound] = run(this.backend);
+    this.guardMint();
     if (outbound.length > 0) {
       this.wire?.(outbound);
       this.dispatch("local", outbound, before);

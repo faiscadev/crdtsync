@@ -487,6 +487,15 @@ struct Room {
     /// one: no authenticated writer, and no frame or store record naming a
     /// non-anonymous actor.
     creator: Option<Vec<u8>>,
+    /// Which authenticated actor each replica identity writing into this room
+    /// belongs to — set once, by that identity's first authenticated writer, and
+    /// never displaced. A stamp names its author and the mint counts on from its
+    /// author's whole id-space high-water, so an op admitted under another
+    /// replica's `ClientId` moves that replica's floor and can spend it outright;
+    /// the claim is what refuses one. Ordered, so the persisted record is
+    /// byte-stable. Durable across a restart, and re-established by the next
+    /// writer wherever it is absent.
+    client_actors: BTreeMap<ClientId, Vec<u8>>,
 }
 
 impl Room {
@@ -498,6 +507,7 @@ impl Room {
             base_seq: 0,
             max_op_version: None,
             creator: None,
+            client_actors: BTreeMap::new(),
         }
     }
 
@@ -1075,6 +1085,9 @@ impl Hub {
             let standing = self.rooms.get(&room);
             let creator = standing.and_then(|r| r.creator.clone());
             let max_op_version = standing.and_then(|r| r.max_op_version);
+            let client_actors = standing
+                .map(|r| r.client_actors.clone())
+                .unwrap_or_default();
             self.rooms.insert(
                 room.clone(),
                 Room {
@@ -1084,6 +1097,7 @@ impl Hub {
                     base_seq: snapshot.base_seq,
                     max_op_version,
                     creator,
+                    client_actors,
                 },
             );
         }
@@ -1113,6 +1127,19 @@ impl Hub {
                 if let Some(r) = self.rooms.get_mut(&room) {
                     if r.creator.is_none() {
                         r.creator = Some(creator);
+                    }
+                }
+            }
+            // Claims are set-once too, so a record read back composes against what
+            // stands rather than replacing it, and an anonymous claimant is dropped
+            // on the same rule that establishes one: an id per connection cannot own
+            // a replica identity across connections.
+            if !meta.client_actors.is_empty() {
+                if let Some(r) = self.rooms.get_mut(&room) {
+                    for (client, actor) in meta.client_actors {
+                        if crate::acl::is_authenticated(&actor) {
+                            r.client_actors.entry(client).or_insert(actor);
+                        }
                     }
                 }
             }
@@ -1646,6 +1673,13 @@ impl Hub {
         // this same room's history, and the frame carries no high-water of its own to
         // raise it with.
         let max_op_version = standing.and_then(|r| r.max_op_version);
+        // A replica identity's owner is a property of the room, not of the bytes, so a
+        // snapshot replacing the state leaves the claims standing — a re-sent snapshot
+        // would otherwise release every identity the room has bound. A room being
+        // installed for the first time (an import, a clone's destination) has none.
+        let client_actors = standing
+            .map(|r| r.client_actors.clone())
+            .unwrap_or_default();
         self.rooms.insert(
             room.to_vec(),
             Room {
@@ -1655,6 +1689,7 @@ impl Hub {
                 base_seq,
                 max_op_version,
                 creator: root.or_else(|| creator.filter(|a| crate::acl::is_authenticated(a))),
+                client_actors,
             },
         );
         // Best-effort, matching the governing metadata: the room is installed either
@@ -2303,6 +2338,58 @@ impl Hub {
         }
     }
 
+    /// The authenticated actor `client` writes into `room` under, or `None` where
+    /// no authenticated writer has claimed that replica identity here yet.
+    pub fn client_actor(&self, room: &[u8], client: ClientId) -> Option<&[u8]> {
+        self.rooms
+            .get(room)
+            .and_then(|r| r.client_actors.get(&client))
+            .map(Vec::as_slice)
+    }
+
+    /// Record `actor` as the owner of the replica identity `client` in `room` if it
+    /// has none yet, persisting the durable metadata. Set-once, on the same rules
+    /// [`ensure_creator`](Self::ensure_creator) follows and for the same reasons: a
+    /// no-op for an unknown room and for an [anonymous](crate::acl::is_authenticated)
+    /// actor, since an id minted per connection cannot own a replica identity that
+    /// outlives one — a claim under it would refuse that client's own next
+    /// connection.
+    ///
+    /// The claim is what makes a `ClientId` more than a declaration. Whoever holds
+    /// it is the only actor whose ops may move that replica's stamp high-water, so
+    /// the position a peer would need to spend the replica's id space cannot be
+    /// planted under it.
+    ///
+    /// Persisting is best-effort, exactly as the creator's is: a failed write leaves
+    /// the claim standing in memory and re-established by the writer's next batch
+    /// after a restart. Where a restart loses the record, the identity is unclaimed
+    /// again and its next authenticated writer takes it — which in ordinary traffic
+    /// is the replica that owns it.
+    ///
+    /// The record holds one entry per replica identity that has ever written the
+    /// room, and each new one rewrites the whole metadata file — the same unbounded
+    /// shape the document's own id-space record carries, and the cost of a
+    /// set-once fact that nothing can re-derive. It grows with distinct writing
+    /// replicas rather than with traffic, and a claim is established once.
+    pub fn claim_client(&mut self, room: &[u8], client: ClientId, actor: &[u8]) {
+        if !crate::acl::is_authenticated(actor) {
+            return;
+        }
+        let established = match self.rooms.get_mut(room) {
+            Some(r) => {
+                let before = r.client_actors.len();
+                r.client_actors
+                    .entry(client)
+                    .or_insert_with(|| actor.to_vec());
+                r.client_actors.len() != before
+            }
+            None => false,
+        };
+        if established {
+            let _ = self.persist_meta(room);
+        }
+    }
+
     /// The governing app's op-version high-water for `room` — the highest op
     /// version ever folded into the merged replica, the worst-case op version a
     /// joiner must be able to down-reach to be served the whole state. It tracks
@@ -2360,6 +2447,16 @@ impl Hub {
             governing: self.governing.get(room).cloned(),
             max_op_version: self.rooms.get(room).and_then(|r| r.max_op_version),
             creator: self.rooms.get(room).and_then(|r| r.creator.clone()),
+            client_actors: self
+                .rooms
+                .get(room)
+                .map(|r| {
+                    r.client_actors
+                        .iter()
+                        .map(|(client, actor)| (*client, actor.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
         self.store
             .as_mut()

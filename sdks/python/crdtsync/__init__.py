@@ -46,6 +46,7 @@ __all__ = [
     "ErrorCode",
     "Key",
     "LocalProvider",
+    "MintExhausted",
     "Provider",
     "Redirect",
     "Rejected",
@@ -163,6 +164,21 @@ class ChannelsExhausted(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("the session's channel numbers are exhausted")
+
+
+class MintExhausted(RuntimeError):
+    """An edit the replica had no id left to mint. A stamp is drawn from this
+    replica's own id space and the space is finite: honest traffic reaches the end
+    of it after 2**63 edits, and a peer authoring under this replica's client id
+    can put it there in one op. The edit emitted nothing and changed nothing — a
+    refused mint is the fail-closed answer, never a re-issued id that would collide
+    with one already published. Raised because a refused edit otherwise returns the
+    same empty ops an inert one does, so the application would report a write that
+    never happened. A refusal inside :meth:`Doc.transact` ends that transaction:
+    the edits after it would address what it failed to create."""
+
+    def __init__(self) -> None:
+        super().__init__("the replica has no id left to mint, so the edit was refused")
 
 
 class Redirect(NamedTuple):
@@ -300,6 +316,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     sig(lib.crdtsync_doc_encode_state, [doc], buf)
     sig(lib.crdtsync_doc_decode_state, [cbytes, size], doc)
     sig(lib.crdtsync_doc_begin_atomic, [doc], None)
+    sig(lib.crdtsync_doc_mint_refused, [doc], c.c_int32)
     sig(lib.crdtsync_doc_commit_atomic, [doc], buf)
     sig(lib.crdtsync_diff, [cbytes, size, cbytes, size], buf)
     sig(lib.crdtsync_diff_decode, [cbytes, size, c.POINTER(buf)], c.c_int32)
@@ -453,6 +470,7 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
     )
     sig(lib.crdtsync_client_acl_revoke, [doc, ch, cbytes, size], buf)
     sig(lib.crdtsync_client_begin_atomic, [doc, ch], None)
+    sig(lib.crdtsync_client_mint_refused, [doc, ch], c.c_int32)
     sig(lib.crdtsync_client_commit_atomic, [doc, ch], buf)
     sig(lib.crdtsync_client_get_int, [doc, ch, cbytes, size, c.POINTER(c.c_int64)], c.c_int32)
     sig(lib.crdtsync_client_get_bytes, [doc, ch, cbytes, size, c.POINTER(buf)], c.c_int32)
@@ -1311,6 +1329,13 @@ class Document:
         applied = _LIB.crdtsync_doc_apply(self._handle, ops, len(ops), ctypes.byref(refused))
         return ApplyOutcome(applied=applied, refused=refused.value)
 
+    def mint_refused(self) -> bool:
+        """Whether the edit most recently made through this document was refused
+        for want of an id. Every mutator returns the ops to broadcast, and a
+        refused edit produces the same empty bytes an inert one does; this is what
+        tells the two apart."""
+        return _LIB.crdtsync_doc_mint_refused(self._handle) == 1
+
     def begin_atomic(self) -> None:
         """Start recording an atomic transaction; edits accumulate until commit."""
         _LIB.crdtsync_doc_begin_atomic(self._handle)
@@ -2043,6 +2068,14 @@ class Client:
         return _take_buf(
             _LIB.crdtsync_client_acl_revoke(self._handle, channel, tuple_id, len(tuple_id))
         )
+
+    def mint_refused(self, channel: int) -> bool:
+        """Whether the edit most recently made on ``channel`` was refused for want
+        of an id. Per channel, because each channel holds its own replica minting
+        under its own identity; ``False`` for a channel this session does not
+        hold."""
+        _u32("channel", channel)
+        return _LIB.crdtsync_client_mint_refused(self._handle, channel) == 1
 
     def begin_atomic(self, channel: int) -> None:
         """Start an atomic transaction on ``channel``; edits accumulate until commit."""
@@ -3179,16 +3212,21 @@ class Doc:
 
     def _mutate(self, run: Callable[[Document], bytes]) -> bytes:
         with self._gate:
-            ops, changes, repairs = b"", [], []
+            ops, changes, repairs, refused = b"", [], [], False
             try:
                 with self._lock:
                     # Inside a transaction the edit just accumulates; the commit
                     # sends and publishes.
                     if self._transacting:
                         run(self._backend)
+                        refused = self._backend.mint_refused()
                         return b""
                     before = self._backend.encode_state() if self._observing() else None
                     ops = run(self._backend)
+                    # Read straight after the edit, never before: the core clears
+                    # the latch as each intention opens, so this answers for the
+                    # edit just made.
+                    refused = self._backend.mint_refused()
                     if ops:
                         changes = self._collect(before)
                         repairs = self._take_repairs()
@@ -3200,6 +3238,11 @@ class Doc:
                     self._send(ops)
                     self._publish("local", ops, changes)
                     self._publish_repairs(repairs)
+                # The refusal is raised after delivery for the same reason: a
+                # refusal cuts an intention at the edit that could not mint, and
+                # what it emitted before that is already applied here.
+                if refused:
+                    raise MintExhausted()
             return ops
 
     def _fold_remote(self, receive: Callable[[], object]):
@@ -3576,6 +3619,10 @@ class _ClientBackend:
     def take_repairs(self) -> List[list]:
         """Empty for the same reason :meth:`set_schema` binds nothing."""
         return []
+
+    def mint_refused(self) -> bool:
+        with self._lock:
+            return self._client.mint_refused(self._channel)
 
     def begin_atomic(self) -> None:
         with self._lock:

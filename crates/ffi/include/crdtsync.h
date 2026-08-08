@@ -549,6 +549,26 @@ int32_t crdtsync_doc_apply(CrdtDoc *doc,
                            uintptr_t len,
                            uint32_t *out_refused);
 
+// Whether the edit most recently made through this handle was refused for want
+// of an id (1), was not (0), or the handle is bad (-1).
+//
+// The answer a mutation entry point cannot give: every one of them returns the ops
+// to broadcast, and a refused edit produces the same empty buffer an inert one
+// does. A refusal means the replica's id space is spent — honest traffic reaches
+// that after 2^63 edits, a peer authoring under this replica's client id can put it
+// there in one op — or that a run was longer than the space that is left. Nothing
+// was emitted and nothing changed; a caller that ignores this reports the edit as
+// having happened.
+//
+// True from the refusal until the next transaction begins, so it answers for the
+// edit just made rather than for the handle's whole history. It is deliberately a
+// query rather than an empty buffer: that signal already carries a bad handle and
+// an inert edit, and a third meaning on it would be unreadable.
+//
+// # Safety
+// `doc` must be a handle returned by a constructor and not yet freed.
+int32_t crdtsync_doc_mint_refused(const CrdtDoc *doc);
+
 // Begin recording an atomic transaction: until [`crdtsync_doc_commit_atomic`],
 // edits accumulate into one group and each returns an empty ops buffer.
 //
@@ -1430,6 +1450,17 @@ int32_t crdtsync_client_set_undo_origin(CrdtClient *client,
 // # Safety
 // `client` is a live handle.
 int32_t crdtsync_client_clear_undo_origin(CrdtClient *client, uint32_t channel);
+
+// Whether the edit most recently made on `channel` was refused for want of an id
+// (1), was not (0), or the handle is bad and the channel unheld (-1).
+//
+// The per-channel form of [`crdtsync_doc_mint_refused`], and it answers per
+// channel because each channel holds its own replica minting under its own
+// identity: a channel a peer has spent says nothing about its siblings.
+//
+// # Safety
+// `client` must be a handle returned by a constructor and not yet freed.
+int32_t crdtsync_client_mint_refused(const CrdtClient *client, uint32_t channel);
 
 // Whether `origin` has an intention to undo on `channel` (1), none (0), or a bad
 // handle (-1).

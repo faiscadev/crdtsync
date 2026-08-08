@@ -576,6 +576,14 @@ func (d *Document) CommitAtomic() []byte {
 	return takeBuf(C.crdtsync_doc_commit_atomic(d.h))
 }
 
+// MintRefused reports whether the edit most recently made through this document
+// was refused for want of an id. Every mutator returns the ops to broadcast, and
+// a refused edit produces the same empty slice an inert one does; this is what
+// tells the two apart.
+func (d *Document) MintRefused() bool {
+	return C.crdtsync_doc_mint_refused(d.h) == 1
+}
+
 // --- undo / redo ---
 
 // DefaultUndoOrigin is the origin an Undo records under when none is named.
@@ -748,6 +756,16 @@ func (c *Client) Actor() ([]byte, bool) {
 // under a fresh client id has a fresh range, since the derivation is pure over
 // the id and the channel number.
 var ErrChannelsExhausted = errors.New("the session's channel numbers are exhausted")
+
+// ErrMintExhausted is the refusal an edit reports when the replica has no id left
+// to mint. A stamp is drawn from this replica's own id space and the space is
+// finite: honest traffic reaches the end of it after 2^63 edits, and a peer
+// authoring under this replica's client id can put it there in one op. The edit
+// emitted nothing and changed nothing — a refused mint is the fail-closed answer,
+// never a re-issued id that would collide with one already published. Without it
+// a refusal is indistinguishable from an inert edit and the caller reports a write
+// that never happened.
+var ErrMintExhausted = errors.New("the replica has no id left to mint, so the edit was refused")
 
 // assigned reports the channel and Subscribe frame a subscribe produced. An
 // empty frame is the C ABI declining to assign one, leaving the channel
@@ -962,6 +980,13 @@ func (c *Client) BeginAtomic(channel uint32) {
 // to send, carrying one group per zone partition the edits fall in.
 func (c *Client) CommitAtomic(channel uint32) []byte {
 	return takeBuf(C.crdtsync_client_commit_atomic(c.h, C.uint32_t(channel)))
+}
+
+// MintRefused reports whether the edit most recently made on channel was refused
+// for want of an id. Per channel, because each channel holds its own replica
+// minting under its own identity; false for a channel this session does not hold.
+func (c *Client) MintRefused(channel uint32) bool {
+	return C.crdtsync_client_mint_refused(c.h, C.uint32_t(channel)) == 1
 }
 
 // GetInt reads an integer Register at path in channel's room.

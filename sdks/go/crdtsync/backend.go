@@ -66,6 +66,11 @@ type Backend interface {
 	BeginAtomic()
 	CommitAtomic() []byte
 
+	// MintRefused reports whether the edit just made was refused for want of an
+	// id. Every mutator above answers an empty slice for a refused edit and for
+	// an inert one alike, so this is what tells them apart.
+	MintRefused() bool
+
 	// SetSchema binds a schema for repair observation and mark flavors, reporting
 	// whether it bound; TakeRepairs drains the paths whose repaired reading newly
 	// changed against it.
@@ -234,6 +239,8 @@ func (c *ClientBackend) XmlMove(parentPath [][]byte, childIndex uint, newParentP
 func (c *ClientBackend) BeginAtomic() { c.client.BeginAtomic(c.channel) }
 
 func (c *ClientBackend) CommitAtomic() []byte { return c.client.CommitAtomic(c.channel) }
+
+func (c *ClientBackend) MintRefused() bool { return c.client.MintRefused(c.channel) }
 
 // Apply refuses: a networked replica folds a peer's work in through the frames
 // its provider receives, never through a side channel that would bypass the
