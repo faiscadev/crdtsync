@@ -260,10 +260,17 @@ pub struct Document {
     /// guarantees is that every op that *is* emitted names something that exists.
     ///
     /// Not persisted. It is raised for the rest of one intention — an atomic group
-    /// is several transacts and one delivery, so it spans them all — and cleared by
-    /// the *next* intention rather than by the close of its own. Clearing it at the
-    /// close would leave the caller that ran the intention nothing to read, which is
-    /// the whole of what [`mint_refused`](Self::mint_refused) reports.
+    /// is several transacts and one delivery, so it spans them all — and cleared
+    /// only where an intention *opens*, which is what lets
+    /// [`mint_refused`](Self::mint_refused) report on the intention the caller just
+    /// ran.
+    ///
+    /// One rule follows and is the reason clearing is on the opening side alone: an
+    /// atomic group nested inside an explicit intention **joins** that intention, so
+    /// neither opening nor closing the group is an intention boundary and the latch
+    /// spans the whole of the outer one. Clearing at a nested `commit_atomic` would
+    /// hand the mint a fresh answer mid-intention, which is exactly what
+    /// [`begin_atomic`](Self::begin_atomic) is already guarded against on the way in.
     mint_refused: bool,
     seq: u64,
     /// When recording an atomic transaction (between `begin_atomic` and
@@ -3694,10 +3701,11 @@ impl Document {
     ///
     /// `None` when this replica has no id to mint: either the target's partition is
     /// spent, or an earlier mint in this same intention was refused and latched. The
-    /// latch is document-global, so once set it refuses every partition until the
-    /// intention ends. The edit emits no op and changes no state. A caller that
-    /// derives a child id from the stamp must refuse alongside, or it would name a
-    /// child no op creates.
+    /// latch is document-global, so once set it refuses every partition for the rest
+    /// of that intention, and it stands until the next one opens so
+    /// [`mint_refused`](Self::mint_refused) can report it. The edit emits no op and
+    /// changes no state. A caller that derives a child id from the stamp must refuse
+    /// alongside, or it would name a child no op creates.
     fn emit_stamped(&mut self, target: ElementId, kind: OpKind) -> Option<Stamp> {
         // The op is stamped from its own partition's clock, so an edit in one zone
         // never advances another's and the op carries which partition it belongs
@@ -6680,8 +6688,9 @@ impl RangedCursor<'_> {
         let root = self.doc.root_id();
         // A refused mint creates nothing, so the handle names nothing: an
         // unoccupiable stamp, which every later edit through it resolves to absent.
-        // See [`Document::can_mint`] — the id space is spent, so an `Option` here
-        // would only restate a document-wide condition at every mutation.
+        // See [`Document::mint_refused`] — the refusal is reported once, for the
+        // whole intention, so an `Option` here would only restate it at every
+        // mutation.
         let stamp = self
             .doc
             .emit_stamped(
@@ -6911,8 +6920,8 @@ impl XmlChildrenCursor<'_> {
     /// is a no-op: the children List is not materialised (an op the author never
     /// applied would diverge a peer that has the List — unreachable through the
     /// public API, since a cursor is only handed out for a List a create already
-    /// registered), or the mint refused because this replica's id space is spent
-    /// ([`Document::can_mint`]).
+    /// registered), or the mint refused for want of an id
+    /// ([`Document::mint_refused`]).
     fn insert_child(&mut self, index: usize, tag: Option<Vec<u8>>, kind: ElementKind) -> ElementId {
         let absent = unmintable_stamp(self.doc.client);
         let anchor = match self.doc.lists.get(&self.list_id) {

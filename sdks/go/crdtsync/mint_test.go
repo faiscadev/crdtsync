@@ -12,18 +12,25 @@ import (
 	"testing"
 )
 
-// An op body opens with its author's 16-byte client id and its 8-byte sequence, so
-// the stamp's lamport runs from body offset 24 — past the frame's 4-byte length
-// prefix.
-const lamportAt = 4 + 16 + 8
+// An op body opens with its author's 16-byte client id, its 8-byte sequence and
+// the stamp's 8-byte lamport — so the sequence runs from body offset 16 and the
+// lamport from 24, both past the frame's 4-byte length prefix.
+const (
+	opSeqAt   = 4 + 16
+	lamportAt = 4 + 16 + 8
+)
 
 // The last id of the space: math.MaxUint64 >> 1. A stamp may legally sit there,
 // which is why one op is enough to spend its author's mint.
 const lamportCeiling uint64 = 1<<63 - 1
 
-// planted returns one op frame authored under first's client id, its stamp moved
-// to the last id of the space.
-func planted(t *testing.T, first byte) []byte {
+// An op-id sequence the receiving replica has not spent, so the plant is not
+// deduplicated away as one of that replica's own ops.
+const unspentSeq uint64 = 9999
+
+// stampedAt returns one op frame authored under first's client id, its stamp moved
+// to lamport.
+func stampedAt(t *testing.T, first byte, lamport uint64) []byte {
 	t.Helper()
 	d := newErgoDoc(t, first)
 	defer d.Close()
@@ -40,8 +47,22 @@ func planted(t *testing.T, first byte) []byte {
 		t.Fatal("the seed edit emitted nothing")
 	}
 	frame := append([]byte(nil), opFrames(emitted[0])[0]...)
-	binary.LittleEndian.PutUint64(frame[lamportAt:], lamportCeiling)
+	binary.LittleEndian.PutUint64(frame[opSeqAt:], unspentSeq)
+	binary.LittleEndian.PutUint64(frame[lamportAt:], lamport)
 	return frame
+}
+
+// planted is the plant that spends the space outright.
+func planted(t *testing.T, first byte) []byte {
+	t.Helper()
+	return stampedAt(t, first, lamportCeiling)
+}
+
+// nearlySpent leaves a handful of ids — enough for a single-id edit, not for a
+// ten-codepoint run.
+func nearlySpent(t *testing.T, first byte) []byte {
+	t.Helper()
+	return stampedAt(t, first, lamportCeiling-6)
 }
 
 func TestASpentIDSpaceReportsItsRefusal(t *testing.T) {
@@ -81,15 +102,68 @@ func TestAMutatorWithNoErrorOfItsOwnReportsThroughErr(t *testing.T) {
 	}
 }
 
-func TestAnOrdinaryEditIsUntouched(t *testing.T) {
+func TestARefusedCallStillDispatchesWhatItEmitted(t *testing.T) {
+	// One handle call is one core transaction, and a refusal cuts it at the edit
+	// that could not mint — so a refused call can carry ops that did. They are
+	// applied to this replica already; withholding them would leave it ahead of
+	// every peer.
 	d := newErgoDoc(t, 3)
+	defer d.Close()
+	var updates int
+	d.OnUpdate(func(e UpdateEvent) {
+		if e.Origin == "local" {
+			updates++
+		}
+	})
+	d.ApplyUpdate(nearlySpent(t, 3))
+
+	// The text does not exist, so this emits a container-create the space still has
+	// room for, then a ten-codepoint run it does not.
+	d.GetText("t").Insert(0, "abcdefghij")
+	if err := d.Err(); err != ErrMintExhausted {
+		t.Fatalf("the refused run left Err as %v", err)
+	}
+	if updates != 1 {
+		t.Fatalf("the refused call dispatched %d updates, want 1", updates)
+	}
+	if got := d.GetText("t").String(); got != "" {
+		t.Fatalf("the refused run landed %q", got)
+	}
+}
+
+func TestAnInertEditIsNotReportedAsARefusal(t *testing.T) {
+	// An inert edit and a refused one both emit nothing, which is the whole reason
+	// the query exists — so an edit that resolves to nothing must answer for itself
+	// rather than inherit the previous edit's refusal.
+	d := newErgoDoc(t, 4)
+	defer d.Close()
+	d.GetText("t").Insert(0, "ab")
+	d.ApplyUpdate(nearlySpent(t, 4))
+
+	d.GetText("t").Insert(0, "abcdefghij")
+	if err := d.Err(); err != ErrMintExhausted {
+		t.Fatalf("the refused run left Err as %v", err)
+	}
+	// An XML insert on a path that holds no XML node resolves to nothing.
+	d.GetXml("nope").InsertElement(0, "p")
+	if err := d.Err(); err != nil {
+		t.Fatalf("an inert edit reported %v", err)
+	}
+	// And the replica really did still have room.
+	d.GetText("t").Insert(0, "z")
+	if err := d.Err(); err != nil {
+		t.Fatalf("a healthy edit reported %v", err)
+	}
+	if got := d.GetText("t").String(); got != "zab" {
+		t.Fatalf("text reads %q", got)
+	}
+}
+
+func TestAnOrdinaryEditIsUntouched(t *testing.T) {
+	d := newErgoDoc(t, 5)
 	defer d.Close()
 	if err := d.GetMap("root").Set("k", int64(1)); err != nil {
 		t.Fatalf("Set: %v", err)
-	}
-	// An inert edit emits nothing either, and that is not a refusal.
-	if err := d.GetMap("root").Set("k", int64(1)); err != nil {
-		t.Fatalf("an inert edit reported %v", err)
 	}
 	if err := d.Err(); err != nil {
 		t.Fatalf("Doc.Err reported %v on a healthy replica", err)

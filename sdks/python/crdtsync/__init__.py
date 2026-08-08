@@ -167,15 +167,13 @@ class ChannelsExhausted(RuntimeError):
 
 
 class MintExhausted(RuntimeError):
-    """An edit the replica had no id left to mint. A stamp is drawn from this
-    replica's own id space and the space is finite: honest traffic reaches the end
-    of it after 2**63 edits, and a peer authoring under this replica's client id
-    can put it there in one op. The edit emitted nothing and changed nothing — a
-    refused mint is the fail-closed answer, never a re-issued id that would collide
-    with one already published. Raised because a refused edit otherwise returns the
-    same empty ops an inert one does, so the application would report a write that
-    never happened. A refusal inside :meth:`Doc.transact` ends that transaction:
-    the edits after it would address what it failed to create."""
+    """An edit the replica had no id left to mint. The edit emitted nothing and
+    changed nothing, and no retry helps: a refused mint is the fail-closed answer to
+    a spent id space, never a re-issued id that would collide with one already
+    published. Raised because a refused edit otherwise returns the same empty ops an
+    inert one does, so the application would report a write that never happened. A
+    refusal ends the transaction it happened in; what it emitted before that is
+    applied here already and still ships."""
 
     def __init__(self) -> None:
         super().__init__("the replica has no id left to mint, so the edit was refused")
@@ -3220,16 +3218,18 @@ class Doc:
                     if self._transacting:
                         run(self._backend)
                         refused = self._backend.mint_refused()
-                        return b""
-                    before = self._backend.encode_state() if self._observing() else None
-                    ops = run(self._backend)
-                    # Read straight after the edit, never before: the core clears
-                    # the latch as each intention opens, so this answers for the
-                    # edit just made.
-                    refused = self._backend.mint_refused()
-                    if ops:
-                        changes = self._collect(before)
-                        repairs = self._take_repairs()
+                    else:
+                        before = (
+                            self._backend.encode_state() if self._observing() else None
+                        )
+                        ops = run(self._backend)
+                        # Read straight after the edit, never before: the core clears
+                        # the latch as each intention opens, so this answers for the
+                        # edit just made.
+                        refused = self._backend.mint_refused()
+                        if ops:
+                            changes = self._collect(before)
+                            repairs = self._take_repairs()
             finally:
                 # The ops are stamped into this replica and its outbox the moment
                 # `run` returns, so they have to reach the room even if reading
@@ -3238,11 +3238,12 @@ class Doc:
                     self._send(ops)
                     self._publish("local", ops, changes)
                     self._publish_repairs(repairs)
-                # The refusal is raised after delivery for the same reason: a
-                # refusal cuts an intention at the edit that could not mint, and
-                # what it emitted before that is already applied here.
-                if refused:
-                    raise MintExhausted()
+            # Raised outside the `finally`, so a failure of the body's own is not
+            # replaced by this one. It is raised after delivery, though: a refusal
+            # cuts an intention at the edit that could not mint, and what it emitted
+            # before that is already applied here.
+            if refused:
+                raise MintExhausted()
             return ops
 
     def _fold_remote(self, receive: Callable[[], object]):

@@ -483,6 +483,11 @@ func refusal(refused bool) error {
 // built on, and Delete/Insert have nothing to say but this. A mutator that does
 // return an error returns this same sentinel directly; both read the one
 // condition, so a caller may use whichever suits its call site.
+//
+// It answers for the edit most recently made on this document by any goroutine,
+// so it is meaningful only where the document is edited from one. A concurrent
+// edit between a refused call and its Err clears the answer; the mutators that
+// return an error hand it back per call and are unaffected.
 func (d *Doc) Err() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -870,7 +875,7 @@ func (l *CrdtList) Append(value any) error {
 // end. Returns an error when index is out of range.
 func (l *CrdtList) Delete(index int) error {
 	var err error
-	_, refused := l.doc.mutate(func(b Backend) []byte {
+	_, mintErr := l.doc.mutate(func(b Backend) []byte {
 		var idx uint
 		idx, err = l.checkedLocked(index)
 		if err != nil {
@@ -881,7 +886,7 @@ func (l *CrdtList) Delete(index int) error {
 	if err != nil {
 		return err
 	}
-	return refused
+	return mintErr
 }
 
 // Get reads the item at index. The bool is false when index is out of range.

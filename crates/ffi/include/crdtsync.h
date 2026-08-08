@@ -560,10 +560,11 @@ int32_t crdtsync_doc_apply(CrdtDoc *doc,
 // was emitted and nothing changed; a caller that ignores this reports the edit as
 // having happened.
 //
-// True from the refusal until the next transaction begins, so it answers for the
-// edit just made rather than for the handle's whole history. It is deliberately a
-// query rather than an empty buffer: that signal already carries a bad handle and
-// an inert edit, and a third meaning on it would be unreadable.
+// True from the refusal until the next *intention* begins — a further edit inside
+// an open atomic group does not clear it, since the group is one intention — so it
+// answers for the edit just made rather than for the handle's whole history. It is
+// a query rather than an empty buffer because that signal already carries a bad
+// handle and an inert edit, and a third meaning on it would be unreadable.
 //
 // # Safety
 // `doc` must be a handle returned by a constructor and not yet freed.
@@ -1452,7 +1453,7 @@ int32_t crdtsync_client_set_undo_origin(CrdtClient *client,
 int32_t crdtsync_client_clear_undo_origin(CrdtClient *client, uint32_t channel);
 
 // Whether the edit most recently made on `channel` was refused for want of an id
-// (1), was not (0), or the handle is bad and the channel unheld (-1).
+// (1), was not (0), or the handle is bad or the channel unheld (-1).
 //
 // The per-channel form of [`crdtsync_doc_mint_refused`], and it answers per
 // channel because each channel holds its own replica minting under its own
