@@ -369,6 +369,8 @@ fn an_xml_create_over_a_map_create() -> Vec<Op> {
 
 #[test]
 fn an_xml_create_over_a_map_create_encodes_the_same_bytes_in_every_order() {
+    // Which of the two the key retains is pinned where it is observable — by the
+    // migration, in `state_project.rs`; here it is only that every order agrees.
     every_order_encodes_alike(&an_xml_create_over_a_map_create(), &[b"k"]);
 }
 

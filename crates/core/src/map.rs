@@ -87,8 +87,8 @@ struct Entry {
 /// create landed at, plus which kind it was, so a key that hosted more than one
 /// container kind resurrects the exact one. An XML kind derives its id by node
 /// rather than by key, so it is recorded — it ranks against the creates it wins
-/// the slot from — but resolves to no handle, and its key is carried verbatim
-/// instead.
+/// the slot from — but resolves to no handle, and its key migrates by what the
+/// registry still holds there instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ContainerCreate {
     stamp: Stamp,
@@ -175,8 +175,8 @@ impl Map {
         self.slots.keys().cloned().collect()
     }
 
-    /// Whether `key` holds a live container (map / list / text) — the slots a
-    /// migration carries verbatim, never dropping or re-keying.
+    /// Whether `key` holds a live container of any kind — the slots a migration
+    /// carries verbatim, never dropping or re-keying.
     pub(crate) fn slot_is_live_container(&self, key: &[u8]) -> bool {
         self.slots
             .get(key)
@@ -603,10 +603,9 @@ impl Map {
         }
         let id = ElementId::derive(self.id, key, ElementKind::Counter);
         let fresh = Rc::new(RefCell::new(Counter::new(id)));
-        if self.wins(key, stamp) {
-            self.evict(key);
-            self.install(key, Element::Counter(Rc::clone(&fresh)), stamp);
-        } else {
+        let won = self.wins(key, stamp);
+        self.set(key, Element::Counter(Rc::clone(&fresh)), stamp);
+        if !won {
             fresh.borrow().displace();
         }
         fresh
@@ -618,10 +617,9 @@ impl Map {
         }
         let id = ElementId::derive(self.id, key, ElementKind::Register);
         let fresh = Rc::new(RefCell::new(Register::new(id, seed, stamp)));
-        if self.wins(key, stamp) {
-            self.evict(key);
-            self.install(key, Element::Register(Rc::clone(&fresh)), stamp);
-        } else {
+        let won = self.wins(key, stamp);
+        self.set(key, Element::Register(Rc::clone(&fresh)), stamp);
+        if !won {
             fresh.borrow().displace();
         }
         fresh
@@ -684,22 +682,6 @@ impl Map {
 
     fn wins(&self, key: &[u8], stamp: Stamp) -> bool {
         self.slots.get(key).map_or(true, |e| stamp.gt(&e.stamp))
-    }
-
-    fn install(&mut self, key: &[u8], value: Element, stamp: Stamp) {
-        let container = higher(
-            self.slots.get(key).and_then(|e| e.container),
-            create_of(&value, stamp),
-        );
-        self.slots.insert(
-            key.to_vec(),
-            Entry {
-                stamp,
-                value: Some(value),
-                tombstone: false,
-                container,
-            },
-        );
     }
 
     pub fn deep_clone(&self) -> Self {

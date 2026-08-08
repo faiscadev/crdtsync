@@ -724,6 +724,9 @@ impl Document {
         key: &[u8],
         kind: ElementKind,
     ) -> Option<Element> {
+        if !kind.is_key_derived_container() {
+            return None;
+        }
         let id = ElementId::derive(map_id, key, kind);
         match kind {
             ElementKind::Map => self.maps.get(&id).map(|m| Element::Map(Rc::clone(m))),
@@ -738,9 +741,9 @@ impl Document {
     /// versions, so a snapshot-served joiner converges byte-for-byte with a peer
     /// served the same history as a translated op delta. Across every map, each
     /// leaf slot (scalar / register / counter, live or tombstoned) is `Keep`t,
-    /// `Drop`ped, or `Rename`d to a new key per `fate`. A live container slot (map
-    /// / list / text) is carried verbatim, mirroring the op seam, which carries a
-    /// container-create verbatim rather than tear its subtree. A *deleted*
+    /// `Drop`ped, or `Rename`d to a new key per `fate`. A live container slot is
+    /// carried verbatim, mirroring the op seam, which carries a container-create
+    /// verbatim rather than tear its subtree. A *deleted*
     /// container's tombstone is re-keyed faithfully: its retained create-stamp
     /// resurrects the container live at the old key — the create the op seam
     /// carries verbatim there — while the delete re-keys (a fresh tombstone at the
@@ -758,10 +761,10 @@ impl Document {
     /// create verbatim either way. A tombstone that resurrects nothing migrates by
     /// what the registry still holds at the key: a container of some key-derived
     /// kind there and the slot is carried verbatim rather than mis-migrated as a
-    /// leaf, none and it re-keys as the leaf tombstone it reads as. An XML kind,
-    /// whose id derives by node rather than key, is not resurrectable here and
-    /// records no create identity; its deleted slot migrates as a leaf tombstone,
-    /// faithful XML-field migration being out of scope.
+    /// leaf, none and it re-keys as the leaf tombstone it reads as. An XML kind ranks
+    /// against the creates it wins a key from, but derives its id by node rather
+    /// than by key, so it resolves to no handle and never resurrects — faithful
+    /// XML-field migration being out of scope.
     pub fn migrate_leaf_slots(&mut self, fate: impl Fn(&[u8]) -> SlotFate) -> bool {
         self.migrate_leaf_slots_scoped(|_, key| fate(key))
     }
@@ -852,9 +855,10 @@ impl Document {
                 // (a key whose retained create resolves to no handle, an XML one
                 // among them, or a tombstone retaining no create at all) while
                 // the registry still holds a container there. The COUNTER
-                // registry at the key's derived id migrates regardless: it is a separate identity from the
-                // slot body and from any container at the key, retained across
-                // displacement, so it must prune / re-home even when the slot is
+                // registry at the key's derived id migrates regardless: it is a
+                // separate identity from the slot body and from any container at
+                // the key, retained across displacement, so it must prune /
+                // re-home even when the slot is
                 // carried verbatim.
                 let carry_slot = map.borrow().slot_is_live_container(&key)
                     || (map.borrow().slot_is_tombstone(&key)

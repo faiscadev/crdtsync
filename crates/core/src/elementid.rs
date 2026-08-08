@@ -82,6 +82,30 @@ impl ElementKind {
     }
 
     /// The container kinds a key names — the candidates a snapshot migration
-    /// resolves a retained create against.
+    /// resolves a retained create against. Kept in step with
+    /// [`is_key_derived_container`](Self::is_key_derived_container) by
+    /// `every_key_derived_kind_is_a_candidate`.
     pub(crate) const KEY_DERIVED_CONTAINERS: [Self; 3] = [Self::Map, Self::List, Self::Text];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ElementKind;
+
+    #[test]
+    fn every_key_derived_kind_is_a_candidate() {
+        // The candidate list a migration walks and the predicate that classifies a
+        // kind are two statements of one fact; a kind in either and not the other
+        // records a create no resolution ever reaches, or the reverse.
+        for tag in 0..=u8::MAX {
+            let Some(kind) = ElementKind::from_tag(tag) else {
+                continue;
+            };
+            assert_eq!(
+                kind.is_key_derived_container(),
+                ElementKind::KEY_DERIVED_CONTAINERS.contains(&kind),
+                "{kind:?} is classified one way and listed the other"
+            );
+        }
+    }
 }
