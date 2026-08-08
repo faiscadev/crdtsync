@@ -1272,7 +1272,7 @@ fn a_refused_edit_is_reported_where_an_empty_batch_says_nothing() {
     // that set it or the caller that ran the transact has nothing to read.
     let me = cid(1);
     let mut doc = Document::new(me);
-    assert!(!doc.mint_refused(), "a fresh replica has refused nothing");
+    assert!(!doc.mint_refused(), "a fresh replica reported a refusal");
 
     // An inert edit — the key already holds this value — emits nothing and was not
     // refused. This is the case the empty batch cannot tell from a refusal.

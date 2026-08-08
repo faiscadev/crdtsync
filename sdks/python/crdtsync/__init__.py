@@ -167,13 +167,17 @@ class ChannelsExhausted(RuntimeError):
 
 
 class MintExhausted(RuntimeError):
-    """An edit the replica had no id left to mint. The edit emitted nothing and
-    changed nothing, and no retry helps: a refused mint is the fail-closed answer to
-    a spent id space, never a re-issued id that would collide with one already
-    published. Raised because a refused edit otherwise returns the same empty ops an
-    inert one does, so the application would report a write that never happened. A
-    refusal ends the transaction it happened in; what it emitted before that is
-    applied here already and still ships."""
+    """An edit the replica had no id left to mint. A refused mint is the fail-closed
+    answer to a spent id space, never a re-issued id that would collide with one
+    already published. Raised because a refused edit otherwise returns the same empty
+    ops an inert one does, so the application would report a write that never
+    happened.
+
+    It does not promise that nothing happened: a refusal cuts the intention at the
+    edit that could not mint, so the call may still have emitted and published what
+    came before it. Nor does it mean the replica is spent outright — a run reserves
+    one id per codepoint, so a shorter edit can still fit where a longer one was
+    refused."""
 
     def __init__(self) -> None:
         super().__init__("the replica has no id left to mint, so the edit was refused")

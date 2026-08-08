@@ -105,6 +105,29 @@ describe("a spent id space", () => {
     expect(d.getText("t").toString()).toBe("");
   });
 
+  it("reports the refusal even when a listener throws", () => {
+    // The refusal is the answer to the call the application made; a listener's own
+    // failure must not take its place, or the edit reads as a listener bug and the
+    // write that never happened is reported as one that did.
+    const me = cid(7);
+    const d = new Doc({ clientId: me });
+    const boom = new Error("listener");
+    d.applyUpdate(nearlySpent(me));
+    d.on("update", (e) => {
+      if (e.origin === "local") throw boom;
+    });
+
+    // The container-create is delivered (and the listener throws on it), then the
+    // ten-codepoint run is refused.
+    try {
+      d.getText("t").insert(0, "abcdefghij");
+      expect.unreachable("the refusal was swallowed");
+    } catch (e) {
+      expect(e).toBeInstanceOf(MintExhausted);
+      expect((e as MintExhausted).cause).toBe(boom);
+    }
+  });
+
   it("does not report an inert edit as a refusal", () => {
     // An inert edit and a refused one both emit nothing, which is the whole reason
     // the query exists — so an edit that resolves to nothing must answer for itself

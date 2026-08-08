@@ -25,17 +25,23 @@ const EMPTY = new Uint8Array();
 
 /** Thrown by an edit the replica had no id left to mint.
  *
- * The edit emitted nothing and changed nothing, and no retry helps: a refused mint
- * is the fail-closed answer to a spent id space, never a re-issued id that would
- * collide with one already published. Without this it is indistinguishable from an
- * inert edit and the application reports a write that never happened.
+ * A refused mint is the fail-closed answer to a spent id space, never a re-issued
+ * id that would collide with one already published. Without this it is
+ * indistinguishable from an inert edit and the application reports a write that
+ * never happened.
  *
- * A refusal ends the transaction it happened in — the edits after it would address
- * what it failed to create. What was emitted before it is applied here already and
- * still ships. */
+ * A refusal cuts the transaction at the edit that could not mint — the edits after
+ * it would address what it failed to create — so the call may still have emitted
+ * and delivered what came *before* the refusal. Those ops are applied here and
+ * shipped; the throw says the intention was not completed, not that nothing
+ * happened. Nor is the replica always spent outright: a run reserves one id per
+ * codepoint, so a shorter edit can still fit where a longer one was refused
+ * (`can_mint` on the core is the capacity reading). */
 export class MintExhausted extends Error {
-  constructor() {
-    super("crdtsync: the replica has no id left to mint, so the edit was refused");
+  constructor(cause?: unknown) {
+    super("crdtsync: the replica had no id left to mint, so the edit was refused", {
+      cause,
+    });
     this.name = "MintExhausted";
   }
 }
@@ -232,8 +238,26 @@ export class Doc {
    * cuts it at the edit that could not mint, so a refused call can carry ops that
    * did. Those are applied to this replica already; withholding them would leave it
    * ahead of every peer. */
-  private guardMint(refused: boolean): void {
-    if (refused) throw new MintExhausted();
+  private guardMint(refused: boolean, dispatchError?: unknown): void {
+    // The refusal outranks a listener's own failure: it is the answer to the call
+    // the application made, and losing it is the silence this whole seam removes.
+    // The listener's error rides along as the cause rather than disappearing.
+    if (refused) throw new MintExhausted(dispatchError);
+    if (dispatchError !== undefined) throw dispatchError;
+  }
+
+  /** Wire and dispatch what the edit emitted, returning a listener's failure
+   * rather than propagating it, so the refusal is still reported. */
+  private deliver(outbound: Uint8Array, before: Uint8Array | undefined): unknown {
+    if (outbound.length === 0) return undefined;
+    try {
+      this.wire?.(outbound);
+      this.dispatch("local", outbound, before);
+      this.emitRepairs();
+      return undefined;
+    } catch (e) {
+      return e === undefined ? new Error("crdtsync: an update listener threw") : e;
+    }
   }
 
   private mutate(run: (backend: Backend) => Uint8Array): void {
@@ -246,12 +270,7 @@ export class Doc {
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const outbound = run(this.backend);
     const refused = this.backend.mintRefused();
-    if (outbound.length > 0) {
-      this.wire?.(outbound);
-      this.dispatch("local", outbound, before);
-      this.emitRepairs();
-    }
-    this.guardMint(refused);
+    this.guardMint(refused, this.deliver(outbound, before));
   }
 
   private mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T {
@@ -263,12 +282,7 @@ export class Doc {
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const [value, outbound] = run(this.backend);
     const refused = this.backend.mintRefused();
-    if (outbound.length > 0) {
-      this.wire?.(outbound);
-      this.dispatch("local", outbound, before);
-      this.emitRepairs();
-    }
-    this.guardMint(refused);
+    this.guardMint(refused, this.deliver(outbound, before));
     return value;
   }
 

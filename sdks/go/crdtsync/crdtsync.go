@@ -757,12 +757,17 @@ func (c *Client) Actor() ([]byte, bool) {
 // the id and the channel number.
 var ErrChannelsExhausted = errors.New("the session's channel numbers are exhausted")
 
-// ErrMintExhausted is the refusal an edit reports when the replica has no id left
-// to mint. The edit emitted nothing and changed nothing, and no retry helps: a
-// refused mint is the fail-closed answer to a spent id space, never a re-issued id
-// that would collide with one already published. Without it a refusal is
-// indistinguishable from an inert edit and the caller reports a write that never
+// ErrMintExhausted is the refusal an edit reports when the replica had no id left
+// to mint. A refused mint is the fail-closed answer to a spent id space, never a
+// re-issued id that would collide with one already published. Without it a refusal
+// is indistinguishable from an inert edit and the caller reports a write that never
 // happened.
+//
+// It does not promise that nothing happened. A refusal cuts the intention at the
+// edit that could not mint, so the call may still have emitted and dispatched what
+// came before it — those ops are applied here and go to the room. Nor does it mean
+// the replica is spent outright: a run reserves one id per codepoint, so a shorter
+// edit can still fit where a longer one was refused.
 var ErrMintExhausted = errors.New("the replica has no id left to mint, so the edit was refused")
 
 // assigned reports the channel and Subscribe frame a subscribe produced. An
