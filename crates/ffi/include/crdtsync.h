@@ -559,8 +559,9 @@ int32_t crdtsync_doc_apply(CrdtDoc *doc,
 // there in one op — or that a run was longer than the space that is left. The
 // intention was not completed; a caller that ignores this reports it as having
 // been. It does not say that nothing happened — a refusal cuts an intention at
-// the edit that could not mint, so edits before it are applied and their ops are
-// in the buffer this call returned.
+// the edit that could not mint, so edits before it are applied here, and their ops
+// are in the buffer this call returned or, inside an atomic group, in the one
+// `crdtsync_doc_commit_atomic` returns.
 //
 // True from the refusal until the next *intention* begins — a further edit inside
 // an open atomic group does not clear it, since the group is one intention — so it

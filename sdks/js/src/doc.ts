@@ -233,9 +233,15 @@ export class Doc {
     if (threw) {
       // The body's own failure is what the caller asked for — a refusal or anything
       // else it threw — and a delivery failure rides along as its cause rather than
-      // replacing it.
+      // replacing it. Attaching is best-effort: a frozen or read-only error still
+      // reaches the caller as itself rather than as the `TypeError` the write would
+      // raise.
       if (delivery !== undefined && body instanceof Error && body.cause === undefined) {
-        (body as { cause?: unknown }).cause = delivery;
+        try {
+          (body as { cause?: unknown }).cause = delivery;
+        } catch {
+          // The caller's error outranks the annotation.
+        }
       }
       throw body;
     }
