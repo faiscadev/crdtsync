@@ -2,8 +2,9 @@
 //!
 //! A plain `transact` streams its ops: each merges independently on arrival, so
 //! a peer can observe a partial group. An `atomic_transact` instead tags its ops
-//! as one transaction; a receiver holds the members until the whole group is
-//! present, then applies them together, so no peer ever sees a partial
+//! as a transaction — one per zone partition they fall in, since a transaction
+//! stays inside one zone (C2); a receiver holds a group's members until the whole
+//! of it is present, then applies them together, so no peer ever sees a partial
 //! transaction. Atomicity is a *view* guarantee — the same ops still merge, so an
 //! atomic author and a non-atomic peer converge on identical state.
 

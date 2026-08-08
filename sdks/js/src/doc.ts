@@ -181,10 +181,9 @@ export class Doc {
   }
 
   /** Run `fn`'s edits as an atomic group — they apply together on every replica
-   * and ride the wire as a single batch, firing one update. Edits spanning two zones
-   * form one group per zone, since a transaction stays inside one zone, so each
-   * applies together at the replicas served that zone. Nested calls flatten into the
-   * outermost transaction. */
+   * served the zone they fall in, and ride the wire as a single batch, firing one
+   * update. Edits spanning two zones form one group per zone, since a transaction
+   * stays inside one zone. Nested calls flatten into the outermost transaction. */
   transact(fn: () => void): void {
     if (this.transacting) {
       fn();

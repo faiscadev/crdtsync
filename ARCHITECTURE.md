@@ -555,7 +555,7 @@ Tx must stay within one branch, one zone, one schema version. Cannot include mig
 
 The cap is a protocol constant, not a per-deployment setting. A receiver decides a group complete from the `count` its members declare, so a deployment that raised its own cap would emit groups every peer refuses, and one that lowered it would refuse groups the room holds; a bound both ends compute identically is what makes the field decidable at all. It is enforced at three points: the decode boundary, where a `count` of zero or one past the cap fails the frame carrying it; the apply seam an in-process caller reaches without decoding, where the one op is refused and its group-mates are not; and the mint, where a group past the cap is emitted untagged rather than tagged with a size no receiver will accept — so an oversized transaction is a non-atomic one rather than a frame every peer rejects.
 
-The zone constraint is enforced at that same mint, on the same principle. A commit whose edits fall in more than one zone is emitted as **one atomic transaction per zone** rather than one straddling both, each group's id derived from its own members' sequences. Only a subscriber admitted to every partition a group spans can receive it whole — a zone-scoped subscription withholds the other partitions' members and destrands the survivors (§Opt-In: Atomic) — so a group cut to a partition is one every recipient whose subscription cuts on *zone* holds whole or not at all. A straddling commit gives up atomicity *across* the zones, which §Not Shipped never offered, and keeps every edit plus per-zone atomicity everywhere the constraint does hold.
+The zone constraint is enforced at that same mint, on the same principle. A commit whose edits fall in more than one zone is emitted as **one atomic transaction per zone** rather than one straddling both, each group's id derived from its own members' sequences. Only a subscriber admitted to every partition a group spans can receive it whole — a zone-scoped subscription withholds the other partitions' members and destrands the survivors (§Opt-In: Atomic) — so no zone-scoped filter can cut *through* a group — it runs between them. A straddling commit gives up atomicity *across* the zones, which §Not Shipped never offered, and keeps every edit plus per-zone atomicity everywhere the constraint does hold.
 
 The cut is by the partition each op is stamped in, which is the region it **governs** rather than the position it is emitted at (§Internal Data Model). So an op whose governing region resolves to no single partition — a mark whose two anchors land in different zones, which is a `CrossZoneAnchor` violation the read repairs away — keeps the root partition and groups there, rather than being assigned to one of the two zones it names. The group boundary follows the envelope's partition exactly; nothing re-derives it.
 
@@ -569,7 +569,7 @@ For atomic txs, repair runs inside the commit pipeline, not after. Visible effec
 
 ## Interaction with Undo
 
-A transaction is naturally an undo intention. Undo of atomic tx = generate inverse ops for all members, wrap in new atomic tx, apply atomically. Atomicity preserved through undo / redo.
+A transaction is naturally an undo intention. Undo of atomic tx = generate inverse ops for all members, wrap in a new atomic tx per zone partition the inverses fall in (§Scope Constraints), apply atomically. Atomicity preserved through undo / redo, on the same terms the forward commit had it.
 
 ## Not Shipped
 

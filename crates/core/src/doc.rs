@@ -2925,7 +2925,7 @@ impl Document {
         let Some(ops) = self.atomic.take() else {
             return Vec::new();
         };
-        // The group is one intention, undone and redone as one transaction — and it
+        // The group is one intention, undone and redone as one — and it
         // is over, so the refusal latch clears with it.
         self.history.close(true);
         self.mint_refused = false;
@@ -2946,9 +2946,9 @@ impl Document {
     /// A group is only ever received whole by a subscriber admitted to every
     /// partition it spans, since a zone-scoped subscription withholds the other
     /// partitions' members and [destrands](crate::destrand_split) the survivors —
-    /// so a group cut to a partition is one every recipient whose
-    /// subscription cuts on *zone* holds whole or not at all. What a straddling commit gives up is atomicity
-    /// *across* the zones, which is the thing never offered; what it keeps is every
+    /// so no zone-scoped filter can cut
+    /// *through* a group — it runs between them. What a straddling commit gives up
+    /// is atomicity *across* the zones, which is never offered; what it keeps is every
     /// edit, and per-zone atomicity where the constraint holds. The cut is the
     /// emitter's, not a property of the whole path: a relay that re-stamps an op's
     /// partition can hand a downstream filter a group spanning two again, so every
@@ -4711,9 +4711,9 @@ impl Document {
 
     /// Emit an intention's inverses — last edit undone first — and return their
     /// ops. The emitted ops record their own inverses, which close as the mirror
-    /// intention on `landing`. An atomic intention replays inside one atomic
-    /// transaction, so its ops reach a peer all-or-nothing and the mirror is
-    /// itself atomic.
+    /// intention on `landing`. An atomic intention replays inside one open
+    /// transaction, which closes as one group per zone partition its inverses fall
+    /// in, so the mirror is atomic on the terms the forward commit was.
     fn replay(&mut self, intention: Intention, landing: Landing) -> Vec<Op> {
         let Intention {
             origin,

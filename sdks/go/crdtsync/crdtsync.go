@@ -569,8 +569,9 @@ func (d *Document) BeginAtomic() {
 	C.crdtsync_doc_begin_atomic(d.h)
 }
 
-// CommitAtomic commits the atomic transaction, returning the group's ops to
-// broadcast.
+// CommitAtomic commits the atomic transaction, returning its ops to broadcast —
+// one group per zone partition the edits fall in, since a transaction stays inside
+// one zone.
 func (d *Document) CommitAtomic() []byte {
 	return takeBuf(C.crdtsync_doc_commit_atomic(d.h))
 }
@@ -957,8 +958,8 @@ func (c *Client) BeginAtomic(channel uint32) {
 	C.crdtsync_client_begin_atomic(c.h, C.uint32_t(channel))
 }
 
-// CommitAtomic commits the atomic transaction on channel, returning the Ops
-// frame to send.
+// CommitAtomic commits the atomic transaction on channel, returning the Ops frame
+// to send, carrying one group per zone partition the edits fall in.
 func (c *Client) CommitAtomic(channel uint32) []byte {
 	return takeBuf(C.crdtsync_client_commit_atomic(c.h, C.uint32_t(channel)))
 }

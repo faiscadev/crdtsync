@@ -13,8 +13,8 @@
 //! partitions, so its filter withholds the other zone's members and destrands (C11)
 //! what is left; a group straddling the cut therefore loses its atomic view at exactly
 //! the recipients zones exist to serve, while a full-doc subscriber keeps it. Cut to
-//! partitions, every recipient whose subscription cuts on zone holds a group whole or
-//! not at all.
+//! partitions, no zone-scoped filter can cut *through* a group — it runs between
+//! them.
 //!
 //! What a straddling commit gives up is atomicity *across* the zones, which
 //! §Not Shipped never offered; what it keeps is every edit and per-zone atomicity.
@@ -468,14 +468,18 @@ fn the_member_cap_bounds_a_partition_rather_than_the_commit() {
 #[test]
 fn undoing_a_cross_zone_atomic_intention_replays_one_group_per_zone() {
     // An intention is undone by emitting its inverses through the same commit seam,
-    // so the undo is cut exactly as the forward edits were: a peer scoped to one
-    // zone sees the revert of its own partition all-or-nothing, and never a group
-    // half of which it can never receive.
+    // so the undo is cut by partition as the forward edits were: a peer scoped to
+    // one zone sees the revert of its own partition all-or-nothing, and never a
+    // group half of which it can never receive. The partitions are resolved against
+    // live state at replay, so a region that has since crossed a zone cuts
+    // differently (C84); nothing here moves one.
     let (mut d, _) = seeded(1);
     let undo = crdtsync_core::UndoManager::new();
     let forward = undo.atomic_group(&mut d, |doc| {
         edit(doc, b"board", "x");
-        edit(doc, b"notes", "y");
+        edit(doc, b"board", "y");
+        edit(doc, b"notes", "z");
+        edit(doc, b"notes", "w");
     });
     assert_eq!(
         groups(&forward).len(),
@@ -486,10 +490,20 @@ fn undoing_a_cross_zone_atomic_intention_replays_one_group_per_zone() {
     let inverses = undo.undo(&mut d).expect("the intention undoes");
     let groups = groups(&inverses);
     assert_eq!(groups.len(), 2, "the undo is cut the same way");
+    let mut ids = Vec::new();
     for zone in [Some(zone_of(b"board")), Some(zone_of(b"notes"))] {
         let tx = groups[&zone].expect("each partition's inverses are tagged");
         assert_eq!(tx.count, members(&inverses, zone));
+        // Several members per partition, so a group per *partition* is what this
+        // reads — an implementation tagging each op alone satisfies neither the
+        // count nor the single tag `groups` demands of a partition.
+        assert!(tx.count > 1, "the partition's inverses are held together");
+        ids.push(tx.id);
     }
+    assert_ne!(
+        ids[0], ids[1],
+        "each partition's inverses name their own group"
+    );
     assert_eq!(
         path::text_get(&d, &seq_of(b"board")).as_deref(),
         Some("hello"),
