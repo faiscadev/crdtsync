@@ -14,7 +14,7 @@
 //! [`authorized`] composes that abstain with the room's governing schema `@auth`
 //! grants (decision-flow step 4) and a terminal default-deny.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crdtsync_core::acl::{
     decide_capability_with_authority, AclActor, AclDecision, AclRecord, AclScope, Capability,
@@ -908,6 +908,21 @@ impl OpReadGate {
 /// its registered descendants under their range's anchors, so an op *editing* a mark's
 /// payload is gated by the mark rather than falling to the root the index leaves it at.
 ///
+/// `held` is every container id the served state has materialised, live or retained
+/// ([`Document::container_ids`](crdtsync_core::Document::container_ids)). It separates
+/// the two readings of "the index does not resolve this target": a container this state
+/// *retains* (displaced, its payload kept for a re-won slot) still falls back to the
+/// root, which is the reading [`op_read_path`]'s own argument is about and C67's ruling
+/// to narrow; a target this state has never held names nothing at all and takes
+/// [`WholeDocument`](OpReadGate::WholeDocument) with the rest of C52's family. The
+/// distinction is load-bearing wherever the served tree is not the live room's: a branch
+/// stream resolves against its own tree, so an op addressed to a container only `main`
+/// holds is unresolvable there — and reading that as a retained one would hand the root
+/// verdict an op out of a subtree the root grant's deny carves out (C60).
+///
+/// It is read **only** where `index` does not resolve the target, so a caller whose batch
+/// holds no such op may pass an empty set rather than walk the registries for one.
+///
 /// A governing target that does not resolve — an anchor seq the tree no longer holds,
 /// a range id no held anchor set names, an element scope whose target has left the tree
 /// — names no path, so no path verdict places the op, and it takes
@@ -919,6 +934,7 @@ impl OpReadGate {
 /// recipients, so op-join and snapshot-join agree.
 pub fn op_read_gate(
     index: &HashMap<ElementId, Vec<Vec<u8>>>,
+    held: &HashSet<ElementId>,
     ranged: &HashMap<ElementId, (ElementId, ElementId)>,
     records: &[AclRecord],
     op: &Op,
@@ -950,6 +966,12 @@ pub fn op_read_gate(
         // makes keying a whole payload subtree here safe against a stale edge.
         _ if !index.contains_key(&op.target) => match ranged.get(&op.target) {
             Some((start, end)) => anchor_gate(index, *start, *end),
+            // A target the served state has never materialised names no element to place,
+            // redact, or come back to — C52's rule, not C67's, so the whole document
+            // rather than the root. The root fallback below is for the container this
+            // state *retains*, which is the case its own payload argument is about
+            // (C60).
+            None if !held.contains(&op.target) => OpReadGate::WholeDocument,
             None => at(op_read_path(index, op)),
         },
         _ => at(op_read_path(index, op)),
