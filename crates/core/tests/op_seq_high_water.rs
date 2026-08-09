@@ -1032,3 +1032,76 @@ fn a_state_naming_one_id_as_both_reserved_and_applied_is_refused() {
         "a reservation over an applied id decoded",
     );
 }
+
+/// The body text as a string.
+fn body_text(d: &Document) -> String {
+    match d.get(b"body") {
+        Some(Element::Text(t)) => t.borrow().as_string(),
+        _ => panic!("no body text"),
+    }
+}
+
+#[test]
+fn a_withheld_text_run_reserves_one_position_per_codepoint() {
+    // `reservation_end` is the op's lamport plus the run it occupies, and a text
+    // insert is the one op kind whose run is longer than one — it takes an id per
+    // codepoint. A frame reporting the bare lamport leaves the recipient minting
+    // *inside* the withheld run, where the char ids it derives are ones the room
+    // already binds, and the insert is dropped at ingest exactly as a re-minted
+    // sequence is.
+    let (_, seed) = doc_with_body(cid(1));
+    let run = seed
+        .iter()
+        .find(|op| matches!(op.kind, crdtsync_core::OpKind::TextInsert { .. }))
+        .expect("the fixture writes a run");
+    assert_eq!(
+        run.reservation_end(),
+        run.stamp.lamport + 4,
+        "five codepoints reserve five positions",
+    );
+
+    let mut room = Document::new(cid(9));
+    for op in &seed {
+        room.apply(op);
+    }
+    // The restart: the run is on a path this reader may no longer read, so its
+    // delta carries the container and not the run.
+    let delivered: Vec<Op> = seed
+        .iter()
+        .filter(|op| !matches!(op.kind, crdtsync_core::OpKind::TextInsert { .. }))
+        .cloned()
+        .collect();
+
+    // Told the run's bare lamport, the replica mints inside it.
+    let mut bare = body_replica(cid(1), &delivered);
+    bare.note_published(&[run.id.seq], run.stamp.lamport);
+    let inside = bare.transact(|tx| tx.text(b"body").insert(0, "Z"));
+    assert!(
+        inside[0].stamp.lamport <= run.reservation_end(),
+        "the fixture no longer mints inside the run, so it measures nothing",
+    );
+
+    // Told the position the run reaches, it mints past it and the insert lands.
+    let mut fixed = body_replica(cid(1), &delivered);
+    fixed.note_published(&[run.id.seq], run.reservation_end());
+    let after = fixed.transact(|tx| tx.text(b"body").insert(0, "Z"));
+    assert!(
+        after[0].stamp.lamport > run.reservation_end(),
+        "minted onto a position the withheld run occupies",
+    );
+    for op in &after {
+        room.apply(op);
+    }
+    // Where the char lands is the anchor's business — the restored replica holds an
+    // empty body, so its insert anchors at the end. What matters is that it lands.
+    let body = body_text(&room);
+    assert_eq!(
+        body.chars().count(),
+        6,
+        "the post-restart insert was swallowed at ingest"
+    );
+    assert!(
+        body.contains('Z'),
+        "the post-restart insert was swallowed at ingest"
+    );
+}
