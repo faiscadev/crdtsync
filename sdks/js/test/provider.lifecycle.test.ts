@@ -86,6 +86,7 @@ class ScriptedSocket implements FakeHandlers {
 // Server frames: a tag byte, then the message's fields, all little-endian.
 const TAG_OPS = 2;
 const TAG_AUTH_OK = 7;
+const TAG_SNAPSHOT = 4;
 const TAG_FRONTIER = 54;
 
 function concat(parts: Uint8Array[]): Uint8Array {
@@ -161,6 +162,36 @@ describe("provider connection lifecycle", () => {
     provider.close();
     await expect(pending).rejects.toThrow();
     expect(provider.state).toBe("disconnected");
+  });
+
+  it("does not complete the initial sync on a catch-up reply that failed to fold", async () => {
+    // Right tag, right channel, undecodable body. The frame names the catch-up but
+    // carries no room, so opening the socket to app traffic on it would let an edit
+    // author against an empty replica — the same failure the frontier ordering
+    // exists to prevent, reached by a different route.
+    ScriptedSocket.last = null;
+    const provider = new Provider("ws://127.0.0.1:1", "room", {
+      WebSocket: ScriptedSocket as never,
+      reconnect: false,
+    });
+    try {
+      await sleep(20);
+      const socket = ScriptedSocket.last as ScriptedSocket;
+      socket.deliver(authOk());
+      await sleep(10);
+
+      // A Snapshot for channel 0, truncated mid-field: the right tag and channel,
+      // a body the codec refuses.
+      socket.deliver(concat([Uint8Array.of(TAG_SNAPSHOT), u32(0), Uint8Array.of(0x01)]));
+      await sleep(20);
+      expect(provider.state).not.toBe("connected");
+
+      socket.deliver(opsFrame(0));
+      await provider.whenConnected();
+      expect(provider.state).toBe("connected");
+    } finally {
+      provider.close();
+    }
   });
 
   it("does not complete the initial sync on a redacted catch-up's frontier", async () => {

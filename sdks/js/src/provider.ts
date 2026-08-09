@@ -125,6 +125,8 @@ export class Provider {
   // "auth" awaits the AuthOk (the first frame on a socket); "catchup" awaits the
   // initial subscribe reply; "ready" is synced.
   private phase: "auth" | "catchup" | "ready" = "auth";
+  /** Whether the frame most recently handed to `receive` was actually applied. */
+  private lastApplied = false;
   private stateValue: ConnectionState = "connecting";
   private reconnectAttempt = 0;
   private closed = false;
@@ -518,17 +520,22 @@ export class Provider {
     // ride ahead of it carry none of the room: a schema advert, an awareness update,
     // and the frontier naming what a redacted delta withholds. Opening the socket to
     // app traffic on one of those would let an edit author against an empty replica.
-    if (this.phase === "catchup" && isCatchUpReply(data, this.channel)) {
+    if (this.phase === "catchup" && this.lastApplied && isCatchUpReply(data, this.channel)) {
       this.markConnected();
     }
   }
 
-  /** Fold one inbound frame; return the server `ErrorCode` when it was an Error. */
+  /** Fold one inbound frame; return the server `ErrorCode` when it was an Error.
+   * Records whether the session actually applied it: the core answers `false` for
+   * a frame it refuses — one that fails to decode, or names a channel this session
+   * does not hold — and throws only for a server Error, so the boolean is the only
+   * thing that tells a folded frame from a refused one. */
   private receive(data: Uint8Array): number | null {
     try {
-      this.client.receive(data);
+      this.lastApplied = this.client.receive(data) === true;
       return null;
     } catch (e) {
+      this.lastApplied = false;
       return typeof e === "number" ? e : -1;
     }
   }
