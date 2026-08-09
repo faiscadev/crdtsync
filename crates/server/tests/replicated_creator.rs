@@ -6,8 +6,10 @@
 //! decides nothing — while `acl_records` is non-empty, because ACL ops ride the log
 //! like any other. Follower reads let a caught-up follower serve a read from its own
 //! replica, so what a replica holds decides what a partial reader landing there is
-//! served — through the op catch-up, the snapshot catch-up, the version fetch and the
-//! diff query, the four seams that hand a reader a whole state. These pin that a
+//! served — through the op catch-up, the snapshot catch-up and the branch diff. A
+//! version fetch is the room's leader's (C33), so the same question reaches it one
+//! step later, on a replica a promotion has made that leader. Four seams that hand a
+//! reader a whole state, and every one of them narrows by the root. These pin that a
 //! replicated room carries its root and that each of those four narrows by it; that a
 //! promoted replica keeps the root rather than handing `/` to its first writer; that
 //! the root installs set-once through either frame and through the hub call; and which
@@ -794,9 +796,10 @@ fn changed_paths(changes: &[Change]) -> Vec<Vec<u8>> {
 #[test]
 fn a_diff_served_off_a_replica_withholds_the_denied_key() {
     // The diff query resolves two of the room's states and hands each through the same
-    // projection the other reads use, keyed by the same root — and it is not leader-
-    // gated, so a replica answers it. A change list is content, so a rootless replica
-    // would diff the denied key into view.
+    // projection the other reads use, keyed by the same root. A change list is content,
+    // so a rootless replica would diff the denied key into view. The two sides here are
+    // the replica's own captures, so — like a version fetch — the query is answered
+    // where the room's leadership is (C33), which a promotion puts on this node.
     let room = room_led_by_a_with_b_next();
     let mut leader = seeded_leader(&room);
     let mut follower = follower_by_ops(&mut leader, &room);
@@ -820,6 +823,10 @@ fn a_diff_served_off_a_replica_withholds_the_denied_key() {
         .hub_mut()
         .create_version(&room, b"after")
         .expect("the version is captured"));
+
+    follower
+        .membership_mut_for_test()
+        .mark_node_down(&NodeId::from_addr(A));
 
     let (bob, _) = bob_reads(&mut follower, &room);
     assert!(follower.deliver(
@@ -854,10 +861,11 @@ fn a_diff_served_off_a_replica_withholds_the_denied_key() {
 
 #[test]
 fn a_version_captured_on_a_replica_withholds_the_denied_key() {
-    // The fetch seam is not leader-gated, so it answers from any node holding the
-    // version — and it reads the same authority root the subscribe seam does. The
-    // version is captured through the hub directly, as `VersionCreate` does once a
-    // failover has made this replica the room's leader.
+    // The version is captured through the hub directly, as `VersionCreate` does once
+    // a failover has made this replica the room's leader — which is also what lets it
+    // answer the fetch at all, since a version read is the leader's (C33). What is
+    // read here is the authority root it holds: the promoted node redacts the version
+    // by the same creator the subscribe seam narrows by.
     let room = room_led_by_a_with_b_next();
     let mut leader = seeded_leader(&room);
     let mut follower = follower_by_ops(&mut leader, &room);
@@ -865,6 +873,9 @@ fn a_version_captured_on_a_replica_withholds_the_denied_key() {
         .hub_mut()
         .create_version(&room, b"v1")
         .expect("the version is captured"));
+    follower
+        .membership_mut_for_test()
+        .mark_node_down(&NodeId::from_addr(A));
 
     let (bob, _) = bob_reads(&mut follower, &room);
     let view = fetched_version(&mut follower, bob, b"v1");
