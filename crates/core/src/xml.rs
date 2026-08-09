@@ -102,7 +102,11 @@ impl XmlElement {
     }
 
     /// Claim this node's tag for `tag`, which takes it when its bytes are the
-    /// smaller — the seam every path that names a node's tag runs through.
+    /// smaller — the seam every path that can meet a tag *already held* runs
+    /// through. A path with no incumbent has nothing to rank and seats its tag
+    /// directly: a first materialisation, a decode (the registry holds one tag per
+    /// id, so a snapshot restores the ranked winner rather than re-deciding it),
+    /// and a detached deep clone.
     ///
     /// A children-list node's id derives from `(list, stamp, kind)` and carries no
     /// tag, deliberately: a stamp derives exactly two children, the tagged and the
