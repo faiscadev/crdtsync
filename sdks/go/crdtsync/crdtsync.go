@@ -584,6 +584,10 @@ func (d *Document) CommitAtomic() []byte {
 // Intention-scoped rather than per-edit: an atomic group is one intention, so once
 // a refusal is raised inside one it stays raised for the rest of the group and is
 // cleared by the next intention rather than by a later edit within this one.
+//
+// Read it before the next edit. The next intention clears it, so a reading taken
+// after one answers for that edit — a refusal read too late reads as none, and a
+// later refusal reads as this edit's.
 func (d *Document) MintRefused() bool {
 	return C.crdtsync_doc_mint_refused(d.h) == 1
 }

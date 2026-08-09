@@ -3790,6 +3790,10 @@ impl Document {
     /// spent, a run longer than the space that is left, and the latch that carries
     /// the first refusal across the rest of the intention.
     ///
+    /// Read it before opening the next intention. The next one clears it, so a
+    /// reading taken after a later edit answers for *that* edit — a refusal read
+    /// too late reads as none, and a later refusal reads as this edit's.
+    ///
     /// Distinct from [`can_mint`](Self::can_mint), which reports capacity rather
     /// than an outcome: a replica with room for a single id answers `true` there
     /// and `true` here both, if the edit it just refused was a run.

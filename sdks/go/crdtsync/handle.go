@@ -484,6 +484,12 @@ func refusal(refused bool) error {
 // return an error returns this same sentinel directly; both read the one
 // condition, so a caller may use whichever suits its call site.
 //
+// It is intention-scoped, not per-edit: a Transact body is one intention and so is
+// an atomic group, commit included, so a refusal inside one stays raised for the
+// rest of it and is cleared by the next intention rather than by a later edit
+// within this one. Read it before the next edit — that edit's intention clears the
+// latch, so a later reading answers for it and not for the call in question.
+//
 // It answers for the edit most recently made on this document by any goroutine,
 // so it is meaningful only where the document is edited from one. A concurrent
 // edit between a refused call and its Err clears the answer; the mutators that
@@ -791,11 +797,13 @@ func (m *CrdtMap) GetXml(key string) *CrdtXml {
 
 // SetBlob stores a small blob inline at key, minting its public handle. Returns
 // false when data exceeds the inline ceiling — upload it out of band with
-// UploadBlob and set the returned handle via SetBlobRef.
+// UploadBlob and set the returned handle via SetBlobRef — and false when the
+// replica could not mint the ids the write needed, since neither stored the
+// blob. Doc.Err distinguishes them: it is ErrMintExhausted only for the second.
 func (m *CrdtMap) SetBlob(key, mime string, data []byte) bool {
 	slot := m.slot(key)
 	ok := false
-	m.doc.mutate(func(b Backend) []byte {
+	_, err := m.doc.mutate(func(b Backend) []byte {
 		ops, inlined := b.SetBlob(slot, mime, data)
 		if !inlined {
 			return nil
@@ -803,7 +811,10 @@ func (m *CrdtMap) SetBlob(key, mime string, data []byte) bool {
 		ok = true
 		return ops
 	})
-	return ok
+	// Fitting under the ceiling is not the same as landing: a blob that inlines
+	// still needs an id, so a refused mint stores nothing and the answer is false.
+	// Doc.Err carries which of the two happened.
+	return ok && err == nil
 }
 
 // SetBlobRef sets a store-backed blob ref at key from a 16-byte id handle, mime,

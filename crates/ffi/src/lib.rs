@@ -1319,7 +1319,9 @@ pub unsafe extern "C" fn crdtsync_doc_apply(
 ///
 /// True from the refusal until the next *intention* begins — a further edit inside
 /// an open atomic group does not clear it, since the group is one intention — so it
-/// answers for the edit just made rather than for the handle's whole history. It is
+/// answers for the edit just made rather than for the handle's whole history. Call it
+/// before starting the next edit or atomic group: that one clears the latch, so a
+/// later call answers for the later intention and not for this one. It is
 /// a query rather than an empty buffer because that signal already carries a bad
 /// handle and an inert edit, and a third meaning on it would be unreadable.
 ///
@@ -3513,6 +3515,9 @@ pub unsafe extern "C" fn crdtsync_client_clear_undo_origin(
 /// The per-channel form of [`crdtsync_doc_mint_refused`], and it answers per
 /// channel because each channel holds its own replica minting under its own
 /// identity: a channel a peer has spent says nothing about its siblings.
+///
+/// Latched and cleared on that channel's intentions, as the per-document form is:
+/// call it before the next edit on that channel, or the answer is that edit's.
 ///
 /// # Safety
 /// `client` must be a handle returned by a constructor and not yet freed.

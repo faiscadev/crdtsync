@@ -721,7 +721,10 @@ impl WasmDocument {
     /// edit produces the same empty buffer an inert one does — this is what tells
     /// the two apart, so a caller can raise rather than report an edit that never
     /// happened. An atomic group is one intention, so a refusal inside one stays
-    /// raised for the rest of the group.
+    /// raised for the rest of the group and across the commit that closes it.
+    ///
+    /// Read it before the next edit: the next intention clears it, so a later
+    /// reading answers for that edit rather than this one.
     #[wasm_bindgen(js_name = mintRefused)]
     pub fn mint_refused(&self) -> bool {
         self.inner.mint_refused()
@@ -1202,7 +1205,8 @@ impl WasmClient {
     /// Latched for the whole intention, as the per-document reading is: an atomic
     /// group is one intention, so a refusal inside one stays raised across the
     /// edits that follow it and across the commit, and clears when the next
-    /// intention opens.
+    /// intention opens. Read it before editing that channel again, or the answer
+    /// is the later edit's.
     #[wasm_bindgen(js_name = mintRefused)]
     pub fn mint_refused(&self, channel: u32) -> bool {
         self.inner.mint_refused(Channel(channel)).unwrap_or(false)

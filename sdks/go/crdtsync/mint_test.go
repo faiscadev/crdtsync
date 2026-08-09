@@ -169,3 +169,37 @@ func TestAnOrdinaryEditIsUntouched(t *testing.T) {
 		t.Fatalf("Doc.Err reported %v on a healthy replica", err)
 	}
 }
+
+func TestABlobThatFitsButCannotMintIsNotReportedStored(t *testing.T) {
+	// SetBlob's bool is read as "the blob is at this key". Fitting under the inline
+	// ceiling is only half of that: an inline blob still mints a handle, so a spent
+	// replica stores nothing while the size check passes.
+	d := newErgoDoc(t, 8)
+	defer d.Close()
+	d.ApplyUpdate(planted(t, 8))
+
+	if d.GetMap("root").SetBlob("b", "text/plain", []byte("small")) {
+		t.Fatal("SetBlob reported a stored blob on a spent replica")
+	}
+	if _, ok := d.GetMap("root").GetBlob("b"); ok {
+		t.Fatal("a refused blob reached local state")
+	}
+	if err := d.Err(); err != ErrMintExhausted {
+		t.Fatalf("Doc.Err reported %v, want ErrMintExhausted", err)
+	}
+}
+
+func TestABlobStoredOnAReplicaWithRoomStillReportsTrue(t *testing.T) {
+	d := newErgoDoc(t, 9)
+	defer d.Close()
+
+	if !d.GetMap("root").SetBlob("b", "text/plain", []byte("small")) {
+		t.Fatal("SetBlob refused a blob on a replica with ids to spare")
+	}
+	if _, ok := d.GetMap("root").GetBlob("b"); !ok {
+		t.Fatal("the stored blob is not readable at its key")
+	}
+	if err := d.Err(); err != nil {
+		t.Fatalf("Doc.Err reported %v on an ordinary blob write", err)
+	}
+}

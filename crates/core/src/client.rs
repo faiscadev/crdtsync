@@ -1069,6 +1069,10 @@ impl ClientSession {
     /// Each channel holds its own replica and mints under its own identity, so a
     /// channel exhausted by a peer authoring under that identity says nothing about
     /// its siblings.
+    ///
+    /// Latched for that channel's whole intention — an atomic group is one, commit
+    /// included — and cleared as its next one opens, so read it before editing that
+    /// channel again or the answer is the later edit's.
     pub fn mint_refused(&self, channel: Channel) -> Option<bool> {
         self.rooms.get(&channel).map(|r| r.doc.mint_refused())
     }
