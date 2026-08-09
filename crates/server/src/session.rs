@@ -2396,9 +2396,9 @@ fn channel_authorized(
 
 /// The refusal for a channel-keyed `what` request that [`bound_room`] or
 /// [`channel_authorized`] rejected: a violation if the connection is unauthenticated
-/// or the channel is unbound, otherwise a non-closing forbidden. `what` names the request kind (`"version"`,
-/// `"diff"`) so the diagnostic points at the surface the client actually used — the
-/// channel-bound counterpart of [`request_denied`].
+/// or the channel is unbound, otherwise a non-closing forbidden. `what` names the
+/// request kind (`"version"`, `"diff"`) so the diagnostic points at the surface the
+/// client actually used — the channel-bound counterpart of [`request_denied`].
 fn channel_request_denied(session: &Session, channel: Channel, what: &str) -> Response {
     if session.actor().is_none() {
         violation(&format!("{what} request before auth"))

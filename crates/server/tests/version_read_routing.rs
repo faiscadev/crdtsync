@@ -45,7 +45,7 @@ use crdtsync_core::{
     AclEffect, ClientId, Document, Element, ErrorCode, Message, Op, Scalar, Schema,
 };
 use crdtsync_server::acl::{actor_key, Acl, ResourceMatch, Subject};
-use crdtsync_server::membership::Membership;
+use crdtsync_server::membership::{Membership, DEAD_AFTER_FAILURES, REAP_AFTER_DEAD_TICKS};
 use crdtsync_server::placement::NodeId;
 use crdtsync_server::{ConnId, ManualClock, Registry, SchemaRegistry, StaticTokens};
 
@@ -425,6 +425,59 @@ fn a_bound_channels_read_floor_never_outruns_the_replica_answering_it() {
     assert!(
         cursor < leader.hub().seq(&room),
         "and it is behind the room, with nothing on this channel able to raise it",
+    );
+}
+
+#[test]
+fn a_replica_reads_an_empty_record_set_as_nothing_denied() {
+    // Why the gate cannot be "serve where the room carries no doc-ACL records". A
+    // replica behind the commit that installed the tuples holds none of them, and an
+    // empty record set is indistinguishable at that node from a room where nothing is
+    // denied — so such a gate admits exactly the case it exists to refuse, and admits
+    // it to serve the room whole rather than narrowed.
+    let room = room_led_by_a_with_b_next();
+    let mut leader = node(Some(A), &room);
+    let alice = auth(&mut leader, 1, "t-alice");
+    assert!(leader.deliver(alice, subscribe(&room)));
+    leader.take_outbox(alice);
+
+    let mut alice_doc = Document::new(cid(1));
+    alice_doc.set_schema(Schema::parse(PARTIAL).expect("the partial schema parses"));
+    let content = alice_doc.transact(|tx| {
+        tx.map(b"a").register(b"aseed", Scalar::Int(0));
+        tx.map(b"b").register(b"bseed", Scalar::Int(0));
+    });
+    assert!(leader.deliver(
+        alice,
+        Message::Ops {
+            channel: CH,
+            ops: content
+        }
+    ));
+    leader.take_outbox(alice);
+
+    // The follower catches up to the content and stops there.
+    let mut follower = node(Some(B), &room);
+    let peer = peer_conn_as(&mut follower, &NodeId::from_addr(A));
+    replicate(&mut leader, &mut follower, peer);
+    assert!(
+        follower.hub().holds_room(&room),
+        "it holds a materialized copy"
+    );
+
+    // The deny lands on the leader and is withheld.
+    let ops = deny_b(&mut alice_doc);
+    assert!(leader.deliver(alice, Message::Ops { channel: CH, ops }));
+    leader.take_outbox(alice);
+    leader.take_replication();
+
+    assert!(
+        holds_a_read_deny(&leader, &room),
+        "the room denies /b to bob",
+    );
+    assert!(
+        follower.hub().acl_records(&room).is_empty(),
+        "the replica that would be admitted holds no record at all",
     );
 }
 
@@ -837,11 +890,11 @@ fn a_stranded_node_refuses_a_version_read_rather_than_answering_it_alone() {
             .filter(|n| n != view.self_id())
             .collect();
         for peer in &peers {
-            for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+            for _ in 0..DEAD_AFTER_FAILURES {
                 view.note_gossip_unreachable(peer);
             }
         }
-        for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+        for _ in 0..REAP_AFTER_DEAD_TICKS {
             view.reap_dead();
         }
         assert!(view.is_stranded(), "it can no longer rebuild a ring");
