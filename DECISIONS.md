@@ -7,7 +7,7 @@ Log of design changes to [ARCHITECTURE.md](ARCHITECTURE.md) that implementation 
 The entries below (2026-07-02) are a backfill: design changes made during the v0.1→v0.2 build that predate this log, recovered from the sessions and commit history.
 
 
-## 2026-08-09 · C14 redacted-delta frontier (#PR) · the carrier C9 refused for the snapshot seam is the right answer one seam over — and a redaction owes the recipient **both** records its mint reads, without burying the ops it names
+## 2026-08-09 · C14 redacted-delta frontier (#398) · the carrier C9 refused for the snapshot seam is the right answer one seam over — and a redaction owes the recipient **both** records its mint reads, without burying the ops it names
 
 **Changed:** ARCHITECTURE §Wire-Level Redaction gains a paragraph ruling what a redaction owes its recipient's own authorship and how each of the three seams pays it. Wire: one new frame, `Message::Frontier { channel, seqs, reach }` (tag 54), server→client only — 53 went to C55's `ReplicateMeta` while both branches were open. State: `STATE_VERSION` 15, carrying the published-but-unheld run.
 
