@@ -2363,8 +2363,7 @@ fn read_redirect_response(
 /// The routing half of such a request needs the room and must run *before* the gate:
 /// a node that will not answer must not decide it, since [`Authorizer::observe`]
 /// records the verdict and would leave a durable audit entry for a read the node
-/// then refuses. So the two halves are separable, [`channel_authorized`] being the
-/// other.
+/// then refuses.
 fn bound_room(session: &Session, channel: Channel) -> Option<RoomId> {
     session.identity()?;
     Some(session.channels.get(&channel)?.room.clone())
@@ -2396,8 +2395,8 @@ fn channel_authorized(
 }
 
 /// The refusal for a channel-keyed `what` request that [`bound_room`] or
-/// [`channel_authorized`] rejected: a violation if the connection is
-/// unauthenticated or the channel is unbound, otherwise a non-closing forbidden. `what` names the request kind (`"version"`,
+/// [`channel_authorized`] rejected: a violation if the connection is unauthenticated
+/// or the channel is unbound, otherwise a non-closing forbidden. `what` names the request kind (`"version"`,
 /// `"diff"`) so the diagnostic points at the surface the client actually used — the
 /// channel-bound counterpart of [`request_denied`].
 fn channel_request_denied(session: &Session, channel: Channel, what: &str) -> Response {

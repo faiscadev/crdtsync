@@ -529,8 +529,11 @@ export class Provider {
     if (Array.isArray(rejected) && rejected.length > 0) this.onOpsRejected?.(rejected);
     const redirects = this.client.takeRedirects() as unknown[];
     if (Array.isArray(redirects) && redirects.length > 0) {
-      // A version/branch mutation routed to a non-leader is redirected, not
-      // answered — reject the request awaiting it so it doesn't hang to timeout.
+      // A request the room's leader alone answers — a version or branch mutation, a
+      // version read, a version diff — is redirected on any other node rather than
+      // answered, so fail the request awaiting it instead of hanging to timeout. The
+      // redirect names a room and no channel, so the oldest pending request on this
+      // socket is the one failed.
       if (this.pending.length > 0) {
         this.pending.shift()?.fail(new Error("crdtsync: request redirected to the room's leader"));
       }

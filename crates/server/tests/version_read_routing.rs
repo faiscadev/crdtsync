@@ -28,7 +28,7 @@
 //! A replica serves version reads once it holds the room's leadership: that is what
 //! keeps the gate from being a blanket centralization, and it is as strong as the
 //! leadership is — a node promoted on its own liveness view answers from its own
-//! records, which is where the residue of this unit lives (C109).
+//! records, which is where the residue of this unit lives (C111).
 //!
 //! Two in-process registries — a leader `Registry` and a follower `Registry` over
 //! one static cluster, no socket — as in `follower_reads.rs`: the leader commits,
@@ -170,6 +170,36 @@ fn fetch(name: &[u8]) -> Message {
         channel: CH,
         name: name.to_vec(),
     }
+}
+
+/// Every channel-keyed frame of the version seam — the two reads, the three
+/// mutations, and the diff arm that carries the same captured bytes. All six resolve
+/// the channel's room, route on it, and then decide the gate, so a claim about that
+/// order is a claim about all six.
+fn channel_keyed_frames() -> Vec<Message> {
+    vec![
+        fetch(V1),
+        Message::VersionList { channel: CH },
+        Message::VersionCreate {
+            channel: CH,
+            name: b"v2".to_vec(),
+        },
+        Message::VersionRename {
+            channel: CH,
+            from: V1.to_vec(),
+            to: b"v2".to_vec(),
+        },
+        Message::VersionDelete {
+            channel: CH,
+            name: V1.to_vec(),
+        },
+        Message::DiffQuery {
+            channel: CH,
+            kind: DiffKind::Versions,
+            a: V1.to_vec(),
+            b: V1.to_vec(),
+        },
+    ]
 }
 
 /// A connection admitted to `r`'s peer plane as the member `node`.
@@ -546,7 +576,7 @@ fn a_lagging_promoted_leader_still_answers_from_its_own_records() {
     // replica that promotes over a leader still committing answers the fetch from
     // the records it has, and serves the subtree the revoke closed. The gate moves
     // the read to the node that holds the room's leadership; making that leadership
-    // an authority the read can rely on is C109.
+    // an authority the read can rely on is C111.
     let room = room_led_by_a_with_b_next();
     let (mut leader, mut alice_doc, alice) = seeded_leader(&room);
     let (mut promoted, _peer) = caught_up_follower_holding_v1(&mut leader, &room);
@@ -571,7 +601,7 @@ fn a_lagging_promoted_leader_still_answers_from_its_own_records() {
     let state = served_state(&promoted.take_outbox(bob)).expect("the promoted node serves");
     assert!(
         carries(&state, b"b", b"bseed"),
-        "the promotion residue is closed — if C109 is fixed, retire this pin",
+        "the promotion residue is closed — if C111 is fixed, retire this pin",
     );
 }
 
@@ -674,8 +704,8 @@ fn a_version_mutation_on_a_replica_still_redirects() {
 #[test]
 fn a_version_read_on_an_unbound_channel_is_a_violation_not_a_redirect() {
     // Where the gate sits: above the authorization, below the channel. The channel is
-    // what names the room a redirect would point at, so a request that never bound one
-    // names no bound channel is a protocol violation, not something to route.
+    // what names the room a redirect would point at, so a request that names no bound
+    // channel is a protocol violation, not something to route.
     let room = room_led_by_a_with_b_next();
     let mut follower = node(Some(B), &room);
     let bob = auth(&mut follower, 2, "t-bob");
@@ -703,12 +733,11 @@ fn a_version_read_on_an_unbound_channel_is_a_violation_not_a_redirect() {
 
 #[test]
 fn a_reader_whose_room_read_was_revoked_is_routed_before_it_is_refused() {
-    // What the ordering costs. A reader who bound a channel and then lost its room
-    // read is told where the room
-    // is answered before it is told it may not read it — the redirect names a room
-    // this client itself supplied at subscribe and a leader any authenticated actor
-    // can already resolve, so it discloses nothing the subscribe gate does not. The
-    // node that does answer the read is the node that refuses it.
+    // What the ordering costs. A reader who bound a channel and then lost its room read
+    // is told where the room is answered before it is told it may not read it — the
+    // redirect names a room this client itself supplied at subscribe and a leader any
+    // authenticated actor can already resolve, so it discloses nothing the subscribe
+    // gate does not. The node that does answer the read is the node that refuses it.
     let room = room_led_by_a_with_b_next();
     let mut follower = node(Some(B), &room);
     // Leadership flaps under the bound channel: B leads while bob subscribes, then A
@@ -730,31 +759,9 @@ fn a_reader_whose_room_read_was_revoked_is_routed_before_it_is_refused() {
         ResourceMatch::Room(room.clone()),
     );
     follower.set_authorizer(Box::new(revoked.clone()));
-    // Every channel-keyed frame of the seam takes the order, so every one is measured
-    // — a regression on any single frame is otherwise invisible.
-    for request in [
-        fetch(V1),
-        Message::VersionList { channel: CH },
-        Message::VersionCreate {
-            channel: CH,
-            name: b"v2".to_vec(),
-        },
-        Message::VersionRename {
-            channel: CH,
-            from: V1.to_vec(),
-            to: b"v2".to_vec(),
-        },
-        Message::VersionDelete {
-            channel: CH,
-            name: V1.to_vec(),
-        },
-        Message::DiffQuery {
-            channel: CH,
-            kind: DiffKind::Versions,
-            a: V1.to_vec(),
-            b: V1.to_vec(),
-        },
-    ] {
+    // Every frame of the seam takes the order, so every one is measured — a regression
+    // on any single one is otherwise invisible.
+    for request in channel_keyed_frames() {
         let named = format!("{request:?}");
         assert!(follower.deliver(bob, request));
         assert_eq!(
@@ -771,18 +778,21 @@ fn a_reader_whose_room_read_was_revoked_is_routed_before_it_is_refused() {
     assert!(leader.deliver(bob, subscribe(&room)));
     leader.take_outbox(bob);
     leader.set_authorizer(Box::new(revoked));
-    assert!(leader.deliver(bob, fetch(V1)));
-    let out = leader.take_outbox(bob);
-    assert!(
-        out.iter().any(|m| matches!(
-            m,
-            Message::Error {
-                code: ErrorCode::Forbidden,
-                ..
-            }
-        )),
-        "the node that answers the read is the node that refuses it: {out:?}",
-    );
+    for request in channel_keyed_frames() {
+        let named = format!("{request:?}");
+        assert!(leader.deliver(bob, request));
+        let out = leader.take_outbox(bob);
+        assert!(
+            out.iter().any(|m| matches!(
+                m,
+                Message::Error {
+                    code: ErrorCode::Forbidden,
+                    ..
+                }
+            )),
+            "the node that answers the request did not refuse it, for {named}: {out:?}",
+        );
+    }
 }
 
 #[test]
@@ -804,6 +814,50 @@ fn an_empty_room_on_its_leader_still_serves_a_version_read() {
             Some(Message::Versions { names, .. }) if names.is_empty()
         ),
         "an unwritten room on its leader answers its own empty version list",
+    );
+}
+
+#[test]
+fn a_stranded_node_refuses_a_version_read_rather_than_answering_it_alone() {
+    // The gate resolves the room's leadership, and a node whose ring has emptied has
+    // none to resolve — so it refuses rather than answering from a replica no quorum
+    // stands behind. The same reading the seam's mutations and an ops write already
+    // take, now shared by its reads.
+    let room = room_led_by_a_with_b_next();
+    let mut stranded = node(Some(A), &room);
+    let alice = auth(&mut stranded, 1, "t-alice");
+    assert!(stranded.deliver(alice, subscribe(&room)));
+    stranded.take_outbox(alice);
+
+    {
+        let view = stranded.membership_mut_for_test();
+        let peers: Vec<NodeId> = view
+            .members()
+            .into_iter()
+            .filter(|n| n != view.self_id())
+            .collect();
+        for peer in &peers {
+            for _ in 0..crdtsync_server::membership::DEAD_AFTER_FAILURES {
+                view.note_gossip_unreachable(peer);
+            }
+        }
+        for _ in 0..crdtsync_server::membership::REAP_AFTER_DEAD_TICKS {
+            view.reap_dead();
+        }
+        assert!(view.is_stranded(), "it can no longer rebuild a ring");
+    }
+
+    assert!(stranded.deliver(alice, Message::VersionList { channel: CH }));
+    let out = stranded.take_outbox(alice);
+    assert!(
+        out.iter().any(|m| matches!(
+            m,
+            Message::Error {
+                code: ErrorCode::Internal,
+                ..
+            }
+        )),
+        "a stranded node answered a version read from its own state: {out:?}",
     );
 }
 
