@@ -1816,6 +1816,89 @@ impl Hub {
         self.rooms.get(room).map_or(0, Room::head)
     }
 
+    /// The highest sequence at or below `through` in the `(room, branch)` stream
+    /// whose op belongs to a partition `admits` keeps, against the room's own
+    /// sequence space. `admits` reads an op's `zone` and nothing else, so this is the
+    /// head of the stream **as one zone scope sees it** — not as one *reader* does,
+    /// which the doc-ACL filter narrows further along an axis a partition cannot
+    /// name.
+    ///
+    /// [`seq`](Hub::seq) counts the whole log, so the difference between two of its
+    /// readings counts the ops written into partitions a zone-limited reader is not
+    /// served. This one moves only when a partition that scope does see is written, so
+    /// within a compaction epoch a window of hidden-only writes reads like an idle one
+    /// — while the value stays a real room sequence, so it remains a resume floor
+    /// `catch_up` can index and the follower-read gate can compare. **Across** a
+    /// compaction it can fall, since only the retained log is scanned and the floor
+    /// moves with the room's whole volume; that residue is C119's, and it is why the
+    /// version seam — whose scalar is no one's cursor — refuses the field instead.
+    ///
+    /// `0` where the retained log holds no such op: nothing in this stream that scope
+    /// admits carries a sequence still on record. Only the retained log is scanned,
+    /// so a scope whose ops all sit below the compaction floor reads `0` and, as a
+    /// resume floor, re-takes the whole projected state on each reconnect until a
+    /// sequence it admits lands above the floor. That is the cost of the answer being
+    /// honest: a floor drawn from the compacted range would move with the room's
+    /// total volume, which is the inference the narrowing exists to close.
+    pub fn partition_head(
+        &self,
+        room: &[u8],
+        branch: &[u8],
+        through: u64,
+        admits: impl Fn(Option<u32>) -> bool,
+    ) -> u64 {
+        // The stream's retained log as `(sequence before the first record, records,
+        // highest sequence this segment contributes)` segments. `main` is one — the
+        // room's own log. A branch is its divergent tail past the fork point over the
+        // shared base below it, which a snapshot-forked branch replaces with a
+        // captured state carrying no ops at all.
+        let mut segments: Vec<(u64, &[StoredOp], u64)> = Vec::new();
+        if branch.is_empty() || branch == MAIN_BRANCH {
+            if let Some(r) = self.rooms.get(room) {
+                segments.push((r.base_seq, &r.log, through));
+            }
+        } else {
+            let Some(fork_point) = self
+                .branches
+                .get(room)
+                .and_then(|registry| registry.branch(branch))
+                .map(|b| b.fork_point)
+            else {
+                return 0;
+            };
+            if let Some(log) = self.branch_logs.get(room).and_then(|logs| logs.get(branch)) {
+                segments.push((fork_point, &log.ops, through));
+            }
+            if !self.owns_base(room, branch) {
+                if let Some(r) = self.rooms.get(room) {
+                    segments.push((r.base_seq, &r.log, through.min(fork_point)));
+                }
+            }
+        }
+        let mut head = 0;
+        for (base, records, upper) in segments {
+            // A record at index `i` carries sequence `base + i + 1`, so the last one
+            // this segment contributes sits at index `upper - base - 1`.
+            let span = upper.saturating_sub(base);
+            let end = if span >= records.len() as u64 {
+                records.len()
+            } else {
+                span as usize
+            };
+            for (i, rec) in records[..end].iter().enumerate().rev() {
+                let seq = base + i as u64 + 1;
+                if seq <= head {
+                    break;
+                }
+                if admits(rec.op.zone) {
+                    head = seq;
+                    break;
+                }
+            }
+        }
+        head
+    }
+
     /// Whether this hub holds a materialized replica of `room` — the room is
     /// present, distinct from one never seen (both report [`seq`](Hub::seq) `0`).
     /// A follower serves a read only from a room it holds, so it never answers
