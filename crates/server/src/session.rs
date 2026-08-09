@@ -1954,14 +1954,37 @@ fn handle_ops(
     // Whether this write is what rooted the room, reported out so the leader can
     // replicate a root its op batch does not carry.
     let mut root_established = false;
+    // Whether the batch presented any op at all — not whether one landed. This is the
+    // evidence a *client* offers for being the room's author, and the two differ: a
+    // resend the room dedups whole still presented the room's content, which is
+    // something only a replica that holds it can do, while an empty frame presents
+    // nothing and costs its sender nothing.
+    let submitted_ops = !ops.is_empty();
     let applied = if branch == MAIN_BRANCH {
         let applied = hub.ingest(&room, ops, write_version);
         // The first authenticated actor to write a room establishes it, so it becomes
-        // the room's creator — the doc-ACL authority root that owns `/`. Set-once and
-        // authenticated-only, both decided by `ensure_creator` so a root arriving over
-        // a replication frame is judged by the same rule. A branch write presupposes
-        // an already-established (forked) room, so it never bootstraps a creator.
-        if applied.is_ok() {
+        // the room's creator — the doc-ACL authority root that owns `/`. Two conditions
+        // decide it, and they close the same defect from opposite sides (C99).
+        //
+        // The room must have reached a sequence, which lives in `ensure_creator` so
+        // that a root arriving over a replication frame is judged by it too — the ingest
+        // above materialises the room and answers `Ok` for an empty batch just as for a
+        // landed one, so without it a no-op frame *created* a room and owned it.
+        //
+        // And the batch must have presented an op, which lives here because it is a
+        // statement about what a client offered. A rootless room that already holds
+        // content is a real state — an anonymous establishing commit leaves one, and so
+        // does a replica whose metadata write was lost — and there the room-level
+        // condition is already satisfied, so a frame carrying nothing would take `/`
+        // over content it had no part in. The replication callers state no such
+        // condition and must not: they *adopt* a root established elsewhere, and
+        // `Message::ReplicateMeta` is by construction the frame with no batch beneath
+        // it. A peer asserting a root it did not earn is refused by the replica-set
+        // gate, not by this one.
+        //
+        // A branch write presupposes an already-established (forked) room, so it never
+        // bootstraps a creator.
+        if applied.is_ok() && submitted_ops {
             root_established = hub.ensure_creator(&room, identity.actor());
         }
         applied

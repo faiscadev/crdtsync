@@ -517,6 +517,83 @@ impl Room {
     }
 }
 
+/// Whether `actor` may stand as the doc-ACL authority root of a room whose server
+/// sequence is `head` — the room-level half of who may be established as a root, in one
+/// place, for every seam that takes an *actor's* word for one. That is
+/// [`Hub::ensure_creator`], which a client's write, a peer's `Replicate` and the
+/// metadata-only `ReplicateMeta` all compose through, so the rule is stated once rather
+/// than bolted onto the client seam with the replication path left judging by another.
+/// Two other seams install a root without passing here — a snapshot install and the
+/// durable record read back off the store — and both are named below. Set-once is the
+/// separate question of whether a root already stands.
+///
+/// An [anonymous](crate::acl::is_authenticated) actor never may: an anonymous id is
+/// ephemeral per-connection, so the set-once root would wedge the room's authority on
+/// a principal that can never re-present to exercise it.
+///
+/// And no actor may root a room **at sequence zero**. The root owns `/` and every
+/// doc-ACL deny in the room is decided under it, so it is the heaviest authority the
+/// server hands out — and a room that has reached no sequence has had nothing put in it
+/// to be the authority over. Without this an empty `Ops` frame took it: the ingest
+/// materialises the room, appends nothing, persists nothing and answers `Ok`, so the
+/// first authenticated actor to send a no-op batch at an unestablished room owned it,
+/// having authored no byte the room retains (C99).
+///
+/// **This is one of two conditions, and alone it closes only half the defect.** It is a
+/// rule about the *room*, so it says nothing once the room has reached a sequence — and
+/// a room that holds content with **no root** is a real state, left by an anonymous
+/// establishing commit or by a replica whose best-effort metadata write was lost (C55's
+/// two routes). There, a frame carrying nothing satisfies this rule and would take `/`
+/// over content its sender had no part in. The condition that refuses it is a statement
+/// about what the *batch* offered, so it lives at the client write seam
+/// (`session.rs`, `handle_ops`) rather than here: the replication callers adopt a root
+/// established elsewhere and `ReplicateMeta` is by construction the frame with no batch
+/// beneath it, so neither can state it and neither should.
+///
+/// **The rule stops here, and the two seams it deliberately does not reach were
+/// measured rather than argued.** A root also arrives *with a state* — a snapshot
+/// install, and the durable record read back off the store — and at both of those the
+/// sequence is not this node's count of what it accepted but a number that came in
+/// beside the root — no honest catch-up even names zero, since a `Snapshot` is served
+/// only below a room's floor and so at a floor of at least one, which makes a zero
+/// there the mark of a buggy or hostile sender. Applying the rule to those two refuses
+/// that sender nothing (it names a nonzero floor instead) and breaks two things that
+/// hold today: a state
+/// full of content whose frame names floor zero comes up **rootless**, leaving every
+/// tuple in it with no authority to be decided under, and a room a state transfer left
+/// at zero loses the root it was legitimately established with on its next reload. Both
+/// are the C29 hole reached from the other side, which is worse than the reservation
+/// this rule exists to refuse. Pinned by
+/// `a_state_installed_at_sequence_zero_still_carries_the_frames_root` and
+/// `a_durable_root_survives_a_reload_of_a_room_left_at_sequence_zero`.
+///
+/// So the sequence this rule reads is only as honest as the floor the room came up at:
+/// a peer whose state transfer named a nonzero floor over empty bytes leaves a room
+/// this rule then lets the next actor root. That peer is inside the room's replica set
+/// and could assert the root itself, so the rule is not what stands between it and the
+/// room — what it refuses is the actor with nothing but a client connection, which is
+/// the reach the defect had.
+///
+/// The rule is about the **room**, not about the batch that reached it. A write that
+/// the room's dedup swallows whole still roots a room that already holds ops (the shape
+/// C55 built [`Message::ReplicateMeta`](crdtsync_core::Message::ReplicateMeta) to
+/// replicate), deliberately — and the line is drawn at what the batch *presented*, not
+/// at what landed. A resend presents the room's content, which only a replica holding
+/// it can do and which an attacker must therefore obtain; an empty frame presents
+/// nothing and costs its sender nothing, which is why the two are not the same act
+/// however alike their effect on the log. The refusal of the resend would still buy
+/// attributability — the fresh-op route leaves an op under the taker's `ClientId` and
+/// claims that identity, the deduped route leaves the room's state with no record of
+/// who took `/` — and what it would cost is C55's route 1, whose only shape is a root
+/// established by a write the dedup swallowed whole, against an attacker who pays one
+/// op to route around it. C23 ruled the other way one tier down, for the
+/// replica-identity claim, where the act *is* the taking of an identity another
+/// replica's historic ops wrote; a root is the room's, not another actor's, so the same
+/// act does not carry the same theft.
+fn may_stand_as_root(actor: &[u8], head: u64) -> bool {
+    crate::acl::is_authenticated(actor) && head > 0
+}
+
 /// What a subscriber needs to catch up, given the sequence it last saw.
 pub enum Catchup {
     /// The subscriber is at or above the compaction floor: fold these ops, in
@@ -1127,7 +1204,10 @@ impl Hub {
             }
             // The stored bytes are supplied by whoever hands the store over, so the
             // root they name is checked here as one off a frame is: an anonymous id
-            // could never re-present to exercise the ownership it would be handed.
+            // could never re-present to exercise the ownership it would be handed. The
+            // room's sequence decides nothing here — this is a root the node itself
+            // recorded, and a room the state transfer left at zero still holds the
+            // authority its content was written under ([`may_stand_as_root`]).
             if let Some(creator) = meta.creator.filter(|a| crate::acl::is_authenticated(a)) {
                 if let Some(r) = self.rooms.get_mut(&room) {
                     if r.creator.is_none() {
@@ -1691,6 +1771,14 @@ impl Hub {
     /// defined everywhere else — set-once, never displaced, and never an anonymous
     /// actor — so a re-sent snapshot that names none leaves the standing root alone
     /// rather than dropping the authority every deny in the state is decided under.
+    ///
+    /// The room's sequence decides nothing here, deliberately: this frame installs the
+    /// content *and* names the floor it lands at, so requiring a nonzero one would
+    /// refuse a root over a state full of content whose sender named zero — leaving the
+    /// tuples in that state with no authority to be decided under — while refusing
+    /// nothing, since a sender that wanted the root would name one instead. See
+    /// [`may_stand_as_root`], which is why that rule stops at the seams whose sequence
+    /// is this node's own count.
     ///
     /// The room's op-version high-water is *preserved*, never supplied here: it is the
     /// all-time worst case a joiner must down-reach rather than a property of the
@@ -2474,14 +2562,18 @@ impl Hub {
 
     /// Record `actor` as `room`'s creator if it has none yet, persisting the durable
     /// metadata. Set-once: a room keeps its first writer as creator, so a later
-    /// caller never displaces it. A no-op for an unknown room, and for an
-    /// [anonymous](crate::acl::is_authenticated) actor — an anonymous id is ephemeral
-    /// per-connection, so set-once would wedge the room's authority on a principal
-    /// that can never re-present to exercise it. Both rules decide a root arriving with
-    /// an installed snapshot and one read back off the store too, so a root is judged
-    /// the same whichever seam carries it. An install expresses set-once by composing
-    /// against the standing root rather than guarding on its absence; the answer is
-    /// the same either way.
+    /// caller never displaces it. A no-op for an unknown room, and for an actor
+    /// [`may_stand_as_root`] refuses — an anonymous one, and any actor at a room at
+    /// sequence zero, so a no-op frame cannot mint a room and own it (C99). This is the
+    /// seam every *actor-asserted* root composes through — a client's write, a peer's
+    /// `Replicate`, and the metadata-only `ReplicateMeta` — so all three are judged
+    /// alike. It is not the whole of C99's answer: refusing a no-op frame at a room
+    /// that already holds content is a statement about the batch, which only the client
+    /// seam can make, and it makes it there. Set-once and the anonymous rule decide a root arriving with an
+    /// installed snapshot and one read back off the store too; the sequence rule does
+    /// not, and [`may_stand_as_root`] records why. An install expresses set-once by
+    /// composing against the standing root rather than guarding on its absence; the
+    /// answer is the same either way.
     ///
     /// Persisting is best-effort, matching the governing metadata: a failed write does
     /// not fail the caller's write. Set-once means nothing retries it either, so a
@@ -2495,11 +2587,8 @@ impl Hub {
     /// tell the rest of the cluster can — a root established by a write the room's
     /// dedup swallowed whole has no op batch to ride out on.
     pub fn ensure_creator(&mut self, room: &[u8], actor: &[u8]) -> bool {
-        if !crate::acl::is_authenticated(actor) {
-            return false;
-        }
         let established = match self.rooms.get_mut(room) {
-            Some(r) if r.creator.is_none() => {
+            Some(r) if r.creator.is_none() && may_stand_as_root(actor, r.head()) => {
                 r.creator = Some(actor.to_vec());
                 true
             }
