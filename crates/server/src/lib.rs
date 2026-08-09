@@ -527,11 +527,16 @@ pub enum Catchup {
     /// The subscriber fell below the floor: load this whole-replica state, then
     /// treat `seq` as the sequence it has now caught up to.
     Snapshot { seq: u64, state: Vec<u8> },
-    /// The stream cannot be served: the branch owns a base this node cannot decode,
-    /// so what it would serve *below the fork point* is unknown. A subscriber already
-    /// past the fork point still gets its tail delta — it holds the base already.
-    /// Distinct from an empty delta on purpose — reading "unknown" as "nothing to
-    /// send" is what let a publish freeze an empty document over a live branch.
+    /// The stream cannot be served: part of what it would put below this subscriber's
+    /// position is not reachable here. Two ways — the branch owns a base this node
+    /// cannot decode, or it is a live-log fork whose shared base is `main`'s retained
+    /// log and the compaction floor has passed part of what this subscriber still
+    /// needs (C53). The second reaches only a subscriber standing below **both** the
+    /// floor and its own base window: above the floor everything it still needs is
+    /// retained, and above the window it needs none of the base at all. Distinct from
+    /// an empty delta on purpose — a caller reading "unknown" as "nothing to send"
+    /// freezes an empty document over a live branch, or catches a subscriber up to a
+    /// divergent tail over nothing.
     Unavailable,
 }
 
@@ -1505,6 +1510,15 @@ impl Hub {
     /// log point) instead owns its base: it serves that version's materialized
     /// state — with its tail folded in — never main's log. See
     /// [`fork_branch_from_version`](Hub::fork_branch_from_version).
+    ///
+    /// [`Catchup::Unavailable`] where part of the base this subscriber still needs is
+    /// not reachable here: an owned base that does not decode, or a shared base
+    /// `main`'s compaction floor has passed. Serving what remains would catch the
+    /// subscriber up to a stream missing that history and say nothing about it. The
+    /// shared-base refusal takes both ends of the window — it reaches a subscriber
+    /// standing below the floor *and* below its own fork point, since either one on
+    /// its own leaves nothing missing — and the position is the one the caller
+    /// supplies rather than one this seam verifies.
     pub fn catch_up_branch(&mut self, room: &[u8], branch: &[u8], last_seen_seq: u64) -> Catchup {
         if branch == MAIN_BRANCH {
             return self.catch_up(room, last_seen_seq);
@@ -1553,6 +1567,29 @@ impl Hub {
         // `base_seq + i + 1`.
         if let Some(r) = self.rooms.get(room) {
             let base_end = fork_point.min(r.head());
+            // A live-log fork owns none of that base and `main` retains only
+            // `(base_seq, head]`, so a record this subscriber still needs is missing
+            // whenever the floor sits above what it has seen. Serving the retained
+            // remainder would fold the branch over a document missing every op below
+            // the floor while answering as if the stream were whole, so there is no
+            // delta to give (C53). Asked of a fold from zero this is `stream_doc`'s
+            // own clipped-base check, which is what keeps the tree a read is redacted
+            // against and the stream a subscriber is served describing one branch.
+            //
+            // The bound is what the subscriber needs, not what the branch is, and it
+            // takes both ends: at or above the floor nothing it still needs was
+            // dropped, and at or above its own fork point it needs none of the base
+            // whatever the floor has since done. It is what the subscriber *claims* to
+            // need — nothing verifies a cursor — so this covers a client catching up
+            // honestly rather than the branch itself.
+            if base_end.min(r.base_seq) > last_seen_seq {
+                return Catchup::Unavailable;
+            }
+            // The clamps below narrow nothing past the refusal — it leaves
+            // `base_seq <= last_seen_seq` wherever `base_end` exceeds either. They are
+            // kept because the slice is total on *their* inputs and not on the
+            // refusal's: `base_end <= head = base_seq + log.len()` bounds `hi`, and the
+            // conjunction bounds `lo` below it.
             if base_end > last_seen_seq && base_end > r.base_seq {
                 let lo = last_seen_seq.max(r.base_seq) - r.base_seq;
                 let hi = base_end - r.base_seq;

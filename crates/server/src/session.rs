@@ -1024,11 +1024,13 @@ pub fn step(
                         ),
                     }]
                 }
-                // The branch owns a base this node cannot decode, so there is no
-                // state and no delta over it. Say so and leave the subscriber
-                // uncaught-up: an empty delta would tell it it is at the head of a
-                // stream it holds none of, and it would then edit from an empty
-                // document.
+                // Part of the base this subscriber needs is not reachable here — an
+                // owned base that does not decode, or a shared base `main`'s
+                // compaction floor has passed, the latter only for a subscriber below
+                // both the floor and its own fork point — so there is no state and no
+                // delta over it. Say so and leave the subscriber uncaught-up: a short
+                // delta would tell it it is at the head of a stream it holds only the
+                // divergent tail of, and it would then edit from there.
                 Catchup::Unavailable => {
                     return Response {
                         replies: vec![Message::Error {
