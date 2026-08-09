@@ -528,12 +528,20 @@ fn a_version_the_client_just_created_is_found_when_it_asks_for_it() {
     );
 
     // She fetches it back on the channel she still holds here. The read follows the
-    // mutation rather than answering from a set that never had it.
+    // mutation rather than answering from a set that never had it — and where it is
+    // sent, the version is there.
     assert!(follower.deliver(alice_here, fetch(b"v2")));
     assert_eq!(
         follower.take_outbox(alice_here),
         redirect_to_a(&room),
         "the read answered from an index the client's own mutation never reached",
+    );
+
+    assert!(leader.deliver(alice_there, fetch(b"v2")));
+    let out = leader.take_outbox(alice_there);
+    assert!(
+        served_state(&out).is_some(),
+        "the node the read is sent to does not have the version either: {out:?}",
     );
 }
 

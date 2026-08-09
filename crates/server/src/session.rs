@@ -1075,14 +1075,16 @@ pub fn step(
         // The whole sub-protocol is served by the room's leader; on a non-leader
         // every frame of it is redirected. A mutation persists to the room, so —
         // like an ops write — a follower that served it would diverge the room's
-        // versions. A *read* is the leader's for two reasons of its own. A room's
-        // version index is node-local — replication carries the room's log, never
-        // its captures — so a replica answers about its own captures rather than
-        // the room's. And a fetch answers with captured bytes projected through the
-        // doc-ACL records the answering node holds, which ride the log like any
-        // other op: only the leader's are the room's current authority, and nothing
-        // a replica can read tells a caught-up one from one a committed revoke has
-        // just passed by (C33).
+        // versions. A *read* follows the mutation because a version index is **per
+        // node**: replication carries the room's log and never its captures, so a
+        // node answers about the captures it took, and a read answered anywhere but
+        // where the mutations land reports on a different set from the one the
+        // client's own mutations built. Routing it there also puts it on the
+        // freshest `acl_records` a fetch redacts by — those tuples ride the log, so
+        // a replica's are as old as its last replicated commit — which is a
+        // consequence worth having rather than the reason: the live stream that
+        // node serves beside it is behind by the same records at the same instant
+        // (C33).
         Message::VersionCreate { channel, name } => {
             let Some(room) = bound_room(session, channel) else {
                 return channel_request_denied(session, channel, "version");
@@ -1387,9 +1389,10 @@ pub fn step(
             let Some(room) = bound_room(session, channel) else {
                 return channel_request_denied(session, channel, "diff");
             };
-            // A **version** diff is two of this room's captures put through the same
-            // projection a fetch runs, so it is the leader's on the same terms — the
-            // index is node-local and the redaction is by log-borne records (C33). A
+            // A **version** diff names two of this room's captures and puts them
+            // through the projection a fetch runs, so it is the leader's on the same
+            // terms — the index is per node, so only the node the captures land on
+            // can resolve the names at all (C33). A
             // **branch** diff is not routed here: what a replica may answer about a
             // branch, and whether one unservable side refuses the whole query, is
             // C103's question and its own unit's to rule on.
@@ -2300,11 +2303,10 @@ fn redirect_if_not_leader(membership: Option<&Membership>, room: &[u8]) -> Optio
 /// to its leader — or `None` to serve the request as usual. The gate every request
 /// the leader alone answers shares: the room-serving *writes* (an ops write, a
 /// durable version or branch mutation), so a follower never ingests or persists a
-/// room it does not lead; and a **version read**, whose answer a replica cannot
-/// give for the room rather than for itself (the version index is node-local, and a
-/// fetch redacts by log-borne doc-ACL records only the leader holds current). A
-/// live room read uses [`read_redirect_response`] instead, which lets a caught-up
-/// follower serve under a client-named floor.
+/// room it does not lead; and a **version read**, which follows its mutations
+/// because a version index is per node, so a node answers only about the captures
+/// it took. A live room read uses [`read_redirect_response`] instead, which lets a
+/// caught-up follower serve under a client-named floor.
 fn redirect_response(membership: Option<&Membership>, room: &[u8]) -> Option<Response> {
     redirect_if_not_leader(membership, room).map(|redirect| Response {
         replies: vec![redirect],
