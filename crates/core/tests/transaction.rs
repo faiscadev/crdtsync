@@ -1069,6 +1069,27 @@ fn a_disagreeing_bucket_releases_what_it_holds_the_moment_it_disagrees() {
 }
 
 #[test]
+fn a_bucket_reads_no_size_off_the_member_it_happens_to_hold_first() {
+    // Spending a disagreeing bucket's key does not make it safe to read the size
+    // off one member: which member the buffer holds first is the delivery order's,
+    // so a size read there decides the group's fate by arrival order and not by
+    // what its members say. A two-member group with one member rewritten *larger*
+    // separates the two rules where a smaller rewrite cannot — read off the
+    // rewritten member the bucket is short of its size and waits, read off the
+    // honest one it is at its size and commits, so the two orders part company.
+    // The bucket names no size at all, both orders spend the key, and both land
+    // the pair.
+    let (a, ops) = pair();
+    let id = tx_id(&ops[0]);
+    let forged = [retagged(&ops[0], id, 3), ops[1].clone()];
+
+    let b = one_state_in_every_order(&forged);
+    for key in [&b"x"[..], b"y"] {
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
+    }
+}
+
+#[test]
 fn a_bucket_whose_members_disagree_on_the_size_spends_its_key() {
     // The disagreement arriving last is the other half: the bucket is at its
     // declared size in members and names no group, so the arrival that

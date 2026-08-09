@@ -3624,10 +3624,11 @@ impl Document {
                 self.apply_now(&op);
                 progressed = true;
             }
-            // The buckets are read once per pass and used by both group rules, so
+            // The buckets are read once per pass and handed to both group rules, so
             // spending a key and committing a group cannot disagree about what the
-            // buffer holds. Spending untags members, which is what makes the map
-            // stale, so a pass that spends one leaves the commit to the next.
+            // buffer holds. Spending untags members, which leaves the map describing
+            // tags the buffer no longer carries; a pass that spends one therefore
+            // leaves the commit to the next rather than reasoning about that.
             let groups = self.tx_buckets();
             if self.resolve_disagreeing_tx(&groups) {
                 progressed = true;
