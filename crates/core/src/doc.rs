@@ -29,7 +29,7 @@ use crate::elementid::{ElementId, ElementKind};
 use crate::list::{Anchor, List, Side};
 use crate::map::{DecodedMap, Map, SlotValue};
 use crate::marks::{MarkState, ResolvedMark};
-use crate::op::{Op, OpId, OpKind, Tx, TxId, MAX_TX_MEMBERS};
+use crate::op::{span, Op, OpId, OpKind, Tx, TxId, MAX_TX_MEMBERS};
 use crate::ranged::{RangeAnchor, RangedElement, RangedInit, RangedPayload};
 use crate::repair::{keyed_repairs, Repair, RepairId};
 use crate::scalar::Scalar;
@@ -79,7 +79,7 @@ const ROOT_ID: [u8; 16] = *b"crdtsync\0\0\0\0root";
 
 /// The snapshot format version: a reader rejects any stream not stamped with it,
 /// so a format change can never be misread as the current one.
-const STATE_VERSION: u8 = 14;
+const STATE_VERSION: u8 = 15;
 
 /// A composite that a mutation displaced from its slot. Reported wherever the
 /// displacement happens, a hidden subtree included: an op addressed to a retained
@@ -280,6 +280,31 @@ pub struct Document {
     /// returned per edit, so several edits commit as one group.
     atomic: Option<Vec<Op>>,
     seen: HashSet<OpId>,
+    /// Ids this replica published that it does not hold — what a redacted catch-up
+    /// delta withheld from it, named by the frame that leads the delta
+    /// ([`note_published`](Document::note_published)). Every entry is under this
+    /// replica's own identity, and the set is disjoint from `seen` and `buffered`.
+    ///
+    /// Read by the mint and by nothing else. **A third set rather than the dedup
+    /// set**, because the ops behind these ids are ops the room's log still holds:
+    /// a widened read grant or a resumed subscription can deliver them, and an id
+    /// in `seen` would drop them as replays — leaving the recipient the one author
+    /// whose own content it never gets back. Measured, not assumed: naming the run
+    /// in `seen` cost exactly that on a resume, while another author's write into
+    /// the same subtree folded normally.
+    ///
+    /// **And durable rather than in-memory**, which is the other half of the cost
+    /// this set carries. It rides `encode_state` for the reason `seen` does — it is
+    /// the mint's evidence about its own run — and without that a replica that
+    /// persists its state and reloads comes back holding the hole a redacted
+    /// catch-up left in it. That path is shipped surface, not a hypothetical: the
+    /// SDKs expose the document snapshot (`crdtsync_doc_encode_state`) and the
+    /// channel's cursor (`crdtsync_client_last_seen_seq`), so an app can restore
+    /// both and resume above its own withheld ops, where no later frame names them
+    /// again. The price is a `STATE_VERSION` bump and a decode-time disjointness
+    /// rule against `seen` and `buffered`; the alternative is the original defect
+    /// surviving on that path.
+    reserved: HashSet<OpId>,
     /// Ops the current state cannot express, held until it can: a target whose
     /// create is unseen, a delete whose nodes are absent, a member of an incomplete
     /// atomic group ([`ready`](Self::ready)).
@@ -403,6 +428,7 @@ impl Document {
             seq: 0,
             atomic: None,
             seen: HashSet::new(),
+            reserved: HashSet::new(),
             buffer: Vec::new(),
             buffered: HashSet::new(),
             resolved_tx: HashSet::new(),
@@ -1270,6 +1296,18 @@ impl Document {
             put_u64(&mut out, op.seq);
         }
 
+        // The ids this replica published and does not hold. As durable as the dedup
+        // set beside it and for the same reason: they are the mint's evidence about
+        // its own run, and a replica that persists its state and reloads would
+        // otherwise come back with the hole a redacted catch-up left in it. Written
+        // as sequences under one client, since every entry is this replica's own.
+        let mut reserved: Vec<u64> = self.reserved.iter().map(|id| id.seq).collect();
+        reserved.sort_unstable();
+        put_u32(&mut out, len_u32(reserved.len()));
+        for seq in reserved {
+            put_u64(&mut out, seq);
+        }
+
         // The group keys whose bucket has resolved, key-sorted for a deterministic
         // encoding. A stray of a group resolved before a restart has to land at the
         // restored replica too, so the record is as durable as the buffer it rules.
@@ -1917,6 +1955,17 @@ impl Document {
             .into_iter()
             .filter(|id| !self.buffered.contains(id))
             .collect();
+        // Reservations are ids under the *projecting* replica's identity, and a
+        // projection is served to another. What the recipient published is what the
+        // frontier above now carries, so the projector's own run goes with the rest
+        // of its authorship. Inert today and stated rather than relied on: a
+        // reservation is only ever installed by [`note_published`](Self::note_published),
+        // which only a client session's inbound frame reaches, and the documents a
+        // projection runs on are all server-side — a room replica, or an archived
+        // state one encoded. The recipient's own protection is
+        // [`adopt_as`](Self::adopt_as), which clears them as it takes the snapshot
+        // over, and that one is on a live path.
+        self.reserved.clear();
     }
 
     /// Cut the id-space high-water back to the recipient's own entry plus whatever
@@ -2129,7 +2178,10 @@ impl Document {
     /// unreachable target sits in the buffer with its id out of `seen`, and it is
     /// as published as any other — the room's log holds it, and a re-mint of its
     /// id would leave the replica applying two different ops under one identity
-    /// once the buffer drains.
+    /// once the buffer drains. Published, not merely held: an op a redacted
+    /// catch-up withheld is in neither set and the room's log holds it all the
+    /// same, so the sequences such a frame names
+    /// ([`note_published`](Self::note_published)) are walked here too.
     ///
     /// The search wraps at the end of the space rather than stopping there. A
     /// sequence space is a finite *set*, not a ladder, and what a replica holds is
@@ -2141,17 +2193,83 @@ impl Document {
     /// costs a few wrapped steps, not a replica that re-issues one id forever.
     fn free_seq(&self, from: u64) -> u64 {
         let mut seq = from;
-        for _ in 0..self.seen.len() + self.buffered.len() {
+        for _ in 0..self.seen.len() + self.buffered.len() + self.reserved.len() {
             let id = OpId {
                 client: self.client,
                 seq,
             };
-            if !self.seen.contains(&id) && !self.buffered.contains(&id) {
+            if !self.seen.contains(&id)
+                && !self.buffered.contains(&id)
+                && !self.reserved.contains(&id)
+            {
                 return seq;
             }
             seq = seq.wrapping_add(1);
         }
         seq
+    }
+
+    /// Record what a redacted catch-up delta withheld of this replica's own run:
+    /// `seqs`, the per-client sequences it did not carry, and `reach`, the highest
+    /// id-space position the ops behind them occupy.
+    ///
+    /// **A mint has two inputs and this closes both.** The sequence comes from
+    /// [`free_seq`](Self::free_seq)'s walk over the ids the replica holds; the
+    /// lamport position comes from [`mint_floor`](Self::mint_floor), which reads
+    /// this replica's own entry in the id-space record. A per-op read filter is
+    /// authorship-blind — it withholds an op the recipient itself wrote into a
+    /// subtree the recipient may no longer read — so folding such a delta leaves a
+    /// hole in *both*. The sequence hole loses the next write to a peer's dedup set;
+    /// the lamport hole re-derives every id taken from a stamp alone (an ACL
+    /// tuple's, a ranged element's, an XML sequence child's), so the next such
+    /// element takes an id the room already binds and is swallowed at ingest just as
+    /// silently.
+    ///
+    /// Naming them closes the run without materialising the ops, which is the point:
+    /// their targets and content name the structure the redaction withholds.
+    ///
+    /// Each sequence is taken under *this* replica's identity, so a frame can only
+    /// ever reach the id space its recipient already authors in. `reach` moves this
+    /// replica's own entry and no other's, through
+    /// [`record_stamp`](Self::record_stamp) itself, so it reaches the same states an
+    /// op carrying this replica's id already reaches, under the same
+    /// [`LAMPORT_STATE_CEILING`]: an op stamped *at* the ceiling parks the mint
+    /// there too (C23's shape), so the frame buys no state an op cannot.
+    ///
+    /// One asymmetry, stated rather than elided: an out-of-range **stamp** is
+    /// refused on the way in ([`stamp_occupies_a_mintable_position`]), while an
+    /// out-of-range `reach` is *clamped* here — so junk in a frame folds to the
+    /// worst legal position where junk in an op is dropped. That is a real cost of
+    /// a wire number feeding a floor, and this seam is the only refusal it gets.
+    ///
+    /// A sequence the replica already holds — applied or buffered — is skipped: it
+    /// already blocks the mint, and the three sets stay disjoint, which the state
+    /// encoding requires. A reservation is not a refusal: `apply` clears it when the
+    /// op behind it is finally delivered, so a widened grant or a resumed
+    /// subscription still folds what the redaction withheld.
+    pub fn note_published(&mut self, seqs: &[u64], reach: u64) {
+        for &seq in seqs {
+            let id = OpId {
+                client: self.client,
+                seq,
+            };
+            if !self.seen.contains(&id) && !self.buffered.contains(&id) {
+                self.reserved.insert(id);
+            }
+        }
+        // Recorded through the same seam a folded op's stamp takes, so the two
+        // cannot drift: one position, held to the ceiling here because this seam is
+        // the refusal — a wire value has no earlier gate to have been through, where
+        // an op's stamp is refused on the way in
+        // ([`stamp_occupies_a_mintable_position`]).
+        self.record_stamp(
+            Stamp {
+                client: self.client,
+                lamport: reach.min(LAMPORT_STATE_CEILING),
+                offset: 0,
+            },
+            1,
+        );
     }
 
     /// The current lamport high-water of a replication partition: the root clock
@@ -2196,6 +2314,12 @@ impl Document {
     pub fn adopt_as(&mut self, client: ClientId, next_seq: u64) {
         self.client = client;
         self.seq = next_seq;
+        // The reservations belong to whoever encoded the snapshot, not to the
+        // replica taking it over — they are ids under *that* identity, and the
+        // adopter's own run is what the snapshot's frontier carries (a projection
+        // cuts it back to exactly that). Carrying them across would reserve
+        // sequences in the adopter's space that nothing published.
+        self.reserved.clear();
     }
 
     fn read_state(cur: &mut Cursor) -> Result<Document, DecodeError> {
@@ -2526,6 +2650,24 @@ impl Document {
             }
         }
 
+        // The published-but-unheld run, under this document's own client. It has to
+        // stay disjoint from the dedup set: an id in both would be reserved forever,
+        // since `apply` clears a reservation only on an op the dedup set admits.
+        let reserved_count = cur.u32()?;
+        let mut reserved = HashSet::with_capacity((reserved_count as usize).min(1024));
+        for _ in 0..reserved_count {
+            let op = OpId {
+                client,
+                seq: cur.u64()?,
+            };
+            if seen.contains(&op) || !reserved.insert(op) {
+                return Err(DecodeError::BadTag {
+                    what: "document: reserved op already applied or repeated",
+                    tag: 0,
+                });
+            }
+        }
+
         let resolved_count = cur.u32()?;
         let mut resolved_tx = HashSet::with_capacity((resolved_count as usize).min(1024));
         for _ in 0..resolved_count {
@@ -2545,7 +2687,10 @@ impl Document {
         // `drain_buffer`, which dedups against neither: reject both.
         let mut buffered = HashSet::with_capacity(buffer.len().min(1024));
         for op in &buffer {
-            if seen.contains(&op.id) || !buffered.insert(op.id) {
+            // Reserved as well as applied: `apply` clears a reservation only on the
+            // path a held id short-circuits, so an id in both sets would keep its
+            // reservation for the life of the replica and cost it that sequence.
+            if seen.contains(&op.id) || reserved.contains(&op.id) || !buffered.insert(op.id) {
                 return Err(DecodeError::BadTag {
                     what: "document: buffered op already applied or repeated",
                     tag: 0,
@@ -2652,6 +2797,7 @@ impl Document {
             seq,
             atomic: None,
             seen,
+            reserved,
             buffer,
             buffered,
             resolved_tx,
@@ -3106,6 +3252,11 @@ impl Document {
             }
             return false;
         }
+        // The op behind a sequence a redaction named has arrived — a widened read
+        // grant, or a resume re-serving the window it was withheld from. It is
+        // about to be held or applied, so it stops being merely published: the
+        // reservation goes and the id it was standing in for takes over.
+        self.reserved.remove(&op.id);
         // A member of a group whose bucket has already resolved is a stray of a
         // spent key: it joins no bucket and merges standalone, so it is untagged
         // here and takes the ordinary path below.
@@ -6042,13 +6193,6 @@ fn stamp_occupies_a_mintable_position(op: &Op) -> bool {
 
 /// How many consecutive char_ids an op consumes from its stamp. A text run
 /// takes one per codepoint; every other op takes one.
-fn span(kind: &OpKind) -> u64 {
-    match kind {
-        OpKind::TextInsert { s, .. } => s.chars().count().max(1) as u64,
-        _ => 1,
-    }
-}
-
 /// The map key a container-create installs its child under, for a create keyed by a
 /// map slot — so the op's zone resolves at the child's path, not the parent's. A
 /// positional or keyless create (a list/XML positional child, a composite ranged

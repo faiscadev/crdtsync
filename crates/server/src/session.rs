@@ -760,8 +760,27 @@ pub fn step(
             } else {
                 hub.catch_up_branch(&room, &branch, last_seen_seq)
             };
-            let reply = match catchup {
+            // The replica identity this channel's catch-up is served to — what the
+            // recipient authors under, and so the one author whose published ids a
+            // redaction may hand back. Both seams need it: the snapshot keeps those
+            // ids in the frontier it otherwise scrubs, and the delta names the ones
+            // it withholds in the frame that leads it.
+            let recipient = session.client.map(|c| c.for_channel(channel.0));
+            let replies = match catchup {
                 Catchup::Ops(delta) => {
+                    // What this recipient published into the window the delta covers,
+                    // read before any filter narrows it: each op's sequence, in the
+                    // order the stream holds them — so the frame below is a function
+                    // of the log rather than of a set's iteration — beside the
+                    // id-space position it reserves. What survives to the frame is
+                    // subtracted below; the remainder is the hole the redaction
+                    // leaves in the recipient's own run, on both records the mint
+                    // reads.
+                    let published: Vec<(u64, u64)> = delta
+                        .iter()
+                        .filter(|rec| recipient.is_some_and(|c| rec.op.id.client == c))
+                        .map(|rec| (rec.op.id.seq, rec.op.reservation_end()))
+                        .collect();
                     // Replay only the ops this subscriber may read — the same
                     // per-path read authority the live fan-out applies, so a fresh
                     // partial reader catches up on exactly its granted subtrees. A
@@ -915,9 +934,44 @@ pub fn step(
                     let types = schema
                         .map(|s| hub.element_types(&room, s))
                         .unwrap_or_default();
-                    Message::Ops {
-                        channel,
-                        ops: catch_up_ops(registry, governing, session, delta, &types),
+                    let ops = catch_up_ops(registry, governing, session, delta, &types);
+                    // What the frame actually carries, measured on the frame — after
+                    // the read filter, the zone filter, and the version translation
+                    // alike, since each of the three can drop an op the recipient
+                    // wrote and none of them consults authorship.
+                    let served: HashSet<u64> = ops
+                        .iter()
+                        .filter(|op| recipient.is_some_and(|c| op.id.client == c))
+                        .map(|op| op.id.seq)
+                        .collect();
+                    let withheld: Vec<(u64, u64)> = published
+                        .into_iter()
+                        .filter(|(seq, _)| !served.contains(seq))
+                        .collect();
+                    // The id-space record moves as a floor, so the one position the
+                    // withheld ops reach furthest is the whole of what the recipient
+                    // cannot see; a delivered op restores its own reach by being
+                    // folded.
+                    let reach = withheld.iter().map(|(_, reach)| *reach).max().unwrap_or(0);
+                    let seqs: Vec<u64> = withheld.into_iter().map(|(seq, _)| seq).collect();
+                    // The frontier leads the delta. A provider opens the socket to
+                    // app traffic on a frame, so the other order leaves a window in
+                    // which an edit authors against a replica still holding the hole
+                    // — the failure this frame exists to remove. A delta that
+                    // withholds nothing of the recipient's own — every unredacted
+                    // catch-up — sends no frame at all.
+                    let ops = Message::Ops { channel, ops };
+                    if seqs.is_empty() {
+                        vec![ops]
+                    } else {
+                        vec![
+                            Message::Frontier {
+                                channel,
+                                seqs,
+                                reach,
+                            },
+                            ops,
+                        ]
                     }
                 }
                 // A snapshot is the whole materialized replica. A whole-document reader
@@ -931,10 +985,6 @@ pub fn step(
                 // The subscribe gate already refused a reader with no read grant at all,
                 // so a partial reader here holds read on at least one subtree.
                 Catchup::Snapshot { seq, state } => {
-                    // The replica identity this channel's snapshot is served to — what
-                    // the recipient authors under, and so the one author whose ids the
-                    // projections keep in the frontier they otherwise scrub.
-                    let recipient = session.client.map(|c| c.for_channel(channel.0));
                     // The whole-document gate resolves element-scoped grants against the
                     // tree it is deciding for, and `index` is that tree: this snapshot is
                     // the stream's own state — the live room on `main`, a branch's base
@@ -954,7 +1004,7 @@ pub fn step(
                         &zones,
                         recipient,
                     );
-                    Message::Snapshot {
+                    vec![Message::Snapshot {
                         channel,
                         // The state is the stream's whole head, projected to this
                         // reader's partitions; the sequence it is tagged with is
@@ -972,7 +1022,7 @@ pub fn step(
                         state: catch_up_snapshot(
                             registry, governing, session, high_water, state, schema,
                         ),
-                    }
+                    }]
                 }
                 // The branch owns a base this node cannot decode, so there is no
                 // state and no delta over it. Say so and leave the subscriber
@@ -992,7 +1042,7 @@ pub fn step(
             };
             // After the catch-up, replay the room's current presence so the
             // joiner sees who is already here without waiting for a republish.
-            let mut replies = vec![reply];
+            let mut replies = replies;
             for (actor, key, value) in hub.awareness_entries(&room) {
                 replies.push(Message::AwarenessUpdate {
                     channel,
@@ -1057,6 +1107,11 @@ pub fn step(
         // A token grant only travels server-to-client.
         Message::CrossZoneTokenGrant { .. } => violation("client sent a cross-zone token grant"),
         Message::Snapshot { .. } => violation("client sent a snapshot"),
+        // A catch-up delta's frontier is the server's own account of what it
+        // withheld; a client that sends one is claiming sequences into a replica's
+        // id space, which would drive that replica's mint past ids no room's log
+        // binds.
+        Message::Frontier { .. } => violation("client sent a frontier"),
         Message::Error { .. } => violation("client sent an error"),
         Message::AuthOk { .. } => violation("client sent an authok"),
         Message::SchemaAdvert { .. } => violation("client sent a schema advert"),

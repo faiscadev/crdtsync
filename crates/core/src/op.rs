@@ -325,6 +325,26 @@ impl Op {
             zone: None,
         }
     }
+
+    /// The last id-space position this op's stamp reserves — its lamport plus the
+    /// run it occupies, since a text insert reserves one position per codepoint.
+    ///
+    /// The figure a replica records against its author's id-space high-water when it
+    /// folds the op, so a seam that must account for an op it is *not* delivering
+    /// reports the same number the fold would have
+    /// (`Document::note_published`).
+    pub fn reservation_end(&self) -> u64 {
+        self.stamp.lamport.saturating_add(span(&self.kind) - 1)
+    }
+}
+
+/// How many id-space positions an op of this kind reserves from its stamp: one,
+/// except a text insert, which takes one per codepoint of the run it carries.
+pub(crate) fn span(kind: &OpKind) -> u64 {
+    match kind {
+        OpKind::TextInsert { s, .. } => s.chars().count().max(1) as u64,
+        _ => 1,
+    }
 }
 
 /// The atomic groups that withholding `dropped` splits — one `(author, group id)`

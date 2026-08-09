@@ -780,6 +780,25 @@ impl ClientSession {
                 room.last_seen_seq += count;
                 Ok(())
             }
+            // What the delta behind this frame withholds of this channel's own run:
+            // the sequences it does not carry, and the id-space position their ops
+            // occupy. Recording them closes both holes the redaction leaves in this
+            // replica's run, so the next mint clears them instead of landing on ids
+            // the room's log already binds. Both resolve against the identity this
+            // channel authors under — never the session's, which differs on every
+            // channel past the first.
+            Message::Frontier {
+                channel,
+                seqs,
+                reach,
+            } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
+                room.doc.note_published(&seqs, reach);
+                Ok(())
+            }
             Message::Snapshot {
                 channel,
                 seq,

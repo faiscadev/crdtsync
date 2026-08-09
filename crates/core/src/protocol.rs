@@ -269,6 +269,44 @@ pub enum Message {
         seq: u64,
         state: Vec<u8>,
     },
+    /// What `channel`'s catch-up delta withheld of the recipient's own run: `seqs`,
+    /// the per-client sequences it does not carry, and `reach`, the highest id-space
+    /// position the ops behind them occupy. The delta's counterpart of the causal
+    /// frontier and the id-space record a snapshot carries inside its state bytes.
+    ///
+    /// A catch-up delta is redacted per recipient and the filters are
+    /// authorship-blind: an op the recipient wrote into a subtree it may no longer
+    /// read is withheld from it like anyone else's. A mint reads two records and the
+    /// redaction holes both. Walking the ids a replica holds gives a *sequence*, so
+    /// a recipient that persists its `ClientId` across a restart reports one below
+    /// ids the room's log already binds and mints straight onto them. Reading its
+    /// own id-space high-water gives a *lamport position*, and every id derived from
+    /// a stamp alone — an ACL tuple's, a ranged element's, an XML sequence child's —
+    /// re-derives from a position the withheld ops already occupy. Both losses are
+    /// the same one: a write dropped at every peer's dedup set, with nothing
+    /// downstream able to detect it.
+    ///
+    /// Sequences, not `OpId`s: every one names the recipient's own replica, so the
+    /// client resolves them against the identity `channel` authors under — the same
+    /// resolution [`OpsRejected`](Message::OpsRejected) does. No other replica's id
+    /// space is representable here, so the "only the recipient's own" rule the
+    /// redaction rests on is a property of the frame rather than a check on it, and
+    /// `reach` moves that one entry under the ceiling every folded stamp is held to.
+    ///
+    /// Naming a sequence is not refusing its op: the recipient reserves it for the
+    /// mint and still folds the op if a widened grant or a resumed subscription
+    /// delivers it.
+    ///
+    /// The frame **leads** the delta it answers for: a provider opens the socket to
+    /// app traffic on a frame, so the other order leaves a window in which an edit
+    /// authors against a replica still holding the hole.
+    ///
+    /// Server-directed; a client that sends one commits a protocol violation.
+    Frontier {
+        channel: Channel,
+        seqs: Vec<u64>,
+        reach: u64,
+    },
     /// Acknowledges an author's durably-logged ops on `channel`: `through` is the
     /// highest per-client op sequence (`OpId.seq`) the server has committed for
     /// this client, so the author drains its outbox up to it. Sent to the author
@@ -736,6 +774,22 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u64(&mut out, *seq);
             put_bytes(&mut out, state);
         }
+        Message::Frontier {
+            channel,
+            seqs,
+            reach,
+        } => {
+            put_u8(&mut out, 54);
+            put_u32(&mut out, channel.0);
+            put_u64(&mut out, *reach);
+            put_u32(
+                &mut out,
+                u32::try_from(seqs.len()).expect("withheld sequence count exceeds u32"),
+            );
+            for seq in seqs {
+                put_u64(&mut out, *seq);
+            }
+        }
         Message::Unsubscribe { channel } => {
             put_u8(&mut out, 5);
             put_u32(&mut out, channel.0);
@@ -1172,6 +1226,23 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 channel,
                 seq,
                 state,
+            }
+        }
+        54 => {
+            let channel = Channel(cur.u32()?);
+            let reach = cur.u64()?;
+            let count = cur.u32()?;
+            // Grow as sequences are read rather than trusting `count` to size the
+            // allocation — a bogus count then fails on the missing bytes, not on a
+            // giant up-front reservation.
+            let mut seqs = Vec::new();
+            for _ in 0..count {
+                seqs.push(cur.u64()?);
+            }
+            Message::Frontier {
+                channel,
+                seqs,
+                reach,
             }
         }
         5 => Message::Unsubscribe {

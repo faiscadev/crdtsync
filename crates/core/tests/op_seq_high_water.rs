@@ -17,8 +17,18 @@
 //! write primitive on the counter: one op carrying this replica's own id at
 //! `u64::MAX` pins it at the ceiling, and the next ordinary local edit overflows
 //! — a panic in debug, a wrap into already-published ids in release. A search
-//! over the ids already in memory takes nothing off the wire: a forged frame
-//! contributes one held id, which costs one step.
+//! over the ids already in memory takes no number off the wire *for the sequence*:
+//! what a frame contributes there is ids, one search step each, never a position
+//! the counter adopts. The **lamport** half is not that shape and the distinction
+//! is worth keeping straight — `Message::Frontier`'s `reach` is a wire number that
+//! lands in this replica's id-space high-water and is read as the mint floor. It
+//! buys nothing an op carrying this replica's id does not already buy, under the
+//! same ceiling, which is the claim that carries it — not "no number reaches the
+//! mint", which is false of that half.
+//! A forged op contributes one. The frame naming what a redacted delta withheld
+//! (`Message::Frontier`) contributes one per sequence it names — so it buys held
+//! ids at a higher density per wire byte than ops do, bounded by the frame itself
+//! and by nothing else, and that cost is stated rather than claimed away.
 //!
 //! Held, not merely applied — an op waiting on its transaction group sits in the
 //! buffer with its id out of the dedup set, and the room's log holds it all the
@@ -35,6 +45,7 @@
 use std::collections::HashSet;
 
 use crdtsync_core::client::ClientSession;
+use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, Message, Op, OpId, Scalar};
 
 mod common;
@@ -513,4 +524,590 @@ fn a_forged_catch_up_frame_leaves_a_session_minting_ordinarily() {
         panic!("expected an Ops frame");
     };
     assert_eq!(seqs(&ops), vec![0]);
+}
+
+// --- the redacted delta: the ids a frame withholds, named by the frame ahead of it ---
+
+#[test]
+fn a_noted_sequence_is_not_a_free_id() {
+    // The redaction's shape: the room's log holds seqs 0 and 1 on a path this
+    // replica may no longer read, so the delta carries neither. Named, they are as
+    // taken as an applied id.
+    let mut doc = Document::new(cid(1));
+    doc.apply(&op_at_seq(cid(1), b"shown", 2));
+    assert_eq!(doc.next_seq(), 0, "the hole is where the redaction left it");
+
+    doc.note_published(&[0, 1], 0);
+    assert_eq!(doc.next_seq(), 3);
+    assert_eq!(
+        seqs(&doc.transact(|tx| tx.set(b"after", Scalar::Int(9)))),
+        vec![3],
+        "minted into an id the room's log already holds"
+    );
+}
+
+#[test]
+fn a_noted_sequence_leaves_the_gaps_around_it_free() {
+    // Naming ids is not a high-water either: a sequence the room never kept stays
+    // mintable whichever side of a named one it falls.
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&[1, 4], 0);
+    let mut minted = Vec::new();
+    for i in 0..4 {
+        let key = format!("k{i}").into_bytes();
+        minted.extend(doc.transact(|tx| tx.set(&key, Scalar::Int(i))));
+    }
+    assert_eq!(seqs(&minted), vec![0, 2, 3, 5]);
+}
+
+#[test]
+fn a_noted_ceiling_sequence_does_not_move_the_counter() {
+    // The carrier takes sequences off the wire, so it has to obey what the whole
+    // position obeys: one named sequence is one held id and one step of the
+    // search, never a number the counter adopts. A frame naming the ceiling costs
+    // a replica with no durable run nothing.
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&[u64::MAX], 0);
+    assert_eq!(
+        doc.next_seq(),
+        0,
+        "the named seq was adopted as a high-water"
+    );
+    assert_eq!(
+        seqs(&doc.transact(|tx| tx.set(b"x", Scalar::Int(1)))),
+        vec![0]
+    );
+}
+
+#[test]
+fn a_noted_sequence_the_buffer_is_holding_leaves_the_state_encodable() {
+    // The dedup set and the buffer are disjoint by construction — the state
+    // encoding refuses a document whose id appears in both — and a delta split
+    // across frames can name a sequence whose op is already waiting on its group.
+    let mut author = Document::new(cid(1));
+    let group = author.atomic_transact(|tx| {
+        tx.set(b"x", Scalar::Int(1));
+        tx.set(b"y", Scalar::Int(2));
+    });
+    let mut doc = Document::new(cid(1));
+    doc.apply(&group[0]);
+
+    assert_eq!(
+        doc.next_seq(),
+        1,
+        "the buffered id blocks the mint on its own"
+    );
+    doc.note_published(&[group[0].id.seq, group[1].id.seq], 0);
+    assert_eq!(
+        doc.next_seq(),
+        2,
+        "naming a run the buffer half-holds left a hole in it"
+    );
+    Document::decode_state(&doc.encode_state())
+        .expect("a noted id the buffer holds left the state undecodable");
+}
+
+#[test]
+fn noting_a_sequence_reaches_no_other_replicas_run() {
+    // The frame carries sequences, not ids, so it resolves in exactly one id
+    // space: the replica's own. A peer's counter is untouched by anything this
+    // replica is told.
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&[0, 1, 2], 0);
+
+    let mut peer = Document::new(cid(2));
+    peer.note_published(&[0, 1, 2], 0);
+    assert_eq!(doc.next_seq(), 3);
+    assert_eq!(peer.next_seq(), 3);
+
+    // What `doc` was told about its own run says nothing about what `peer` may
+    // mint, and the ids stay distinct across the two.
+    let a = doc.transact(|tx| tx.set(b"a", Scalar::Int(1)));
+    let b = peer.transact(|tx| tx.set(b"b", Scalar::Int(2)));
+    assert_ne!(a[0].id, b[0].id);
+}
+
+#[test]
+fn a_noted_run_survives_a_snapshot_round_trip() {
+    // A replica that persists its own state must not lose the hole's repair with
+    // it: the named ids ride the dedup set, which the encoding carries.
+    let mut doc = Document::new(cid(1));
+    doc.apply(&op_at_seq(cid(1), b"shown", 2));
+    doc.note_published(&[0, 1], 0);
+
+    let back = Document::decode_state(&doc.encode_state()).expect("decodes");
+    assert_eq!(back.next_seq(), 3);
+}
+
+#[test]
+fn a_session_told_what_its_delta_withheld_mints_past_it() {
+    // The wire shape end to end: the delta carries the one op on a readable path,
+    // the frame ahead of it names the two it withheld, and the session's next edit
+    // clears all three.
+    let mut session = ClientSession::new(cid(1));
+    let (channel, _) = session.subscribe(ROOM).unwrap();
+    session
+        .receive(Message::Frontier {
+            channel,
+            seqs: vec![0, 1],
+            reach: 0,
+        })
+        .expect("the frontier applies");
+    session
+        .receive(Message::Ops {
+            channel,
+            ops: vec![op_at_seq(cid(1), b"shown", 2)],
+        })
+        .expect("the delta applies");
+
+    let sent = session
+        .edit(channel, |tx| tx.set(b"after", Scalar::Int(9)))
+        .expect("channel held");
+    let Message::Ops { ops, .. } = sent else {
+        panic!("expected an Ops frame");
+    };
+    assert_eq!(
+        seqs(&ops),
+        vec![3],
+        "the session re-minted an id the redaction withheld"
+    );
+}
+
+#[test]
+fn a_frontier_for_an_unheld_channel_is_refused() {
+    let mut session = ClientSession::new(cid(1));
+    let channel = Channel(7);
+    assert!(session
+        .receive(Message::Frontier {
+            channel,
+            seqs: vec![0],
+            reach: 0,
+        })
+        .is_err());
+}
+
+#[test]
+fn a_frontier_resolves_against_the_channels_own_identity() {
+    // A session past its first subscription authors under a derived identity, so
+    // the sequences it is told resolve in *that* replica's space — the connection's
+    // own id answers only for channel 0.
+    let mut session = ClientSession::new(cid(1));
+    let (first, _) = session.subscribe(ROOM).unwrap();
+    let (second, _) = session.subscribe(ROOM).unwrap();
+    assert_ne!(
+        session.document(second).expect("held").client(),
+        session.document(first).expect("held").client(),
+    );
+
+    session
+        .receive(Message::Frontier {
+            channel: second,
+            seqs: vec![0, 1],
+            reach: 0,
+        })
+        .expect("the frontier applies");
+    assert_eq!(session.document(second).expect("held").next_seq(), 2);
+    assert_eq!(
+        session.document(first).expect("held").next_seq(),
+        0,
+        "one channel's frontier moved another channel's replica",
+    );
+}
+
+// --- the id-space half: a mint reads two records, and a redaction holes both ---
+
+/// A schema with a text body, so a range can be anchored over it.
+const MARK_SCHEMA: &str = r#"{
+    "schema": "doc", "version": 1, "root": "Doc",
+    "types": { "Doc": { "kind": "map", "children": { "body": "Body" } }, "Body": { "kind": "text" } },
+    "marks": { "bold": { "flavor": "boolean" } }
+}"#;
+
+fn doc_with_body(client: ClientId) -> (Document, Vec<Op>) {
+    let mut d = Document::new(client);
+    d.set_schema(crdtsync_core::schema::Schema::parse(MARK_SCHEMA).unwrap());
+    let ops = d.transact(|tx| {
+        tx.text(b"body").insert(0, "hello");
+    });
+    (d, ops)
+}
+
+/// A restarted replica of `client`: the schema bound, and only the ops a redacted
+/// delta carried folded in.
+fn body_replica(client: ClientId, delivered: &[Op]) -> Document {
+    let mut d = Document::new(client);
+    d.set_schema(crdtsync_core::schema::Schema::parse(MARK_SCHEMA).unwrap());
+    for op in delivered {
+        d.apply(op);
+    }
+    d
+}
+
+/// A mark named `bold` over the whole body — an element whose id derives from the
+/// op's stamp alone.
+fn mark_body(d: &mut Document) -> Vec<Op> {
+    let text = match d.get(b"body") {
+        Some(Element::Text(t)) => t,
+        _ => panic!("no body text"),
+    };
+    let seq = text.borrow().id();
+    let start = crdtsync_core::ranged::RangeAnchor {
+        seq,
+        pos: text
+            .borrow()
+            .relative_position(0, crdtsync_core::list::Side::Right),
+    };
+    let end = crdtsync_core::ranged::RangeAnchor {
+        seq,
+        pos: text
+            .borrow()
+            .relative_position(5, crdtsync_core::list::Side::Left),
+    };
+    d.transact(|tx| {
+        tx.ranged().mark(b"bold", start, end, Scalar::Bool(true));
+    })
+}
+
+#[test]
+fn a_noted_reach_moves_the_id_space_floor_like_the_op_it_stands_in_for() {
+    // The frame's `reach` is the same primitive folding the op is: it moves this
+    // replica's own entry in the id-space record and nothing else, so a replica
+    // told the reach and one handed the ops mint from the same position.
+    let (_, durable) = authored(cid(1), 3);
+    let reach = durable
+        .iter()
+        .map(|op| op.reservation_end())
+        .max()
+        .expect("a run");
+
+    let mut folded = Document::new(cid(1));
+    for op in &durable {
+        folded.apply(op);
+    }
+    let mut told = Document::new(cid(1));
+    told.note_published(&seqs(&durable), reach);
+
+    assert_eq!(told.next_seq(), folded.next_seq());
+    assert_eq!(
+        told.transact(|tx| tx.set(b"x", Scalar::Int(1)))[0]
+            .stamp
+            .lamport,
+        folded.transact(|tx| tx.set(b"x", Scalar::Int(1)))[0]
+            .stamp
+            .lamport,
+        "a told reach and a folded op left different mint positions",
+    );
+}
+
+#[test]
+fn a_noted_reach_is_held_to_the_ceiling_a_folded_stamp_is() {
+    // A frame naming a position past the id space cannot install one the encoding
+    // would refuse to carry — the same clamp `record_stamp` applies on the way in.
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&[], u64::MAX);
+    Document::decode_state(&doc.encode_state())
+        .expect("a noted reach past the ceiling left the state undecodable");
+}
+
+#[test]
+fn a_withheld_stamp_named_only_by_its_sequence_re_derives_its_element_id() {
+    // The consequence the sequence half does not reach. A mark, an ACL tuple and an
+    // XML sequence child all take their id from the stamp alone, so a replica
+    // restored onto a position a withheld op already occupies derives an id the room
+    // already binds — and the room drops the second one, silently.
+    let (mut author, text) = doc_with_body(cid(1));
+    let withheld = mark_body(&mut author);
+
+    let mut room = Document::new(cid(9));
+    for op in text.iter().chain(withheld.iter()) {
+        room.apply(op);
+    }
+    assert_eq!(room.ranged_elements().len(), 1);
+
+    // The restart: the mark is on a path this reader may no longer read, so its
+    // delta carries the body and not the mark. Told only the sequences, it mints the
+    // next mark onto the position the withheld op holds.
+    let mut restored = body_replica(cid(1), &text);
+    restored.note_published(&seqs(&withheld), 0);
+    assert_eq!(
+        mark_body(&mut restored)[0].stamp.lamport,
+        withheld[0].stamp.lamport,
+        "the fixture no longer re-derives, so it measures nothing",
+    );
+
+    // Told both, the mark takes a position the withheld op does not hold, and lands.
+    let mut fixed = body_replica(cid(1), &text);
+    let reach = withheld
+        .iter()
+        .map(|op| op.reservation_end())
+        .max()
+        .expect("a withheld run");
+    fixed.note_published(&seqs(&withheld), reach);
+    for op in &mark_body(&mut fixed) {
+        room.apply(op);
+    }
+    assert_eq!(
+        room.ranged_elements().len(),
+        2,
+        "the post-restart mark was swallowed at ingest",
+    );
+}
+
+// --- a named sequence is not the op's grave: a later delivery still folds ---
+
+#[test]
+fn an_op_a_frontier_named_still_applies_when_it_is_delivered() {
+    // Naming the run must not put the ops in the dedup set. The room's log holds
+    // them, so a widened read grant or a resumed subscription can still deliver
+    // them — and the recipient would be the one author whose content it never got
+    // back if the name doubled as a refusal.
+    let (_, durable) = authored(cid(1), 3);
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&seqs(&durable), 0);
+    assert_eq!(doc.next_seq(), 3);
+    assert_eq!(scalar(&doc, b"k0"), None);
+
+    for op in &durable {
+        assert!(
+            doc.apply(op),
+            "an op named as withheld was dropped as a replay"
+        );
+    }
+    assert_eq!(scalar(&doc, b"k0"), Some(Scalar::Int(0)));
+    assert_eq!(
+        doc.next_seq(),
+        3,
+        "the run is still closed once the ops land"
+    );
+}
+
+#[test]
+fn a_named_run_survives_a_state_round_trip_and_still_admits_its_ops() {
+    // Both properties have to ride the encoding: a replica that persists its state
+    // and reloads keeps the repair, and keeps the ops behind it applicable.
+    let (_, durable) = authored(cid(1), 3);
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&seqs(&durable), 0);
+
+    let mut back = Document::decode_state(&doc.encode_state()).expect("decodes");
+    assert_eq!(back.next_seq(), 3);
+    for op in &durable {
+        assert!(back.apply(op), "a reloaded reservation refused its own op");
+    }
+    assert_eq!(scalar(&back, b"k2"), Some(Scalar::Int(2)));
+}
+
+#[test]
+fn a_sequence_the_same_delta_delivered_is_never_reserved_at_all() {
+    // The three sets stay disjoint, which the state encoding requires: a sequence
+    // the replica already holds is not reserved, whichever order the frames arrive
+    // in.
+    let (_, durable) = authored(cid(1), 2);
+    let mut doc = Document::new(cid(1));
+    for op in &durable {
+        doc.apply(op);
+    }
+    doc.note_published(&seqs(&durable), 0);
+    Document::decode_state(&doc.encode_state()).expect("a reservation overlapped the dedup set");
+    assert_eq!(doc.next_seq(), 2);
+}
+
+#[test]
+fn an_adopted_snapshot_carries_none_of_the_encoders_reservations() {
+    // A reservation is an id under the *encoding* replica's identity, so an adopter
+    // taking the snapshot over must not inherit it — its own run is what the
+    // snapshot's frontier carries.
+    let (_, durable) = authored(cid(1), 3);
+    let mut author = Document::new(cid(1));
+    author.note_published(&seqs(&durable), 0);
+    assert_eq!(author.next_seq(), 3);
+
+    let adopter = Document::decode_state_as(cid(2), 0, &author.encode_state()).expect("decodes");
+    assert_eq!(
+        adopter.next_seq(),
+        0,
+        "the adopter inherited reservations in an id space it never published in",
+    );
+}
+
+#[test]
+fn a_state_naming_one_id_as_both_reserved_and_buffered_is_refused() {
+    // The three sets are disjoint by construction at runtime — `apply` clears the
+    // reservation before the op is held — so a snapshot claiming otherwise did not
+    // come from a replica. Decoding it would strand the reservation for the life of
+    // the replica: a held id short-circuits `apply` before the clear, so the
+    // sequence would never come back.
+    let mut author = Document::new(cid(1));
+    let group = author.atomic_transact(|tx| {
+        tx.set(b"x", Scalar::Int(1));
+        tx.set(b"y", Scalar::Int(2));
+    });
+    let mut doc = Document::new(cid(1));
+    doc.apply(&group[0]);
+    // A distinctive reservation, so the one occurrence in the encoding is the one
+    // the patch below re-points.
+    const MARKER: u64 = 0xDEAD_BEEF_0BAD_F00D;
+    doc.note_published(&[MARKER], 0);
+    let bytes = doc.encode_state();
+    assert!(
+        Document::decode_state(&bytes).is_ok(),
+        "the honest document must decode",
+    );
+
+    // The reserved section is a `u32` count then one `u64` per sequence, following
+    // the dedup set. Re-point the one reservation at the buffered member's sequence.
+    let at = bytes
+        .windows(8)
+        .position(|w| w == MARKER.to_le_bytes())
+        .expect("the reserved sequence is in the encoding");
+    let mut forged = bytes.clone();
+    forged[at..at + 8].copy_from_slice(&group[0].id.seq.to_le_bytes());
+    assert!(
+        Document::decode_state(&forged).is_err(),
+        "a reservation over a buffered id decoded",
+    );
+}
+
+// --- the three sets stay disjoint through every transition, because the encoding
+//     writes a reservation as a bare sequence and reads it back under whatever
+//     client the document then names ---
+
+#[test]
+fn an_op_delivered_after_its_reservation_leaves_the_state_encodable() {
+    // `apply` clears the reservation as the op lands, and it has to: the id would
+    // otherwise sit in the dedup set *and* the reserved set, which `read_state`
+    // refuses — so a replica that folded a frontier, was later delivered the ops,
+    // and persisted itself would write a snapshot it cannot read back.
+    let (_, durable) = authored(cid(1), 3);
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&seqs(&durable), 0);
+    for op in &durable {
+        doc.apply(op);
+    }
+    assert_eq!(doc.next_seq(), 3);
+    Document::decode_state(&doc.encode_state())
+        .expect("a delivered op left its reservation standing");
+}
+
+#[test]
+fn an_adopting_replica_does_not_re_encode_the_encoders_reservations_as_its_own() {
+    // The encoding writes a reservation as a bare sequence, which is right only
+    // while every entry belongs to the document's own client — so the one place
+    // that changes the client has to clear them. Immediately after `adopt_as` a
+    // stale entry is inert (it is keyed on the *encoder's* id, which the mint no
+    // longer asks about); it becomes real on the next round trip, where the
+    // sequences are read back under the adopter's own identity.
+    let (_, durable) = authored(cid(1), 3);
+    let mut author = Document::new(cid(1));
+    author.note_published(&seqs(&durable), 0);
+
+    let adopter = Document::decode_state_as(cid(2), 0, &author.encode_state()).expect("decodes");
+    assert_eq!(adopter.next_seq(), 0);
+    let back = Document::decode_state(&adopter.encode_state()).expect("decodes");
+    assert_eq!(
+        back.next_seq(),
+        0,
+        "the adopter re-encoded the encoder's run as its own",
+    );
+}
+
+#[test]
+fn a_state_naming_one_id_as_both_reserved_and_applied_is_refused() {
+    // The dedup-set half of the same disjointness `read_state` enforces for the
+    // buffer: a reservation over an applied id is one `apply` can never clear,
+    // since the dedup check short-circuits ahead of it.
+    let (_, durable) = authored(cid(1), 1);
+    let mut doc = Document::new(cid(1));
+    doc.apply(&durable[0]);
+    const MARKER: u64 = 0xDEAD_BEEF_0BAD_F00D;
+    doc.note_published(&[MARKER], 0);
+    let bytes = doc.encode_state();
+    assert!(
+        Document::decode_state(&bytes).is_ok(),
+        "the honest document must decode",
+    );
+
+    let at = bytes
+        .windows(8)
+        .position(|w| w == MARKER.to_le_bytes())
+        .expect("the reserved sequence is in the encoding");
+    let mut forged = bytes.clone();
+    forged[at..at + 8].copy_from_slice(&durable[0].id.seq.to_le_bytes());
+    assert!(
+        Document::decode_state(&forged).is_err(),
+        "a reservation over an applied id decoded",
+    );
+}
+
+/// The body text as a string.
+fn body_text(d: &Document) -> String {
+    match d.get(b"body") {
+        Some(Element::Text(t)) => t.borrow().as_string(),
+        _ => panic!("no body text"),
+    }
+}
+
+#[test]
+fn a_withheld_text_run_reserves_one_position_per_codepoint() {
+    // `reservation_end` is the op's lamport plus the run it occupies, and a text
+    // insert is the one op kind whose run is longer than one — it takes an id per
+    // codepoint. A frame reporting the bare lamport leaves the recipient minting
+    // *inside* the withheld run, where the char ids it derives are ones the room
+    // already binds, and the insert is dropped at ingest exactly as a re-minted
+    // sequence is.
+    let (_, seed) = doc_with_body(cid(1));
+    let run = seed
+        .iter()
+        .find(|op| matches!(op.kind, crdtsync_core::OpKind::TextInsert { .. }))
+        .expect("the fixture writes a run");
+    assert_eq!(
+        run.reservation_end(),
+        run.stamp.lamport + 4,
+        "five codepoints reserve five positions",
+    );
+
+    let mut room = Document::new(cid(9));
+    for op in &seed {
+        room.apply(op);
+    }
+    // The restart: the run is on a path this reader may no longer read, so its
+    // delta carries the container and not the run.
+    let delivered: Vec<Op> = seed
+        .iter()
+        .filter(|op| !matches!(op.kind, crdtsync_core::OpKind::TextInsert { .. }))
+        .cloned()
+        .collect();
+
+    // Told the run's bare lamport, the replica mints inside it.
+    let mut bare = body_replica(cid(1), &delivered);
+    bare.note_published(&[run.id.seq], run.stamp.lamport);
+    let inside = bare.transact(|tx| tx.text(b"body").insert(0, "Z"));
+    assert!(
+        inside[0].stamp.lamport <= run.reservation_end(),
+        "the fixture no longer mints inside the run, so it measures nothing",
+    );
+
+    // Told the position the run reaches, it mints past it and the insert lands.
+    let mut fixed = body_replica(cid(1), &delivered);
+    fixed.note_published(&[run.id.seq], run.reservation_end());
+    let after = fixed.transact(|tx| tx.text(b"body").insert(0, "Z"));
+    assert!(
+        after[0].stamp.lamport > run.reservation_end(),
+        "minted onto a position the withheld run occupies",
+    );
+    for op in &after {
+        room.apply(op);
+    }
+    // Where the char lands is the anchor's business — the restored replica holds an
+    // empty body, so its insert anchors at the end. What matters is that it lands.
+    let body = body_text(&room);
+    assert_eq!(
+        body.chars().count(),
+        6,
+        "the post-restart insert was swallowed at ingest"
+    );
+    assert!(
+        body.contains('Z'),
+        "the post-restart insert was swallowed at ingest"
+    );
 }
