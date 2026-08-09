@@ -1956,11 +1956,15 @@ fn handle_ops(
     let mut root_established = false;
     let applied = if branch == MAIN_BRANCH {
         let applied = hub.ingest(&room, ops, write_version);
-        // The first authenticated actor to write a room establishes it, so it becomes
-        // the room's creator — the doc-ACL authority root that owns `/`. Set-once and
-        // authenticated-only, both decided by `ensure_creator` so a root arriving over
-        // a replication frame is judged by the same rule. A branch write presupposes
-        // an already-established (forked) room, so it never bootstraps a creator.
+        // The first authenticated actor to write a room that retains one establishes
+        // it, so it becomes the room's creator — the doc-ACL authority root that owns
+        // `/`. Every rule that decides it lives in `ensure_creator`, so a root arriving
+        // over a replication frame is judged by the same ones — including that a room
+        // at sequence zero has no root to give, which is what stops a no-op batch from
+        // reserving a document's authority here (C99): the ingest above materialises
+        // the room and answers `Ok` for an empty batch just as for a landed one. A
+        // branch write presupposes an already-established (forked) room, so it never
+        // bootstraps a creator.
         if applied.is_ok() {
             root_established = hub.ensure_creator(&room, identity.actor());
         }

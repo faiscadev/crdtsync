@@ -6,11 +6,12 @@
 //! absent on another, with nothing scheduled to close the gap:
 //!
 //! 1. **A root established by a write that broadcast nothing.** `ensure_creator` fires
-//!    on any `Ok` from `Hub::ingest`, a batch the room's dedup swallowed whole
-//!    included, while replication is enqueued only for a *non-empty* broadcast. A room
-//!    whose establishing commit was anonymous (root `None`, replicated as such) and
-//!    whose next authenticated write is a pure resend of ops the hub already holds
-//!    gains its root on the leader with no frame to carry it. The client reaches that
+//!    on any `Ok` from `Hub::ingest` at a room that retains a write (C99), a batch the
+//!    room's dedup swallowed whole included, while replication is enqueued only for a
+//!    *non-empty* broadcast. A room whose establishing commit was anonymous (root
+//!    `None`, replicated as such) and whose next authenticated write is a pure resend
+//!    of ops the hub already holds gains its root on the leader with no frame to carry
+//!    it. The client reaches that
 //!    state by *reconnecting*, not by authenticating in place: an anonymously-admitted
 //!    connection already holds an identity, so an in-band `Auth` on it is refused as a
 //!    protocol violation. It writes anonymously, reconnects under its credential with
@@ -711,22 +712,40 @@ fn a_re_rooted_replica_persists_the_root_it_was_handed() {
 
 #[test]
 fn a_room_that_reached_no_sequence_is_dialed_nothing() {
-    // A rooted room with no ops: an authenticated `Ops` frame carrying no ops roots
-    // one (C99's shape). No follower holds it — the frame creates no room and there
-    // is no delta to converge one — so a root sent here would be inert on every dial
-    // for the life of the room. It has no ACL tuples for a root to decide either.
+    // A rooted room with no ops. No follower holds it — the frame creates no room and
+    // there is no delta to converge one — so a root sent here would be inert on every
+    // dial for the life of the room. It has no ACL tuples for a root to decide either.
+    //
+    // No write establishes this state any more: a root stands only over a room that
+    // retains a write (C99). What still reaches it is a state transfer landing at
+    // sequence zero, which leaves the standing root alone rather than letting an empty
+    // state strip a room's authority.
     let room = room_led_by_a_with_b_next();
     let mut leader = node(A);
     let alice = hello_auth(&mut leader, 1, "t-alice");
     assert!(leader.deliver(alice, sub(&room)));
     leader.take_outbox(alice);
-    submit(&mut leader, alice, Vec::new());
+    let mut doc = Document::new(cid(1));
+    submit(
+        &mut leader,
+        alice,
+        doc.transact(|tx| tx.register(OPEN, Scalar::Int(1))),
+    );
     assert_eq!(
         leader.hub().room_creator(&room).as_deref(),
         Some(b"alice".as_slice()),
-        "the empty write roots the room",
+        "the write roots the room",
     );
-    assert_eq!(leader.hub().seq(&room), 0, "and lands no sequence");
+    leader
+        .hub_mut()
+        .install_snapshot(&room, &Document::new(cid(9)).encode_state(), 0, None)
+        .expect("the state decodes");
+    assert_eq!(leader.hub().seq(&room), 0, "and it now holds no sequence");
+    assert_eq!(
+        leader.hub().room_creator(&room).as_deref(),
+        Some(b"alice".as_slice()),
+        "with its root standing",
+    );
     leader.take_replication();
 
     leader.catch_up_follower(&NodeId::from_addr(B));

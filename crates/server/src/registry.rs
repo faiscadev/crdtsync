@@ -800,9 +800,11 @@ impl Registry {
                     // holds no such room and this frame does not create one, so the
                     // root would be re-sent inertly on every dial forever. A room
                     // with no ops also has no ACL tuples for a root to decide, so
-                    // there is nothing to repair. It is reachable — an authenticated
-                    // `Ops` frame carrying no ops roots a zero-op room (C99) — which
-                    // is why it is a case rather than an impossibility.
+                    // there is nothing to repair. It is reachable — no seam roots a
+                    // room at sequence zero any more (C99), but a snapshot install
+                    // *lands* a standing root at one, which it must: dropping the root
+                    // there would let a peer strip a room's authority with an empty
+                    // state — so it is a case rather than an impossibility.
                     if meta.creator.is_none() || self.hub.seq(room) == 0 {
                         return None;
                     }
