@@ -898,16 +898,6 @@ pub fn step(
                                 _ => None,
                             })
                             .collect();
-                        // A move is not the only thing that staleses a shell. A node's
-                        // tag is a meet over the claims that named it, so a claim in
-                        // this delta can lower one — and that claim is a birth into the
-                        // node's own list, which this recipient may not read, so it is
-                        // served neither the claim nor (on the move gate alone) a shell.
-                        // It would sit at a tag its document can never revise.
-                        let retagged_in_delta: std::collections::HashSet<_> = delta
-                            .iter()
-                            .filter_map(|rec| crdtsync_core::retagged_node(&rec.op))
-                            .collect();
                         let reveals = hub
                             .reveal_ops(
                                 &room,
@@ -925,7 +915,6 @@ pub fn step(
                             .filter(|op| match &op.kind {
                                 crdtsync_core::OpKind::XmlReveal { node, .. } => {
                                     moved_in_delta.contains(node)
-                                        || retagged_in_delta.contains(node)
                                 }
                                 _ => false,
                             });

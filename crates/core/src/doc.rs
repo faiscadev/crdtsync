@@ -6045,35 +6045,6 @@ fn stamp_key(stamp: Stamp) -> [u8; 24] {
 /// The element id an XML sequence child takes: derived from its children List
 /// and its node stamp, so the apply path, the readiness gate, and the cursor all
 /// agree. `kind` is `XmlElement` for an element child, `Text` for a text run.
-/// The node an op can install or restate a tag on, if any — the trigger a redaction
-/// reads to know a revealed node's shell has gone stale.
-///
-/// A shell carries the node's tag as its payload *and* in its identity
-/// ([`reveal_op_id`]), read off live state at emission. A node's tag is a meet over
-/// the claims that named it, so a later claim can lower it, and the shell a reader
-/// already holds then names a tag its own document will never revise. The fan-out
-/// gates shells on the node appearing in an `XmlMove` in the batch, which a
-/// retagging claim need not be: the claim that lowers a tag is an `XmlInsertChild`
-/// into the node's *birth* list, and a reader that may not read that list is served
-/// neither the claim nor a shell. So the trigger is widened by this, and both seams
-/// read it.
-///
-/// Over-reporting is safe and deliberate: this names the node an op *could* retag
-/// without asking whether it did, since re-emitting an unchanged shell is inert —
-/// its id is a function of `(node, tag)`, so an identical shell dedups, and a
-/// changed one runs a rank that is idempotent.
-pub fn retagged_node(op: &Op) -> Option<ElementId> {
-    match &op.kind {
-        // A tagged birth derives its child under the element kind; the tagless
-        // sibling of the stamp is a text run, which holds no tag.
-        OpKind::XmlInsertChild { tag: Some(_), .. } => {
-            Some(xml_child_id(op.target, op.stamp, ElementKind::XmlElement))
-        }
-        OpKind::XmlReveal { node, tag: Some(_) } => Some(*node),
-        _ => None,
-    }
-}
-
 fn xml_child_id(list_id: ElementId, stamp: Stamp, kind: ElementKind) -> ElementId {
     ElementId::derive(list_id, &stamp_key(stamp), kind)
 }
