@@ -259,8 +259,20 @@ pub struct Document {
     /// batch while keeping them locally is precisely a divergence. What the latch
     /// guarantees is that every op that *is* emitted names something that exists.
     ///
-    /// Not persisted: it lives for the duration of one intention — an atomic group
-    /// is several transacts and one delivery, so it spans them all.
+    /// Not persisted. It is raised for the rest of one intention — an atomic group
+    /// is several transacts and one delivery, so it spans them all — and cleared
+    /// only where an intention *opens*, which is what lets
+    /// [`mint_refused`](Self::mint_refused) report on the intention the caller just
+    /// ran.
+    ///
+    /// One rule follows and is the reason clearing is on the opening side alone: an
+    /// atomic group nested inside an explicit intention **joins** that intention for
+    /// the purpose of the mint, so the latch spans the whole of the outer one and
+    /// neither end of the group clears it. Clearing at a nested `commit_atomic` would
+    /// hand the mint a fresh answer mid-intention, which is exactly what
+    /// [`begin_atomic`](Self::begin_atomic) is already guarded against on the way in.
+    /// The undo history draws its own boundary at that same point and is not this
+    /// field's concern.
     mint_refused: bool,
     seq: u64,
     /// When recording an atomic transaction (between `begin_atomic` and
@@ -2867,11 +2879,6 @@ impl Document {
         // closes the intention itself.
         if self.atomic.is_none() && !self.history.grouped() {
             self.history.close(false);
-            // The intention is over, so the refusal latch goes with it. Clearing at
-            // both ends is what makes [`can_mint`](Self::can_mint) a reading of the
-            // id space *between* operations rather than a report on the last one:
-            // held while the intention runs, gone once it has.
-            self.mint_refused = false;
         }
         // While recording an atomic transaction, edits accumulate into the group
         // rather than returning per call; the group ships on `commit_atomic`.
@@ -2925,10 +2932,8 @@ impl Document {
         let Some(ops) = self.atomic.take() else {
             return Vec::new();
         };
-        // The group is one intention, undone and redone as one — and it
-        // is over, so the refusal latch clears with it.
+        // The group is one intention, undone and redone as one transaction.
         self.history.close(true);
-        self.mint_refused = false;
         self.tag_atomic(ops)
     }
 
@@ -3698,10 +3703,11 @@ impl Document {
     ///
     /// `None` when this replica has no id to mint: either the target's partition is
     /// spent, or an earlier mint in this same intention was refused and latched. The
-    /// latch is document-global, so once set it refuses every partition until the
-    /// intention ends. The edit emits no op and changes no state. A caller that
-    /// derives a child id from the stamp must refuse alongside, or it would name a
-    /// child no op creates.
+    /// latch is document-global, so once set it refuses every partition for the rest
+    /// of that intention, and it stands until the next one opens so
+    /// [`mint_refused`](Self::mint_refused) can report it. The edit emits no op and
+    /// changes no state. A caller that derives a child id from the stamp must refuse
+    /// alongside, or it would name a child no op creates.
     fn emit_stamped(&mut self, target: ElementId, kind: OpKind) -> Option<Stamp> {
         // The op is stamped from its own partition's clock, so an edit in one zone
         // never advances another's and the op carries which partition it belongs
@@ -3754,28 +3760,45 @@ impl Document {
         Some(stamp)
     }
 
-    /// Whether this replica still holds an unspent id in `zone`'s partition — the
-    /// predicate a refused edit reports on.
+    /// Whether this replica still holds an unspent id in `zone`'s partition —
+    /// capacity, read between operations.
     ///
-    /// False in two cases, and the first is not exhaustion. **The refusal latch is
-    /// document-global and lives for the rest of the intention**, so after a mint was
-    /// refused anywhere — including in another partition, and including for span
-    /// alone where a single-id edit would still fit — this answers false for every
-    /// `zone` until that intention ends. It is a report on what the *next* mint in
-    /// this intention will do, not a per-partition capacity reading.
-    ///
-    /// The second is real exhaustion: the mint counts on from the higher of the
-    /// partition clock and this replica's own id-space high-water, and both stop at
-    /// [`LAMPORT_STATE_CEILING`]. Honest traffic reaches it after 2^63 edits; a peer
-    /// impersonating this replica's `ClientId` can put it there in one op, which is
-    /// the same residual [`mint_floor`](Self::mint_floor) already carries — and a
-    /// refused edit is the fail-closed answer to it, not a re-issued live id.
+    /// The mint counts on from the higher of the partition clock and this replica's
+    /// own id-space high-water, and both stop at [`LAMPORT_STATE_CEILING`]. Honest
+    /// traffic reaches it after 2^63 edits; a peer authoring under this replica's
+    /// `ClientId` can put it there in one op, which is the residual
+    /// [`mint_floor`](Self::mint_floor) carries — and a refused edit is the
+    /// fail-closed answer to it, not a re-issued live id.
     ///
     /// A multi-codepoint text insert reserves one id per codepoint, so it can be
     /// refused where a single-id edit is still admitted; this reports the
-    /// single-id case.
+    /// single-id case. Whether an edit *was* refused is a different question, and
+    /// [`mint_refused`](Self::mint_refused) is what answers it: this one says
+    /// nothing about the refusal latch, so an intention cut short for want of a
+    /// run's length still reads as having room for the single-id edit it does.
     pub fn can_mint(&self, zone: Option<u32>) -> bool {
-        !self.mint_refused && mint_position(self.mint_floor(zone), 1, self.client).is_some()
+        mint_position(self.mint_floor(zone), 1, self.client).is_some()
+    }
+
+    /// Whether a local edit was refused for want of an id during the intention most
+    /// recently opened — the signal a mutation seam reports, since a refused edit
+    /// returns the same empty op batch an inert one does.
+    ///
+    /// True from the refusal until the next intention begins, so the caller that ran
+    /// the transact, the atomic group, or the undo replay reads the answer for the
+    /// edit it just made. It covers every reason the mint declined: the partition
+    /// spent, a run longer than the space that is left, and the latch that carries
+    /// the first refusal across the rest of the intention.
+    ///
+    /// Read it before opening the next intention. The next one clears it, so a
+    /// reading taken after a later edit answers for *that* edit — a refusal read
+    /// too late reads as none, and a later refusal reads as this edit's.
+    ///
+    /// Distinct from [`can_mint`](Self::can_mint), which reports capacity rather
+    /// than an outcome: a replica with room for a single id answers `true` there
+    /// and `true` here both, if the edit it just refused was a run.
+    pub fn mint_refused(&self) -> bool {
+        self.mint_refused
     }
 
     /// A target is reachable when it names a materialised container that is
@@ -4668,7 +4691,6 @@ impl Document {
     pub fn end_intention(&mut self) {
         if self.history.close_group() && self.atomic.is_none() {
             self.history.close(false);
-            self.mint_refused = false;
         }
     }
 
@@ -4774,9 +4796,6 @@ impl Document {
             self.commit_atomic()
         } else {
             self.history.close(false);
-            // The replayed intention ends here, so the latch ends with it — the same
-            // rule the other three `history.close` sites follow.
-            self.mint_refused = false;
             ops
         };
         self.history.end_replay(saved);
@@ -6675,8 +6694,9 @@ impl RangedCursor<'_> {
         let root = self.doc.root_id();
         // A refused mint creates nothing, so the handle names nothing: an
         // unoccupiable stamp, which every later edit through it resolves to absent.
-        // See [`Document::can_mint`] — the id space is spent, so an `Option` here
-        // would only restate a document-wide condition at every mutation.
+        // See [`Document::mint_refused`] — the refusal is reported once, for the
+        // whole intention, so an `Option` here would only restate it at every
+        // mutation.
         let stamp = self
             .doc
             .emit_stamped(
@@ -6906,8 +6926,8 @@ impl XmlChildrenCursor<'_> {
     /// is a no-op: the children List is not materialised (an op the author never
     /// applied would diverge a peer that has the List — unreachable through the
     /// public API, since a cursor is only handed out for a List a create already
-    /// registered), or the mint refused because this replica's id space is spent
-    /// ([`Document::can_mint`]).
+    /// registered), or the mint refused for want of an id
+    /// ([`Document::mint_refused`]).
     fn insert_child(&mut self, index: usize, tag: Option<Vec<u8>>, kind: ElementKind) -> ElementId {
         let absent = unmintable_stamp(self.doc.client);
         let anchor = match self.doc.lists.get(&self.list_id) {

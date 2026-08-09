@@ -576,6 +576,22 @@ func (d *Document) CommitAtomic() []byte {
 	return takeBuf(C.crdtsync_doc_commit_atomic(d.h))
 }
 
+// MintRefused reports whether an edit was refused for want of an id during the
+// intention most recently opened. Every mutator returns the ops to broadcast, and
+// a refused edit produces the same empty slice an inert one does; this is what
+// tells the two apart.
+//
+// Intention-scoped rather than per-edit: an atomic group is one intention, so once
+// a refusal is raised inside one it stays raised for the rest of the group and is
+// cleared by the next intention rather than by a later edit within this one.
+//
+// Read it before the next edit. The next intention clears it, so a reading taken
+// after one answers for that edit — a refusal read too late reads as none, and a
+// later refusal reads as this edit's.
+func (d *Document) MintRefused() bool {
+	return C.crdtsync_doc_mint_refused(d.h) == 1
+}
+
 // --- undo / redo ---
 
 // DefaultUndoOrigin is the origin an Undo records under when none is named.
@@ -748,6 +764,19 @@ func (c *Client) Actor() ([]byte, bool) {
 // under a fresh client id has a fresh range, since the derivation is pure over
 // the id and the channel number.
 var ErrChannelsExhausted = errors.New("the session's channel numbers are exhausted")
+
+// ErrMintExhausted is the refusal an edit reports when the replica had no id left
+// for *this* edit. A refused mint is the fail-closed answer, never a re-issued id
+// that would collide with one already published. Without it a refusal is
+// indistinguishable from an inert edit and the caller reports a write that never
+// happened.
+//
+// It does not promise that nothing happened. A refusal cuts the intention at the
+// edit that could not mint, so the call may still have emitted and dispatched what
+// came before it — those ops are applied here and go to the room. Nor does it mean
+// the replica is spent outright: a run reserves one id per codepoint, so a shorter
+// edit can still fit where a longer one was refused.
+var ErrMintExhausted = errors.New("the edit was refused: the replica could not mint the ids it needed")
 
 // assigned reports the channel and Subscribe frame a subscribe produced. An
 // empty frame is the C ABI declining to assign one, leaving the channel
@@ -962,6 +991,18 @@ func (c *Client) BeginAtomic(channel uint32) {
 // to send, carrying one group per zone partition the edits fall in.
 func (c *Client) CommitAtomic(channel uint32) []byte {
 	return takeBuf(C.crdtsync_client_commit_atomic(c.h, C.uint32_t(channel)))
+}
+
+// MintRefused reports whether an edit on channel was refused for want of an id
+// during the intention most recently opened there. Per channel, because each
+// channel holds its own replica minting under its own identity; false for a
+// channel this session does not hold.
+//
+// Latched for the whole intention, as the per-document reading is: an atomic group
+// is one intention, so a refusal inside one stays raised across the edits that
+// follow it and across the commit, and clears when the next intention opens.
+func (c *Client) MintRefused(channel uint32) bool {
+	return C.crdtsync_client_mint_refused(c.h, C.uint32_t(channel)) == 1
 }
 
 // GetInt reads an integer Register at path in channel's room.

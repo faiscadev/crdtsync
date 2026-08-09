@@ -69,6 +69,11 @@ export interface Backend {
 
   /** Fold a peer's ops in (local only); a client backend syncs through its provider. */
   apply(ops: Uint8Array): ApplyOutcome;
+
+  /** Whether the edit just made was refused for want of an id. Every mutator above
+   * answers an empty buffer for a refused edit and for an inert one alike, so this
+   * is what tells them apart. */
+  mintRefused(): boolean;
 }
 
 /** What one fold of a peer's ops did — see `Doc.applyUpdate`. */
@@ -224,5 +229,9 @@ export class ClientBackend implements Backend {
 
   apply(_ops: Uint8Array): ApplyOutcome {
     throw new Error("crdtsync: a networked document syncs through its provider, not applyUpdate");
+  }
+
+  mintRefused(): boolean {
+    return this.client.mintRefused(this.channel);
   }
 }

@@ -1062,6 +1062,21 @@ impl ClientSession {
         self.rooms.get(&channel).map(|r| &r.doc)
     }
 
+    /// Whether an edit on `channel` was refused for want of an id during the
+    /// intention most recently opened there — [`Document::mint_refused`] of that
+    /// channel's replica. `None` if the channel isn't held.
+    ///
+    /// Each channel holds its own replica and mints under its own identity, so a
+    /// channel exhausted by a peer authoring under that identity says nothing about
+    /// its siblings.
+    ///
+    /// Latched for that channel's whole intention — an atomic group is one, commit
+    /// included — and cleared as its next one opens, so read it before editing that
+    /// channel again or the answer is the later edit's.
+    pub fn mint_refused(&self, channel: Channel) -> Option<bool> {
+        self.rooms.get(&channel).map(|r| r.doc.mint_refused())
+    }
+
     /// Mutable access to `channel`'s replica, for an embedder that edits through
     /// the path façade rather than the [`edit`](ClientSession::edit) closure —
     /// the ops it emits still travel to the server as a `Message::Ops` the caller

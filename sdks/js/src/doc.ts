@@ -23,6 +23,29 @@ export type { RepairStep } from "./path.js";
 
 const EMPTY = new Uint8Array();
 
+/** Thrown by an edit the replica had no id left for.
+ *
+ * A refused mint is the fail-closed answer, never a re-issued id that would
+ * collide with one already published. Without this it is
+ * indistinguishable from an inert edit and the application reports a write that
+ * never happened.
+ *
+ * A refusal cuts the transaction at the edit that could not mint — the edits after
+ * it would address what it failed to create — so the call may still have emitted
+ * and delivered what came *before* the refusal. Those ops are applied here and
+ * shipped; the throw says the intention was not completed, not that nothing
+ * happened. Nor is the replica always spent outright: a run reserves one id per
+ * codepoint, so a shorter edit can still fit where a longer one was refused
+ * (`can_mint` on the core is the capacity reading). */
+export class MintExhausted extends Error {
+  constructor(cause?: unknown) {
+    super("crdtsync: the edit was refused, the replica could not mint the ids it needed", {
+      cause,
+    });
+    this.name = "MintExhausted";
+  }
+}
+
 /** An applied change to the document, delivered to `Doc.on("update")`. */
 export interface UpdateEvent {
   /** `"local"` for an edit made on this replica, `"remote"` for an applied peer update. */
@@ -192,16 +215,68 @@ export class Doc {
     const before = this.observing() ? this.backend.encodeState() : undefined;
     this.transacting = true;
     this.backend.beginAtomic();
+    let body: unknown;
+    let threw = false;
     try {
       fn();
-    } finally {
-      this.transacting = false;
-      const outbound = this.backend.commitAtomic();
-      if (outbound.length > 0) {
-        this.wire?.(outbound);
-        this.dispatch("local", outbound, before);
-        this.emitRepairs();
+    } catch (e) {
+      body = e;
+      threw = true;
+    }
+    this.transacting = false;
+    // The group is committed and delivered whatever the body did, so a body that
+    // threw never strands it open. A listener that throws during that delivery is
+    // held rather than propagated: a refusal already on its way out of `fn` is the
+    // answer to the edit the application made, and outranks it — carrying it as
+    // the cause rather than dropping it.
+    const delivery = this.deliver(this.backend.commitAtomic(), before);
+    if (threw) {
+      // The body's own failure is what the caller asked for — a refusal or anything
+      // else it threw — and a delivery failure rides along as its cause rather than
+      // replacing it. Attaching is best-effort: a frozen or read-only error still
+      // reaches the caller as itself rather than as the `TypeError` the write would
+      // raise.
+      if (delivery !== undefined && body instanceof Error && body.cause === undefined) {
+        try {
+          (body as { cause?: unknown }).cause = delivery;
+        } catch {
+          // The caller's error outranks the annotation.
+        }
       }
+      throw body;
+    }
+    if (delivery !== undefined) throw delivery;
+  }
+
+  /** Raise the refusal an edit's empty byte string cannot express.
+   *
+   * `refused` is read straight after the edit, never before and never later: the
+   * core clears the latch as each intention opens, so reading it there is what makes
+   * it this edit's answer, and reading it after the dispatch block would lose it to
+   * a listener that throws. It is *raised* after the ops have gone to the wire and
+   * the listeners, though — one backend call is one core transaction, and a refusal
+   * cuts it at the edit that could not mint, so a refused call can carry ops that
+   * did. Those are applied to this replica already; withholding them would leave it
+   * ahead of every peer. */
+  private guardMint(refused: boolean, dispatchError?: unknown): void {
+    // The refusal outranks a listener's own failure: it is the answer to the call
+    // the application made, and losing it is the silence this whole seam removes.
+    // The listener's error rides along as the cause rather than disappearing.
+    if (refused) throw new MintExhausted(dispatchError);
+    if (dispatchError !== undefined) throw dispatchError;
+  }
+
+  /** Wire and dispatch what the edit emitted, returning a listener's failure
+   * rather than propagating it, so the refusal is still reported. */
+  private deliver(outbound: Uint8Array, before: Uint8Array | undefined): unknown {
+    if (outbound.length === 0) return undefined;
+    try {
+      this.wire?.(outbound);
+      this.dispatch("local", outbound, before);
+      this.emitRepairs();
+      return undefined;
+    } catch (e) {
+      return e === undefined ? new Error("crdtsync: an update listener threw") : e;
     }
   }
 
@@ -209,28 +284,25 @@ export class Doc {
     // Inside a transaction the edit just accumulates; the commit sends + dispatches.
     if (this.transacting) {
       run(this.backend);
+      this.guardMint(this.backend.mintRefused());
       return;
     }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const outbound = run(this.backend);
-    if (outbound.length === 0) return;
-    this.wire?.(outbound);
-    this.dispatch("local", outbound, before);
-    this.emitRepairs();
+    const refused = this.backend.mintRefused();
+    this.guardMint(refused, this.deliver(outbound, before));
   }
 
   private mutateReturning<T>(run: (backend: Backend) => [T, Uint8Array]): T {
     if (this.transacting) {
       const [value] = run(this.backend);
+      this.guardMint(this.backend.mintRefused());
       return value;
     }
     const before = this.observing() ? this.backend.encodeState() : undefined;
     const [value, outbound] = run(this.backend);
-    if (outbound.length > 0) {
-      this.wire?.(outbound);
-      this.dispatch("local", outbound, before);
-      this.emitRepairs();
-    }
+    const refused = this.backend.mintRefused();
+    this.guardMint(refused, this.deliver(outbound, before));
     return value;
   }
 

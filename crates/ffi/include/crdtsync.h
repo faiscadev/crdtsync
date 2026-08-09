@@ -549,6 +549,32 @@ int32_t crdtsync_doc_apply(CrdtDoc *doc,
                            uintptr_t len,
                            uint32_t *out_refused);
 
+// Whether an edit was refused for want of an id during the intention most
+// recently opened on this handle (1), none was (0), or the handle is bad (-1).
+//
+// The answer a mutation entry point cannot give: every one of them returns the ops
+// to broadcast, and a refused edit produces the same empty buffer an inert one
+// does. A refusal means the replica's id space is spent — honest traffic reaches
+// that after 2^63 edits, a peer authoring under this replica's client id can put it
+// there in one op — or that a run was longer than the space that is left. The
+// intention was not completed; a caller that ignores this reports it as having
+// been. It does not say that nothing happened — a refusal cuts an intention at
+// the edit that could not mint, so edits before it are applied here, and their ops
+// are in the buffer this call returned or, inside an atomic group, in the one
+// `crdtsync_doc_commit_atomic` returns.
+//
+// True from the refusal until the next *intention* begins — a further edit inside
+// an open atomic group does not clear it, since the group is one intention — so it
+// answers for the edit just made rather than for the handle's whole history. Call it
+// before starting the next edit or atomic group: that one clears the latch, so a
+// later call answers for the later intention and not for this one. It is
+// a query rather than an empty buffer because that signal already carries a bad
+// handle and an inert edit, and a third meaning on it would be unreadable.
+//
+// # Safety
+// `doc` must be a handle returned by a constructor and not yet freed.
+int32_t crdtsync_doc_mint_refused(const CrdtDoc *doc);
+
 // Begin recording an atomic transaction: until [`crdtsync_doc_commit_atomic`],
 // edits accumulate into one group and each returns an empty ops buffer.
 //
@@ -1430,6 +1456,21 @@ int32_t crdtsync_client_set_undo_origin(CrdtClient *client,
 // # Safety
 // `client` is a live handle.
 int32_t crdtsync_client_clear_undo_origin(CrdtClient *client, uint32_t channel);
+
+// Whether an edit on `channel` was refused for want of an id during the intention
+// most recently opened there (1), none was (0), or the handle is bad or the
+// channel unheld (-1).
+//
+// The per-channel form of [`crdtsync_doc_mint_refused`], and it answers per
+// channel because each channel holds its own replica minting under its own
+// identity: a channel a peer has spent says nothing about its siblings.
+//
+// Latched and cleared on that channel's intentions, as the per-document form is:
+// call it before the next edit on that channel, or the answer is that edit's.
+//
+// # Safety
+// `client` must be a handle returned by a constructor and not yet freed.
+int32_t crdtsync_client_mint_refused(const CrdtClient *client, uint32_t channel);
 
 // Whether `origin` has an intention to undo on `channel` (1), none (0), or a bad
 // handle (-1).

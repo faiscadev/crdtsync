@@ -2788,3 +2788,65 @@ fn the_channel_reads_reject_null_handles_and_pointers() {
         crdtsync_client_free(a);
     }
 }
+
+#[test]
+fn a_channel_reports_the_refusal_its_empty_frame_cannot() {
+    // A refused edit frames the same empty buffer an inert one does, and a client
+    // that reads only the frame reports a write that never happened. Per channel,
+    // because each channel holds its own replica minting under its own identity.
+    unsafe {
+        let c = crdtsync_client_new(client_id(1).as_ptr());
+        let (spent, frame) = subscribe(c, b"room-a");
+        crdtsync_buf_free(frame);
+        let (fresh, frame) = subscribe(c, b"room-b");
+        crdtsync_buf_free(frame);
+        assert_eq!(crdtsync_client_mint_refused(c, spent), 0);
+
+        // Channel 0 authors under the declared id unchanged, so this plants under
+        // that channel's own replica identity, at the last id of the space.
+        let mut plant =
+            crdtsync_core::Document::new(crdtsync_core::ClientId::from_bytes(client_id(1)))
+                .transact(|tx| tx.set(b"planted", Scalar::Int(1)))
+                .remove(0);
+        plant.stamp.lamport = crdtsync_core::stamp::LAMPORT_STATE_CEILING;
+        plant.id.seq = 99;
+        let ops = encode_message(&Message::Ops {
+            channel: Channel(spent),
+            ops: vec![plant],
+        });
+        let mut code: i32 = 0;
+        assert_eq!(
+            crdtsync_client_receive(c, ops.as_ptr(), ops.len(), &mut code),
+            1
+        );
+
+        let p = path(&[b"k"]);
+        let refused = register_int(c, spent, &p, 1);
+        // The client seam frames every edit, so a refusal is not even an empty
+        // buffer here — it is a well-formed Ops frame carrying no ops.
+        let framed = std::slice::from_raw_parts(refused.ptr, refused.len);
+        match decode_message(framed).expect("a frame") {
+            Message::Ops { ops, .. } => assert!(ops.is_empty(), "a refused edit framed ops"),
+            other => panic!("expected Ops, got {other:?}"),
+        }
+        crdtsync_buf_free(refused);
+        assert_eq!(crdtsync_client_mint_refused(c, spent), 1);
+
+        let landed = register_int(c, fresh, &p, 1);
+        assert!(landed.len > 0);
+        crdtsync_buf_free(landed);
+        assert_eq!(
+            crdtsync_client_mint_refused(c, fresh),
+            0,
+            "one channel's exhaustion was reported on another's replica"
+        );
+        assert_eq!(
+            crdtsync_client_mint_refused(c, 9),
+            -1,
+            "an unheld channel is neither refused nor accepted"
+        );
+
+        crdtsync_client_free(c);
+        assert_eq!(crdtsync_client_mint_refused(ptr::null(), 0), -1);
+    }
+}

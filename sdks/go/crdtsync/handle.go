@@ -439,26 +439,71 @@ func (d *Doc) applyRemote(receive func()) func() {
 // mutate runs one edit, transmits its bytes, and dispatches them as a local
 // update. Inside a transaction the edit just accumulates; Transact's commit
 // transmits and dispatches once.
-func (d *Doc) mutate(run func(Backend) []byte) []byte {
+func (d *Doc) mutate(run func(Backend) []byte) ([]byte, error) {
 	d.mu.Lock()
 	if d.transacting {
 		run(d.backend)
+		refused := d.backend.MintRefused()
 		d.mu.Unlock()
-		return nil
+		return nil, refusal(refused)
 	}
 	var before []byte
 	if d.observingLocked() {
 		before = d.backend.EncodeState()
 	}
 	ops := run(d.backend)
+	// Read straight after the edit, never before: the core clears the latch as
+	// each intention opens, so this answers for the edit just made.
+	refused := d.backend.MintRefused()
 	if len(ops) == 0 {
 		d.mu.Unlock()
-		return ops
+		return ops, refusal(refused)
 	}
 	plan := d.planDispatchLocked("local", ops, before)
 	d.mu.Unlock()
+	// The ops are stamped into this replica and its outbox already, so they reach
+	// the room even when the edit that followed them could not mint.
 	plan.run()
-	return ops
+	return ops, refusal(refused)
+}
+
+// refusal turns the backend's reading into the sentinel the mutators return.
+func refusal(refused bool) error {
+	if refused {
+		return ErrMintExhausted
+	}
+	return nil
+}
+
+// Err reports ErrMintExhausted when the edit most recently made through this
+// document was refused for want of an id, and nil otherwise.
+//
+// It is the seam for the mutators that return no error of their own — the XML
+// handles chain, so an error return there would cost the chaining the API is
+// built on, and Delete/Insert have nothing to say but this. A mutator that does
+// return an error returns this same sentinel directly; both read the one
+// condition, so a caller may use whichever suits its call site.
+//
+// It is intention-scoped, not per-edit: a Transact body is one intention and so is
+// an atomic group, commit included, so a refusal inside one stays raised for the
+// rest of it and is cleared by the next intention rather than by a later edit
+// within this one. Read it before the next edit — that edit's intention clears the
+// latch, so a later reading answers for it and not for the call in question.
+//
+// It answers for edits that reached the replica. A call refused at Go's own type
+// boundary — Set, Insert or Append handed a value with no CRDT scalar — never
+// resolves a path, opens no intention, and leaves the previous reading standing;
+// those return their error directly, which is the answer to read there. Filed as
+// C105.
+//
+// It answers for the edit most recently made on this document by any goroutine,
+// so it is meaningful only where the document is edited from one. A concurrent
+// edit between a refused call and its Err clears the answer; the mutators that
+// return an error hand it back per call and are unaffected.
+func (d *Doc) Err() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return refusal(d.backend.MintRefused())
 }
 
 // observingLocked reports whether any update listener or subtree observer is
@@ -648,8 +693,8 @@ func (m *CrdtMap) Set(key string, value any) error {
 		return err
 	}
 	slot := m.slot(key)
-	m.doc.mutate(func(b Backend) []byte { return b.SetScalar(slot, scalar) })
-	return nil
+	_, err = m.doc.mutate(func(b Backend) []byte { return b.SetScalar(slot, scalar) })
+	return err
 }
 
 // Get reads key: a native scalar for a leaf, a BlobRef for a blob, a nested
@@ -757,12 +802,19 @@ func (m *CrdtMap) GetXml(key string) *CrdtXml {
 }
 
 // SetBlob stores a small blob inline at key, minting its public handle. Returns
-// false when data exceeds the inline ceiling — upload it out of band with
-// UploadBlob and set the returned handle via SetBlobRef.
+// false when the replica could not mint the ids the write needed, and false on a
+// local document when data exceeds the inline ceiling — upload that out of band
+// with UploadBlob and set the returned handle via SetBlobRef. Doc.Err reports
+// ErrMintExhausted for the first and nil for the second.
+//
+// The size reading is the local document's. A networked Doc derives it from the
+// frame its edit surface returns, and that frame is non-empty even for an edit
+// that enqueued nothing, so an over-size blob there reads as stored. Filed as
+// C109; the mint reading is correct against either backend.
 func (m *CrdtMap) SetBlob(key, mime string, data []byte) bool {
 	slot := m.slot(key)
 	ok := false
-	m.doc.mutate(func(b Backend) []byte {
+	_, err := m.doc.mutate(func(b Backend) []byte {
 		ops, inlined := b.SetBlob(slot, mime, data)
 		if !inlined {
 			return nil
@@ -770,7 +822,10 @@ func (m *CrdtMap) SetBlob(key, mime string, data []byte) bool {
 		ok = true
 		return ops
 	})
-	return ok
+	// Fitting under the ceiling is not the same as landing: a blob that inlines
+	// still needs an id, so a refused mint stores nothing and the answer is false.
+	// Doc.Err carries which of the two happened.
+	return ok && err == nil
 }
 
 // SetBlobRef sets a store-backed blob ref at key from a 16-byte id handle, mime,
@@ -809,7 +864,7 @@ func (l *CrdtList) Insert(index int, value any) error {
 	// Resolve the index against the same live length the insert lands in — an
 	// index read in an earlier critical section could be stale by the time the
 	// item is placed.
-	l.doc.mutate(func(b Backend) []byte {
+	_, err = l.doc.mutate(func(b Backend) []byte {
 		at := index
 		n := l.lenLocked()
 		if at < 0 {
@@ -823,7 +878,7 @@ func (l *CrdtList) Insert(index int, value any) error {
 		}
 		return b.ListInsert(l.path, uint(at), item)
 	})
-	return nil
+	return err
 }
 
 // Append appends a scalar item.
@@ -832,25 +887,33 @@ func (l *CrdtList) Append(value any) error {
 	if err != nil {
 		return err
 	}
-	l.doc.mutate(func(b Backend) []byte {
+	_, err = l.doc.mutate(func(b Backend) []byte {
 		return b.ListInsert(l.path, uint(l.lenLocked()), item)
 	})
-	return nil
+	return err
 }
 
 // Delete tombstones the live item at index. A negative index counts from the
 // end. Returns an error when index is out of range.
 func (l *CrdtList) Delete(index int) error {
 	var err error
-	l.doc.mutate(func(b Backend) []byte {
+	_, mintErr := l.doc.mutate(func(b Backend) []byte {
 		var idx uint
 		idx, err = l.checkedLocked(index)
 		if err != nil {
-			return nil
+			// An index off the end names no live item, which the core answers with
+			// an *inert* edit rather than with nothing at all — and reaching that
+			// seam is what opens the intention this call's refusal reading answers
+			// for. The live length is out of range by definition, so the call is
+			// inert whatever index was asked for.
+			idx = uint(l.lenLocked())
 		}
 		return b.ListDelete(l.path, idx)
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return mintErr
 }
 
 // Get reads the item at index. The bool is false when index is out of range.
