@@ -653,10 +653,12 @@ impl List {
     /// tombstone holds no kind to read and keeps the document's verdict, which
     /// outlives the delete where a sequence rank would not.
     fn yields_to_seated(&self, id: Stamp, claim: &Element) -> bool {
-        let Some(seated) = self.nodes.get(&seq_key(&id)).map(|n| n.value.kind()) else {
-            return false;
-        };
-        seated == ElementKind::Scalar && claim.kind() != ElementKind::Scalar
+        debug_assert_ne!(
+            claim.kind(),
+            ElementKind::Scalar,
+            "a scalar reaches no placement key, so nothing ranks one here"
+        );
+        self.nodes.get(&seq_key(&id)).map(|n| n.value.kind()) == Some(ElementKind::Scalar)
     }
 
     /// Where `id` currently sits, or `None` if the list does not hold it — read

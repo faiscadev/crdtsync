@@ -381,6 +381,131 @@ fn a_composite_claim_does_not_take_an_id_a_scalar_holds_through_a_move() {
     assert_eq!(back.encode_state(), bytes, "the re-encode is not canonical");
 }
 
+#[test]
+fn the_kind_tag_leads_the_position_across_the_scalar_boundary() {
+    // The three claims carry *different* anchors, so the order of the first two
+    // keys is observable — and it is not a preference: ranking the position above
+    // the tag makes this op set fold two ways. A composite that took the id on a
+    // smaller anchor would be evicted by the document's own `(list, stamp)` rank in
+    // one order and refused before it ever reached the sequence in another, because
+    // the eviction carries a verdict the refusal never asks for.
+    let mut author = Document::new(cid(1));
+    let build = author.transact(|tx| {
+        let mut frag = tx.xml_fragment(b"doc");
+        let mut kids = frag.children();
+        for tag in [b"p", b"q", b"r"] {
+            let at = kids.len();
+            kids.insert_element(at, tag);
+        }
+    });
+
+    let tagged = only_kind(
+        author.transact(|tx| {
+            let mut frag = tx.xml_fragment(b"doc");
+            frag.children().insert_element(0, b"c");
+        }),
+        |k| matches!(k, OpKind::XmlInsertChild { .. }),
+    );
+    let mut tagless = only_kind(
+        author.transact(|tx| {
+            let mut frag = tx.xml_fragment(b"doc");
+            frag.children().insert_text(1);
+        }),
+        |k| matches!(k, OpKind::XmlInsertChild { .. }),
+    );
+    let back = only_kind(
+        author.transact(|tx| {
+            let mut frag = tx.xml_fragment(b"doc");
+            frag.children().insert_element(5, b"z");
+        }),
+        |k| matches!(k, OpKind::XmlInsertChild { .. }),
+    );
+    let mut scalar = scalar_into_children(&back, Scalar::Int(5));
+    tagless.stamp = tagged.stamp;
+    scalar.stamp = tagged.stamp;
+    let anchors: Vec<Anchor> = [&tagged, &tagless, &scalar]
+        .iter()
+        .map(|op| match op.kind {
+            OpKind::XmlInsertChild { anchor, .. } | OpKind::ListInsert { anchor, .. } => anchor,
+            _ => panic!("a claim op"),
+        })
+        .collect();
+    assert_eq!(
+        anchors
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3,
+        "the three claims must name three positions"
+    );
+
+    let (state, _) = converges(&build, &[&scalar, &tagged, &tagless], kids);
+    assert!(
+        state.ends_with(",Int(5)]"),
+        "the scalar lost its own position to a composite: {state}"
+    );
+}
+
+#[test]
+fn a_join_at_an_id_a_scalar_holds_converges_in_every_order() {
+    // Two moves of one node at one stamp into one list are not a contest — the key
+    // is already the claimant's own — so the document answers `Joined` and the
+    // sequence takes the meet of the two positions. A scalar on the id is a contest
+    // all the same, and the join has to yield to it: the placement key never ranked
+    // the mover against a scalar, so if the join skipped the order the same three
+    // ops would fold two ways.
+    let mut author = Document::new(cid(1));
+    let build = author.transact(|tx| {
+        let mut frag = tx.xml_fragment(b"doc");
+        let mut kids = frag.children();
+        for tag in [b"p", b"q", b"r"] {
+            let at = kids.len();
+            kids.insert_element(at, tag);
+        }
+    });
+    let frag_id = XmlFragment::node_id(author.root_id(), b"doc");
+    let children = XmlFragment::children_id(frag_id);
+    let node = match author.get(b"doc") {
+        Some(Element::XmlFragment(f)) => f
+            .borrow()
+            .children()
+            .borrow()
+            .get(0)
+            .expect("a first child")
+            .id(),
+        _ => panic!("doc is not a fragment"),
+    };
+
+    let first = only_kind(author.transact(|tx| tx.move_xml(node, frag_id, 2)), |k| {
+        matches!(k, OpKind::XmlMove { .. })
+    });
+    let mut second = only_kind(author.transact(|tx| tx.move_xml(node, frag_id, 0)), |k| {
+        matches!(k, OpKind::XmlMove { .. })
+    });
+    second.stamp = first.stamp;
+    assert_ne!(
+        second.kind, first.kind,
+        "the two moves must differ in anchor"
+    );
+
+    let mut scalar = first.clone();
+    scalar.id.seq = 9_700;
+    scalar.target = children;
+    let OpKind::XmlMove { anchor, .. } = second.kind else {
+        panic!("the move op")
+    };
+    scalar.kind = OpKind::ListInsert {
+        value: Scalar::Int(5),
+        anchor,
+    };
+
+    let (state, _) = converges(&build, &[&first, &second, &scalar], kids);
+    assert!(
+        state.contains("Int(5)"),
+        "the join took an id the scalar's tag outranks: {state}"
+    );
+}
+
 // --- the seam itself ---
 
 #[test]
@@ -409,6 +534,41 @@ fn merging_two_sequences_that_disagree_at_one_id_converges_either_way() {
         ab.encode_state(),
         ba.encode_state(),
         "a merge resolved by which side received"
+    );
+}
+
+#[test]
+fn merging_one_value_seated_at_two_positions_takes_the_meet() {
+    // The two replicas hold the same value at one id and disagree only on where it
+    // sits — each folded one of two claims that tie on the value. Nothing is
+    // contested, so the position is the meet, which is the same on both.
+    let id = eid(1, 1);
+    let low = Anchor {
+        parent: None,
+        side: Side::Left,
+    };
+    let high = Anchor {
+        parent: None,
+        side: Side::Right,
+    };
+    let mk = |anchor: Anchor| {
+        let mut l = List::new(id);
+        l.insert_at(stmp(5, 1), Element::Scalar(Scalar::Int(4)), anchor);
+        l
+    };
+    let mut ab = mk(low);
+    ab.merge(&mk(high));
+    let mut ba = mk(high);
+    ba.merge(&mk(low));
+    assert_eq!(
+        ab.encode_state(),
+        ba.encode_state(),
+        "a merge kept the position of whichever side received"
+    );
+    assert_eq!(
+        ab.encode_state(),
+        mk(low).encode_state(),
+        "the meet is not the lesser position"
     );
 }
 
