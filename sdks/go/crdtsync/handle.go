@@ -490,6 +490,12 @@ func refusal(refused bool) error {
 // within this one. Read it before the next edit — that edit's intention clears the
 // latch, so a later reading answers for it and not for the call in question.
 //
+// It answers for edits that reached the replica. A call refused at Go's own type
+// boundary — Set, Insert or Append handed a value with no CRDT scalar — never
+// resolves a path, opens no intention, and leaves the previous reading standing;
+// those return their error directly, which is the answer to read there. Filed as
+// C105.
+//
 // It answers for the edit most recently made on this document by any goroutine,
 // so it is meaningful only where the document is edited from one. A concurrent
 // edit between a refused call and its Err clears the answer; the mutators that
@@ -890,7 +896,12 @@ func (l *CrdtList) Delete(index int) error {
 		var idx uint
 		idx, err = l.checkedLocked(index)
 		if err != nil {
-			return nil
+			// An index off the end names no live item, which the core answers with
+			// an *inert* edit rather than with nothing at all — and reaching that
+			// seam is what opens the intention this call's refusal reading answers
+			// for. The live length is out of range by definition, so the call is
+			// inert whatever index was asked for.
+			idx = uint(l.lenLocked())
 		}
 		return b.ListDelete(l.path, idx)
 	})

@@ -203,3 +203,56 @@ func TestABlobStoredOnAReplicaWithRoomStillReportsTrue(t *testing.T) {
 		t.Fatalf("Doc.Err reported %v on an ordinary blob write", err)
 	}
 }
+
+func TestAnOutOfRangeDeleteDoesNotInheritTheLastRefusal(t *testing.T) {
+	// A call that resolves to nothing still opens an intention, so the reading
+	// answers for it rather than for the edit before it. An out-of-range index
+	// names no live item, which the core answers with an inert edit — reaching
+	// that seam is what clears the previous call's refusal.
+	d := newErgoDoc(t, 10)
+	defer d.Close()
+	l := d.GetList("xs")
+	if err := l.Append("a"); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	d.ApplyUpdate(planted(t, 10))
+
+	// A refusal to inherit.
+	if err := l.Append("b"); err != ErrMintExhausted {
+		t.Fatalf("Append on a spent replica reported %v, want ErrMintExhausted", err)
+	}
+
+	if err := l.Delete(7); err == nil {
+		t.Fatal("an out-of-range delete reported no error")
+	} else if err == ErrMintExhausted {
+		t.Fatalf("an out-of-range delete reported the mint refusal: %v", err)
+	}
+	if err := d.Err(); err != nil {
+		t.Fatalf("Doc.Err after an inert delete reported %v, want nil", err)
+	}
+	if l.Len() != 1 {
+		t.Fatalf("the inert delete changed the list: len %d, want 1", l.Len())
+	}
+}
+
+func TestAnOutOfRangeDeleteStillTombstonesNothing(t *testing.T) {
+	// The inert path is reached with the live length as its index, which is out of
+	// range by definition — a negative index must not fall back onto item 0.
+	d := newErgoDoc(t, 11)
+	defer d.Close()
+	l := d.GetList("xs")
+	for _, v := range []string{"a", "b", "c"} {
+		if err := l.Append(v); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+	if err := l.Delete(-9); err == nil {
+		t.Fatal("a negative index past the start reported no error")
+	}
+	if l.Len() != 3 {
+		t.Fatalf("the refused delete removed an item: len %d, want 3", l.Len())
+	}
+	if v, ok := l.Get(0); !ok || v.(string) != "a" {
+		t.Fatalf("item 0 is %v (ok=%v), want \"a\"", v, ok)
+	}
+}
