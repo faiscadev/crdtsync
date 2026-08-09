@@ -47,6 +47,21 @@ interface WebSocketLike {
 type WebSocketCtor = new (url: string) => WebSocketLike;
 const WS_OPEN = 1;
 
+/** The wire tags of the subscribe reply, from `crdtsync_core::protocol::encode_message`.
+ * The core folds every frame; the provider needs only to tell which one answers the
+ * Subscribe. */
+const MSG_OPS = 2;
+const MSG_SNAPSHOT = 4;
+
+/** Whether `frame` is the subscribe reply for `channel` — the catch-up `Ops` delta or
+ * the whole-replica `Snapshot`, and not a frame riding ahead of it. */
+function isCatchUpReply(frame: Uint8Array, channel: number): boolean {
+  if (frame.length < 5 || (frame[0] !== MSG_OPS && frame[0] !== MSG_SNAPSHOT)) return false;
+  return (
+    new DataView(frame.buffer, frame.byteOffset, frame.byteLength).getUint32(1, true) === channel
+  );
+}
+
 export interface ProviderOptions {
   /** A fixed 16-byte client id; a random one is minted when omitted. */
   clientId?: Uint8Array;
@@ -498,9 +513,12 @@ export class Provider {
     }
     this.drainSignals();
 
-    // The subscribe reply (a catch-up Ops/Snapshot) advances last_seen_seq; a bare
-    // awareness frame does not, so it can't prematurely mark the initial sync done.
-    if (this.phase === "catchup" && this.client.lastSeenSeq(this.channel) !== undefined) {
+    // The subscribe reply — a catch-up Ops or the whole-replica Snapshot — is what
+    // completes the initial sync, matched by its own tag and channel. Frames that
+    // ride ahead of it carry none of the room: a schema advert, an awareness update,
+    // and the frontier naming what a redacted delta withholds. Opening the socket to
+    // app traffic on one of those would let an edit author against an empty replica.
+    if (this.phase === "catchup" && isCatchUpReply(data, this.channel)) {
       this.markConnected();
     }
   }

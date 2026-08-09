@@ -3466,10 +3466,13 @@ _WIRE_MAGIC = b"CRDT"
 #: The credential sent when the caller names none — what a dev server accepts.
 _ANONYMOUS = b"anonymous"
 
-#: The wire tag of the frontier a redacted catch-up leads with, from
-#: ``crdtsync_core::protocol::encode_message``. The core folds the frame; the
-#: provider needs only to tell it from the catch-up reply it precedes.
-_MSG_FRONTIER = b"\x35"
+#: The wire tags of the subscribe reply — the ``Ops`` delta and the whole-replica
+#: ``Snapshot`` — from ``crdtsync_core::protocol::encode_message``. The core folds
+#: every frame; the provider needs only to tell which one answers the Subscribe,
+#: since a schema advert, an awareness update or the frontier a redacted catch-up
+#: leads with can all arrive first and none of them carries the room.
+_MSG_OPS = 2
+_MSG_SNAPSHOT = 4
 
 #: The floor on a reconnect delay, so a zero ceiling cannot spin the dial loop.
 _MIN_RECONNECT_DELAY = 0.01
@@ -4075,13 +4078,13 @@ class Provider:
             # — the update-required push is exactly that — would otherwise be
             # redialled at the floor delay forever, by every client at once.
             self._attempt = 0
-            # The Subscribe is answered with the room's catch-up, so the first
-            # frame the session applies past the handshake completes the sync —
-            # except the frontier a redacted catch-up leads with, which names the
-            # sequences the delta behind it withholds and carries none of the
-            # room's content. Opening the socket to app traffic on it would let an
-            # edit author against an empty replica.
-            if self._phase == "catchup" and data[:1] != _MSG_FRONTIER:
+            # The Subscribe is answered with the room's catch-up, and *that* frame
+            # is what completes the sync — matched by tag and channel rather than
+            # by being the first thing to fold. A redacted catch-up leads with a
+            # frontier naming the sequences its delta withholds; opening the socket
+            # to app traffic on that would let an edit author against an empty
+            # replica.
+            if self._phase == "catchup" and self._is_catch_up_reply(data):
                 self._mark_connected()
         self._drain_signals()
         try:
@@ -4115,6 +4118,14 @@ class Provider:
             self._notify(self._on_ops_rejected, rejected)
         if redirects:
             self._notify(self._on_redirect, redirects)
+
+    def _is_catch_up_reply(self, data: bytes) -> bool:
+        """Whether `data` is the subscribe reply for this provider's channel — the
+        ``Ops`` delta or the whole-replica ``Snapshot``, and not a frame riding
+        ahead of it."""
+        if len(data) < 5 or data[0] not in (_MSG_OPS, _MSG_SNAPSHOT):
+            return False
+        return int.from_bytes(data[1:5], "little") == self._channel
 
     def _resume_frame(self) -> bytes:
         with self._lock:

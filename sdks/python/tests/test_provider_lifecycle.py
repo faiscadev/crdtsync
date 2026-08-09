@@ -56,10 +56,11 @@ def ops(channel: int, payload: bytes = b"") -> bytes:
     return bytes([_TAG_OPS]) + struct.pack("<I", channel) + payload
 
 
-def frontier(channel: int, seqs: "list[int]") -> bytes:
+def frontier(channel: int, seqs: "list[int]", reach: int = 0) -> bytes:
     """The frame a redacted catch-up leads with, naming the per-client sequences the
-    delta behind it withholds. It carries none of the room's content."""
-    body = struct.pack("<II", channel, len(seqs))
+    delta behind it withholds and the id-space position their ops reach. It carries
+    none of the room's content."""
+    body = struct.pack("<IQI", channel, reach, len(seqs))
     return bytes([_TAG_FRONTIER]) + body + b"".join(struct.pack("<Q", s) for s in seqs)
 
 
@@ -240,7 +241,10 @@ class TestHandshake:
     def test_a_frontier_does_not_complete_the_initial_sync(self, transport, provider):
         # A redacted catch-up leads with the frontier naming what its delta withholds.
         # The frame folds cleanly and carries no content, so opening the socket to app
-        # traffic on it would let an edit author against an empty replica.
+        # traffic on it would let an edit author against an empty replica. The gate is
+        # an allowlist on the catch-up reply's own tag and channel — the shape the Go
+        # provider has always had — so a frame this SDK has never seen cannot reopen
+        # the window by not being on a list of exclusions.
         socket = transport.socket(0)
         socket.wait_sent(3)
         socket.deliver(auth_ok())
@@ -702,10 +706,16 @@ class TestCallbackFailures:
             socket.wait_sent(3)
             socket.deliver(auth_ok())
             socket.wait_sent(4)
-            # The catch-up frame carries a rejection the hook fumbles. If that
-            # aborted the frame the provider would sit at "catchup" forever,
-            # dropping every later edit into an outbox nothing replays.
+            # A rejection rides ahead of the catch-up and the hook fumbles it. If
+            # that aborted the frame the provider would sit at "catchup" forever,
+            # dropping every later edit into an outbox nothing replays. The sync is
+            # completed by the catch-up reply behind it, not by the rejection: a
+            # frame that carries none of the room never opens the socket to app
+            # traffic.
             socket.deliver(ops_rejected(p._channel, [1], ErrorCode.FORBIDDEN))
+            time.sleep(0.05)
+            assert p.state != "connected"
+            socket.deliver(ops(p._channel))
             p.wait_connected(timeout=2.0)
             p.doc.get_text("body").insert(0, "after")
             assert tag(socket.wait_sent(5)[4]) == _TAG_OPS

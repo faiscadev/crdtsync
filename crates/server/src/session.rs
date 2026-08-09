@@ -768,21 +768,19 @@ pub fn step(
             let recipient = session.client.map(|c| c.for_channel(channel.0));
             let replies = match catchup {
                 Catchup::Ops(delta) => {
-                    // The sequences this recipient published into the window the
-                    // delta covers, read before any filter narrows it, in the order
-                    // the stream holds them — so the frame below is a function of the
-                    // log rather than of a set's iteration, and two nodes serving one
-                    // catch-up send the same bytes. What survives to the frame is
-                    // subtracted below; the remainder is the hole the redaction leaves
-                    // in the recipient's own run.
-                    let published: Vec<u64> = match recipient {
-                        Some(client) => delta
-                            .iter()
-                            .filter(|rec| rec.op.id.client == client)
-                            .map(|rec| rec.op.id.seq)
-                            .collect(),
-                        None => Vec::new(),
-                    };
+                    // What this recipient published into the window the delta covers,
+                    // read before any filter narrows it: each op's sequence, in the
+                    // order the stream holds them — so the frame below is a function
+                    // of the log rather than of a set's iteration — beside the
+                    // id-space position it reserves. What survives to the frame is
+                    // subtracted below; the remainder is the hole the redaction
+                    // leaves in the recipient's own run, on both records the mint
+                    // reads.
+                    let published: Vec<(u64, u64)> = delta
+                        .iter()
+                        .filter(|rec| recipient.is_some_and(|c| rec.op.id.client == c))
+                        .map(|rec| (rec.op.id.seq, rec.op.reservation_end()))
+                        .collect();
                     // Replay only the ops this subscriber may read — the same
                     // per-path read authority the live fan-out applies, so a fresh
                     // partial reader catches up on exactly its granted subtrees. A
@@ -941,33 +939,36 @@ pub fn step(
                     // the read filter, the zone filter, and the version translation
                     // alike, since each of the three can drop an op the recipient
                     // wrote and none of them consults authorship.
-                    let served: HashSet<u64> = match recipient {
-                        Some(client) => ops
-                            .iter()
-                            .filter(|op| op.id.client == client)
-                            .map(|op| op.id.seq)
-                            .collect(),
-                        None => HashSet::new(),
-                    };
-                    let withheld: Vec<u64> = published
-                        .into_iter()
-                        .filter(|seq| !served.contains(seq))
+                    let served: HashSet<u64> = ops
+                        .iter()
+                        .filter(|op| recipient.is_some_and(|c| op.id.client == c))
+                        .map(|op| op.id.seq)
                         .collect();
-                    // The frontier leads the delta. A delivery truncated between the
-                    // two leaves the replica reserving sequences whose ops it never
-                    // received, which costs it a skipped mint; the other order leaves
-                    // it minting onto ids the room's log already binds, which costs a
-                    // write with no downstream able to detect the loss. A delta that
+                    let withheld: Vec<(u64, u64)> = published
+                        .into_iter()
+                        .filter(|(seq, _)| !served.contains(seq))
+                        .collect();
+                    // The id-space record moves as a floor, so the one position the
+                    // withheld ops reach furthest is the whole of what the recipient
+                    // cannot see; a delivered op restores its own reach by being
+                    // folded.
+                    let reach = withheld.iter().map(|(_, reach)| *reach).max().unwrap_or(0);
+                    let seqs: Vec<u64> = withheld.into_iter().map(|(seq, _)| seq).collect();
+                    // The frontier leads the delta. A provider opens the socket to
+                    // app traffic on a frame, so the other order leaves a window in
+                    // which an edit authors against a replica still holding the hole
+                    // — the failure this frame exists to remove. A delta that
                     // withholds nothing of the recipient's own — every unredacted
                     // catch-up — sends no frame at all.
                     let ops = Message::Ops { channel, ops };
-                    if withheld.is_empty() {
+                    if seqs.is_empty() {
                         vec![ops]
                     } else {
                         vec![
                             Message::Frontier {
                                 channel,
-                                seqs: withheld,
+                                seqs,
+                                reach,
                             },
                             ops,
                         ]

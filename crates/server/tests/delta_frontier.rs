@@ -99,6 +99,14 @@ fn frontier_in(replies: &[Message]) -> Option<Vec<u64>> {
     })
 }
 
+/// The id-space position a frontier frame reports, or `None` when none rode.
+fn reach_in(replies: &[Message]) -> Option<u64> {
+    replies.iter().find_map(|m| match m {
+        Message::Frontier { reach, .. } => Some(*reach),
+        _ => None,
+    })
+}
+
 /// The ops in a batch of reply frames, flattened.
 fn ops_in(replies: &[Message]) -> Vec<Op> {
     replies
@@ -532,6 +540,7 @@ fn a_client_sent_frontier_is_a_protocol_violation() {
             Message::Frontier {
                 channel,
                 seqs: vec![0, 1, 2],
+                reach: 0,
             }
         ),
         "a client drove a frontier into the server",
@@ -672,7 +681,7 @@ fn subscribe_zone(r: &mut Registry, id: ConnId, zone: &[u8]) -> Vec<Message> {
 fn fold_catch_up(doc: &mut Document, replies: &[Message]) {
     for reply in replies {
         match reply {
-            Message::Frontier { seqs, .. } => doc.note_published(seqs),
+            Message::Frontier { seqs, reach, .. } => doc.note_published(seqs, *reach),
             Message::Ops { ops, .. } => {
                 for op in ops {
                     doc.apply(op);
@@ -759,5 +768,126 @@ fn a_restarted_zone_scoped_reader_does_not_re_mint_across_a_redacted_delta() {
         nested(&room_doc(&r), b"board", b"after"),
         Some(9),
         "the post-restart write was deduped away",
+    );
+}
+
+// --- the id-space half of the hole ---
+
+#[test]
+fn a_restarted_partial_reader_mints_above_the_stamps_its_delta_withheld() {
+    // A mint reads two records and the redaction holes both. The sequence half is
+    // above; this is the other — every id taken from a stamp alone (an ACL tuple's,
+    // a ranged element's, an XML sequence child's) re-derives from a position the
+    // withheld ops already occupy, so the element it names is swallowed at ingest
+    // exactly as a re-minted sequence is.
+    let (mut r, _alice_doc, _alice) = acl_room();
+    let (mut bob, conn, channel, _) = bob_session(&mut r, b"t-bob");
+
+    // The readable write first, so the withheld ones are the run's high water.
+    let mut withheld_reach = 0;
+    for (outer, key, v) in [
+        (&b"a"[..], &b"shown"[..], 0i64),
+        (&b"b"[..], &b"hidden0"[..], 1),
+        (&b"b"[..], &b"hidden1"[..], 2),
+    ] {
+        let ops = edit_ops(&mut bob, channel, outer, key, v);
+        if outer == b"b" {
+            withheld_reach = withheld_reach.max(
+                ops.iter()
+                    .map(|op| op.reservation_end())
+                    .max()
+                    .expect("a batch"),
+            );
+        }
+        submit(&mut r, conn, ops);
+    }
+    r.take_outbox(conn);
+
+    let (mut back, _conn2, channel2, replies) = bob_session(&mut r, b"t-bob2");
+    assert_eq!(
+        reach_in(&replies),
+        Some(withheld_reach),
+        "the frame reported a position other than the one its withheld run reaches",
+    );
+
+    let fresh = edit_ops(&mut back, channel2, b"a", b"after", 9);
+    assert!(
+        fresh.iter().all(|op| op.stamp.lamport > withheld_reach),
+        "minted onto a position the room's log already holds",
+    );
+}
+
+// --- a named run is not the ops' grave ---
+
+#[test]
+fn a_reader_that_regains_read_still_gets_its_own_withheld_ops() {
+    // Naming the run must not put the ops in the dedup set. The room's log holds
+    // them, and the client's cursor advances by the *delivered* batch length, so a
+    // reader whose run ends in the withheld subtree resumes from below its own last
+    // ops — and a widened grant re-serves exactly them. If the name doubled as a
+    // refusal, the recipient would be the one author whose content it never got
+    // back, while every other author's folded normally.
+    let (mut r, mut alice_doc, alice) = acl_room();
+    let (mut bob, conn, channel, _) = bob_session(&mut r, b"t-bob");
+    for (outer, key, v) in [
+        (&b"a"[..], &b"shown"[..], 0i64),
+        (&b"b"[..], &b"hidden0"[..], 10),
+        (&b"b"[..], &b"hidden1"[..], 11),
+    ] {
+        let ops = edit_ops(&mut bob, channel, outer, key, v);
+        submit(&mut r, conn, ops);
+    }
+    r.take_outbox(conn);
+    // alice writes into the same subtree — the control, whose ids the frame never
+    // names.
+    submit(
+        &mut r,
+        alice,
+        alice_doc.transact(|tx| {
+            tx.map(b"b").register(b"alice", Scalar::Int(7));
+        }),
+    );
+    r.take_outbox(alice);
+
+    let (mut back, conn2, channel2, replies) = bob_session(&mut r, b"t-bob2");
+    assert!(
+        frontier_in(&replies).is_some(),
+        "the restart was not redacted, so this measures nothing",
+    );
+
+    // alice opens the subtree, and bob reconnects: a session outlives its
+    // connections, so the resume rides a fresh one and asks from the cursor the
+    // redacted catch-up left it on.
+    submit(
+        &mut r,
+        alice,
+        alice_grant(&mut alice_doc, Capability::Read, &encode_path(&[b"b"])),
+    );
+    r.take_outbox(alice);
+    r.take_outbox(conn2);
+    let conn3 = r.connect();
+    assert!(r.deliver(conn3, back.hello()));
+    assert!(r.deliver(conn3, back.auth(b"t-bob")));
+    let resume = back.resume(channel2).expect("the channel is held");
+    assert!(r.deliver(conn3, resume));
+    for reply in r.take_outbox(conn3) {
+        back.receive(reply).expect("the session folds its replies");
+    }
+
+    let doc = back.document(channel2).expect("the channel is held");
+    assert_eq!(
+        nested(doc, b"b", b"alice"),
+        Some(7),
+        "an author the frame never named did not fold on the re-serve",
+    );
+    assert_eq!(
+        nested(doc, b"b", b"hidden0"),
+        Some(10),
+        "the reader's own withheld op was dropped as a replay",
+    );
+    assert_eq!(
+        nested(doc, b"b", b"hidden1"),
+        Some(11),
+        "the reader's own withheld op was dropped as a replay",
     );
 }

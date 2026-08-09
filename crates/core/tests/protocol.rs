@@ -290,6 +290,7 @@ fn frontier_round_trips() {
     round_trips(Message::Frontier {
         channel: Channel(3),
         seqs: vec![0, 1, u64::MAX],
+        reach: 4_200_000,
     });
 }
 
@@ -298,6 +299,7 @@ fn frontier_round_trips_an_empty_run() {
     round_trips(Message::Frontier {
         channel: Channel(0),
         seqs: Vec::new(),
+        reach: 0,
     });
 }
 
@@ -306,6 +308,7 @@ fn a_truncated_frontier_is_an_error() {
     let bytes = encode_message(&Message::Frontier {
         channel: Channel(1),
         seqs: vec![4, 5],
+        reach: 9,
     });
     assert_eq!(
         decode_message(&bytes[..bytes.len() - 1]),
@@ -320,8 +323,10 @@ fn a_frontier_count_beyond_its_body_is_an_error() {
     let mut bytes = encode_message(&Message::Frontier {
         channel: Channel(1),
         seqs: vec![7],
+        reach: 3,
     });
-    bytes[5..9].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+    // The count follows the tag, the channel and the reach.
+    bytes[13..17].copy_from_slice(&1_000_000_000u32.to_le_bytes());
     assert_eq!(decode_message(&bytes), Err(ProtocolError::UnexpectedEof));
 }
 
