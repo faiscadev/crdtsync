@@ -518,12 +518,14 @@ impl Room {
 }
 
 /// Whether `actor` may stand as the doc-ACL authority root of a room whose server
-/// sequence is `head` — who may be *established* as a root, in one place, for every
-/// seam that establishes one. That is [`Hub::ensure_creator`] and only it, which is
-/// what a client's write, a peer's `Replicate` and the metadata-only `ReplicateMeta`
-/// all compose through, so the rule is stated once rather than bolted onto the client
-/// seam with the replication path left judging by another. Set-once is the separate
-/// question of whether a root already stands.
+/// sequence is `head` — the room-level half of who may be established as a root, in one
+/// place, for every seam that takes an *actor's* word for one. That is
+/// [`Hub::ensure_creator`], which a client's write, a peer's `Replicate` and the
+/// metadata-only `ReplicateMeta` all compose through, so the rule is stated once rather
+/// than bolted onto the client seam with the replication path left judging by another.
+/// Two other seams install a root without passing here — a snapshot install and the
+/// durable record read back off the store — and both are named below. Set-once is the
+/// separate question of whether a root already stands.
 ///
 /// An [anonymous](crate::acl::is_authenticated) actor never may: an anonymous id is
 /// ephemeral per-connection, so the set-once root would wedge the room's authority on
@@ -536,6 +538,17 @@ impl Room {
 /// materialises the room, appends nothing, persists nothing and answers `Ok`, so the
 /// first authenticated actor to send a no-op batch at an unestablished room owned it,
 /// having authored no byte the room retains (C99).
+///
+/// **This is one of two conditions, and alone it closes only half the defect.** It is a
+/// rule about the *room*, so it says nothing once the room has reached a sequence — and
+/// a room that holds content with **no root** is a real state, left by an anonymous
+/// establishing commit or by a replica whose best-effort metadata write was lost (C55's
+/// two routes). There, a frame carrying nothing satisfies this rule and would take `/`
+/// over content its sender had no part in. The condition that refuses it is a statement
+/// about what the *batch* offered, so it lives at the client write seam
+/// (`session.rs`, `handle_ops`) rather than here: the replication callers adopt a root
+/// established elsewhere and `ReplicateMeta` is by construction the frame with no batch
+/// beneath it, so neither can state it and neither should.
 ///
 /// **The rule stops here, and the two seams it deliberately does not reach were
 /// measured rather than argued.** A root also arrives *with a state* — a snapshot
@@ -564,18 +577,19 @@ impl Room {
 /// The rule is about the **room**, not about the batch that reached it. A write that
 /// the room's dedup swallows whole still roots a room that already holds ops (the shape
 /// C55 built [`Message::ReplicateMeta`](crdtsync_core::Message::ReplicateMeta) to
-/// replicate), deliberately — and the trade is the *shape*, not that the refusal would
-/// buy nothing. It would buy attributability: the fresh-op route leaves an op in the
-/// log under the taker's `ClientId` and claims that identity, where the deduped route
-/// appends nothing and leaves the room's own state with no record of who took `/`. What
-/// it costs is C55's route 1, whose only shape is a root established by a write the
-/// dedup swallowed whole, against an attacker who pays one op to route around it. C23
-/// ruled the other way one tier down, for the replica-identity claim, where the act
-/// *is* the taking of an identity another replica's historic ops wrote; a root is the
-/// room's, not another actor's, so the same act does not carry the same theft. And the
-/// room-level rule is the only form of the condition the replication seams can state at
-/// all, since a root arriving on `ReplicateMeta` has no batch beneath it by
-/// construction.
+/// replicate), deliberately — and the line is drawn at what the batch *presented*, not
+/// at what landed. A resend presents the room's content, which only a replica holding
+/// it can do and which an attacker must therefore obtain; an empty frame presents
+/// nothing and costs its sender nothing, which is why the two are not the same act
+/// however alike their effect on the log. The refusal of the resend would still buy
+/// attributability — the fresh-op route leaves an op under the taker's `ClientId` and
+/// claims that identity, the deduped route leaves the room's state with no record of
+/// who took `/` — and what it would cost is C55's route 1, whose only shape is a root
+/// established by a write the dedup swallowed whole, against an attacker who pays one
+/// op to route around it. C23 ruled the other way one tier down, for the
+/// replica-identity claim, where the act *is* the taking of an identity another
+/// replica's historic ops wrote; a root is the room's, not another actor's, so the same
+/// act does not carry the same theft.
 fn may_stand_as_root(actor: &[u8], head: u64) -> bool {
     crate::acl::is_authenticated(actor) && head > 0
 }
@@ -2550,10 +2564,12 @@ impl Hub {
     /// metadata. Set-once: a room keeps its first writer as creator, so a later
     /// caller never displaces it. A no-op for an unknown room, and for an actor
     /// [`may_stand_as_root`] refuses — an anonymous one, and any actor at a room at
-    /// sequence zero, so a no-op batch cannot reserve a document's authority (C99).
-    /// This is the seam every root *establishment* composes through — a client's write,
-    /// a peer's `Replicate`, and the metadata-only `ReplicateMeta` — so all three are
-    /// judged alike. Set-once and the anonymous rule decide a root arriving with an
+    /// sequence zero, so a no-op frame cannot mint a room and own it (C99). This is the
+    /// seam every *actor-asserted* root composes through — a client's write, a peer's
+    /// `Replicate`, and the metadata-only `ReplicateMeta` — so all three are judged
+    /// alike. It is not the whole of C99's answer: refusing a no-op frame at a room
+    /// that already holds content is a statement about the batch, which only the client
+    /// seam can make, and it makes it there. Set-once and the anonymous rule decide a root arriving with an
     /// installed snapshot and one read back off the store too; the sequence rule does
     /// not, and [`may_stand_as_root`] records why. An install expresses set-once by
     /// composing against the standing root rather than guarding on its absence; the

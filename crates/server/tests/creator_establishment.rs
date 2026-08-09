@@ -251,6 +251,57 @@ fn an_authenticated_resend_roots_a_room_that_already_retains_a_write() {
     );
 }
 
+#[test]
+fn an_empty_frame_does_not_take_a_rootless_rooms_authority() {
+    // The room-level condition alone leaves the defect standing where it bites hardest.
+    // A room that holds content and has no root is a real state, not a corner: an
+    // anonymous establishing commit leaves one (C55 route 1), and so does a replica
+    // whose best-effort metadata write was lost (route 2). There the room has long
+    // reached a sequence, so a frame carrying *nothing* would satisfy the room rule and
+    // take `/` over content its sender had no part in — needing no knowledge of the
+    // room at all, unlike the resend the rule does admit.
+    let mut r = Registry::new(cid(0xFF));
+    let ghost = anonymous_writer(&mut r, 1);
+    assert!(r.deliver(
+        ghost,
+        Message::Ops {
+            channel: CH,
+            ops: batch(1, OPEN)
+        }
+    ));
+    assert_eq!(
+        r.hub().room_creator(ROOM),
+        None,
+        "an anonymous actor roots nothing, so the room holds content and no root",
+    );
+    let before = r.hub().seq(ROOM);
+    assert!(before > 0, "the room holds content");
+
+    let mallory = writer(&mut r, 2, b"mallory");
+    assert!(r.deliver(mallory, empty_ops()));
+    assert_eq!(r.hub().seq(ROOM), before, "the frame carried nothing");
+    assert_eq!(
+        r.hub().room_creator(ROOM),
+        None,
+        "a frame carrying nothing took the room's authority",
+    );
+
+    // And the room's own author still can: the refusal narrows who establishes the
+    // root, it does not lock the room out of ever having one.
+    let alice = writer(&mut r, 3, b"alice");
+    assert!(r.deliver(
+        alice,
+        Message::Ops {
+            channel: CH,
+            ops: batch(3, SECRET)
+        }
+    ));
+    assert_eq!(
+        r.hub().room_creator(ROOM).as_deref(),
+        Some(b"alice".as_slice()),
+    );
+}
+
 // --- what the reservation was worth: authority over the document ---
 
 /// A single node holding `SCHEMA` and an abstaining deployment ACL, so the schema and
@@ -670,9 +721,14 @@ fn a_durable_root_survives_a_reload_of_a_room_left_at_sequence_zero() {
         hub.ingest(ROOM, batch(1, OPEN), None)
             .expect("the write lands");
         assert!(hub.ensure_creator(ROOM, b"alice"));
-        hub.install_snapshot(ROOM, &empty_state(), 0, None)
+        // The install lands *content* at floor zero, so what a reload would drop the
+        // root over is a room holding a whole document — the inert-deny harm, not a
+        // bookkeeping one. An empty state here would prove only that a root over
+        // nothing survives a restart, which is the reservation this unit refuses.
+        hub.install_snapshot(ROOM, &state_with_a_write(), 0, None)
             .expect("the state decodes");
         assert_eq!(hub.seq(ROOM), 0);
+        assert!(hub.get(ROOM, OPEN).is_some(), "the room holds content");
     }
     let hub = Hub::from_rooms(
         cid(0xFF),
@@ -683,11 +739,13 @@ fn a_durable_root_survives_a_reload_of_a_room_left_at_sequence_zero() {
     )
     .expect("the record loads");
     let root = hub.room_creator(ROOM);
+    let content = hub.get(ROOM, OPEN).is_some();
     let _ = std::fs::remove_dir_all(&dir);
+    assert!(content, "the room came back holding its content");
     assert_eq!(
         root.as_deref(),
         Some(b"alice".as_slice()),
-        "the reload dropped a root the room was legitimately established with",
+        "the reload dropped a root over content the room still holds, leaving every deny in it inert",
     );
 }
 
