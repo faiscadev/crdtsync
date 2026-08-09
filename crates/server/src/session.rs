@@ -1286,12 +1286,13 @@ pub fn step(
         // not read contributes no change at all rather than a redacted one — with the
         // one exception the projections themselves carry, a *container* the live walk
         // does not reach, which they still serve (C67).
-        // Served locally from the replicated state, so no leader redirect. A version
-        // or branch that does not materialize answers `NotFound`, and a materialized
-        // side that fails to decode `Internal`;
-        // neither closes. A side is archived or reconstructed state — a version's
+        // Served locally from the replicated state, so no leader redirect — which is
+        // also what makes every answer a statement about this node's own state (C99).
+        // A name the room does not have answers `NotFound`; a branch this node cannot
+        // read, and a materialized side that fails to decode, answer `Internal`. None
+        // of them closes. A side is archived or reconstructed state — a version's
         // captured bytes, a branch's folded stream, the live replica for `main` — and
-        // one of them failing to decode is a server-side fault this channel's live
+        // one of them being unreadable is a server-side fault this channel's live
         // stream survives, which is the reading the version fetch already takes.
         Message::DiffQuery {
             channel,
@@ -2341,18 +2342,20 @@ fn request_denied(session: &Session, what: &str) -> Response {
     }
 }
 
-/// Map a [`DiffError`] to the client failure it surfaces. A version or branch that
-/// does not materialize is a recoverable `NotFound` — usually a name the room does
-/// not have, though a branch whose durable base this node cannot read reaches it too
-/// (C51). A materialized state that fails to decode is an `Internal` fault, since
-/// nothing the client sent caused it. Neither closes: a diff's sides are archived or
+/// Map a [`DiffError`] to the client failure it surfaces. A version or branch the
+/// room does not have is a recoverable `NotFound` — a name the client can correct.
+/// A branch the room *does* have whose state this node cannot read is an `Internal`
+/// fault, as is a materialized state that fails to decode: nothing the client sent
+/// caused either, and a branch `BranchList` enumerates is not a name the client can
+/// correct (C51) — the code the subscribe seam gives a branch stream it cannot
+/// resolve a redaction index for. None of them closes: a diff's sides are archived or
 /// reconstructed state, so one of them being unreadable is a server-side fault the
 /// channel's live stream survives — the reading the version fetch takes of the
 /// version bytes, generalized.
 fn diff_error(e: DiffError) -> Response {
     let code = match e {
         DiffError::UnknownVersion(_) | DiffError::UnknownBranch(_) => ErrorCode::NotFound,
-        DiffError::Decode => ErrorCode::Internal,
+        DiffError::UnreadableBranch(_) | DiffError::Decode => ErrorCode::Internal,
     };
     Response {
         replies: vec![Message::Error {

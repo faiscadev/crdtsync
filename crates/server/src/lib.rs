@@ -86,14 +86,26 @@ pub const MAIN_BRANCH: &[u8] = b"main";
 pub const PUBLISHED_BRANCH: &[u8] = b"published";
 
 /// Why a snapshot diff could not be computed. A diff runs the core engine over
-/// two decoded whole-replica states; either a named version or branch is absent,
-/// or a snapshot's encoded state does not decode into a document.
+/// two decoded whole-replica states; a named version or branch is absent, a branch
+/// this node holds is one whose state it cannot read, or a snapshot's encoded state
+/// does not decode into a document.
+///
+/// Absence and unreadability are separate answers because they are separate
+/// situations for the client (C51): a name the room does not have is the client's to
+/// correct, while a branch the room enumerates and this node cannot state is a
+/// server-side fault no request the client can phrase gets past.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffError {
     /// A named version the room does not have.
     UnknownVersion(Vec<u8>),
     /// A branch the room does not have.
     UnknownBranch(Vec<u8>),
+    /// A branch the room has, whose state this node cannot read: a durable snapshot
+    /// base that no longer decodes, or a live-log fork whose shared base `main`'s
+    /// retained log no longer covers. The second needs no damage — a compaction, or a
+    /// state transfer installing a replica at a raised floor, reaches it in ordinary
+    /// operation, and the defect under it is C88's.
+    UnreadableBranch(Vec<u8>),
     /// A snapshot's encoded state failed to decode into a document.
     Decode,
 }
@@ -107,12 +119,35 @@ impl std::fmt::Display for DiffError {
             DiffError::UnknownBranch(name) => {
                 write!(f, "unknown branch {}", String::from_utf8_lossy(name))
             }
+            DiffError::UnreadableBranch(name) => write!(
+                f,
+                "branch {} has no state this node can read",
+                String::from_utf8_lossy(name)
+            ),
             DiffError::Decode => write!(f, "a snapshot's state failed to decode"),
         }
     }
 }
 
 impl std::error::Error for DiffError {}
+
+/// What a `(room, branch)` stream materializes to — the answer
+/// [`Hub::materialize_branch`] hands its callers. The three non-states are three
+/// different facts about the stream, and the callers are told them apart (C51).
+enum BranchState {
+    /// The stream's whole-replica state, encoded.
+    State(Vec<u8>),
+    /// `main` on a room this node holds no replica for: locally that stream folds to
+    /// the empty document. Distinct from a stream this node cannot read — nothing
+    /// here failed to fold.
+    Empty,
+    /// A branch the room's registry does not hold.
+    Absent,
+    /// A branch the room's registry holds, whose base this node cannot read — a
+    /// damaged owned base, or a shared base `main`'s retained log no longer covers,
+    /// which needs no damage at all.
+    Unreadable,
+}
 
 /// Decode two encoded whole-replica states and diff them with the core engine. A
 /// state that does not decode is [`DiffError::Decode`]; identical states diff to
@@ -1790,11 +1825,14 @@ impl Hub {
 
     /// The document the `(room, branch)` **stream** serves — `main`'s live replica, or
     /// a named branch's own tree: its shared or owned base with its divergent tail
-    /// folded in. `None` when the stream has no tree to serve: an unknown room or
-    /// branch, or a branch whose owned base does not decode. A caller that redacts owes
-    /// that `None` a refusal — the two indexes it could reach for instead resolve *less*
-    /// than the truth, and a scope or an op target that resolves to nothing is admitted,
-    /// not withheld.
+    /// folded in. `None` when the stream has no tree to serve: `main` on a room this
+    /// node holds no replica for, a branch the room's registry does not hold, a branch
+    /// whose owned base does not decode, or a live-log fork whose shared base `main`'s
+    /// floor has passed (C88). A caller that redacts owes that `None` a refusal — the two
+    /// indexes it could reach for instead resolve *less* than the truth, and a scope or
+    /// an op target that resolves to nothing is admitted, not withheld. A caller that
+    /// needs those cases apart resolves the name first, as
+    /// [`materialize_branch`](Hub::materialize_branch) does (C51).
     ///
     /// Every redaction decision is made against the state being served (C28), and on a
     /// branch that state is **not** `main`: a branch owns its base — a captured version,
@@ -2526,14 +2564,24 @@ impl Hub {
     /// each branch materialized (shared base plus divergent tail, or its owned
     /// snapshot base), narrowed by `narrow`, then fed to the core engine, so a
     /// branch against its fork source yields only the divergence. Diffing a branch
-    /// against itself is empty. A branch that does not materialize is
-    /// [`DiffError::UnknownBranch`] — which today covers more than an unknown name,
-    /// since [`materialize_branch`](Hub::materialize_branch) also answers `None` for a
-    /// branch whose durable base this node cannot read, and for `main` on a room it
-    /// holds no state for (C51), or a live-log fork whose shared base `main`'s
-    /// compaction has dropped (C88). A *materialized* state that does not decode is
-    /// [`DiffError::Decode`]. `narrow` is the reader's redaction, as in
-    /// [`Hub::diff_versions`].
+    /// against itself is empty.
+    ///
+    /// A name the room's registry does not hold is [`DiffError::UnknownBranch`]; a
+    /// branch it *does* hold whose base this node cannot read is
+    /// [`DiffError::UnreadableBranch`] — a durable base that no longer decodes (C15),
+    /// or a live-log fork whose shared base `main`'s compaction has dropped (C88).
+    /// `main` on a room this node holds no replica for diffs as the empty state this
+    /// node holds for it, rather than as a missing branch (C51). A *materialized*
+    /// state that does not decode is [`DiffError::Decode`]. `narrow` is the reader's
+    /// redaction, as in [`Hub::diff_versions`].
+    ///
+    /// Every answer here is about the state *this node* holds, since the read takes no
+    /// leader redirect: on a follower — which replicates `main` alone — a branch the
+    /// leader holds is absent, and on a node holding no replica for a room at all,
+    /// `main` is empty. A channel only binds where this node serves the read itself,
+    /// which is the room's leader, promoted or not — and there the live stream is
+    /// served empty too, so the change list stays the diff of two states this reader
+    /// would itself have been handed. What is missing is the routing, which is C99's.
     pub fn diff_branches(
         &mut self,
         room: &[u8],
@@ -2541,12 +2589,8 @@ impl Hub {
         b: &[u8],
         narrow: impl Fn(Vec<u8>) -> Vec<u8>,
     ) -> Result<Vec<Change>, DiffError> {
-        let old = self
-            .materialize_branch(room, a)
-            .ok_or_else(|| DiffError::UnknownBranch(a.to_vec()))?;
-        let new = self
-            .materialize_branch(room, b)
-            .ok_or_else(|| DiffError::UnknownBranch(b.to_vec()))?;
+        let old = self.diff_side(room, a)?;
+        let new = self.diff_side(room, b)?;
         diff_states(&narrow(old), &narrow(new))
     }
 
@@ -2883,7 +2927,12 @@ impl Hub {
         if source == published {
             return Ok(false);
         }
-        let Some(state) = self.materialize_branch(room, &source) else {
+        // Only a materialized state is publishable. An unreadable source would freeze
+        // an empty replica over the target's base and into a permanent capture, and a
+        // `main` this node holds no replica for stands for a room it cannot speak for.
+        // The diff seam tells those two apart, since it can report the second honestly
+        // (C51); a publish, which writes, can do nothing with either.
+        let BranchState::State(state) = self.materialize_branch(room, &source) else {
             return Ok(false);
         };
         // The editor sequence being published — the source branch's head — names the
@@ -2982,27 +3031,65 @@ impl Hub {
     /// The whole-replica state of `(room, branch)` — the bytes a publish freezes
     /// onto the published branch. `main` is the room's live replica; a named branch
     /// folds its own stream (shared base plus divergent tail, or its owned snapshot
-    /// base) into one state. `None` for an unknown room or branch.
+    /// base) into one state.
     ///
     /// The fold is [`fold_stream`](Hub::fold_stream)'s, the one the redaction index also
     /// walks — what a publish freezes and what a read is narrowed by are the same stream,
-    /// and there is one statement of what that stream is. `None` for an unservable one:
-    /// folding it into a fresh document would materialize an *empty* replica, and the
-    /// publish path writes what it is handed straight over the target branch's base and
-    /// its captured version, so answering `None` is what keeps a stream this node cannot
-    /// read from destroying the branch it names.
-    fn materialize_branch(&mut self, room: &[u8], branch: &[u8]) -> Option<Vec<u8>> {
+    /// and there is one statement of what that stream is.
+    ///
+    /// Three ways there are no materialized bytes, and they are three different facts
+    /// about the stream rather than one (C51), so the callers are told them apart:
+    /// [`Absent`](BranchState::Absent) is a name the room's registry does not hold,
+    /// [`Unreadable`](BranchState::Unreadable) a branch it does hold whose base this
+    /// node cannot read, and [`Empty`](BranchState::Empty) `main` on a room this node
+    /// holds no replica for — every subscribed-but-never-written room, and a stream
+    /// that folds rather than one that fails to.
+    ///
+    /// Only [`State`](BranchState::State) is publishable. Folding an unreadable stream
+    /// into a fresh document would materialize an *empty* replica, and the publish path
+    /// writes what it is handed straight over the target branch's base and its captured
+    /// version, so a clipped shared base would freeze the loss instead of exposing it
+    /// (C88). Refusing is recoverable; the capture is not.
+    fn materialize_branch(&mut self, room: &[u8], branch: &[u8]) -> BranchState {
         if branch == MAIN_BRANCH {
-            return self.export_room(room);
+            // `main` is on every room's branch list, held or not, so it is never an
+            // absent name. With no replica behind it, its stream folds to the empty
+            // document — which is a state, not a missing one.
+            return match self.export_room(room) {
+                Some(state) => BranchState::State(state),
+                None => BranchState::Empty,
+            };
+        }
+        // A named branch is in the room's registry or nowhere; `main`, the one name the
+        // observed set synthesizes, is answered above.
+        if !self
+            .branches
+            .get(room)
+            .is_some_and(|registry| registry.branch(branch).is_some())
+        {
+            return BranchState::Absent;
         }
         // The tree the stream serves, which is also the tree its reads are redacted
         // against — one fold, so what a publish freezes and what a read is narrowed by
-        // cannot describe different streams. A stream this node cannot state answers
-        // `None` rather than a substitute: a publish writes what it folds over the target
-        // branch's base *and* captures it as a permanent version, so a clipped shared
-        // base would freeze the loss instead of exposing it (C88). Refusing is
-        // recoverable; the capture is not.
-        self.stream_doc(room, branch).map(Document::encode_state)
+        // cannot describe different streams. The name resolved above, so a stream with
+        // no tree is one this node cannot read rather than one that does not exist.
+        match self.stream_doc(room, branch) {
+            Some(doc) => BranchState::State(doc.encode_state()),
+            None => BranchState::Unreadable,
+        }
+    }
+
+    /// The whole-replica state a diff reads for `(room, branch)`: the materialized
+    /// state, or the empty document that stands for a `main` this node holds no
+    /// replica for. A branch with no readable state at all is the [`DiffError`]
+    /// naming why.
+    fn diff_side(&mut self, room: &[u8], branch: &[u8]) -> Result<Vec<u8>, DiffError> {
+        match self.materialize_branch(room, branch) {
+            BranchState::State(state) => Ok(state),
+            BranchState::Empty => Ok(Document::new(self.server).encode_state()),
+            BranchState::Absent => Err(DiffError::UnknownBranch(branch.to_vec())),
+            BranchState::Unreadable => Err(DiffError::UnreadableBranch(branch.to_vec())),
+        }
     }
 
     /// Apply `change` to `room`'s registry, persisting the result before it
