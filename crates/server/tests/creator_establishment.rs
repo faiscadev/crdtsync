@@ -302,6 +302,47 @@ fn an_empty_frame_does_not_take_a_rootless_rooms_authority() {
     );
 }
 
+#[test]
+fn a_batch_of_ops_no_replica_can_hold_presents_nothing_either() {
+    // What makes "presented an op" more than a formality: a batch whose ops are
+    // inadmissible lands nothing and costs its sender nothing to fabricate, so if it
+    // reached the establishment seam it would be the empty frame under another name.
+    // It does not — the session refuses such a batch recoverably before the ingest —
+    // and that ordering is what this pins, since a reader has no other way to tell
+    // whether the condition above can be satisfied for free.
+    let mut r = Registry::new(cid(0xFF));
+    let ghost = anonymous_writer(&mut r, 1);
+    assert!(r.deliver(
+        ghost,
+        Message::Ops {
+            channel: CH,
+            ops: batch(1, OPEN)
+        }
+    ));
+    let before = r.hub().seq(ROOM);
+    assert!(before > 0 && r.hub().room_creator(ROOM).is_none());
+
+    // An op whose stamp names a client other than its author: admissible-forever's
+    // complement, a pure function of the op, so every replica refuses it.
+    let mallory = writer(&mut r, 2, b"mallory");
+    let mut ops = batch(2, SECRET);
+    for op in ops.iter_mut() {
+        op.stamp.client = cid(9);
+    }
+    assert!(r.deliver(mallory, Message::Ops { channel: CH, ops }));
+    let out = r.take_outbox(mallory);
+    assert!(
+        out.iter().any(refusal),
+        "the batch was admitted rather than refused: {out:?}",
+    );
+    assert_eq!(r.hub().seq(ROOM), before, "it landed nothing");
+    assert_eq!(
+        r.hub().room_creator(ROOM),
+        None,
+        "a batch no replica can hold took the room's authority",
+    );
+}
+
 // --- what the reservation was worth: authority over the document ---
 
 /// A single node holding `SCHEMA` and an abstaining deployment ACL, so the schema and
