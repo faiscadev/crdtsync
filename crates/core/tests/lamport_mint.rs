@@ -50,9 +50,10 @@ use crdtsync_core::doc::Document;
 use crdtsync_core::list::Side;
 use crdtsync_core::op::Op;
 use crdtsync_core::path;
+use crdtsync_core::scalar::INLINE_MAX;
 use crdtsync_core::schema::Schema;
 use crdtsync_core::stamp::{LAMPORT_STATE_CEILING, LAMPORT_WIRE_CEILING};
-use crdtsync_core::{ClientId, Element, OpKind, Scalar, Stamp};
+use crdtsync_core::{ClientId, Element, Host, OpKind, Scalar, Stamp};
 
 mod common;
 use common::{cid, with_only_zone_clock, with_root_clock, with_stamp_high_water};
@@ -1479,7 +1480,37 @@ fn an_edit_that_resolves_to_nothing_is_not_a_refusal() {
         "a mark over an absent sequence reported the previous refusal"
     );
 
+    // A blob too large to inline is the one inert answer that is *also* a value the
+    // caller reads — the bool it drives says whether to upload out of band — so a
+    // stale refusal underneath it would be read as this call's.
+    refuse(&mut doc);
+    let big = vec![0u8; INLINE_MAX + 1];
+    assert!(path::set_blob(
+        &mut doc,
+        &nowhere,
+        &BlobHost,
+        "application/octet-stream",
+        &big
+    )
+    .is_none());
+    assert!(
+        !doc.mint_refused(),
+        "a blob over the inline ceiling reported the previous refusal"
+    );
+
     // And the replica really did still have room throughout.
     assert!(!path::text_insert(&mut doc, &text, 0, "z").is_empty());
     assert!(!doc.mint_refused());
+}
+
+// A blob handle is minted from entropy; the value is irrelevant here, only that a
+// host is available to mint one.
+struct BlobHost;
+impl Host for BlobHost {
+    fn entropy(&self, buf: &mut [u8]) {
+        buf.fill(7);
+    }
+    fn now_unix_millis(&self) -> u64 {
+        0
+    }
 }

@@ -802,10 +802,15 @@ func (m *CrdtMap) GetXml(key string) *CrdtXml {
 }
 
 // SetBlob stores a small blob inline at key, minting its public handle. Returns
-// false when data exceeds the inline ceiling — upload it out of band with
-// UploadBlob and set the returned handle via SetBlobRef — and false when the
-// replica could not mint the ids the write needed, since neither stored the
-// blob. Doc.Err distinguishes them: it is ErrMintExhausted only for the second.
+// false when the replica could not mint the ids the write needed, and false on a
+// local document when data exceeds the inline ceiling — upload that out of band
+// with UploadBlob and set the returned handle via SetBlobRef. Doc.Err reports
+// ErrMintExhausted for the first and nil for the second.
+//
+// The size reading is the local document's. A networked Doc derives it from the
+// frame its edit surface returns, and that frame is non-empty even for an edit
+// that enqueued nothing, so an over-size blob there reads as stored. Filed as
+// C109; the mint reading is correct against either backend.
 func (m *CrdtMap) SetBlob(key, mime string, data []byte) bool {
 	slot := m.slot(key)
 	ok := false
