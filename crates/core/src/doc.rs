@@ -3223,8 +3223,9 @@ impl Document {
     /// `false` covers three unrelated situations, and only the last is permanent:
     /// the op is already applied or already held (a duplicate); it is admissible but
     /// not applicable yet, so it is buffered and replays once a create makes its
-    /// target reachable or its transaction group completes; or it is one
-    /// [`Op::is_admissible`] refuses, which no later arrival changes. A caller that
+    /// target reachable or its transaction group resolves — by completing, or by its
+    /// members disagreeing so its key is spent; or it is one [`Op::is_admissible`]
+    /// refuses, which no later arrival changes. A caller that
     /// must tell "not yet" from "never" — an ingest seam deciding what to log, dedup
     /// and acknowledge — asks the op, since the refusal is a function of the op
     /// alone and never of this document's state.
@@ -3624,11 +3625,12 @@ impl Document {
                 self.apply_now(&op);
                 progressed = true;
             }
-            // The buckets are read once per pass and handed to both group rules, so
-            // spending a key and committing a group cannot disagree about what the
-            // buffer holds. Spending untags members, which leaves the map describing
-            // tags the buffer no longer carries; a pass that spends one therefore
-            // leaves the commit to the next rather than reasoning about that.
+            // Read once per pass and handed to both group rules, so spending a key
+            // and committing a group cannot disagree about what the buffer holds. A
+            // pass that spends one takes the next pass to commit, which is the drain's
+            // ordinary fixpoint rather than a rule: the map a spend leaves behind
+            // describes tags the buffer no longer carries, and re-reading it is
+            // cheaper to justify than reasoning about which of its entries survived.
             let groups = self.tx_buckets();
             if self.resolve_disagreeing_tx(&groups) {
                 progressed = true;
@@ -6156,7 +6158,7 @@ impl Op {
     /// than splitting over it. That is what makes rejecting it safe, and it is the
     /// line an ingest seam needs: an admissible op that does not apply yet is
     /// *waiting* — held until a create makes its target reachable or its
-    /// transaction group completes — so it is state worth logging, fanning out and
+    /// transaction group resolves — so it is state worth logging, fanning out and
     /// acknowledging, while an inadmissible one is worth none of those. Admissible
     /// says only that no rule forbids the op outright; it does not promise the op
     /// applies, and an already-applied op stays admissible.

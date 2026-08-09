@@ -775,12 +775,14 @@ fn rewritten_group_counts_converge_under_every_order() {
             );
         }
 
-        // A rewrite of a *minority* of each group is the cheapest of the shapes and
-        // the only one a subset can complete around: every member but the last is
-        // rewritten to declare one fewer, so those members are unanimous among
-        // themselves and reach their own size before the dissenter lands. Delivered
-        // the other way the bucket disagrees from the start. Both halves of that
-        // arrival space have to read the same, on the ops alone.
+        // A rewrite that leaves a *unanimous remainder whose size is exactly what it
+        // now declares* is the only shape a subset can complete around: every member
+        // but the last is rewritten to declare one fewer, so the rewritten members
+        // are unanimous among themselves and reach their own size before the
+        // dissenter lands. Delivered the other way the bucket disagrees from the
+        // start. Both halves of that arrival space have to read the same, on the ops
+        // alone — and, since a disagreement now spends its key, eviction has to find
+        // nothing left to do.
         let minority = rewrite_all_but_last(&pool);
         assert!(
             minority.iter().zip(&pool).any(|(f, o)| f.tx != o.tx),
@@ -788,6 +790,10 @@ fn rewritten_group_counts_converge_under_every_order() {
         );
         let held = converge_shuffled(&minority, 100, 1, &mut Rng::new(seed));
         let reference = converge_evicting(&minority, 100, &mut Rng::new(seed));
+        assert_eq!(
+            held, reference,
+            "seed {seed}: a minority rewrite left something for eviction"
+        );
         for round in 0..shuffles {
             assert_eq!(
                 converge_shuffled(&minority, 180 + round as u8, 1, &mut rng),

@@ -682,7 +682,7 @@ impl WasmDocument {
     ///
     /// **The two zeros mean opposite things.** An op that did not apply may be a
     /// duplicate, or be *waiting* — buffered until a create makes its target
-    /// reachable or its transaction group completes, which a later arrival does,
+    /// reachable or its transaction group resolves, which a later arrival does,
     /// including one later in this same batch, which `applied` does not count —
     /// while a refused op is a bug in whoever wrote it, and no arrival lifts it.
     /// The refusal is the stamp conditions [`Op::is_admissible`] names, the codec

@@ -1313,6 +1313,73 @@ fn two_envelopes_naming_different_groups_spend_both_keys() {
 /// record closes: it needs the two copies to name different groups, it is
 /// order-dependent on `main` before the record exists, and the record narrows it
 /// from a split in what a replica reads to a split in which keys it has spent.
+/// The **third** door into that same residue, and the one this unit opened. A
+/// second envelope is answerable only where the buffer is still *holding* the
+/// first copy, and a disagreement now takes a member out of the buffer — so
+/// whether the conflict rule fires at all became the delivery order's. Delivered
+/// with the contradiction ahead of the second envelope, the copy it would have
+/// disagreed with is already released and the second group's key is never spent;
+/// delivered the other way round both keys are spent. The members converge on
+/// eviction, and which keys each replica has spent does not — which is exactly
+/// C46's state, reached without a group ever completing. Closing it needs the same
+/// per-op-id evidence C46 is filed for: which group a member was released *under*,
+/// not merely that its key resolved. Pinned here so the door is a measured fact
+/// rather than a claim.
+#[test]
+fn a_copy_released_by_a_disagreement_leaves_the_second_envelope_nothing_to_contradict() {
+    let (mut a, group) = pair();
+    let t1 = tx_id(&group[0]);
+    let t2 = crdtsync_core::TxId(0x5eed_5eed_5eed_5eed);
+    // `x` under its own group, `y` contradicting it, and `x` again under a second
+    // group — every envelope admissible, none of them malformed.
+    let ops = [
+        retagged(&group[0], t1, 2),
+        retagged(&group[1], t1, 3),
+        retagged(&group[0], t2, 2),
+    ];
+
+    // The contradiction first: it releases `x`, so the second envelope is a plain
+    // duplicate of an applied id and `t2` is never spent.
+    let mut released = doc(9);
+    for i in [0, 1, 2] {
+        released.apply(&ops[i]);
+    }
+    // The second envelope first: the buffer is still holding `x` under `t1`, the
+    // conflict rule fires, and both keys are spent.
+    let mut contradicted = doc(9);
+    for i in [0, 2, 1] {
+        contradicted.apply(&ops[i]);
+    }
+    assert_ne!(
+        released.encode_state(),
+        contradicted.encode_state(),
+        "the two orders no longer differ — the third door has been closed, so this \
+         test and C46's filing need revisiting rather than deleting"
+    );
+    // Both readings agree on what a reader sees: the split is in the spent-key
+    // record, and every member has landed either way.
+    for key in [&b"x"[..], b"y"] {
+        assert_eq!(reg(&released, key), reg(&a, key));
+        assert_eq!(reg(&contradicted, key), reg(&a, key));
+    }
+
+    // And eviction leaves every order reading the same document, which is what
+    // keeps this a residue rather than a divergence a deployment sees.
+    let mut evicted: Option<Vec<Option<Scalar>>> = None;
+    for order in orderings(ops.len()) {
+        let mut d = doc(9);
+        for &i in &order {
+            d.apply(&ops[i]);
+        }
+        d.evict_partial_transactions();
+        let read: Vec<Option<Scalar>> = [&b"x"[..], b"y"].iter().map(|k| reg(&d, k)).collect();
+        match &evicted {
+            None => evicted = Some(read),
+            Some(first) => assert_eq!(&read, first, "order {order:?} read differently"),
+        }
+    }
+}
+
 /// Filed as its own unit (KANBAN C46).
 #[test]
 fn a_copy_absorbed_by_another_groups_bucket_strands_its_own_group_until_eviction() {
