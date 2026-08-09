@@ -675,7 +675,7 @@ fn a_version_mutation_on_a_replica_still_redirects() {
 fn a_version_read_on_an_unbound_channel_is_a_violation_not_a_redirect() {
     // Where the gate sits: above the authorization, below the channel. The channel is
     // what names the room a redirect would point at, so a request that never bound one
-    // is the protocol violation it always was rather than something to route.
+    // names no bound channel is a protocol violation, not something to route.
     let room = room_led_by_a_with_b_next();
     let mut follower = node(Some(B), &room);
     let bob = auth(&mut follower, 2, "t-bob");
@@ -703,12 +703,12 @@ fn a_version_read_on_an_unbound_channel_is_a_violation_not_a_redirect() {
 
 #[test]
 fn a_reader_whose_room_read_was_revoked_is_routed_before_it_is_refused() {
-    // What the ordering costs, stated as a test rather than left to be discovered. A
-    // reader who bound a channel and then lost its room read is told where the room
+    // What the ordering costs. A reader who bound a channel and then lost its room
+    // read is told where the room
     // is answered before it is told it may not read it — the redirect names a room
     // this client itself supplied at subscribe and a leader any authenticated actor
-    // can already resolve, so it discloses nothing the subscribe gate does not. On
-    // the node that does answer, the refusal is the one it always was.
+    // can already resolve, so it discloses nothing the subscribe gate does not. The
+    // node that does answer the read is the node that refuses it.
     let room = room_led_by_a_with_b_next();
     let mut follower = node(Some(B), &room);
     // Leadership flaps under the bound channel: B leads while bob subscribes, then A
@@ -730,12 +730,39 @@ fn a_reader_whose_room_read_was_revoked_is_routed_before_it_is_refused() {
         ResourceMatch::Room(room.clone()),
     );
     follower.set_authorizer(Box::new(revoked.clone()));
-    assert!(follower.deliver(bob, fetch(V1)));
-    assert_eq!(
-        follower.take_outbox(bob),
-        redirect_to_a(&room),
-        "the replica routes the read rather than deciding a gate it will not answer",
-    );
+    // Every channel-keyed frame of the seam takes the order, so every one is measured
+    // — a regression on any single frame is otherwise invisible.
+    for request in [
+        fetch(V1),
+        Message::VersionList { channel: CH },
+        Message::VersionCreate {
+            channel: CH,
+            name: b"v2".to_vec(),
+        },
+        Message::VersionRename {
+            channel: CH,
+            from: V1.to_vec(),
+            to: b"v2".to_vec(),
+        },
+        Message::VersionDelete {
+            channel: CH,
+            name: V1.to_vec(),
+        },
+        Message::DiffQuery {
+            channel: CH,
+            kind: DiffKind::Versions,
+            a: V1.to_vec(),
+            b: V1.to_vec(),
+        },
+    ] {
+        let named = format!("{request:?}");
+        assert!(follower.deliver(bob, request));
+        assert_eq!(
+            follower.take_outbox(bob),
+            redirect_to_a(&room),
+            "the replica decided a gate it will not answer, for {named}",
+        );
+    }
 
     // The leader, which does answer, refuses. Same order: bob binds while he may read,
     // and the grant goes away under the bound channel.

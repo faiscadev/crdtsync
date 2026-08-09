@@ -8,12 +8,11 @@
 //! replica, so what a replica holds decides what a partial reader landing there is
 //! served — through the op catch-up and the snapshot catch-up. A version fetch and a
 //! version diff are the room's leader's (C33), so the same question reaches those two
-//! one step later, on a replica a promotion has made that leader. Four seams that
-//! hand a reader a whole state, and every one of them narrows by the root. These pin that a
-//! replicated room carries its root and that each of those four narrows by it; that a
-//! promoted replica keeps the root rather than handing `/` to its first writer; that
-//! the root installs set-once through either frame and through the hub call; and which
-//! actors may stand as one.
+//! one step later, on a replica a promotion has made that leader. These pin that a
+//! replicated room carries its root and that each of those four state-serving seams
+//! narrows by it; that a promoted replica keeps the root rather than handing `/` to
+//! its first writer; that the root installs set-once through either frame and through
+//! the hub call; and which actors may stand as one.
 //!
 //! The schema tier is what makes the gap observable. It grants root read to any
 //! authenticated actor, so bob passes the room gate on both nodes, while alice's

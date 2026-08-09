@@ -1141,8 +1141,7 @@ pub fn step(
             versions_list(hub, channel, &room)
         }
         Message::VersionFetch { channel, name } => {
-            // The reader is resolved before the room, so the redaction below has the
-            // identity it narrows for without a second, unreachable lookup.
+            // The identity the redaction below narrows for.
             let Some(identity) = session.identity() else {
                 return channel_request_denied(session, channel, "version");
             };
@@ -1381,8 +1380,7 @@ pub fn step(
             a,
             b,
         } => {
-            // The reader is resolved before the room, so the redaction below has the
-            // identity it narrows for without a second, unreachable lookup.
+            // The identity each side's redaction narrows for.
             let Some(identity) = session.identity() else {
                 return channel_request_denied(session, channel, "diff");
             };
@@ -2398,9 +2396,8 @@ fn channel_authorized(
 }
 
 /// The refusal for a channel-keyed `what` request that [`bound_room`] or
-/// [`channel_authorized`] rejected: a
-/// violation if the connection is unauthenticated or the channel is unbound,
-/// otherwise a non-closing forbidden. `what` names the request kind (`"version"`,
+/// [`channel_authorized`] rejected: a violation if the connection is
+/// unauthenticated or the channel is unbound, otherwise a non-closing forbidden. `what` names the request kind (`"version"`,
 /// `"diff"`) so the diagnostic points at the surface the client actually used — the
 /// channel-bound counterpart of [`request_denied`].
 fn channel_request_denied(session: &Session, channel: Channel, what: &str) -> Response {
