@@ -665,13 +665,13 @@ fn atomic_groups_do_not_change_what_ops_merge_to() {
 /// sizes no arrival meets, and sizes a group's members do not share — and every
 /// replica must fold it to one state on the ops alone, before any eviction.
 ///
-/// Whether a *bucket* looks unreachable is a property of which of its members
-/// have landed, so nothing may be decided from it: a replica that released a
-/// bucket the moment its members disagreed would release a different set from one
-/// served the same ops in another order, and the member that arrived after the
-/// release would be held against a size its bucket had already given up on. Only
-/// a judgement on a member's own declared size is order-free. Eviction then has to
-/// leave them converged too, on whatever each was still holding.
+/// Whether a *bucket* ever holds a disagreement is a property of which of its
+/// members have landed — a rewritten subset that agrees among itself reaches its
+/// own declared size and commits before the dissenter arrives — so holding one is
+/// a decision the delivery order makes. A disagreement therefore resolves its key
+/// where a commit resolves it: every order releases the same members, and every
+/// member still to come is a stray of a spent key. Eviction then has to leave them
+/// converged too, on whatever each was still holding.
 #[test]
 fn rewritten_group_counts_converge_under_every_order() {
     let seeds = if cfg!(miri) { 1 } else { 60 };
@@ -774,7 +774,57 @@ fn rewritten_group_counts_converge_under_every_order() {
                 "seed {seed}: shuffle {round} diverged after eviction"
             );
         }
+
+        // A rewrite of a *minority* of each group is the cheapest of the shapes and
+        // the only one a subset can complete around: every member but the last is
+        // rewritten to declare one fewer, so those members are unanimous among
+        // themselves and reach their own size before the dissenter lands. Delivered
+        // the other way the bucket disagrees from the start. Both halves of that
+        // arrival space have to read the same, on the ops alone.
+        let minority = rewrite_all_but_last(&pool);
+        assert!(
+            minority.iter().zip(&pool).any(|(f, o)| f.tx != o.tx),
+            "seed {seed}: the relay rewrote no minority"
+        );
+        let held = converge_shuffled(&minority, 100, 1, &mut Rng::new(seed));
+        let reference = converge_evicting(&minority, 100, &mut Rng::new(seed));
+        for round in 0..shuffles {
+            assert_eq!(
+                converge_shuffled(&minority, 180 + round as u8, 1, &mut rng),
+                held,
+                "seed {seed}: shuffle {round} diverged on a minority rewrite"
+            );
+            assert_eq!(
+                converge_evicting(&minority, 180 + round as u8, &mut rng),
+                reference,
+                "seed {seed}: shuffle {round} diverged after eviction"
+            );
+        }
     }
+}
+
+/// `pool` with every member of each multi-member group except the last one it
+/// holds rewritten to declare one fewer — leaving a unanimous majority that can
+/// reach its own declared size and a single dissenting member that cannot.
+fn rewrite_all_but_last(pool: &[Op]) -> Vec<Op> {
+    let mut out = pool.to_vec();
+    let mut last: std::collections::HashMap<(crdtsync_core::ClientId, crdtsync_core::TxId), usize> =
+        std::collections::HashMap::new();
+    for (i, op) in out.iter().enumerate() {
+        if let Some(tx) = op.tx {
+            last.insert((op.id.client, tx.id), i);
+        }
+    }
+    for (i, op) in out.iter_mut().enumerate() {
+        let Some(tx) = op.tx else { continue };
+        if tx.count > 1 && last[&(op.id.client, tx.id)] != i {
+            op.tx = Some(crdtsync_core::Tx {
+                count: tx.count - 1,
+                ..tx
+            });
+        }
+    }
+    out
 }
 
 /// Deliver `ops` shuffled, then evict whatever the replica is still holding —

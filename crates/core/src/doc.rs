@@ -3624,6 +3624,9 @@ impl Document {
                 self.apply_now(&op);
                 progressed = true;
             }
+            if self.resolve_disagreeing_tx() {
+                progressed = true;
+            }
             // One complete atomic transaction: apply every member in seq order, so a
             // member that targets a container an earlier member creates reaches it on
             // the first pass. Order is a shortcut, not the mechanism — a member that
@@ -3805,6 +3808,35 @@ impl Document {
         }
     }
 
+    /// Spend the key of every bucket whose members disagree on the group's size,
+    /// releasing what it holds — a group no arrival can complete resolves where a
+    /// commit resolves.
+    ///
+    /// Holding a disagreement instead would be a decision the arrival order makes:
+    /// where a *subset* of a rewritten group agrees, it reaches its own declared
+    /// size before the dissenting member lands, commits, and leaves the dissenter a
+    /// stray of a resolved key — so whether the bucket ever holds the disagreement
+    /// at all depends on which members came first, and one op set folds to two
+    /// states. Resolving it makes both halves of that arrival space read the same
+    /// set: the members held are released untagged, and the key is spent against
+    /// the members still to come (ARCHITECTURE §Opt-In: Atomic).
+    fn resolve_disagreeing_tx(&mut self) -> bool {
+        let split: Vec<(ClientId, TxId)> = self
+            .tx_buckets()
+            .into_iter()
+            .filter(|(_, idxs)| self.tx_declared_count(idxs).is_none())
+            .map(|(key, _)| key)
+            .collect();
+        let mut spent = false;
+        for key in split {
+            spent |= self.resolved_tx.insert(key);
+        }
+        if spent {
+            self.untag_resolved();
+        }
+        spent
+    }
+
     /// The buffer positions of every held transaction member, bucketed by the
     /// `(author, group id)` key a group is identified by.
     fn tx_buckets(&self) -> HashMap<(ClientId, TxId), Vec<usize>> {
@@ -3818,8 +3850,9 @@ impl Document {
     }
 
     /// The size the members held at `idxs` declare, or `None` if they do not all
-    /// declare the same one — a bucket without unanimity names no group, so it is
-    /// never complete.
+    /// declare the same one — a bucket without unanimity names no group, so it can
+    /// never complete and [`resolve_disagreeing_tx`](Self::resolve_disagreeing_tx)
+    /// spends its key instead.
     ///
     /// The size is the group's, not that of whichever member the buffer holds
     /// first: read off one member, a rewritten envelope chooses when the group

@@ -854,9 +854,10 @@ fn a_group_built_over_a_reused_sequence_does_not_collide_with_the_first() {
 // releases a group, and `encode_state` carries the buffer, so the next replica
 // starts holding them too. The bound at the decode boundary keeps the
 // unreachable sizes off the wire and a member carrying one past `apply` is
-// untagged on its own account; unanimity across a bucket keeps a group's size
-// from being whichever member landed first; and eviction is the way out for a
-// group that is merely never completed, whatever left it that way.
+// untagged on its own account; a bucket whose members disagree names no size at
+// all, so rather than hold it the receiver spends its key on the spot; and
+// eviction is the way out for a group that is merely never completed — a
+// unanimous one nobody finishes.
 
 /// `op` re-tagged as a member of group `id` declaring `count` members — the
 /// envelope rewrite a hostile peer or a relay can perform on a member in flight.
@@ -1039,102 +1040,69 @@ fn a_member_declaring_a_size_outside_the_cap_is_refused_on_arrival() {
 }
 
 #[test]
-fn a_rewritten_first_member_count_does_not_commit_the_group_at_the_wrong_size() {
-    // Three members; the one that lands first is rewritten to declare two. Read
-    // off that member, the size is met by the pair — committing a group two
-    // thirds of the way through, and leaving the third holding a size its bucket
-    // has already spent. The bucket has to agree on its size instead.
-    let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
-    });
+fn a_disagreeing_bucket_releases_what_it_holds_the_moment_it_disagrees() {
+    // Three members; the one that lands first is rewritten to declare two. The
+    // size is still not read off that member — the bucket names no size at all —
+    // but naming none is not a reason to wait: no arrival can complete a bucket
+    // whose members disagree, so the key is spent the moment the second member
+    // contradicts the first, and the pair is released untagged then and there
+    // rather than at eviction.
+    let (a, ops) = triple();
     assert_eq!(ops.len(), 3);
     let id = tx_id(&ops[0]);
 
     let mut b = doc(2);
-    assert!(!b.apply(&retagged(&ops[0], id, 2)));
-    assert!(!b.apply(&ops[1]));
-    assert_eq!(reg(&b, b"x"), None, "the pair is not the group");
-    assert_eq!(reg(&b, b"y"), None, "the pair is not the group");
+    assert!(
+        !b.apply(&retagged(&ops[0], id, 2)),
+        "one member is a bucket"
+    );
+    assert_eq!(reg(&b, b"x"), None, "a lone member still waits");
+    assert!(b.apply(&ops[1]), "the contradiction releases the bucket");
+    assert_eq!(reg(&b, b"x"), reg(&a, b"x"));
+    assert_eq!(reg(&b, b"y"), reg(&a, b"y"));
 
-    // The third arrives; the bucket still names no size, so nothing commits —
-    // and eviction is what releases all three.
-    assert!(!b.apply(&ops[2]));
-    assert_eq!(reg(&b, b"z"), None);
-    assert_eq!(b.evict_partial_transactions(), 1);
-    for key in [&b"x"[..], b"y", b"z"] {
-        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
-    }
+    // The key is spent, so the member still to come is a stray of a resolved
+    // group and merges standalone — leaving eviction nothing to evict.
+    assert!(b.apply(&ops[2]));
+    assert_eq!(reg(&b, b"z"), reg(&a, b"z"));
+    assert_eq!(b.evict_partial_transactions(), 0);
 }
 
 #[test]
-fn a_bucket_whose_members_disagree_on_the_size_never_completes() {
+fn a_bucket_whose_members_disagree_on_the_size_spends_its_key() {
     // The disagreement arriving last is the other half: the bucket is at its
-    // declared size in members, and still names no group.
-    let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
-    });
+    // declared size in members and names no group, so the arrival that
+    // contradicts is also the one that releases all three.
+    let (a, ops) = triple();
     let id = tx_id(&ops[0]);
 
     let mut b = doc(2);
-    b.apply(&ops[0]);
-    b.apply(&ops[1]);
-    assert!(!b.apply(&retagged(&ops[2], id, 2)));
-    for key in [&b"x"[..], b"y", b"z"] {
-        assert_eq!(
-            reg(&b, key),
-            None,
-            "member {key:?} committed a size-3 bucket"
-        );
+    assert!(!b.apply(&ops[0]));
+    assert!(!b.apply(&ops[1]));
+    for key in [&b"x"[..], b"y"] {
+        assert_eq!(reg(&b, key), None, "a unanimous bucket waits, whole");
     }
-    assert_eq!(b.evict_partial_transactions(), 1);
+    assert!(b.apply(&retagged(&ops[2], id, 2)));
     for key in [&b"x"[..], b"y", b"z"] {
-        assert_eq!(reg(&b, key), reg(&a, key));
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
+    assert_eq!(b.evict_partial_transactions(), 0);
 }
 
 #[test]
-fn a_rewritten_count_holds_the_same_set_whatever_order_it_arrives_in() {
-    // Whether a bucket looks unreachable depends on which of its members have
-    // landed, so nothing may be decided from that: two replicas served the same
-    // ops in different orders would then release different sets and diverge.
-    let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
-    });
+fn a_rewritten_count_lands_the_same_set_whatever_order_it_arrives_in() {
+    // Whether a bucket ever *holds* the disagreement depends on which of its
+    // members have landed, so holding is a decision the arrival order makes: two
+    // replicas served the same ops in different orders would release different
+    // sets and diverge. Spending the key on the disagreement is what removes the
+    // choice — every order lands the whole set, and folds to the same bytes.
+    let (a, ops) = triple();
     let id = tx_id(&ops[0]);
     let forged = [ops[0].clone(), ops[1].clone(), retagged(&ops[2], id, 2)];
 
-    for order in [
-        [0, 1, 2],
-        [0, 2, 1],
-        [2, 0, 1],
-        [2, 1, 0],
-        [1, 2, 0],
-        [1, 0, 2],
-    ] {
-        let mut b = doc(2);
-        for i in order {
-            b.apply(&forged[i]);
-        }
-        for key in [&b"x"[..], b"y", b"z"] {
-            assert_eq!(reg(&b, key), None, "order {order:?} released {key:?} early");
-        }
-        b.evict_partial_transactions();
-        for key in [&b"x"[..], b"y", b"z"] {
-            assert_eq!(
-                reg(&b, key),
-                reg(&a, key),
-                "order {order:?} stranded {key:?}"
-            );
-        }
+    let b = one_state_in_every_order(&forged);
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
 }
 
@@ -1159,6 +1127,30 @@ fn a_group_rewritten_smaller_on_every_member_folds_one_state_in_every_order() {
     let shrunk: Vec<Op> = ops.iter().map(|op| retagged(op, id, 2)).collect();
 
     let b = one_state_in_every_order(&shrunk);
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
+    }
+}
+
+#[test]
+fn a_group_rewritten_smaller_on_a_minority_of_members_folds_one_state_in_every_order() {
+    // Two of three members rewritten to declare two, the third left declaring
+    // three: every member legal on its own terms, and the bucket disagreeing only
+    // once the dissenter is in it. Delivered `x,y,z` or `y,x,z` the unanimous pair
+    // reaches its own declared size first and commits, so the dissenter is a stray
+    // of a resolved key and all three land; delivered any of the other four ways
+    // the dissenter is in the bucket from the start. A bucket that disagrees is a
+    // group no honest arrival completes, so it resolves where a commit does — and
+    // the two halves of the arrival space read the same.
+    let (a, ops) = triple();
+    let id = tx_id(&ops[0]);
+    let forged = [
+        retagged(&ops[0], id, 2),
+        retagged(&ops[1], id, 2),
+        ops[2].clone(),
+    ];
+
+    let b = one_state_in_every_order(&forged);
     for key in [&b"x"[..], b"y", b"z"] {
         assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
