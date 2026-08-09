@@ -1,13 +1,16 @@
-//! The `Replicate` and `ReplicaAck` wire frames — a room's leader fanning its
-//! committed ops to a follower replica, and the follower's watermark reply.
+//! The `Replicate`, `ReplicaAck` and `ReplicateMeta` wire frames — a room's leader
+//! fanning its committed ops to a follower replica, the follower's watermark reply,
+//! and the leader's assertion of the room's replicated metadata on its own.
 //!
 //! `Replicate { room, branch, ops, base_seq, epoch }` carries a length-framed
 //! room and branch, the leader's compaction floor, its leadership epoch, then the
 //! op batch, which reuses the op codec and consumes the frame's remainder.
 //! `ReplicaAck { room, through_seq }`
-//! reports the server sequence the follower has reached. Both are node-to-node,
-//! never client frames. Decoding is total — a truncation or trailing byte is a
-//! `ProtocolError`, never a panic.
+//! reports the server sequence the follower has reached.
+//! `ReplicateMeta { room, epoch, creator }` carries the room's doc-ACL authority root
+//! with no ops beneath it — no branch and no sequence, since it advances no stream.
+//! All three are node-to-node, never client frames. Decoding is total — a truncation
+//! or trailing byte is a `ProtocolError`, never a panic.
 
 use crdtsync_core::op::{Op, OpId, OpKind};
 use crdtsync_core::protocol::{decode_message, encode_message, Message, ProtocolError};
@@ -395,6 +398,68 @@ fn trailing_bytes_after_a_replica_ack_are_an_error() {
     let mut bytes = encode_message(&Message::ReplicaAck {
         room: b"room".to_vec(),
         through_seq: 5,
+    });
+    bytes.push(0);
+    assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));
+}
+
+// --- ReplicateMeta ---
+
+#[test]
+fn replicate_meta_round_trips() {
+    round_trips(Message::ReplicateMeta {
+        room: b"room-42".to_vec(),
+        epoch: 9,
+        creator: Some(b"alice".to_vec()),
+    });
+}
+
+#[test]
+fn replicate_meta_round_trips_a_rootless_room() {
+    // A room no authenticated actor has written names no root; the field is absent
+    // rather than empty, so the receiver can tell "no root" from "the empty actor".
+    round_trips(Message::ReplicateMeta {
+        room: b"room".to_vec(),
+        epoch: 0,
+        creator: None,
+    });
+}
+
+#[test]
+fn replicate_meta_round_trips_binary_and_extreme_fields() {
+    round_trips(Message::ReplicateMeta {
+        room: vec![0, 1, 2, 255],
+        epoch: u64::MAX,
+        creator: Some(vec![255, 0, 128]),
+    });
+    round_trips(Message::ReplicateMeta {
+        room: Vec::new(),
+        epoch: 1,
+        creator: Some(Vec::new()),
+    });
+}
+
+#[test]
+fn a_truncated_replicate_meta_is_an_error_not_a_panic() {
+    let bytes = encode_message(&Message::ReplicateMeta {
+        room: b"room".to_vec(),
+        epoch: 3,
+        creator: Some(b"alice".to_vec()),
+    });
+    for cut in 0..bytes.len() {
+        assert!(
+            decode_message(&bytes[..cut]).is_err(),
+            "truncating to {cut} bytes must error, not panic",
+        );
+    }
+}
+
+#[test]
+fn trailing_bytes_after_a_replicate_meta_are_an_error() {
+    let mut bytes = encode_message(&Message::ReplicateMeta {
+        room: b"room".to_vec(),
+        epoch: 3,
+        creator: None,
     });
     bytes.push(0);
     assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));

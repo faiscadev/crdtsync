@@ -2422,13 +2422,19 @@ impl Hub {
     /// the same either way.
     ///
     /// Persisting is best-effort, matching the governing metadata: a failed write does
-    /// not fail the caller's write. Set-once means nothing retries it either. On a
-    /// leader that costs nothing lasting — the room comes back creatorless and its
-    /// next writer establishes it afresh — but a replica serves no client write, so
-    /// its root returns only with the room's next replicated commit.
-    pub fn ensure_creator(&mut self, room: &[u8], actor: &[u8]) {
+    /// not fail the caller's write. Set-once means nothing retries it either, so a
+    /// node whose write failed reloads the room creatorless — a leader re-establishes
+    /// it from its next client write, and a replica, which serves none, is re-rooted
+    /// by the leader's next frame for the room, an ops one or the metadata-only
+    /// [`Message::ReplicateMeta`](crdtsync_core::Message::ReplicateMeta) its catch-up
+    /// sends when there is no delta to carry one.
+    ///
+    /// Returns whether this call is what established the root, so a caller that must
+    /// tell the rest of the cluster can — a root established by a write the room's
+    /// dedup swallowed whole has no op batch to ride out on.
+    pub fn ensure_creator(&mut self, room: &[u8], actor: &[u8]) -> bool {
         if !crate::acl::is_authenticated(actor) {
-            return;
+            return false;
         }
         let established = match self.rooms.get_mut(room) {
             Some(r) if r.creator.is_none() => {
@@ -2440,6 +2446,7 @@ impl Hub {
         if established {
             let _ = self.persist_meta(room);
         }
+        established
     }
 
     /// The authenticated actor `client` writes into `room` under, or `None` where

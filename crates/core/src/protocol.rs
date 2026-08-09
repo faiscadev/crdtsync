@@ -385,6 +385,32 @@ pub enum Message {
         epoch: u64,
         creator: Option<Vec<u8>>,
     },
+    /// A room's leader asserts `room`'s replicated metadata with no ops to carry it:
+    /// `creator` is the doc-ACL authority root, exactly the field a
+    /// [`Replicate`](Message::Replicate) carries and composed on arrival by the same
+    /// set-once rule. `epoch` is the leader's leadership generation, fenced exactly as
+    /// a `Replicate` is.
+    ///
+    /// The root is established by facts a commit does not always accompany — a write
+    /// the room's dedup swallowed whole establishes one and produces no ops, and a
+    /// replica whose best-effort metadata write failed reloads without one while the
+    /// room stays quiescent — so the metadata needs a carrier of its own. This frame
+    /// names **no branch and no sequence**: it advances no stream, so it is neither
+    /// acknowledged nor counted toward a watermark, and unlike every other
+    /// replication frame it **never creates the room**. A receiver that does not hold
+    /// `room` drops it, so a follower is never left holding an empty room its
+    /// read-serving would then advertise. Such a follower is converged by the ops or
+    /// snapshot catch-up, which carries the root itself, for every room that has
+    /// reached a sequence — and a room that has not carries no ACL tuples for a root
+    /// to decide, so no frame is built for it.
+    ///
+    /// Node-to-node — never a client frame; a client that sends one commits a
+    /// protocol violation.
+    ReplicateMeta {
+        room: Vec<u8>,
+        epoch: u64,
+        creator: Option<Vec<u8>>,
+    },
     /// A follower's acknowledgement of replicated ops: `through_seq` is the
     /// server sequence the follower's replica of `room` has now reached, the
     /// watermark the leader records per follower. Node-to-node — never a client
@@ -593,6 +619,7 @@ pub enum Message {
     /// address). The accepting node honors the node-to-node frames —
     /// [`Replicate`](Message::Replicate),
     /// [`ReplicateSnapshot`](Message::ReplicateSnapshot),
+    /// [`ReplicateMeta`](Message::ReplicateMeta),
     /// [`Gossip`](Message::Gossip), [`FollowerHeads`](Message::FollowerHeads),
     /// [`PingReq`](Message::PingReq) — only on a connection that presented it, and
     /// treats each of them on any other connection as a protocol violation. The
@@ -861,6 +888,16 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u8(&mut out, 25);
             put_bytes(&mut out, room);
             put_u64(&mut out, *through_seq);
+        }
+        Message::ReplicateMeta {
+            room,
+            epoch,
+            creator,
+        } => {
+            put_u8(&mut out, 53);
+            put_bytes(&mut out, room);
+            put_u64(&mut out, *epoch);
+            put_opt_bytes(&mut out, creator.as_deref());
         }
         Message::ReplicateSnapshot {
             room,
@@ -1265,6 +1302,16 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let room = cur.bytes()?;
             let through_seq = cur.u64()?;
             Message::ReplicaAck { room, through_seq }
+        }
+        53 => {
+            let room = cur.bytes()?;
+            let epoch = cur.u64()?;
+            let creator = cur.opt_bytes()?;
+            Message::ReplicateMeta {
+                room,
+                epoch,
+                creator,
+            }
         }
         49 => {
             let room = cur.bytes()?;
