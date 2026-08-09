@@ -2504,17 +2504,23 @@ impl Registry {
         // in, which an author's envelope only coincidentally does. A node the served
         // tree does not resolve keeps its move's answer, the only other partition claim
         // there is. For a room with no zones every zone is `None`, so this is a no-op.
-        let moved_nodes: Vec<(ElementId, Option<u32>)> = broadcast
+        let shell_nodes: Vec<(ElementId, Option<u32>)> = broadcast
             .iter()
-            .filter_map(|op| match &op.kind {
-                OpKind::XmlMove { node, .. } => {
-                    let landed = schema
-                        .as_deref()
-                        .zip(index.get(node))
-                        .map(|(s, path)| crdtsync_core::zone::zone_id_of(s, path));
-                    Some((*node, landed.unwrap_or(op.zone)))
-                }
-                _ => None,
+            .filter_map(|op| {
+                // A move is not the only thing that staleses a shell: a node's tag is a
+                // meet over the claims that named it, so a claim in this broadcast can
+                // lower one. That claim is a birth into the node's own list, which a
+                // recipient denied the origin never sees, so on the move gate alone it
+                // would keep a tag its document can never revise.
+                let node = match &op.kind {
+                    OpKind::XmlMove { node, .. } => *node,
+                    _ => crdtsync_core::retagged_node(op)?,
+                };
+                let landed = schema
+                    .as_deref()
+                    .zip(index.get(&node))
+                    .map(|(s, path)| crdtsync_core::zone::zone_id_of(s, path));
+                Some((node, landed.unwrap_or(op.zone)))
             })
             .collect();
         for (peer, conn) in self.conns.iter_mut() {
@@ -2578,7 +2584,13 @@ impl Registry {
                     reads_whole,
                 )
             });
-            if readable.is_empty() {
+            // An empty readable subset is not on its own a reason to send nothing: a
+            // shell can be due for a batch whose every op this recipient is denied.
+            // That is exactly the retag case — the claim that lowers a revealed node's
+            // tag is a birth into the node's own denied list — so the shell would be
+            // skipped precisely when it is the only thing that could carry the change.
+            // A batch that yields neither is dropped by the emptiness check below.
+            if readable.is_empty() && shell_nodes.is_empty() {
                 continue;
             }
             // Reveal-on-move-in: for every node this batch moves into a position this
@@ -2587,8 +2599,10 @@ impl Registry {
             // — the live-fan-out mirror of the catch-up reveal, derived from the same read
             // predicate. A recipient reading the node's origin all along gets no shell
             // (`reveal_ops` returns it only when the birth path is denied). Shells lead so
-            // the move lands onto them.
-            let readable = if moved_nodes.is_empty() {
+            // the move lands onto them. A batch that only *retags* a revealed node sends
+            // the shell alone: its payload and its identity both carry the tag, so the
+            // re-emitted shell is the change.
+            let readable = if shell_nodes.is_empty() {
                 readable
             } else {
                 let shells: Vec<Op> = hub
@@ -2606,7 +2620,7 @@ impl Registry {
                     )
                     .into_iter()
                     .filter_map(|mut op| match &op.kind {
-                        OpKind::XmlReveal { node, .. } => moved_nodes
+                        OpKind::XmlReveal { node, .. } => shell_nodes
                             .iter()
                             .find(|(n, _)| n == node)
                             .map(|(_, zone)| {

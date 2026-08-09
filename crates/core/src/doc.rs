@@ -6045,6 +6045,35 @@ fn stamp_key(stamp: Stamp) -> [u8; 24] {
 /// The element id an XML sequence child takes: derived from its children List
 /// and its node stamp, so the apply path, the readiness gate, and the cursor all
 /// agree. `kind` is `XmlElement` for an element child, `Text` for a text run.
+/// The node an op can install or restate a tag on, if any — the trigger a redaction
+/// reads to know a revealed node's shell has gone stale.
+///
+/// A shell carries the node's tag as its payload *and* in its identity
+/// ([`reveal_op_id`]), read off live state at emission. A node's tag is a meet over
+/// the claims that named it, so a later claim can lower it, and the shell a reader
+/// already holds then names a tag its own document will never revise. The fan-out
+/// gates shells on the node appearing in an `XmlMove` in the batch, which a
+/// retagging claim need not be: the claim that lowers a tag is an `XmlInsertChild`
+/// into the node's *birth* list, and a reader that may not read that list is served
+/// neither the claim nor a shell. So the trigger is widened by this, and both seams
+/// read it.
+///
+/// Over-reporting is safe and deliberate: this names the node an op *could* retag
+/// without asking whether it did, since re-emitting an unchanged shell is inert —
+/// its id is a function of `(node, tag)`, so an identical shell dedups, and a
+/// changed one runs a rank that is idempotent.
+pub fn retagged_node(op: &Op) -> Option<ElementId> {
+    match &op.kind {
+        // A tagged birth derives its child under the element kind; the tagless
+        // sibling of the stamp is a text run, which holds no tag.
+        OpKind::XmlInsertChild { tag: Some(_), .. } => {
+            Some(xml_child_id(op.target, op.stamp, ElementKind::XmlElement))
+        }
+        OpKind::XmlReveal { node, tag: Some(_) } => Some(*node),
+        _ => None,
+    }
+}
+
 fn xml_child_id(list_id: ElementId, stamp: Stamp, kind: ElementKind) -> ElementId {
     ElementId::derive(list_id, &stamp_key(stamp), kind)
 }
@@ -6090,11 +6119,11 @@ fn ranged_id(stamp: Stamp) -> ElementId {
 ///
 /// The client is derived under a fixed reveal namespace: deterministic and unique per
 /// `(node, tag)`. No *derived* replica id can coincide with it: this derivation's name is
-/// a node id, a tag-presence byte and the tag (at least 17 bytes), where the only other
-/// id-shaped derivation a replica performs ([`for_channel`](ClientId::for_channel)) names
-/// a four-byte channel number, so the two SHA-1 inputs differ by length alone whatever
-/// namespaces they run under. A *declared* id is not a derivation at all — an embedder
-/// supplies its bytes —
+/// a node id alone (16 bytes) or a node id, a marker and the tag (17 or more), where the
+/// only other id-shaped derivation a replica performs
+/// ([`for_channel`](ClientId::for_channel)) names a four-byte channel number, so the two
+/// SHA-1 inputs differ by length alone whatever namespaces they run under. A *declared*
+/// id is not a derivation at all — an embedder supplies its bytes —
 /// so an embedder that reuses a shell's id here collides, the same one-id-one-replica
 /// contract that governs two sessions sharing an id. `seq` is 0 — the derived client is
 /// a namespace of one.
@@ -6102,12 +6131,12 @@ fn reveal_op_id(node: ElementId, tag: Option<&[u8]>) -> OpId {
     let ns = ElementId::from_bytes(*b"crdtsync\0reveal\0");
     let mut name = node.as_bytes().to_vec();
     // A marker leads the tag, so no tag's own bytes can spell the tagless case: a
-    // `None` name is the node's 16 bytes and every `Some` name is at least 17. That
-    // separates the tagless shell from the empty-tagged one — the empty tag is
-    // admissible and is the rank's bottom, so the two are different claims — and
-    // from a tag of one NUL byte, which is what a bare concatenation would spell.
-    // The tagless side needs no marker of its own: the one here is what puts every
-    // tagged name out of its reach.
+    // `None` name is the node's 16 bytes and every `Some` name is at least 17. What
+    // it separates is the tagless shell from the **empty-tagged** one, which a bare
+    // concatenation would make one name — and the empty tag is admissible and is the
+    // rank's bottom, so the two are different claims. The tagless side needs no
+    // marker of its own: the one here is what puts every tagged name out of its
+    // reach.
     if let Some(t) = tag {
         name.push(1);
         name.extend_from_slice(t);
@@ -7325,12 +7354,12 @@ mod tests {
     /// every byte string alike. The `Some` marker buys that on its own: a tagless
     /// name is the node's 16 bytes and every tagged name is at least 17, so no
     /// tag's own bytes can spell the absent case. Drop it and `None` names the bare
-    /// node, which the empty tag then spells too — a tagless shell and an
-    /// empty-tagged one would be one op and the later would dedup away; a bare
-    /// concatenation collides `None` with a tag of one NUL byte the same way. A tag
-    /// is unvalidated bytes off the wire, so a NUL is as authorable as any letter.
-    /// A matching marker on the tagless side would be dead: nothing it separates is
-    /// not already separated.
+    /// node, which the **empty** tag then spells too — a tagless shell and an
+    /// empty-tagged one would be one op and the later would dedup away. The empty
+    /// tag is admissible: nothing validates op-level tag bytes, and it is the tag
+    /// rank's bottom, so it is a claim a node can genuinely end at. A matching
+    /// marker on the tagless side would be dead — nothing it separates is not
+    /// already separated — so there is none.
     ///
     /// `reveal_ops` emits one shell per node and reads its kind off the registry,
     /// so no honest stream asks for two of these today. The derivation is what
@@ -7340,8 +7369,11 @@ mod tests {
     fn a_reveal_shell_id_is_injective_in_the_tag() {
         let node = ElementId::from_bytes([3u8; 16]);
         let nul: &[u8] = &[0u8];
-        // The absent tag is separated from every tag that could otherwise spell it.
+        // The absent tag against the one that would otherwise spell it. This is the
+        // assert the marker is load-bearing for: drop the marker and it fails.
         assert_ne!(reveal_op_id(node, None), reveal_op_id(node, Some(b"")));
+        // And against tags that would not — inert against the marker, kept because
+        // they say the derivation reads bytes rather than emptiness.
         assert_ne!(reveal_op_id(node, None), reveal_op_id(node, Some(nul)));
         assert_ne!(reveal_op_id(node, Some(b"")), reveal_op_id(node, Some(nul)));
         // The tag is read, not merely present.

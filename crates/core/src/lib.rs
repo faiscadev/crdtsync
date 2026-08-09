@@ -52,7 +52,7 @@ pub use client::{ClientError, ClientSession, Redirect, Rejected, SubscribeError}
 pub use clientid::ClientId;
 pub use codec::{decode_op, decode_ops, encode_op, encode_ops, DecodeError};
 pub use counter::Counter;
-pub use doc::{Document, OrphanEvent};
+pub use doc::{retagged_node, Document, OrphanEvent};
 pub use element::{Element, ElementKind};
 pub use elementid::ElementId;
 pub use host::Host;

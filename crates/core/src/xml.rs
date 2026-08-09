@@ -14,10 +14,12 @@
 //! every replica agrees on them (the same convergence the [`ElementId`] derivation
 //! gives Map slots). The `tag` is identity rather than editable state: no op edits
 //! a tag the way a `MapSet` edits a slot, and retagging in the API is a replace.
-//! But every claim that *names* a node carries one, and a children-list node's id
-//! derives from `(list, stamp, kind)` and carries no tag — so two claims can name
-//! one node under two tags (an insert twin, or an `XmlReveal` shell), and either
-//! can lower what a materialised node reads. The tag is therefore reconciled by
+//! But every claim that *materialises* a node carries one, and a children-list
+//! node's id derives from `(list, stamp, kind)` and carries no tag — so two such
+//! claims can name one node under two tags (an insert twin, or an `XmlReveal`
+//! shell), and either can lower what a materialised node reads. A claim that only
+//! names a node without materialising it carries none: an `XmlMove` relocates a
+//! node and says nothing about its tag. The tag is therefore reconciled by
 //! its own rank ([`XmlElement::claim_tag`]) wherever a claim meets one already
 //! held, a merge included, rather than left at whichever claim landed first.
 

@@ -609,3 +609,67 @@ fn a_shuffled_pool_of_tag_claims_converges_on_every_permutation() {
         );
     }
 }
+
+#[test]
+fn the_empty_tag_is_the_rank_s_bottom_at_the_reveal_seat_too() {
+    // The empty tag has to be admissible at *every* seat, not just the birth. A
+    // guard exempting it at the reveal seat alone left the whole workspace green
+    // while an `XmlReveal` and a birth naming one node resolved by arrival.
+    let mut author = Document::new(cid(1));
+    let build = frag_with_a(&mut author);
+    let birth = only_insert(author.transact(|tx| {
+        tx.xml_fragment(b"doc").children().insert_element(1, b"div");
+    }));
+    let node = {
+        let mut d = Document::new(cid(9));
+        for op in build.iter().chain([&birth]) {
+            d.apply(op);
+        }
+        contested_id(&d).expect("the born child")
+    };
+    let mut reveal = birth.clone();
+    reveal.id.seq = 9_000;
+    reveal.kind = OpKind::XmlReveal {
+        node,
+        tag: Some(Vec::new()),
+    };
+
+    let (tree_a, bytes_a) = fold(&build, &[&birth, &reveal]);
+    let (tree_b, bytes_b) = fold(&build, &[&reveal, &birth]);
+    assert_eq!(tree_a, tree_b, "the two orders folded to different trees");
+    assert_eq!(
+        bytes_a, bytes_b,
+        "the two orders encode different snapshots"
+    );
+    for order in [[&birth, &reveal], [&reveal, &birth]] {
+        let mut d = Document::new(cid(9));
+        for op in build.iter().chain(order) {
+            d.apply(op);
+        }
+        assert_eq!(
+            contested_tag(&d).as_deref(),
+            Some(&b""[..]),
+            "the empty tag must take the node at the reveal seat"
+        );
+    }
+}
+
+#[test]
+fn the_empty_tag_is_the_rank_s_bottom_at_the_merge_seat_too() {
+    // And at the third seat. Both directions, since a merge that exempted the
+    // empty tag would answer by which side received.
+    let id = ElementId::from_bytes([7u8; 16]);
+    let node = |tag: &[u8]| XmlElement::new(id, tag.to_vec());
+
+    let mut receives_empty = node(b"div");
+    receives_empty.merge(&node(b""));
+    let mut receives_named = node(b"");
+    receives_named.merge(&node(b"div"));
+
+    assert_eq!(receives_empty.tag(), b"");
+    assert_eq!(
+        receives_named.tag(),
+        b"",
+        "the merge took the receiver's tag"
+    );
+}
