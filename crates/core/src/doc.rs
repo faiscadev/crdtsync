@@ -1944,7 +1944,13 @@ impl Document {
         // Reservations are ids under the *projecting* replica's identity, and a
         // projection is served to another. What the recipient published is what the
         // frontier above now carries, so the projector's own run goes with the rest
-        // of its authorship.
+        // of its authorship. Inert today and stated rather than relied on: a
+        // reservation is only ever installed by [`note_published`](Self::note_published),
+        // which only a client session's inbound frame reaches, and the documents a
+        // projection runs on are all server-side — a room replica, or an archived
+        // state one encoded. The recipient's own protection is
+        // [`adopt_as`](Self::adopt_as), which clears them as it takes the snapshot
+        // over, and that one is on a live path.
         self.reserved.clear();
     }
 
@@ -2210,10 +2216,12 @@ impl Document {
     ///
     /// Each sequence is taken under *this* replica's identity, so a frame can only
     /// ever reach the id space its recipient already authors in. `reach` moves this
-    /// replica's own entry and no other's, and is held to the same
-    /// [`LAMPORT_STATE_CEILING`] every folded stamp is held to
-    /// ([`record_stamp`](Self::record_stamp)) — the frame is the same primitive an
-    /// op carrying this replica's id already is, under the same bound.
+    /// replica's own entry and no other's, through
+    /// [`record_stamp`](Self::record_stamp) itself, so it is the same primitive an
+    /// op carrying this replica's id already is, under the same
+    /// [`LAMPORT_STATE_CEILING`]. A frame naming a position past the ceiling buys
+    /// exactly what an op naming it buys, which is nothing the ceiling does not
+    /// already allow.
     ///
     /// A sequence the replica already holds — applied or buffered — is skipped: it
     /// already blocks the mint, and the three sets stay disjoint, which the state
@@ -2230,10 +2238,19 @@ impl Document {
                 self.reserved.insert(id);
             }
         }
-        if reach > 0 {
-            let slot = self.stamp_high_water.entry(self.client).or_insert(0);
-            *slot = (*slot).max(reach.min(LAMPORT_STATE_CEILING));
-        }
+        // Recorded through the same seam a folded op's stamp takes, so the two
+        // cannot drift: one position, held to the ceiling here because this seam is
+        // the refusal — a wire value has no earlier gate to have been through, where
+        // an op's stamp is refused on the way in
+        // ([`stamp_occupies_a_mintable_position`]).
+        self.record_stamp(
+            Stamp {
+                client: self.client,
+                lamport: reach.min(LAMPORT_STATE_CEILING),
+                offset: 0,
+            },
+            1,
+        );
     }
 
     /// The current lamport high-water of a replication partition: the root clock
