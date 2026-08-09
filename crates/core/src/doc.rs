@@ -4401,10 +4401,12 @@ impl Document {
     ///
     /// The rank orders the *nodes* two claims name, which is the whole question
     /// only while they name two. A move can name exactly the child a birth at the
-    /// key derives, and two inserts carrying one tag derive one child between them
-    /// — there the key is already the claimant's own, nothing changes hands, and
-    /// what is left to settle is the position, which the sequence takes as the meet
-    /// of the two ([`List::rejoin`]). A meet is the same whichever arrived first,
+    /// key derives, and two inserts of one *kind* derive one child between them —
+    /// there the key is already the claimant's own, nothing changes hands, and what
+    /// is left to settle is the position, which the sequence takes as the meet of
+    /// the two ([`List::rejoin`]). Their two *tags* are left to settle with it when
+    /// the kind is `XmlElement` and the tags differ, which this rank does not reach
+    /// and C44 is filed for. A meet is the same whichever arrived first,
     /// where a contest between two claims on one node would have needed to know
     /// what put the incumbent there, and nothing answers that: the move log dedups
     /// on the stamp alone, so a move can hold the key having recorded no edge.

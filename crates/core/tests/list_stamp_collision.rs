@@ -7,11 +7,12 @@
 //! on `OpId`, and the id-space record only bounds an *honest* mint.
 //!
 //! Which claim holds a sequence id therefore has to be a function of the ops
-//! alone. The order is `(kind tag, encoded value)`: two scalars separate on their
-//! bytes, a scalar and a composite on the tag, and two composites are already
-//! ranked by the document's `(list, stamp)` rank (C24) before the sequence is
-//! touched at all. Every shape is folded here in every delivery order and
-//! compared byte-for-byte.
+//! alone. The order is `(kind tag, position, encoded value)`: a scalar and a
+//! composite separate on the tag, two of a class on the position and then on
+//! their encoded bytes, and two composites are already ranked by the document's
+//! `(list, stamp)` rank (C24) before the sequence is touched at all. The position
+//! sits above the value because it is the only key a delete leaves behind. Every
+//! shape is folded here in every delivery order and compared byte-for-byte.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::elementid::{ElementId, ElementKind};
@@ -180,9 +181,10 @@ fn the_winners_anchor_travels_with_its_value() {
     let mut back = only_insert(author.transact(|tx| tx.list(b"l").insert(3, Scalar::Int(99))));
     back.stamp = front.stamp;
 
+    // The front claim wins on the position, which is the key that decides between
+    // two scalars — so what the sequence must show is *its* value at *its* anchor,
+    // never one claim's value frozen at the other's position.
     let (state, _) = converges(&build, &[&front, &back], seq);
-    // `Int(2)` wins on encoded bytes, and it was placed at the front — so the
-    // winner's own anchor is what the sequence must show.
     assert_eq!(
         state, "[Int(2),Int(1),Int(7)]",
         "the winner sits at the loser's position"
@@ -574,9 +576,10 @@ fn merging_one_value_seated_at_two_positions_takes_the_meet() {
 
 #[test]
 fn a_claim_that_ties_takes_the_meet_of_the_two_positions() {
-    // Two claims that carry the same value are not a contest — nothing separates
-    // them — so the position is the meet, which is the same whichever arrived
-    // first. This is the scalar image of `rejoin`.
+    // Two claims that carry the same value separate on the position alone, so the
+    // id ends at the lesser of the two whichever arrived first — the same place
+    // `rejoin` reaches by taking the meet, falling out of the one order rather
+    // than being a rule of its own.
     let id = eid(1, 1);
     let low = Anchor {
         parent: None,
