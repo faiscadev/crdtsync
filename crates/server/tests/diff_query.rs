@@ -4,7 +4,8 @@
 //! A client asks for the diff between two of a room's saved versions or two of
 //! its branches; the server routes the query to the matching `Hub::diff_*` seam,
 //! encodes the change list into a `DiffResult`, and maps an absent version/branch
-//! to a recoverable `NotFound`. The query is channel-keyed: the room, and the scope
+//! to a recoverable `NotFound` — the other two answers a branch can carry, unreadable
+//! and empty, are `branch_state_taxonomy`'s. The query is channel-keyed: the room, and the scope
 //! the change list is narrowed to, come from the subscription the channel holds
 //! (`diff_projection` pins the narrowing). Gated by the same read tier a version
 //! request uses — a diff request before auth is a protocol violation, one on an

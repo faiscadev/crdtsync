@@ -16,8 +16,9 @@
 //! engine has to decode both sides to compare them, so a diff cannot serve a side it
 //! cannot read whoever asks, where a fetch serves a reader nothing would narrow for.
 //! These two cases are a `DiffKind::Versions` query; a *branch* whose durable base
-//! does not decode reaches the seam as an unmaterializable branch instead, which is
-//! answered `NotFound` rather than `Internal` (C51).
+//! does not decode reaches the seam as an unreadable branch instead, told apart from
+//! an absent name and answered with the same `Internal` (C51, pinned by
+//! `branch_state_taxonomy`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
