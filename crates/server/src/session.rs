@@ -1230,7 +1230,7 @@ pub fn step(
                     // The version's state is being served — an auditable history read,
                     // distinct from the live subscribe stream. Record it through the audit
                     // seam once it is actually going out (the read was authorized by
-                    // `channel_room` above, so the verdict is granted).
+                    // `channel_authorized` above, so the verdict is granted).
                     authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     // The replica identity this channel authors under — the one author
                     // whose ids a projection keeps in the frontier it otherwise scrubs,
@@ -1366,8 +1366,9 @@ pub fn step(
         // not read contributes no change at all rather than a redacted one — with the
         // one exception the projections themselves carry, a *container* the live walk
         // does not reach, which they still serve (C67).
-        // Served locally from the replicated state, so no leader redirect — which is
-        // also what makes every answer a statement about this node's own state (C103).
+        // A **branch** answer is served locally from the replicated state, with no
+        // leader redirect — which is also what makes it a statement about this node's
+        // own state (C103). The **version** arm routes; see the gate below.
         // A name the room does not have answers `NotFound`; a branch this node cannot
         // read, and a materialized side that fails to decode, answer `Internal`. None
         // of them closes. A side is archived or reconstructed state — a version's
@@ -1473,7 +1474,7 @@ pub fn step(
                     // is actually going out. (Later than the fetch's, which fires
                     // before its projections and so can record a read it then narrows
                     // to nothing; both are on the reply path.) The read was authorized
-                    // by `channel_room` above, so the verdict is granted.
+                    // by `channel_authorized` above, so the verdict is granted.
                     authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     Response {
                         replies: vec![Message::DiffResult {
@@ -2361,11 +2362,11 @@ fn read_redirect_response(
 
 /// The room a channel-keyed request names, resolved without deciding anything about
 /// it: the connection is authenticated and the channel is bound, and nothing more.
-/// The routing half of such a request needs the room and must run *before* the gate
-/// — a node that will not answer must not decide it, since the records and creator
-/// it would decide on are a replica's and [`Authorizer::observe`] would record a
-/// read it then refuses — so the two halves are separable, [`channel_authorized`]
-/// being the other.
+/// The routing half of such a request needs the room and must run *before* the gate:
+/// a node that will not answer must not decide it, since [`Authorizer::observe`]
+/// records the verdict and would leave a durable audit entry for a read the node
+/// then refuses. So the two halves are separable, [`channel_authorized`] being the
+/// other.
 fn bound_room(session: &Session, channel: Channel) -> Option<RoomId> {
     session.identity()?;
     Some(session.channels.get(&channel)?.room.clone())
@@ -2396,7 +2397,8 @@ fn channel_authorized(
     )
 }
 
-/// The refusal for a channel-keyed `what` request that [`channel_room`] rejected: a
+/// The refusal for a channel-keyed `what` request that [`bound_room`] or
+/// [`channel_authorized`] rejected: a
 /// violation if the connection is unauthenticated or the channel is unbound,
 /// otherwise a non-closing forbidden. `what` names the request kind (`"version"`,
 /// `"diff"`) so the diagnostic points at the surface the client actually used — the

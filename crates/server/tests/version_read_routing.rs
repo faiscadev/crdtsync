@@ -28,7 +28,7 @@
 //! A replica serves version reads once it holds the room's leadership: that is what
 //! keeps the gate from being a blanket centralization, and it is as strong as the
 //! leadership is — a node promoted on its own liveness view answers from its own
-//! records, which is where the residue of this unit lives (C108).
+//! records, which is where the residue of this unit lives (C109).
 //!
 //! Two in-process registries — a leader `Registry` and a follower `Registry` over
 //! one static cluster, no socket — as in `follower_reads.rs`: the leader commits,
@@ -546,7 +546,7 @@ fn a_lagging_promoted_leader_still_answers_from_its_own_records() {
     // replica that promotes over a leader still committing answers the fetch from
     // the records it has, and serves the subtree the revoke closed. The gate moves
     // the read to the node that holds the room's leadership; making that leadership
-    // an authority the read can rely on is C108.
+    // an authority the read can rely on is C109.
     let room = room_led_by_a_with_b_next();
     let (mut leader, mut alice_doc, alice) = seeded_leader(&room);
     let (mut promoted, _peer) = caught_up_follower_holding_v1(&mut leader, &room);
@@ -571,7 +571,7 @@ fn a_lagging_promoted_leader_still_answers_from_its_own_records() {
     let state = served_state(&promoted.take_outbox(bob)).expect("the promoted node serves");
     assert!(
         carries(&state, b"b", b"bseed"),
-        "a promotion this node decided alone is what carries the stale-record read",
+        "the promotion residue is closed — if C109 is fixed, retire this pin",
     );
 }
 
@@ -615,8 +615,8 @@ fn a_version_diff_takes_the_gate_and_a_branch_diff_does_not() {
     ));
     let out = follower.take_outbox(bob);
     assert!(
-        !out.iter().any(|m| matches!(m, Message::Redirect { .. })),
-        "the branch arm was routed with the version arm: {out:?}",
+        out.iter().any(|m| matches!(m, Message::DiffResult { .. })),
+        "the branch arm no longer answers off a replica: {out:?}",
     );
 }
 
@@ -673,11 +673,9 @@ fn a_version_mutation_on_a_replica_still_redirects() {
 
 #[test]
 fn a_version_read_on_an_unbound_channel_is_a_violation_not_a_redirect() {
-    // Where the gate sits: below `channel_room`, as the mutations' does. The channel
-    // is what names the room a redirect would point at, so a request that never
-    // bound one is refused as the protocol violation it is rather than routed — and
-    // an unauthorized reader is likewise answered by the gate above, never handed
-    // the room's leader.
+    // Where the gate sits: above the authorization, below the channel. The channel is
+    // what names the room a redirect would point at, so a request that never bound one
+    // is the protocol violation it always was rather than something to route.
     let room = room_led_by_a_with_b_next();
     let mut follower = node(Some(B), &room);
     let bob = auth(&mut follower, 2, "t-bob");
@@ -700,6 +698,63 @@ fn a_version_read_on_an_unbound_channel_is_a_violation_not_a_redirect() {
     assert!(
         !out.iter().any(|m| matches!(m, Message::Redirect { .. })),
         "routing ran before the channel resolved: {out:?}",
+    );
+}
+
+#[test]
+fn a_reader_whose_room_read_was_revoked_is_routed_before_it_is_refused() {
+    // What the ordering costs, stated as a test rather than left to be discovered. A
+    // reader who bound a channel and then lost its room read is told where the room
+    // is answered before it is told it may not read it — the redirect names a room
+    // this client itself supplied at subscribe and a leader any authenticated actor
+    // can already resolve, so it discloses nothing the subscribe gate does not. On
+    // the node that does answer, the refusal is the one it always was.
+    let room = room_led_by_a_with_b_next();
+    let mut follower = node(Some(B), &room);
+    // Leadership flaps under the bound channel: B leads while bob subscribes, then A
+    // returns and B is a replica again — the only way a channel is bound on a node
+    // that will later redirect it.
+    follower
+        .membership_mut_for_test()
+        .mark_node_down(&NodeId::from_addr(A));
+    let bob = auth(&mut follower, 2, "t-bob");
+    assert!(follower.deliver(bob, subscribe(&room)));
+    follower.take_outbox(bob);
+    follower
+        .membership_mut_for_test()
+        .mark_node_live(&NodeId::from_addr(A));
+
+    let revoked = Acl::new().deny(
+        Subject::Actor(b"bob".to_vec()),
+        None,
+        ResourceMatch::Room(room.clone()),
+    );
+    follower.set_authorizer(Box::new(revoked.clone()));
+    assert!(follower.deliver(bob, fetch(V1)));
+    assert_eq!(
+        follower.take_outbox(bob),
+        redirect_to_a(&room),
+        "the replica routes the read rather than deciding a gate it will not answer",
+    );
+
+    // The leader, which does answer, refuses. Same order: bob binds while he may read,
+    // and the grant goes away under the bound channel.
+    let mut leader = node(Some(A), &room);
+    let bob = auth(&mut leader, 2, "t-bob");
+    assert!(leader.deliver(bob, subscribe(&room)));
+    leader.take_outbox(bob);
+    leader.set_authorizer(Box::new(revoked));
+    assert!(leader.deliver(bob, fetch(V1)));
+    let out = leader.take_outbox(bob);
+    assert!(
+        out.iter().any(|m| matches!(
+            m,
+            Message::Error {
+                code: ErrorCode::Forbidden,
+                ..
+            }
+        )),
+        "the node that answers the read is the node that refuses it: {out:?}",
     );
 }
 

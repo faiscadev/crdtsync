@@ -6,10 +6,10 @@
 //! decides nothing — while `acl_records` is non-empty, because ACL ops ride the log
 //! like any other. Follower reads let a caught-up follower serve a read from its own
 //! replica, so what a replica holds decides what a partial reader landing there is
-//! served — through the op catch-up, the snapshot catch-up and the branch diff. A
-//! version fetch is the room's leader's (C33), so the same question reaches it one
-//! step later, on a replica a promotion has made that leader. Four seams that hand a
-//! reader a whole state, and every one of them narrows by the root. These pin that a
+//! served — through the op catch-up and the snapshot catch-up. A version fetch and a
+//! version diff are the room's leader's (C33), so the same question reaches those two
+//! one step later, on a replica a promotion has made that leader. Four seams that
+//! hand a reader a whole state, and every one of them narrows by the root. These pin that a
 //! replicated room carries its root and that each of those four narrows by it; that a
 //! promoted replica keeps the root rather than handing `/` to its first writer; that
 //! the root installs set-once through either frame and through the hub call; and which
