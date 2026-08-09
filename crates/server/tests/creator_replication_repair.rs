@@ -210,6 +210,25 @@ fn room_led_by_a_with_b_next() -> Vec<u8> {
     panic!("no room led by A with B its next replica");
 }
 
+/// A second room with the same placement as `room`, so one node can be handed frames
+/// for two rooms it does not hold.
+fn room_led_by_a_with_b_next_after(room: &[u8]) -> Vec<u8> {
+    let m = membership_for(A);
+    let a = NodeId::from_addr(A);
+    let b = NodeId::from_addr(B);
+    for i in 0..1_000_000 {
+        let candidate = format!("room-{i}").into_bytes();
+        if candidate == room {
+            continue;
+        }
+        let replicas = m.replicas_for(&candidate);
+        if replicas.first() == Some(&a) && replicas.get(1) == Some(&b) {
+            return candidate;
+        }
+    }
+    panic!("no second room led by A with B its next replica");
+}
+
 /// A connection admitted to `r`'s peer plane as one of `room`'s other replicas.
 fn peer_conn(r: &mut Registry, room: &[u8]) -> ConnId {
     let node = r
@@ -708,6 +727,47 @@ fn the_frame_never_creates_the_room_it_names() {
         "a node missing the room stays missing it",
     );
     assert_eq!(follower.hub().room_creator(&room), None);
+}
+
+#[test]
+fn an_empty_replicate_would_have_created_the_room_instead() {
+    // The measurement behind the design, not an argument about it: the frame the
+    // root could have ridden — a `Replicate` with an empty batch — creates the room
+    // it names, because `ingest_records` does so unconditionally. The follower comes
+    // up holding an empty replica at the head, which `holds_room` then reports as
+    // servable, and a client routed there is served an empty document for a room
+    // that has content. That is why the root gets a frame of its own.
+    let room = room_led_by_a_with_b_next();
+    let mut follower = node(B);
+    let peer = peer_conn(&mut follower, &room);
+    assert!(!follower.hub().holds_room(&room));
+    assert!(follower.deliver(
+        peer,
+        Message::Replicate {
+            room: room.clone(),
+            branch: b"main".to_vec(),
+            ops: Vec::new(),
+            base_seq: 0,
+            epoch: 1,
+            creator: Some(b"alice".to_vec()),
+        },
+    ));
+    assert!(
+        follower.hub().holds_room(&room),
+        "an empty delta creates the room — the reason it cannot be the root's carrier",
+    );
+
+    // The metadata-only frame, on the same node in the same state, does not.
+    let other = room_led_by_a_with_b_next_after(&room);
+    assert!(follower.deliver(
+        peer,
+        Message::ReplicateMeta {
+            room: other.clone(),
+            epoch: 1,
+            creator: Some(b"alice".to_vec()),
+        },
+    ));
+    assert!(!follower.hub().holds_room(&other));
 }
 
 #[test]
