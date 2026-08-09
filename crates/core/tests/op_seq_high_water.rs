@@ -961,3 +961,74 @@ fn a_state_naming_one_id_as_both_reserved_and_buffered_is_refused() {
         "a reservation over a buffered id decoded",
     );
 }
+
+// --- the three sets stay disjoint through every transition, because the encoding
+//     writes a reservation as a bare sequence and reads it back under whatever
+//     client the document then names ---
+
+#[test]
+fn an_op_delivered_after_its_reservation_leaves_the_state_encodable() {
+    // `apply` clears the reservation as the op lands, and it has to: the id would
+    // otherwise sit in the dedup set *and* the reserved set, which `read_state`
+    // refuses — so a replica that folded a frontier, was later delivered the ops,
+    // and persisted itself would write a snapshot it cannot read back.
+    let (_, durable) = authored(cid(1), 3);
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&seqs(&durable), 0);
+    for op in &durable {
+        doc.apply(op);
+    }
+    assert_eq!(doc.next_seq(), 3);
+    Document::decode_state(&doc.encode_state())
+        .expect("a delivered op left its reservation standing");
+}
+
+#[test]
+fn an_adopting_replica_does_not_re_encode_the_encoders_reservations_as_its_own() {
+    // The encoding writes a reservation as a bare sequence, which is right only
+    // while every entry belongs to the document's own client — so the one place
+    // that changes the client has to clear them. Immediately after `adopt_as` a
+    // stale entry is inert (it is keyed on the *encoder's* id, which the mint no
+    // longer asks about); it becomes real on the next round trip, where the
+    // sequences are read back under the adopter's own identity.
+    let (_, durable) = authored(cid(1), 3);
+    let mut author = Document::new(cid(1));
+    author.note_published(&seqs(&durable), 0);
+
+    let adopter = Document::decode_state_as(cid(2), 0, &author.encode_state()).expect("decodes");
+    assert_eq!(adopter.next_seq(), 0);
+    let back = Document::decode_state(&adopter.encode_state()).expect("decodes");
+    assert_eq!(
+        back.next_seq(),
+        0,
+        "the adopter re-encoded the encoder's run as its own",
+    );
+}
+
+#[test]
+fn a_state_naming_one_id_as_both_reserved_and_applied_is_refused() {
+    // The dedup-set half of the same disjointness `read_state` enforces for the
+    // buffer: a reservation over an applied id is one `apply` can never clear,
+    // since the dedup check short-circuits ahead of it.
+    let (_, durable) = authored(cid(1), 1);
+    let mut doc = Document::new(cid(1));
+    doc.apply(&durable[0]);
+    const MARKER: u64 = 0xDEAD_BEEF_0BAD_F00D;
+    doc.note_published(&[MARKER], 0);
+    let bytes = doc.encode_state();
+    assert!(
+        Document::decode_state(&bytes).is_ok(),
+        "the honest document must decode",
+    );
+
+    let at = bytes
+        .windows(8)
+        .position(|w| w == MARKER.to_le_bytes())
+        .expect("the reserved sequence is in the encoding");
+    let mut forged = bytes.clone();
+    forged[at..at + 8].copy_from_slice(&durable[0].id.seq.to_le_bytes());
+    assert!(
+        Document::decode_state(&forged).is_err(),
+        "a reservation over an applied id decoded",
+    );
+}
