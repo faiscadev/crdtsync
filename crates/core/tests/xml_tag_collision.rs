@@ -13,6 +13,15 @@
 //! its tag), so a replica that took the first arrival's tag encodes different
 //! bytes from one that saw the other order. Every shape that reaches the question
 //! is folded here in both orders and compared byte-for-byte.
+//!
+//! The rank is a **meet** over the tags, and the three properties that buys are
+//! each pinned rather than argued: it is commutative (two claims, both orders),
+//! associative and idempotent (three claims, all six orders), and it needs no
+//! state a snapshot does not carry — a claim arriving at a *reloaded* replica is
+//! ranked against a decoded tag and lands where no restart does. The last shape
+//! is the randomized one: pools mixing several tag claims at two stamps with a
+//! reveal and a delete, shuffled, where an interaction the reasoning missed shows
+//! up and an isolated shape would not reach it.
 
 use crdtsync_core::doc::Document;
 use crdtsync_core::elementid::ElementId;
@@ -188,6 +197,41 @@ fn a_restated_tag_survives_a_snapshot_round_trip() {
             Some(&b"div"[..]),
             "the reload forgot which tag won"
         );
+    }
+}
+
+#[test]
+fn a_reload_between_the_two_claims_lands_where_no_restart_does() {
+    // The sharper form of the round-trip: the *second* claim arrives at a replica
+    // that has restarted, so it is ranked against a **decoded** tag rather than a
+    // live one. Both directions matter — the reload can carry the winner (the
+    // later claim must lose to it) or the loser (the later claim must take it) —
+    // and a rule needing state the snapshot does not carry would break on one of
+    // them.
+    let mut author = Document::new(cid(1));
+    let build = frag_with_a(&mut author);
+    let base = only_insert(author.transact(|tx| {
+        tx.xml_fragment(b"doc").children().insert_element(1, b"div");
+    }));
+    let div = twin_tagged(&base, 9_000, b"div");
+    let span = twin_tagged(&base, 9_001, b"span");
+
+    for order in [[&div, &span], [&span, &div]] {
+        let mut d = Document::new(cid(9));
+        for op in build.iter().chain([order[0]]) {
+            d.apply(op);
+        }
+        let mut back = Document::decode_state(&d.encode_state()).expect("a reloadable snapshot");
+        back.apply(order[1]);
+
+        // The replica that never restarted, fed the same two ops.
+        let straight = fold(&build, &order);
+        assert_eq!(
+            (tree(&back), back.encode_state()),
+            straight,
+            "a reload between the two claims landed somewhere a restart-free replica does not"
+        );
+        assert_eq!(contested_tag(&back).as_deref(), Some(&b"div"[..]));
     }
 }
 
@@ -392,4 +436,113 @@ fn a_list_merge_ranks_a_child_s_tag() {
     b.merge(&a2);
     assert_eq!(tag_of(&a), b"div");
     assert_eq!(tag_of(&b), b"div", "the merge took the receiver's tag");
+}
+/// A small linear-congruential PRNG — deterministic, seedable, reproducible.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
+    }
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 17
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() as usize) % n
+    }
+}
+
+const TAGS: &[&[u8]] = &[b"p", b"div", b"span", b"b", b"section", b"a"];
+
+#[test]
+fn a_shuffled_pool_of_tag_claims_converges_on_every_permutation() {
+    // The deterministic tests fold the shapes the rank was reasoned about. This
+    // pools them — several inserts at one stamp under different tags, a reveal
+    // naming the node they derive, a delete of the contested slot, and a second
+    // stamp's claims — and folds every pool in many permutations, comparing
+    // snapshot bytes. An interaction the reasoning missed shows up here, where an
+    // isolated shape would not reach it.
+    for seed in 0..40u64 {
+        let mut rng = Rng::new(seed);
+        let mut author = Document::new(cid(1));
+        let build = frag_with_a(&mut author);
+        let base = only_insert(author.transact(|tx| {
+            tx.xml_fragment(b"doc").children().insert_element(1, b"z");
+        }));
+        let other = only_insert(author.transact(|tx| {
+            tx.xml_fragment(b"doc").children().insert_element(2, b"z");
+        }));
+
+        // The node the first stamp's tagged child derives, read off a replica
+        // that folded one claim alone.
+        let node = {
+            let mut d = Document::new(cid(9));
+            for op in build.iter().chain([&base]) {
+                d.apply(op);
+            }
+            contested_id(&d).expect("the born child")
+        };
+
+        let mut pool: Vec<Op> = Vec::new();
+        let mut seq = 9_000u64;
+        for _ in 0..3 {
+            pool.push(twin_tagged(&base, seq, TAGS[rng.below(TAGS.len())]));
+            seq += 1;
+        }
+        for _ in 0..2 {
+            pool.push(twin_tagged(&other, seq, TAGS[rng.below(TAGS.len())]));
+            seq += 1;
+        }
+        if rng.below(2) == 0 {
+            let mut reveal = base.clone();
+            reveal.id.seq = seq;
+            seq += 1;
+            reveal.kind = OpKind::XmlReveal {
+                node,
+                tag: Some(TAGS[rng.below(TAGS.len())].to_vec()),
+            };
+            pool.push(reveal);
+        }
+        if rng.below(2) == 0 {
+            let mut delete = base.clone();
+            delete.id.seq = seq;
+            delete.stamp.lamport = base.stamp.lamport + 2;
+            delete.kind = OpKind::ListDelete { id: base.stamp };
+            pool.push(delete);
+        }
+
+        let expect = {
+            let refs: Vec<&Op> = pool.iter().collect();
+            fold(&build, &refs)
+        };
+        for round in 0..12 {
+            let mut shuffled = pool.clone();
+            for i in (1..shuffled.len()).rev() {
+                shuffled.swap(i, rng.below(i + 1));
+            }
+            let refs: Vec<&Op> = shuffled.iter().collect();
+            assert_eq!(
+                fold(&build, &refs),
+                expect,
+                "seed {seed} round {round} diverged"
+            );
+        }
+
+        // And the pool's verdict survives a reload.
+        let mut d = Document::new(cid(9));
+        for op in build.iter().chain(pool.iter()) {
+            d.apply(op);
+        }
+        let bytes = d.encode_state();
+        let back = Document::decode_state(&bytes).expect("a replica could not load its snapshot");
+        assert_eq!(
+            back.encode_state(),
+            bytes,
+            "seed {seed}: the re-encode is not canonical"
+        );
+    }
 }

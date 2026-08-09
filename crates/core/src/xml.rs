@@ -1,6 +1,6 @@
 //! XmlElement / XmlFragment — the tree primitives.
 //!
-//! An [`XmlElement`] is a tagged tree node: an immutable `tag`, an `attrs` [`Map`]
+//! An [`XmlElement`] is a tagged tree node: a `tag`, an `attrs` [`Map`]
 //! (holding any CRDT values), and an ordered `children` sequence of nested
 //! `XmlElement`s and `Text` runs. An [`XmlFragment`] is the same children sequence
 //! without a tag or attrs — a bare document body.
@@ -12,8 +12,12 @@
 //! engines unchanged — this type only pairs them under one id and a tag. The
 //! attrs Map and children List take ids derived from the element's own id, so
 //! every replica agrees on them (the same convergence the [`ElementId`] derivation
-//! gives Map slots). The `tag` is fixed at creation — retagging a node is a
-//! replace, not a mutation — so a merge of the same element never reconciles it.
+//! gives Map slots). The `tag` is identity rather than editable state — no op
+//! retags a node, and retagging in the API is a replace — but two claims can
+//! still *name* one node under two tags, since a children-list node's id derives
+//! from `(list, stamp, kind)` and carries no tag. So the tag is reconciled by its
+//! own rank ([`XmlElement::claim_tag`]) wherever one is installed, a merge
+//! included, rather than left at whichever claim landed first.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
