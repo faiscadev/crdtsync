@@ -6101,15 +6101,16 @@ fn ranged_id(stamp: Stamp) -> ElementId {
 fn reveal_op_id(node: ElementId, tag: Option<&[u8]>) -> OpId {
     let ns = ElementId::from_bytes(*b"crdtsync\0reveal\0");
     let mut name = node.as_bytes().to_vec();
-    // The presence byte leads the tag, so a tagless shell and one carrying an empty
-    // tag are two shells rather than one — the empty tag is admissible and is the
-    // rank's bottom, so the two are not the same claim.
-    match tag {
-        Some(t) => {
-            name.push(1);
-            name.extend_from_slice(t);
-        }
-        None => name.push(0),
+    // A marker leads the tag, so no tag's own bytes can spell the tagless case: a
+    // `None` name is the node's 16 bytes and every `Some` name is at least 17. That
+    // separates the tagless shell from the empty-tagged one — the empty tag is
+    // admissible and is the rank's bottom, so the two are different claims — and
+    // from a tag of one NUL byte, which is what a bare concatenation would spell.
+    // The tagless side needs no marker of its own: the one here is what puts every
+    // tagged name out of its reach.
+    if let Some(t) = tag {
+        name.push(1);
+        name.extend_from_slice(t);
     }
     let derived = ElementId::derive(ns, &name, ElementKind::XmlElement);
     OpId {
@@ -7318,6 +7319,46 @@ mod tests {
         let mut b = [0u8; 16];
         b[0] = first;
         ClientId::from_bytes(b)
+    }
+
+    /// A reveal shell's id is injective in the tag it carries — the absent tag and
+    /// every byte string alike. The `Some` marker buys that on its own: a tagless
+    /// name is the node's 16 bytes and every tagged name is at least 17, so no
+    /// tag's own bytes can spell the absent case. Drop it and `None` names the bare
+    /// node, which the empty tag then spells too — a tagless shell and an
+    /// empty-tagged one would be one op and the later would dedup away; a bare
+    /// concatenation collides `None` with a tag of one NUL byte the same way. A tag
+    /// is unvalidated bytes off the wire, so a NUL is as authorable as any letter.
+    /// A matching marker on the tagless side would be dead: nothing it separates is
+    /// not already separated.
+    ///
+    /// `reveal_ops` emits one shell per node and reads its kind off the registry,
+    /// so no honest stream asks for two of these today. The derivation is what
+    /// makes that a property of the id rather than of who calls it, which an op
+    /// family added later would otherwise break in silence.
+    #[test]
+    fn a_reveal_shell_id_is_injective_in_the_tag() {
+        let node = ElementId::from_bytes([3u8; 16]);
+        let nul: &[u8] = &[0u8];
+        // The absent tag is separated from every tag that could otherwise spell it.
+        assert_ne!(reveal_op_id(node, None), reveal_op_id(node, Some(b"")));
+        assert_ne!(reveal_op_id(node, None), reveal_op_id(node, Some(nul)));
+        assert_ne!(reveal_op_id(node, Some(b"")), reveal_op_id(node, Some(nul)));
+        // The tag is read, not merely present.
+        assert_ne!(
+            reveal_op_id(node, Some(b"a")),
+            reveal_op_id(node, Some(b"b"))
+        );
+        assert_eq!(
+            reveal_op_id(node, Some(b"a")),
+            reveal_op_id(node, Some(b"a"))
+        );
+        // And the node still separates two shells carrying one tag.
+        let other = ElementId::from_bytes([4u8; 16]);
+        assert_ne!(
+            reveal_op_id(node, Some(b"a")),
+            reveal_op_id(other, Some(b"a"))
+        );
     }
 
     /// A snapshot whose move log folds the parent relation into a cycle is
