@@ -2568,20 +2568,24 @@ impl Hub {
     ///
     /// A name the room's registry does not hold is [`DiffError::UnknownBranch`]; a
     /// branch it *does* hold whose base this node cannot read is
-    /// [`DiffError::UnreadableBranch`] — a durable base that no longer decodes (C15),
-    /// or a live-log fork whose shared base `main`'s compaction has dropped (C88).
+    /// [`DiffError::UnreadableBranch`] — a durable base that no longer decodes, or a
+    /// live-log fork whose shared base `main`'s retained log no longer covers (C88).
     /// `main` on a room this node holds no replica for diffs as the empty state this
     /// node holds for it, rather than as a missing branch (C51). A *materialized*
     /// state that does not decode is [`DiffError::Decode`]. `narrow` is the reader's
     /// redaction, as in [`Hub::diff_versions`].
     ///
+    /// The sides resolve left to right, so `a`'s answer is the one returned when both
+    /// fail.
+    ///
     /// Every answer here is about the state *this node* holds, since the read takes no
-    /// leader redirect: on a follower — which replicates `main` alone — a branch the
-    /// leader holds is absent, and on a node holding no replica for a room at all,
-    /// `main` is empty. A channel only binds where this node serves the read itself,
-    /// which is the room's leader, promoted or not — and there the live stream is
-    /// served empty too, so the change list stays the diff of two states this reader
-    /// would itself have been handed. What is missing is the routing, which is C99's.
+    /// leader redirect. A follower binds channels, and reaches the absent answer from
+    /// its own side — it replicates `main` alone, so a branch the leader holds is not
+    /// here — but it serves a read only while it holds a materialized replica, so no
+    /// follower answers `Empty`. A node that does is the room's leader, promoted or
+    /// not, and there the live stream is served empty too, so the change list stays the
+    /// diff of two states this reader would itself have been handed. What is missing is
+    /// the routing, which is C99's.
     pub fn diff_branches(
         &mut self,
         room: &[u8],

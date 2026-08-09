@@ -22,9 +22,10 @@
 //! here beside them. `unreadable_branch_base` pins the same refusal against the
 //! durable path end to end.
 
-use crdtsync_core::diff::decode_changes;
+use crdtsync_core::diff::{decode_changes, Change};
+use crdtsync_core::path::encode_path;
 use crdtsync_core::protocol::{Channel, DiffKind};
-use crdtsync_core::{ClientId, Document, ErrorCode, Message, Op, Scalar};
+use crdtsync_core::{ClientId, Document, ElementKind, ErrorCode, Message, Op, Scalar};
 use crdtsync_server::store::{Branch, RoomLog, Snapshot, Store};
 use crdtsync_server::{Catchup, ConnId, DiffError, Hub, Registry};
 use std::fs;
@@ -170,9 +171,12 @@ fn an_empty_room_diffs_main_against_a_written_branch() {
         .diff_branches(ROOM, MAIN, DRAFT, |s| s)
         .expect("an empty `main` is a state, not an unknown branch");
     assert_eq!(
-        changes.len(),
-        1,
-        "the branch's whole divergence is an add over the empty state: {changes:?}"
+        changes,
+        vec![Change::Added {
+            path: encode_path(&[b"key"]),
+            kind: ElementKind::Register,
+        }],
+        "the branch's whole divergence is an add over the empty state"
     );
 }
 
