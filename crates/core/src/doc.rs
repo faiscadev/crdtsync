@@ -285,11 +285,25 @@ pub struct Document {
     /// ([`note_published`](Document::note_published)). Every entry is under this
     /// replica's own identity, and the set is disjoint from `seen` and `buffered`.
     ///
-    /// Read by the mint and by nothing else. The dedup set is deliberately *not*
-    /// where these go: the ops behind them are ops the room's log holds, so a
-    /// widened read grant or a resumed subscription can still deliver them, and an
-    /// id in `seen` would drop them as replays — leaving the recipient the one
-    /// author whose content it never gets back.
+    /// Read by the mint and by nothing else. **A third set rather than the dedup
+    /// set**, because the ops behind these ids are ops the room's log still holds:
+    /// a widened read grant or a resumed subscription can deliver them, and an id
+    /// in `seen` would drop them as replays — leaving the recipient the one author
+    /// whose own content it never gets back. Measured, not assumed: naming the run
+    /// in `seen` cost exactly that on a resume, while another author's write into
+    /// the same subtree folded normally.
+    ///
+    /// **And durable rather than in-memory**, which is the other half of the cost
+    /// this set carries. It rides `encode_state` for the reason `seen` does — it is
+    /// the mint's evidence about its own run — and without that a replica that
+    /// persists its state and reloads comes back holding the hole a redacted
+    /// catch-up left in it. That path is shipped surface, not a hypothetical: the
+    /// SDKs expose the document snapshot (`crdtsync_doc_encode_state`) and the
+    /// channel's cursor (`crdtsync_client_last_seen_seq`), so an app can restore
+    /// both and resume above its own withheld ops, where no later frame names them
+    /// again. The price is a `STATE_VERSION` bump and a decode-time disjointness
+    /// rule against `seen` and `buffered`; the alternative is the original defect
+    /// surviving on that path.
     reserved: HashSet<OpId>,
     /// Ops the current state cannot express, held until it can: a target whose
     /// create is unseen, a delete whose nodes are absent, a member of an incomplete
