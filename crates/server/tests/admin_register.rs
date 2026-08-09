@@ -15,8 +15,8 @@ use crdtsync_server::{Action, Authorizer, Identity, Resource, StaticTokens};
 use std::sync::Mutex;
 
 const APP: &[u8] = b"app-x";
-const S1: &[u8] = br#"{"schema":1}"#;
-const S2: &[u8] = br#"{"schema":2}"#;
+const S1: &[u8] = br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#;
+const S2: &[u8] = br#"{"schema":"s","version":2,"root":"R","types":{"R":{"kind":"map"}}}"#;
 
 /// A verifier that maps `admin-cred`→actor `admin` and `user-cred`→actor `user`.
 fn verifier() -> StaticTokens {

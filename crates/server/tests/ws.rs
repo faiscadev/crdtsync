@@ -738,7 +738,14 @@ async fn the_authorization_header_wins_over_other_carriers() {
 #[tokio::test]
 async fn a_registered_apps_unknown_version_is_refused_at_the_handshake() {
     let mut schema = SchemaRegistry::new();
-    schema.register(b"app-x", 1, br#"{"v":1}"#, b"").unwrap();
+    schema
+        .register(
+            b"app-x",
+            1,
+            br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#,
+            b"",
+        )
+        .unwrap();
     let server = start_server_with(ServeConfig {
         schema: Arc::new(Mutex::new(schema)),
         ..ServeConfig::default()
@@ -832,7 +839,7 @@ async fn a_registration_over_the_admin_plane_reaches_the_data_plane_handshake() 
 
     // Before registration, app-x is unregistered — a handshake would relay any
     // version. Register v1 over the admin socket.
-    let body = b"{\"v\":1}";
+    let body = br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#;
     // `Connection: close` so the server closes the socket after the response and
     // `read_to_end` reaches EOF rather than blocking on a kept-alive connection.
     let request = format!(

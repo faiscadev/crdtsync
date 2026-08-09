@@ -188,6 +188,19 @@ async fn register(
             (StatusCode::UNAUTHORIZED, "a valid credential is required")
         }
         RegisterOutcome::Forbidden => (StatusCode::FORBIDDEN, "not permitted to register this app"),
+        // A body this server cannot read as a schema is wrong on its own terms, and
+        // wrong at every position — the one refusal that is about the payload rather
+        // than about the chain.
+        RegisterOutcome::Rejected(RegisterError::Unparseable { .. }) => {
+            (StatusCode::BAD_REQUEST, "schema body does not parse")
+        }
+        // A zone block is refused *relative to its predecessor's*: the same body is a
+        // valid version 1 of a fresh app, so this is a collision with what is already
+        // registered, the same class as a gap or a changed lock.
+        RegisterOutcome::Rejected(RegisterError::ZonesNotAppendOnly { .. }) => (
+            StatusCode::CONFLICT,
+            "zones must extend the previous version's block, never reorder or remove",
+        ),
         RegisterOutcome::Rejected(_) => (
             StatusCode::CONFLICT,
             "registration rejected: not the next contiguous version, or a locked version changed",

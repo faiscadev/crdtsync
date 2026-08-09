@@ -12,6 +12,11 @@ use crdtsync_server::translate::{reachable, translate_op, translate_ops, Transla
 
 const APP: &[u8] = b"app";
 
+/// The registered body every version in these chains carries: the chain's shape and
+/// its migration edges are what is under test, not the schema itself, so one
+/// well-formed body serves every link.
+const SCHEMA_BODY: &[u8] = br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#;
+
 fn cid(first: u8) -> ClientId {
     let mut b = [0u8; 16];
     b[0] = first;
@@ -49,13 +54,13 @@ fn edge(to: u32, step: &str) -> String {
 
 /// A registry whose app is a chain of the given per-version migration bodies:
 /// `edges[0]` is the 1->2 edge, `edges[1]` the 2->3 edge, and so on. Version 1
-/// has no predecessor, so it carries an empty edge. The schema body is opaque
-/// to translation, so any bytes suffice.
+/// has no predecessor, so it carries an empty edge. Translation reads the edges, not
+/// the schema bodies, so every version registers the same one.
 fn registry_with(edges: &[&str]) -> SchemaRegistry {
     let mut reg = SchemaRegistry::new();
-    reg.register(APP, 1, b"{}", b"").unwrap();
+    reg.register(APP, 1, SCHEMA_BODY, b"").unwrap();
     for (i, e) in edges.iter().enumerate() {
-        reg.register(APP, (i + 2) as u32, b"{}", e.as_bytes())
+        reg.register(APP, (i + 2) as u32, SCHEMA_BODY, e.as_bytes())
             .unwrap();
     }
     reg

@@ -56,6 +56,27 @@ async fn send(
     router.oneshot(request).await.unwrap().status().as_u16()
 }
 
+/// Registrable bodies. The registry parses what it stores, so a chain test needs
+/// real schema text; the versions differ only in their `version` field, which is
+/// enough to make each a distinct content lock.
+const S1: &str = r#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#;
+const S2: &str = r#"{"schema":"s","version":2,"root":"R","types":{"R":{"kind":"map"}}}"#;
+const S3: &str = r#"{"schema":"s","version":3,"root":"R","types":{"R":{"kind":"map"}}}"#;
+/// A registrable body that is not `S1` — a content change under a locked version. It
+/// has to parse in its own right, or the refusal under test would be the body's rather
+/// than the lock's.
+const OTHER: &str = r#"{"schema":"s","version":1,"root":"R",
+    "types":{"R":{"kind":"map","children":{"a":"S"}},"S":{"kind":"map"}}}"#;
+
+/// Two zones in declaration order, and the same two swapped — the id re-point the
+/// registry refuses.
+const ZONED_V1: &str = r#"{"schema":"s","version":1,"root":"R",
+    "types":{"R":{"kind":"map","children":{"a":"S","b":"S"}},"S":{"kind":"map"}},
+    "zones":{"za":"/a","zb":"/b"}}"#;
+const ZONED_V2_REORDERED: &str = r#"{"schema":"s","version":2,"root":"R",
+    "types":{"R":{"kind":"map","children":{"a":"S","b":"S"}},"S":{"kind":"map"}},
+    "zones":{"zb":"/b","za":"/a"}}"#;
+
 #[tokio::test]
 async fn a_well_formed_post_registers_and_returns_200() {
     assert_eq!(
@@ -64,10 +85,53 @@ async fn a_well_formed_post_registers_and_returns_200() {
             "POST",
             "/apps/app-x/schemas/1",
             Some("admin-cred"),
-            "S1"
+            S1
         )
         .await,
         200
+    );
+}
+
+#[tokio::test]
+async fn a_body_the_server_cannot_parse_as_a_schema_is_400() {
+    // The registry stores only what it can read back as a schema: a version that
+    // resolves to *no* schema reads at every zone seam as a room with no partitions
+    // and is served whole. A malformed body is the caller's payload being wrong, so
+    // it is a 400 rather than the 409 a chain-shape collision gets.
+    assert_eq!(
+        send(
+            SchemaRegistry::new(),
+            "POST",
+            "/apps/app-x/schemas/1",
+            Some("admin-cred"),
+            "not a schema {"
+        )
+        .await,
+        400
+    );
+}
+
+#[tokio::test]
+async fn a_zone_block_that_is_not_an_extension_is_409() {
+    // A zone id is the zone's position in the block, so reordering or removing one
+    // re-points ids already stamped into every room the app governs. The control
+    // plane refuses the version rather than letting it land — a conflict with the
+    // registered predecessor, since the same body is a valid version 1, so it takes
+    // the same 409 a gap or a changed lock does.
+    let mut registry = SchemaRegistry::new();
+    registry
+        .register(b"app-x", 1, ZONED_V1.as_bytes(), b"")
+        .unwrap();
+    assert_eq!(
+        send(
+            registry,
+            "POST",
+            "/apps/app-x/schemas/2",
+            Some("admin-cred"),
+            ZONED_V2_REORDERED
+        )
+        .await,
+        409
     );
 }
 
@@ -79,7 +143,7 @@ async fn a_missing_credential_is_401() {
             "POST",
             "/apps/app-x/schemas/1",
             None,
-            "S1"
+            S1
         )
         .await,
         401
@@ -94,7 +158,7 @@ async fn an_unpermitted_credential_is_403() {
             "POST",
             "/apps/app-x/schemas/1",
             Some("user-cred"),
-            "S1"
+            S1
         )
         .await,
         403
@@ -163,7 +227,7 @@ async fn a_non_numeric_version_is_400() {
             "POST",
             "/apps/app-x/schemas/latest",
             Some("admin-cred"),
-            "S1"
+            S1
         )
         .await,
         400
@@ -216,37 +280,34 @@ async fn the_admin_plane_serves_registration_over_a_socket() {
 
     // A permitted admin registers version 1.
     assert_eq!(
-        post(addr, &register("app-x", 1, Some("admin-cred"), "SCHEMA-1")).await,
+        post(addr, &register("app-x", 1, Some("admin-cred"), S1)).await,
         200
     );
     // The same registration again is an idempotent 200 — the registry kept state.
     assert_eq!(
-        post(addr, &register("app-x", 1, Some("admin-cred"), "SCHEMA-1")).await,
+        post(addr, &register("app-x", 1, Some("admin-cred"), S1)).await,
         200
     );
     // A changed body under the locked version is a 409 — proving v1 was retained.
     assert_eq!(
-        post(addr, &register("app-x", 1, Some("admin-cred"), "OTHER")).await,
+        post(addr, &register("app-x", 1, Some("admin-cred"), OTHER)).await,
         409
     );
     // A gap (version 3 while head is 1) is a 409.
     assert_eq!(
-        post(addr, &register("app-x", 3, Some("admin-cred"), "SCHEMA-3")).await,
+        post(addr, &register("app-x", 3, Some("admin-cred"), S3)).await,
         409
     );
     // The next contiguous version registers.
     assert_eq!(
-        post(addr, &register("app-x", 2, Some("admin-cred"), "SCHEMA-2")).await,
+        post(addr, &register("app-x", 2, Some("admin-cred"), S2)).await,
         200
     );
 
     // No credential is refused; an unpermitted one is forbidden.
+    assert_eq!(post(addr, &register("app-x", 3, None, S3)).await, 401);
     assert_eq!(
-        post(addr, &register("app-x", 3, None, "SCHEMA-3")).await,
-        401
-    );
-    assert_eq!(
-        post(addr, &register("app-x", 3, Some("user-cred"), "SCHEMA-3")).await,
+        post(addr, &register("app-x", 3, Some("user-cred"), S3)).await,
         403
     );
 }

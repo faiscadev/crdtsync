@@ -166,10 +166,13 @@ pub struct Registry {
     /// dropped.
     room_apps: HashMap<RoomId, (Vec<u8>, u32)>,
     /// Parsed schemas keyed by `{app_id, version}`, the sweep's TTL source. A
-    /// registry link is immutable once locked, so the outcome — the parsed schema
-    /// or `None` for an absent/unparseable one — is cached for the process
-    /// lifetime and never re-resolved for the same version.
-    schema_cache: HashMap<(Vec<u8>, u32), Option<Arc<Schema>>>,
+    /// registry link is immutable once locked, so a version that resolves is cached
+    /// for the process lifetime and never re-parsed. A version that does **not**
+    /// resolve is *absent* from the map rather than held as a negative entry — the
+    /// control plane can register it at any moment ([`Registry::parsed_schema`]) —
+    /// which is why the value is an `Arc<Schema>` and not an `Option`: the type is
+    /// what keeps a negative entry unrepresentable.
+    schema_cache: HashMap<(Vec<u8>, u32), Arc<Schema>>,
     /// Auto-version signals a recording sink queued during a delivery, drained
     /// after it: each room-bearing lifecycle event, awaiting its schema's trigger
     /// match. Shared with the sink the hub holds.
@@ -1709,13 +1712,36 @@ impl Registry {
     }
 
     /// The parsed schema for `{app_id, version}`, resolved out of the shared
-    /// registry and cached for the process lifetime — a link never changes once
-    /// registered, so the outcome is cached even when it is `None` (a version the
-    /// registry does not hold, or a body that fails to parse), sparing a re-lock
-    /// and re-parse on every sweep of a room bound to an unparseable schema.
+    /// registry and cached for the process lifetime — a link is immutable once
+    /// registered, so a resolved schema is cached and never re-parsed.
+    ///
+    /// An **unresolved** version is not cached. The registry parses what it stores, so
+    /// the only way this resolves to nothing is a version this node does not hold —
+    /// which the control plane can register at any moment, and a negative entry would
+    /// outlive that registration for the life of the process. The rooms bound to such
+    /// a version are the ones that most need to pick it up: until it resolves they
+    /// have no `@auth` grants and no declared zones, so a whole-room channel there is
+    /// served every partition.
+    ///
+    /// The cost is a registry lock per resolve — not a re-parse, since an absent
+    /// version has no bytes to parse — for as long as a bound version stays
+    /// unresolvable. That is usually the startup window before an app re-registers,
+    /// but it can be permanent: a binding only ever rises
+    /// ([`bind_room_app`](Registry::bind_room_app)) and it is durable, so a room bound
+    /// at a version above what this node's registry reaches — an operator rollback, a
+    /// lagging node in a mixed fleet — pays that lock on every frame.
+    ///
+    /// An *uncontended* lock against a frame's decode and per-path ACL evaluation is
+    /// not worth a registry generation counter to avoid, and the counter would move
+    /// the same bug — an append that forgets to bump caches a miss forever — somewhere
+    /// no test presses on it. What breaks that argument is **contention**, not how
+    /// often the unresolvable binding occurs: this mutex is shared with the admin
+    /// plane and with chain resolution, so a deployment registering frequently, or a
+    /// mixed fleet driving `resolve_chains` hard, makes the lock contended while the
+    /// misconfiguration stays exactly as rare. Reconsider there.
     fn parsed_schema(&mut self, app: &(Vec<u8>, u32)) -> Option<Arc<Schema>> {
         let schema = match self.schema_cache.get(app) {
-            Some(schema) => schema.clone(),
+            Some(schema) => Some(schema.clone()),
             None => {
                 let registry = match self.schema.lock() {
                     Ok(guard) => guard,
@@ -1727,7 +1753,9 @@ impl Registry {
                     .and_then(|src| Schema::parse(src).ok())
                     .map(Arc::new);
                 drop(registry);
-                self.schema_cache.insert(app.clone(), schema.clone());
+                if let Some(schema) = &schema {
+                    self.schema_cache.insert(app.clone(), schema.clone());
+                }
                 schema
             }
         };
@@ -1761,9 +1789,28 @@ impl Registry {
     }
 
     /// The parsed schema governing `room` — the app bound to it — which gates a
-    /// peer's read of the room's fan-out. `None` for a relay room none enforces.
+    /// peer's read of the room's fan-out and narrows each channel's zone scope.
+    /// `None` for a relay room none enforces.
+    ///
+    /// The binding is the live map's, or — where a dormant sweep or a restart dropped
+    /// it — the room's own, which the hub holds. The same resolution an authorizing
+    /// frame takes ([`Registry::deliver`]'s `room_binding`), and it has to be: the two
+    /// decide the same room's zone partitions, one at Subscribe and one at every write
+    /// after it, so a fan-out that answered "this room declares nothing" where the
+    /// subscribe answered "these zones" would serve a channel the partitions it was
+    /// narrowed away from.
+    ///
+    /// The two are resolved at different moments in a frame, so a registration landing
+    /// between them can leave the gate deciding under one schema and the fan-out under
+    /// the next. Both directions are safe: the newer schema's zone block extends the
+    /// older's, so the fan-out either narrows by the same partitions or by more of
+    /// them, and the gate's answer is never the wider one for having been taken first.
     fn governing_schema(&mut self, room: &[u8]) -> Option<Arc<Schema>> {
-        let app = self.room_apps.get(room)?.clone();
+        let app = self
+            .room_apps
+            .get(room)
+            .cloned()
+            .or_else(|| self.hub.governing_app(room))?;
         self.parsed_schema(&app)
     }
 
@@ -2013,8 +2060,12 @@ impl Registry {
                 // Narrow to the channel's authorized zone partitions — the
                 // per-zone wire redaction. A channel scoped to a subset of the
                 // room's zones drops the rest, so an unauthorized zone never
-                // surfaces on it; an emptied channel gets no frame.
-                let zoned = conn.session.zone_filter(channel, ops);
+                // surfaces on it; an emptied channel gets no frame. The scope is
+                // resolved against the room's governing schema as it governs now,
+                // not the one that was acting when the channel joined.
+                let zoned = conn
+                    .session
+                    .zone_filter(channel, ops, authorizer, schema.as_deref());
                 if zoned.is_empty() {
                     continue;
                 }
@@ -2348,8 +2399,12 @@ impl Registry {
                 // Narrow to the channel's authorized zone partitions — the wire
                 // redaction for per-zone streams. A channel scoped to a subset of the
                 // room's zones drops the rest; an unauthorized zone never surfaces,
-                // and a channel left with nothing is not sent an empty frame.
-                let ops = conn.session.zone_filter(channel, &translated);
+                // and a channel left with nothing is not sent an empty frame. The
+                // scope is resolved against the room's governing schema as it governs
+                // now, not the one that was acting when the channel joined.
+                let ops =
+                    conn.session
+                        .zone_filter(channel, &translated, authorizer, schema.as_deref());
                 if ops.is_empty() {
                     continue;
                 }

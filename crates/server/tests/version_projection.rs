@@ -440,14 +440,14 @@ fn a_reader_denied_every_zone_is_served_only_the_root_partition() {
 }
 
 #[test]
-fn a_zone_set_wider_than_the_schema_still_projects() {
-    // The other side of the drift, and the conservative half of the rule. A set that
-    // covers every *currently* declared zone but also names one the schema has since
-    // dropped is not "exactly the declared range", so the projection runs. It purges
-    // no content — a de-zoned subtree belongs to the root partition — but it does
-    // scrub the frontier, and being narrower than `main` was here is the deliberate
-    // choice: whole-zone is a claim about which partitions a set names, and a set
-    // resolved against a schema that no longer exists cannot make it.
+fn a_whole_room_scope_stays_whole_across_a_zone_append() {
+    // The other side of the same re-resolution. Skipping the zone projection is not
+    // merely an optimization — it is what leaves a reader entitled to every partition
+    // the whole causal frontier to dedup against — and it is claimed by naming
+    // *exactly* the declared id range. A reader denied nothing names that range under
+    // v1 and must still name it under v2, which declares one zone more; a scope frozen
+    // at Subscribe falls short of the new range, projects, and scrubs the frontier of
+    // a reader nothing was ever withheld from.
     let mut sr = SchemaRegistry::new();
     sr.register(DRIFT_APP, 1, DRIFT_V1.as_bytes(), b"").unwrap();
     sr.register(
@@ -494,7 +494,7 @@ fn a_zone_set_wider_than_the_schema_still_projects() {
     );
     create_version(&mut r, author, V1);
 
-    // The lift drops a zone, leaving the bound set wider than the schema.
+    // The lift appends a zone, so the range the reader's scope must name grows.
     let newer = auth(&mut r, 3, "c-author", DRIFT_APP, 2);
     subscribe(&mut r, newer, b"");
 
@@ -503,8 +503,9 @@ fn a_zone_set_wider_than_the_schema_still_projects() {
     assert_eq!(nested(&served, b"board", b"bseed"), Some(0));
     assert_eq!(
         frontier_authors(&state),
-        HashSet::from([cid(2)]),
-        "a set wider than the schema was mistaken for a whole-zone one",
+        HashSet::from([cid(1), cid(2)]),
+        "a reader denied no zone is owed the whole frontier — a scope frozen under v1 \
+         is short of v2's range, projects, and scrubs every author but the recipient",
     );
 }
 
@@ -970,29 +971,30 @@ fn a_version_is_narrowed_by_both_projections_at_once() {
     );
 }
 
-// --- a zone set that outlives the schema it was resolved against ---
+// --- a channel bound across a lift of the room's governing schema ---
 
-/// Three zoned subtrees. A channel that cannot read `zsecret` resolves to `{1, 2}`.
+/// Three zoned subtrees and one unzoned slot (`/extra`, v2's new zone).
 const DRIFT_V1: &str = r#"{
     "schema": "d", "version": 1, "root": "Doc",
     "types": {
         "Doc": { "kind": "map", "children": {
-            "secret": "Sect", "board": "Sect", "notes": "Sect" } },
+            "secret": "Sect", "board": "Sect", "notes": "Sect", "extra": "Sect" } },
         "Sect": { "kind": "map" }
     },
     "zones": { "zsecret": "/secret", "za": "/board", "zb": "/notes" }
 }"#;
 
-/// The same app, one zone fewer — so a set of two ids resolved against v1 has
-/// exactly as many members as v2 declares zones, while naming different ones.
+/// The same app one zone later: `zc` appended, the earlier three untouched — the
+/// only shape of `zones` change the registry admits, since an id is a position in
+/// the block. `/extra` is the root partition under v1 and zone `zc` under v2.
 const DRIFT_V2: &str = r#"{
     "schema": "d", "version": 2, "root": "Doc",
     "types": {
         "Doc": { "kind": "map", "children": {
-            "secret": "Sect", "board": "Sect", "notes": "Sect" } },
+            "secret": "Sect", "board": "Sect", "notes": "Sect", "extra": "Sect" } },
         "Sect": { "kind": "map" }
     },
-    "zones": { "zsecret": "/secret", "za": "/board" }
+    "zones": { "zsecret": "/secret", "za": "/board", "zb": "/notes", "zc": "/extra" }
 }"#;
 
 const DRIFT_APP: &[u8] = b"d";
@@ -1009,12 +1011,14 @@ fn drift_authorizer(id: &Identity, _action: Action, res: &Resource) -> bool {
 }
 
 #[test]
-fn a_zone_set_that_outlived_its_schema_still_narrows() {
-    // A channel's zone ids are positions in the schema's zone order, resolved once at
-    // Subscribe; the room's governing version lifts underneath it when a newer client
-    // joins. Deciding "whole-zone" by counting members then says yes to a set that
-    // names none of the partitions the count was taken over — and serves the room
-    // whole. Containment over the declared ids does not care how many there are.
+fn a_bound_channels_scope_re_resolves_against_the_lifted_schema() {
+    // A channel's zone ids are positions in the acting schema's zone order, and the
+    // room's governing version lifts underneath a bound channel when a newer client
+    // joins. So the channel carries the zone *names* it was admitted to and resolves
+    // them again at each use: a partition v2 declares that v1 did not is served to a
+    // reader that may read it, and the one it is denied stays withheld. A set frozen
+    // at Subscribe answers both wrong — it names ids v2 did not have in mind, and
+    // being short of v2's declared range it also projects away the new zone.
     let mut sr = SchemaRegistry::new();
     sr.register(DRIFT_APP, 1, DRIFT_V1.as_bytes(), b"").unwrap();
     sr.register(
@@ -1044,34 +1048,33 @@ fn a_zone_set_that_outlived_its_schema_still_narrows() {
             tx.map(b"secret").register(b"sseed", Scalar::Int(0));
             tx.map(b"board").register(b"bseed", Scalar::Int(0));
             tx.map(b"notes").register(b"nseed", Scalar::Int(0));
+            tx.map(b"extra").register(b"eseed", Scalar::Int(0));
         }),
     );
 
-    // The reader binds its channel under v1: `zsecret` is denied, so its set is the
-    // other two ids.
+    // The reader binds its channel under v1, where `/extra` is not a zone at all and
+    // `zsecret` is the one partition it is denied.
     let reader = auth(&mut r, 2, "c-reader", DRIFT_APP, 1);
     subscribe(&mut r, reader, b"");
     create_version(&mut r, author, V1);
 
     // A v2 client joins and the room's governing version lifts under the bound
-    // channel — two declared zones now, against a two-member set naming neither pair.
+    // channel: `/extra` is now zone `zc`, which the reader may read.
     let newer = auth(&mut r, 3, "c-author", DRIFT_APP, 2);
     subscribe(&mut r, newer, b"");
 
     let served = Document::decode_state(&fetch_version(&mut r, reader, V1))
         .expect("the served version state decodes");
     assert_eq!(nested(&served, b"board", b"bseed"), Some(0));
+    assert_eq!(nested(&served, b"notes", b"nseed"), Some(0));
     assert!(
         served.get(b"secret").is_none(),
-        "a stale zone set was mistaken for a whole-zone one",
+        "the one denied zone is withheld across the lift",
     );
-    // And the consequence of the lift itself, stated rather than left implicit: a
-    // subtree v2 stopped declaring as a zone falls into the root partition, which no
-    // zone verdict governs, so it is served to everyone the room admits. Narrowing a
-    // stale set cannot recover what the schema no longer partitions.
     assert_eq!(
-        nested(&served, b"notes", b"nseed"),
+        nested(&served, b"extra", b"eseed"),
         Some(0),
-        "a de-zoned subtree is the root partition's, not a withheld zone's",
+        "a zone the lift declared is served to a reader that may read it — a scope \
+         frozen at Subscribe names no id for it and projects it away",
     );
 }

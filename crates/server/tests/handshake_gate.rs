@@ -24,8 +24,20 @@ fn cid(first: u8) -> ClientId {
 
 fn registered() -> SchemaRegistry {
     let mut r = SchemaRegistry::new();
-    r.register(APP, 1, br#"{"v":1}"#, b"").unwrap();
-    r.register(APP, 2, br#"{"v":2}"#, b"").unwrap();
+    r.register(
+        APP,
+        1,
+        br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#,
+        b"",
+    )
+    .unwrap();
+    r.register(
+        APP,
+        2,
+        br#"{"schema":"s","version":2,"root":"R","types":{"R":{"kind":"map"}}}"#,
+        b"",
+    )
+    .unwrap();
     r
 }
 
@@ -95,7 +107,7 @@ fn a_registered_app_pins_the_declared_version_and_advertises_it() {
     // The enforcing handshake advertises the resolved version and its bytes.
     assert!(matches!(
         resp.replies.as_slice(),
-        [Message::SchemaAdvert { schema_version: 1, schema }] if schema == br#"{"v":1}"#,
+        [Message::SchemaAdvert { schema_version: 1, schema }] if schema == br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#,
     ));
 }
 
@@ -112,7 +124,7 @@ fn a_dynamic_client_adopts_the_head_version_and_is_advertised_it() {
     // The dynamic client is advertised the head version + bytes to adopt.
     assert!(matches!(
         resp.replies.as_slice(),
-        [Message::SchemaAdvert { schema_version: 2, schema }] if schema == br#"{"v":2}"#,
+        [Message::SchemaAdvert { schema_version: 2, schema }] if schema == br#"{"schema":"s","version":2,"root":"R","types":{"R":{"kind":"map"}}}"#,
     ));
 }
 
@@ -158,7 +170,7 @@ fn the_registry_refuses_an_unknown_version_and_admits_a_known_one() {
     assert!(r.deliver(good, hello(APP, 2)));
     assert!(matches!(
         r.take_outbox(good).as_slice(),
-        [Message::SchemaAdvert { schema_version: 2, schema }] if schema == br#"{"v":2}"#,
+        [Message::SchemaAdvert { schema_version: 2, schema }] if schema == br#"{"schema":"s","version":2,"root":"R","types":{"R":{"kind":"map"}}}"#,
     ));
 }
 

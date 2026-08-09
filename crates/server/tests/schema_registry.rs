@@ -7,14 +7,28 @@
 //! retry, and refuses a gap, a backward version, or a content change under an
 //! already-registered version. Resolution returns the exact schema bytes a
 //! registered version holds, and nothing for an app or version it never saw.
+//!
+//! A body is also parsed on the way in, and its `zones` block held to an append-only
+//! rule against its predecessor's. Both guard what a stored version *means* rather
+//! than the chain's shape: a body the server cannot parse resolves to no schema at
+//! all, which every zone seam reads as "this room has no partitions" and serves whole;
+//! and a zone id is a position in the block, so reordering or removing a zone
+//! re-points every id already stamped into a room's log at a different partition
+//! (C30).
 
 use crdtsync_server::schema_registry::{RegisterError, Registered, SchemaRegistry};
 
 const APP: &[u8] = b"app-x";
-const S1: &[u8] = br#"{"schema":1}"#;
-const S2: &[u8] = br#"{"schema":2}"#;
-const S3: &[u8] = br#"{"schema":3}"#;
+const S1: &[u8] = br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#;
+const S2: &[u8] = br#"{"schema":"s","version":2,"root":"R","types":{"R":{"kind":"map"}}}"#;
+const S3: &[u8] = br#"{"schema":"s","version":3,"root":"R","types":{"R":{"kind":"map"}}}"#;
 const M2: &[u8] = br#"[{"rename":"a->b"}]"#;
+
+/// Two zoned subtrees, in declaration order — `za` is id 0, `zb` is id 1.
+const Z_AB: &[u8] = br#"{"schema":"s","version":1,"root":"R",
+    "types":{"R":{"kind":"map","children":{"board":"S","notes":"S","extra":"S"}},
+             "S":{"kind":"map"}},
+    "zones":{"za":"/board","zb":"/notes"}}"#;
 
 fn reg(
     r: &mut SchemaRegistry,
@@ -184,4 +198,103 @@ fn the_content_hash_is_stable_and_content_addressed() {
     reg(&mut r, APP, 2, S2).unwrap();
     assert_ne!(r.hash(APP, 2), Some(h1));
     assert_eq!(r.hash(APP, 3), None, "no such version");
+}
+
+#[test]
+fn a_body_that_does_not_parse_is_refused() {
+    let mut r = SchemaRegistry::default();
+    assert_eq!(
+        reg(&mut r, APP, 1, b"not a schema {"),
+        Err(RegisterError::Unparseable { version: 1 }),
+    );
+    assert_eq!(
+        r.head_version(APP),
+        None,
+        "a refused body left no version behind",
+    );
+    // Well-formed JSON that is not a *schema* is refused on the same footing — the
+    // placeholder shape a body most easily degrades into.
+    assert_eq!(
+        reg(&mut r, APP, 1, br#"{"v":1}"#),
+        Err(RegisterError::Unparseable { version: 1 }),
+    );
+    assert_eq!(
+        reg(&mut r, APP, 1, b"{}"),
+        Err(RegisterError::Unparseable { version: 1 }),
+    );
+    // Nor does one slip in later in a chain: a stored version that resolves to no
+    // schema is what a zone-limited reader is served the whole room on.
+    reg(&mut r, APP, 1, S1).unwrap();
+    assert_eq!(
+        reg(&mut r, APP, 2, b"\xff\xfe not utf-8"),
+        Err(RegisterError::Unparseable { version: 2 }),
+    );
+    assert_eq!(r.head_version(APP), Some(1));
+}
+
+#[test]
+fn a_zone_block_may_only_be_extended() {
+    let mut r = SchemaRegistry::default();
+    reg(&mut r, APP, 1, Z_AB).unwrap();
+
+    // Reordered: `za` and `zb` swap positions, so every op already stamped id 0
+    // would come to name `/notes`.
+    let reordered = br#"{"schema":"s","version":2,"root":"R",
+        "types":{"R":{"kind":"map","children":{"board":"S","notes":"S","extra":"S"}},
+                 "S":{"kind":"map"}},
+        "zones":{"zb":"/notes","za":"/board"}}"#;
+    assert_eq!(
+        reg(&mut r, APP, 2, reordered),
+        Err(RegisterError::ZonesNotAppendOnly { version: 2 }),
+    );
+
+    // Removed: dropping `za` shifts `zb` down onto id 0.
+    let removed = br#"{"schema":"s","version":2,"root":"R",
+        "types":{"R":{"kind":"map","children":{"board":"S","notes":"S","extra":"S"}},
+                 "S":{"kind":"map"}},
+        "zones":{"zb":"/notes"}}"#;
+    assert_eq!(
+        reg(&mut r, APP, 2, removed),
+        Err(RegisterError::ZonesNotAppendOnly { version: 2 }),
+    );
+
+    // Re-rooted: the name and the position hold, but the region the id governs
+    // moves — the same re-point by another door.
+    let rerooted = br#"{"schema":"s","version":2,"root":"R",
+        "types":{"R":{"kind":"map","children":{"board":"S","notes":"S","extra":"S"}},
+                 "S":{"kind":"map"}},
+        "zones":{"za":"/notes","zb":"/board"}}"#;
+    assert_eq!(
+        reg(&mut r, APP, 2, rerooted),
+        Err(RegisterError::ZonesNotAppendOnly { version: 2 }),
+    );
+
+    assert_eq!(
+        r.head_version(APP),
+        Some(1),
+        "every refusal left v1 the head"
+    );
+
+    // Appending keeps every earlier id where it was, and is what a deployment does
+    // instead of removing: a retired zone stays declared.
+    let appended = br#"{"schema":"s","version":2,"root":"R",
+        "types":{"R":{"kind":"map","children":{"board":"S","notes":"S","extra":"S"}},
+                 "S":{"kind":"map"}},
+        "zones":{"za":"/board","zb":"/notes","zc":"/extra"}}"#;
+    assert_eq!(reg(&mut r, APP, 2, appended), Ok(Registered::Appended));
+}
+
+#[test]
+fn a_first_version_declares_whatever_zones_it_likes() {
+    // The rule is about a *predecessor's* block, and version 1 has none.
+    let mut r = SchemaRegistry::default();
+    assert_eq!(reg(&mut r, APP, 1, Z_AB), Ok(Registered::Appended));
+    // And a chain that starts with no zones may declare them at the next version —
+    // an extension of the empty block.
+    let mut r2 = SchemaRegistry::default();
+    reg(&mut r2, APP, 1, S1).unwrap();
+    let zoned_v2 = br#"{"schema":"s","version":2,"root":"R",
+        "types":{"R":{"kind":"map","children":{"board":"S"}},"S":{"kind":"map"}},
+        "zones":{"za":"/board"}}"#;
+    assert_eq!(reg(&mut r2, APP, 2, zoned_v2), Ok(Registered::Appended));
 }

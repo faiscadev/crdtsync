@@ -10,8 +10,8 @@
 use crdtsync_server::schema_registry::{Resolution, SchemaRegistry};
 
 const APP: &[u8] = b"app-x";
-const S1: &[u8] = br#"{"v":1}"#;
-const S2: &[u8] = br#"{"v":2}"#;
+const S1: &[u8] = br#"{"schema":"s","version":1,"root":"R","types":{"R":{"kind":"map"}}}"#;
+const S2: &[u8] = br#"{"schema":"s","version":2,"root":"R","types":{"R":{"kind":"map"}}}"#;
 
 fn registered() -> SchemaRegistry {
     let mut r = SchemaRegistry::new();
