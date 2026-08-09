@@ -3223,8 +3223,9 @@ impl Document {
     /// `false` covers three unrelated situations, and only the last is permanent:
     /// the op is already applied or already held (a duplicate); it is admissible but
     /// not applicable yet, so it is buffered and replays once a create makes its
-    /// target reachable or its transaction group completes; or it is one
-    /// [`Op::is_admissible`] refuses, which no later arrival changes. A caller that
+    /// target reachable or its transaction group resolves — by completing, or by its
+    /// members disagreeing so its key is spent; or it is one [`Op::is_admissible`]
+    /// refuses, which no later arrival changes. A caller that
     /// must tell "not yet" from "never" — an ingest seam deciding what to log, dedup
     /// and acknowledge — asks the op, since the refusal is a function of the op
     /// alone and never of this document's state.
@@ -3624,12 +3625,22 @@ impl Document {
                 self.apply_now(&op);
                 progressed = true;
             }
+            // Read once per pass and handed to both group rules, so spending a key
+            // and committing a group cannot disagree about what the buffer holds. A
+            // pass that spends one takes the next pass to commit, which is the drain's
+            // ordinary fixpoint rather than a rule: the map a spend leaves behind
+            // describes tags the buffer no longer carries, and re-reading it is
+            // cheaper to justify than reasoning about which of its entries survived.
+            let groups = self.tx_buckets();
+            if self.resolve_disagreeing_tx(&groups) {
+                progressed = true;
+            }
             // One complete atomic transaction: apply every member in seq order, so a
             // member that targets a container an earlier member creates reaches it on
             // the first pass. Order is a shortcut, not the mechanism — a member that
             // is not ready is re-buffered untagged and lands on the drain's fixpoint
             // either way.
-            if let Some(mut members) = self.take_complete_tx() {
+            else if let Some(mut members) = self.take_complete_tx(groups) {
                 // The bucket's key is spent by this commit — its members are leaving
                 // the buffer and the count they met cannot be met a second time — so
                 // record it before anything else can arrive under it.
@@ -3751,8 +3762,10 @@ impl Document {
     /// not monotone — a container is installed, displaced, and re-installed as
     /// ops arrive — so a group-wide resolution gate would make commit a window
     /// arrival order decides, and the same ops would fold to different states.
-    fn take_complete_tx(&mut self) -> Option<Vec<Op>> {
-        let groups = self.tx_buckets();
+    fn take_complete_tx(
+        &mut self,
+        groups: HashMap<(ClientId, TxId), Vec<usize>>,
+    ) -> Option<Vec<Op>> {
         // Lowest buffer position wins when more than one group is complete, so the
         // commit order is the buffer's, not the hash map's. Draining to a fixpoint
         // after every fold keeps a replica's own buffer down to at most one complete
@@ -3805,6 +3818,34 @@ impl Document {
         }
     }
 
+    /// Spend the key of every bucket whose members disagree on the group's size,
+    /// releasing what it holds — a group no arrival can complete resolves where a
+    /// commit resolves.
+    ///
+    /// Holding a disagreement instead would be a decision the arrival order makes:
+    /// where a *subset* of a rewritten group agrees, it reaches its own declared
+    /// size before the dissenting member lands, commits, and leaves the dissenter a
+    /// stray of a resolved key — so whether the bucket ever holds the disagreement
+    /// at all depends on which members came first, and one op set folds to two
+    /// states. Resolving it makes both halves of that arrival space read the same
+    /// set: the members held are released untagged, and the key is spent against
+    /// the members still to come (ARCHITECTURE §Opt-In: Atomic).
+    fn resolve_disagreeing_tx(&mut self, groups: &HashMap<(ClientId, TxId), Vec<usize>>) -> bool {
+        let split: Vec<(ClientId, TxId)> = groups
+            .iter()
+            .filter(|(_, idxs)| self.tx_declared_count(idxs).is_none())
+            .map(|(key, _)| *key)
+            .collect();
+        let mut spent = false;
+        for key in split {
+            spent |= self.resolved_tx.insert(key);
+        }
+        if spent {
+            self.untag_resolved();
+        }
+        spent
+    }
+
     /// The buffer positions of every held transaction member, bucketed by the
     /// `(author, group id)` key a group is identified by.
     fn tx_buckets(&self) -> HashMap<(ClientId, TxId), Vec<usize>> {
@@ -3818,8 +3859,9 @@ impl Document {
     }
 
     /// The size the members held at `idxs` declare, or `None` if they do not all
-    /// declare the same one — a bucket without unanimity names no group, so it is
-    /// never complete.
+    /// declare the same one — a bucket without unanimity names no group, so it can
+    /// never complete and [`resolve_disagreeing_tx`](Self::resolve_disagreeing_tx)
+    /// spends its key instead.
     ///
     /// The size is the group's, not that of whichever member the buffer holds
     /// first: read off one member, a rewritten envelope chooses when the group
@@ -6116,7 +6158,7 @@ impl Op {
     /// than splitting over it. That is what makes rejecting it safe, and it is the
     /// line an ingest seam needs: an admissible op that does not apply yet is
     /// *waiting* — held until a create makes its target reachable or its
-    /// transaction group completes — so it is state worth logging, fanning out and
+    /// transaction group resolves — so it is state worth logging, fanning out and
     /// acknowledging, while an inadmissible one is worth none of those. Admissible
     /// says only that no rule forbids the op outright; it does not promise the op
     /// applies, and an already-applied op stays admissible.

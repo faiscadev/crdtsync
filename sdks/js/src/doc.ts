@@ -145,7 +145,7 @@ export class Doc {
    * The outcome separates an op that did not apply *yet* from one that never
    * will. `applied` counts what the fold took as the ops arrived; one it did not
    * take may be a duplicate, or be waiting — buffered until a create makes its
-   * target reachable or its transaction group completes, which a later update
+   * target reachable or its transaction group resolves, which a later update
    * does, including one later in this same batch (released that way, it is not
    * counted). `refused` counts what no replica will ever hold, which is a bug in
    * whoever wrote it: a peer reached offline, directly, or over a byte pipe the

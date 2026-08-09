@@ -854,9 +854,10 @@ fn a_group_built_over_a_reused_sequence_does_not_collide_with_the_first() {
 // releases a group, and `encode_state` carries the buffer, so the next replica
 // starts holding them too. The bound at the decode boundary keeps the
 // unreachable sizes off the wire and a member carrying one past `apply` is
-// untagged on its own account; unanimity across a bucket keeps a group's size
-// from being whichever member landed first; and eviction is the way out for a
-// group that is merely never completed, whatever left it that way.
+// untagged on its own account; a bucket whose members disagree names no size at
+// all, so rather than hold it the receiver spends its key on the spot; and
+// eviction is the way out for a group that is merely never completed — a
+// unanimous one nobody finishes.
 
 /// `op` re-tagged as a member of group `id` declaring `count` members — the
 /// envelope rewrite a hostile peer or a relay can perform on a member in flight.
@@ -1039,102 +1040,90 @@ fn a_member_declaring_a_size_outside_the_cap_is_refused_on_arrival() {
 }
 
 #[test]
-fn a_rewritten_first_member_count_does_not_commit_the_group_at_the_wrong_size() {
-    // Three members; the one that lands first is rewritten to declare two. Read
-    // off that member, the size is met by the pair — committing a group two
-    // thirds of the way through, and leaving the third holding a size its bucket
-    // has already spent. The bucket has to agree on its size instead.
-    let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
-    });
+fn a_disagreeing_bucket_releases_what_it_holds_the_moment_it_disagrees() {
+    // Three members; the one that lands first is rewritten to declare two. The
+    // size is still not read off that member — the bucket names no size at all —
+    // but naming none is not a reason to wait: no arrival can complete a bucket
+    // whose members disagree, so the key is spent the moment the second member
+    // contradicts the first, and the pair is released untagged then and there
+    // rather than at eviction.
+    let (a, ops) = triple();
     assert_eq!(ops.len(), 3);
     let id = tx_id(&ops[0]);
 
     let mut b = doc(2);
-    assert!(!b.apply(&retagged(&ops[0], id, 2)));
-    assert!(!b.apply(&ops[1]));
-    assert_eq!(reg(&b, b"x"), None, "the pair is not the group");
-    assert_eq!(reg(&b, b"y"), None, "the pair is not the group");
+    assert!(
+        !b.apply(&retagged(&ops[0], id, 2)),
+        "one member is a bucket"
+    );
+    assert_eq!(reg(&b, b"x"), None, "a lone member still waits");
+    assert!(b.apply(&ops[1]), "the contradiction releases the bucket");
+    assert_eq!(reg(&b, b"x"), reg(&a, b"x"));
+    assert_eq!(reg(&b, b"y"), reg(&a, b"y"));
 
-    // The third arrives; the bucket still names no size, so nothing commits —
-    // and eviction is what releases all three.
-    assert!(!b.apply(&ops[2]));
-    assert_eq!(reg(&b, b"z"), None);
-    assert_eq!(b.evict_partial_transactions(), 1);
-    for key in [&b"x"[..], b"y", b"z"] {
+    // The key is spent, so the member still to come is a stray of a resolved
+    // group and merges standalone — leaving eviction nothing to evict.
+    assert!(b.apply(&ops[2]));
+    assert_eq!(reg(&b, b"z"), reg(&a, b"z"));
+    assert_eq!(b.evict_partial_transactions(), 0);
+}
+
+#[test]
+fn a_bucket_reads_no_size_off_the_member_it_happens_to_hold_first() {
+    // Spending a disagreeing bucket's key does not make it safe to read the size
+    // off one member: which member the buffer holds first is the delivery order's,
+    // so a size read there decides the group's fate by arrival order and not by
+    // what its members say. A two-member group with one member rewritten *larger*
+    // separates the two rules where a smaller rewrite cannot — read off the
+    // rewritten member the bucket is short of its size and waits, read off the
+    // honest one it is at its size and commits, so the two orders part company.
+    // The bucket names no size at all, both orders spend the key, and both land
+    // the pair.
+    let (a, ops) = pair();
+    let id = tx_id(&ops[0]);
+    let forged = [retagged(&ops[0], id, 3), ops[1].clone()];
+
+    let b = one_state_in_every_order(&forged);
+    for key in [&b"x"[..], b"y"] {
         assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
 }
 
 #[test]
-fn a_bucket_whose_members_disagree_on_the_size_never_completes() {
+fn a_bucket_whose_members_disagree_on_the_size_spends_its_key() {
     // The disagreement arriving last is the other half: the bucket is at its
-    // declared size in members, and still names no group.
-    let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
-    });
+    // declared size in members and names no group, so the arrival that
+    // contradicts is also the one that releases all three.
+    let (a, ops) = triple();
     let id = tx_id(&ops[0]);
 
     let mut b = doc(2);
-    b.apply(&ops[0]);
-    b.apply(&ops[1]);
-    assert!(!b.apply(&retagged(&ops[2], id, 2)));
-    for key in [&b"x"[..], b"y", b"z"] {
-        assert_eq!(
-            reg(&b, key),
-            None,
-            "member {key:?} committed a size-3 bucket"
-        );
+    assert!(!b.apply(&ops[0]));
+    assert!(!b.apply(&ops[1]));
+    for key in [&b"x"[..], b"y"] {
+        assert_eq!(reg(&b, key), None, "a unanimous bucket waits, whole");
     }
-    assert_eq!(b.evict_partial_transactions(), 1);
+    assert!(b.apply(&retagged(&ops[2], id, 2)));
     for key in [&b"x"[..], b"y", b"z"] {
-        assert_eq!(reg(&b, key), reg(&a, key));
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
+    assert_eq!(b.evict_partial_transactions(), 0);
 }
 
 #[test]
-fn a_rewritten_count_holds_the_same_set_whatever_order_it_arrives_in() {
-    // Whether a bucket looks unreachable depends on which of its members have
-    // landed, so nothing may be decided from that: two replicas served the same
-    // ops in different orders would then release different sets and diverge.
-    let mut a = doc(1);
-    let ops = a.atomic_transact(|tx| {
-        tx.register(b"x", Scalar::Int(1));
-        tx.register(b"y", Scalar::Int(2));
-        tx.register(b"z", Scalar::Int(3));
-    });
+fn a_rewritten_count_lands_the_same_set_whatever_order_it_arrives_in() {
+    // Whether a bucket ever *holds* the disagreement depends on which of its
+    // members have landed, so holding is a decision the arrival order makes: two
+    // replicas served the same ops in different orders would release different
+    // sets and diverge. Spending the key on the disagreement is what removes the
+    // choice — every order lands the whole set, and folds to the same bytes.
+    let (a, ops) = triple();
     let id = tx_id(&ops[0]);
     let forged = [ops[0].clone(), ops[1].clone(), retagged(&ops[2], id, 2)];
 
-    for order in [
-        [0, 1, 2],
-        [0, 2, 1],
-        [2, 0, 1],
-        [2, 1, 0],
-        [1, 2, 0],
-        [1, 0, 2],
-    ] {
-        let mut b = doc(2);
-        for i in order {
-            b.apply(&forged[i]);
-        }
-        for key in [&b"x"[..], b"y", b"z"] {
-            assert_eq!(reg(&b, key), None, "order {order:?} released {key:?} early");
-        }
-        b.evict_partial_transactions();
-        for key in [&b"x"[..], b"y", b"z"] {
-            assert_eq!(
-                reg(&b, key),
-                reg(&a, key),
-                "order {order:?} stranded {key:?}"
-            );
-        }
+    let b = one_state_in_every_order(&forged);
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
 }
 
@@ -1159,6 +1148,30 @@ fn a_group_rewritten_smaller_on_every_member_folds_one_state_in_every_order() {
     let shrunk: Vec<Op> = ops.iter().map(|op| retagged(op, id, 2)).collect();
 
     let b = one_state_in_every_order(&shrunk);
+    for key in [&b"x"[..], b"y", b"z"] {
+        assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
+    }
+}
+
+#[test]
+fn a_group_rewritten_smaller_on_a_minority_of_members_folds_one_state_in_every_order() {
+    // Two of three members rewritten to declare two, the third left declaring
+    // three: every member legal on its own terms, and the bucket disagreeing only
+    // once the dissenter is in it. Delivered `x,y,z` or `y,x,z` the unanimous pair
+    // reaches its own declared size first and commits, so the dissenter is a stray
+    // of a resolved key and all three land; delivered any of the other four ways
+    // the dissenter is in the bucket from the start. A bucket that disagrees is a
+    // group no honest arrival completes, so it resolves where a commit does — and
+    // the two halves of the arrival space read the same.
+    let (a, ops) = triple();
+    let id = tx_id(&ops[0]);
+    let forged = [
+        retagged(&ops[0], id, 2),
+        retagged(&ops[1], id, 2),
+        ops[2].clone(),
+    ];
+
+    let b = one_state_in_every_order(&forged);
     for key in [&b"x"[..], b"y", b"z"] {
         assert_eq!(reg(&b, key), reg(&a, key), "member {key:?} did not land");
     }
@@ -1300,6 +1313,73 @@ fn two_envelopes_naming_different_groups_spend_both_keys() {
 /// record closes: it needs the two copies to name different groups, it is
 /// order-dependent on `main` before the record exists, and the record narrows it
 /// from a split in what a replica reads to a split in which keys it has spent.
+/// The **third** door into that same residue, and the one this unit opened. A
+/// second envelope is answerable only where the buffer is still *holding* the
+/// first copy, and a disagreement now takes a member out of the buffer — so
+/// whether the conflict rule fires at all became the delivery order's. Delivered
+/// with the contradiction ahead of the second envelope, the copy it would have
+/// disagreed with is already released and the second group's key is never spent;
+/// delivered the other way round both keys are spent. The members converge on
+/// eviction, and which keys each replica has spent does not — which is exactly
+/// C46's state, reached without a group ever completing. Closing it needs the same
+/// per-op-id evidence C46 is filed for: which group a member was released *under*,
+/// not merely that its key resolved. Pinned here so the door is a measured fact
+/// rather than a claim.
+#[test]
+fn a_copy_released_by_a_disagreement_leaves_the_second_envelope_nothing_to_contradict() {
+    let (mut a, group) = pair();
+    let t1 = tx_id(&group[0]);
+    let t2 = crdtsync_core::TxId(0x5eed_5eed_5eed_5eed);
+    // `x` under its own group, `y` contradicting it, and `x` again under a second
+    // group — every envelope admissible, none of them malformed.
+    let ops = [
+        retagged(&group[0], t1, 2),
+        retagged(&group[1], t1, 3),
+        retagged(&group[0], t2, 2),
+    ];
+
+    // The contradiction first: it releases `x`, so the second envelope is a plain
+    // duplicate of an applied id and `t2` is never spent.
+    let mut released = doc(9);
+    for i in [0, 1, 2] {
+        released.apply(&ops[i]);
+    }
+    // The second envelope first: the buffer is still holding `x` under `t1`, the
+    // conflict rule fires, and both keys are spent.
+    let mut contradicted = doc(9);
+    for i in [0, 2, 1] {
+        contradicted.apply(&ops[i]);
+    }
+    assert_ne!(
+        released.encode_state(),
+        contradicted.encode_state(),
+        "the two orders no longer differ — the third door has been closed, so this \
+         test and C46's filing need revisiting rather than deleting"
+    );
+    // Both readings agree on what a reader sees: the split is in the spent-key
+    // record, and every member has landed either way.
+    for key in [&b"x"[..], b"y"] {
+        assert_eq!(reg(&released, key), reg(&a, key));
+        assert_eq!(reg(&contradicted, key), reg(&a, key));
+    }
+
+    // And eviction leaves every order reading the same document, which is what
+    // keeps this a residue rather than a divergence a deployment sees.
+    let mut evicted: Option<Vec<Option<Scalar>>> = None;
+    for order in orderings(ops.len()) {
+        let mut d = doc(9);
+        for &i in &order {
+            d.apply(&ops[i]);
+        }
+        d.evict_partial_transactions();
+        let read: Vec<Option<Scalar>> = [&b"x"[..], b"y"].iter().map(|k| reg(&d, k)).collect();
+        match &evicted {
+            None => evicted = Some(read),
+            Some(first) => assert_eq!(&read, first, "order {order:?} read differently"),
+        }
+    }
+}
+
 /// Filed as its own unit (KANBAN C46).
 #[test]
 fn a_copy_absorbed_by_another_groups_bucket_strands_its_own_group_until_eviction() {
