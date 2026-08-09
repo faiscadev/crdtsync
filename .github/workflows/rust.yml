@@ -31,7 +31,7 @@ jobs:
     # One shard per crate so they run in parallel — wall-clock is the slowest
     # single job, not the sum. The two long poles fan further into nextest
     # partitions that split their tests by hash and run in parallel: core into
-    # eight, server into three, keeping the slowest job under the CI budget.
+    # eight, server into six, keeping the slowest job under the CI budget.
     # Within each shard: a warm build cache skips the cold Miri codegen +
     # sysroot rebuild, and nextest fans the tests across cores instead of one
     # serial process.
@@ -57,11 +57,17 @@ jobs:
             partition: 8/8
           - crate: crdtsync-ffi
           - crate: crdtsync-server
-            partition: 1/3
+            partition: 1/6
           - crate: crdtsync-server
-            partition: 2/3
+            partition: 2/6
           - crate: crdtsync-server
-            partition: 3/3
+            partition: 3/6
+          - crate: crdtsync-server
+            partition: 4/6
+          - crate: crdtsync-server
+            partition: 5/6
+          - crate: crdtsync-server
+            partition: 6/6
     steps:
       - uses: actions/checkout@v5
       - name: Install Miri
