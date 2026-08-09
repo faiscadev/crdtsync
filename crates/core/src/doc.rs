@@ -3624,7 +3624,12 @@ impl Document {
                 self.apply_now(&op);
                 progressed = true;
             }
-            if self.resolve_disagreeing_tx() {
+            // The buckets are read once per pass and used by both group rules, so
+            // spending a key and committing a group cannot disagree about what the
+            // buffer holds. Spending untags members, which is what makes the map
+            // stale, so a pass that spends one leaves the commit to the next.
+            let groups = self.tx_buckets();
+            if self.resolve_disagreeing_tx(&groups) {
                 progressed = true;
             }
             // One complete atomic transaction: apply every member in seq order, so a
@@ -3632,7 +3637,7 @@ impl Document {
             // the first pass. Order is a shortcut, not the mechanism — a member that
             // is not ready is re-buffered untagged and lands on the drain's fixpoint
             // either way.
-            if let Some(mut members) = self.take_complete_tx() {
+            else if let Some(mut members) = self.take_complete_tx(groups) {
                 // The bucket's key is spent by this commit — its members are leaving
                 // the buffer and the count they met cannot be met a second time — so
                 // record it before anything else can arrive under it.
@@ -3754,8 +3759,10 @@ impl Document {
     /// not monotone — a container is installed, displaced, and re-installed as
     /// ops arrive — so a group-wide resolution gate would make commit a window
     /// arrival order decides, and the same ops would fold to different states.
-    fn take_complete_tx(&mut self) -> Option<Vec<Op>> {
-        let groups = self.tx_buckets();
+    fn take_complete_tx(
+        &mut self,
+        groups: HashMap<(ClientId, TxId), Vec<usize>>,
+    ) -> Option<Vec<Op>> {
         // Lowest buffer position wins when more than one group is complete, so the
         // commit order is the buffer's, not the hash map's. Draining to a fixpoint
         // after every fold keeps a replica's own buffer down to at most one complete
@@ -3820,12 +3827,11 @@ impl Document {
     /// states. Resolving it makes both halves of that arrival space read the same
     /// set: the members held are released untagged, and the key is spent against
     /// the members still to come (ARCHITECTURE §Opt-In: Atomic).
-    fn resolve_disagreeing_tx(&mut self) -> bool {
-        let split: Vec<(ClientId, TxId)> = self
-            .tx_buckets()
-            .into_iter()
+    fn resolve_disagreeing_tx(&mut self, groups: &HashMap<(ClientId, TxId), Vec<usize>>) -> bool {
+        let split: Vec<(ClientId, TxId)> = groups
+            .iter()
             .filter(|(_, idxs)| self.tx_declared_count(idxs).is_none())
-            .map(|(key, _)| key)
+            .map(|(key, _)| *key)
             .collect();
         let mut spent = false;
         for key in split {
