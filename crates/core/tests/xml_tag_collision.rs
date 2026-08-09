@@ -383,26 +383,89 @@ fn a_live_handle_observes_the_restated_tag() {
     );
 }
 
-/// Two independent replicas of one node under two tags.
-fn twin_nodes(id: ElementId) -> (XmlElement, XmlElement) {
-    (
-        XmlElement::new(id, b"div".to_vec()),
-        XmlElement::new(id, b"span".to_vec()),
-    )
-}
-
 #[test]
 fn an_element_merge_ranks_the_tag_rather_than_taking_the_receiver_s() {
     // `XmlElement::merge` folds two replicas of one node. Leaving the tag alone
     // resolved it by which side received — the seam the op fold does not reach,
     // and the one C40's sweep found a layer down in `List::merge`.
+    //
+    // Both directions have to run, and they have to differ: a pair where the
+    // receiver is `div` in *both* merges tests one direction twice and stays green
+    // with the rank removed.
     let id = ElementId::from_bytes([7u8; 16]);
-    let (mut a, b) = twin_nodes(id);
-    a.merge(&b);
-    let (mut b, a2) = twin_nodes(id);
-    b.merge(&a2);
-    assert_eq!(a.tag(), b"div");
-    assert_eq!(b.tag(), b"div", "the merge took the receiver's tag");
+    let node = |tag: &[u8]| XmlElement::new(id, tag.to_vec());
+
+    let mut receives_larger = node(b"div");
+    receives_larger.merge(&node(b"span"));
+    let mut receives_smaller = node(b"span");
+    receives_smaller.merge(&node(b"div"));
+
+    assert_eq!(receives_larger.tag(), b"div");
+    assert_eq!(
+        receives_smaller.tag(),
+        b"div",
+        "the merge took the receiver's tag"
+    );
+}
+
+#[test]
+fn the_empty_tag_is_the_rank_s_bottom() {
+    // `Some(vec![])` survives the wire — no op-level validation bounds a tag's
+    // bytes — so it is an admissible claim and, being the least byte string, it
+    // takes every node it names. A rank that special-cased it away would decide
+    // an empty-vs-nonempty pair by arrival order, which is the whole bug.
+    let mut author = Document::new(cid(1));
+    let build = frag_with_a(&mut author);
+    let base = only_insert(author.transact(|tx| {
+        tx.xml_fragment(b"doc").children().insert_element(1, b"div");
+    }));
+    let empty = twin_tagged(&base, 9_000, b"");
+    let div = twin_tagged(&base, 9_001, b"div");
+
+    let (tree_a, bytes_a) = fold(&build, &[&empty, &div]);
+    let (tree_b, bytes_b) = fold(&build, &[&div, &empty]);
+    assert_eq!(tree_a, tree_b, "the two orders folded to different trees");
+    assert_eq!(
+        bytes_a, bytes_b,
+        "the two orders encode different snapshots"
+    );
+    for order in [[&empty, &div], [&div, &empty]] {
+        let mut d = Document::new(cid(9));
+        for op in build.iter().chain(order) {
+            d.apply(op);
+        }
+        assert_eq!(
+            contested_tag(&d).as_deref(),
+            Some(&b""[..]),
+            "the empty tag is the least byte string and must take the node"
+        );
+    }
+}
+
+#[test]
+fn a_non_utf8_tag_ranks_on_its_bytes() {
+    // Nothing constrains a tag to UTF-8 either, and the rank is over bytes, so a
+    // tag that is no text at all still orders totally against one that is.
+    let mut author = Document::new(cid(1));
+    let build = frag_with_a(&mut author);
+    let base = only_insert(author.transact(|tx| {
+        tx.xml_fragment(b"doc").children().insert_element(1, b"div");
+    }));
+    let raw = twin_tagged(&base, 9_000, &[0x00, 0xff, 0xfe]);
+    let div = twin_tagged(&base, 9_001, b"div");
+
+    assert_eq!(fold(&build, &[&raw, &div]), fold(&build, &[&div, &raw]));
+    for order in [[&raw, &div], [&div, &raw]] {
+        let mut d = Document::new(cid(9));
+        for op in build.iter().chain(order) {
+            d.apply(op);
+        }
+        assert_eq!(
+            contested_tag(&d).as_deref(),
+            Some(&[0x00u8, 0xff, 0xfe][..]),
+            "a leading 0x00 byte is below every printable tag"
+        );
+    }
 }
 
 #[test]

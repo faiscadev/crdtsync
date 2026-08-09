@@ -11,8 +11,11 @@
 //! An XmlElement diffs as its children (a sequence, structural inserts/deletes at
 //! the element's own path) then its attrs (a keyed Map, value diffs at the deeper
 //! attr-key paths) — that order keeps the change list path-sorted; a fragment as
-//! its children alone. A tag is part of an element's identity, so a changed tag at
-//! a slot reads as a replace. Marks — named RangedElement annotations — live
+//! its children alone. A tag distinguishes elements, so a changed tag at a slot
+//! reads as a replace — including where the change is one node's tag being lowered
+//! by a later claim ([`XmlElement::claim_tag`](crate::xml::XmlElement::claim_tag)),
+//! which the emitted change list describes soundly as a replace of an unchanged
+//! node rather than as the retag it is. Marks — named RangedElement annotations — live
 //! outside the tree, so they diff as a set by stable id (added / removed / value
 //! changed) and their changes append after the tree changes.
 
@@ -301,8 +304,10 @@ fn diff_elem(a: &Element, b: &Element, prefix: &mut Vec<Vec<u8>>, out: &mut Vec<
 /// Diff two XmlElement snapshots at the same slot: children (an ordered sequence
 /// → structural inserts/deletes at the element's own path) then attrs (a keyed
 /// Map → value diffs at the deeper attr-key paths), so the change list stays
-/// ordered by path. A tag is part of an element's identity, so a different tag at
-/// the same slot is a different element — a structural replace, not a field diff.
+/// ordered by path. A different tag at the same slot reads as a structural replace
+/// rather than a field diff. That is exact for two different elements and
+/// conservative for one node whose tag a later claim lowered — the change list is
+/// sound either way, since nothing downstream reads a tag as stable.
 fn diff_xml_element(
     a: &Rc<RefCell<XmlElement>>,
     b: &Rc<RefCell<XmlElement>>,

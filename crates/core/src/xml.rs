@@ -12,12 +12,14 @@
 //! engines unchanged — this type only pairs them under one id and a tag. The
 //! attrs Map and children List take ids derived from the element's own id, so
 //! every replica agrees on them (the same convergence the [`ElementId`] derivation
-//! gives Map slots). The `tag` is identity rather than editable state — no op
-//! retags a node, and retagging in the API is a replace — but two claims can
-//! still *name* one node under two tags, since a children-list node's id derives
-//! from `(list, stamp, kind)` and carries no tag. So the tag is reconciled by its
-//! own rank ([`XmlElement::claim_tag`]) wherever one is installed, a merge
-//! included, rather than left at whichever claim landed first.
+//! gives Map slots). The `tag` is identity rather than editable state: no op edits
+//! a tag the way a `MapSet` edits a slot, and retagging in the API is a replace.
+//! But every claim that *names* a node carries one, and a children-list node's id
+//! derives from `(list, stamp, kind)` and carries no tag — so two claims can name
+//! one node under two tags (an insert twin, or an `XmlReveal` shell), and either
+//! can lower what a materialised node reads. The tag is therefore reconciled by
+//! its own rank ([`XmlElement::claim_tag`]) wherever a claim meets one already
+//! held, a merge included, rather than left at whichever claim landed first.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

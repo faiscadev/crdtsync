@@ -2075,7 +2075,7 @@ impl Document {
             // birth stamp: the birth stamp names the origin author, which a reader who
             // could not read the origin must not learn. A zero lamport under the shell's
             // own reveal client leaks nothing and advances no clock.
-            let id = reveal_op_id(*node);
+            let id = reveal_op_id(*node, tag.as_deref());
             let stamp = Stamp {
                 lamport: 0,
                 client: id.client,
@@ -4448,8 +4448,9 @@ impl Document {
     /// there the key is already the claimant's own, nothing changes hands, and what
     /// is left to settle is the position, which the sequence takes as the meet of
     /// the two ([`List::rejoin`]). Their two *tags* are left to settle with it when
-    /// the kind is `XmlElement` and the tags differ, which this rank does not reach
-    /// and C44 is filed for. A meet is the same whichever arrived first,
+    /// the kind is `XmlElement` and the tags differ, which this rank does not reach:
+    /// the tag runs its own, [`XmlElement::claim_tag`], and the smaller bytes take it.
+    /// A meet is the same whichever arrived first,
     /// where a contest between two claims on one node would have needed to know
     /// what put the incumbent there, and nothing answers that: the move log dedups
     /// on the stamp alone, so a move can hold the key having recorded no edge.
@@ -6072,22 +6073,45 @@ fn ranged_id(stamp: Stamp) -> ElementId {
     ElementId::derive(ns, &stamp_key(stamp), ElementKind::Scalar)
 }
 
-/// The [`OpId`] a reveal shell for `node` carries. A reveal is a redaction-time
-/// synthesis, not an authored op, so it has no real `(client, seq)` — but it must
-/// dedup stably (a resumed catch-up re-derives the same shell) and never collide with a
-/// real authored op the reader also receives. The client is derived from the node under
-/// a fixed reveal namespace: deterministic and unique per node (so two revealed nodes
-/// never alias). No *derived* replica id can coincide with it: this derivation's name is
-/// a node id plus a kind tag (17 bytes), where the only other id-shaped derivation a
-/// replica performs ([`for_channel`](ClientId::for_channel)) names a four-byte channel
-/// number, so the two SHA-1 inputs differ by length alone whatever namespaces they run
-/// under. A *declared* id is not a derivation at all — an embedder supplies its bytes —
+/// The [`OpId`] a reveal shell for `node` under `tag` carries. A reveal is a
+/// redaction-time synthesis, not an authored op, so it has no real `(client, seq)` — but
+/// it must dedup stably (a resumed catch-up re-derives the same shell) and never collide
+/// with a real authored op the reader also receives.
+///
+/// **The tag is in the derivation, and has to be**, because a shell reads it off live
+/// state and a node's tag is not fixed: two claims can name one node under two tags and
+/// the smaller bytes take it ([`XmlElement::claim_tag`]). Keyed on the node alone, a
+/// shell emitted before the smaller claim landed and the corrected shell after it are one
+/// `OpId`, so the correction dedups away and a reader served the earlier one is pinned at
+/// a tag its own document will never revise — two readers of one node encoding different
+/// bytes. Keyed on both, the corrected shell is a distinct op that reaches
+/// [`apply_reveal`] and runs the rank, which is idempotent, so a reader that sees the
+/// shells in either order lands on the meet.
+///
+/// The client is derived under a fixed reveal namespace: deterministic and unique per
+/// `(node, tag)`. No *derived* replica id can coincide with it: this derivation's name is
+/// a node id, a tag-presence byte and the tag (at least 17 bytes), where the only other
+/// id-shaped derivation a replica performs ([`for_channel`](ClientId::for_channel)) names
+/// a four-byte channel number, so the two SHA-1 inputs differ by length alone whatever
+/// namespaces they run under. A *declared* id is not a derivation at all — an embedder
+/// supplies its bytes —
 /// so an embedder that reuses a shell's id here collides, the same one-id-one-replica
 /// contract that governs two sessions sharing an id. `seq` is 0 — the derived client is
 /// a namespace of one.
-fn reveal_op_id(node: ElementId) -> OpId {
+fn reveal_op_id(node: ElementId, tag: Option<&[u8]>) -> OpId {
     let ns = ElementId::from_bytes(*b"crdtsync\0reveal\0");
-    let derived = ElementId::derive(ns, &node.as_bytes(), ElementKind::XmlElement);
+    let mut name = node.as_bytes().to_vec();
+    // The presence byte leads the tag, so a tagless shell and one carrying an empty
+    // tag are two shells rather than one — the empty tag is admissible and is the
+    // rank's bottom, so the two are not the same claim.
+    match tag {
+        Some(t) => {
+            name.push(1);
+            name.extend_from_slice(t);
+        }
+        None => name.push(0),
+    }
+    let derived = ElementId::derive(ns, &name, ElementKind::XmlElement);
     OpId {
         client: ClientId::from_bytes(derived.as_bytes()),
         seq: 0,
