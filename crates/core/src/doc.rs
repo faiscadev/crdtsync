@@ -2668,7 +2668,10 @@ impl Document {
         // `drain_buffer`, which dedups against neither: reject both.
         let mut buffered = HashSet::with_capacity(buffer.len().min(1024));
         for op in &buffer {
-            if seen.contains(&op.id) || !buffered.insert(op.id) {
+            // Reserved as well as applied: `apply` clears a reservation only on the
+            // path a held id short-circuits, so an id in both sets would keep its
+            // reservation for the life of the replica and cost it that sequence.
+            if seen.contains(&op.id) || reserved.contains(&op.id) || !buffered.insert(op.id) {
                 return Err(DecodeError::BadTag {
                     what: "document: buffered op already applied or repeated",
                     tag: 0,

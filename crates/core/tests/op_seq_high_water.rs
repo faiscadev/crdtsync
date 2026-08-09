@@ -923,3 +923,41 @@ fn an_adopted_snapshot_carries_none_of_the_encoders_reservations() {
         "the adopter inherited reservations in an id space it never published in",
     );
 }
+
+#[test]
+fn a_state_naming_one_id_as_both_reserved_and_buffered_is_refused() {
+    // The three sets are disjoint by construction at runtime — `apply` clears the
+    // reservation before the op is held — so a snapshot claiming otherwise did not
+    // come from a replica. Decoding it would strand the reservation for the life of
+    // the replica: a held id short-circuits `apply` before the clear, so the
+    // sequence would never come back.
+    let mut author = Document::new(cid(1));
+    let group = author.atomic_transact(|tx| {
+        tx.set(b"x", Scalar::Int(1));
+        tx.set(b"y", Scalar::Int(2));
+    });
+    let mut doc = Document::new(cid(1));
+    doc.apply(&group[0]);
+    // A distinctive reservation, so the one occurrence in the encoding is the one
+    // the patch below re-points.
+    const MARKER: u64 = 0xDEAD_BEEF_0BAD_F00D;
+    doc.note_published(&[MARKER], 0);
+    let bytes = doc.encode_state();
+    assert!(
+        Document::decode_state(&bytes).is_ok(),
+        "the honest document must decode",
+    );
+
+    // The reserved section is a `u32` count then one `u64` per sequence, following
+    // the dedup set. Re-point the one reservation at the buffered member's sequence.
+    let at = bytes
+        .windows(8)
+        .position(|w| w == MARKER.to_le_bytes())
+        .expect("the reserved sequence is in the encoding");
+    let mut forged = bytes.clone();
+    forged[at..at + 8].copy_from_slice(&group[0].id.seq.to_le_bytes());
+    assert!(
+        Document::decode_state(&forged).is_err(),
+        "a reservation over a buffered id decoded",
+    );
+}
