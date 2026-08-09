@@ -185,9 +185,15 @@ fn a_leader_replicates_a_commit_to_its_follower() {
             // the same frame that carries the commit carries the authority root under
             // which the follower will decide the room's ACL tuples.
             creator: Some(b"cred".to_vec()),
+            // The writer here declares no app and no version — a relay session — so the
+            // room binds nothing and its ops are untagged. Both halves of the room's
+            // governing metadata are therefore genuinely absent, not merely uncarried;
+            // `replicated_op_version` pins what the frame carries when they exist.
+            governing: None,
+            max_op_version: None,
         },
         "the frame carries the fresh ops on main from an uncompacted base at the \
-         leader's first epoch, under the room's creator",
+         leader's first epoch, under the room's creator and its governing metadata",
     );
 }
 
@@ -295,6 +301,8 @@ fn a_follower_drops_a_branch_replicate() {
             base_seq: 0,
             epoch: 1,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     );
     assert!(!kept, "a non-main Replicate drops the connection");
@@ -363,6 +371,8 @@ fn a_follower_ignores_a_replicate_for_a_room_it_leads() {
             base_seq: 0,
             epoch: 1,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     );
     assert!(
@@ -415,6 +425,8 @@ fn single_node_rejects_a_replicate() {
             base_seq: 0,
             epoch: 1,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     );
     assert!(!kept);
@@ -534,6 +546,8 @@ async fn a_follower_applies_a_replicate_over_the_socket_and_acks() {
             base_seq: 0,
             epoch: 1,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     )
     .await;

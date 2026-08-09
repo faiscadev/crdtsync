@@ -1371,9 +1371,11 @@ impl Hub {
         };
         // The op-version high-water grew, so its durable record is stale: persist
         // it beside the log now, before any compaction below drops the log the
-        // high-water would otherwise have to be rebuilt from. Best-effort — the
-        // metadata is a durability cache over derivable state, so a write failure
-        // degrades to the rebuild-from-log fallback rather than failing the write.
+        // high-water would otherwise have to be rebuilt from. Best-effort — a write
+        // failure degrades to whatever the replayed log yields rather than failing the
+        // write. That fallback is a real one only where the log's own ops carry
+        // versions: a replica logs a leader's batch untagged, so its record is the only
+        // source it has and a failed write there loses the high-water for good (C55).
         if high_water_grew {
             let _ = self.persist_meta(key);
         }
@@ -1620,9 +1622,10 @@ impl Hub {
     /// before the room commits, so the import survives a restart.
     ///
     /// A portable snapshot is a `Document` encoding and carries no server-side room
-    /// metadata, so an imported room has no creator until its first authenticated
-    /// write establishes one. Until then it holds no doc-ACL authority root, and the
-    /// tuples that rode the snapshot decide nothing.
+    /// metadata, so an imported room has no creator and no op-version high-water until
+    /// its first write establishes each. Until then it holds no doc-ACL authority root —
+    /// so the tuples that rode the snapshot decide nothing — and the handshake
+    /// range-check has nothing to refuse an under-versioned joiner against.
     pub fn import_room(&mut self, room: &[u8], state: &[u8]) -> io::Result<bool> {
         if self.rooms.contains_key(room) {
             return Ok(false);
@@ -1651,6 +1654,11 @@ impl Hub {
     /// defined everywhere else — set-once, never displaced, and never an anonymous
     /// actor — so a re-sent snapshot that names none leaves the standing root alone
     /// rather than dropping the authority every deny in the state is decided under.
+    ///
+    /// The room's op-version high-water is *preserved*, never supplied here: it is the
+    /// all-time worst case a joiner must down-reach rather than a property of the
+    /// installed state, so replacing the replica leaves it exactly as it leaves it
+    /// across a compaction.
     fn install_room_state(
         &mut self,
         room: &[u8],
@@ -1670,8 +1678,7 @@ impl Hub {
         let root = standing.and_then(|r| r.creator.clone());
         // The op-version high-water is the all-time worst case a joiner must down-reach,
         // so it survives the replace as it survives compaction: the installed state is
-        // this same room's history, and the frame carries no high-water of its own to
-        // raise it with.
+        // this same room's history, and the bytes carry no version of their own.
         let max_op_version = standing.and_then(|r| r.max_op_version);
         // A replica identity's owner is a property of the room, not of the bytes, so a
         // snapshot replacing the state leaves the claims standing — a re-sent snapshot
@@ -1715,7 +1722,10 @@ impl Hub {
     /// store attached the snapshot is persisted before the room commits.
     ///
     /// `creator` is the room's doc-ACL authority root as the sending leader holds it,
-    /// installed set-once beside the state, which does not carry one.
+    /// installed set-once beside the state, which does not carry one. The room's
+    /// op-version high-water survives the replace and is raised separately
+    /// ([`raise_max_op_version`](Hub::raise_max_op_version)), by a caller that has
+    /// resolved which app's version space the incoming one belongs to.
     pub fn install_snapshot(
         &mut self,
         room: &[u8],
@@ -1777,14 +1787,22 @@ impl Hub {
                     .collect()
             })
             .unwrap_or_default();
+        // The source's op-version high-water travels on the same reasoning at the
+        // version tier: a joiner to the clone must down-reach the worst-case version
+        // that content embodies. A clone that came up with none would range-check
+        // nobody and project its snapshot from no version. It travels only where the
+        // source's binding travels with it, below — the number is read in that app's
+        // version space, so a clone given one without the other holds a floor nothing
+        // can interpret, and the handshake abstains on an unbound room however high the
+        // number is. Raised after the install, which preserves the destination's own
+        // rather than taking one.
+        let governing = self.governing.get(src).cloned();
+        let max_op_version = governing.as_ref().and(self.max_op_version(src));
         self.install_room_state(dst, &state, None, creator)?;
-        if let Some(room) = self.rooms.get_mut(dst) {
-            for (client, actor) in claims {
-                room.client_actors.entry(client).or_insert(actor);
-            }
-        }
-        let _ = self.persist_meta(dst);
-        match self.governing.get(src).cloned() {
+        // The binding before the high-water, so no durable write of `dst`'s record ever
+        // carries a version with no app beside it — the same ordering the replicated
+        // adopt takes, and for the same reason.
+        match governing {
             Some((app, version)) => self.bind_governing(dst, app, version),
             // An ungoverned source makes an ungoverned clone — and the destination
             // name may already carry a binding, since a subscribe binds before
@@ -1797,6 +1815,13 @@ impl Hub {
                 }
             }
         }
+        self.raise_max_op_version(dst, max_op_version);
+        if let Some(room) = self.rooms.get_mut(dst) {
+            for (client, actor) in claims {
+                room.client_actors.entry(client).or_insert(actor);
+            }
+        }
+        let _ = self.persist_meta(dst);
         Ok(true)
     }
 
@@ -2497,6 +2522,36 @@ impl Hub {
             None => false,
         };
         if established {
+            let _ = self.persist_meta(room);
+        }
+    }
+
+    /// Raise `room`'s op-version high-water to `version` if it is higher than what
+    /// stands, persisting the durable metadata when it grew. A max, never an
+    /// assignment: the high-water is the all-time worst case a joiner must down-reach,
+    /// so a caller naming a lower version — or none — leaves it alone. A no-op for an
+    /// unknown room.
+    ///
+    /// This is the replicated arrival seam, the counterpart of the `schema_version` a
+    /// client write carries into [`ingest`](Hub::ingest). A replica's ops arrive already
+    /// committed on the leader, so nothing local raises one: the frame that carries the
+    /// batch carries the leader's high-water too, and a replica that took only the ops
+    /// would report `None` and refuse no joiner the room's own state defeats.
+    ///
+    /// Persisting is best-effort, so a failed write does not fail the caller's
+    /// delivery — but this is the one seam where nothing recovers it. A replica's log
+    /// holds its leader's batch untagged, so a replay derives no high-water from it and
+    /// the stored record is the only source; a lost write leaves the room refusing no
+    /// joiner until its next replicated commit (C55).
+    pub fn raise_max_op_version(&mut self, room: &[u8], version: Option<u32>) {
+        let grew = match self.rooms.get_mut(room) {
+            Some(r) if version > r.max_op_version => {
+                r.max_op_version = version;
+                true
+            }
+            _ => false,
+        };
+        if grew {
             let _ = self.persist_meta(room);
         }
     }

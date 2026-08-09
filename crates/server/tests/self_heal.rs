@@ -513,6 +513,8 @@ fn reporting_a_room_this_node_does_not_lead_dials_nothing() {
             base_seq: 0,
             epoch: 1,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     );
     a_node.take_outbox(peer);

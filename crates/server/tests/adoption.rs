@@ -210,9 +210,11 @@ fn replicate(d: &mut Document, room: &[u8], epoch: u64) -> Message {
         epoch,
         base_seq: 0,
         ops,
-        // These frames exercise placement and epoch fencing, not the doc ACL, so the
-        // room carries no creator to replicate.
+        // These frames exercise placement and epoch fencing, not the doc ACL or the
+        // version range-check, so the room carries no metadata record to replicate.
         creator: None,
+        governing: None,
+        max_op_version: None,
     }
 }
 

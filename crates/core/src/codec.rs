@@ -109,6 +109,30 @@ pub(crate) fn put_opt_bytes(out: &mut Vec<u8>, b: Option<&[u8]>) {
     }
 }
 
+/// A room's governing binding: a present-flag byte, then the app id and its version
+/// when bound.
+pub(crate) fn put_opt_governing(out: &mut Vec<u8>, governing: Option<&(Vec<u8>, u32)>) {
+    match governing {
+        None => put_u8(out, 0),
+        Some((app, version)) => {
+            put_u8(out, 1);
+            put_bytes(out, app);
+            put_u32(out, *version);
+        }
+    }
+}
+
+/// An optional u32: a present-flag byte then the value when `Some`.
+pub(crate) fn put_opt_u32(out: &mut Vec<u8>, v: Option<u32>) {
+    match v {
+        None => put_u8(out, 0),
+        Some(v) => {
+            put_u8(out, 1);
+            put_u32(out, v);
+        }
+    }
+}
+
 pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_u32(out, len_u32(b.len()));
     out.extend_from_slice(b);
@@ -588,6 +612,34 @@ impl<'a> Cursor<'a> {
             1 => Ok(Some(self.bytes()?)),
             tag => Err(DecodeError::BadTag {
                 what: "optional bytes present-flag",
+                tag,
+            }),
+        }
+    }
+
+    /// The governing binding written by [`put_opt_governing`].
+    pub(crate) fn opt_governing(&mut self) -> Result<Option<(Vec<u8>, u32)>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => {
+                let app = self.bytes()?;
+                let version = self.u32()?;
+                Ok(Some((app, version)))
+            }
+            tag => Err(DecodeError::BadTag {
+                what: "governing binding present-flag",
+                tag,
+            }),
+        }
+    }
+
+    /// An optional u32 written by [`put_opt_u32`].
+    pub(crate) fn opt_u32(&mut self) -> Result<Option<u32>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.u32()?)),
+            tag => Err(DecodeError::BadTag {
+                what: "optional u32 present-flag",
                 tag,
             }),
         }

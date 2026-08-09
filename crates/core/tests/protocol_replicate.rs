@@ -2,9 +2,10 @@
 //! fanning its committed ops to a follower replica, the follower's watermark reply,
 //! and the leader's assertion of the room's replicated metadata on its own.
 //!
-//! `Replicate { room, branch, ops, base_seq, epoch }` carries a length-framed
-//! room and branch, the leader's compaction floor, its leadership epoch, then the
-//! op batch, which reuses the op codec and consumes the frame's remainder.
+//! `Replicate` carries a length-framed room and branch, the leader's compaction floor,
+//! its leadership epoch, the room's metadata record — the doc-ACL authority root, the
+//! governing `{app_id, version}` binding, and the op-version high-water — then the op
+//! batch, which reuses the op codec and consumes the frame's remainder.
 //! `ReplicaAck { room, through_seq }`
 //! reports the server sequence the follower has reached.
 //! `ReplicateMeta { room, epoch, creator }` carries the room's doc-ACL authority root
@@ -61,6 +62,8 @@ fn replicate_round_trips() {
         base_seq: 9,
         epoch: 4,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
 }
 
@@ -74,6 +77,8 @@ fn replicate_round_trips_the_epoch() {
         base_seq: 1,
         epoch: 0,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
     round_trips(Message::Replicate {
         room: b"room-42".to_vec(),
@@ -82,6 +87,8 @@ fn replicate_round_trips_the_epoch() {
         base_seq: 1,
         epoch: u64::MAX,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
 }
 
@@ -94,6 +101,8 @@ fn replicate_round_trips_an_empty_room() {
         base_seq: 0,
         epoch: 1,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
 }
 
@@ -106,6 +115,8 @@ fn replicate_round_trips_an_empty_branch() {
         base_seq: 3,
         epoch: 7,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
 }
 
@@ -118,6 +129,8 @@ fn replicate_round_trips_an_empty_batch() {
         base_seq: 0,
         epoch: 2,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
 }
 
@@ -130,6 +143,8 @@ fn replicate_round_trips_a_binary_room_and_branch() {
         base_seq: u64::MAX,
         epoch: u64::MAX,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
 }
 
@@ -146,6 +161,8 @@ fn replicate_round_trips_the_creator() {
             base_seq: 9,
             epoch: 4,
             creator,
+            governing: None,
+            max_op_version: None,
         });
     }
     round_trips(Message::Replicate {
@@ -155,17 +172,47 @@ fn replicate_round_trips_the_creator() {
         base_seq: 9,
         epoch: 4,
         creator: Some(vec![0xFF, 0x00, 0x80, 0x7F]),
+        governing: None,
+        max_op_version: None,
     });
 }
 
 #[test]
+fn replicate_round_trips_the_governing_metadata() {
+    // The binding and the high-water are what the receiver's handshake range-check runs
+    // on, so an absent one and a present one must be distinguishable — a lost binding
+    // stands the gate down entirely, and a lost high-water refuses nobody.
+    for governing in [
+        None,
+        Some((b"collab".to_vec(), 1)),
+        Some((Vec::new(), 0)),
+        Some((vec![0xFF, 0x00, 0x80, 0x7F], u32::MAX)),
+    ] {
+        for max_op_version in [None, Some(0), Some(7), Some(u32::MAX)] {
+            round_trips(Message::Replicate {
+                room: b"room-42".to_vec(),
+                branch: b"main".to_vec(),
+                ops: sample_ops(),
+                base_seq: 9,
+                epoch: 4,
+                creator: Some(b"alice".to_vec()),
+                governing: governing.clone(),
+                max_op_version,
+            });
+        }
+    }
+}
+
+#[test]
 fn a_truncated_replicate_header_is_an_error_not_a_panic() {
-    // The fixed leading region (room, branch, base_seq, epoch, creator) before the
-    // op batch: truncating anywhere inside it must error, never panic. The batch
+    // The fixed leading region (room, branch, base_seq, epoch, and the metadata record:
+    // creator, governing, max_op_version) before the op batch: truncating anywhere
+    // inside it must error, never panic. The batch
     // itself consumes the frame's remainder (like `Ops`), so a shorter batch
     // decodes as valid — the corrupt-batch case is covered separately. An empty-
     // batch frame is exactly that leading region, so its length is where the batch
-    // begins. A present creator, so the sweep covers its flag, length, and bytes.
+    // begins. A present creator, binding and high-water, so the sweep covers each
+    // present-flag, the binding's app length and version, and the high-water's value.
     let header_len = encode_message(&Message::Replicate {
         room: b"room".to_vec(),
         branch: b"main".to_vec(),
@@ -173,6 +220,8 @@ fn a_truncated_replicate_header_is_an_error_not_a_panic() {
         base_seq: 5,
         epoch: 3,
         creator: Some(b"alice".to_vec()),
+        governing: Some((b"collab".to_vec(), 2)),
+        max_op_version: Some(2),
     })
     .len();
     let bytes = encode_message(&Message::Replicate {
@@ -182,6 +231,8 @@ fn a_truncated_replicate_header_is_an_error_not_a_panic() {
         base_seq: 5,
         epoch: 3,
         creator: Some(b"alice".to_vec()),
+        governing: Some((b"collab".to_vec(), 2)),
+        max_op_version: Some(2),
     });
     for cut in 0..header_len {
         assert!(
@@ -200,6 +251,8 @@ fn a_corrupt_op_batch_in_a_replicate_is_an_error() {
         base_seq: 5,
         epoch: 1,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
     // Truncate inside the batch payload; the framed op codec must reject it.
     assert!(matches!(
@@ -219,6 +272,8 @@ fn replicate_snapshot_round_trips() {
         state: vec![1, 2, 3, 4, 5],
         epoch: 4,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
 }
 
@@ -233,6 +288,8 @@ fn replicate_snapshot_round_trips_the_extremes() {
         state: Vec::new(),
         epoch: 0,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
     round_trips(Message::ReplicateSnapshot {
         room: vec![0, 1, 2, 255],
@@ -241,6 +298,8 @@ fn replicate_snapshot_round_trips_the_extremes() {
         state: vec![0xAB; 300],
         epoch: u64::MAX,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
 }
 
@@ -261,7 +320,33 @@ fn replicate_snapshot_round_trips_the_creator() {
             state: vec![1, 2, 3, 4, 5],
             epoch: 4,
             creator,
+            governing: None,
+            max_op_version: None,
         });
+    }
+}
+
+#[test]
+fn replicate_snapshot_round_trips_the_governing_metadata() {
+    // This frame carries no ops, so the record it names is the only version fact a
+    // state-transferred replica ever gets.
+    for governing in [
+        None,
+        Some((b"collab".to_vec(), 3)),
+        Some((Vec::new(), u32::MAX)),
+    ] {
+        for max_op_version in [None, Some(0), Some(u32::MAX)] {
+            round_trips(Message::ReplicateSnapshot {
+                room: b"room-42".to_vec(),
+                branch: b"main".to_vec(),
+                seq: 12,
+                state: vec![1, 2, 3, 4, 5],
+                epoch: 4,
+                creator: Some(b"alice".to_vec()),
+                governing: governing.clone(),
+                max_op_version,
+            });
+        }
     }
 }
 
@@ -274,6 +359,8 @@ fn a_truncated_replicate_snapshot_is_an_error_not_a_panic() {
         state: vec![7, 8, 9],
         epoch: 3,
         creator: Some(b"alice".to_vec()),
+        governing: Some((b"collab".to_vec(), 2)),
+        max_op_version: Some(2),
     });
     for cut in 0..bytes.len() {
         assert!(
@@ -292,6 +379,8 @@ fn trailing_bytes_after_a_replicate_snapshot_are_an_error() {
         state: vec![7, 8, 9],
         epoch: 3,
         creator: None,
+        governing: None,
+        max_op_version: None,
     });
     bytes.push(0);
     assert_eq!(decode_message(&bytes), Err(ProtocolError::TrailingBytes));

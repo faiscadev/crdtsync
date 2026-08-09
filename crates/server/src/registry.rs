@@ -279,6 +279,21 @@ impl DialFrames {
     }
 }
 
+/// A room's server-side metadata record, as the two replication frames carry it and as
+/// the store writes it: the doc-ACL authority root, the governing `{app_id, version}`
+/// binding, and the op-version high-water. None of the three rides the ops or the
+/// snapshot bytes, and each decides how what does ride is read — the root is the
+/// authority the doc-ACL denies resolve against, and the binding and the high-water
+/// together are what the handshake range-check refuses an under-versioned joiner on. So
+/// a replica that took only the payload holds a room it cannot decide anything about,
+/// and it serves the client writes that would establish any of them only once a failover
+/// has made it a leader.
+struct ReplicatedMeta {
+    creator: Option<Vec<u8>>,
+    governing: Option<(Vec<u8>, u32)>,
+    max_op_version: Option<u32>,
+}
+
 impl Registry {
     /// An in-memory registry whose hub's replicas are owned by `server`.
     pub fn new(server: ClientId) -> Self {
@@ -505,11 +520,12 @@ impl Registry {
             return;
         }
         let base_seq = self.hub.base_seq(room);
-        // The room's doc-ACL authority root rides the frame, so a follower holds the
-        // authority its replicated ACL tuples are decided under rather than only the
-        // tuples. Read per fan-out: the first write to a fresh room establishes it,
-        // and that same write is the frame that carries it.
-        let creator = self.hub.room_creator(room);
+        // The room's metadata record rides the frame — its doc-ACL authority root, its
+        // governing binding and its op-version high-water — so a follower holds what
+        // decides how the replicated log is read rather than only the log. Read per
+        // fan-out: the write that establishes a fresh room establishes each of them, and
+        // that same write is the frame that carries them.
+        let meta = self.replicated_room_meta(room);
         // Stamp the frames with this node's leadership epoch for the room. A
         // promotion opens a fresh (higher) epoch — persist the advance so the fence
         // survives a restart and this node never re-leads at a stale epoch.
@@ -525,9 +541,129 @@ impl Registry {
                     ops: ops.to_vec(),
                     base_seq,
                     epoch,
-                    creator: creator.clone(),
+                    creator: meta.creator.clone(),
+                    governing: meta.governing.clone(),
+                    max_op_version: meta.max_op_version,
                 },
             );
+        }
+    }
+
+    /// The room's metadata record as this node holds it — the three fields the two
+    /// replication frames carry beside the log or the state.
+    ///
+    /// The binding is [resolved](Registry::governing_binding) the way the write that
+    /// raised the high-water resolved it, so the pair a frame carries is the pair the
+    /// leader itself decided under. Reading either source alone strands the number: the
+    /// receiver adopts a high-water only beside the app it was measured in, so a record
+    /// naming none is dropped there and the room's range-check stays inert.
+    fn replicated_room_meta(&self, room: &[u8]) -> ReplicatedMeta {
+        ReplicatedMeta {
+            creator: self.hub.room_creator(room),
+            governing: self.governing_binding(room),
+            max_op_version: self.hub.max_op_version(room),
+        }
+    }
+
+    /// Adopt a frame's whole metadata record onto this node's replica of `room`, each
+    /// field on its own composition rule: the root set-once, the binding on the
+    /// incumbent-app rule, and the high-water as a max — but only under the binding that
+    /// won that composition, since the number is meaningless in any other app's version
+    /// space. A frame is an *assertion*, so every one of them composes against what
+    /// stands rather than replacing it — a peer cannot re-root a room, talk a replica's
+    /// high-water down into admitting a joiner its state defeats, re-govern it under
+    /// another app, or slip a number in under an app that is not the one answering.
+    fn adopt_replicated_meta(&mut self, room: &[u8], meta: &ReplicatedMeta) {
+        // The binding first: it decides whose version space the high-water is read in,
+        // and the two writes after it each persist the whole record, so the last one to
+        // land is a complete one.
+        self.adopt_replicated_binding(room, meta.governing.as_ref());
+        if let Some(creator) = &meta.creator {
+            self.hub.ensure_creator(room, creator);
+        }
+        // The high-water only alongside the binding that gives it meaning, and only when
+        // that binding is the one this room is read under. It is a number in some app's
+        // version space: named without one it says nothing, and named under an app that
+        // lost the incumbent-wins composition it says something about a chain this room
+        // is not read by — either way the range-check would be deciding against a
+        // version it cannot interpret. An honest leader sends neither pair: a write
+        // raises the high-water only through a version the room's own binding resolved,
+        // so on a leader a high-water implies a binding and the two agree at the source.
+        // The one shape that breaks that is a leader whose metadata write was lost while
+        // its log kept the versions its ops were tagged with (C55), and a replica is
+        // better off not adopting a number that arrives with nothing to read it in.
+        let incumbent = self.governing_binding(room).map(|(app, _)| app);
+        if let (Some(incumbent), Some((app, _))) = (incumbent, meta.governing.as_ref()) {
+            if incumbent == *app {
+                self.hub.raise_max_op_version(room, meta.max_op_version);
+            }
+        }
+    }
+
+    /// The room's governing binding, resolved exactly as a write's own version tag
+    /// resolves it: the live presence map, falling back to the room's own binding on the
+    /// hub. The one resolution for every seam that reads which app answers for a room —
+    /// what a replication frame carries, what a replicated high-water is judged under,
+    /// and what an eviction decides against — because a high-water is only meaningful
+    /// beside the binding the write that raised it was tagged from.
+    ///
+    /// Neither source alone is sufficient, and each covers the other's gap. A
+    /// dormant-room sweep drops the *presence map's* entry for a room nobody subscribes,
+    /// so the hub carries a template room's binding. The same sweep drops the *hub's*
+    /// for a room the hub does not hold — a subscribe binds before the first write
+    /// materializes anything — while the map keeps it, so a room bound and then written
+    /// has its binding only there until its next subscribe. Reading the hub alone in
+    /// that state emits a high-water with no app beside it, which every replica then
+    /// discards.
+    fn governing_binding(&self, room: &[u8]) -> Option<(Vec<u8>, u32)> {
+        self.room_apps
+            .get(room)
+            .cloned()
+            .or_else(|| self.hub.governing_app(room))
+    }
+
+    /// Evict every subscriber of `room` a just-applied replicated frame stranded — one
+    /// admitted under the high-water `pre` that the frame opened past. A leader runs this
+    /// on its own writes; a replica has to run it on the frames that are its writes, or a
+    /// follower-served subscriber outlives a lift that a leader-served one does not. The
+    /// two fan-outs differ in what the survivor is then handed, which is why the replica
+    /// runs this *before* its own: a leader's fan-out translates per recipient and drops
+    /// a batch whose chain will not resolve, so its stranded peer is told to update and
+    /// given nothing, while a replicated batch is served verbatim and would reach that
+    /// peer at a version it cannot model.
+    /// The lift test assumes the admission it is re-checking was taken under the same
+    /// binding, which is what makes it a short-circuit rather than a rule: `evict_stranded`
+    /// re-runs the predicate the subscribe gate admitted on, so an unchanged high-water
+    /// reproduces each subscriber's own answer. The assumption holds wherever a room's
+    /// high-water and its binding travel together: the two replication apply seams, the
+    /// write path that re-asserts what it tagged from, and the clone. It is not a
+    /// property of every state a `Hub` can be put in — `ingest` takes a version and binds
+    /// nothing. Where a room holds one without the other the gate *abstains* at
+    /// admission, so a peer can be let in against a number it cannot reach and then bind
+    /// the room itself, and this never re-checks it — C129, which predates this seam.
+    ///
+    /// The binding is resolved rather than assumed. An unbound room does reach here — a
+    /// relay write carries no version, so it lands on one — and returns at the lift test
+    /// above, because an untagged write raises no high-water for it to have opened past.
+    /// So the `if let` answers a room that is genuinely unbound rather than a case the
+    /// callers cannot produce, and is what makes this total rather than a panic.
+    fn evict_stranded_by_lift(&mut self, room: &[u8], pre: Option<u32>) {
+        let post = self.hub.max_op_version(room);
+        if post <= pre {
+            return;
+        }
+        if let Some((app, version)) = self.governing_binding(room) {
+            self.evict_stranded(room, (&app, version), post);
+        }
+    }
+
+    /// Adopt a frame's governing binding, routed through
+    /// [`bind_room_app`](Registry::bind_room_app) so a peer's assertion composes on the
+    /// incumbent-app rule a client subscribe and the durable load already take: the
+    /// incumbent keeps the room, and only a same-app frame lifts the version.
+    fn adopt_replicated_binding(&mut self, room: &[u8], governing: Option<&(Vec<u8>, u32)>) {
+        if let Some((app, version)) = governing {
+            self.bind_room_app(room.to_vec(), app.clone(), *version);
         }
     }
 
@@ -649,10 +785,11 @@ impl Registry {
     /// commit a quiescent room never makes. `None` only when there is neither a delta
     /// nor a root to send.
     fn catch_up_room_frame(&mut self, room: &[u8], floor: u64) -> Option<Message> {
-        // The room's doc-ACL authority root, carried by a dialed catch-up exactly as
-        // by a steady commit — a follower converged either way holds the authority its
-        // replicated ACL tuples are decided under.
-        let creator = self.hub.room_creator(room);
+        // The room's metadata record, carried by a dialed catch-up exactly as by a
+        // steady commit — a follower converged either way holds the authority its
+        // replicated ACL tuples are decided under, and the binding and high-water its
+        // handshake range-check runs on.
+        let meta = self.replicated_room_meta(room);
         match self.hub.catch_up(room, floor) {
             Catchup::Ops(records) => {
                 let ops: Vec<Op> = records.into_iter().map(|rec| rec.op).collect();
@@ -666,13 +803,17 @@ impl Registry {
                     // there is nothing to repair. It is reachable — an authenticated
                     // `Ops` frame carrying no ops roots a zero-op room (C99) — which
                     // is why it is a case rather than an impossibility.
-                    if creator.is_none() || self.hub.seq(room) == 0 {
+                    if meta.creator.is_none() || self.hub.seq(room) == 0 {
                         return None;
                     }
+                    // Only the root rides this frame today; the room's binding and
+                    // op-version high-water are repaired by the next delta instead
+                    // (C125), so a follower that lost its whole metadata record
+                    // recovers the root here and the rest on the room's next commit.
                     return Some(Message::ReplicateMeta {
                         room: room.to_vec(),
                         epoch: self.claim_and_persist_epoch(room),
-                        creator,
+                        creator: meta.creator,
                     });
                 }
                 let base_seq = self.hub.base_seq(room);
@@ -682,7 +823,9 @@ impl Registry {
                     ops,
                     base_seq,
                     epoch: self.claim_and_persist_epoch(room),
-                    creator,
+                    creator: meta.creator.clone(),
+                    governing: meta.governing.clone(),
+                    max_op_version: meta.max_op_version,
                 })
             }
             // Below the floor: send the whole-replica snapshot the ops path cannot
@@ -695,7 +838,9 @@ impl Registry {
                 seq,
                 state,
                 epoch: self.claim_and_persist_epoch(room),
-                creator,
+                creator: meta.creator,
+                governing: meta.governing,
+                max_op_version: meta.max_op_version,
             }),
             // `catch_up` reads main's log, never a branch base, so it has no
             // unservable answer. Dialling nothing is the fail-closed reading anyway:
@@ -897,18 +1042,21 @@ impl Registry {
     /// a stray frame drops the connection, a stale-epoch one is fenced. Returns
     /// whether the connection stays open.
     ///
-    /// `creator` is the room's doc-ACL authority root as the leader holds it, adopted
-    /// set-once here so this replica decides its replicated ACL tuples under the same
-    /// authority the leader does. The frame is where it comes from: a replica that took
-    /// only the ops would hold the room's ACL tuples and not the authority they are
-    /// decided under, since it serves the client writes that establish one only once a
-    /// failover has made it a leader — by which time the tuples are long folded in.
+    /// `meta` is the room's metadata record as the leader holds it — its doc-ACL
+    /// authority root, its governing binding, and its op-version high-water — adopted
+    /// beside the ops, each on its own composition rule. The frame is where all three
+    /// come from: a replica that took only the ops would hold the room's ACL tuples and
+    /// not the authority they are decided under, and would hold its versioned state and
+    /// not the high-water its handshake refuses an under-versioned joiner against. It
+    /// serves the client writes that establish any of them only once a failover has made
+    /// it a leader — by which time the tuples are long folded in and the state is long
+    /// past the joiner's reach.
     fn apply_replicate(
         &mut self,
         id: ConnId,
         frame: ReplicaFrame<'_>,
         ops: Vec<Op>,
-        creator: Option<Vec<u8>>,
+        meta: ReplicatedMeta,
     ) -> bool {
         match self.gate_replica_frame(&frame) {
             ReplicaGate::Reject => return false,
@@ -916,17 +1064,20 @@ impl Registry {
             ReplicaGate::Apply => {}
         }
         let (room, branch) = (frame.room, frame.branch);
+        // The high-water before the batch, so the lift the frame delivers is the pre/post
+        // delta — the same capture the client write path takes, for the same eviction.
+        let pre_high_water = self.hub.max_op_version(&room);
         // Ingest through the same path a client `Ops` write uses. A replicated write
         // carries no schema version — the leader logs its writers' ops untagged on the
-        // relay seam, and the follower mirrors them verbatim.
+        // relay seam, and the follower mirrors them verbatim. What the room's ops were
+        // authored at rides the frame as the room-level high-water instead, which is
+        // what the range-check reads. The per-op source version is C71's.
         let Ok(applied) = self.hub.ingest(&room, ops, None) else {
             return false;
         };
-        // After the ingest: the room must exist for the root to land on it, and the
+        // After the ingest: the room must exist for the record to land on it, and the
         // frame that first creates it is the one that names it.
-        if let Some(creator) = &creator {
-            self.hub.ensure_creator(&room, creator);
-        }
+        self.adopt_replicated_meta(&room, &meta);
         // Serve this node's own subscribers. A follower is an ordinary read-serving
         // node, so a client subscribed here is subscribed to a stream the leader is
         // the sole author of, and its replica advances on exactly what this seam
@@ -939,6 +1090,15 @@ impl Registry {
         // channel here already holds it. Everything else the fan-out decides —
         // per-recipient reads, zone scoping, migration translation — is re-decided
         // against this replica, never inherited from the leader ([`fan_out_ops`](Registry::fan_out_ops)).
+        // Before the fan-out, which is what makes a follower-served subscriber's fate the
+        // leader's. A frame that lifted the high-water strands a subscriber this replica
+        // admitted under the old one; a leader's stranded peer never receives the batch,
+        // because the leader's fan-out translates per recipient and drops one whose
+        // chain will not resolve. This fan-out translates nothing — a replicated batch is
+        // served verbatim (C71) — so a peer still in the room here would be handed an op
+        // above its reach and only then told to update. Evicting first drops it from the
+        // room, so the fan-out below no longer names it.
+        self.evict_stranded_by_lift(&room, pre_high_water);
         if !applied.is_empty() {
             self.fan_out_ops(WriteOrigin::Replicated, &room, &branch, &applied, None);
         }
@@ -1004,16 +1164,19 @@ impl Registry {
     /// exactly as [`apply_replicate`](Registry::apply_replicate). Returns whether the
     /// connection stays open.
     ///
-    /// `creator` — the room's authority root, which the state bytes do not carry (see
-    /// [`Message::ReplicateSnapshot`]) — installs set-once, so replacing the replica
-    /// never drops a root already standing here.
+    /// `meta` — the room's metadata record, which the state bytes do not carry (see
+    /// [`Message::ReplicateSnapshot`]) — is adopted beside it, through the same seam and
+    /// on the same composition rules the ops path uses. The root rides the install
+    /// itself, since the install replaces the room and has to compose it against what
+    /// stood there. This frame is the only way a replica converged purely by state
+    /// transfer ever learns any of the three, since it carries no ops at all.
     fn apply_replicate_snapshot(
         &mut self,
         id: ConnId,
         frame: ReplicaFrame<'_>,
         seq: u64,
         state: Vec<u8>,
-        creator: Option<Vec<u8>>,
+        meta: ReplicatedMeta,
     ) -> bool {
         match self.gate_replica_frame(&frame) {
             ReplicaGate::Reject => return false,
@@ -1021,13 +1184,23 @@ impl Registry {
             ReplicaGate::Apply => {}
         }
         let room = frame.room;
+        // The high-water before the install, so the lift the frame delivers is the
+        // pre/post delta — the same capture the ops path takes, for the same eviction.
+        let pre_high_water = self.hub.max_op_version(&room);
         if self
             .hub
-            .install_snapshot(&room, &state, seq, creator)
+            .install_snapshot(&room, &state, seq, meta.creator.clone())
             .is_err()
         {
             return false;
         }
+        // The same adopt the ops seam runs, after the fallible part exactly as there:
+        // nothing of the record lands for a room this node failed to install, and the
+        // last write to the store is the complete one.
+        self.adopt_replicated_meta(&room, &meta);
+        // A state transfer lifts the high-water exactly as an ops batch does, so it
+        // strands the same subscribers and evicts them on the same rule.
+        self.evict_stranded_by_lift(&room, pre_high_water);
         let through_seq = self.hub.seq(&room);
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.outbox.push(Message::ReplicaAck { room, through_seq });
@@ -2631,6 +2804,8 @@ impl Registry {
                     base_seq,
                     epoch,
                     creator,
+                    governing,
+                    max_op_version,
                 } => {
                     // `base_seq` is the leader's compaction floor. Unit 4 replicates
                     // the whole log from the first op, so a follower on the ops path
@@ -2644,7 +2819,16 @@ impl Registry {
                         branch,
                         epoch,
                     };
-                    return self.apply_replicate(id, frame, ops, creator);
+                    return self.apply_replicate(
+                        id,
+                        frame,
+                        ops,
+                        ReplicatedMeta {
+                            creator,
+                            governing,
+                            max_op_version,
+                        },
+                    );
                 }
                 Message::ReplicateSnapshot {
                     room,
@@ -2653,6 +2837,8 @@ impl Registry {
                     state,
                     epoch,
                     creator,
+                    governing,
+                    max_op_version,
                 } => {
                     let frame = ReplicaFrame {
                         sender: &sender,
@@ -2660,7 +2846,17 @@ impl Registry {
                         branch,
                         epoch,
                     };
-                    return self.apply_replicate_snapshot(id, frame, seq, state, creator);
+                    return self.apply_replicate_snapshot(
+                        id,
+                        frame,
+                        seq,
+                        state,
+                        ReplicatedMeta {
+                            creator,
+                            governing,
+                            max_op_version,
+                        },
+                    );
                 }
                 // A metadata-only frame names no branch: the root is a fact about the
                 // room, not about one of its streams, so the gate is handed `main` —
@@ -3120,16 +3316,39 @@ impl Registry {
                 }
             }
         }
-        // A write that raised the room's op-version high-water can strand a joined
-        // enforcing peer whose back-compat reach the new high-water opens past:
-        // fan-out fail-closes its down-drop, so evict it with `UpdateRequired`
-        // rather than leaving it silently un-updated. Only a genuine lift re-checks
-        // — a same-or-lower write moves nothing.
-        if let (Some((room, pre_high_water)), Some((app, version))) = (lift_room, &governing) {
-            let post_high_water = self.hub.max_op_version(&room);
-            if post_high_water > pre_high_water {
-                self.evict_stranded(&room, (app.as_slice(), *version), post_high_water);
+        if let Some((room, pre_high_water)) = lift_room {
+            // A write tags its ops from the room's binding, so the room now holds a
+            // high-water in that app's version space — and the two are read as a pair
+            // wherever either is read. Re-assert the binding, so the room's own durable
+            // record carries both: a dormant-room sweep prunes the hub's copy for a room
+            // it does not yet *hold*, and a subscribe binds before the first write
+            // materializes one, so a room bound, swept and then written keeps its number
+            // and loses its app — after which its replication frames carry a version
+            // nothing can read, and a restart makes that permanent.
+            //
+            // This cannot seize a room, on two independent grounds. `governing` is
+            // resolved from the room's *existing* binding and is `None` for an unbound
+            // one, so a write only ever re-states what a subscribe already established —
+            // it can introduce no binding. And `bind_room_app` composes incumbent-wins
+            // regardless, so even a caller that reached here with another app would leave
+            // the incumbent standing.
+            //
+            // Off the steady path by construction: the assertion is only made when the
+            // room's own record actually disagrees, which is the sweep's window and
+            // nothing else, so an ordinary write compares and allocates nothing.
+            if let Some((app, version)) = &governing {
+                let stale = self
+                    .hub
+                    .governing_app(&room)
+                    .is_none_or(|(bound, at)| bound != *app || at != *version);
+                if stale {
+                    self.bind_room_app(room.clone(), app.clone(), *version);
+                }
             }
+            // A write that raised the high-water strands the same joined peers a
+            // replicated lift does, and is answered the same way — one predicate, one
+            // seam, so admission and eviction cannot drift apart between the two.
+            self.evict_stranded_by_lift(&room, pre_high_water);
         }
         // Every room-bearing lifecycle event this delivery emitted (a subscribe, a
         // version mutation, a compaction) was recorded by the auto-version sink;
