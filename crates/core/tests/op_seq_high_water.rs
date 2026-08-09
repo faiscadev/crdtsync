@@ -17,8 +17,12 @@
 //! write primitive on the counter: one op carrying this replica's own id at
 //! `u64::MAX` pins it at the ceiling, and the next ordinary local edit overflows
 //! — a panic in debug, a wrap into already-published ids in release. A search
-//! over the ids already in memory takes nothing off the wire: a forged frame
-//! contributes one held id, which costs one step.
+//! over the ids already in memory takes no *number* off the wire: what a frame
+//! contributes is ids, one search step each, never a position the counter adopts.
+//! A forged op contributes one. The frame naming what a redacted delta withheld
+//! (`Message::Frontier`) contributes one per sequence it names — so it buys held
+//! ids at a higher density per wire byte than ops do, bounded by the frame itself
+//! and by nothing else, and that cost is stated rather than claimed away.
 //!
 //! Held, not merely applied — an op waiting on its transaction group sits in the
 //! buffer with its id out of the dedup set, and the room's log holds it all the

@@ -13,9 +13,14 @@
 //! per-client sequences the delta withholds and nothing else — not the ops, whose
 //! targets and content name the structure the redaction exists to withhold.
 //!
-//! The other half of the unit is the seam that is *not* given the carrier: a live
-//! fan-out redacts the same way and needs none, because the author folded its own op
-//! locally before the frame was ever built.
+//! The other half of the unit is the seam that is *not* given the carrier. A live
+//! fan-out redacts the same way and is given no frame, on one invariant: **a replica
+//! applies its own op at authoring time**, so the filter withholding its own echo
+//! leaves nothing missing. That is a property of one replica per identity, not of the
+//! frame — two live connections declaring one `ClientId` break it, and nothing refuses
+//! them within a single actor (C23 binds a replica identity across actors; C96 holds
+//! the ruling on the rest). Where it holds, the live seam needs nothing; where it
+//! fails, the hole is identity sharing's and not this frame's.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -551,10 +556,14 @@ fn a_client_sent_frontier_is_a_protocol_violation() {
 
 #[test]
 fn a_live_redacted_fan_out_needs_no_frontier() {
-    // The counterfactual behind serving the frontier on the catch-up seam alone: a
-    // session that stays up folds its own op locally before the frame is built, so
-    // the live filter withholding it leaves no hole. Measured, not assumed — the
-    // whole live exchange, then the position the replica reports.
+    // The catch-up seam gets the frame and the live seam does not, so the two are
+    // measured against one another here: the same reader, redacted the same way,
+    // live and then restarted. An implementation that emitted the frame at the
+    // fan-out site fails the first half; one that emitted it nowhere fails the
+    // second. In between is the invariant — a session that stays up folded its own
+    // op locally before the frame was built, so the live filter withholding it
+    // leaves no hole — measured by running the whole exchange out and reading the
+    // position back.
     let (mut r, mut alice_doc, alice) = acl_room();
     let (mut bob, conn, channel, joined) = bob_session(&mut r, b"t-bob");
     assert_eq!(frontier_in(&joined), None, "an empty room named a run");
@@ -601,6 +610,15 @@ fn a_live_redacted_fan_out_needs_no_frontier() {
     let fresh = edit_ops(&mut bob, channel, b"a", b"after", 9);
     submit(&mut r, conn, fresh);
     assert_eq!(nested(&room_doc(&r), b"a", b"after"), Some(9));
+
+    // The other half of the contrast: the same reader restarted onto the same
+    // redaction *is* sent one, so "no frame" is this seam's answer and not the
+    // implementation's answer everywhere.
+    let (_back, _conn2, _channel2, rejoin) = bob_session(&mut r, b"t-bob2");
+    assert!(
+        frontier_in(&rejoin).is_some(),
+        "the catch-up seam served no frame either, so this measures nothing",
+    );
 }
 
 // --- the zone seam, which redacts on a different dimension ---
