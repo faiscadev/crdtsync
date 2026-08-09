@@ -576,20 +576,23 @@ fn a_projection_carries_none_of_the_projectors_reservations() {
     // session's inbound frame and every projection today runs on a server-side
     // document. Both projections are public API, though, so the rule is enforced
     // rather than assumed.
-    // Served to a recipient that has published nothing, so the frontier the
-    // projection keeps is empty and the *only* thing that could move the adopter's
-    // mint is a reservation that rode across.
+    // Asserted on the projected *bytes*, which is what a projection controls.
+    // Reading them back with `decode_state_as` would prove nothing: `adopt_as`
+    // clears reservations as it takes a snapshot over, so it masks this rule
+    // entirely — measured, and the reason the earlier shape of this test was
+    // vacuous. Served for a recipient that published nothing, so the frontier the
+    // projection keeps is empty and a surviving reservation is the only thing that
+    // could move the decoded replica's mint.
     let (_, ops) = reader_run();
     let mut d = room(&ops);
     d.note_published(&[0, 1, 2], 0);
     d.project_zones(&zoned(), &za_only(), Some(cid(7)));
 
-    let adopter =
-        Document::decode_state_as(cid(7), 0, &d.encode_state()).expect("the projection decodes");
+    let served = Document::decode_state(&d.encode_state()).expect("the projection decodes");
     assert_eq!(
-        adopter.next_seq(),
+        served.next_seq(),
         0,
-        "the recipient inherited the projector's reservations",
+        "the projected snapshot carries the projector's reservations",
     );
 }
 
@@ -600,11 +603,10 @@ fn a_read_path_projection_carries_none_of_the_projectors_reservations() {
     d.note_published(&[0, 1, 2], 0);
     d.project_read_paths(reads_board, Some(cid(7)));
 
-    let adopter =
-        Document::decode_state_as(cid(7), 0, &d.encode_state()).expect("the projection decodes");
+    let served = Document::decode_state(&d.encode_state()).expect("the projection decodes");
     assert_eq!(
-        adopter.next_seq(),
+        served.next_seq(),
         0,
-        "the recipient inherited the projector's reservations",
+        "the projected snapshot carries the projector's reservations",
     );
 }
