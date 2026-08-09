@@ -716,10 +716,15 @@ fn a_room_that_reached_no_sequence_is_dialed_nothing() {
     // there is no delta to converge one — so a root sent here would be inert on every
     // dial for the life of the room. It has no ACL tuples for a root to decide either.
     //
-    // No write establishes this state any more: a root stands only over a room that
-    // retains a write (C99). What still reaches it is a state transfer landing at
-    // sequence zero, which leaves the standing root alone rather than letting an empty
-    // state strip a room's authority.
+    // No write establishes this state any more: a root is established only over a room
+    // that has reached a sequence (C99). What still reaches it is a state install
+    // landing at sequence zero, which leaves the standing root alone rather than
+    // letting an empty state strip a room's authority. No honest catch-up produces one
+    // — `Hub::catch_up` yields a `Snapshot` only below the room's floor, so it is sent
+    // at a floor of at least one — so the producer is a buggy or hostile peer, reaching
+    // this node's install through a superseding epoch. Driven here through the hub for
+    // the same reason the state is worth pinning: the guard is about the state, not
+    // about who put the node in it.
     let room = room_led_by_a_with_b_next();
     let mut leader = node(A);
     let alice = hello_auth(&mut leader, 1, "t-alice");

@@ -796,15 +796,19 @@ impl Registry {
                 if ops.is_empty() {
                     // Nothing to catch up but the room's root, and only where there
                     // is one — a rootless room has nothing this frame could assert.
-                    // Nor where the room has reached no sequence at all: a follower
-                    // holds no such room and this frame does not create one, so the
-                    // root would be re-sent inertly on every dial forever. A room
-                    // with no ops also has no ACL tuples for a root to decide, so
-                    // there is nothing to repair. It is reachable — no seam roots a
-                    // room at sequence zero any more (C99), but a snapshot install
-                    // *lands* a standing root at one, which it must: dropping the root
-                    // there would let a peer strip a room's authority with an empty
-                    // state — so it is a case rather than an impossibility.
+                    // Nor where the room has reached no sequence at all, where the root
+                    // would be re-sent inertly on every dial: this frame creates no
+                    // room, so a follower holding none is unreachable by it, and one
+                    // that does hold a zero-sequence room refuses the root on arrival —
+                    // `Hub::ensure_creator` establishes none there (C99), which is the
+                    // same rule read from the receiving end.
+                    //
+                    // Inert, then, rather than unnecessary. A zero-sequence room is not
+                    // the empty thing it reads as: a state install takes its floor from
+                    // its frame and its content from its bytes, so such a room can hold
+                    // a whole document, doc-ACL tuples included, and a replica of one
+                    // that lost its root has a repair neither this dial nor the frame
+                    // can carry (C141).
                     if meta.creator.is_none() || self.hub.seq(room) == 0 {
                         return None;
                     }

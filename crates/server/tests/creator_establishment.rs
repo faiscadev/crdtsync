@@ -1,4 +1,5 @@
-//! A room's doc-ACL authority root stands only over a room that retains a write (C99).
+//! A room's doc-ACL authority root is established only over a room that has reached a
+//! sequence (C99).
 //!
 //! The creator owns `/`: every doc-ACL grant in the room confers authority only if it
 //! traces back to it, and the room's denies decide nothing without it. It is the
@@ -10,12 +11,21 @@
 //! the shape C23 (#389) closed one tier down for the replica-identity claim, and the
 //! sharper of the two: a claim holds one id space, a creator holds the document.
 //!
-//! The rule that closes it is stated once, in `may_stand_as_root`, for every seam that
-//! installs a root — a client write, a peer's `Replicate` or `ReplicateMeta`, a
-//! snapshot install, and the record read back off the store — because a root arriving
-//! over a peer frame is judged by the same rules deliberately, and `ReplicateMeta`
-//! carries no batch at all. So the condition is about the **room**: no actor roots a
-//! room at sequence zero.
+//! The rule that closes it is stated once, in `may_stand_as_root`, at the one seam
+//! every *establishment* composes through — `Hub::ensure_creator`, which a client's
+//! write, a peer's `Replicate` and the metadata-only `ReplicateMeta` all reach — rather
+//! than bolted onto the client seam with the replication path left judging by another.
+//! So the condition is about the **room**: no actor roots a room at sequence zero.
+//! *Sequence*, not retention: at this seam they are one fact, because the sequence is
+//! this node's own count of what it accepted.
+//!
+//! **Where the rule stops is measured rather than argued.** A root also arrives *with a
+//! state* — a snapshot install, and the record read back off the store — and there the
+//! sequence came in beside the root instead of being counted here. Extending the rule
+//! to those two refuses nothing (a sender that wants the root names a nonzero floor)
+//! and breaks two things: content installed at floor zero comes up rootless, and a room
+//! a state transfer left at zero loses its legitimate root on the next reload. Both are
+//! pinned below, as the reason the rule ends where it does.
 //!
 //! Which leaves a write the room's dedup swallows whole still rooting a room that
 //! already holds ops, and that is deliberate rather than residue — see
@@ -25,7 +35,8 @@
 //!
 //! The negatives here read as an absence — no root where one used to land. Each is
 //! paired with the positive that shows the same seam still establishes a root when the
-//! room retains a write, so a seam that simply stopped working would fail this file.
+//! room has reached a sequence, so a seam that simply stopped working would fail this
+//! file.
 
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +46,7 @@ use crdtsync_core::protocol::Channel;
 use crdtsync_core::{AclEffect, ClientId, Document, Message, Op, Scalar};
 use crdtsync_server::acl::{actor_key, Acl};
 use crdtsync_server::membership::Membership;
+use crdtsync_server::store::Store;
 use crdtsync_server::{
     ConnId, Hub, Identity, ManualClock, Registry, RoomLog, RoomMeta, SchemaRegistry, StaticTokens,
     StoredOp,
@@ -287,15 +299,21 @@ fn hello_auth(r: &mut Registry, client: u8, credential: &str) -> ConnId {
     id
 }
 
-/// The room's establishing commit: two keys and a `Deny(Read)` for bob at `/secret`
-/// naming alice as its grantor — a tuple that decides nothing unless alice is the
-/// room's authority root.
+/// The room's establishing commit: two keys and a `Deny(Read)` for **mallory** at
+/// `/secret`, naming alice as its grantor.
+///
+/// The denied actor is the squatter deliberately. A deny beats the schema tier's static
+/// grant whoever wrote it — `acl::denies_path` never drops one for an unrooted grantor —
+/// so a deny aimed at a third party decides the same either way and would pin nothing
+/// about the root. What only the root has is the *exemption*: the creator auto-owns `/`,
+/// so no deny in the room reaches it. Aiming the deny at mallory is therefore the one
+/// reading that moves when the reservation succeeds.
 fn establishing_batch() -> Vec<Op> {
     Document::new(cid(2)).transact(|tx| {
         tx.register(OPEN, Scalar::Int(1));
         tx.register(SECRET, Scalar::Int(2));
         tx.acl().grant(
-            AclSubject::Actor(actor_key(b"bob")),
+            AclSubject::Actor(actor_key(b"mallory")),
             AclGrant::Capability(Capability::Read),
             AclEffect::Deny,
             encode_path(&[SECRET]),
@@ -304,16 +322,17 @@ fn establishing_batch() -> Vec<Op> {
     })
 }
 
-/// Subscribe bob and fold whatever the catch-up served him into one document.
-fn bob_reads(r: &mut Registry) -> Document {
-    let bob = hello_auth(r, 7, "t-bob");
-    assert!(r.deliver(bob, sub(ROOM)));
-    let out = r.take_outbox(bob);
+/// Subscribe `credential` on a fresh connection and fold whatever the catch-up served
+/// it into one document.
+fn reads(r: &mut Registry, client: u8, credential: &str) -> Document {
+    let id = hello_auth(r, client, credential);
+    assert!(r.deliver(id, sub(ROOM)));
+    let out = r.take_outbox(id);
     assert!(
         !out.iter().any(|m| matches!(m, Message::Error { .. })),
-        "the schema's authenticated read grant admits bob: {out:?}",
+        "the schema's authenticated read grant admits the reader: {out:?}",
     );
-    let mut view = Document::new(cid(7));
+    let mut view = Document::new(cid(client));
     let mut served = false;
     for msg in out {
         match msg {
@@ -330,17 +349,18 @@ fn bob_reads(r: &mut Registry) -> Document {
             _ => {}
         }
     }
-    assert!(served, "bob was served a catch-up");
+    assert!(served, "the reader was served a catch-up");
     view
 }
 
 #[test]
 fn a_no_op_reservation_does_not_take_the_documents_authority_from_its_author() {
-    // The consequence the root carries, rather than the field: a doc-ACL tuple's
-    // authority is resolved at read time against the room's root. With the room
-    // reserved by mallory's no-op frame, alice's deny is authored by a stranger and
-    // decides nothing — bob reads the key it names. The room's real author roots it,
-    // and the deny bites.
+    // The consequence the root carries, rather than the field. The creator auto-owns
+    // `/`, so it is exempt from every deny the room holds — which is the privilege a
+    // no-op reservation stole. Mallory reserves the room with a batch of no ops, alice
+    // establishes it and denies mallory `/secret`, and mallory reads: denied, because
+    // the room's root is its author. Had the reservation stood, mallory would own `/`
+    // and read straight through alice's deny.
     let mut r = schema_node();
     let mallory = hello_auth(&mut r, 1, "t-mallory");
     assert!(r.deliver(mallory, sub(ROOM)));
@@ -368,14 +388,50 @@ fn a_no_op_reservation_does_not_take_the_documents_authority_from_its_author() {
         Some(b"alice".as_slice()),
         "the room's authority root is the actor that established it",
     );
-    let view = bob_reads(&mut r);
+    let view = reads(&mut r, 7, "t-mallory");
     assert!(
         view.get(OPEN).is_some(),
-        "bob keeps the read the schema grants him",
+        "mallory keeps the read the schema grants her",
     );
     assert!(
         view.get(SECRET).is_none(),
-        "alice's deny decided the read, so her authority over `/` is real",
+        "the squatter read through the deny, so it holds `/` after all",
+    );
+}
+
+#[test]
+fn a_later_writer_does_not_displace_the_root() {
+    // The other half of the guard the rule shares: set-once. A room the reservation
+    // failed to take is rooted by its first landed write and stays there, so the
+    // squatter's *real* write afterwards inherits nothing.
+    let mut r = Registry::new(cid(0xFF));
+    let mallory = writer(&mut r, 1, b"mallory");
+    assert!(r.deliver(mallory, empty_ops()));
+
+    let alice = writer(&mut r, 2, b"alice");
+    assert!(r.deliver(
+        alice,
+        Message::Ops {
+            channel: CH,
+            ops: batch(2, OPEN)
+        }
+    ));
+    assert_eq!(
+        r.hub().room_creator(ROOM).as_deref(),
+        Some(b"alice".as_slice()),
+    );
+
+    assert!(r.deliver(
+        mallory,
+        Message::Ops {
+            channel: CH,
+            ops: batch(1, SECRET)
+        }
+    ));
+    assert_eq!(
+        r.hub().room_creator(ROOM).as_deref(),
+        Some(b"alice".as_slice()),
+        "a later write displaced the room's root",
     );
 }
 
@@ -459,6 +515,10 @@ fn an_empty_replicate_frame_does_not_root_the_replica_it_creates() {
     let (mut r, peer) = follower(&room);
 
     assert!(r.deliver(peer, replicate(&room, Vec::new(), b"mallory")));
+    assert!(
+        r.hub().holds_room(&room),
+        "the empty frame reached the ingest and created the room",
+    );
     assert_eq!(r.hub().seq(&room), 0, "the frame carried nothing");
     assert_eq!(
         r.hub().room_creator(&room),
@@ -550,23 +610,21 @@ fn empty_state() -> Vec<u8> {
 }
 
 #[test]
-fn a_snapshot_installed_at_sequence_zero_roots_nothing() {
-    // The state-transfer seam takes its root from the frame rather than the bytes, so
-    // it is judged by the same rule: an install landing at sequence zero has retained
-    // nothing for a root to be the authority over.
+fn a_state_installed_at_sequence_zero_still_carries_the_frames_root() {
+    // Where the rule stops, and why — measured, not argued. This seam takes both the
+    // content and the floor it lands at from the same frame, so refusing a root at
+    // sequence zero refuses nothing (a sender that wants it names a nonzero floor) and
+    // lands a room full of content with no authority its tuples are decided under: the
+    // C29 hole, reached from the other side and strictly worse than the reservation.
     let mut hub = Hub::new(cid(0xFF));
-    hub.install_snapshot(ROOM, &empty_state(), 0, Some(b"mallory".to_vec()))
+    hub.install_snapshot(ROOM, &state_with_a_write(), 0, Some(b"alice".to_vec()))
         .expect("the state decodes");
-    assert!(hub.holds_room(ROOM), "the install created the room");
-    assert_eq!(hub.room_creator(ROOM), None);
-}
-
-#[test]
-fn a_snapshot_installed_over_a_landed_room_carries_its_root() {
-    let mut hub = Hub::new(cid(0xFF));
-    hub.install_snapshot(ROOM, &state_with_a_write(), 4, Some(b"alice".to_vec()))
-        .expect("the state decodes");
-    assert_eq!(hub.room_creator(ROOM).as_deref(), Some(b"alice".as_slice()));
+    assert!(hub.get(ROOM, OPEN).is_some(), "the content installed");
+    assert_eq!(
+        hub.room_creator(ROOM).as_deref(),
+        Some(b"alice".as_slice()),
+        "content came up rootless, so every deny in it decides nothing",
+    );
 }
 
 #[test]
@@ -597,16 +655,40 @@ fn stored(actor: &[u8], ops: Vec<Op>) -> RoomLog {
 }
 
 #[test]
-fn a_stored_root_over_a_room_that_retains_nothing_is_dropped_on_load() {
-    // The store's bytes are supplied by whoever hands it over, so a root read off disk
-    // is judged like one off a frame — by every rule, not just the anonymous one.
+#[cfg_attr(miri, ignore)] // drives the room store on the filesystem
+fn a_durable_root_survives_a_reload_of_a_room_left_at_sequence_zero() {
+    // The other seam the rule stops short of, for the same reason read one restart
+    // later. A state transfer landing at sequence zero leaves the standing root alone
+    // — and persists it — so a load that judged the record by the room's sequence would
+    // drop a root the node itself established over content, handing `/` to whoever
+    // writes next.
+    let dir = std::env::temp_dir().join(format!("c99-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let mut hub = Hub::new(cid(0xFF));
+        hub.attach_store(Store::open(&dir).expect("the store opens"));
+        hub.ingest(ROOM, batch(1, OPEN), None)
+            .expect("the write lands");
+        assert!(hub.ensure_creator(ROOM, b"alice"));
+        hub.install_snapshot(ROOM, &empty_state(), 0, None)
+            .expect("the state decodes");
+        assert_eq!(hub.seq(ROOM), 0);
+    }
     let hub = Hub::from_rooms(
         cid(0xFF),
-        vec![(ROOM.to_vec(), stored(b"mallory", Vec::new()))],
+        Store::open(&dir)
+            .expect("the store opens")
+            .load()
+            .expect("it loads"),
     )
     .expect("the record loads");
-    assert_eq!(hub.seq(ROOM), 0);
-    assert_eq!(hub.room_creator(ROOM), None);
+    let root = hub.room_creator(ROOM);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        root.as_deref(),
+        Some(b"alice".as_slice()),
+        "the reload dropped a root the room was legitimately established with",
+    );
 }
 
 #[test]
