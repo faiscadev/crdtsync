@@ -51,6 +51,7 @@ struct Placement {
     stamp: Stamp,
 }
 use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -4625,10 +4626,20 @@ impl Document {
     /// the snapshot projection keeping a born-denied node at its readable current
     /// position: it registers the node's attrs Map and children List (by derived id)
     /// so the node's readable content ops resolve and drain onto it, then the readable
-    /// move lands its first placement. Idempotent — a node already materialized (its
-    /// real create arrived, or a duplicate reveal) is left as it is.
+    /// move lands its first placement. Idempotent in everything but the tag — a node
+    /// already materialized (its real create arrived, or a duplicate reveal) is left
+    /// as it is, except that the reveal's tag still runs the rank: a children-list
+    /// node's id carries no tag, so a reveal and a birth can name one node with two
+    /// tags, and returning early here would settle that by which arrived first.
     fn apply_reveal(&mut self, node: ElementId, tag: Option<Vec<u8>>) {
-        if self.node_element(node).is_some() {
+        if let Some(element) = self.node_element(node) {
+            // Only against an element, and only from a tagged reveal: a tagless
+            // reveal names a text run, which holds no tag, and the two kinds are
+            // never one node — `xml_child_id` mixes the kind in, so a claim under
+            // the other kind names the other child of the stamp.
+            if let (Element::XmlElement(x), Some(t)) = (&element, &tag) {
+                x.borrow_mut().claim_tag(t);
+            }
             return;
         }
         let container = match tag {
@@ -4805,11 +4816,21 @@ impl Document {
                     .or_insert_with(|| Rc::new(RefCell::new(Text::new(id)))),
             )),
             Container::XmlElement(tag) => {
-                let handle = Rc::clone(
-                    self.xml_elements
-                        .entry(id)
-                        .or_insert_with(|| Rc::new(RefCell::new(XmlElement::new(id, tag)))),
-                );
+                let handle = match self.xml_elements.entry(id) {
+                    // Nothing held the id: the claim takes the tag uncontested.
+                    Entry::Vacant(slot) => {
+                        Rc::clone(slot.insert(Rc::new(RefCell::new(XmlElement::new(id, tag)))))
+                    }
+                    // A node already materialised meets this claim at the tag
+                    // rank. A children-list node's id carries no tag, so two
+                    // claims can name one node with two tags, and the smaller
+                    // bytes take it whichever arrived first.
+                    Entry::Occupied(held) => {
+                        let handle = Rc::clone(held.get());
+                        handle.borrow_mut().claim_tag(&tag);
+                        handle
+                    }
+                };
                 // The node's attrs Map and children List are containers in their
                 // own right — register them so ops targeting them resolve, and
                 // link them to the node so reachability walks up through it.

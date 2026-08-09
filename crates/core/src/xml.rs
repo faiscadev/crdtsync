@@ -92,9 +92,36 @@ impl XmlElement {
         self.id
     }
 
-    /// The node's tag — fixed at creation.
+    /// The node's tag — the rank over every claim that named it.
     pub fn tag(&self) -> &[u8] {
         &self.tag
+    }
+
+    /// Claim this node's tag for `tag`, which takes it when its bytes are the
+    /// smaller — the seam every path that names a node's tag runs through.
+    ///
+    /// A children-list node's id derives from `(list, stamp, kind)` and carries no
+    /// tag, deliberately: a stamp derives exactly two children, the tagged and the
+    /// tagless, and mixing the tag in would make "is this node the child this key
+    /// derives" unanswerable without guessing every tag. So two ops can name one
+    /// node with two tags and both pass every gate — dedup is on `OpId`, and an
+    /// id-space record only bounds an *honest* mint — and which tag the node ends
+    /// at has to be a function of the ops alone, never of which arrived first.
+    ///
+    /// **The smaller bytes take it.** A lexicographic order over the tags is
+    /// total, intrinsic, and held by every replica that has either op; there is
+    /// nothing else two such claims differ in to read. It is idempotent and
+    /// commutative by construction — the meet of a set of byte strings is the same
+    /// whatever order they arrive in — so a replay ties and changes nothing.
+    ///
+    /// Every claim runs it, including one on a node whose id *does* determine its
+    /// tag (a map slot's, which derives from `(map, key, tag)`): whether an id
+    /// determines its tag is not a question an id answers, and where it does, every
+    /// honest claim carries that same tag and the rank is a tie.
+    pub(crate) fn claim_tag(&mut self, tag: &[u8]) {
+        if tag < &self.tag[..] {
+            self.tag = tag.to_vec();
+        }
     }
 
     /// The attrs Map handle, shared with the document registry.
@@ -108,9 +135,12 @@ impl XmlElement {
     }
 
     /// Merge `src` (the same element) into this one — attrs and children each
-    /// reconcile through their own engine. The `tag` is identity, not state, so
-    /// it is left untouched.
-    pub fn merge(&self, src: &Self) {
+    /// reconcile through their own engine, and the tag through its own rank
+    /// ([`claim_tag`](Self::claim_tag)). Two replicas can hold one node under two
+    /// tags, so leaving the tag untouched here would make a merge resolve it by
+    /// which side received.
+    pub fn merge(&mut self, src: &Self) {
+        self.claim_tag(&src.tag);
         self.attrs.borrow_mut().merge(&src.attrs.borrow());
         self.children.borrow_mut().merge(&src.children.borrow());
     }

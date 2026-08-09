@@ -164,7 +164,7 @@ fn twins(tag: &str) -> (XmlElement, XmlElement) {
 
 #[test]
 fn merge_is_idempotent() {
-    let x = xml("ul");
+    let mut x = xml("ul");
     insert_child(&x, 0, child(eid(2, 1), "li"), 1, 1);
     let twin = x.deep_clone();
     x.merge(&twin);
@@ -173,7 +173,7 @@ fn merge_is_idempotent() {
 
 #[test]
 fn merge_absorbs_disjoint_children() {
-    let (a, b) = twins("ul");
+    let (mut a, mut b) = twins("ul");
     insert_child(&a, 0, child(eid(2, 1), "a"), 1, 1);
     insert_child(&b, 0, child(eid(2, 2), "b"), 1, 2);
     a.merge(&b);
@@ -189,10 +189,10 @@ fn merge_is_commutative() {
     insert_child(&a, 0, child(eid(2, 1), "a"), 1, 1);
     insert_child(&b, 0, child(eid(2, 2), "b"), 1, 2);
 
-    let (ab, _) = twins("ul");
+    let (mut ab, _) = twins("ul");
     ab.merge(&a);
     ab.merge(&b);
-    let (ba, _) = twins("ul");
+    let (mut ba, _) = twins("ul");
     ba.merge(&b);
     ba.merge(&a);
     assert_eq!(child_tags(&ab), child_tags(&ba));
@@ -200,7 +200,7 @@ fn merge_is_commutative() {
 
 #[test]
 fn merge_carries_child_tombstones() {
-    let (a, b) = twins("ul");
+    let (a, mut b) = twins("ul");
     insert_child(&a, 0, child(eid(2, 1), "gone"), 1, 1);
     // b learns of the child, then a deletes it; the tombstone must ride the merge.
     b.merge(&a);
@@ -211,7 +211,7 @@ fn merge_carries_child_tombstones() {
 
 #[test]
 fn merge_reconciles_attrs_by_lww() {
-    let (a, b) = twins("a");
+    let (mut a, b) = twins("a");
     a.attrs()
         .borrow_mut()
         .set(b"k", Element::Scalar(Scalar::Int(1)), stmp(1, 1));
@@ -228,7 +228,7 @@ fn merge_reconciles_attrs_by_lww() {
 #[test]
 fn merge_recurses_into_a_shared_child() {
     // The same child element edited on both sides folds together, not replaced.
-    let (a, b) = twins("ul");
+    let (mut a, mut b) = twins("ul");
     let child_id = eid(2, 7);
     insert_child(&a, 0, child(child_id, "li"), 1, 1);
     b.merge(&a); // b now holds the same child (same id)
