@@ -176,6 +176,53 @@ fn zone_admits(zones: &Option<HashSet<u32>>, op_zone: Option<u32>) -> bool {
     }
 }
 
+/// The catch-up watermark a reader scoped to `zones` may be told, for a state
+/// captured at room sequence `at` on the `(room, branch)` stream, given the `floor`
+/// that reader already holds — which is below `at`, since a reader is only handed a
+/// state it does not already have.
+///
+/// A whole-room reader is told `at` — the room's own head — unchanged. A
+/// **zone-limited** one is not: `at` counts the whole log, so the difference between
+/// two of its readings counts the ops written into partitions this reader is never
+/// served, and version names are a room-read fact, so a reader enumerates the
+/// captures and charts a hidden partition's write volume from the scalars alone.
+/// What it is told instead is [`Hub::partition_head`] — the last sequence in the
+/// stream its own zone scope admits — so the number moves only when a partition it can
+/// see is written, and within a compaction epoch a window of hidden-only writes reads
+/// like an idle one. Across a compaction it can fall to `0`, which is C119's residue:
+/// this scalar is the client's resume cursor, so it cannot be refused the way the
+/// version seam's can.
+///
+/// It stays a room sequence, which is what keeps resume working: the client sends it
+/// back as `last_seen_seq`, [`Hub::catch_up`] indexes the log with it, and
+/// [`read_redirect_response`] compares it against the answering node's committed
+/// watermark. The `floor` the reader arrived on is the lower bound — a watermark that
+/// went backwards would let a lagging replica serve it a state older than the one it
+/// has. Why a room sequence rather than a per-reader count or an opaque token, and why
+/// the zone scope rather than the doc-ACL one, is DECISIONS 2026-08-09.
+///
+/// The gate is [`zone_narrowing`] — the same predicate that decides whether the
+/// *state* projection runs — so the scalar and the bytes narrow together, including
+/// where that predicate declines. It declines for a channel holding the empty scope
+/// against an acting schema declaring no zones, which the op seam does narrow: there
+/// the state goes out whole too, so the scalar tells that reader nothing the bytes
+/// have not already. That disagreement is C106's, and closing it there closes it here.
+fn narrowed_watermark(
+    hub: &Hub,
+    room: &[u8],
+    branch: &[u8],
+    schema: Option<&Schema>,
+    zones: &Option<HashSet<u32>>,
+    at: u64,
+    floor: u64,
+) -> u64 {
+    if zone_narrowing(schema, zones).is_none() {
+        return at;
+    }
+    let served = hub.partition_head(room, branch, at, |op_zone| zone_admits(zones, op_zone));
+    served.max(floor)
+}
+
 /// One client connection's protocol state. The handshake runs Hello → Auth →
 /// Subscribe: the client names itself, then presents a credential the server
 /// turns into an [`Identity`] (actor plus roles and groups), then joins rooms. A
@@ -903,7 +950,19 @@ pub fn step(
                     );
                     Message::Snapshot {
                         channel,
-                        seq,
+                        // The state is the stream's whole head, projected to this
+                        // reader's partitions; the sequence it is tagged with is
+                        // narrowed to match, so the scalar carries no more about the
+                        // partitions withheld than the bytes do.
+                        seq: narrowed_watermark(
+                            hub,
+                            &room,
+                            &branch,
+                            schema,
+                            &zones,
+                            seq,
+                            last_seen_seq,
+                        ),
                         state: catch_up_snapshot(
                             registry, governing, session, high_water, state, schema,
                         ),
@@ -1158,7 +1217,7 @@ pub fn step(
             }
             match hub.version_state(&room, &name) {
                 Some(state) => {
-                    let seq = hub.version_seq(&room, &name).unwrap_or(0);
+                    let captured_at = hub.version_seq(&room, &name).unwrap_or(0);
                     let state = state.to_vec();
                     // A version is the room's own state at an earlier sequence, so it
                     // carries every partition the room carried — the zones this
@@ -1192,6 +1251,29 @@ pub fn step(
                             ..Response::default()
                         };
                     }
+                    // The sequence this capture is tagged with. A version's own
+                    // capture point is a room sequence like any other, and a version
+                    // *name* is a room-read fact — the `Versions` reply hands them all
+                    // over — so an unnarrowed scalar lets a zone-limited reader
+                    // enumerate the captures and chart a hidden partition's write
+                    // volume across them. Such a reader is told **nothing** instead.
+                    //
+                    // Not the catch-up seam's answer — the last sequence this reader's
+                    // scope admits — because that one is read out of the *retained*
+                    // log, and what a compaction has dropped is a function of the whole
+                    // room's volume. A capture's answer would then move when hidden
+                    // writes alone pushed the floor past this reader's last visible op:
+                    // re-reading one fixed capture would flip, which is a signal a
+                    // constant does not carry and which the unnarrowed scalar did not
+                    // carry either. A catch-up frame has no such option — its scalar is
+                    // the client's resume cursor and must be a real sequence — but a
+                    // version read feeds no cursor and carries no floor, so refusing
+                    // the field outright is available here and is strictly quieter.
+                    let seq = if zone_narrowing(schema, &zones).is_some() {
+                        0
+                    } else {
+                        captured_at
+                    };
                     // Whether either redaction is configured over these bytes on this
                     // channel at all. A room with no doc-ACL state, read by a channel that
                     // is not zone-limited, is served the captured bytes as it always was,
