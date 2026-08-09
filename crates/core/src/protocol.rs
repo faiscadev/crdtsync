@@ -269,6 +269,26 @@ pub enum Message {
         seq: u64,
         state: Vec<u8>,
     },
+    /// The per-client sequences the recipient itself published that `channel`'s
+    /// catch-up delta does not carry — the delta's counterpart of the causal
+    /// frontier a snapshot carries inside its state bytes.
+    ///
+    /// A catch-up delta is redacted per recipient, and the read filter is
+    /// authorship-blind: an op the recipient wrote into a subtree it may no longer
+    /// read is withheld from it like anyone else's. Minting walks the ids a replica
+    /// holds, so a recipient that persists its `ClientId` across a restart and folds
+    /// such a delta reports a position *below* ids the room's log already holds, and
+    /// mints straight onto them — every one of those writes deduped away at ingest,
+    /// silently. This frame names them, and leads the delta so a truncated delivery
+    /// costs a skipped sequence rather than a lost write.
+    ///
+    /// Sequences, not `OpId`s: every one names the recipient's own replica, so the
+    /// client resolves them against the identity `channel` authors under — the same
+    /// resolution [`OpsRejected`](Message::OpsRejected) does. No other replica's id
+    /// space is representable here, so the "only the recipient's own" rule the
+    /// redaction rests on is a property of the frame rather than a check on it.
+    /// Server-directed; a client that sends one commits a protocol violation.
+    Frontier { channel: Channel, seqs: Vec<u64> },
     /// Acknowledges an author's durably-logged ops on `channel`: `through` is the
     /// highest per-client op sequence (`OpId.seq`) the server has committed for
     /// this client, so the author drains its outbox up to it. Sent to the author
@@ -736,6 +756,17 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u64(&mut out, *seq);
             put_bytes(&mut out, state);
         }
+        Message::Frontier { channel, seqs } => {
+            put_u8(&mut out, 53);
+            put_u32(&mut out, channel.0);
+            put_u32(
+                &mut out,
+                u32::try_from(seqs.len()).expect("withheld sequence count exceeds u32"),
+            );
+            for seq in seqs {
+                put_u64(&mut out, *seq);
+            }
+        }
         Message::Unsubscribe { channel } => {
             put_u8(&mut out, 5);
             put_u32(&mut out, channel.0);
@@ -1173,6 +1204,18 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 seq,
                 state,
             }
+        }
+        53 => {
+            let channel = Channel(cur.u32()?);
+            let count = cur.u32()?;
+            // Grow as sequences are read rather than trusting `count` to size the
+            // allocation — a bogus count then fails on the missing bytes, not on a
+            // giant up-front reservation.
+            let mut seqs = Vec::new();
+            for _ in 0..count {
+                seqs.push(cur.u64()?);
+            }
+            Message::Frontier { channel, seqs }
         }
         5 => Message::Unsubscribe {
             channel: Channel(cur.u32()?),

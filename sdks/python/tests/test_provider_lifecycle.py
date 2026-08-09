@@ -38,6 +38,7 @@ _TAG_AWARENESS_UPDATE = 9
 _TAG_ACCEPTED = 18
 _TAG_OPS_REJECTED = 22
 _TAG_REDIRECT = 23
+_TAG_FRONTIER = 53
 
 PROTOCOL_HEADER = b"CRDT" + struct.pack("<I", 1)
 
@@ -53,6 +54,13 @@ def auth_ok(actor: bytes = b"anonymous") -> bytes:
 def ops(channel: int, payload: bytes = b"") -> bytes:
     """An Ops delta. An empty payload is the catch-up reply for an empty room."""
     return bytes([_TAG_OPS]) + struct.pack("<I", channel) + payload
+
+
+def frontier(channel: int, seqs: "list[int]") -> bytes:
+    """The frame a redacted catch-up leads with, naming the per-client sequences the
+    delta behind it withholds. It carries none of the room's content."""
+    body = struct.pack("<II", channel, len(seqs))
+    return bytes([_TAG_FRONTIER]) + body + b"".join(struct.pack("<Q", s) for s in seqs)
 
 
 def accepted(channel: int, through: int) -> bytes:
@@ -226,6 +234,23 @@ class TestHandshake:
 
     def test_catch_up_completes_the_initial_sync(self, transport, provider):
         handshake(transport)
+        provider.wait_connected(timeout=2.0)
+        assert provider.state == "connected"
+
+    def test_a_frontier_does_not_complete_the_initial_sync(self, transport, provider):
+        # A redacted catch-up leads with the frontier naming what its delta withholds.
+        # The frame folds cleanly and carries no content, so opening the socket to app
+        # traffic on it would let an edit author against an empty replica.
+        socket = transport.socket(0)
+        socket.wait_sent(3)
+        socket.deliver(auth_ok())
+        socket.wait_sent(4)  # the Subscribe
+
+        socket.deliver(frontier(0, [0, 1]))
+        time.sleep(0.05)
+        assert provider.state != "connected"
+
+        socket.deliver(ops(0))
         provider.wait_connected(timeout=2.0)
         assert provider.state == "connected"
 

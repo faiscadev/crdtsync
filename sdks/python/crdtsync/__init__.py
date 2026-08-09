@@ -3466,6 +3466,11 @@ _WIRE_MAGIC = b"CRDT"
 #: The credential sent when the caller names none — what a dev server accepts.
 _ANONYMOUS = b"anonymous"
 
+#: The wire tag of the frontier a redacted catch-up leads with, from
+#: ``crdtsync_core::protocol::encode_message``. The core folds the frame; the
+#: provider needs only to tell it from the catch-up reply it precedes.
+_MSG_FRONTIER = b"\x35"
+
 #: The floor on a reconnect delay, so a zero ceiling cannot spin the dial loop.
 _MIN_RECONNECT_DELAY = 0.01
 
@@ -4071,8 +4076,12 @@ class Provider:
             # redialled at the floor delay forever, by every client at once.
             self._attempt = 0
             # The Subscribe is answered with the room's catch-up, so the first
-            # frame the session applies past the handshake completes the sync.
-            if self._phase == "catchup":
+            # frame the session applies past the handshake completes the sync —
+            # except the frontier a redacted catch-up leads with, which names the
+            # sequences the delta behind it withholds and carries none of the
+            # room's content. Opening the socket to app traffic on it would let an
+            # edit author against an empty replica.
+            if self._phase == "catchup" and data[:1] != _MSG_FRONTIER:
                 self._mark_connected()
         self._drain_signals()
         try:

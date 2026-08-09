@@ -780,6 +780,21 @@ impl ClientSession {
                 room.last_seen_seq += count;
                 Ok(())
             }
+            // The catch-up delta's causal frontier, which the delta itself cannot
+            // carry: the sequences this channel's replica published that the frame
+            // behind this one withholds. Recording them closes the hole the read
+            // filter leaves in this replica's own run, so the next mint clears it
+            // instead of landing on an id the room's log already binds. The
+            // sequences resolve against the identity this channel authors under —
+            // never the session's, which differs on every channel past the first.
+            Message::Frontier { channel, seqs } => {
+                let room = self
+                    .rooms
+                    .get_mut(&channel)
+                    .ok_or(ClientError::UnknownChannel(channel))?;
+                room.doc.note_published(&seqs);
+                Ok(())
+            }
             Message::Snapshot {
                 channel,
                 seq,

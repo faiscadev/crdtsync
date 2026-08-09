@@ -35,6 +35,7 @@
 use std::collections::HashSet;
 
 use crdtsync_core::client::ClientSession;
+use crdtsync_core::protocol::Channel;
 use crdtsync_core::{ClientId, Document, Element, Message, Op, OpId, Scalar};
 
 mod common;
@@ -513,4 +514,189 @@ fn a_forged_catch_up_frame_leaves_a_session_minting_ordinarily() {
         panic!("expected an Ops frame");
     };
     assert_eq!(seqs(&ops), vec![0]);
+}
+
+// --- the redacted delta: the ids a frame withholds, named by the frame ahead of it ---
+
+#[test]
+fn a_noted_sequence_is_not_a_free_id() {
+    // The redaction's shape: the room's log holds seqs 0 and 1 on a path this
+    // replica may no longer read, so the delta carries neither. Named, they are as
+    // taken as an applied id.
+    let mut doc = Document::new(cid(1));
+    doc.apply(&op_at_seq(cid(1), b"shown", 2));
+    assert_eq!(doc.next_seq(), 0, "the hole is where the redaction left it");
+
+    doc.note_published(&[0, 1]);
+    assert_eq!(doc.next_seq(), 3);
+    assert_eq!(
+        seqs(&doc.transact(|tx| tx.set(b"after", Scalar::Int(9)))),
+        vec![3],
+        "minted into an id the room's log already holds"
+    );
+}
+
+#[test]
+fn a_noted_sequence_leaves_the_gaps_around_it_free() {
+    // Naming ids is not a high-water either: a sequence the room never kept stays
+    // mintable whichever side of a named one it falls.
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&[1, 4]);
+    let mut minted = Vec::new();
+    for i in 0..4 {
+        let key = format!("k{i}").into_bytes();
+        minted.extend(doc.transact(|tx| tx.set(&key, Scalar::Int(i))));
+    }
+    assert_eq!(seqs(&minted), vec![0, 2, 3, 5]);
+}
+
+#[test]
+fn a_noted_ceiling_sequence_does_not_move_the_counter() {
+    // The carrier takes sequences off the wire, so it has to obey what the whole
+    // position obeys: one named sequence is one held id and one step of the
+    // search, never a number the counter adopts. A frame naming the ceiling costs
+    // a replica with no durable run nothing.
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&[u64::MAX]);
+    assert_eq!(
+        doc.next_seq(),
+        0,
+        "the named seq was adopted as a high-water"
+    );
+    assert_eq!(
+        seqs(&doc.transact(|tx| tx.set(b"x", Scalar::Int(1)))),
+        vec![0]
+    );
+}
+
+#[test]
+fn a_noted_sequence_the_buffer_is_holding_leaves_the_state_encodable() {
+    // The dedup set and the buffer are disjoint by construction — the state
+    // encoding refuses a document whose id appears in both — and a delta split
+    // across frames can name a sequence whose op is already waiting on its group.
+    let mut author = Document::new(cid(1));
+    let group = author.atomic_transact(|tx| {
+        tx.set(b"x", Scalar::Int(1));
+        tx.set(b"y", Scalar::Int(2));
+    });
+    let mut doc = Document::new(cid(1));
+    doc.apply(&group[0]);
+
+    assert_eq!(
+        doc.next_seq(),
+        1,
+        "the buffered id blocks the mint on its own"
+    );
+    doc.note_published(&[group[0].id.seq, group[1].id.seq]);
+    assert_eq!(
+        doc.next_seq(),
+        2,
+        "naming a run the buffer half-holds left a hole in it"
+    );
+    Document::decode_state(&doc.encode_state())
+        .expect("a noted id the buffer holds left the state undecodable");
+}
+
+#[test]
+fn noting_a_sequence_reaches_no_other_replicas_run() {
+    // The frame carries sequences, not ids, so it resolves in exactly one id
+    // space: the replica's own. A peer's counter is untouched by anything this
+    // replica is told.
+    let mut doc = Document::new(cid(1));
+    doc.note_published(&[0, 1, 2]);
+
+    let mut peer = Document::new(cid(2));
+    peer.note_published(&[0, 1, 2]);
+    assert_eq!(doc.next_seq(), 3);
+    assert_eq!(peer.next_seq(), 3);
+
+    // What `doc` was told about its own run says nothing about what `peer` may
+    // mint, and the ids stay distinct across the two.
+    let a = doc.transact(|tx| tx.set(b"a", Scalar::Int(1)));
+    let b = peer.transact(|tx| tx.set(b"b", Scalar::Int(2)));
+    assert_ne!(a[0].id, b[0].id);
+}
+
+#[test]
+fn a_noted_run_survives_a_snapshot_round_trip() {
+    // A replica that persists its own state must not lose the hole's repair with
+    // it: the named ids ride the dedup set, which the encoding carries.
+    let mut doc = Document::new(cid(1));
+    doc.apply(&op_at_seq(cid(1), b"shown", 2));
+    doc.note_published(&[0, 1]);
+
+    let back = Document::decode_state(&doc.encode_state()).expect("decodes");
+    assert_eq!(back.next_seq(), 3);
+}
+
+#[test]
+fn a_session_told_what_its_delta_withheld_mints_past_it() {
+    // The wire shape end to end: the delta carries the one op on a readable path,
+    // the frame ahead of it names the two it withheld, and the session's next edit
+    // clears all three.
+    let mut session = ClientSession::new(cid(1));
+    let (channel, _) = session.subscribe(ROOM).unwrap();
+    session
+        .receive(Message::Frontier {
+            channel,
+            seqs: vec![0, 1],
+        })
+        .expect("the frontier applies");
+    session
+        .receive(Message::Ops {
+            channel,
+            ops: vec![op_at_seq(cid(1), b"shown", 2)],
+        })
+        .expect("the delta applies");
+
+    let sent = session
+        .edit(channel, |tx| tx.set(b"after", Scalar::Int(9)))
+        .expect("channel held");
+    let Message::Ops { ops, .. } = sent else {
+        panic!("expected an Ops frame");
+    };
+    assert_eq!(
+        seqs(&ops),
+        vec![3],
+        "the session re-minted an id the redaction withheld"
+    );
+}
+
+#[test]
+fn a_frontier_for_an_unheld_channel_is_refused() {
+    let mut session = ClientSession::new(cid(1));
+    let channel = Channel(7);
+    assert!(session
+        .receive(Message::Frontier {
+            channel,
+            seqs: vec![0]
+        })
+        .is_err());
+}
+
+#[test]
+fn a_frontier_resolves_against_the_channels_own_identity() {
+    // A session past its first subscription authors under a derived identity, so
+    // the sequences it is told resolve in *that* replica's space — the connection's
+    // own id answers only for channel 0.
+    let mut session = ClientSession::new(cid(1));
+    let (first, _) = session.subscribe(ROOM).unwrap();
+    let (second, _) = session.subscribe(ROOM).unwrap();
+    assert_ne!(
+        session.document(second).expect("held").client(),
+        session.document(first).expect("held").client(),
+    );
+
+    session
+        .receive(Message::Frontier {
+            channel: second,
+            seqs: vec![0, 1],
+        })
+        .expect("the frontier applies");
+    assert_eq!(session.document(second).expect("held").next_seq(), 2);
+    assert_eq!(
+        session.document(first).expect("held").next_seq(),
+        0,
+        "one channel's frontier moved another channel's replica",
+    );
 }

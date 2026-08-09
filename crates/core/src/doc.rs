@@ -2154,6 +2154,36 @@ impl Document {
         seq
     }
 
+    /// Record `seqs` as sequences this replica published, without the ops behind
+    /// them — what a redacted catch-up delta withholds, named by the frame that
+    /// leads it.
+    ///
+    /// Minting walks the ids the replica holds ([`free_seq`](Self::free_seq)), and a
+    /// per-op read filter is authorship-blind: it withholds an op the recipient
+    /// itself wrote into a subtree the recipient may no longer read. Folding such a
+    /// delta leaves a hole in the replica's own run, and the next mint lands in it —
+    /// onto an id the room's log already binds, so the write dedups away at every
+    /// peer with nothing downstream able to detect it. Naming the sequences closes
+    /// the run without materialising the ops, which is the point: their targets and
+    /// content name the structure the redaction withholds.
+    ///
+    /// Each sequence is taken under *this* replica's identity, so a frame can only
+    /// ever reach the id space its recipient already authors in. A sequence the
+    /// buffer is holding is skipped rather than folded into the dedup set: the two
+    /// sets are disjoint by construction (the state encoding refuses a document
+    /// where they overlap), and a buffered id already blocks the mint on its own.
+    pub fn note_published(&mut self, seqs: &[u64]) {
+        for &seq in seqs {
+            let id = OpId {
+                client: self.client,
+                seq,
+            };
+            if !self.buffered.contains(&id) {
+                self.seen.insert(id);
+            }
+        }
+    }
+
     /// The current lamport high-water of a replication partition: the root clock
     /// for `None`, or a declared zone's own clock (`0` if that zone has never been
     /// stamped) for `Some(zone_id)`. Two replicas that have folded the same op set

@@ -286,6 +286,46 @@ fn trailing_bytes_after_a_snapshot_are_an_error() {
 }
 
 #[test]
+fn frontier_round_trips() {
+    round_trips(Message::Frontier {
+        channel: Channel(3),
+        seqs: vec![0, 1, u64::MAX],
+    });
+}
+
+#[test]
+fn frontier_round_trips_an_empty_run() {
+    round_trips(Message::Frontier {
+        channel: Channel(0),
+        seqs: Vec::new(),
+    });
+}
+
+#[test]
+fn a_truncated_frontier_is_an_error() {
+    let bytes = encode_message(&Message::Frontier {
+        channel: Channel(1),
+        seqs: vec![4, 5],
+    });
+    assert_eq!(
+        decode_message(&bytes[..bytes.len() - 1]),
+        Err(ProtocolError::UnexpectedEof)
+    );
+}
+
+#[test]
+fn a_frontier_count_beyond_its_body_is_an_error() {
+    // The count is read as a bound on what follows, never as an allocation size —
+    // a frame claiming a billion sequences fails on the bytes it does not carry.
+    let mut bytes = encode_message(&Message::Frontier {
+        channel: Channel(1),
+        seqs: vec![7],
+    });
+    bytes[5..9].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+    assert_eq!(decode_message(&bytes), Err(ProtocolError::UnexpectedEof));
+}
+
+#[test]
 fn error_round_trips() {
     round_trips(Message::Error {
         code: ErrorCode::UnsupportedVersion,
