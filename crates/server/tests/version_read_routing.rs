@@ -28,7 +28,7 @@
 //! A replica serves version reads once it holds the room's leadership: that is what
 //! keeps the gate from being a blanket centralization, and it is as strong as the
 //! leadership is — a node promoted on its own liveness view answers from its own
-//! records, which is where the residue of this unit lives (C111).
+//! records, which is where the residue of this unit lives (C113).
 //!
 //! Two in-process registries — a leader `Registry` and a follower `Registry` over
 //! one static cluster, no socket — as in `follower_reads.rs`: the leader commits,
@@ -481,6 +481,62 @@ fn a_replica_reads_an_empty_record_set_as_nothing_denied() {
     );
 }
 
+#[test]
+fn a_version_the_client_just_created_is_found_when_it_asks_for_it() {
+    // The incoherence a client meets first, and the plainest reason the read belongs
+    // where the mutation does. A version mutation persists, so it is redirected to the
+    // leader and lands there. A read answered off whichever node holds the channel is
+    // answered from *that* node's index — a different set of captures from the one the
+    // client's own mutation just added to — so create-then-fetch answers "no such
+    // version" for a version the client watched itself create.
+    let room = room_led_by_a_with_b_next();
+    let (mut leader, _alice_doc, _alice) = seeded_leader(&room);
+    let (mut follower, _peer) = caught_up_follower_holding_v1(&mut leader, &room);
+
+    // Alice creates `v2`. The replica redirects her, so the capture lands on the
+    // leader and nowhere else.
+    let alice_here = auth(&mut follower, 3, "t-alice");
+    assert!(follower.deliver(alice_here, subscribe(&room)));
+    follower.take_outbox(alice_here);
+    assert!(follower.deliver(
+        alice_here,
+        Message::VersionCreate {
+            channel: CH,
+            name: b"v2".to_vec(),
+        }
+    ));
+    assert_eq!(follower.take_outbox(alice_here), redirect_to_a(&room));
+
+    let alice_there = auth(&mut leader, 3, "t-alice");
+    assert!(leader.deliver(alice_there, subscribe(&room)));
+    leader.take_outbox(alice_there);
+    assert!(leader.deliver(
+        alice_there,
+        Message::VersionCreate {
+            channel: CH,
+            name: b"v2".to_vec(),
+        }
+    ));
+    leader.take_outbox(alice_there);
+    assert!(
+        leader.hub().version_state(&room, b"v2").is_some(),
+        "the capture landed on the leader",
+    );
+    assert!(
+        follower.hub().version_state(&room, b"v2").is_none(),
+        "and on no other node",
+    );
+
+    // She fetches it back on the channel she still holds here. The read follows the
+    // mutation rather than answering from a set that never had it.
+    assert!(follower.deliver(alice_here, fetch(b"v2")));
+    assert_eq!(
+        follower.take_outbox(alice_here),
+        redirect_to_a(&room),
+        "the read answered from an index the client's own mutation never reached",
+    );
+}
+
 // --- the headline: a revoke the replica has not seen ---
 
 #[test]
@@ -629,7 +685,7 @@ fn a_lagging_promoted_leader_still_answers_from_its_own_records() {
     // replica that promotes over a leader still committing answers the fetch from
     // the records it has, and serves the subtree the revoke closed. The gate moves
     // the read to the node that holds the room's leadership; making that leadership
-    // an authority the read can rely on is C111.
+    // an authority the read can rely on is C113.
     let room = room_led_by_a_with_b_next();
     let (mut leader, mut alice_doc, alice) = seeded_leader(&room);
     let (mut promoted, _peer) = caught_up_follower_holding_v1(&mut leader, &room);
@@ -654,7 +710,7 @@ fn a_lagging_promoted_leader_still_answers_from_its_own_records() {
     let state = served_state(&promoted.take_outbox(bob)).expect("the promoted node serves");
     assert!(
         carries(&state, b"b", b"bseed"),
-        "the promotion residue is closed — if C111 is fixed, retire this pin",
+        "the promotion residue is closed — if C113 is fixed, retire this pin",
     );
 }
 

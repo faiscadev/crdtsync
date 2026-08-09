@@ -1393,7 +1393,11 @@ pub fn step(
             // **branch** diff is not routed here: what a replica may answer about a
             // branch, and whether one unservable side refuses the whole query, is
             // C103's question and its own unit's to rule on.
-            if matches!(kind, DiffKind::Versions) {
+            let routed = match kind {
+                DiffKind::Versions => true,
+                DiffKind::Branches => false,
+            };
+            if routed {
                 if let Some(redirect) = redirect_response(membership, &room) {
                     return redirect;
                 }

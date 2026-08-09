@@ -532,9 +532,11 @@ export class Provider {
       // A request the room's leader alone answers — a version or branch mutation, a
       // version read, a version diff — is redirected on any other node rather than
       // answered, so fail the request awaiting it instead of hanging to timeout. One
-      // per redirect drained: several may arrive in a single batch when requests are
-      // issued concurrently, and a redirect names a room and no channel, so the ones
-      // failed are the oldest pending on this socket.
+      // per redirect drained, since several arrive together when requests are issued
+      // concurrently. A redirect names a room and no channel, so the pairing is
+      // positional and approximate: an ops flush redirects with no request behind it,
+      // and that redirect fails the oldest pending one instead. Correcting it needs
+      // the redirect to name the channel it answers (C114).
       for (const _ of redirects) {
         if (this.pending.length === 0) break;
         this.pending.shift()?.fail(new Error("crdtsync: request redirected to the room's leader"));
