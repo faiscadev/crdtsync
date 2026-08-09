@@ -86,7 +86,7 @@ class ScriptedSocket implements FakeHandlers {
 // Server frames: a tag byte, then the message's fields, all little-endian.
 const TAG_OPS = 2;
 const TAG_AUTH_OK = 7;
-const TAG_FRONTIER = 53;
+const TAG_FRONTIER = 54;
 
 function concat(parts: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));

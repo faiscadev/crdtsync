@@ -779,7 +779,7 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             seqs,
             reach,
         } => {
-            put_u8(&mut out, 53);
+            put_u8(&mut out, 54);
             put_u32(&mut out, channel.0);
             put_u64(&mut out, *reach);
             put_u32(
@@ -1228,7 +1228,7 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 state,
             }
         }
-        53 => {
+        54 => {
             let channel = Channel(cur.u32()?);
             let reach = cur.u64()?;
             let count = cur.u32()?;
