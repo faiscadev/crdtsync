@@ -807,3 +807,94 @@ fn a_range_whose_anchor_seq_is_deleted_is_dropped() {
         "an identity predicate is a narrowing projection too, so the orphan still goes",
     );
 }
+
+#[test]
+fn a_reveal_shell_carries_a_tag_the_rank_can_still_revise() {
+    // A shell reads the node's tag off live state, and a node's tag is not fixed: two
+    // claims can name one node under two tags and the smaller bytes take it (C44). So a
+    // shell emitted before the smaller claim landed and the corrected shell after it must
+    // be **two** ops. Keyed on the node alone they were one, and the correction deduped
+    // away — a reader served the earlier shell was pinned at a tag its own document could
+    // never revise, so two op-served readers of one node encoded different bytes and both
+    // differed from the replica whose tag is the meet.
+    let reads = reads_top(false, &[b"a"]);
+    let mut author = doc();
+    let a = xml_fragment(&mut author, &encode_path(&[b"a"]));
+    let b = xml_fragment(&mut author, &encode_path(&[b"b"]));
+
+    // Born in the DENIED /b under the larger tag, then moved into readable /a.
+    let birth = xml_insert_element(&mut author, &encode_path(&[b"b"]), 0, b"bbb");
+    let larger = birth
+        .iter()
+        .find(|op| matches!(op.kind, OpKind::XmlInsertChild { .. }))
+        .expect("the child insert")
+        .clone();
+    // The twin: one stamp, a distinct OpId, the smaller tag. Both are admissible —
+    // dedup is on `OpId` and an id-space record only bounds an honest mint.
+    let mut smaller = larger.clone();
+    smaller.id.seq = 9_000;
+    if let OpKind::XmlInsertChild { tag, .. } = &mut smaller.kind {
+        *tag = Some(b"aaa".to_vec());
+    }
+    assert_eq!(smaller.stamp, larger.stamp, "the twin carries one stamp");
+    let mv = xml_move_child(
+        &mut author,
+        &encode_path(&[b"b"]),
+        0,
+        &encode_path(&[b"a"]),
+        0,
+    );
+
+    // The reader is served the shell before the smaller claim reaches the author.
+    let early = author.reveal_ops(&reads);
+    assert!(
+        matches!(&early[0].kind, OpKind::XmlReveal { tag, .. } if tag.as_deref() == Some(b"bbb")),
+        "the early shell carries the tag the author then holds",
+    );
+    let mut reader = doc();
+    for op in a.iter().chain(&early).chain(&mv) {
+        reader.apply(op);
+    }
+
+    // The twin lands on the author and the rank revises its tag; the re-derived shell
+    // must be a *different* op, or the reader can never be told.
+    author.apply(&smaller);
+    let late = author.reveal_ops(&reads);
+    assert!(
+        matches!(&late[0].kind, OpKind::XmlReveal { tag, .. } if tag.as_deref() == Some(b"aaa")),
+        "the author's tag is the meet of the two claims",
+    );
+    assert_ne!(
+        early[0].id, late[0].id,
+        "the corrected shell must not dedup against the stale one",
+    );
+
+    for op in &late {
+        reader.apply(op);
+    }
+    let tag_of = |d: &Document| match d.get(b"a") {
+        Some(Element::XmlFragment(f)) => {
+            let kids = f.borrow().children();
+            let v = kids.borrow().values();
+            match v.first() {
+                Some(Element::XmlElement(x)) => Some(x.borrow().tag().to_vec()),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    assert_eq!(
+        tag_of(&reader).as_deref(),
+        Some(&b"aaa"[..]),
+        "the reader stayed pinned at the stale tag",
+    );
+
+    // And a reader served the shells in the other order lands in the same place — the
+    // rank is a meet, so a late *larger* shell changes nothing.
+    let mut other = doc();
+    for op in a.iter().chain(&late).chain(&mv).chain(&early) {
+        other.apply(op);
+    }
+    assert_eq!(tag_of(&other).as_deref(), Some(&b"aaa"[..]));
+    let _ = b;
+}

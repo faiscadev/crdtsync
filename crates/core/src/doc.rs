@@ -51,6 +51,7 @@ struct Placement {
     stamp: Stamp,
 }
 use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -2074,7 +2075,7 @@ impl Document {
             // birth stamp: the birth stamp names the origin author, which a reader who
             // could not read the origin must not learn. A zero lamport under the shell's
             // own reveal client leaks nothing and advances no clock.
-            let id = reveal_op_id(*node);
+            let id = reveal_op_id(*node, tag.as_deref());
             let stamp = Stamp {
                 lamport: 0,
                 client: id.client,
@@ -4447,8 +4448,9 @@ impl Document {
     /// there the key is already the claimant's own, nothing changes hands, and what
     /// is left to settle is the position, which the sequence takes as the meet of
     /// the two ([`List::rejoin`]). Their two *tags* are left to settle with it when
-    /// the kind is `XmlElement` and the tags differ, which this rank does not reach
-    /// and C44 is filed for. A meet is the same whichever arrived first,
+    /// the kind is `XmlElement` and the tags differ, which this rank does not reach:
+    /// the tag runs its own, [`XmlElement::claim_tag`], and the smaller bytes take it.
+    /// A meet is the same whichever arrived first,
     /// where a contest between two claims on one node would have needed to know
     /// what put the incumbent there, and nothing answers that: the move log dedups
     /// on the stamp alone, so a move can hold the key having recorded no edge.
@@ -4625,10 +4627,20 @@ impl Document {
     /// the snapshot projection keeping a born-denied node at its readable current
     /// position: it registers the node's attrs Map and children List (by derived id)
     /// so the node's readable content ops resolve and drain onto it, then the readable
-    /// move lands its first placement. Idempotent — a node already materialized (its
-    /// real create arrived, or a duplicate reveal) is left as it is.
+    /// move lands its first placement. Idempotent in everything but the tag — a node
+    /// already materialized (its real create arrived, or a duplicate reveal) is left
+    /// as it is, except that the reveal's tag still runs the rank: a children-list
+    /// node's id carries no tag, so a reveal and a birth can name one node with two
+    /// tags, and returning early here would settle that by which arrived first.
     fn apply_reveal(&mut self, node: ElementId, tag: Option<Vec<u8>>) {
-        if self.node_element(node).is_some() {
+        if let Some(element) = self.node_element(node) {
+            // Only against an element, and only from a tagged reveal: a tagless
+            // reveal names a text run, which holds no tag, and the two kinds are
+            // never one node — `xml_child_id` mixes the kind in, so a claim under
+            // the other kind names the other child of the stamp.
+            if let (Element::XmlElement(x), Some(t)) = (&element, &tag) {
+                x.borrow_mut().claim_tag(t);
+            }
             return;
         }
         let container = match tag {
@@ -4805,11 +4817,21 @@ impl Document {
                     .or_insert_with(|| Rc::new(RefCell::new(Text::new(id)))),
             )),
             Container::XmlElement(tag) => {
-                let handle = Rc::clone(
-                    self.xml_elements
-                        .entry(id)
-                        .or_insert_with(|| Rc::new(RefCell::new(XmlElement::new(id, tag)))),
-                );
+                let handle = match self.xml_elements.entry(id) {
+                    // Nothing held the id: the claim takes the tag uncontested.
+                    Entry::Vacant(slot) => {
+                        Rc::clone(slot.insert(Rc::new(RefCell::new(XmlElement::new(id, tag)))))
+                    }
+                    // A node already materialised meets this claim at the tag
+                    // rank. A children-list node's id carries no tag, so two
+                    // claims can name one node with two tags, and the smaller
+                    // bytes take it whichever arrived first.
+                    Entry::Occupied(held) => {
+                        let handle = Rc::clone(held.get());
+                        handle.borrow_mut().claim_tag(&tag);
+                        handle
+                    }
+                };
                 // The node's attrs Map and children List are containers in their
                 // own right — register them so ops targeting them resolve, and
                 // link them to the node so reachability walks up through it.
@@ -6051,22 +6073,46 @@ fn ranged_id(stamp: Stamp) -> ElementId {
     ElementId::derive(ns, &stamp_key(stamp), ElementKind::Scalar)
 }
 
-/// The [`OpId`] a reveal shell for `node` carries. A reveal is a redaction-time
-/// synthesis, not an authored op, so it has no real `(client, seq)` — but it must
-/// dedup stably (a resumed catch-up re-derives the same shell) and never collide with a
-/// real authored op the reader also receives. The client is derived from the node under
-/// a fixed reveal namespace: deterministic and unique per node (so two revealed nodes
-/// never alias). No *derived* replica id can coincide with it: this derivation's name is
-/// a node id plus a kind tag (17 bytes), where the only other id-shaped derivation a
-/// replica performs ([`for_channel`](ClientId::for_channel)) names a four-byte channel
-/// number, so the two SHA-1 inputs differ by length alone whatever namespaces they run
-/// under. A *declared* id is not a derivation at all — an embedder supplies its bytes —
+/// The [`OpId`] a reveal shell for `node` under `tag` carries. A reveal is a
+/// redaction-time synthesis, not an authored op, so it has no real `(client, seq)` — but
+/// it must dedup stably (a resumed catch-up re-derives the same shell) and never collide
+/// with a real authored op the reader also receives.
+///
+/// **The tag is in the derivation, and has to be**, because a shell reads it off live
+/// state and a node's tag is not fixed: two claims can name one node under two tags and
+/// the smaller bytes take it ([`XmlElement::claim_tag`]). Keyed on the node alone, a
+/// shell emitted before the smaller claim landed and the corrected shell after it are one
+/// `OpId`, so the correction dedups away and a reader served the earlier one is pinned at
+/// a tag its own document will never revise — two readers of one node encoding different
+/// bytes. Keyed on both, the corrected shell is a distinct op that reaches
+/// [`apply_reveal`] and runs the rank, which is idempotent, so a reader that sees the
+/// shells in either order lands on the meet.
+///
+/// The client is derived under a fixed reveal namespace: deterministic and unique per
+/// `(node, tag)`. No *derived* replica id can coincide with it: this derivation's name is
+/// a node id alone (16 bytes) or a node id, a marker and the tag (17 or more), where the
+/// only other id-shaped derivation a replica performs
+/// ([`for_channel`](ClientId::for_channel)) names a four-byte channel number, so the two
+/// SHA-1 inputs differ by length alone whatever namespaces they run under. A *declared*
+/// id is not a derivation at all — an embedder supplies its bytes —
 /// so an embedder that reuses a shell's id here collides, the same one-id-one-replica
 /// contract that governs two sessions sharing an id. `seq` is 0 — the derived client is
 /// a namespace of one.
-fn reveal_op_id(node: ElementId) -> OpId {
+fn reveal_op_id(node: ElementId, tag: Option<&[u8]>) -> OpId {
     let ns = ElementId::from_bytes(*b"crdtsync\0reveal\0");
-    let derived = ElementId::derive(ns, &node.as_bytes(), ElementKind::XmlElement);
+    let mut name = node.as_bytes().to_vec();
+    // A marker leads the tag, so no tag's own bytes can spell the tagless case: a
+    // `None` name is the node's 16 bytes and every `Some` name is at least 17. What
+    // it separates is the tagless shell from the **empty-tagged** one, which a bare
+    // concatenation would make one name — and the empty tag is admissible and is the
+    // rank's bottom, so the two are different claims. The tagless side needs no
+    // marker of its own: the one here is what puts every tagged name out of its
+    // reach.
+    if let Some(t) = tag {
+        name.push(1);
+        name.extend_from_slice(t);
+    }
+    let derived = ElementId::derive(ns, &name, ElementKind::XmlElement);
     OpId {
         client: ClientId::from_bytes(derived.as_bytes()),
         seq: 0,
@@ -7273,6 +7319,49 @@ mod tests {
         let mut b = [0u8; 16];
         b[0] = first;
         ClientId::from_bytes(b)
+    }
+
+    /// A reveal shell's id is injective in the tag it carries — the absent tag and
+    /// every byte string alike. The `Some` marker buys that on its own: a tagless
+    /// name is the node's 16 bytes and every tagged name is at least 17, so no
+    /// tag's own bytes can spell the absent case. Drop it and `None` names the bare
+    /// node, which the **empty** tag then spells too — a tagless shell and an
+    /// empty-tagged one would be one op and the later would dedup away. The empty
+    /// tag is admissible: nothing validates op-level tag bytes, and it is the tag
+    /// rank's bottom, so it is a claim a node can genuinely end at. A matching
+    /// marker on the tagless side would be dead — nothing it separates is not
+    /// already separated — so there is none.
+    ///
+    /// `reveal_ops` emits one shell per node and reads its kind off the registry,
+    /// so no honest stream asks for two of these today. The derivation is what
+    /// makes that a property of the id rather than of who calls it, which an op
+    /// family added later would otherwise break in silence.
+    #[test]
+    fn a_reveal_shell_id_is_injective_in_the_tag() {
+        let node = ElementId::from_bytes([3u8; 16]);
+        let nul: &[u8] = &[0u8];
+        // The absent tag against the one that would otherwise spell it. This is the
+        // assert the marker is load-bearing for: drop the marker and it fails.
+        assert_ne!(reveal_op_id(node, None), reveal_op_id(node, Some(b"")));
+        // And against tags that would not — inert against the marker, kept because
+        // they say the derivation reads bytes rather than emptiness.
+        assert_ne!(reveal_op_id(node, None), reveal_op_id(node, Some(nul)));
+        assert_ne!(reveal_op_id(node, Some(b"")), reveal_op_id(node, Some(nul)));
+        // The tag is read, not merely present.
+        assert_ne!(
+            reveal_op_id(node, Some(b"a")),
+            reveal_op_id(node, Some(b"b"))
+        );
+        assert_eq!(
+            reveal_op_id(node, Some(b"a")),
+            reveal_op_id(node, Some(b"a"))
+        );
+        // And the node still separates two shells carrying one tag.
+        let other = ElementId::from_bytes([4u8; 16]);
+        assert_ne!(
+            reveal_op_id(node, Some(b"a")),
+            reveal_op_id(other, Some(b"a"))
+        );
     }
 
     /// A snapshot whose move log folds the parent relation into a cycle is
