@@ -2585,7 +2585,7 @@ impl Hub {
     /// follower answers `Empty`. A node that does is the room's leader, promoted or
     /// not, and there the live stream is served empty too, so the change list stays the
     /// diff of two states this reader would itself have been handed. What is missing is
-    /// the routing, which is C99's.
+    /// the routing, which is C103's.
     pub fn diff_branches(
         &mut self,
         room: &[u8],

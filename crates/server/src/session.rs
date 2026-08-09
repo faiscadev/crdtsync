@@ -1287,7 +1287,7 @@ pub fn step(
         // one exception the projections themselves carry, a *container* the live walk
         // does not reach, which they still serve (C67).
         // Served locally from the replicated state, so no leader redirect — which is
-        // also what makes every answer a statement about this node's own state (C99).
+        // also what makes every answer a statement about this node's own state (C103).
         // A name the room does not have answers `NotFound`; a branch this node cannot
         // read, and a materialized side that fails to decode, answer `Internal`. None
         // of them closes. A side is archived or reconstructed state — a version's
