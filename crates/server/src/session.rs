@@ -1072,16 +1072,28 @@ pub fn step(
         // A mutation replies with the fresh name list — the authoritative
         // post-state — and a list request the same; a fetch that hits replies
         // with the version's state, and one that misses falls back to the list.
-        // A version mutation persists to the room, so — like an ops write — it is
-        // served only by the room's leader; on a non-leader it is redirected
-        // rather than persisted, so a follower never diverges the room's versions.
+        // The whole sub-protocol is served by the room's leader; on a non-leader
+        // every frame of it is redirected. A mutation persists to the room, so —
+        // like an ops write — a follower that served it would diverge the room's
+        // versions. A *read* follows the mutation because a version index is **per
+        // node**: replication carries the room's log and never its captures, so a
+        // node answers about the captures it took, and a read answered anywhere but
+        // where the mutations land reports on a different set from the one the
+        // client's own mutations built. Routing it there also puts it on the
+        // freshest `acl_records` a fetch redacts by — those tuples ride the log, so
+        // a replica's are as old as its last replicated commit — which is a
+        // consequence worth having rather than the reason: the live stream that
+        // node serves beside it is behind by the same records at the same instant
+        // (C33).
         Message::VersionCreate { channel, name } => {
-            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Write)
-            else {
+            let Some(room) = bound_room(session, channel) else {
                 return channel_request_denied(session, channel, "version");
             };
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
+            }
+            if !channel_authorized(session, authorizer, schema, &room, Action::Write) {
+                return channel_request_denied(session, channel, "version");
             }
             match hub.create_version(&room, &name) {
                 Ok(_) => versions_list(hub, channel, &room),
@@ -1089,12 +1101,14 @@ pub fn step(
             }
         }
         Message::VersionRename { channel, from, to } => {
-            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Write)
-            else {
+            let Some(room) = bound_room(session, channel) else {
                 return channel_request_denied(session, channel, "version");
             };
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
+            }
+            if !channel_authorized(session, authorizer, schema, &room, Action::Write) {
+                return channel_request_denied(session, channel, "version");
             }
             match hub.rename_version(&room, &from, &to) {
                 Ok(_) => versions_list(hub, channel, &room),
@@ -1102,12 +1116,14 @@ pub fn step(
             }
         }
         Message::VersionDelete { channel, name } => {
-            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Write)
-            else {
+            let Some(room) = bound_room(session, channel) else {
                 return channel_request_denied(session, channel, "version");
             };
             if let Some(redirect) = redirect_response(membership, &room) {
                 return redirect;
+            }
+            if !channel_authorized(session, authorizer, schema, &room, Action::Write) {
+                return channel_request_denied(session, channel, "version");
             }
             match hub.delete_version(&room, &name) {
                 Ok(_) => versions_list(hub, channel, &room),
@@ -1115,22 +1131,31 @@ pub fn step(
             }
         }
         Message::VersionList { channel } => {
-            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Read)
-            else {
+            let Some(room) = bound_room(session, channel) else {
                 return channel_request_denied(session, channel, "version");
             };
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
+            if !channel_authorized(session, authorizer, schema, &room, Action::Read) {
+                return channel_request_denied(session, channel, "version");
+            }
             versions_list(hub, channel, &room)
         }
         Message::VersionFetch { channel, name } => {
-            // The reader is resolved before the room, so the redaction below has the
-            // identity it narrows for without a second, unreachable lookup.
+            // The identity the redaction below narrows for.
             let Some(identity) = session.identity() else {
                 return channel_request_denied(session, channel, "version");
             };
-            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Read)
-            else {
+            let Some(room) = bound_room(session, channel) else {
                 return channel_request_denied(session, channel, "version");
             };
+            if let Some(redirect) = redirect_response(membership, &room) {
+                return redirect;
+            }
+            if !channel_authorized(session, authorizer, schema, &room, Action::Read) {
+                return channel_request_denied(session, channel, "version");
+            }
             match hub.version_state(&room, &name) {
                 Some(state) => {
                     let seq = hub.version_seq(&room, &name).unwrap_or(0);
@@ -1206,7 +1231,7 @@ pub fn step(
                     // The version's state is being served — an auditable history read,
                     // distinct from the live subscribe stream. Record it through the audit
                     // seam once it is actually going out (the read was authorized by
-                    // `channel_room` above, so the verdict is granted).
+                    // `channel_authorized` above, so the verdict is granted).
                     authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     // The replica identity this channel authors under — the one author
                     // whose ids a projection keeps in the frontier it otherwise scrubs,
@@ -1342,8 +1367,9 @@ pub fn step(
         // not read contributes no change at all rather than a redacted one — with the
         // one exception the projections themselves carry, a *container* the live walk
         // does not reach, which they still serve (C67).
-        // Served locally from the replicated state, so no leader redirect — which is
-        // also what makes every answer a statement about this node's own state (C103).
+        // A **branch** answer is served locally from the replicated state, with no
+        // leader redirect — which is also what makes it a statement about this node's
+        // own state (C103). The **version** arm routes; see the gate below.
         // A name the room does not have answers `NotFound`; a branch this node cannot
         // read, and a materialized side that fails to decode, answer `Internal`. None
         // of them closes. A side is archived or reconstructed state — a version's
@@ -1356,15 +1382,32 @@ pub fn step(
             a,
             b,
         } => {
-            // The reader is resolved before the room, so the redaction below has the
-            // identity it narrows for without a second, unreachable lookup.
+            // The identity each side's redaction narrows for.
             let Some(identity) = session.identity() else {
                 return channel_request_denied(session, channel, "diff");
             };
-            let Some(room) = channel_room(session, channel, authorizer, schema, Action::Read)
-            else {
+            let Some(room) = bound_room(session, channel) else {
                 return channel_request_denied(session, channel, "diff");
             };
+            // A **version** diff names two of this room's captures and puts them
+            // through the projection a fetch runs, so it is the leader's on the same
+            // terms — the index is per node, so only the node the captures land on
+            // can resolve the names at all (C33). A
+            // **branch** diff is not routed here: what a replica may answer about a
+            // branch, and whether one unservable side refuses the whole query, is
+            // C103's question and its own unit's to rule on.
+            let routed = match kind {
+                DiffKind::Versions => true,
+                DiffKind::Branches => false,
+            };
+            if routed {
+                if let Some(redirect) = redirect_response(membership, &room) {
+                    return redirect;
+                }
+            }
+            if !channel_authorized(session, authorizer, schema, &room, Action::Read) {
+                return channel_request_denied(session, channel, "diff");
+            }
             let records = hub.acl_records(&room);
             let creator = hub.room_creator(&room);
             // The channel's zone scope against the acting schema — the same set the
@@ -1436,7 +1479,7 @@ pub fn step(
                     // is actually going out. (Later than the fetch's, which fires
                     // before its projections and so can record a read it then narrows
                     // to nothing; both are on the reply path.) The read was authorized
-                    // by `channel_room` above, so the verdict is granted.
+                    // by `channel_authorized` above, so the verdict is granted.
                     authorizer.observe(identity, Action::VersionRead, &Resource::Room(&room), true);
                     Response {
                         replies: vec![Message::DiffResult {
@@ -2257,11 +2300,13 @@ fn redirect_if_not_leader(membership: Option<&Membership>, room: &[u8]) -> Optio
 }
 
 /// The [`Response`] declining to serve `room` here — a lone [`Message::Redirect`]
-/// to its leader — or `None` to serve the request as usual. The gate the room-
-/// serving *writes* (an ops write, a durable version mutation) share, so a follower
-/// never ingests or persists a room it does not lead; it points the client at the
-/// leader instead. Reads use [`read_redirect_response`], which lets a caught-up
-/// follower serve.
+/// to its leader — or `None` to serve the request as usual. The gate every request
+/// the leader alone answers shares: the room-serving *writes* (an ops write, a
+/// durable version or branch mutation), so a follower never ingests or persists a
+/// room it does not lead; and a **version read**, which follows its mutations
+/// because a version index is per node, so a node answers only about the captures
+/// it took. A live room read uses [`read_redirect_response`] instead, which lets a
+/// caught-up follower serve under a client-named floor.
 fn redirect_response(membership: Option<&Membership>, room: &[u8]) -> Option<Response> {
     redirect_if_not_leader(membership, room).map(|redirect| Response {
         replies: vec![redirect],
@@ -2319,40 +2364,47 @@ fn read_redirect_response(
     })
 }
 
-/// Resolve the room a channel-keyed request targets — a version request, a diff
-/// query — having checked the connection is authenticated, the channel is bound,
-/// and the actor is authorized for `action`. `None` means the request cannot
-/// proceed — [`channel_request_denied`] distinguishes an unbound channel (a
-/// violation) from a denial (forbidden).
-fn channel_room(
+/// The room a channel-keyed request names, resolved without deciding anything about
+/// it: the connection is authenticated and the channel is bound, and nothing more.
+/// The routing half of such a request needs the room and must run *before* the gate:
+/// a node that will not answer must not decide it, since [`Authorizer::observe`]
+/// records the verdict and would leave a durable audit entry for a read the node
+/// then refuses.
+fn bound_room(session: &Session, channel: Channel) -> Option<RoomId> {
+    session.identity()?;
+    Some(session.channels.get(&channel)?.room.clone())
+}
+
+/// Whether this connection may take `action` on `room` through a channel-keyed
+/// request — a version request, a diff query. Neither is gated by the doc-ACL tier
+/// here — it abstains, so the deployment and schema tiers decide. What a partial
+/// reader may see of the content behind such a request is the projections' answer,
+/// not this gate's.
+fn channel_authorized(
     session: &Session,
-    channel: Channel,
     authorizer: &dyn Authorizer,
     schema: Option<&Schema>,
+    room: &[u8],
     action: Action,
-) -> Option<RoomId> {
-    let identity = session.identity()?;
-    let room = session.channels.get(&channel)?.room.clone();
-    // Neither a version request nor a diff query is gated by the doc-ACL tier here —
-    // it abstains, so the deployment and schema tiers decide. What a partial reader
-    // may see of the content behind such a request is the projections' answer, not
-    // this gate's.
+) -> bool {
+    let Some(identity) = session.identity() else {
+        return false;
+    };
     authorized(
         authorizer,
         Decision::Abstain,
         schema,
         identity,
         action,
-        &Resource::Room(&room),
+        &Resource::Room(room),
     )
-    .then_some(room)
 }
 
-/// The refusal for a channel-keyed `what` request that [`channel_room`] rejected: a
-/// violation if the connection is unauthenticated or the channel is unbound,
-/// otherwise a non-closing forbidden. `what` names the request kind (`"version"`,
-/// `"diff"`) so the diagnostic points at the surface the client actually used — the
-/// channel-bound counterpart of [`request_denied`].
+/// The refusal for a channel-keyed `what` request that [`bound_room`] or
+/// [`channel_authorized`] rejected: a violation if the connection is unauthenticated
+/// or the channel is unbound, otherwise a non-closing forbidden. `what` names the
+/// request kind (`"version"`, `"diff"`) so the diagnostic points at the surface the
+/// client actually used — the channel-bound counterpart of [`request_denied`].
 fn channel_request_denied(session: &Session, channel: Channel, what: &str) -> Response {
     if session.actor().is_none() {
         violation(&format!("{what} request before auth"))

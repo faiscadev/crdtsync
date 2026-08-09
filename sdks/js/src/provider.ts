@@ -529,9 +529,16 @@ export class Provider {
     if (Array.isArray(rejected) && rejected.length > 0) this.onOpsRejected?.(rejected);
     const redirects = this.client.takeRedirects() as unknown[];
     if (Array.isArray(redirects) && redirects.length > 0) {
-      // A version/branch mutation routed to a non-leader is redirected, not
-      // answered — reject the request awaiting it so it doesn't hang to timeout.
-      if (this.pending.length > 0) {
+      // A request the room's leader alone answers — a version or branch mutation, a
+      // version read, a version diff — is redirected on any other node rather than
+      // answered, so fail the request awaiting it instead of hanging to timeout. One
+      // per redirect drained, since several arrive together when requests are issued
+      // concurrently. A redirect names a room and no channel, so the pairing is
+      // positional and approximate: an ops flush redirects with no request behind it,
+      // and that redirect fails the oldest pending one instead. Correcting it needs
+      // the redirect to name the channel it answers (C114).
+      for (const _ of redirects) {
+        if (this.pending.length === 0) break;
         this.pending.shift()?.fail(new Error("crdtsync: request redirected to the room's leader"));
       }
       this.onRedirect?.(redirects);
