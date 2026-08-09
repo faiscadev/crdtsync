@@ -243,16 +243,20 @@ struct ReplicaFrame<'a> {
     epoch: u64,
 }
 
-/// A dial's catch-up frames, split by what losing one costs. A peer's outbound
+/// A dial's catch-up frames, ordered by what a dial emits more of. A peer's outbound
 /// channel is bounded and drops on overflow (`dispatch_replication`), so the order
 /// frames are queued in decides which are lost when a dial spans more rooms than the
-/// channel holds — and the two kinds are not equally costly. A **delta** (an ops tail
-/// or a state transfer) is the only thing that converges a follower's replica, and a
-/// dropped one leaves a gap the steady path — which mirrors fresh commits only —
-/// never closes for a quiescent room. A **root-only** [`Message::ReplicateMeta`] is a
-/// repair for a replica that is already converged, and the next dial re-sends it. So
-/// deltas are queued first and roots last, and an overflowing dial sheds the repair
-/// rather than the convergence.
+/// channel holds.
+///
+/// Neither kind is lost *permanently*: a dropped frame advances no watermark, so the
+/// next dial recomputes the same delta and re-sends the same root. What differs is
+/// **how many of each a dial builds**. A delta (an ops tail or a state transfer) is
+/// built only for a room the follower is actually behind on; a root-only
+/// [`Message::ReplicateMeta`] is built for every rooted room this node leads,
+/// converged or not. Unordered, the repairs would crowd the deltas out of the channel
+/// by sheer count and delay the convergence a whole dial cycle for no gain. So deltas
+/// are queued first and roots last, and an overflowing dial sheds the frames whose
+/// loss costs nothing this cycle.
 #[derive(Default)]
 struct DialFrames {
     deltas: Vec<Message>,
@@ -655,7 +659,14 @@ impl Registry {
                 if ops.is_empty() {
                     // Nothing to catch up but the room's root, and only where there
                     // is one — a rootless room has nothing this frame could assert.
-                    if creator.is_none() {
+                    // Nor where the room has reached no sequence at all: a follower
+                    // holds no such room and this frame does not create one, so the
+                    // root would be re-sent inertly on every dial forever. A room
+                    // with no ops also has no ACL tuples for a root to decide, so
+                    // there is nothing to repair. It is reachable — an authenticated
+                    // `Ops` frame carrying no ops roots a zero-op room (C99) — which
+                    // is why it is a case rather than an impossibility.
+                    if creator.is_none() || self.hub.seq(room) == 0 {
                         return None;
                     }
                     return Some(Message::ReplicateMeta {
@@ -960,8 +971,8 @@ impl Registry {
     /// disqualified an empty `Replicate` from being this frame, arriving one restart
     /// later. Every other replication frame reaches the gate because each carries a
     /// stream position the fence exists to order; this one carries none. A node
-    /// missing the room gets it from the ops or snapshot catch-up, each of which
-    /// carries the root itself, and each of which still refuses a stray sender's link.
+    /// missing the room gets it from the ops or snapshot catch-up where the room has
+    /// reached a sequence, and each of those still refuses a stray sender's link.
     ///
     /// Unacknowledged, and deliberately: the frame names no sequence and advances no
     /// stream, so there is no watermark for a [`Message::ReplicaAck`] to report. It

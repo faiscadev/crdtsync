@@ -399,8 +399,10 @@ pub enum Message {
     /// acknowledged nor counted toward a watermark, and unlike every other
     /// replication frame it **never creates the room**. A receiver that does not hold
     /// `room` drops it, so a follower is never left holding an empty room its
-    /// read-serving would then advertise; such a follower is converged by the ops or
-    /// snapshot catch-up, which carries the root itself.
+    /// read-serving would then advertise. Such a follower is converged by the ops or
+    /// snapshot catch-up, which carries the root itself, for every room that has
+    /// reached a sequence — and a room that has not carries no ACL tuples for a root
+    /// to decide, so no frame is built for it.
     ///
     /// Node-to-node — never a client frame; a client that sends one commits a
     /// protocol violation.

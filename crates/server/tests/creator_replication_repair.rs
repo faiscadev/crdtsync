@@ -10,7 +10,11 @@
 //!    included, while replication is enqueued only for a *non-empty* broadcast. A room
 //!    whose establishing commit was anonymous (root `None`, replicated as such) and
 //!    whose next authenticated write is a pure resend of ops the hub already holds
-//!    gains its root on the leader with no frame to carry it.
+//!    gains its root on the leader with no frame to carry it. The client reaches that
+//!    state by *reconnecting*, not by authenticating in place: an anonymously-admitted
+//!    connection already holds an identity, so an in-band `Auth` on it is refused as a
+//!    protocol violation. It writes anonymously, reconnects under its credential with
+//!    the same replica identity, and flushes its outbox.
 //! 2. **A root whose best-effort persist failed on a replica.** Set-once retries
 //!    nothing, so the replica reloads creatorless — and unlike a leader it serves no
 //!    client write to establish one afresh, so a quiescent room's root never returns:
@@ -30,6 +34,12 @@
 //! over a connection the deployment admitted anonymously), the server checks no
 //! grantor at write time, and the tuple therefore decides nothing until alice roots
 //! the room. That resend is what roots it.
+//!
+//! The negatives that read as an *absence* — the frame creating no room, leaving no
+//! durable trace, acking nothing — cannot distinguish a correctly inert seam from an
+//! unimplemented one, and are not claimed to: each is pinned against the mutation
+//! that would break it (an ingest before the adopt, the guard removed, an ack added),
+//! which is where the sweep found them. The ones that *can* show a live seam do.
 //!
 //! Two in-process registries over one static cluster, no socket and a fixed clock,
 //! as in `replicated_creator.rs`.
@@ -555,8 +565,16 @@ fn a_single_node_deployment_queues_no_frame() {
 
 // --- route 2: a replica whose root persist failed, in a quiescent room ---
 
-/// `write_meta` is best-effort — a failure leaves no record on disk — so removing
-/// every metadata file reproduces exactly the state a failed persist leaves behind.
+/// Remove every persisted metadata record under `dir` — the state a replica whose
+/// best-effort `write_meta` failed comes back in.
+///
+/// Faithful for the replica these tests build and not in general, which is worth
+/// being exact about: `write_meta` goes through `atomic_write` (temp, flush,
+/// rename), so a failed *rewrite* leaves the **prior** record intact rather than no
+/// record. It is the establishing write — the one with nothing to preserve — that
+/// leaves the file absent, and a pure-replication follower's first metadata write is
+/// exactly that, since it has served no subscribe to bind a governing app. A replica
+/// that had served one would carry a binding this helper also erases.
 fn drop_persisted_meta(dir: &Path) {
     let mut removed = 0;
     for entry in fs::read_dir(dir).unwrap() {
@@ -600,6 +618,7 @@ fn seeded_leader(room: &[u8]) -> Registry {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // drives the room store on the filesystem
 fn a_quiescent_replica_that_lost_its_root_is_re_rooted_by_the_dial() {
     let room = room_led_by_a_with_b_next();
     let dir = tempdir("quiescent");
@@ -657,6 +676,7 @@ fn a_quiescent_replica_that_lost_its_root_is_re_rooted_by_the_dial() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // drives the room store on the filesystem
 fn a_re_rooted_replica_persists_the_root_it_was_handed() {
     // The repair has to survive the *next* restart too, or a node whose disk is
     // healthy again would keep losing it.
@@ -687,6 +707,33 @@ fn a_re_rooted_replica_persists_the_root_it_was_handed() {
         "the adopted root was written through, so the reload keeps it",
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_room_that_reached_no_sequence_is_dialed_nothing() {
+    // A rooted room with no ops: an authenticated `Ops` frame carrying no ops roots
+    // one (C99's shape). No follower holds it — the frame creates no room and there
+    // is no delta to converge one — so a root sent here would be inert on every dial
+    // for the life of the room. It has no ACL tuples for a root to decide either.
+    let room = room_led_by_a_with_b_next();
+    let mut leader = node(A);
+    let alice = hello_auth(&mut leader, 1, "t-alice");
+    assert!(leader.deliver(alice, sub(&room)));
+    leader.take_outbox(alice);
+    submit(&mut leader, alice, Vec::new());
+    assert_eq!(
+        leader.hub().room_creator(&room).as_deref(),
+        Some(b"alice".as_slice()),
+        "the empty write roots the room",
+    );
+    assert_eq!(leader.hub().seq(&room), 0, "and lands no sequence");
+    leader.take_replication();
+
+    leader.catch_up_follower(&NodeId::from_addr(B));
+    assert!(
+        frames_for_b(&mut leader).is_empty(),
+        "no sequence, nothing a replica could be caught up to",
+    );
 }
 
 #[test]
@@ -756,6 +803,35 @@ fn an_empty_replicate_would_have_created_the_room_instead() {
         follower.hub().holds_room(&room),
         "an empty delta creates the room — the reason it cannot be the root's carrier",
     );
+    // And the consequence, not just the flag: this node does not lead the room, so a
+    // client should be redirected to the leader. It is served from the empty replica
+    // instead, because `read_redirect_response` admits a held room at or above the
+    // reader's floor and an empty one at sequence 0 satisfies both.
+    let bob = hello_auth(&mut follower, 7, "t-bob");
+    assert!(follower.deliver(bob, sub(&room)));
+    let out = follower.take_outbox(bob);
+    assert!(
+        !out.iter().any(|m| matches!(m, Message::Redirect { .. })),
+        "the follower serves rather than redirects: {out:?}",
+    );
+    let mut view = Document::new(cid(7));
+    for m in &out {
+        match m {
+            Message::Snapshot { state, .. } => {
+                view = Document::decode_state(state).expect("decodes")
+            }
+            Message::Ops { ops, .. } => {
+                for op in ops {
+                    view.apply(op);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        view.get(OPEN).is_none() && view.get(SECRET).is_none(),
+        "and serves an empty document for a room that has content: {out:?}",
+    );
 
     // The metadata-only frame, on the same node in the same state, does not.
     let other = room_led_by_a_with_b_next_after(&room);
@@ -771,6 +847,7 @@ fn an_empty_replicate_would_have_created_the_room_instead() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // drives the room store on the filesystem
 fn a_frame_for_an_unheld_room_leaves_no_durable_trace_of_it() {
     // The frame is dropped *ahead of the fence*, not merely ahead of the root. The
     // gate advances and persists this node's leadership epoch for the room, and
@@ -903,22 +980,34 @@ fn a_dial_queues_its_deltas_before_its_root_repairs() {
             _ => "delta",
         })
         .collect();
-    assert_eq!(
-        kinds,
-        vec!["delta", "root"],
-        "the convergence is queued ahead of the repair",
+    // Read as a partition, not as a fixed sequence: the dial ranges over
+    // `Hub::room_ids`, whose order is a `HashMap`'s and so differs per run. What is
+    // pinned is that no root precedes any delta, which is the property and is
+    // decided the same way whatever order the rooms come out in.
+    assert!(
+        kinds.contains(&"delta") && kinds.contains(&"root"),
+        "{kinds:?}"
+    );
+    let last_delta = kinds.iter().rposition(|k| *k == "delta").expect("a delta");
+    let first_root = kinds.iter().position(|k| *k == "root").expect("a root");
+    assert!(
+        last_delta < first_root,
+        "every convergence is queued ahead of every repair: {kinds:?}",
     );
 }
 
 #[test]
 fn the_frame_is_not_acknowledged() {
     // It names no sequence and advances no stream, so there is no watermark to
-    // report — an ack would advance one the frame did not move.
-    let room = room_led_by_a_with_b_next();
-    let mut leader = seeded_leader(&room);
-    let mut follower = node(B);
-    let peer = peer_conn(&mut follower, &room);
-    apply_all(&mut follower, peer, frames_for_b(&mut leader));
+    // report — an ack would advance one the frame did not move. Read on a *rootless*
+    // replica, so the root landing is this frame's work and the silence is a live
+    // seam's rather than a dropped frame's.
+    let Rootless {
+        room,
+        mut follower,
+        peer,
+        ..
+    } = rootless_room();
     follower.take_outbox(peer);
 
     assert!(follower.deliver(
@@ -929,15 +1018,14 @@ fn the_frame_is_not_acknowledged() {
             creator: Some(b"alice".to_vec()),
         },
     ));
-    assert!(
-        follower.take_outbox(peer).is_empty(),
-        "a metadata-only frame is answered with nothing",
-    );
-    // Against a live seam, not a dropped frame: this node holds the room and the
-    // frame's root is the one standing, so it was applied and answered with silence.
     assert_eq!(
         follower.hub().room_creator(&room).as_deref(),
         Some(b"alice".as_slice()),
+        "the frame applied",
+    );
+    assert!(
+        follower.take_outbox(peer).is_empty(),
+        "and was answered with nothing",
     );
 }
 
@@ -1055,6 +1143,20 @@ fn a_stale_epoch_frame_is_fenced_rather_than_applied() {
         follower.hub().room_creator(&room),
         None,
         "and roots nothing",
+    );
+    // Refused for the fence, not ignored: the same frame at the observed epoch roots
+    // the room, so the seam is live and the epoch is what decided the refusal.
+    assert!(follower.deliver(
+        peer,
+        Message::ReplicateMeta {
+            room: room.clone(),
+            epoch: 9,
+            creator: Some(b"mallory".to_vec()),
+        },
+    ));
+    assert_eq!(
+        follower.hub().room_creator(&room).as_deref(),
+        Some(b"mallory".as_slice()),
     );
 }
 
