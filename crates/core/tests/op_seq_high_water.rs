@@ -17,8 +17,14 @@
 //! write primitive on the counter: one op carrying this replica's own id at
 //! `u64::MAX` pins it at the ceiling, and the next ordinary local edit overflows
 //! — a panic in debug, a wrap into already-published ids in release. A search
-//! over the ids already in memory takes no *number* off the wire: what a frame
-//! contributes is ids, one search step each, never a position the counter adopts.
+//! over the ids already in memory takes no number off the wire *for the sequence*:
+//! what a frame contributes there is ids, one search step each, never a position
+//! the counter adopts. The **lamport** half is not that shape and the distinction
+//! is worth keeping straight — `Message::Frontier`'s `reach` is a wire number that
+//! lands in this replica's id-space high-water and is read as the mint floor. It
+//! buys nothing an op carrying this replica's id does not already buy, under the
+//! same ceiling, which is the claim that carries it — not "no number reaches the
+//! mint", which is false of that half.
 //! A forged op contributes one. The frame naming what a redacted delta withheld
 //! (`Message::Frontier`) contributes one per sequence it names — so it buys held
 //! ids at a higher density per wire byte than ops do, bounded by the frame itself

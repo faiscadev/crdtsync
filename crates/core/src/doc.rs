@@ -2217,11 +2217,16 @@ impl Document {
     /// Each sequence is taken under *this* replica's identity, so a frame can only
     /// ever reach the id space its recipient already authors in. `reach` moves this
     /// replica's own entry and no other's, through
-    /// [`record_stamp`](Self::record_stamp) itself, so it is the same primitive an
-    /// op carrying this replica's id already is, under the same
-    /// [`LAMPORT_STATE_CEILING`]. A frame naming a position past the ceiling buys
-    /// exactly what an op naming it buys, which is nothing the ceiling does not
-    /// already allow.
+    /// [`record_stamp`](Self::record_stamp) itself, so it reaches the same states an
+    /// op carrying this replica's id already reaches, under the same
+    /// [`LAMPORT_STATE_CEILING`]: an op stamped *at* the ceiling parks the mint
+    /// there too (C23's shape), so the frame buys no state an op cannot.
+    ///
+    /// One asymmetry, stated rather than elided: an out-of-range **stamp** is
+    /// refused on the way in ([`stamp_occupies_a_mintable_position`]), while an
+    /// out-of-range `reach` is *clamped* here — so junk in a frame folds to the
+    /// worst legal position where junk in an op is dropped. That is a real cost of
+    /// a wire number feeding a floor, and this seam is the only refusal it gets.
     ///
     /// A sequence the replica already holds — applied or buffered — is skipped: it
     /// already blocks the mint, and the three sets stay disjoint, which the state
