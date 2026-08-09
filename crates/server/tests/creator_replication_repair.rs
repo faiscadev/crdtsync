@@ -815,12 +815,14 @@ fn a_frame_asserting_no_root_is_dropped_before_the_fence() {
     // No send seam builds one — `enqueue_root_replication` returns for a rootless
     // room — so a frame that asserts nothing is a peer's, and honouring it would let
     // a contentless frame move this node's fence and step it down from leadership.
-    let room = room_led_by_a_with_b_next();
-    let mut leader = seeded_leader(&room);
-    let mut follower = node(B);
-    let peer = peer_conn(&mut follower, &room);
-    apply_all(&mut follower, peer, frames_for_b(&mut leader));
-
+    // Read through what a *later* legitimate frame can still do, not through the
+    // delivery's own answer: a fenced frame is answered exactly as an applied one.
+    let Rootless {
+        room,
+        mut follower,
+        peer,
+        ..
+    } = rootless_room();
     assert!(follower.deliver(
         peer,
         Message::ReplicateMeta {
@@ -829,12 +831,27 @@ fn a_frame_asserting_no_root_is_dropped_before_the_fence() {
             creator: None,
         },
     ));
-    // The fence did not move: a legitimate frame at the leader's own epoch still
-    // applies, where an adopted `u64::MAX` would have fenced it out forever.
-    let mut second = seeded_leader(&room);
-    let frames = frames_for_b(&mut second);
-    assert!(!frames.is_empty());
-    apply_all(&mut follower, peer, frames);
+    assert_eq!(
+        follower.hub().room_creator(&room),
+        None,
+        "a frame naming no root roots nothing",
+    );
+
+    // The fence did not move: a legitimate frame at an ordinary epoch still applies,
+    // where an adopted `u64::MAX` would have fenced every later one out for good.
+    assert!(follower.deliver(
+        peer,
+        Message::ReplicateMeta {
+            room: room.clone(),
+            epoch: 1,
+            creator: Some(b"alice".to_vec()),
+        },
+    ));
+    assert_eq!(
+        follower.hub().room_creator(&room).as_deref(),
+        Some(b"alice".as_slice()),
+        "the leader can still root the room it leads",
+    );
 }
 
 #[test]
