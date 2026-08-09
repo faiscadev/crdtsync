@@ -403,6 +403,56 @@ impl Registry {
         }
     }
 
+    /// The nodes this registry originates `room`'s replication to — its replica set
+    /// minus self — and empty where it originates none: a node with no membership
+    /// leads nothing (single-node), and a node that does not *effectively* lead the
+    /// room defers to whoever does. Origination follows effective (live) leadership,
+    /// so a node promoted over a down placement primary originates for its newly-led
+    /// rooms and a demoted-but-recovered old primary waits until it leads again. The
+    /// set is the same replica-set-minus-self the majority gate counts, so the fan-out
+    /// and the quorum never disagree on who is a follower — and it is the one gate
+    /// every origination seam reads, so an ops frame and a metadata-only one are
+    /// addressed alike.
+    fn replication_followers(&self, room: &[u8]) -> Vec<NodeId> {
+        let Some(membership) = &self.membership else {
+            return Vec::new();
+        };
+        if !membership.is_effective_primary_for(room) {
+            return Vec::new();
+        }
+        self.quorum(room).1
+    }
+
+    /// Queue a [`Message::ReplicateMeta`] for each follower of `room` when this node
+    /// leads it — the carrier for a doc-ACL authority root that has no op batch to
+    /// ride out on. A write the room's dedup swallowed whole establishes a root and
+    /// broadcasts nothing, so the frame that would have carried it is never built; a
+    /// replica left creatorless that way serves every doc-ACL deny in the room as
+    /// inert until the room's next *fresh* commit.
+    ///
+    /// A no-op for a room with no root to assert, so a peer is never sent a frame
+    /// saying nothing.
+    fn enqueue_root_replication(&mut self, room: &[u8]) {
+        let Some(creator) = self.hub.room_creator(room) else {
+            return;
+        };
+        let followers = self.replication_followers(room);
+        if followers.is_empty() {
+            return;
+        }
+        let epoch = self.claim_and_persist_epoch(room);
+        for follower in followers {
+            self.replication.enqueue(
+                follower,
+                Message::ReplicateMeta {
+                    room: room.to_vec(),
+                    epoch,
+                    creator: Some(creator.clone()),
+                },
+            );
+        }
+    }
+
     /// Queue a [`Message::Replicate`] for each follower of `room` when this node
     /// leads it, mirroring the fresh `ops` on `branch`. A node with no membership
     /// leads nothing, so it never replicates — single-node behavior is unchanged.
@@ -414,18 +464,7 @@ impl Registry {
         if branch != MAIN_BRANCH {
             return;
         }
-        let Some(membership) = &self.membership else {
-            return;
-        };
-        // Origination follows *effective* (live) leadership: a node promoted over a
-        // down placement primary originates replication for its newly-led rooms,
-        // and a demoted-but-recovered old primary defers until it leads again.
-        if !membership.is_effective_primary_for(room) {
-            return;
-        }
-        // The same replica-set-minus-self the majority gate counts, so the fan-out
-        // and the quorum never disagree on who is a follower.
-        let followers = self.quorum(room).1;
+        let followers = self.replication_followers(room);
         if followers.is_empty() {
             return;
         }
@@ -554,15 +593,25 @@ impl Registry {
             .collect()
     }
 
-    /// The catch-up frame that lands a follower at `room`'s head from `floor`, or
-    /// `None` when it is already at the head (an empty ops tail). The leader branches
-    /// by comparing `floor` to the room's compaction floor, which `catch_up` folds
-    /// into its reply: at or above the floor it yields the ops past `floor` (an
-    /// ordinary delta), below it — the ops the follower needs are compacted away — it
-    /// yields the whole-replica snapshot at the head. So a follower below the floor is
-    /// caught up by a state-transfer rather than a futile ops-replay that would leave
-    /// it divergent; one at or above it keeps the ops-tail path. The frame is stamped
-    /// with this node's leadership epoch, fenced exactly as a steady replication frame.
+    /// The catch-up frame that lands a follower at `room`'s head from `floor`. The
+    /// leader branches by comparing `floor` to the room's compaction floor, which
+    /// `catch_up` folds into its reply: at or above the floor it yields the ops past
+    /// `floor` (an ordinary delta), below it — the ops the follower needs are
+    /// compacted away — it yields the whole-replica snapshot at the head. So a
+    /// follower below the floor is caught up by a state-transfer rather than a futile
+    /// ops-replay that would leave it divergent; one at or above it keeps the ops-tail
+    /// path. The frame is stamped with this node's leadership epoch, fenced exactly as
+    /// a steady replication frame.
+    ///
+    /// A follower already at the head is sent no delta — an empty `Replicate` would
+    /// create the room on a node that does not hold it, leaving an empty replica its
+    /// read-serving then advertises. It is sent the room's root on its own instead
+    /// ([`Message::ReplicateMeta`], which creates nothing), because a caught-up
+    /// follower is exactly the one that cannot recover a root it lost: persisting the
+    /// root is best-effort and set-once retries nothing, so a replica whose metadata
+    /// write failed reloads creatorless and, serving no client write, waits for a
+    /// commit a quiescent room never makes. `None` only when there is neither a delta
+    /// nor a root to send.
     fn catch_up_room_frame(&mut self, room: &[u8], floor: u64) -> Option<Message> {
         // The room's doc-ACL authority root, carried by a dialed catch-up exactly as
         // by a steady commit — a follower converged either way holds the authority its
@@ -572,7 +621,16 @@ impl Registry {
             Catchup::Ops(records) => {
                 let ops: Vec<Op> = records.into_iter().map(|rec| rec.op).collect();
                 if ops.is_empty() {
-                    return None;
+                    // Nothing to catch up but the room's root, and only where there
+                    // is one — a rootless room has nothing this frame could assert.
+                    if creator.is_none() {
+                        return None;
+                    }
+                    return Some(Message::ReplicateMeta {
+                        room: room.to_vec(),
+                        epoch: self.claim_and_persist_epoch(room),
+                        creator,
+                    });
                 }
                 let base_seq = self.hub.base_seq(room);
                 Some(Message::Replicate {
@@ -844,6 +902,40 @@ impl Registry {
         let through_seq = self.hub.seq(&room);
         if let Some(conn) = self.conns.get_mut(&id) {
             conn.outbox.push(Message::ReplicaAck { room, through_seq });
+        }
+        true
+    }
+
+    /// Adopt a leader's assertion of `room`'s doc-ACL authority root, with no ops
+    /// beneath it — the carrier for a root the ops path cannot deliver. Gated by
+    /// [`gate_replica_frame`](Registry::gate_replica_frame) exactly as an ops frame
+    /// is, against `main`, since the root is a fact about the room rather than about
+    /// any one stream. Returns whether the connection stays open.
+    ///
+    /// Composed set-once through the same
+    /// [`Hub::ensure_creator`](crate::Hub::ensure_creator) the ops path uses, so this
+    /// frame is judged by the rules every other arrival seam applies and can never
+    /// displace a root already standing here.
+    ///
+    /// **Inert for a room this node does not hold.** `ensure_creator` roots no unknown
+    /// room, which is what lets this frame exist at all: an empty `Replicate` would
+    /// have `ingest_records` create the room, and a follower would come up holding an
+    /// *empty* replica at the head that `holds_room` then reports as servable. A node
+    /// missing the room gets it from the ops or snapshot catch-up, each of which
+    /// carries the root itself.
+    ///
+    /// Unacknowledged, and deliberately: the frame names no sequence and advances no
+    /// stream, so there is no watermark for a [`Message::ReplicaAck`] to report. It
+    /// runs no fan-out either — a root only ever *narrows* what this replica serves,
+    /// and there are no ops to deliver under it.
+    fn apply_replicate_meta(&mut self, frame: ReplicaFrame<'_>, creator: Option<Vec<u8>>) -> bool {
+        match self.gate_replica_frame(&frame) {
+            ReplicaGate::Reject => return false,
+            ReplicaGate::Fenced => return true,
+            ReplicaGate::Apply => {}
+        }
+        if let Some(creator) = &creator {
+            self.hub.ensure_creator(&frame.room, creator);
         }
         true
     }
@@ -2516,6 +2608,22 @@ impl Registry {
                     };
                     return self.apply_replicate_snapshot(id, frame, seq, state, creator);
                 }
+                // A metadata-only frame names no branch: the root is a fact about the
+                // room, not about one of its streams, so the gate is handed `main` —
+                // the stream every replication frame is fenced against.
+                Message::ReplicateMeta {
+                    room,
+                    epoch,
+                    creator,
+                } => {
+                    let frame = ReplicaFrame {
+                        sender: &sender,
+                        room,
+                        branch: MAIN_BRANCH.to_vec(),
+                        epoch,
+                    };
+                    return self.apply_replicate_meta(frame, creator);
+                }
                 Message::Gossip { members } => return self.apply_gossip(id, &sender, members),
                 // A follower's durable-head report arrives node-to-node on a peer
                 // connection; catch it up from the reported heads off the client session
@@ -2708,6 +2816,7 @@ impl Registry {
             newly_subscribed,
             owed_accept,
             cloned,
+            root_established,
         ) = {
             let Some(conn) = self.conns.get_mut(&id) else {
                 return false;
@@ -2802,6 +2911,7 @@ impl Registry {
                 newly_subscribed,
                 owed_accept,
                 cloned,
+                resp.root_established,
             )
         };
         if newly_subscribed {
@@ -2860,6 +2970,17 @@ impl Registry {
         if !broadcast.is_empty() {
             if let (Some(room), Some(branch)) = (&room, &broadcast_branch) {
                 self.enqueue_replication(room, branch, &broadcast);
+            }
+        } else if root_established {
+            // A write can establish the room's authority root and broadcast nothing —
+            // an authenticated resend of ops the room already holds is swallowed whole
+            // by the dedup, and it is exactly the write that roots a room whose
+            // establishing commit was anonymous. The frame above is the root's only
+            // ride out; with no ops to build one, send the root on its own, so the
+            // replicas do not stay creatorless — serving every doc-ACL deny in the
+            // room as inert — until the room's next fresh commit.
+            if let Some(room) = &room {
+                self.enqueue_root_replication(room);
             }
         }
         // Gate the write's ack on majority durability. Only a main-stream write

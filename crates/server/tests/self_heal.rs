@@ -314,11 +314,22 @@ fn a_healthy_follower_reporting_its_true_head_gets_only_its_tail() {
     leader.catch_up_follower_reporting(&b, &[(room.clone(), 2)]);
     assert_eq!(ops_dialed_to(&leader.take_replication(), &b), 2);
 
-    // One caught up to the head reports 4 and is dialed nothing.
+    // One caught up to the head reports 4 and is dialed no ops. The room is rooted, so
+    // it is dialed the room's authority root on its own (C55) — the frame a replica
+    // that lost its durable record is re-rooted by — which carries no stream position
+    // and so cannot be mistaken for a delta.
     leader.catch_up_follower_reporting(&b, &[(room.clone(), 4)]);
+    let frames = leader.take_replication();
+    assert_eq!(
+        ops_dialed_to(&frames, &b),
+        0,
+        "a follower at the head is dialed no ops"
+    );
     assert!(
-        leader.take_replication().is_empty(),
-        "a follower at the head is dialed no catch-up"
+        frames
+            .iter()
+            .all(|(_, f)| matches!(f, Message::ReplicateMeta { .. })),
+        "and nothing but the root: {frames:?}"
     );
 }
 

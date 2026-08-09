@@ -1028,6 +1028,9 @@ impl ClientSession {
             Message::ReplicateSnapshot { .. } => Err(ClientError::UnexpectedMessage(
                 "server sent a replicate snapshot",
             )),
+            Message::ReplicateMeta { .. } => Err(ClientError::UnexpectedMessage(
+                "server sent a replicate meta",
+            )),
             Message::FollowerHeads { .. } => {
                 Err(ClientError::UnexpectedMessage("server sent follower heads"))
             }

@@ -445,6 +445,12 @@ pub struct Response {
     /// recipient's own version. `None` for a relay write (no schema).
     pub broadcast_version: Option<u32>,
     pub awareness: Option<AwarenessBroadcast>,
+    /// Whether this step is what established `broadcast_room`'s doc-ACL authority
+    /// root. The room's replicas need the root as much as its ops do, and the two do
+    /// not always travel together: a write the room's dedup swallowed whole
+    /// establishes a root and produces no ops, so the fan-out that would have carried
+    /// it never runs. This says the root moved, so the leader can send it on its own.
+    pub root_established: bool,
     pub close: bool,
 }
 
@@ -1642,6 +1648,7 @@ pub fn step(
         Message::Replicate { .. } => violation("client sent a replicate"),
         Message::ReplicaAck { .. } => violation("client sent a replica ack"),
         Message::ReplicateSnapshot { .. } => violation("client sent a replicate snapshot"),
+        Message::ReplicateMeta { .. } => violation("client sent a replicate meta"),
         Message::FollowerHeads { .. } => violation("client sent follower heads"),
         // Gossip is a node-to-node membership advertisement the registry handles
         // off the client session path; a client that sends one violates.
@@ -1887,6 +1894,9 @@ fn handle_ops(
     // today; a branch write appends to that branch's divergent tail, advancing its
     // head, never main's. A hub that cannot durably record the ops rejects the write
     // rather than advertising an unpersisted one.
+    // Whether this write is what rooted the room, reported out so the leader can
+    // replicate a root its op batch does not carry.
+    let mut root_established = false;
     let applied = if branch == MAIN_BRANCH {
         let applied = hub.ingest(&room, ops, write_version);
         // The first authenticated actor to write a room establishes it, so it becomes
@@ -1895,7 +1905,7 @@ fn handle_ops(
         // a replication frame is judged by the same rule. A branch write presupposes
         // an already-established (forked) room, so it never bootstraps a creator.
         if applied.is_ok() {
-            hub.ensure_creator(&room, identity.actor());
+            root_established = hub.ensure_creator(&room, identity.actor());
         }
         applied
     } else {
@@ -1924,6 +1934,7 @@ fn handle_ops(
             broadcast_room: Some(room),
             broadcast_branch: Some(branch),
             broadcast_version: write_version,
+            root_established,
             ..Response::default()
         },
         Err(_) => Response {
