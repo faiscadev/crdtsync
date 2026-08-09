@@ -243,6 +243,38 @@ struct ReplicaFrame<'a> {
     epoch: u64,
 }
 
+/// A dial's catch-up frames, split by what losing one costs. A peer's outbound
+/// channel is bounded and drops on overflow (`dispatch_replication`), so the order
+/// frames are queued in decides which are lost when a dial spans more rooms than the
+/// channel holds — and the two kinds are not equally costly. A **delta** (an ops tail
+/// or a state transfer) is the only thing that converges a follower's replica, and a
+/// dropped one leaves a gap the steady path — which mirrors fresh commits only —
+/// never closes for a quiescent room. A **root-only** [`Message::ReplicateMeta`] is a
+/// repair for a replica that is already converged, and the next dial re-sends it. So
+/// deltas are queued first and roots last, and an overflowing dial sheds the repair
+/// rather than the convergence.
+#[derive(Default)]
+struct DialFrames {
+    deltas: Vec<Message>,
+    roots: Vec<Message>,
+}
+
+impl DialFrames {
+    fn push(&mut self, frame: Option<Message>) {
+        match frame {
+            Some(frame @ Message::ReplicateMeta { .. }) => self.roots.push(frame),
+            Some(frame) => self.deltas.push(frame),
+            None => {}
+        }
+    }
+
+    fn enqueue_to(self, replication: &mut Replication, follower: &NodeId) {
+        for frame in self.deltas.into_iter().chain(self.roots) {
+            replication.enqueue(follower.clone(), frame);
+        }
+    }
+}
+
 impl Registry {
     /// An in-memory registry whose hub's replicas are owned by `server`.
     pub fn new(server: ClientId) -> Self {
@@ -524,12 +556,12 @@ impl Registry {
     /// Making a wiped follower self-heal (it reports its true head on reconnect, or
     /// the leader re-sends from the floor and leans on op-dedup) is a follow-on.
     pub fn catch_up_follower(&mut self, follower: &NodeId) {
+        let mut dial = DialFrames::default();
         for room in self.rooms_led_for(follower) {
             let floor = self.replication.watermark(&room, follower);
-            if let Some(frame) = self.catch_up_room_frame(&room, floor) {
-                self.replication.enqueue(follower.clone(), frame);
-            }
+            dial.push(self.catch_up_room_frame(&room, floor));
         }
+        dial.enqueue_to(&mut self.replication, follower);
     }
 
     /// Catch a follower up from the durable heads it *reported* on (re)join, honoring
@@ -554,6 +586,7 @@ impl Registry {
     /// this node does not lead.
     pub fn catch_up_follower_reporting(&mut self, follower: &NodeId, heads: &[(RoomId, u64)]) {
         let reported: HashMap<&[u8], u64> = heads.iter().map(|(r, h)| (r.as_slice(), *h)).collect();
+        let mut dial = DialFrames::default();
         for room in self.rooms_led_for(follower) {
             // The reported head is authoritative — a room the follower did not name is
             // one it can no longer prove any of, so its floor is 0 (fail-closed) —
@@ -566,10 +599,9 @@ impl Registry {
             // reported head even when that lowers it.
             self.replication
                 .set_watermark(follower.clone(), &room, floor);
-            if let Some(frame) = self.catch_up_room_frame(&room, floor) {
-                self.replication.enqueue(follower.clone(), frame);
-            }
+            dial.push(self.catch_up_room_frame(&room, floor));
         }
+        dial.enqueue_to(&mut self.replication, follower);
     }
 
     /// The rooms this node effectively leads that `follower` replicates — the set a
@@ -917,26 +949,37 @@ impl Registry {
     /// frame is judged by the rules every other arrival seam applies and can never
     /// displace a root already standing here.
     ///
-    /// **Inert for a room this node does not hold.** `ensure_creator` roots no unknown
-    /// room, which is what lets this frame exist at all: an empty `Replicate` would
-    /// have `ingest_records` create the room, and a follower would come up holding an
-    /// *empty* replica at the head that `holds_room` then reports as servable. A node
+    /// **Inert for a room this node does not hold, and inert before the fence.** A
+    /// frame asserting nothing — no room here to assert it about, or no root asserted
+    /// — is dropped ahead of [`gate_replica_frame`](Registry::gate_replica_frame),
+    /// because the gate *advances and persists* this node's leadership fence for the
+    /// room and a fence recorded for a stream this node holds none of is a durable
+    /// record with no room behind it: `Store::load` materialises a room from an epoch
+    /// record alone, so the next restart would come up holding an **empty** replica at
+    /// the head that `holds_room` reports as servable — the very state that
+    /// disqualified an empty `Replicate` from being this frame, arriving one restart
+    /// later. Every other replication frame reaches the gate because each carries a
+    /// stream position the fence exists to order; this one carries none. A node
     /// missing the room gets it from the ops or snapshot catch-up, each of which
-    /// carries the root itself.
+    /// carries the root itself, and each of which still refuses a stray sender's link.
     ///
     /// Unacknowledged, and deliberately: the frame names no sequence and advances no
     /// stream, so there is no watermark for a [`Message::ReplicaAck`] to report. It
     /// runs no fan-out either — a root only ever *narrows* what this replica serves,
     /// and there are no ops to deliver under it.
     fn apply_replicate_meta(&mut self, frame: ReplicaFrame<'_>, creator: Option<Vec<u8>>) -> bool {
+        let Some(creator) = creator else {
+            return true;
+        };
+        if !self.hub.holds_room(&frame.room) {
+            return true;
+        }
         match self.gate_replica_frame(&frame) {
             ReplicaGate::Reject => return false,
             ReplicaGate::Fenced => return true,
             ReplicaGate::Apply => {}
         }
-        if let Some(creator) = &creator {
-            self.hub.ensure_creator(&frame.room, creator);
-        }
+        self.hub.ensure_creator(&frame.room, &creator);
         true
     }
 

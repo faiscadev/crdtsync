@@ -771,6 +771,129 @@ fn an_empty_replicate_would_have_created_the_room_instead() {
 }
 
 #[test]
+fn a_frame_for_an_unheld_room_leaves_no_durable_trace_of_it() {
+    // The frame is dropped *ahead of the fence*, not merely ahead of the root. The
+    // gate advances and persists this node's leadership epoch for the room, and
+    // `Store::load` materialises a room from an epoch record alone — so a fence
+    // written for a room this node holds none of would come back after a restart as
+    // an empty replica at the head, which `holds_room` reports as servable. That is
+    // the state an empty `Replicate` was rejected for, arriving one restart later.
+    let room = room_led_by_a_with_b_next();
+    let dir = tempdir("unheld");
+    {
+        let mut follower = stored_node(B, &dir);
+        let peer = peer_conn(&mut follower, &room);
+        assert!(!follower.hub().holds_room(&room));
+        assert!(follower.deliver(
+            peer,
+            Message::ReplicateMeta {
+                room: room.clone(),
+                epoch: 7,
+                creator: Some(b"alice".to_vec()),
+            },
+        ));
+        assert!(!follower.hub().holds_room(&room));
+    }
+    assert!(
+        fs::read_dir(&dir).unwrap().next().is_none(),
+        "the frame wrote nothing at all: {:?}",
+        fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>(),
+    );
+    let reloaded = stored_node(B, &dir);
+    assert!(
+        !reloaded.hub().holds_room(&room),
+        "and the restart does not conjure the room from a fence",
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_frame_asserting_no_root_is_dropped_before_the_fence() {
+    // No send seam builds one — `enqueue_root_replication` returns for a rootless
+    // room — so a frame that asserts nothing is a peer's, and honouring it would let
+    // a contentless frame move this node's fence and step it down from leadership.
+    let room = room_led_by_a_with_b_next();
+    let mut leader = seeded_leader(&room);
+    let mut follower = node(B);
+    let peer = peer_conn(&mut follower, &room);
+    apply_all(&mut follower, peer, frames_for_b(&mut leader));
+
+    assert!(follower.deliver(
+        peer,
+        Message::ReplicateMeta {
+            room: room.clone(),
+            epoch: u64::MAX,
+            creator: None,
+        },
+    ));
+    // The fence did not move: a legitimate frame at the leader's own epoch still
+    // applies, where an adopted `u64::MAX` would have fenced it out forever.
+    let mut second = seeded_leader(&room);
+    let frames = frames_for_b(&mut second);
+    assert!(!frames.is_empty());
+    apply_all(&mut follower, peer, frames);
+}
+
+#[test]
+fn a_dial_queues_its_deltas_before_its_root_repairs() {
+    // A peer's outbound channel is bounded and drops on overflow, so order decides
+    // what a dial spanning many rooms loses. A dropped delta leaves a gap the steady
+    // path never closes for a quiescent room; a dropped root repair is re-sent by the
+    // next dial. Deltas first, roots last.
+    let b = NodeId::from_addr(B);
+    let mut leader = node(A);
+
+    // One room the follower is at the head of (root repair only), one it is behind on
+    // (a delta), with the room needing the delta discovered second so the ordering
+    // cannot be an accident of iteration.
+    let mut caught_up = Vec::new();
+    let mut behind = Vec::new();
+    for i in 0..1_000_000u32 {
+        let room = format!("room-{i}").into_bytes();
+        let m = membership_for(A);
+        let replicas = m.replicas_for(&room);
+        if replicas.first() != Some(&NodeId::from_addr(A)) || replicas.get(1) != Some(&b) {
+            continue;
+        }
+        if caught_up.is_empty() {
+            caught_up = room;
+        } else {
+            behind = room;
+            break;
+        }
+    }
+    for room in [&caught_up, &behind] {
+        let alice = hello_auth(&mut leader, 1, "t-alice");
+        assert!(leader.deliver(alice, sub(room)));
+        leader.take_outbox(alice);
+        submit(
+            &mut leader,
+            alice,
+            establishing_batch(&mut Document::new(cid(1))),
+        );
+    }
+    leader.take_replication();
+    leader.record_replica_ack(b.clone(), &caught_up, leader.hub().seq(&caught_up));
+
+    leader.catch_up_follower(&b);
+    let kinds: Vec<&str> = frames_for_b(&mut leader)
+        .iter()
+        .map(|f| match f {
+            Message::ReplicateMeta { .. } => "root",
+            _ => "delta",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["delta", "root"],
+        "the convergence is queued ahead of the repair",
+    );
+}
+
+#[test]
 fn the_frame_is_not_acknowledged() {
     // It names no sequence and advances no stream, so there is no watermark to
     // report — an ack would advance one the frame did not move.
@@ -793,17 +916,39 @@ fn the_frame_is_not_acknowledged() {
         follower.take_outbox(peer).is_empty(),
         "a metadata-only frame is answered with nothing",
     );
+    // Against a live seam, not a dropped frame: this node holds the room and the
+    // frame's root is the one standing, so it was applied and answered with silence.
+    assert_eq!(
+        follower.hub().room_creator(&room).as_deref(),
+        Some(b"alice".as_slice()),
+    );
 }
 
 #[test]
 fn a_frame_naming_another_root_does_not_displace_the_standing_one() {
     // Set-once, through the same `ensure_creator` every other arrival seam uses: a
-    // frame is an assertion, and the receiver composes it against what it holds.
-    let room = room_led_by_a_with_b_next();
-    let mut leader = seeded_leader(&room);
-    let mut follower = node(B);
-    let peer = peer_conn(&mut follower, &room);
-    apply_all(&mut follower, peer, frames_for_b(&mut leader));
+    // frame is an assertion, and the receiver composes it against what it holds. The
+    // standing root is landed *by this frame* first, so the refusal below is the
+    // composition rather than a frame the seam ignored.
+    let Rootless {
+        room,
+        mut follower,
+        peer,
+        ..
+    } = rootless_room();
+    assert!(follower.deliver(
+        peer,
+        Message::ReplicateMeta {
+            room: room.clone(),
+            epoch: 1,
+            creator: Some(b"alice".to_vec()),
+        },
+    ));
+    assert_eq!(
+        follower.hub().room_creator(&room).as_deref(),
+        Some(b"alice".as_slice()),
+        "the frame roots the room",
+    );
 
     assert!(follower.deliver(
         peer,
@@ -840,6 +985,20 @@ fn a_frame_naming_an_anonymous_root_roots_nothing() {
         },
     ));
     assert_eq!(follower.hub().room_creator(&room), None);
+    // The seam is live, not silently dropping the frame: an authenticated root sent
+    // the same way lands.
+    assert!(follower.deliver(
+        peer,
+        Message::ReplicateMeta {
+            room: room.clone(),
+            epoch: 1,
+            creator: Some(b"alice".to_vec()),
+        },
+    ));
+    assert_eq!(
+        follower.hub().room_creator(&room).as_deref(),
+        Some(b"alice".as_slice()),
+    );
 }
 
 #[test]
@@ -852,11 +1011,14 @@ fn a_stale_epoch_frame_is_fenced_rather_than_applied() {
         peer,
         ..
     } = rootless_room();
-    // Observe a high epoch, as a live leader's frame would leave it.
+    // Observe a high epoch, as a live leader's frame leaves it.
     assert!(follower.deliver(
         peer,
-        Message::ReplicateMeta {
+        Message::Replicate {
             room: room.clone(),
+            branch: b"main".to_vec(),
+            ops: Vec::new(),
+            base_seq: 0,
             epoch: 9,
             creator: None,
         },
@@ -881,8 +1043,11 @@ fn a_stale_epoch_frame_is_fenced_rather_than_applied() {
 
 #[test]
 fn a_frame_from_a_node_that_does_not_replicate_the_room_drops_the_link() {
-    let room = room_led_by_a_with_b_next();
-    let mut follower = node(B);
+    // The room is held here, so the frame reaches the gate rather than being dropped
+    // ahead of it as an assertion about nothing.
+    let Rootless {
+        room, mut follower, ..
+    } = rootless_room();
     // A member of the cluster, but not one of this room's replicas.
     let outsider = follower
         .membership()
