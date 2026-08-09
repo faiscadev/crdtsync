@@ -399,6 +399,8 @@ fn a_follower_applies_only_while_its_leader_is_live() {
             base_seq: 0,
             epoch: 1,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     ));
     assert_eq!(r.hub().seq(&room), 1, "a follower applied the replicate");
@@ -418,6 +420,8 @@ fn a_follower_applies_only_while_its_leader_is_live() {
                 base_seq: 0,
                 epoch: 1,
                 creator: None,
+                governing: None,
+                max_op_version: None,
             },
         ),
         "a promoted leader drops a Replicate for a room it now leads",

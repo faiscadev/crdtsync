@@ -22,8 +22,8 @@
 
 use crate::clientid::ClientId;
 use crate::codec::{
-    decode_ops, encode_ops, put_bytes, put_opt_bytes, put_u16, put_u32, put_u64, put_u8, Cursor,
-    DecodeError,
+    decode_ops, encode_ops, put_bytes, put_opt_bytes, put_opt_governing, put_opt_u32, put_u16,
+    put_u32, put_u64, put_u8, Cursor, DecodeError,
 };
 use crate::elementid::ElementId;
 use crate::op::Op;
@@ -375,8 +375,18 @@ pub enum Message {
     /// A room's root is set-once and immutable once established, so no two frames for a
     /// room ever name *different* roots — one sent before a root exists names none — and
     /// re-sending it can never conflict. A frame is still an *assertion*: the receiver
-    /// composes it set-once against whatever it already holds. Node-to-node — never a
-    /// client frame; a client that sends one commits a protocol violation.
+    /// composes it set-once against whatever it already holds.
+    ///
+    /// `governing` and `max_op_version` are the rest of the room's metadata record — the
+    /// `{app_id, version}` the room is bound to, and the highest governing-app op version
+    /// ever folded into it. They travel together because neither is usable alone: the
+    /// high-water is a number in the binding's version space, and it is what the
+    /// receiver's handshake range-check refuses an under-versioned joiner against.
+    /// `None` for a room with no binding, and for one holding no governing-app op. Each
+    /// composes on the rule its own seam already uses — the binding on the incumbent-app
+    /// rule a subscribe and the durable load both take, the high-water as a max, since it
+    /// is the all-time worst case a joiner must down-reach. Node-to-node — never a client
+    /// frame; a client that sends one commits a protocol violation.
     Replicate {
         room: Vec<u8>,
         branch: Vec<u8>,
@@ -384,6 +394,8 @@ pub enum Message {
         base_seq: u64,
         epoch: u64,
         creator: Option<Vec<u8>>,
+        governing: Option<(Vec<u8>, u32)>,
+        max_op_version: Option<u32>,
     },
     /// A room's leader asserts `room`'s replicated metadata with no ops to carry it:
     /// `creator` is the doc-ACL authority root, exactly the field a
@@ -431,8 +443,10 @@ pub enum Message {
     /// authority root, carried exactly as a `Replicate` carries it: the state bytes
     /// are a `Document` encoding and hold no server-side metadata, so a room installed
     /// from them alone would come up with no root and serve every doc-ACL deny as
-    /// inert. Node-to-node — never a client frame; a client that sends one commits a
-    /// protocol violation.
+    /// inert. `governing` and `max_op_version` ride for the same reason and compose the
+    /// same way ([`Replicate`](Message::Replicate)) — and this frame needs them more, since
+    /// it carries no ops at all for a receiver to read a version off. Node-to-node —
+    /// never a client frame; a client that sends one commits a protocol violation.
     ReplicateSnapshot {
         room: Vec<u8>,
         branch: Vec<u8>,
@@ -440,6 +454,8 @@ pub enum Message {
         state: Vec<u8>,
         epoch: u64,
         creator: Option<Vec<u8>>,
+        governing: Option<(Vec<u8>, u32)>,
+        max_op_version: Option<u32>,
     },
     /// A (re)joining follower's report of the durable head it can actually prove it
     /// holds for each room it replicates. `reporter` is the reporting node's id (the
@@ -873,6 +889,8 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             base_seq,
             epoch,
             creator,
+            governing,
+            max_op_version,
         } => {
             put_u8(&mut out, 24);
             put_bytes(&mut out, room);
@@ -882,6 +900,8 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             // Ahead of the batch: an op batch is length-framed and consumes the
             // remainder, so every scalar field precedes it.
             put_opt_bytes(&mut out, creator.as_deref());
+            put_opt_governing(&mut out, governing.as_ref());
+            put_opt_u32(&mut out, *max_op_version);
             out.extend_from_slice(&encode_ops(ops));
         }
         Message::ReplicaAck { room, through_seq } => {
@@ -906,6 +926,8 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             state,
             epoch,
             creator,
+            governing,
+            max_op_version,
         } => {
             put_u8(&mut out, 49);
             put_bytes(&mut out, room);
@@ -913,6 +935,8 @@ pub fn encode_message(m: &Message) -> Vec<u8> {
             put_u64(&mut out, *seq);
             put_u64(&mut out, *epoch);
             put_opt_bytes(&mut out, creator.as_deref());
+            put_opt_governing(&mut out, governing.as_ref());
+            put_opt_u32(&mut out, *max_op_version);
             put_bytes(&mut out, state);
         }
         Message::FollowerHeads { reporter, heads } => {
@@ -1289,12 +1313,16 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let base_seq = cur.u64()?;
             let epoch = cur.u64()?;
             let creator = cur.opt_bytes()?;
+            let governing = cur.opt_governing()?;
+            let max_op_version = cur.opt_u32()?;
             return Ok(Message::Replicate {
                 room,
                 branch,
                 base_seq,
                 epoch,
                 creator,
+                governing,
+                max_op_version,
                 ops: decode_ops(cur.rest()).map_err(ProtocolError::Op)?,
             });
         }
@@ -1319,6 +1347,8 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
             let seq = cur.u64()?;
             let epoch = cur.u64()?;
             let creator = cur.opt_bytes()?;
+            let governing = cur.opt_governing()?;
+            let max_op_version = cur.opt_u32()?;
             let state = cur.bytes()?;
             Message::ReplicateSnapshot {
                 room,
@@ -1327,6 +1357,8 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, ProtocolError> {
                 state,
                 epoch,
                 creator,
+                governing,
+                max_op_version,
             }
         }
         50 => {

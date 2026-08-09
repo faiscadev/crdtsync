@@ -620,6 +620,8 @@ fn a_second_frame_naming_another_root_does_not_displace_the_first() {
             base_seq: 0,
             epoch: 1,
             creator: Some(b"mallory".to_vec()),
+            governing: None,
+            max_op_version: None,
         },
     ));
     assert!(
@@ -635,6 +637,8 @@ fn a_second_frame_naming_another_root_does_not_displace_the_first() {
             state,
             epoch: 1,
             creator: Some(b"mallory".to_vec()),
+            governing: None,
+            max_op_version: None,
         },
     ));
     assert_eq!(
@@ -667,6 +671,8 @@ fn a_frame_naming_an_anonymous_root_roots_nothing() {
             base_seq: 0,
             epoch: 1,
             creator: Some(b"anon:ephemeral".to_vec()),
+            governing: None,
+            max_op_version: None,
         },
     ));
     assert!(
@@ -689,6 +695,8 @@ fn a_frame_naming_an_anonymous_root_roots_nothing() {
             state,
             epoch: 1,
             creator: Some(b"anon:ephemeral".to_vec()),
+            governing: None,
+            max_op_version: None,
         },
     ));
     assert_eq!(
@@ -721,6 +729,8 @@ fn a_rootless_frame_leaves_the_replica_rootless() {
             base_seq: 0,
             epoch: 1,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     ));
     assert!(

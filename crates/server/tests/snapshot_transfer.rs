@@ -440,6 +440,8 @@ fn a_stale_epoch_snapshot_is_fenced() {
             base_seq: 0,
             epoch: 5,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     ));
     let seq_before = follower.hub().seq(&room);
@@ -456,6 +458,8 @@ fn a_stale_epoch_snapshot_is_fenced() {
             state,
             epoch: 4,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     ));
     assert_eq!(

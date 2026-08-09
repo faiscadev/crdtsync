@@ -797,6 +797,8 @@ fn an_empty_replicate_would_have_created_the_room_instead() {
             base_seq: 0,
             epoch: 1,
             creator: Some(b"alice".to_vec()),
+            governing: None,
+            max_op_version: None,
         },
     ));
     assert!(
@@ -1126,6 +1128,8 @@ fn a_stale_epoch_frame_is_fenced_rather_than_applied() {
             base_seq: 0,
             epoch: 9,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     ));
     assert!(

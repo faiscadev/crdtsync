@@ -447,6 +447,8 @@ fn a_fenced_frame_fans_nothing_out() {
             base_seq: 0,
             epoch: 0,
             creator: None,
+            governing: None,
+            max_op_version: None,
         },
     ));
     let out = pump(&mut follower, conn, &mut session);
