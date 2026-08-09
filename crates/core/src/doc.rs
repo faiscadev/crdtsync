@@ -59,15 +59,18 @@ use std::rc::Rc;
 enum Claim {
     /// Nothing held the key. A claim owns the key, not the sequence id: a plain
     /// `ListInsert` reaches a children list without passing through the placement
-    /// index, so the id may already be taken, in which case this answer's insert
-    /// does not land and the eviction and join below overwrite what is there.
+    /// index at all, so the id may still be taken — by a scalar, which outranks
+    /// every composite on the kind tag, the first key of the sequence's own order.
+    /// All four answers below therefore go through that order too; only the
+    /// question of who holds the *key* is settled here.
     Fresh,
     /// The claimant's own node already held it, so nothing changes hands — the
     /// sequence slot takes the meet of the two positions and the placement record
     /// is already there.
     Joined,
     /// A node this one outranks held it and now holds nothing at it, so the
-    /// sequence slot is re-seated rather than inserted into.
+    /// sequence slot is re-seated rather than inserted into — over the composite
+    /// this claim was ranked against, never over a scalar it was not.
     Evicted,
     /// A node this one does not outrank holds the key.
     Refused,
@@ -4297,7 +4300,7 @@ impl Document {
     /// (an `XmlElement` when `tag` is present, else a `Text` run), register it,
     /// and insert its handle as a sequence node keyed by the op's stamp. The
     /// child's element id derives from that stamp, so every replica builds the
-    /// same child; `insert_at` is idempotent on the stamp, so a replay is inert.
+    /// same child; a replay ties its own claim on the sequence id, so it is inert.
     ///
     /// Inserts into the sequence even when its holding element is displaced: a
     /// displaced parent retains its children, so the child materialises hidden and
@@ -4398,10 +4401,12 @@ impl Document {
     ///
     /// The rank orders the *nodes* two claims name, which is the whole question
     /// only while they name two. A move can name exactly the child a birth at the
-    /// key derives, and two inserts carrying one tag derive one child between them
-    /// — there the key is already the claimant's own, nothing changes hands, and
-    /// what is left to settle is the position, which the sequence takes as the meet
-    /// of the two ([`List::rejoin`]). A meet is the same whichever arrived first,
+    /// key derives, and two inserts of one *kind* derive one child between them —
+    /// there the key is already the claimant's own, nothing changes hands, and what
+    /// is left to settle is the position, which the sequence takes as the meet of
+    /// the two ([`List::rejoin`]). Their two *tags* are left to settle with it when
+    /// the kind is `XmlElement` and the tags differ, which this rank does not reach
+    /// and C44 is filed for. A meet is the same whichever arrived first,
     /// where a contest between two claims on one node would have needed to know
     /// what put the incumbent there, and nothing answers that: the move log dedups
     /// on the stamp alone, so a move can hold the key having recorded no edge.

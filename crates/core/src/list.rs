@@ -118,6 +118,51 @@ pub struct Anchor {
     pub side: Side,
 }
 
+/// How a claim on a sequence id is ranked against the claim already holding it:
+/// the kind tag, then the position, then the encoded value.
+///
+/// Two ops can carry one `Stamp` into one sequence — dedup is on `OpId`, and an
+/// id-space record only bounds an *honest* mint — so which of them the id ends at
+/// has to be a function of the ops alone. This is that function, and every seat
+/// path runs it: a claim owns the key it named, not the id, so a path that
+/// skipped it would keep the bug in that path only.
+///
+/// The **tag leads** because it is the one key a scalar and a composite both
+/// have, and it is read as the number it is rather than as a preference for
+/// either: a numeric order is total, and it stays total when a kind is added,
+/// where a semantic one would re-open the question on every new op.
+///
+/// The **position outranks the value** because it is the only part of a claim a
+/// delete leaves behind. A tombstone drops the value and keeps the anchor, so a
+/// claim arriving at a tombstoned id can be ranked on the position and on nothing
+/// else — and ranking it there settles everything, since the position is also all
+/// a tombstone encodes. Were the value read first, the winner of a contest a
+/// delete landed in the middle of would depend on which claim the delete buried.
+///
+/// Two *composites* are not ranked here. The document ranks them at the
+/// `(list, stamp)` placement key first — a birth over a move, then the smaller
+/// element id — and hands the sequence its verdict, which is why the tag decides
+/// only across the scalar/composite boundary and never inside it.
+type Rank = (u8, Anchor, Vec<u8>);
+
+fn claim_rank(value: &Element, anchor: Anchor) -> Rank {
+    let mut encoded = Vec::new();
+    put_node_value(&mut encoded, value);
+    (value.kind() as u8, anchor, encoded)
+}
+
+/// What holds a sequence id, as far as a claim can rank it.
+enum Seated {
+    /// Nothing holds it: the claim seats without a contest.
+    Vacant,
+    /// A live node, rankable in full.
+    Live(Rank),
+    /// A tombstone. The delete dropped the value, so only the position is left to
+    /// rank on — and only the position is encoded, so nothing a snapshot can show
+    /// goes unranked.
+    Dead(Anchor),
+}
+
 struct Node {
     id: Stamp,
     value: Element,
@@ -505,35 +550,69 @@ impl List {
         Anchor { parent, side }
     }
 
-    /// Insert a node with an explicit id and placement. Idempotent on the id:
-    /// a replayed op leaves the sequence untouched, and an id already deleted
-    /// stays deleted.
+    /// Claim the id `id` for `value` at `anchor`, ranked against whatever holds
+    /// it — the seam every claim the document has *not* already ranked passes
+    /// through: a plain `ListInsert`, a `Text` run's codepoints, a birth whose
+    /// `(list, stamp)` key was free.
+    ///
+    /// Idempotent where it is a replay: a claim that ties the seated one ranks
+    /// equal and changes nothing. Where the two differ, the smaller [`Rank`] takes
+    /// the id with its value *and* its position, so the id ends at the same claim
+    /// whichever arrived first.
     pub fn insert_at(&mut self, id: Stamp, value: Element, anchor: Anchor) {
-        if self.contains(id) {
-            return;
+        let takes = match self.seated(id) {
+            Seated::Vacant => true,
+            Seated::Live(seated) => claim_rank(&value, anchor) < seated,
+            // A delete is terminal for the value but not for the position: the
+            // claims still have to agree on where the id sits, and the anchor is
+            // the one key of the rank that survived the delete to compare on.
+            Seated::Dead(seated) => anchor < seated,
+        };
+        if takes {
+            self.seat(id, value, anchor);
         }
-        self.nodes.insert(
-            seq_key(&id),
-            Node {
-                id,
-                value,
-                parent: anchor.parent,
-                side: anchor.side,
-                moved_away: false,
-            },
-        );
     }
 
-    /// Hand the id `id` to `value` at `anchor`, whatever it currently holds. The
-    /// seam a children-list placement collision resolves through: two ops can carry
-    /// one id into one list, and which position it ends at is decided by the ops
-    /// alone, not by which arrived first — so the id has to be re-seated when the
-    /// deciding op lands second, where `insert_at` is idempotent on it.
+    /// Hand the id `id` to `value` at `anchor` on the document's ranking. The seam
+    /// a children-list placement collision resolves through: the document ranked
+    /// this claim against the composite holding the `(list, stamp)` key (a birth
+    /// over a move, then the smaller element id) and this claim won, so the id is
+    /// re-seated even though it is taken.
+    ///
+    /// It still yields to a *scalar* on the id, which no placement key ranks it
+    /// against — that half is the kind tag's, the first key of the one order every
+    /// seat path runs.
     ///
     /// A delete stays terminal. An id already tombstoned keeps its tombstone and
     /// takes only the new position, so the run remembers where the deciding op put
     /// it rather than where the other one did.
     pub(crate) fn reseat(&mut self, id: Stamp, value: Element, anchor: Anchor) {
+        if self.yields_to_seated(id, &value) {
+            return;
+        }
+        self.seat(id, value, anchor);
+    }
+
+    /// Re-seat `id` at the lesser of where it already sits and `anchor`, under
+    /// `value`. Two ops can carry one id into one list naming the same node and
+    /// differ in nothing but the position — neither is the other's loser, so the
+    /// position is the meet of the two, which is the same wherever it is computed
+    /// and whichever arrived first. Yields to a scalar on the id for the reason
+    /// [`reseat`](Self::reseat) gives.
+    pub(crate) fn rejoin(&mut self, id: Stamp, value: Element, anchor: Anchor) {
+        if self.yields_to_seated(id, &value) {
+            return;
+        }
+        let anchor = self.anchor_of(id).map_or(anchor, |held| anchor.min(held));
+        self.seat(id, value, anchor);
+    }
+
+    /// Install `value` at `id` and `anchor`, whatever the id currently holds — the
+    /// one mutation behind every seat path, run once the claim has been ranked.
+    ///
+    /// A delete stays terminal: an id already tombstoned keeps its tombstone and
+    /// takes only the new position.
+    fn seat(&mut self, id: Stamp, value: Element, anchor: Anchor) {
         let dead = self.take_dead(id);
         self.nodes.insert(
             seq_key(&id),
@@ -550,24 +629,41 @@ impl List {
         }
     }
 
-    /// Re-seat `id` at the lesser of where it already sits and `anchor`, under
-    /// `value`. Two ops can carry one id into one list naming the same node and
-    /// differ in nothing but the position — neither is the other's loser, so the
-    /// position is the meet of the two, which is the same wherever it is computed
-    /// and whichever arrived first.
-    pub(crate) fn rejoin(&mut self, id: Stamp, value: Element, anchor: Anchor) {
-        let anchor = self.anchor_of(id).map_or(anchor, |held| anchor.min(held));
-        self.reseat(id, value, anchor);
+    /// What holds `id`, ranked as far as it can be — the reading every seat path
+    /// takes its verdict from.
+    fn seated(&self, id: Stamp) -> Seated {
+        if let Some(node) = self.nodes.get(&seq_key(&id)) {
+            let anchor = Anchor {
+                parent: node.parent,
+                side: node.side,
+            };
+            return Seated::Live(claim_rank(&node.value, anchor));
+        }
+        match self.dead_anchor_of(id) {
+            Some(anchor) => Seated::Dead(anchor),
+            None => Seated::Vacant,
+        }
+    }
+
+    /// Whether a claim the document has already ranked yields to what holds `id`.
+    ///
+    /// Only a composite reaches a placement key, so such a claim carries a kind tag
+    /// above `Scalar`'s: a live scalar on the id outranks it on the tag, and a live
+    /// composite was ranked against it at the key, where the answer came from. A
+    /// tombstone holds no kind to read and keeps the document's verdict, which
+    /// outlives the delete where a sequence rank would not.
+    fn yields_to_seated(&self, id: Stamp, claim: &Element) -> bool {
+        debug_assert_ne!(
+            claim.kind(),
+            ElementKind::Scalar,
+            "a scalar reaches no placement key, so nothing ranks one here"
+        );
+        self.nodes.get(&seq_key(&id)).map(|n| n.value.kind()) == Some(ElementKind::Scalar)
     }
 
     /// Where `id` currently sits, or `None` if the list does not hold it — read
     /// back off the sequence rather than remembered, so a reloaded replica joins a
     /// later claim exactly as the one that never restarted.
-    ///
-    /// A tombstoned id answers as faithfully as a live one. It heads the run the
-    /// delete built, which keeps the anchor it was buried with; and an interior id
-    /// only ever welds into a run by hanging to the right of its predecessor, so
-    /// that is the anchor it was buried with too.
     fn anchor_of(&self, id: Stamp) -> Option<Anchor> {
         if let Some(node) = self.nodes.get(&seq_key(&id)) {
             return Some(Anchor {
@@ -575,6 +671,15 @@ impl List {
                 side: node.side,
             });
         }
+        self.dead_anchor_of(id)
+    }
+
+    /// Where a tombstoned `id` sits, or `None` if no run covers it. A tombstone
+    /// answers as faithfully as a live node: it heads the run the delete built,
+    /// which keeps the anchor it was buried with; and an interior id only ever
+    /// welds into a run by hanging to the right of its predecessor, so that is the
+    /// anchor it was buried with too.
+    fn dead_anchor_of(&self, id: Stamp) -> Option<Anchor> {
         let (head, run) = self.dead_run(id)?;
         if head == id {
             return Some(Anchor {
@@ -792,20 +897,37 @@ impl List {
     /// per-id registry, not in the node.
     pub fn merge(&mut self, other: &Self) {
         for (key, on) in &other.nodes {
-            if self.dead_run(on.id).is_some() {
-                continue;
-            }
-            match self.nodes.get_mut(key) {
-                // Same logical item: fold composite values together; scalars are
-                // immutable so their shared id already agrees.
-                Some(sn) => {
-                    if sn.value.kind() != ElementKind::Scalar && sn.value.kind() == on.value.kind()
-                    {
-                        sn.value.merge(&on.value);
-                    }
-                }
-                None => {
+            let anchor = Anchor {
+                parent: on.parent,
+                side: on.side,
+            };
+            match self.seated(on.id) {
+                Seated::Vacant => {
                     self.nodes.insert(*key, on.deep_clone());
+                }
+                // A delete wins and is terminal, so the peer's copy of a deleted
+                // node is dropped rather than folded.
+                Seated::Dead(_) => {}
+                Seated::Live(seated) => {
+                    let claim = claim_rank(&on.value, anchor);
+                    if (claim.0, &claim.2) == (seated.0, &seated.2) {
+                        // The same value at one id, so nothing is contested: fold
+                        // the composite halves together and take the meet of the
+                        // two positions, which is the same on both replicas.
+                        let sn = self.nodes.get_mut(key).expect("a live node was just read");
+                        if sn.value.kind() != ElementKind::Scalar {
+                            sn.value.merge(&on.value);
+                        }
+                        if claim.1 < seated.1 {
+                            sn.parent = anchor.parent;
+                            sn.side = anchor.side;
+                        }
+                    } else if claim < seated {
+                        // Two claims took one id on the two replicas — the same
+                        // contest an op fold resolves, resolved by the same rank so
+                        // a merge cannot answer it by which side received.
+                        self.seat(on.id, on.value.deep_clone(), anchor);
+                    }
                 }
             }
         }
